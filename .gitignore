@@ -1,0 +1,14 @@
+# SQLite database + WAL/SHM sidecars (regenerate with `python db.py && python seed.py`)
+wisp.db
+wisp.db-wal
+wisp.db-shm
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local env overrides
+.env

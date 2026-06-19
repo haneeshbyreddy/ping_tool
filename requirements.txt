@@ -1,0 +1,6 @@
+# Runtime deps. Phases 1-2 run on pure stdlib (asyncio loop) — none required yet.
+# These come online in later phases; install into a venv (system Python is PEP 668-locked):
+#     python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+icmplib>=3.0      # Phase 7: raw-socket ICMP prober (real polling; needs root/cap_net_raw)
+APScheduler>=3.10 # optional: alternative scheduler for the poll loop + escalation sweeper
+httpx>=0.27       # Phase 5/7: ntfy + Telegram HTTP notifiers
