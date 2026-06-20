@@ -1,26 +1,35 @@
-"""The polling daemon: every `poll_interval_s` it pings every active device (plus
-the canary and power-reference nodes) concurrently, feeds the samples to the
-MonitorEngine, persists the resulting states and outage changes, and surfaces
-events.
+"""Daemon runtime — the background polling worker.
 
-Phase 3 wires in the real state machine. Notification dispatch (turning these
-events into ntfy/Telegram messages) is Phase 5 — for now events are printed in
-the alert format we designed, so the behavior is visible.
+One of the two decoupled runtimes (the other is apps/dashboard). Every
+`poll_interval_s` it pings every active device (plus the canary and
+power-reference nodes) concurrently, feeds the samples to the MonitorEngine,
+persists the resulting states and outage changes, dispatches alerts, and sweeps
+overdue escalations.
+
+    python apps/daemon/main.py                      # real 60s cadence, forever
+    python apps/daemon/main.py --interval 1 --cycles 13   # fast demo
 
 Scheduling is a plain asyncio interval loop (no third-party deps); it is isolated
-in `run_forever`, so swapping to APScheduler later is a one-spot change.
+in `run_forever`, so swapping to APScheduler later is a one-spot change. Zero-
+install: this entry point puts <repo>/src on sys.path.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-from config import CONFIG, Config
-from db import connect, migrate, transaction, write_with_retry
-from probers import PingResult, Prober, build_prober
-from notifiers import AlertDispatcher, build_notifier
-from state_machine import (
+# --- bootstrap: make the `wisp` package importable without installing ---
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from wisp.config import CONFIG, Config  # noqa: E402
+from wisp.database.client import connect, migrate, transaction, write_with_retry
+from wisp.ingress.probers import PingResult, Prober, build_prober
+from wisp.egress.notifiers import AlertDispatcher, build_notifier
+from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
     Event,

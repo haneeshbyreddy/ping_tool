@@ -6,12 +6,13 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from analytics import _now, compute_digest
-from config import Config
-from db import connect, migrate
-from state_machine import DOWN, UNREACHABLE
+from wisp.core.analytics import _now, compute_digest
+from wisp.config import Config
+from wisp.database.client import connect, migrate
+from wisp.core.state_machine import DOWN, UNREACHABLE
 
 
 def iso(dt) -> str:

@@ -1,13 +1,13 @@
 """Acknowledge an outage from the terminal — the dev stand-in for the Telegram
 /ack button. Acking stops the escalation ladder (no re-alert, no owner escalation).
 
-    python ack.py                 # list currently-open outages
-    python ack.py <outage_id> <your name>
+    PYTHONPATH=src python -m wisp.egress.ack                 # list currently-open outages
+    PYTHONPATH=src python -m wisp.egress.ack <outage_id> <your name>
 """
 import sys
 
-from db import connect
-from notifiers import acknowledge_outage
+from wisp.database.client import connect
+from wisp.egress.notifiers import acknowledge_outage
 
 
 def _list_open() -> None:

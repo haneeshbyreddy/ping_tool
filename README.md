@@ -12,35 +12,81 @@ notes inside it.
 
 ## Quick start (no dependencies)
 
-```bash
-python db.py                 # create the database (WAL) + run migrations
-python seed.py --reset       # load a demo network (8 devices, real topology)
+**Fastest path:** `./run.sh --demo` — migrates, seeds a demo network with live
+outages, and runs both the worker and the dashboard on http://127.0.0.1:8000
+(Ctrl-C stops both). The rest of this section shows the pieces it orchestrates.
 
-# watch it run — simulated outages, flap suppression, alerts, recovery:
-python polling_daemon.py --interval 1 --cycles 13
+The `wisp` package lives under `src/` (a *src layout*) but nothing is installed —
+the two runtimes (`apps/daemon`, `apps/dashboard`) put `src/` on the path
+themselves; the admin CLIs use `PYTHONPATH=src python -m …`.
+
+```bash
+PYTHONPATH=src python -m wisp.database.client        # create DB (WAL) + run migrations
+PYTHONPATH=src python -m wisp.database.seed --reset  # load demo network (8 devices, real topology)
+
+# watch the worker run — simulated outages, flap suppression, alerts, recovery:
+python apps/daemon/main.py --interval 1 --cycles 13
 
 # operator views:
-python analytics.py status            # live board: who's up/down right now
-python analytics.py digest            # daily summary (uptime, power-vs-equipment, ₹ lost)
-python analytics.py devices           # per-device uptime
-python analytics.py offenders         # repeat-offender ranking
+PYTHONPATH=src python -m wisp.core.analytics status     # live board: who's up/down right now
+PYTHONPATH=src python -m wisp.core.analytics digest     # daily summary (uptime, power-vs-equipment, ₹)
+PYTHONPATH=src python -m wisp.core.analytics devices    # per-device uptime
+PYTHONPATH=src python -m wisp.core.analytics offenders  # repeat-offender ranking
 
-python ack.py                         # list open outages
-python ack.py <id> "Your Name"        # acknowledge one (stops escalation)
+PYTHONPATH=src python -m wisp.egress.ack                # list open outages
+PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (stops escalation)
 
-python -m unittest discover -s tests  # 20 tests
+# operator dashboard (browser UI over the same live DB):
+python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
+
+python -m unittest discover -s tests                 # 30 tests
 ```
 
-## How it works (the 5 layers)
+The dashboard is **fully self-contained** — Tailwind and the Material icons are
+vendored under `apps/dashboard/static/`, so it works on a site with no internet,
+no build step, and no third-party Python deps. The daemon and the web server are
+**decoupled runtimes** that run side by side (WAL SQLite lets the writer and the
+dashboard reader coexist); all local state lives under `data/` (git-ignored).
 
-| File | Layer | Does |
+From the **Nodes** page you can add / edit / delete devices (the whole inventory —
+IP, type, criticality, parent, power-ref, technician, customers, revenue) from the
+UI. Newly added or removed nodes start/stop being *monitored* after the next
+daemon restart (the engine snapshots the device set at startup).
+
+## Layout
+
+A *src layout*: the engine is an importable `wisp` package; the two runtimes that
+drive it live under `apps/`. Nothing is installed (see "no dependencies" above).
+
+```
+src/wisp/                 # the engine package (import as `wisp.*`)
+├── config.py             # frozen Config from env; CONFIG singleton
+├── core/                 # business logic — state_machine.py, analytics.py
+├── database/             # client.py (WAL conn + migration runner), seed.py (demo data)
+├── ingress/              # probers.py (ping; simulated | icmp)
+├── egress/               # notifiers.py (alert dispatch), ack.py
+└── server/               # services.py (JSON data + device CRUD), routes.py (HTTP layer)
+apps/
+├── daemon/main.py        # worker runtime — the 60s polling loop
+└── dashboard/            # web runtime — main.py + templates/ + static/{app.js,icons.js,vendor/}
+data/                     # wisp.db (+ wal/shm) — git-ignored
+migrations/               # 000N_*.sql, applied in order, tracked in schema_migrations
+tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
+docs/  assets/            # incident post-mortem template; original design mockup
+run.sh                    # one-shot setup + run for both runtimes
+```
+
+## How it works (the layers)
+
+| Module | Layer | Does |
 |---|---|---|
-| `probers.py` | 1 Monitoring | pings devices (`SimulatedProber` now / `IcmpProber` later) |
-| `polling_daemon.py` | 1 | 60s async poll loop; orchestrates everything |
-| `state_machine.py` | 2 Pattern | FSM + flap suppression, canary freeze, topology suppression, power-vs-link |
-| `notifiers.py` | 4/5 Alerting | routing, anti-spam, T+10/T+20 escalation ladder, ack |
-| `analytics.py` | 3 BI | status board, daily digest, uptime, offenders |
-| `db.py` / `migrations/` | 5 Memory | WAL SQLite, durable outages/alerts/escalations |
+| `wisp.ingress.probers` | 1 Monitoring | pings devices (`SimulatedProber` now / `IcmpProber` later) |
+| `apps.daemon.main` | 1 | 60s async poll loop; orchestrates everything |
+| `wisp.core.state_machine` | 2 Pattern | FSM + flap suppression, canary freeze, topology suppression, power-vs-link |
+| `wisp.egress.notifiers` / `wisp.egress.ack` | 4/5 Alerting | routing, anti-spam, T+10/T+20 escalation ladder, ack |
+| `wisp.core.analytics` | 3 BI | status board, daily digest, uptime, offenders |
+| `wisp.server.{services,routes}` + `apps.dashboard` | 6 Dashboard | JSON views + stdlib HTTP server for the self-contained UI |
+| `wisp.database.client` / `migrations/` | 5 Memory | WAL SQLite, durable outages/alerts/escalations |
 
 ## Key behaviors
 
@@ -69,6 +115,7 @@ Full list in `config.py`.
 ## Going live (Phase 7, needs the real network)
 
 1. `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`
-2. Replace the demo rows in `seed.py` with the real device inventory + topology.
+2. Enter the real device inventory + topology from the dashboard **Nodes** page
+   (or replace the demo rows in `src/wisp/database/seed.py`).
 3. `WISP_PROBER=icmp` (run with `sudo`/`cap_net_raw`), `WISP_NOTIFIER=ntfy` (or `telegram`).
 4. Tune thresholds against how the real links actually blip.

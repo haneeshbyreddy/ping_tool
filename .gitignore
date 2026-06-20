@@ -1,8 +1,10 @@
-# SQLite database + WAL/SHM sidecars (regenerate with `python db.py && python seed.py`)
-wisp.db
-wisp.db-wal
-wisp.db-shm
+# Local state lives under data/ (regenerate: see README). Whole dir is git-ignored
+# except a .gitkeep so the directory exists on a fresh clone.
+/data/*
+!/data/.gitkeep
 *.db
+*.db-wal
+*.db-shm
 
 # Python
 __pycache__/

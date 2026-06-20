@@ -6,11 +6,12 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from config import Config
-from probers import PingResult
-from state_machine import (
+from wisp.config import Config
+from wisp.ingress.probers import PingResult
+from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
     LINK_CAUSE,

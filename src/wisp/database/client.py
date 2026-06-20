@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from config import CONFIG, Config
+from wisp.config import CONFIG, Config
 
 
 def connect(cfg: Config = CONFIG) -> sqlite3.Connection:

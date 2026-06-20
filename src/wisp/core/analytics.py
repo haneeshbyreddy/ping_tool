@@ -4,10 +4,10 @@ Turns poll_results + outages into the operator-facing views from plan.md §4:
 the live status board, the daily digest (uptime %, power-vs-equipment split,
 revenue lost, worst site, repeat offenders), and per-device uptime.
 
-    python analytics.py status        # live board (default)
-    python analytics.py digest [hrs]  # summary over last N hours (default 24)
-    python analytics.py devices [hrs] # per-device uptime
-    python analytics.py offenders [hrs]
+    PYTHONPATH=src python -m wisp.core.analytics status        # live board (default)
+    PYTHONPATH=src python -m wisp.core.analytics digest [hrs]  # summary over last N hours
+    PYTHONPATH=src python -m wisp.core.analytics devices [hrs] # per-device uptime
+    PYTHONPATH=src python -m wisp.core.analytics offenders [hrs]
 
 All timestamps are normalised to naive-UTC on read so the ISO8601 poll/outage
 stamps and SQLite's `datetime('now')` ack stamps compare cleanly.
@@ -18,9 +18,9 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from config import CONFIG, Config
-from db import connect
-from state_machine import DEGRADED, DOWN, UNREACHABLE, UP
+from wisp.config import CONFIG, Config
+from wisp.database.client import connect
+from wisp.core.state_machine import DEGRADED, DOWN, UNREACHABLE, UP
 
 
 def _now() -> datetime:

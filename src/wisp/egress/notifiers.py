@@ -17,9 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from config import CONFIG, Config
-from db import connect, write_with_retry
-from state_machine import (
+from wisp.config import CONFIG, Config
+from wisp.database.client import connect, write_with_retry
+from wisp.core.state_machine import (
     DOWN,
     UNREACHABLE,
     Event,

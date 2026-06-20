@@ -2,8 +2,8 @@
 hardware. The topology mirrors a small rural WISP: a core gateway feeding two
 main towers, each with sectors, and one relay reached over a backhaul link.
 
-Run:  python seed.py            # seed only if empty
-      python seed.py --reset    # wipe demo data and reseed
+Run:  PYTHONPATH=src python -m wisp.database.seed            # seed only if empty
+      PYTHONPATH=src python -m wisp.database.seed --reset    # wipe demo data and reseed
 
 The IPs are documentation/TEST-NET-1 (192.0.2.0/24) addresses — never routed —
 so a real ICMP prober won't accidentally hit anything. The SimulatedProber
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 
-from db import connect, migrate, transaction
+from wisp.database.client import connect, migrate, transaction
 
 # id, name, ip, type, criticality, region, parent_id, power_ref_ip, tech_phone, customers, rev/hr
 DEVICES = [

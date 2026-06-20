@@ -19,7 +19,7 @@ import random
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from config import CONFIG, Config
+from wisp.config import CONFIG, Config
 
 
 @dataclass(frozen=True)

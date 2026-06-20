@@ -21,9 +21,9 @@ import sqlite3
 from collections import deque
 from dataclasses import dataclass
 
-from config import CONFIG, Config
-from db import connect
-from probers import PingResult
+from wisp.config import CONFIG, Config
+from wisp.database.client import connect
+from wisp.ingress.probers import PingResult
 
 # --- States -----------------------------------------------------------------
 UP = "UP"

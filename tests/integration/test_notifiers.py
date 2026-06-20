@@ -8,12 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from config import Config
-from db import connect, migrate
-from notifiers import AlertDispatcher, MockNotifier, acknowledge_outage
-from state_machine import (
+from wisp.config import Config
+from wisp.database.client import connect, migrate
+from wisp.egress.notifiers import AlertDispatcher, MockNotifier, acknowledge_outage
+from wisp.core.state_machine import (
     DOWN,
     POWER_CAUSE,
     UNREACHABLE,

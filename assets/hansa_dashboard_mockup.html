@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>HANSA Communications Network Dashboard</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "error": "#ffb4ab",
+                        "secondary": "#c6c6cf",
+                        "surface-container-highest": "#353434",
+                        "on-secondary-fixed-variant": "#45464e",
+                        "surface-dim": "#141313",
+                        "surface-container": "#201f1f",
+                        "primary-fixed-dim": "#c6c6c7",
+                        "on-primary-fixed": "#1a1c1c",
+                        "primary": "#ffffff",
+                        "surface-bright": "#3a3939",
+                        "surface-container-lowest": "#0e0e0e",
+                        "surface-container-low": "#1c1b1b",
+                        "on-background": "#e5e2e1",
+                        "on-surface-variant": "#c4c7c8",
+                        "tertiary-container": "#e2e2e2",
+                        "surface-tint": "#c6c6c7",
+                        "background": "#141313",
+                        "tertiary": "#ffffff",
+                        "primary-fixed": "#e2e2e2",
+                        "surface-variant": "#353434",
+                        "outline-variant": "#444748",
+                        "on-secondary-container": "#b4b4bd",
+                        "on-secondary": "#2f3037",
+                        "on-tertiary": "#2f3131",
+                        "secondary-fixed-dim": "#c6c6cf",
+                        "inverse-surface": "#e5e2e1",
+                        "error-container": "#93000a",
+                        "secondary-container": "#45464e",
+                        "on-surface": "#e5e2e1",
+                        "on-primary-container": "#636565",
+                        "inverse-primary": "#5d5f5f",
+                        "on-error": "#690005",
+                        "surface": "#141313",
+                        "on-error-container": "#ffdad6",
+                        "outline": "#8e9192",
+                        "on-tertiary-container": "#636565",
+                        "on-primary-fixed-variant": "#454747",
+                        "on-tertiary-fixed": "#1a1c1c",
+                        "primary-container": "#e2e2e2",
+                        "inverse-on-surface": "#313030",
+                        "tertiary-fixed": "#e2e2e2",
+                        "secondary-fixed": "#e2e1eb",
+                        "surface-container-high": "#2a2a2a",
+                        "tertiary-fixed-dim": "#c6c6c7",
+                        "on-primary": "#2f3131",
+                        "on-secondary-fixed": "#1a1b22",
+                        "on-tertiary-fixed-variant": "#454747"
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.375rem", // slightly less than rounded-md, but using defaults generally
+                        "md": "0.375rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    spacing: {
+                        "base": "4px",
+                        "section-gap": "32px",
+                        "component-padding-y": "8px",
+                        "component-padding-x": "12px",
+                        "gutter": "16px",
+                        "container-margin": "24px"
+                    },
+                    fontFamily: {
+                        "label-xs": ["Geist", "sans-serif"],
+                        "headline-lg": ["Geist", "sans-serif"],
+                        "headline-md": ["Geist", "sans-serif"],
+                        "display": ["Geist", "sans-serif"],
+                        "body-sm": ["Geist", "sans-serif"],
+                        "mono-data": ["Geist", "monospace"],
+                        "label-md": ["Geist", "sans-serif"],
+                        "body-lg": ["Geist", "sans-serif"]
+                    },
+                    fontSize: {
+                        "label-xs": ["11px", { "lineHeight": "1", "letterSpacing": "0.03em", "fontWeight": "600" }],
+                        "headline-lg": ["24px", { "lineHeight": "1.3", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+                        "headline-md": ["18px", { "lineHeight": "1.4", "fontWeight": "500" }],
+                        "display": ["32px", { "lineHeight": "1.2", "letterSpacing": "-0.02em", "fontWeight": "600" }],
+                        "body-sm": ["14px", { "lineHeight": "1.5", "fontWeight": "400" }],
+                        "mono-data": ["13px", { "lineHeight": "1", "letterSpacing": "0", "fontWeight": "400" }],
+                        "label-md": ["13px", { "lineHeight": "1", "letterSpacing": "0.01em", "fontWeight": "500" }],
+                        "body-lg": ["16px", { "lineHeight": "1.5", "fontWeight": "400" }]
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.4s ease-out forwards',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0', transform: 'translateY(10px)' },
+                            '100%': { opacity: '1', transform: 'translateY(0)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #141313; color: #ffffff; min-height: max(884px, 100dvh); font-family: 'Geist', sans-serif; }
+        .material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; }
+        ::-webkit-scrollbar { height: 6px; width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #444748; border-radius: 4px; }
+        .heatmap-grid {
+            display: grid;
+            grid-template-columns: repeat(15, minmax(0, 1fr));
+            gap: 2px;
+            width: 100%;
+        }
+        .heatmap-cell {
+            aspect-ratio: 1;
+            border-radius: 2px;
+            background-color: #201f1f;
+        }
+        .heatmap-cell.active-ok { background-color: #2a2a2a; }
+        .heatmap-cell.active-outage { background-color: #450a0a; }
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+    </style>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/history@5/umd/history.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-router@6.3.0/umd/react-router.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="antialiased min-h-screen flex flex-col font-body-sm text-body-sm bg-background text-on-background">
+    <div id="root" class="flex flex-col min-h-screen w-full"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { createRoot } = ReactDOM;
+        const { MemoryRouter, Routes, Route, Link, useNavigate, useLocation } = ReactRouterDOM;
+
+        // Shared Components
+        const TopAppBar = () => (
+            <header className="w-full top-0 sticky bg-background border-b border-outline-variant flex justify-between items-center px-container-margin py-component-padding-y z-40 h-16 md:h-[57px]">
+                <div className="flex items-center gap-2 cursor-pointer active:opacity-80 transition-colors">
+                    <span className="material-symbols-outlined text-primary text-[28px]" data-icon="hub">hub</span>
+                    <h1 className="font-headline-lg text-headline-lg font-bold tracking-tighter text-primary">HANSA</h1>
+                </div>
+                <div className="cursor-pointer active:opacity-80 transition-colors hover:bg-surface-container p-2 rounded-full flex items-center justify-center text-on-surface-variant w-10 h-10">
+                    <span className="material-symbols-outlined text-[28px]">account_circle</span>
+                </div>
+            </header>
+        );
+
+        const DesktopSidebar = () => {
+            const location = useLocation();
+            
+            const navItems = [
+                { path: '/', icon: 'dashboard', label: 'Dashboard' },
+                { path: '/nodes', icon: 'router', label: 'Nodes', fillIcon: true },
+                { path: '/logs', icon: 'terminal', label: 'Logs' },
+            ];
+
+            return (
+                <aside className="hidden md:flex flex-col w-[240px] shrink-0 border-r border-outline-variant pr-container-margin pl-4 pt-6 gap-2 sticky top-[57px] h-[calc(100vh-57px)] bg-surface-dim">
+                    <nav className="flex flex-col gap-2">
+                        {navItems.map(item => {
+                            const isActive = location.pathname === item.path;
+                            return (
+                                <Link key={item.path} to={item.path} 
+                                      className={`flex items-center gap-3 px-4 py-3 rounded-md transition-colors cursor-pointer group ${isActive ? 'bg-surface-container text-primary font-bold' : 'text-outline hover:text-on-surface hover:bg-surface-container-low'}`}>
+                                    <span className="material-symbols-outlined" style={isActive && item.fillIcon ? {fontVariationSettings: "'FILL' 1"} : {}}>{item.icon}</span>
+                                    <span className="font-label-md text-label-md">{item.label}</span>
+                                </Link>
+                            );
+                        })}
+                    </nav>
+                </aside>
+            );
+        };
+
+        const BottomNavBar = () => {
+            const location = useLocation();
+            
+            const navItems = [
+                { path: '/', icon: 'dashboard', label: 'Dashboard' },
+                { path: '/nodes', icon: 'router', label: 'Nodes', fillIcon: true },
+                { path: '/logs', icon: 'terminal', label: 'Logs' },
+            ];
+
+            return (
+                <nav className="md:hidden fixed bottom-0 w-full z-50 bg-background border-t border-outline-variant flex justify-around items-center h-16 px-2 pb-safe">
+                    {navItems.map(item => {
+                        const isActive = location.pathname === item.path;
+                        return (
+                            <Link key={item.path} to={item.path} 
+                                  className={`flex flex-col items-center justify-center w-16 h-full transition-all duration-200 active:scale-95 cursor-pointer ${isActive ? 'text-primary' : 'text-outline hover:text-on-surface'}`}>
+                                <div className={`flex items-center justify-center w-12 h-8 rounded-full mb-1 ${isActive ? 'bg-surface-container' : ''}`}>
+                                    <span className="material-symbols-outlined text-2xl" style={isActive && item.fillIcon ? {fontVariationSettings: "'FILL' 1"} : {}}>{item.icon}</span>
+                                </div>
+                                <span className={`font-label-xs text-label-xs ${isActive ? 'font-bold' : 'font-medium'}`}>{item.label}</span>
+                            </Link>
+                        );
+                    })}
+                </nav>
+            );
+        };
+
+        // Screen 1: Dashboard
+        const Dashboard = () => {
+            return (
+                <div className="flex flex-1 flex-col md:flex-row w-full max-w-[1920px] mx-auto pb-[80px] md:pb-0">
+                    <DesktopSidebar />
+                    <main className="flex-1 px-4 md:px-8 py-6 md:py-8 space-y-section-gap overflow-x-hidden">
+                        <section className="animate-fade-in" style={{ animationDelay: '0ms' }}>
+                            <div className="flex items-center gap-2 mb-4">
+                                <span className="material-symbols-outlined text-on-surface-variant" style={{ fontSize: '20px' }}>monitoring</span>
+                                <h2 className="font-headline-md text-headline-md text-primary">Network Analytics</h2>
+                            </div>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                <div className="col-span-2 border border-outline-variant bg-surface-container-low rounded-md p-4 flex flex-col justify-between relative overflow-hidden">
+                                    <div className="flex justify-between items-start mb-2 relative z-10">
+                                        <span className="font-label-md text-label-md text-on-surface-variant uppercase tracking-wider">System Health</span>
+                                        <span className="material-symbols-outlined text-primary" style={{ fontSize: '16px' }}>shield</span>
+                                    </div>
+                                    <div className="font-display text-display text-primary relative z-10">98.4%</div>
+                                    <div className="absolute bottom-0 left-0 w-full h-1/2 opacity-30 pointer-events-none">
+                                        <svg className="w-full h-full stroke-primary fill-none" preserveAspectRatio="none" strokeWidth="1.5" viewBox="0 0 100 30">
+                                            <path d="M0,25 L10,22 L20,28 L30,15 L40,18 L50,5 L60,12 L70,2 L80,10 L90,25 L100,15" vectorEffect="non-scaling-stroke"></path>
+                                        </svg>
+                                        <div className="absolute inset-0 bg-gradient-to-t from-surface-container-low to-transparent"></div>
+                                    </div>
+                                </div>
+                                <div className="border border-outline-variant bg-surface rounded-md p-4 flex flex-col justify-between">
+                                    <span className="font-label-md text-label-md text-on-surface-variant uppercase tracking-wider mb-2">Active Nodes</span>
+                                    <div className="flex items-baseline gap-1">
+                                        <span className="font-headline-lg text-headline-lg text-primary">42</span>
+                                        <span className="font-mono-data text-mono-data text-on-surface-variant">/45</span>
+                                    </div>
+                                </div>
+                                <div className="border border-outline-variant bg-surface rounded-md p-4 flex flex-col justify-between">
+                                    <div className="flex items-center gap-2 mb-2">
+                                        <span className="flex h-2 w-2 rounded-full bg-error"></span>
+                                        <span className="font-label-md text-label-md text-on-surface-variant uppercase tracking-wider">Outages</span>
+                                    </div>
+                                    <span className="font-headline-lg text-headline-lg text-error">3</span>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="animate-fade-in" style={{ animationDelay: '100ms' }}>
+                            <div className="flex items-center justify-between mb-4">
+                                <div className="flex items-center gap-2">
+                                    <span className="material-symbols-outlined text-error" style={{ fontSize: '20px' }}>warning</span>
+                                    <h2 className="font-headline-md text-headline-md text-primary">Active Outage Triage</h2>
+                                </div>
+                                <span className="font-label-xs text-label-xs bg-surface-container px-2 py-1 rounded-md border border-outline-variant">3 ITEMS</span>
+                            </div>
+                            <div className="flex flex-col gap-3">
+                                <div className="border border-outline-variant bg-surface rounded-md p-4 flex flex-col gap-4 border-l-4 border-l-amber-500 bg-amber-500/5">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <h3 className="font-body-lg text-body-lg text-primary font-medium">Village Hub A - Sector 2</h3>
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <span className="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-sm">UNASSIGNED</span>
+                                                <span className="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">
+                                                    <span className="material-symbols-outlined" style={{ fontSize: '14px' }}>schedule</span> Down 42m
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2 w-full md:w-1/2">
+                                        <select className="flex-1 bg-surface-container border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 focus:ring-1 focus:ring-primary focus:border-primary outline-none appearance-none">
+                                            <option value="">Assign Technician...</option>
+                                            <option value="tech1">Sarah K.</option>
+                                            <option value="tech2">Marcus J.</option>
+                                        </select>
+                                        <button className="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform flex items-center justify-center whitespace-nowrap">
+                                            Acknowledge
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="border border-outline-variant bg-surface rounded-md p-4 flex flex-col gap-2 border-l-4 border-l-blue-500 bg-blue-500/5">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <h3 className="font-body-lg text-body-lg text-primary font-medium">Hillside Repeater</h3>
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <span className="font-label-xs text-label-xs text-blue-400 border border-blue-400/30 bg-blue-400/10 px-2 py-0.5 rounded-sm">IN PROGRESS</span>
+                                                <span className="font-mono-data text-mono-data text-on-surface-variant">Tech: Sarah K.</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="border border-outline-variant bg-surface-container-low rounded-md p-4 flex flex-col gap-4 border-l-4 border-l-emerald-500 bg-emerald-500/5">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <h3 className="font-body-lg text-body-lg text-primary font-medium">River Valley Node</h3>
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <span className="font-label-xs text-label-xs text-emerald-400 border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 rounded-sm">PENDING POST-MORTEM</span>
+                                                <span className="font-mono-data text-mono-data text-on-surface-variant">Ping Recovered</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <form className="flex flex-col gap-3 border-t border-outline-variant pt-3 md:w-1/2">
+                                        <div className="space-y-1">
+                                            <label className="font-label-xs text-label-xs text-on-surface-variant">Root Cause</label>
+                                            <select className="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 focus:ring-1 focus:ring-primary focus:border-primary outline-none appearance-none" defaultValue="">
+                                                <option disabled value="">Select suspected cause</option>
+                                                <option value="power">Power Failure</option>
+                                                <option value="fiber">Fiber Cut</option>
+                                                <option value="hardware">Hardware Fault</option>
+                                            </select>
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="font-label-xs text-label-xs text-on-surface-variant">Resolution Details</label>
+                                            <textarea className="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 focus:ring-1 focus:ring-primary focus:border-primary outline-none resize-none" placeholder="Brief summary of fix..." rows="2"></textarea>
+                                        </div>
+                                        <button className="bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors mt-1 w-full" type="button">
+                                            Submit Log
+                                        </button>
+                                    </form>
+                                </div>
+                            </div>
+                        </section>
+                    </main>
+                </div>
+            );
+        };
+
+        // Screen 2: Nodes
+        const Nodes = () => {
+            const [heatmapCells, setHeatmapCells] = useState([]);
+
+            useEffect(() => {
+                const cells = [];
+                for (let i = 0; i < 30; i++) {
+                    const rand = Math.random();
+                    let stateClass = '';
+                    if (rand > 0.15) stateClass = 'active-ok';
+                    else if (rand > 0.05) stateClass = 'active-outage';
+                    cells.push(stateClass);
+                }
+                setHeatmapCells(cells);
+            }, []);
+
+            return (
+                <div className="flex flex-1 flex-col md:flex-row w-full max-w-[1920px] mx-auto pb-[80px] md:pb-0">
+                    <DesktopSidebar />
+                    <div className="flex-1 w-full max-w-5xl mx-auto flex flex-col gap-section-gap px-4 md:px-8 py-6 md:py-8">
+                        <header>
+                            <h2 className="font-display text-display text-primary mb-2">Nodes Management</h2>
+                            <p className="font-body-lg text-body-lg text-on-surface-variant">Monitor network health and node status across the infrastructure.</p>
+                        </header>
+
+                        <section className="bg-surface border border-outline-variant rounded-md p-4 md:p-container-margin">
+                            <div className="flex flex-col md:flex-row md:justify-between md:items-center mb-4 gap-2">
+                                <h3 className="font-headline-md text-headline-md text-primary">Network Health (30 Days)</h3>
+                                <div className="flex items-center gap-4 text-on-surface-variant font-label-xs text-label-xs">
+                                    <div className="flex items-center gap-1.5">
+                                        <div className="w-3 h-3 bg-surface-container rounded-[2px]"></div> <span>No Data</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                        <div className="w-3 h-3 bg-surface-container-high rounded-[2px]"></div> <span>Operational</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                        <div className="w-3 h-3 bg-[#450a0a] rounded-[2px]"></div> <span>Outage</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="w-full">
+                                <div className="heatmap-grid">
+                                    {heatmapCells.map((cls, i) => (
+                                        <div key={i} className={`heatmap-cell ${cls}`}></div>
+                                    ))}
+                                </div>
+                                <div className="flex justify-between mt-3 text-on-surface-variant font-label-xs text-label-xs uppercase tracking-widest">
+                                    <span>30 Days Ago</span>
+                                    <span>Today</span>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="flex flex-col gap-4">
+                            <div className="flex justify-between items-center">
+                                <h3 className="font-headline-md text-headline-md text-primary">Active Nodes</h3>
+                                <button className="bg-primary text-surface-container-lowest font-label-md text-label-md px-3 py-1.5 rounded-md flex items-center gap-1 hover:bg-tertiary-fixed transition-colors">
+                                    <span className="material-symbols-outlined text-[16px]" data-icon="add">add</span> New Node
+                                </button>
+                            </div>
+                            <div className="grid grid-cols-1 gap-2">
+                                <div className="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3 hover:bg-surface-container-low transition-colors cursor-pointer group">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                        <div className="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center shrink-0">
+                                            <span className="material-symbols-outlined text-primary text-[18px]">cell_tower</span>
+                                        </div>
+                                        <div className="min-w-0 truncate">
+                                            <h4 className="font-label-md text-label-md text-primary group-hover:text-tertiary-fixed transition-colors truncate">Village Hub A</h4>
+                                            <p className="font-mono-data text-mono-data text-on-surface-variant mt-0.5 truncate text-[11px]">NDE-001 • 192.168.10.1</p>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-3 shrink-0">
+                                        <div className="text-right hidden sm:block">
+                                            <p className="font-mono-data text-mono-data text-primary">99.9%</p>
+                                        </div>
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="w-2 h-2 rounded-full bg-primary" style={{ boxShadow: '0 0 4px #ffffff' }}></span>
+                                            <span className="font-label-md text-label-md text-primary hidden md:inline">Operational</span>
+                                        </div>
+                                        <span className="material-symbols-outlined text-outline group-hover:text-primary transition-colors text-[20px]">chevron_right</span>
+                                    </div>
+                                </div>
+
+                                <div className="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3 hover:bg-surface-container-low transition-colors cursor-pointer group">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                        <div className="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center shrink-0">
+                                            <span className="material-symbols-outlined text-primary text-[18px]">cell_tower</span>
+                                        </div>
+                                        <div className="min-w-0 truncate">
+                                            <h4 className="font-label-md text-label-md text-primary group-hover:text-tertiary-fixed transition-colors truncate">Hillside Repeater</h4>
+                                            <p className="font-mono-data text-mono-data text-on-surface-variant mt-0.5 truncate text-[11px]">NDE-042 • 192.168.10.42</p>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-3 shrink-0">
+                                        <div className="text-right hidden sm:block">
+                                            <p className="font-mono-data text-mono-data text-error">94.2%</p>
+                                        </div>
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="w-2 h-2 rounded-full bg-error" style={{ boxShadow: '0 0 4px #ffb4ab' }}></span>
+                                            <span className="font-label-md text-label-md text-error hidden md:inline">Warning</span>
+                                        </div>
+                                        <span className="material-symbols-outlined text-outline group-hover:text-primary transition-colors text-[20px]">chevron_right</span>
+                                    </div>
+                                </div>
+
+                                <div className="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3 hover:bg-surface-container-low transition-colors cursor-pointer group opacity-60">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                        <div className="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center shrink-0">
+                                            <span className="material-symbols-outlined text-outline text-[18px]">router</span>
+                                        </div>
+                                        <div className="min-w-0 truncate">
+                                            <h4 className="font-label-md text-label-md text-outline group-hover:text-primary transition-colors truncate">Valley Gateway</h4>
+                                            <p className="font-mono-data text-mono-data text-outline-variant mt-0.5 truncate text-[11px]">NDE-018 • 192.168.10.18</p>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-3 shrink-0">
+                                        <div className="text-right hidden sm:block">
+                                            <p className="font-mono-data text-mono-data text-outline">0.0%</p>
+                                        </div>
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="w-2 h-2 rounded-full bg-outline"></span>
+                                            <span className="font-label-md text-label-md text-outline hidden md:inline">Offline</span>
+                                        </div>
+                                        <span className="material-symbols-outlined text-outline group-hover:text-primary transition-colors text-[20px]">chevron_right</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            );
+        };
+
+        // Screen 3: Logs
+        const Logs = () => {
+            return (
+                <div className="flex flex-1 flex-col md:flex-row w-full max-w-[1920px] mx-auto pb-[80px] md:pb-0">
+                    <DesktopSidebar />
+                    <main className="flex-1 w-full px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6 overflow-hidden">
+                        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                            <div>
+                                <h1 className="font-display text-display text-primary">Historical Logs</h1>
+                                <p className="font-body-sm text-body-sm text-on-surface-variant mt-1">Review past network incidents, anomalies, and systemic events.</p>
+                            </div>
+                            <div className="flex items-center gap-3 w-full md:w-auto">
+                                <div className="relative w-full md:w-64">
+                                    <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline text-[18px]">search</span>
+                                    <input className="w-full bg-surface border border-outline-variant rounded-md py-2 pl-9 pr-3 text-body-sm font-body-sm text-on-surface placeholder-outline focus:border-primary focus:ring-0 focus:outline-none transition-colors" placeholder="Search logs..." type="text" />
+                                </div>
+                                <button className="flex items-center justify-center gap-2 px-4 py-2 bg-transparent border border-outline-variant rounded-md text-on-surface hover:bg-surface-container transition-colors shrink-0">
+                                    <span className="material-symbols-outlined text-[18px]">filter_list</span>
+                                    <span className="font-label-md text-label-md hidden md:inline">Filter</span>
+                                </button>
+                                <button className="flex items-center justify-center gap-2 px-4 py-2 bg-primary text-surface-container-lowest rounded-md hover:bg-tertiary-fixed transition-colors shrink-0">
+                                    <span className="material-symbols-outlined text-[18px]">download</span>
+                                    <span className="font-label-md text-label-md hidden md:inline">Export</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-label-xs text-label-xs text-on-surface-variant uppercase tracking-wider mr-2">Active Filters:</span>
+                            <div className="flex items-center gap-1 px-2 py-1 bg-surface-container border border-outline-variant rounded-full text-on-surface font-label-xs text-label-xs">
+                                Severity: Critical
+                                <span className="material-symbols-outlined text-[14px] cursor-pointer hover:text-primary">close</span>
+                            </div>
+                            <div className="flex items-center gap-1 px-2 py-1 bg-surface-container border border-outline-variant rounded-full text-on-surface font-label-xs text-label-xs">
+                                Region: US-East
+                                <span className="material-symbols-outlined text-[14px] cursor-pointer hover:text-primary">close</span>
+                            </div>
+                            <button className="text-primary hover:underline font-label-xs text-label-xs ml-2">Clear All</button>
+                        </div>
+
+                        <div className="bg-surface-dim border border-outline-variant rounded-md overflow-hidden flex flex-col flex-1 min-h-[500px]">
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left border-collapse min-w-[800px]">
+                                    <thead>
+                                        <tr className="bg-surface-container border-b border-outline-variant text-on-surface-variant font-label-xs text-label-xs uppercase tracking-wider">
+                                            <th className="px-4 py-3 font-semibold w-12 text-center">
+                                                <input className="rounded bg-surface border-outline-variant text-primary focus:ring-primary focus:ring-offset-background" type="checkbox" />
+                                            </th>
+                                            <th className="px-4 py-3 font-semibold cursor-pointer hover:text-primary group">
+                                                <div className="flex items-center gap-1">
+                                                    Timestamp <span className="material-symbols-outlined text-[14px] opacity-0 group-hover:opacity-100 transition-opacity">arrow_downward</span>
+                                                </div>
+                                            </th>
+                                            <th className="px-4 py-3 font-semibold">Incident ID</th>
+                                            <th className="px-4 py-3 font-semibold">Location / Node</th>
+                                            <th className="px-4 py-3 font-semibold">Severity</th>
+                                            <th className="px-4 py-3 font-semibold">Duration</th>
+                                            <th className="px-4 py-3 font-semibold">Root Cause</th>
+                                            <th className="px-4 py-3 font-semibold text-right">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="font-mono-data text-mono-data divide-y divide-surface-container-high">
+                                        <tr className="hover:bg-surface-container-high/50 transition-colors group">
+                                            <td className="px-4 py-3 text-center"><input className="rounded bg-surface border-outline-variant text-primary focus:ring-primary focus:ring-offset-background" type="checkbox" /></td>
+                                            <td className="px-4 py-3 text-on-surface">2023-10-27 14:32:01 UTC</td>
+                                            <td className="px-4 py-3 text-primary">INC-8492-A</td>
+                                            <td className="px-4 py-3 text-on-surface-variant">US-East-1 / Node-Alpha-04</td>
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-center gap-2">
+                                                    <div className="w-2 h-2 rounded-full bg-error"></div>
+                                                    <span className="text-error">Critical</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 text-on-surface-variant">42m 15s</td>
+                                            <td className="px-4 py-3 text-on-surface truncate max-w-[200px]">BGP Route Flap causing cascade failure</td>
+                                            <td className="px-4 py-3 text-right">
+                                                <button className="text-outline hover:text-primary transition-colors opacity-0 group-hover:opacity-100 p-1">
+                                                    <span className="material-symbols-outlined text-[18px]">more_vert</span>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                        <tr className="hover:bg-surface-container-high/50 transition-colors group">
+                                            <td className="px-4 py-3 text-center"><input className="rounded bg-surface border-outline-variant text-primary focus:ring-primary focus:ring-offset-background" type="checkbox" /></td>
+                                            <td className="px-4 py-3 text-on-surface">2023-10-27 11:15:44 UTC</td>
+                                            <td className="px-4 py-3 text-primary">INC-8491-B</td>
+                                            <td className="px-4 py-3 text-on-surface-variant">EU-Central / Edge-Relay-12</td>
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-center gap-2">
+                                                    <div className="w-2 h-2 rounded-full bg-amber-500"></div>
+                                                    <span className="text-amber-500">Warning</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 text-on-surface-variant">05m 02s</td>
+                                            <td className="px-4 py-3 text-on-surface truncate max-w-[200px]">High latency spike on primary uplink</td>
+                                            <td className="px-4 py-3 text-right">
+                                                <button className="text-outline hover:text-primary transition-colors opacity-0 group-hover:opacity-100 p-1">
+                                                    <span className="material-symbols-outlined text-[18px]">more_vert</span>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                        <tr className="hover:bg-surface-container-high/50 transition-colors group">
+                                            <td className="px-4 py-3 text-center"><input className="rounded bg-surface border-outline-variant text-primary focus:ring-primary focus:ring-offset-background" type="checkbox" /></td>
+                                            <td className="px-4 py-3 text-on-surface">2023-10-26 23:45:10 UTC</td>
+                                            <td className="px-4 py-3 text-primary">INC-8490-C</td>
+                                            <td className="px-4 py-3 text-on-surface-variant">AP-South-2 / Core-Switch-01</td>
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-center gap-2">
+                                                    <div className="w-2 h-2 rounded-full bg-error"></div>
+                                                    <span className="text-error">Critical</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 text-on-surface-variant">1h 12m 45s</td>
+                                            <td className="px-4 py-3 text-on-surface truncate max-w-[200px]">Hardware failure: Power supply A</td>
+                                            <td className="px-4 py-3 text-right">
+                                                <button className="text-outline hover:text-primary transition-colors opacity-0 group-hover:opacity-100 p-1">
+                                                    <span className="material-symbols-outlined text-[18px]">more_vert</span>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div className="mt-auto border-t border-outline-variant bg-surface-container-low px-4 py-3 flex items-center justify-between">
+                                <span className="font-body-sm text-body-sm text-on-surface-variant">Showing 1 to 3 of 2,492 entries</span>
+                                <div className="flex items-center gap-2">
+                                    <button className="p-1 text-outline hover:text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors" disabled>
+                                        <span className="material-symbols-outlined text-[20px]">chevron_left</span>
+                                    </button>
+                                    <div className="flex items-center gap-1">
+                                        <button className="w-8 h-8 rounded-md bg-surface-variant border border-outline text-primary font-label-md text-label-md flex items-center justify-center">1</button>
+                                        <button className="w-8 h-8 rounded-md bg-transparent hover:bg-surface-container text-on-surface-variant font-label-md text-label-md flex items-center justify-center transition-colors">2</button>
+                                        <button className="w-8 h-8 rounded-md bg-transparent hover:bg-surface-container text-on-surface-variant font-label-md text-label-md flex items-center justify-center transition-colors">3</button>
+                                        <span className="text-outline mx-1">...</span>
+                                        <button className="w-8 h-8 rounded-md bg-transparent hover:bg-surface-container text-on-surface-variant font-label-md text-label-md flex items-center justify-center transition-colors">50</button>
+                                    </div>
+                                    <button className="p-1 text-outline hover:text-primary transition-colors">
+                                        <span className="material-symbols-outlined text-[20px]">chevron_right</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            );
+        };
+
+        const App = () => {
+            return (
+                <MemoryRouter>
+                    <div className="flex flex-col min-h-screen">
+                        <TopAppBar />
+                        <Routes>
+                            <Route path="/" element={<Dashboard />} />
+                            <Route path="/nodes" element={<Nodes />} />
+                            <Route path="/logs" element={<Logs />} />
+                        </Routes>
+                        <BottomNavBar />
+                    </div>
+                </MemoryRouter>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

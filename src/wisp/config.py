@@ -12,7 +12,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+# This file lives at <repo>/src/wisp/config.py, so the repo root is three up.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
 
 
 def _env(name: str, default: str) -> str:
@@ -33,7 +35,7 @@ def _env_float(name: str, default: float) -> float:
 class Config:
     # --- Storage -------------------------------------------------------------
     db_path: Path = field(
-        default_factory=lambda: Path(_env("WISP_DB", str(PROJECT_ROOT / "wisp.db")))
+        default_factory=lambda: Path(_env("WISP_DB", str(DATA_DIR / "wisp.db")))
     )
     migrations_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "migrations")
     # SQLite waits this long for a competing writer before raising "database is locked".
