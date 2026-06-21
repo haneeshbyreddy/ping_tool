@@ -3,6 +3,7 @@
 All tunables live here as a single frozen dataclass loaded from the environment
 with sensible defaults, so the system runs out-of-the-box with zero setup and is
 reconfigured purely through env vars (no code edits) when hardware/credentials arrive.
+Change a value by exporting the env var and restarting the daemon/dashboard.
 
 Nothing in here imports the rest of the project, so it is safe to import anywhere.
 """
@@ -45,6 +46,14 @@ class Config:
     poll_interval_s: int = field(default_factory=lambda: _env_int("WISP_POLL_INTERVAL_S", 60))
     pings_per_poll: int = field(default_factory=lambda: _env_int("WISP_PINGS_PER_POLL", 5))
 
+    # --- Monitor watchdog (dead-monitor alarm) -------------------------------
+    # If the newest poll is older than this, the monitor itself is considered
+    # down and the watchdog pages the owner. 0 = auto (max(180s, 3 poll cycles)),
+    # so a slow box that misses one cycle doesn't false-alarm.
+    monitor_stale_after_s: int = field(
+        default_factory=lambda: _env_int("WISP_MONITOR_STALE_S", 0)
+    )
+
     # --- State-machine thresholds (see plan.md §"State machine") -------------
     latency_threshold_ms: float = field(
         default_factory=lambda: _env_float("WISP_LATENCY_MS", 150.0)
@@ -70,15 +79,41 @@ class Config:
     # (except the explicit escalation steps above).
     alert_dedupe_min: int = field(default_factory=lambda: _env_int("WISP_ALERT_DEDUPE_MIN", 10))
 
-    # --- Provider selection (mock-first; swap to real later) -----------------
-    # prober: 'simulated' | 'icmp'      notifier: 'mock' | 'ntfy' | 'telegram'
-    prober: str = field(default_factory=lambda: _env("WISP_PROBER", "simulated").lower())
-    notifier: str = field(default_factory=lambda: _env("WISP_NOTIFIER", "mock").lower())
+    # --- Providers (real adapters: ICMP ping + ntfy push) --------------------
+    prober: str = field(default_factory=lambda: _env("WISP_PROBER", "icmp").lower())
+    notifier: str = field(default_factory=lambda: _env("WISP_NOTIFIER", "ntfy").lower())
 
     # --- Channel credentials (only needed once real notifiers are selected) --
     ntfy_base_url: str = field(default_factory=lambda: _env("WISP_NTFY_URL", "https://ntfy.sh"))
-    telegram_bot_token: str = field(default_factory=lambda: _env("WISP_TG_TOKEN", ""))
-    owner_telegram_chat_id: str = field(default_factory=lambda: _env("WISP_OWNER_CHAT", ""))
+    # A page must not be silently lost to a transient blip: retry a failed send
+    # this many times with exponential backoff (only network/5xx errors retry;
+    # a 4xx is a config error and fails fast). Kept short — it runs outside any DB txn.
+    ntfy_retries: int = field(default_factory=lambda: _env_int("WISP_NTFY_RETRIES", 3))
+    ntfy_retry_backoff_s: float = field(
+        default_factory=lambda: _env_float("WISP_NTFY_RETRY_BACKOFF_S", 0.5)
+    )
+
+    # --- Role channels -------------------------------------------------------
+    # Three fixed ntfy topics, one per role. Each person subscribes to the topic
+    # that matches their role (owner / operator / tech) — there is no per-person
+    # routing key. On public ntfy.sh pick unguessable names (anyone who knows a
+    # topic can read it); override these env vars or self-host with auth.
+    ntfy_topic_owner: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_OWNER", "hansa-owner"))
+    ntfy_topic_operator: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_OPERATOR", "hansa-operator"))
+    ntfy_topic_tech: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_TECH", "hansa-tech"))
+
+    # --- Organization / locale (display) -------------------------------------
+    org_name: str = field(default_factory=lambda: _env("WISP_ORG_NAME", "HANSA Communications"))
+    timezone: str = field(default_factory=lambda: _env("WISP_TIMEZONE", "Asia/Kolkata"))
+
+    # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
+    session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
+
+    def stale_threshold_s(self) -> int:
+        """Seconds without a fresh poll before the monitor is 'down'. Honours an
+        explicit override, else auto-derives a forgiving floor from the cadence so
+        one slow cycle never trips the alarm."""
+        return self.monitor_stale_after_s or max(180, 3 * self.poll_interval_s)
 
     def __str__(self) -> str:  # friendly one-liner for startup logs
         return (

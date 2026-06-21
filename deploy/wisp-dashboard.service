@@ -1,0 +1,36 @@
+# WISP Dashboard — operator web UI (Phase 8.15).
+#
+# Serves the dashboard + control-plane API. Pure stdlib, no build step. On the office
+# LAN bind to 0.0.0.0 so other machines can reach it; keep it OFF the public internet
+# (plain HTTP + PIN — see plan §8.2 security note).
+#
+#   sudo cp deploy/wisp-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-dashboard
+#
+[Unit]
+Description=WISP Dashboard (web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wisp
+# Use the venv python so the "Send test alert" button (httpx → ntfy) works:
+ExecStart=/opt/wisp/.venv/bin/python /opt/wisp/apps/dashboard/main.py --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# Role alert channels (ntfy topics) — MUST match wisp-monitor.service exactly, or the
+# "Send test" button and the Settings → Alert channels panel show different topics than
+# the daemon actually pages.
+Environment=WISP_NTFY_TOPIC_OWNER=hansa-owner-35f027e3a8
+Environment=WISP_NTFY_TOPIC_OPERATOR=hansa-ops-428fe896b9
+Environment=WISP_NTFY_TOPIC_TECH=hansa-tech-87e2965d5e
+# Optional first-run convenience: seed the PIN if none is set yet (the UI's first-run
+# screen does this too). Remove after first boot.
+# Environment=WISP_DASHBOARD_PIN=1234
+# User=wisp
+# Group=wisp
+
+[Install]
+WantedBy=multi-user.target

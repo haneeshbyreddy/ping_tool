@@ -14,7 +14,8 @@ from the polling daemon: the daemon writes, this only reads (and the few writes
 go through the same `write_with_retry` path), so they run side by side against
 the WAL database.
 
-Pure stdlib; safe to run on a laptop with the simulated prober + mock notifier.
+The dashboard is pure stdlib; the daemon it runs alongside uses the real ICMP
+prober + ntfy notifier.
 """
 from __future__ import annotations
 
@@ -24,8 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from wisp.server import services
+from wisp.server import services, auth
 from wisp.config import CONFIG, PROJECT_ROOT
+from wisp.database.client import connect, migrate
 
 DASHBOARD_ROOT = PROJECT_ROOT / "apps" / "dashboard"
 STATIC_ROOT = DASHBOARD_ROOT / "static"
@@ -43,7 +45,19 @@ _CONTENT_TYPES = {
 }
 
 _OUTAGE_ACTION = re.compile(r"^/api/outages/(\d+)/(ack|postmortem)$")
+_OUTAGE_ITEM = re.compile(r"^/api/outages/(\d+)$")
 _DEVICE_ITEM = re.compile(r"^/api/devices/(\d+)$")
+_WORKER_ITEM = re.compile(r"^/api/workers/(\d+)$")
+
+# API endpoints reachable without a valid session (the login flow itself). Every
+# other /api/* path requires the wisp_session cookie; static assets are always
+# served (the SPA renders its own PIN gate when /api/* returns 401).
+_PUBLIC_API = {
+    ("GET", "/api/auth/status"),
+    ("POST", "/api/login"),
+    ("POST", "/api/auth/setup"),
+    ("POST", "/api/logout"),
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -51,12 +65,14 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # -- response helpers ----------------------------------------------------
-    def _send_json(self, payload, status: int = 200) -> None:
+    def _send_json(self, payload, status: int = 200, *, set_cookie: str | None = None) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -72,18 +88,110 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status)
 
+    # -- auth ----------------------------------------------------------------
+    def _authed(self) -> bool:
+        token = auth.cookie_token(self.headers.get("Cookie"))
+        return auth.verify_session(token, cfg=CONFIG, timeout_h=CONFIG.session_timeout_h)
+
+    def _guard_api(self, method: str, path: str) -> bool:
+        """Allow login-flow endpoints; gate everything else on a valid session."""
+        if (method, path) in _PUBLIC_API:
+            return True
+        if self._authed():
+            return True
+        self._error(401, "authentication required")
+        return False
+
+    def _login(self) -> None:
+        ip = self.client_address[0]
+        wait = auth.THROTTLE.retry_after(ip)
+        if wait > 0:
+            return self._error(429, f"too many attempts — wait {int(wait) + 1}s")
+        body = self._read_json_body() or {}
+        with connect(CONFIG) as conn:
+            ok = auth.verify_pin(conn, str(body.get("pin", "")))
+        if not ok:
+            auth.THROTTLE.fail(ip)
+            return self._error(401, "incorrect PIN")
+        auth.THROTTLE.reset(ip)
+        token = auth.issue_session(CONFIG)
+        self._send_json({"ok": True}, set_cookie=auth.session_cookie(
+            token, max_age=CONFIG.session_timeout_h * 3600))
+
+    def _setup_pin(self) -> None:
+        """First-run: set the PIN when none exists yet, then sign the operator in."""
+        body = self._read_json_body() or {}
+        with connect(CONFIG) as conn:
+            if auth.pin_is_set(conn):
+                return self._error(409, "a PIN is already set")
+            try:
+                auth.set_pin(conn, str(body.get("pin", "")), by="first-run")
+            except auth.PinError as exc:
+                return self._error(422, str(exc))
+        token = auth.issue_session(CONFIG)
+        self._send_json({"ok": True}, set_cookie=auth.session_cookie(
+            token, max_age=CONFIG.session_timeout_h * 3600))
+
+    def _change_pin(self) -> None:
+        body = self._read_json_body() or {}
+        with connect(CONFIG) as conn:
+            if not auth.verify_pin(conn, str(body.get("old", ""))):
+                return self._error(422, "current PIN is incorrect")
+            try:
+                auth.set_pin(conn, str(body.get("new", "")), by="operator")
+            except auth.PinError as exc:
+                return self._error(422, str(exc))
+        self._send_json({"ok": True})
+
+    def _logout(self) -> None:
+        self._send_json({"ok": True}, set_cookie=auth.clear_cookie())
+
     # -- GET -----------------------------------------------------------------
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/api/"):
+            if not self._guard_api("GET", path):
+                return
+            if path == "/api/backup":
+                return self._send_backup()
             return self._handle_api_get(path, parse_qs(parsed.query))
         return self._serve_static(path)
+
+    def _send_backup(self) -> None:
+        try:
+            blob = services.create_backup(CONFIG)
+        except Exception as exc:
+            return self._error(500, f"backup failed: {exc}")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-sqlite3")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{services.backup_filename()}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(blob)
 
     def _handle_api_get(self, path: str, qs: dict) -> None:
         def _one(name, default=""):
             return qs.get(name, [default])[0]
         try:
+            if path == "/api/auth/status":
+                with connect(CONFIG) as conn:
+                    pin_set = auth.pin_is_set(conn)
+                # org/locale branding is public so the login screen + header can show it
+                return self._send_json({
+                    "pin_set": pin_set,
+                    "authed": self._authed(),
+                    "org_name": CONFIG.org_name,
+                    "timezone": CONFIG.timezone,
+                    "ntfy_base_url": CONFIG.ntfy_base_url,
+                    "channels": {
+                        "owner": CONFIG.ntfy_topic_owner,
+                        "operator": CONFIG.ntfy_topic_operator,
+                        "tech": CONFIG.ntfy_topic_tech,
+                    },
+                })
             if path == "/api/summary":
                 return self._send_json(services.system_summary(CONFIG))
             if path == "/api/triage":
@@ -96,8 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/heatmap":
                 days = int(_one("days", "30") or 30)
                 return self._send_json(services.network_heatmap(CONFIG, days))
-            if path == "/api/technicians":
-                return self._send_json(services.technicians(CONFIG))
+            if path == "/api/workers":
+                return self._send_json(services.list_workers(CONFIG))
             if path == "/api/devices":
                 return self._send_json(services.list_devices(CONFIG))
             if path == "/api/logs":
@@ -137,6 +245,19 @@ class Handler(BaseHTTPRequestHandler):
     # -- POST ----------------------------------------------------------------
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        self._raw_body = None
+        self._consume_body()          # drain before any early reply (keep-alive safety)
+        if not self._guard_api("POST", path):
+            return
+        # Auth-flow endpoints read their own (possibly empty) body and manage cookies.
+        if path == "/api/login":
+            return self._login()
+        if path == "/api/auth/setup":
+            return self._setup_pin()
+        if path == "/api/logout":
+            return self._logout()
+        if path == "/api/settings/pin":
+            return self._change_pin()
         body = self._read_json_body()
         if body is None:
             return self._error(400, "invalid JSON body")
@@ -144,6 +265,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/devices":  # create a node
                 new_id = services.create_device(body, CONFIG)
                 return self._send_json({"ok": True, "id": new_id}, 201)
+            if path == "/api/workers":  # create a worker
+                new_id = services.create_worker(body, CONFIG)
+                return self._send_json({"ok": True, "id": new_id}, 201)
+            if path == "/api/channels/test":   # send a test alert (go-live check)
+                return self._send_json(services.test_channel(body.get("target", "owner"), CONFIG))
 
             m = _OUTAGE_ACTION.match(path)
             if not m:
@@ -163,43 +289,83 @@ class Handler(BaseHTTPRequestHandler):
                     CONFIG,
                 )
                 return self._send_json({"ok": ok}, 200 if ok else 409)
-        except services.DeviceError as exc:    # validation problem
+        except services.LastOwnerError as exc:  # last-owner rule → conflict
+            return self._error(409, str(exc))
+        except (services.DeviceError, services.WorkerError) as exc:  # validation
             return self._error(422, str(exc))
         except Exception as exc:          # never 500 silently — surface a JSON error
             return self._error(500, str(exc))
 
     # -- PUT (edit a node) ---------------------------------------------------
     def do_PUT(self) -> None:
-        m = _DEVICE_ITEM.match(urlparse(self.path).path)
-        if not m:
-            return self._error(404, "no such endpoint")
+        path = urlparse(self.path).path
+        self._raw_body = None
+        self._consume_body()
+        if not self._guard_api("PUT", path):
+            return
         body = self._read_json_body()
         if body is None:
             return self._error(400, "invalid JSON body")
         try:
+            mw = _WORKER_ITEM.match(path)
+            if mw:
+                ok = services.update_worker(int(mw.group(1)), body, CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 404)
+            m = _DEVICE_ITEM.match(path)
+            if not m:
+                return self._error(404, "no such endpoint")
             ok = services.update_device(int(m.group(1)), body, CONFIG)
             return self._send_json({"ok": ok}, 200 if ok else 404)
-        except services.DeviceError as exc:
+        except services.LastOwnerError as exc:
+            return self._error(409, str(exc))
+        except (services.DeviceError, services.WorkerError) as exc:
             return self._error(422, str(exc))
         except Exception as exc:
             return self._error(500, str(exc))
 
     # -- DELETE (remove a node) ----------------------------------------------
     def do_DELETE(self) -> None:
-        m = _DEVICE_ITEM.match(urlparse(self.path).path)
-        if not m:
-            return self._error(404, "no such endpoint")
+        path = urlparse(self.path).path
+        self._raw_body = None
+        self._consume_body()
+        if not self._guard_api("DELETE", path):
+            return
         try:
+            mw = _WORKER_ITEM.match(path)
+            if mw:
+                res = services.delete_worker(int(mw.group(1)), CONFIG)
+                return self._send_json(res, 200 if res.get("ok") else 404)
+            mo = _OUTAGE_ITEM.match(path)
+            if mo:  # dismiss a recovered outage without logging a post-mortem
+                ok = services.dismiss_outage(int(mo.group(1)), CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 409)
+            m = _DEVICE_ITEM.match(path)
+            if not m:
+                return self._error(404, "no such endpoint")
             res = services.delete_device(int(m.group(1)), CONFIG)
             return self._send_json(res, 200 if res.get("ok") else 409)
+        except services.LastOwnerError as exc:
+            return self._error(409, str(exc))
         except Exception as exc:
             return self._error(500, str(exc))
 
-    def _read_json_body(self):
+    def _consume_body(self) -> bytes:
+        """Read the request body exactly once, caching it. Draining it is mandatory
+        on HTTP/1.1 keep-alive: if a handler replies (e.g. 401/429) without reading
+        the body, the leftover bytes get parsed as the next request and corrupt the
+        connection. Verb handlers call this up front so every code path consumes it."""
+        cached = getattr(self, "_raw_body", None)
+        if cached is not None:
+            return cached
         length = int(self.headers.get("Content-Length", "0") or 0)
-        if not length:
+        body = self.rfile.read(length) if length else b""
+        self._raw_body = body
+        return body
+
+    def _read_json_body(self):
+        raw = self._consume_body()
+        if not raw:
             return {}
-        raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -210,9 +376,27 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[web] {self.address_string()} {format % args}")
 
 
+def _seed_pin_from_env() -> None:
+    """Bootstrap convenience: if WISP_DASHBOARD_PIN is exported and no PIN exists
+    yet, seed it so a fresh deploy isn't locked out before the first-run screen.
+    Otherwise the operator sets the PIN from the browser on first visit."""
+    import os
+    pin = os.environ.get("WISP_DASHBOARD_PIN", "").strip()
+    if not pin:
+        return
+    with connect(CONFIG) as conn:
+        if not auth.pin_is_set(conn):
+            try:
+                auth.set_pin(conn, pin, by="env")
+            except auth.PinError:
+                pass  # a bad env PIN just leaves the first-run screen in place
+
+
 def make_server(host: str, port: int) -> ThreadingHTTPServer:
     """Build (but don't start) the dashboard HTTP server. The runnable entry
     point in apps/dashboard/main.py owns the serve loop + CLI."""
     if not INDEX_HTML.is_file():
         raise SystemExit(f"dashboard assets missing — expected {INDEX_HTML}")
+    migrate(CONFIG)            # idempotent; ensures settings table exists for auth
+    _seed_pin_from_env()
     return ThreadingHTTPServer((host, port), Handler)

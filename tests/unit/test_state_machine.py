@@ -46,7 +46,6 @@ def solo_device(**over) -> DeviceMeta:
     base = dict(
         id=1, name="D1", ip_address="d", criticality=3, region="R",
         parent_device_id=None, power_ref_ip=None, technician_phone="+910000000000",
-        customer_count=10, base_revenue_impact=100.0,
     )
     base.update(over)
     return DeviceMeta(**base)

@@ -46,8 +46,6 @@ class DeviceMeta:
     parent_device_id: int | None
     power_ref_ip: str | None
     technician_phone: str | None
-    customer_count: int
-    base_revenue_impact: float
 
 
 # --- Events the engine emits (daemon/notifier act on these) -----------------
@@ -273,7 +271,7 @@ def load_device_meta(cfg: Config = CONFIG) -> list[DeviceMeta]:
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT id, name, ip_address, criticality, region, parent_device_id,"
-            " power_ref_ip, technician_phone, customer_count, base_revenue_impact"
+            " power_ref_ip, technician_phone"
             " FROM devices WHERE is_active = 1 ORDER BY id"
         ).fetchall()
     return [DeviceMeta(**dict(r)) for r in rows]
@@ -293,6 +291,16 @@ def build_engine(cfg: Config = CONFIG) -> MonitorEngine:
             ).fetchone()
             if row:
                 engine.fsm[dev_id].prime(row["state"])
+        # Rehydrate uplink state: if the last uplink log entry was UPLINK_DOWN,
+        # mark the engine as uplink-active so the next healthy cycle emits
+        # UplinkRestored and clears the dashboard badge.
+        uplink_row = conn.execute(
+            "SELECT payload FROM alert_log"
+            " WHERE payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%'"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if uplink_row and "UPLINK_DOWN" in (uplink_row["payload"] or ""):
+            engine._uplink_active = True
     return engine
 
 

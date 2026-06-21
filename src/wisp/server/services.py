@@ -6,12 +6,12 @@ can render it. Read functions are pure-ish (DB in, dict out) and unit-tested in
 `tests/integration/test_api.py`; the write actions (acknowledge / assign /
 post-mortem / device CRUD) go through `write_with_retry` like the rest of the system.
 
-Everything here is read-mostly and stdlib-only, so it stays runnable on a laptop
-with the simulated prober and the mock notifier.
+Everything here is read-mostly and stdlib-only (the JSON views need no extra
+deps); only the daemon's real ICMP prober + ntfy notifier require the venv.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from wisp.core.analytics import (
     _downtime_by_device,
@@ -26,7 +26,6 @@ from wisp.database.client import connect, transaction, write_with_retry
 from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
-    DOWN_FAMILY,
     UNREACHABLE,
     UP,
 )
@@ -52,6 +51,34 @@ def _state_label(state: str) -> str:
     }.get(state, state)
 
 
+# --- shared payload coercion (device + worker CRUD validate the same way) ----
+def _payload_str(data: dict, key: str, err: type[ValueError], *,
+                 required: bool = False, default=None):
+    """Trim a free-text field to a non-empty string or `default`. Raises `err`
+    (DeviceError / WorkerError) with a human message when a required field is blank."""
+    v = data.get(key)
+    v = v.strip() if isinstance(v, str) else (None if v is None else str(v).strip())
+    if required and not v:
+        raise err(f"{key.replace('_', ' ')} is required")
+    return v or default
+
+
+def _payload_int(data: dict, key: str, err: type[ValueError], *,
+                 lo=None, hi=None, default=0):
+    """Coerce a field to a bounded whole number, raising `err` on a non-number or
+    an out-of-range value."""
+    v = data.get(key, default)
+    if v in (None, ""):
+        v = default
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        raise err(f"{key.replace('_', ' ')} must be a whole number")
+    if lo is not None and v < lo or hi is not None and v > hi:
+        raise err(f"{key.replace('_', ' ')} must be between {lo} and {hi}")
+    return v
+
+
 # --- read views -------------------------------------------------------------
 def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
     """Top-of-dashboard KPIs: overall health %, active/total nodes, live outages."""
@@ -68,6 +95,8 @@ def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
             "SELECT payload FROM alert_log WHERE payload LIKE '%UPLINK%'"
             " OR payload LIKE '%Uplink%' ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        last_poll = conn.execute(
+            "SELECT MAX(timestamp) AS t FROM poll_results").fetchone()["t"]
 
     window_s = (win_end - win_start).total_seconds()
     down_by_dev = _downtime_by_device(outages, win_start, win_end, only_down=True)
@@ -80,6 +109,15 @@ def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
     live_outages = sum(1 for r in open_outages if r["final_state"] == DOWN)
     uplink_down = uplink is not None and "UPLINK_DOWN" in (uplink["payload"] or "")
 
+    stale_after_s = cfg.stale_threshold_s()
+    monitor_age_s = None
+    monitor_stale = False
+    if last_poll:
+        monitor_age_s = max(0, int((win_end - _parse(last_poll)).total_seconds()))
+        # Only flag stale once polling has actually started AND there's something to
+        # poll — a fresh, empty install isn't a dead monitor. Mirrors the watchdog.
+        monitor_stale = total > 0 and monitor_age_s > stale_after_s
+
     return {
         "system_health_pct": round(health, 2),
         "active_nodes": up,
@@ -87,6 +125,10 @@ def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
         "outages": live_outages,
         "uplink_down": uplink_down,
         "window_hours": hours,
+        "last_poll": last_poll,
+        "monitor_age_s": monitor_age_s,
+        "monitor_stale": monitor_stale,
+        "stale_after_s": stale_after_s,
     }
 
 
@@ -106,8 +148,8 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
         rows = conn.execute(
             "SELECT o.id, o.device_id, o.started_at, o.resolved_at, o.final_state,"
             " o.inferred_cause, o.acknowledged_by, o.acknowledged_at, o.root_cause,"
-            " o.resolution_notes, d.name, d.region, d.customer_count, d.criticality,"
-            " d.base_revenue_impact, d.technician_phone"
+            " o.resolution_notes, d.name, d.region, d.criticality,"
+            " d.technician_phone"
             " FROM outages o JOIN devices d ON d.id = o.device_id"
             " WHERE o.final_state = ?"
             "   AND (o.resolved_at IS NULL OR o.resolution_notes IS NULL)"
@@ -136,18 +178,16 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             "status": status,
             "cause": _cause_kind(r["inferred_cause"]),
             "inferred_cause": r["inferred_cause"],
-            "customer_count": r["customer_count"],
             "criticality": r["criticality"],
-            "revenue_per_hr": r["base_revenue_impact"],
             "assigned_to": r["acknowledged_by"],
+            "started_at": r["started_at"],
             "duration_s": int(duration_s),
             "duration_label": _fmt_dur(duration_s),
         })
 
-    # impact-ranked: unassigned first, then by blast radius (customers x criticality)
+    # impact-ranked: unassigned first, then by criticality
     order = {"unassigned": 0, "in_progress": 1, "pending_postmortem": 2}
-    items.sort(key=lambda i: (order.get(i["status"], 9),
-                              -(i["customer_count"] * i["criticality"])))
+    items.sort(key=lambda i: (order.get(i["status"], 9), -i["criticality"]))
     return items
 
 
@@ -157,7 +197,7 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
     win_start = win_end - timedelta(hours=hours)
     with connect(cfg) as conn:
         devices = conn.execute(
-            "SELECT id, name, ip_address, device_type, region, customer_count,"
+            "SELECT id, name, ip_address, device_type, region,"
             " criticality FROM devices WHERE is_active=1 ORDER BY id"
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
@@ -175,7 +215,6 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             "ip": d["ip_address"],
             "type": d["device_type"],
             "region": d["region"],
-            "customer_count": d["customer_count"],
             "criticality": d["criticality"],
             "state": state,
             "state_label": _state_label(state),
@@ -223,7 +262,7 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
     with connect(cfg) as conn:
         outages = _outages_in_window(conn, day_start, clip_end)
         meta = {r["id"]: r for r in conn.execute(
-            "SELECT id, name, ip_address, device_type, region, customer_count,"
+            "SELECT id, name, ip_address, device_type, region,"
             " criticality FROM devices WHERE is_active=1")}
 
     per: dict[int, dict] = {}
@@ -249,7 +288,6 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
             "ip": m["ip_address"],
             "type": m["device_type"],
             "region": m["region"],
-            "customer_count": m["customer_count"],
             "criticality": m["criticality"],
             "cause": _cause_kind(agg["cause"]),
             "down_s": int(agg["down_s"]),
@@ -268,7 +306,7 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
         rows = conn.execute(
             "SELECT o.id, o.device_id, o.started_at, o.resolved_at, o.final_state,"
             " o.inferred_cause, o.root_cause, o.resolution_notes, o.acknowledged_by,"
-            " d.name, d.region, d.criticality"
+            " d.name, d.region"
             " FROM outages o JOIN devices d ON d.id = o.device_id"
             " WHERE o.resolved_at IS NOT NULL ORDER BY o.id DESC"
         ).fetchall()
@@ -279,8 +317,6 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
         if q and q not in hay:
             continue
         dur = (_parse(r["resolved_at"]) - _parse(r["started_at"])).total_seconds()
-        sev = "critical" if r["final_state"] == DOWN and r["criticality"] >= 4 else (
-            "warning" if r["final_state"] in DOWN_FAMILY else "info")
         matched.append({
             "id": r["id"],
             "incident": f"INC-{r['id']:04d}",
@@ -288,7 +324,6 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
             "resolved_at": r["resolved_at"],
             "name": r["name"],
             "region": r["region"],
-            "severity": sev,
             "state": r["final_state"],
             "duration_s": int(dur),
             "duration_label": _fmt_dur(dur),
@@ -328,23 +363,179 @@ def submit_postmortem(outage_id: int, root_cause: str, notes: str,
     return bool(write_with_retry(_do))
 
 
-def technicians(cfg: Config = CONFIG) -> list[dict]:
-    """Distinct technician routing keys from the device table, for the assign
-    dropdown. (Real names arrive with the Phase 7 contact directory.)"""
+DISMISSED_NOTE = "Dismissed — no post-mortem logged"
+
+
+def dismiss_outage(outage_id: int, cfg: Config = CONFIG) -> bool:
+    """Clear a recovered outage off the triage feed without writing a real
+    post-mortem. Stamps a sentinel resolution so the row drops out of the
+    pending-post-mortem bucket but stays in the downtime history (analytics are
+    untouched). Only applies to an already-resolved, still-undocumented outage."""
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE outages SET root_cause = ?, resolution_notes = ?"
+                " WHERE id = ? AND resolved_at IS NOT NULL"
+                "   AND resolution_notes IS NULL",
+                ("Dismissed", DISMISSED_NOTE, outage_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
+# --- DB backup --------------------------------------------------------------
+def create_backup(cfg: Config = CONFIG) -> bytes:
+    """A consistent copy of the DB via SQLite `VACUUM INTO` (safe while WAL is live),
+    so a lost wisp.db doesn't mean re-onboarding config + PIN + team (§8.15)."""
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        dest = os.path.join(td, "backup.db")
+        with connect(cfg) as conn:
+            conn.execute("VACUUM INTO ?", (dest,))
+        with open(dest, "rb") as fh:
+            return fh.read()
+
+
+def backup_filename() -> str:
+    return f"wisp-backup-{datetime.now(timezone.utc):%Y%m%d}.db"
+
+
+# --- team directory (workers; plan §8.5) ------------------------------------
+WORKER_ROLES = ("owner", "operator", "tech")
+# Channels are role-based (config.py ntfy_topic_*), so a worker is just an
+# identity + role — no per-person routing key.
+_WORKER_FIELDS = ("name", "role", "region", "is_active", "notes")
+
+
+class WorkerError(ValueError):
+    """A bad worker payload (validation), surfaced to the UI as a 422."""
+
+
+class LastOwnerError(WorkerError):
+    """Removing/deactivating the last active owner — surfaced as a 409 (conflict)."""
+
+
+def list_workers(cfg: Config = CONFIG) -> list[dict]:
     with connect(cfg) as conn:
         rows = conn.execute(
-            "SELECT DISTINCT technician_phone, region FROM devices"
-            " WHERE technician_phone IS NOT NULL AND is_active=1 ORDER BY region"
+            "SELECT id, name, role, region,"
+            " is_active, notes, created_at FROM workers ORDER BY"
+            " CASE role WHEN 'owner' THEN 0 WHEN 'operator' THEN 1 ELSE 2 END, name"
         ).fetchall()
-    return [{"id": r["technician_phone"], "label": f"{r['region']} tech ({r['technician_phone']})"}
-            for r in rows]
+    return [dict(r) for r in rows]
+
+
+def _clean_worker_payload(data: dict) -> dict:
+    def _str(key, *, required=False):
+        return _payload_str(data, key, WorkerError, required=required)
+
+    name = _str("name", required=True)
+    role = (data.get("role") or "tech").strip().lower()
+    if role not in WORKER_ROLES:
+        raise WorkerError(f"role must be one of: {', '.join(WORKER_ROLES)}")
+    is_active_raw = data.get("is_active", 1)
+    is_active = 0 if str(is_active_raw) in ("0", "false", "False", "") else 1
+    return {
+        "name": name, "role": role,
+        "region": _str("region"), "is_active": is_active, "notes": _str("notes"),
+    }
+
+
+def _active_owner_ids(conn) -> list[int]:
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM workers WHERE role='owner' AND is_active=1")]
+
+
+def _guard_last_owner(conn, worker_id: int, *, still_active_owner: bool) -> None:
+    """Block an edit/delete that would remove the last active owner (which would
+    orphan escalations). `still_active_owner` is whether the worker remains an
+    active owner after the operation."""
+    owners = _active_owner_ids(conn)
+    if owners == [worker_id] and not still_active_owner:
+        raise LastOwnerError(
+            "can't remove the last active owner — assign another owner first")
+
+
+def create_worker(data: dict, cfg: Config = CONFIG) -> int:
+    clean = _clean_worker_payload(data)
+
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                f"INSERT INTO workers ({', '.join(_WORKER_FIELDS)})"
+                f" VALUES ({', '.join('?' * len(_WORKER_FIELDS))})",
+                tuple(clean[f] for f in _WORKER_FIELDS),
+            )
+            conn.commit()
+            return cur.lastrowid
+    return int(write_with_retry(_do) or 0)
+
+
+def update_worker(worker_id: int, data: dict, cfg: Config = CONFIG) -> bool:
+    clean = _clean_worker_payload(data)
+    with connect(cfg) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone()
+        if not exists:
+            return False
+        still_owner = clean["role"] == "owner" and clean["is_active"] == 1
+        _guard_last_owner(conn, worker_id, still_active_owner=still_owner)
+
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                f"UPDATE workers SET {', '.join(f + '=?' for f in _WORKER_FIELDS)}"
+                " WHERE id=?",
+                tuple(clean[f] for f in _WORKER_FIELDS) + (worker_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
+def test_channel(target, cfg: Config = CONFIG) -> dict:
+    """Send a fixed "✅ WISP test alert" to one of the three role channels
+    (owner / operator / tech) through the *current* notifier — the go-live check
+    that the channel works before a real outage needs it. Returns
+    {ok, detail, channel, recipient, role}; the network send is OUTSIDE any DB txn,
+    matching the dispatcher."""
+    from wisp.egress.notifiers import build_notifier, role_topic
+    role = str(target or "tech").strip().lower()
+    if role not in WORKER_ROLES:
+        raise WorkerError(f"channel must be one of: {', '.join(WORKER_ROLES)}")
+    recipient = role_topic(role, cfg)
+    notifier = build_notifier(cfg)
+    res = notifier.send(recipient, "✅ WISP test alert",
+                        "This is a test alert from the HANSA dashboard.", 3)
+    detail = res.detail or (
+        f"delivered to {notifier.channel} ({recipient})" if res.ok
+        else "send failed")
+    return {"ok": res.ok, "detail": detail, "channel": notifier.channel,
+            "recipient": recipient, "role": role}
+
+
+def delete_worker(worker_id: int, cfg: Config = CONFIG) -> dict:
+    with connect(cfg) as conn:
+        row = conn.execute("SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone()
+        if not row:
+            return {"ok": False, "reason": "worker not found"}
+        _guard_last_owner(conn, worker_id, still_active_owner=False)
+
+    def _do():
+        with connect(cfg) as conn:
+            conn.execute("DELETE FROM workers WHERE id=?", (worker_id,))
+            conn.commit()
+            return True
+    write_with_retry(_do)
+    return {"ok": True}
 
 
 # --- device inventory management (config from the UI) -----------------------
 DEVICE_TYPES = ("core", "tower", "relay", "sector", "backhaul")
 _DEVICE_FIELDS = ("name", "ip_address", "device_type", "criticality", "region",
-                  "parent_device_id", "power_ref_ip", "technician_phone",
-                  "customer_count", "base_revenue_impact")
+                  "parent_device_id", "power_ref_ip", "technician_phone")
 
 
 class DeviceError(ValueError):
@@ -358,7 +549,7 @@ def list_devices(cfg: Config = CONFIG) -> list[dict]:
         rows = conn.execute(
             "SELECT d.id, d.name, d.ip_address, d.device_type, d.criticality, d.region,"
             " d.is_active, d.parent_device_id, d.power_ref_ip, d.technician_phone,"
-            " d.customer_count, d.base_revenue_impact, p.name AS parent_name,"
+            " p.name AS parent_name,"
             " (SELECT COUNT(*) FROM devices c WHERE c.parent_device_id = d.id) AS child_count"
             " FROM devices d LEFT JOIN devices p ON p.id = d.parent_device_id"
             " WHERE d.is_active = 1 ORDER BY d.id"
@@ -371,23 +562,10 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
     """Validate + normalise a device create/update payload. Raises DeviceError
     with a human message on the first problem found."""
     def _str(key, *, required=False, default=None):
-        v = data.get(key)
-        v = v.strip() if isinstance(v, str) else (None if v is None else str(v).strip())
-        if required and not v:
-            raise DeviceError(f"{key.replace('_', ' ')} is required")
-        return v or default
+        return _payload_str(data, key, DeviceError, required=required, default=default)
 
     def _int(key, *, lo=None, hi=None, default=0):
-        v = data.get(key, default)
-        if v in (None, ""):
-            v = default
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            raise DeviceError(f"{key.replace('_', ' ')} must be a whole number")
-        if lo is not None and v < lo or hi is not None and v > hi:
-            raise DeviceError(f"{key.replace('_', ' ')} must be between {lo} and {hi}")
-        return v
+        return _payload_int(data, key, DeviceError, lo=lo, hi=hi, default=default)
 
     name = _str("name", required=True)
     ip_address = _str("ip_address", required=True)
@@ -398,15 +576,6 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
     region = _str("region")
     power_ref_ip = _str("power_ref_ip")
     technician_phone = _str("technician_phone")
-    customer_count = _int("customer_count", lo=0, default=0)
-
-    rev = data.get("base_revenue_impact", 0) or 0
-    try:
-        base_revenue_impact = float(rev)
-    except (TypeError, ValueError):
-        raise DeviceError("revenue impact must be a number")
-    if base_revenue_impact < 0:
-        raise DeviceError("revenue impact can't be negative")
 
     parent_raw = data.get("parent_device_id")
     parent_id = None
@@ -434,7 +603,6 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
         "name": name, "ip_address": ip_address, "device_type": device_type,
         "criticality": criticality, "region": region, "parent_device_id": parent_id,
         "power_ref_ip": power_ref_ip, "technician_phone": technician_phone,
-        "customer_count": customer_count, "base_revenue_impact": base_revenue_impact,
     }
 
 
@@ -508,7 +676,6 @@ def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
                              (device_id, device_id))
                 conn.execute("DELETE FROM outages WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM poll_results WHERE device_id=?", (device_id,))
-                conn.execute("DELETE FROM customer_mappings WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
             return True
     write_with_retry(_do)

@@ -7,7 +7,7 @@ persists the resulting states and outage changes, dispatches alerts, and sweeps
 overdue escalations.
 
     python apps/daemon/main.py                      # real 60s cadence, forever
-    python apps/daemon/main.py --interval 1 --cycles 13   # fast demo
+    python apps/daemon/main.py --interval 5 --cycles 3    # short run (smoke test)
 
 Scheduling is a plain asyncio interval loop (no third-party deps); it is isolated
 in `run_forever`, so swapping to APScheduler later is a one-spot change. Zero-
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,11 @@ from wisp.core.state_machine import (
     MonitorEngine,
     apply_events,
     build_engine,
+    load_device_meta,
 )
+
+
+log = logging.getLogger("wisp.daemon")
 
 
 def _utc_now_iso() -> str:
@@ -108,7 +113,12 @@ async def run_forever(
     interval: float | None = None,
     max_cycles: int | None = None,
 ) -> None:
+    # Engine, prober, cadence, and notifier are built once from the env/default config
+    # plus the current device set. The device set is re-read each cycle so a UI add/
+    # remove is picked up in-process (no restart); config tunables are env-var + restart
+    # (see config.py — there is no DB settings layer).
     interval = cfg.poll_interval_s if interval is None else interval
+    devices = load_device_meta(cfg)
     prober = build_prober(cfg)
     engine = build_engine(cfg)
     dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
@@ -118,24 +128,48 @@ async def run_forever(
     )
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
-        started = asyncio.get_event_loop().time()
-        await run_cycle(prober, engine, dispatcher, cfg)
+        # Device-set hot reload: rebuild the engine in-process when the active device
+        # set changes (UI add/remove). build_engine rehydrates each FSM from the last
+        # poll, so a rebuild never re-pages an open outage. (Skipped for finite runs.)
+        # A transient DB hiccup here must not kill the monitor — keep the old engine.
+        if max_cycles is None:
+            try:
+                current = load_device_meta(cfg)
+                if current != devices:
+                    print(f"device set changed ({len(current)} devices) — rebuilding monitor")
+                    devices = current
+                    engine = build_engine(cfg)
+                    dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
+            except Exception:
+                log.exception("device-set reload failed; keeping current monitor")
+        started = asyncio.get_running_loop().time()
+        # The watcher must be the hardest thing in the system to kill: one bad cycle
+        # (DB lock, a probe library blowing up, a bug) is logged and skipped, never fatal.
+        try:
+            await run_cycle(prober, engine, dispatcher, cfg)
+        except Exception:
+            log.exception("poll cycle %d failed; continuing to next cycle", cycle + 1)
         cycle += 1
         _print_cycle(cycle, {dev_id: fsm.state for dev_id, fsm in engine.fsm.items()})
         if max_cycles is not None and cycle >= max_cycles:
             break
-        elapsed = asyncio.get_event_loop().time() - started
+        elapsed = asyncio.get_running_loop().time() - started
         await asyncio.sleep(max(0.0, interval - elapsed))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Village WISP polling daemon")
     parser.add_argument("--interval", type=float, default=None,
-                        help="seconds between polls (overrides config; e.g. 1 for demo)")
+                        help="seconds between polls (overrides config)")
     parser.add_argument("--cycles", type=int, default=None,
                         help="stop after N cycles (default: run forever)")
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
     migrate()
     try:
         asyncio.run(run_forever(interval=args.interval, max_cycles=args.cycles))

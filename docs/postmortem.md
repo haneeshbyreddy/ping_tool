@@ -12,7 +12,6 @@ doc is the longer human write-up for repeat offenders or multi-site events.
 - **Date / time (UTC):** ____
 - **Duration:** ____  (down → restored)
 - **Site(s):** ____  (region · node · IP)
-- **Customers impacted:** ~____
 - **Severity:** critical / warning
 - **Acknowledged by:** ____
 
@@ -22,7 +21,7 @@ A short narrative: what the operator saw, when the alert fired, who responded.
 
 ## Detection
 
-- How did we find out? (dashboard / ntfy / Telegram / customer call)
+- How did we find out? (dashboard / ntfy)
 - Did the state machine classify it correctly?
   - Inferred cause (engine guess): power / link-equipment
   - **Confirmed cause** (filled at resolution): ____

@@ -2,31 +2,29 @@
 #
 # HANSA — one-shot setup + run.
 #
-# Pure stdlib, zero install. Migrates the DB, seeds the demo network, then runs
-# the two decoupled runtimes together: the polling daemon (background) and the
-# dashboard web server (foreground). Ctrl-C stops both.
+# Migrates the DB, then runs the two decoupled runtimes together: the polling
+# daemon (background) and the dashboard web server (foreground). Ctrl-C stops
+# both. Add your real devices + team from the dashboard once it's up.
 #
-#   ./run.sh                 # setup (if needed) + run on http://127.0.0.1:8000
-#   ./run.sh --reset         # wipe + reseed the demo network first
-#   ./run.sh --demo          # prepopulate fast demo outages so the UI isn't empty
+#   ./run.sh                 # setup (if needed) + run on http://0.0.0.0:8080
 #   ./run.sh --port 9000     # serve on a different port
 #   ./run.sh --no-daemon     # dashboard only (don't start the worker)
-#   ./run.sh --setup-only    # migrate + seed, then exit
+#   ./run.sh --setup-only    # migrate, then exit
 #
-# Env overrides: PYTHON (default python3), HOST (127.0.0.1), PORT (8000).
+# Real ICMP polling needs raw sockets — install deps in a venv and grant
+# cap_net_raw (see README "Going live"). Env overrides: PYTHON (default
+# python3), HOST (127.0.0.1), PORT (8000).
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 PY="${PYTHON:-python3}"
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
-RESET=0; DEMO=0; NO_DAEMON=0; SETUP_ONLY=0
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8080}"
+NO_DAEMON=0; SETUP_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --reset)       RESET=1 ;;
-    --demo)        DEMO=1 ;;
     --no-daemon)   NO_DAEMON=1 ;;
     --setup-only)  SETUP_ONLY=1 ;;
     --host)        HOST="$2"; shift ;;
@@ -40,6 +38,17 @@ done
 # The src/ layout is not installed; expose the package on the path for the CLIs.
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 
+# Role alert channels (ntfy topics). Unguessable so they can't be read on the
+# public ntfy.sh; each person subscribes to the topic for their role. `:=` keeps
+# any value already set in the environment, so you can override per-host.
+export WISP_NTFY_TOPIC_OWNER="${WISP_NTFY_TOPIC_OWNER:=hansa-owner-35f027e3a8}"
+export WISP_NTFY_TOPIC_OPERATOR="${WISP_NTFY_TOPIC_OPERATOR:=hansa-ops-428fe896b9}"
+export WISP_NTFY_TOPIC_TECH="${WISP_NTFY_TOPIC_TECH:=hansa-tech-87e2965d5e}"
+
+# Detection speed: poll every 20s × 3 consecutive failures = DOWN within ~1 minute,
+# while keeping the 3-strike flap suppression (a single dropped ping won't page).
+export WISP_POLL_INTERVAL_S="${WISP_POLL_INTERVAL_S:=20}"
+
 command -v "$PY" >/dev/null 2>&1 || { echo "error: '$PY' not found" >&2; exit 1; }
 echo "▸ using $("$PY" --version 2>&1)"
 
@@ -48,27 +57,12 @@ echo "▸ migrating database…"
 "$PY" -m wisp.database.client >/dev/null
 echo "  done (data/wisp.db)"
 
-# 2. Demo network ------------------------------------------------------------
-if [ "$RESET" -eq 1 ]; then
-  echo "▸ reseeding demo network (--reset)…"
-  "$PY" -m wisp.database.seed --reset >/dev/null
-else
-  echo "▸ seeding demo network (only if empty)…"
-  "$PY" -m wisp.database.seed >/dev/null || true
-fi
-
-# 3. Optional: fast burst so the dashboard has live outages immediately ------
-if [ "$DEMO" -eq 1 ]; then
-  echo "▸ generating demo outages (fast burst)…"
-  "$PY" apps/daemon/main.py --interval 1 --cycles 13 >/dev/null
-fi
-
 if [ "$SETUP_ONLY" -eq 1 ]; then
   echo "✓ setup complete."
   exit 0
 fi
 
-# 4. Run the two runtimes ----------------------------------------------------
+# 2. Run the two runtimes ----------------------------------------------------
 DAEMON_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true

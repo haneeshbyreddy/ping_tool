@@ -17,9 +17,7 @@ CREATE TABLE IF NOT EXISTS devices (
     is_active            INTEGER NOT NULL DEFAULT 1,
     parent_device_id     INTEGER REFERENCES devices(id),
     power_ref_ip         TEXT,                   -- node on the same MAINS power (power-vs-link)
-    technician_phone     TEXT,                   -- region tech; ntfy/Telegram routing key
-    customer_count       INTEGER NOT NULL DEFAULT 0,  -- customers behind this site (blast radius)
-    base_revenue_impact  REAL NOT NULL DEFAULT 0       -- est. currency/hour while down
+    technician_phone     TEXT                    -- region tech; ntfy routing key
 );
 
 -- Raw poll samples. One row per device per 60s cycle.
@@ -51,7 +49,7 @@ CREATE TABLE IF NOT EXISTS alert_log (
     id         INTEGER PRIMARY KEY,
     outage_id  INTEGER REFERENCES outages(id),
     device_id  INTEGER REFERENCES devices(id),
-    channel    TEXT NOT NULL,               -- 'ntfy'|'telegram'|'mock'
+    channel    TEXT NOT NULL,               -- notifier channel, e.g. 'ntfy'
     recipient  TEXT NOT NULL,
     sent_at    TEXT NOT NULL,
     status     TEXT NOT NULL,               -- 'sent'|'failed'|'suppressed'
@@ -67,13 +65,4 @@ CREATE TABLE IF NOT EXISTS escalations (
     due_at      TEXT NOT NULL,
     executed_at TEXT,
     UNIQUE(outage_id, kind)
-);
-
--- Reserved for the future customer-comms layer. Unused in v1, present so that
--- layer needs no migration later.
-CREATE TABLE IF NOT EXISTS customer_mappings (
-    id             INTEGER PRIMARY KEY,
-    customer_phone TEXT NOT NULL,
-    device_id      INTEGER REFERENCES devices(id),
-    region         TEXT NOT NULL
 );

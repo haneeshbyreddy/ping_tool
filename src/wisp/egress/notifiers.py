@@ -3,8 +3,8 @@
 Engine events (OutageOpened/Resolved/Uplink…) become messages routed to the
 region technician, with a two-step escalation to the owner if nobody acks.
 
-  * Notifier   — the channel interface. MockNotifier (default, no deps, records
-                 sends for tests) + Ntfy/Telegram senders (httpx, lazy import).
+  * Notifier   — the channel interface. NtfyNotifier sends real push
+                 notifications via ntfy (httpx, lazy import).
   * AlertDispatcher — the policy: who gets told, anti-spam dedupe, and the
                  DB-derived escalation timers (restart-safe) plus their sweeper.
 
@@ -14,8 +14,10 @@ never holds a write lock.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Callable
 
 from wisp.config import CONFIG, Config
 from wisp.database.client import connect, write_with_retry
@@ -38,83 +40,92 @@ class NotifyResult:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class _Attempt:
+    """One delivery attempt's outcome plus whether retrying could plausibly help
+    (transient network / 5xx = yes; a 4xx config error = no, fail fast)."""
+    result: NotifyResult
+    retryable: bool
+
+
+def send_with_retry(
+    attempt: Callable[[], _Attempt],
+    *,
+    attempts: int,
+    backoff: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> NotifyResult:
+    """Call `attempt` up to `attempts` times, backing off exponentially between
+    transient failures, so a single push never vanishes to a momentary blip. Stops
+    early on success or a non-retryable error. Pure (clock injected) for testing."""
+    last = NotifyResult(False, "no attempt made")
+    for i in range(1, max(1, attempts) + 1):
+        a = attempt()
+        if a.result.ok or not a.retryable:
+            return a.result
+        last = a.result
+        if i < attempts:
+            sleep(backoff * (2 ** (i - 1)))
+    return last
+
+
 # --- Channels ---------------------------------------------------------------
-class MockNotifier:
-    """Records every send and (optionally) prints it. The default channel for
-    the no-hardware dev build and the one tests assert against."""
-
-    channel = "mock"
-
-    def __init__(self, *, quiet: bool = False) -> None:
-        self.sent: list[dict] = []
-        self.quiet = quiet
-
-    def send(self, recipient: str, title: str, body: str, priority: int) -> NotifyResult:
-        self.sent.append(
-            {"recipient": recipient, "title": title, "body": body, "priority": priority}
-        )
-        if not self.quiet:
-            print(f"      →[mock:{recipient} p{priority}] {title} — {body}")
-        return NotifyResult(True)
-
-
 class NtfyNotifier:
     channel = "ntfy"
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self.base = cfg.ntfy_base_url.rstrip("/")
+        self._retries = max(1, cfg.ntfy_retries)
+        self._backoff = cfg.ntfy_retry_backoff_s
 
     def send(self, recipient: str, title: str, body: str, priority: int) -> NotifyResult:
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover
             return NotifyResult(False, f"httpx missing: {exc}")
-        try:
-            # ntfy: recipient is the topic; priority 1..5 maps directly.
-            resp = httpx.post(
-                f"{self.base}/{recipient}",
-                content=body.encode("utf-8"),
-                headers={"Title": title, "Priority": str(max(1, min(5, priority)))},
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            return NotifyResult(True)
-        except Exception as exc:  # network/HTTP errors must not crash the loop
-            return NotifyResult(False, str(exc))
 
+        def _attempt() -> _Attempt:
+            try:
+                # ntfy's JSON publish endpoint (POST to the server root) so the
+                # title/message carry UTF-8 (emoji) — the header form requires ASCII
+                # and would reject '✅', '🔴', etc. `recipient` is the ntfy topic.
+                resp = httpx.post(
+                    self.base,
+                    json={
+                        "topic": recipient,
+                        "title": title,
+                        "message": body,
+                        "priority": max(1, min(5, priority)),
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code >= 500:  # server hiccup — worth retrying
+                    return _Attempt(NotifyResult(False, f"HTTP {resp.status_code}"), True)
+                resp.raise_for_status()      # 4xx -> raises below, not retried
+                return _Attempt(NotifyResult(True), False)
+            except httpx.HTTPStatusError as exc:  # 4xx: bad topic/config, won't self-heal
+                return _Attempt(NotifyResult(False, str(exc)), False)
+            except Exception as exc:  # timeout / connection error: transient
+                return _Attempt(NotifyResult(False, str(exc)), True)
 
-class TelegramNotifier:
-    channel = "telegram"
-
-    def __init__(self, cfg: Config = CONFIG) -> None:
-        self.token = cfg.telegram_bot_token
-
-    def send(self, recipient: str, title: str, body: str, priority: int) -> NotifyResult:
-        try:
-            import httpx
-        except ImportError as exc:  # pragma: no cover
-            return NotifyResult(False, f"httpx missing: {exc}")
-        if not self.token:
-            return NotifyResult(False, "no telegram token configured")
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": recipient, "text": f"*{title}*\n{body}",
-                      "parse_mode": "Markdown"},
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            return NotifyResult(True)
-        except Exception as exc:
-            return NotifyResult(False, str(exc))
+        return send_with_retry(
+            _attempt, attempts=self._retries, backoff=self._backoff)
 
 
 def build_notifier(cfg: Config = CONFIG):
-    if cfg.notifier == "ntfy":
-        return NtfyNotifier(cfg)
-    if cfg.notifier == "telegram":
-        return TelegramNotifier(cfg)
-    return MockNotifier()
+    return NtfyNotifier(cfg)
+
+
+def role_topic(role: str, cfg: Config = CONFIG) -> str:
+    """The ntfy topic (channel) for a role. People subscribe to the one channel
+    that matches their role — owner / operator / tech — so there is no per-person
+    routing key. Topics are fixed config (config.py), not derived from the team
+    directory."""
+    return {
+        "owner": cfg.ntfy_topic_owner,
+        "operator": cfg.ntfy_topic_operator,
+        "tech": cfg.ntfy_topic_tech,
+    }.get(role, cfg.ntfy_topic_tech)
 
 
 # --- Time helpers -----------------------------------------------------------
@@ -132,7 +143,18 @@ class AlertDispatcher:
         self.engine = engine
         self.notifier = notifier
         self.cfg = cfg
-        self.owner = cfg.owner_telegram_chat_id or "OWNER"
+        self.topic_tech = cfg.ntfy_topic_tech
+        self.topic_owner = cfg.ntfy_topic_owner
+        self.topic_operator = cfg.ntfy_topic_operator
+
+    def _publish(self, role: str, title: str, body: str, priority: int) -> NotifyResult:
+        """Send to a role's channel, with a copy to the operator channel (operators
+        get full visibility into everything). Returns the primary send's result."""
+        primary = role_topic(role, self.cfg)
+        res = self.notifier.send(primary, title, body, priority)
+        if role != "operator" and self.topic_operator and self.topic_operator != primary:
+            self.notifier.send(self.topic_operator, title, body, priority)
+        return res
 
     # -- small DB helpers --
     def _open_outage_id(self, conn, device_id: int) -> int | None:
@@ -182,14 +204,13 @@ class AlertDispatcher:
         dev = self.engine.meta[ev.device_id]
         if ev.state == UNREACHABLE:
             # topology-suppressed: record the decision, page no one
-            self._record(ev.device_id, dev.technician_phone or "tech", "suppressed",
+            self._record(ev.device_id, self.topic_tech, "suppressed",
                          "UNREACHABLE (parent down)", ts)
             return
-        recipient = dev.technician_phone or "tech"
+        recipient = self.topic_tech
         cause = ev.inferred_cause or "unknown"
         title = f"🔴 DOWN — {dev.name} ({dev.region})"
-        body = (f"{'⚡POWER' if 'Power' in cause else '🔧LINK'} · ~{dev.customer_count} "
-                f"customers · ₹{dev.base_revenue_impact:.0f}/hr · crit {dev.criticality}")
+        body = (f"{'⚡POWER' if 'Power' in cause else '🔧LINK'} · crit {dev.criticality}")
 
         # anti-spam (escalations bypass this)
         def _do():
@@ -207,7 +228,7 @@ class AlertDispatcher:
         if oid is None:
             return  # was suppressed
 
-        res = self.notifier.send(recipient, title, body, self._priority(dev.criticality))
+        res = self._publish("tech", title, body, self._priority(dev.criticality))
 
         def _after():
             with connect(self.cfg) as conn:
@@ -227,7 +248,7 @@ class AlertDispatcher:
 
     def _on_resolved(self, ev: OutageResolved, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
-        recipient = dev.technician_phone or "tech"
+        recipient = self.topic_tech
 
         with connect(self.cfg) as conn:
             row = conn.execute(
@@ -239,8 +260,8 @@ class AlertDispatcher:
 
         # Don't announce recovery for an outage we never paged about (UNREACHABLE).
         if not was_suppressed:
-            self.notifier.send(recipient, f"✅ Restored — {dev.name} ({dev.region})",
-                               "Service back up", 3)
+            self._publish("tech", f"✅ Restored — {dev.name} ({dev.region})",
+                          "Service back up", 3)
 
         def _do():
             with connect(self.cfg) as conn:
@@ -266,11 +287,11 @@ class AlertDispatcher:
         write_with_retry(_do)
 
     def _send_owner(self, title: str, body: str, ts: str, priority: int) -> None:
-        res = self.notifier.send(self.owner, title, body, priority)
+        res = self._publish("owner", title, body, priority)
 
         def _do():
             with connect(self.cfg) as conn:
-                self._log(conn, None, None, self.owner,
+                self._log(conn, None, None, self.topic_owner,
                           "sent" if res.ok else "failed", title, ts)
                 conn.commit()
         write_with_retry(_do)
@@ -300,21 +321,21 @@ class AlertDispatcher:
     def _fire_escalation(self, kind: str, device_id: int, ts: str) -> None:
         dev = self.engine.meta[device_id]
         if kind == "realert":
-            recipient = dev.technician_phone or "tech"
-            self.notifier.send(recipient, f"⏰ STILL DOWN — {dev.name}",
-                               "No acknowledgement yet", self._priority(dev.criticality))
+            recipient = self.topic_tech
+            self._publish("tech", f"⏰ STILL DOWN — {dev.name}",
+                          "No acknowledgement yet", self._priority(dev.criticality))
             payload = "realert"
         else:  # escalate_to_owner
-            recipient = self.owner
-            self.notifier.send(recipient, f"⚠️ ESCALATION — {dev.name} ({dev.region})",
-                               f"Unacknowledged outage, ~{dev.customer_count} customers", 5)
+            recipient = self.topic_owner
+            self._publish("owner", f"⚠️ ESCALATION — {dev.name} ({dev.region})",
+                          "Unacknowledged outage", 5)
             payload = "escalate_to_owner"
         self._record(device_id, recipient, "sent", payload, ts)
 
 
 def acknowledge_outage(outage_id: int, by: str, cfg: Config = CONFIG) -> bool:
     """Mark an outage acknowledged — this is what stops the escalation ladder.
-    In production this is wired to a Telegram /ack button; here it's also a CLI."""
+    In production this is wired to an ack action; here it's also a CLI."""
     def _do():
         with connect(cfg) as conn:
             cur = conn.execute(

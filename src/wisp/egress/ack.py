@@ -1,5 +1,5 @@
-"""Acknowledge an outage from the terminal — the dev stand-in for the Telegram
-/ack button. Acking stops the escalation ladder (no re-alert, no owner escalation).
+"""Acknowledge an outage from the terminal — the dev stand-in for an in-app
+/ack action. Acking stops the escalation ladder (no re-alert, no owner escalation).
 
     PYTHONPATH=src python -m wisp.egress.ack                 # list currently-open outages
     PYTHONPATH=src python -m wisp.egress.ack <outage_id> <your name>

@@ -13,6 +13,7 @@ PYTHONPATH is needed.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from wisp.config import CONFIG          # noqa: E402
 from wisp.server.routes import make_server  # noqa: E402
+from wisp.server.watchdog import start_watchdog_thread  # noqa: E402
 
 
 def main() -> None:
@@ -29,6 +31,15 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
+    # The dashboard process watches the polling daemon: if the daemon dies, this
+    # pages the owner instead of silently showing an all-green network.
+    start_watchdog_thread(CONFIG)
 
     server = make_server(args.host, args.port)
     print(f"HANSA dashboard → http://{args.host}:{args.port}  (db={CONFIG.db_path.name})")

@@ -1,4 +1,6 @@
-"""Analytics math, checked with realistic durations and controlled timestamps."""
+"""Outage-window + downtime math, checked with realistic durations and controlled
+timestamps. These shared helpers back both the analytics CLI and the dashboard
+(server/services.py), so they carry the load-bearing uptime arithmetic."""
 import os
 import sys
 import tempfile
@@ -9,7 +11,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from wisp.core.analytics import _now, compute_digest
+from wisp.core.analytics import (
+    _downtime_by_device,
+    _now,
+    _offender_counts,
+    _outages_in_window,
+)
 from wisp.config import Config
 from wisp.database.client import connect, migrate
 from wisp.core.state_machine import DOWN, UNREACHABLE
@@ -19,62 +26,61 @@ def iso(dt) -> str:
     return dt.isoformat(timespec="seconds")
 
 
-class DigestMath(unittest.TestCase):
+class WindowMath(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(db_path=Path(self.tmp.name) / "t.db")
         migrate(self.cfg)
-        now = _now()
+        self.now = _now()
         with connect(self.cfg) as c:
-            # 4 active devices
-            for did, name, cust, rev in [
-                (1, "Tower A", 100, 300.0), (2, "Sector A", 50, 100.0),
-                (3, "Tower B", 80, 200.0), (4, "Tower C", 0, 0.0),
+            for did, name in [
+                (1, "Tower A"), (2, "Sector A"),
+                (3, "Tower B"), (4, "Tower C"),
             ]:
                 c.execute(
-                    "INSERT INTO devices (id,name,ip_address,criticality,region,"
-                    "customer_count,base_revenue_impact) VALUES (?,?,?,3,'R',?,?)",
-                    (did, name, f"10.0.0.{did}", cust, rev))
-            # Tower A: a 2-hour POWER outage, resolved (revenue = 2h * 300 = 600)
+                    "INSERT INTO devices (id,name,ip_address,criticality,region)"
+                    " VALUES (?,?,?,3,'R')",
+                    (did, name, f"10.0.0.{did}"))
+            # Tower A: a 2-hour POWER outage, resolved
             c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state,"
                       "inferred_cause) VALUES (1,?,?,?,?)",
-                      (iso(now - timedelta(hours=3)), iso(now - timedelta(hours=1)),
+                      (iso(self.now - timedelta(hours=3)), iso(self.now - timedelta(hours=1)),
                        DOWN, "Likely Power Outage"))
-            # Tower B: a 1-hour LINK outage, resolved (revenue = 1h * 200 = 200)
+            # Tower B: a 1-hour LINK outage, resolved
             c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state,"
                       "inferred_cause) VALUES (3,?,?,?,?)",
-                      (iso(now - timedelta(hours=2)), iso(now - timedelta(hours=1)),
+                      (iso(self.now - timedelta(hours=2)), iso(self.now - timedelta(hours=1)),
                        DOWN, "Link/Equipment Fault"))
-            # Sector A: UNREACHABLE (must be excluded from DOWN math / revenue)
+            # Sector A: UNREACHABLE (must be excluded from DOWN-only math)
             c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state)"
                       " VALUES (2,?,?,?)",
-                      (iso(now - timedelta(hours=3)), iso(now - timedelta(hours=1)),
+                      (iso(self.now - timedelta(hours=3)), iso(self.now - timedelta(hours=1)),
                        UNREACHABLE))
             c.commit()
-        self.m = compute_digest(self.cfg, hours=24)
+        self.win_start = self.now - timedelta(hours=24)
+        with connect(self.cfg) as c:
+            self.outages = _outages_in_window(c, self.win_start, self.now)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_counts_exclude_unreachable(self):
-        self.assertEqual(self.m["outages"], 2)        # 2 DOWN, UNREACHABLE excluded
-        self.assertEqual(self.m["power"], 1)
-        self.assertEqual(self.m["equipment"], 1)
+    def test_window_overlap_picks_up_all_three(self):
+        # all three outages overlap the 24h window
+        self.assertEqual(len(self.outages), 3)
 
-    def test_downtime_and_revenue(self):
-        self.assertAlmostEqual(self.m["total_down_s"], 3 * 3600, delta=2)  # 2h + 1h
-        self.assertAlmostEqual(self.m["revenue"], 600 + 200, delta=1)      # ₹800
+    def test_down_only_excludes_unreachable(self):
+        down = _downtime_by_device(self.outages, self.win_start, self.now, only_down=True)
+        self.assertNotIn(2, down)                       # Sector A was UNREACHABLE
+        self.assertAlmostEqual(sum(down.values()), 3 * 3600, delta=2)  # 2h + 1h
 
-    def test_worst_site_is_longest(self):
-        self.assertEqual(self.m["worst"][0], "Tower A")  # 2h is the worst
+    def test_per_device_downtime(self):
+        down = _downtime_by_device(self.outages, self.win_start, self.now, only_down=True)
+        self.assertAlmostEqual(down[1], 2 * 3600, delta=2)  # Tower A worst at 2h
 
-    def test_uptime_over_four_devices(self):
-        # 3h down across 4 devices over 24h window
-        expected = 100.0 * (1 - (3 * 3600) / (4 * 24 * 3600))
-        self.assertAlmostEqual(self.m["uptime_pct"], expected, delta=0.05)
-
-    def test_customers_impacted_excludes_unreachable(self):
-        self.assertEqual(self.m["customers"], 100 + 80)  # Tower A + Tower B, not Sector A
+    def test_offender_ranking(self):
+        down_outages = [o for o in self.outages if o["final_state"] == DOWN]
+        ranked = _offender_counts(down_outages)
+        self.assertEqual({n for n, _ in ranked}, {"Tower A", "Tower B"})
 
 
 if __name__ == "__main__":

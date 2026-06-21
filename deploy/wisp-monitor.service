@@ -1,0 +1,41 @@
+# WISP Monitor — polling daemon.
+#
+# Gives auto-start on boot and auto-restart on crash. The daemon also self-reloads
+# (re-execs in place) when settings or the device set change, so config edits apply
+# without systemd. Adjust WorkingDirectory/User to your install.
+#
+#   sudo cp deploy/wisp-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-monitor
+#
+[Unit]
+Description=WISP Monitor (polling daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Where the repo lives on the on-prem box:
+WorkingDirectory=/opt/wisp
+# Use the venv python so icmplib/httpx are importable:
+ExecStart=/opt/wisp/.venv/bin/python /opt/wisp/apps/daemon/main.py
+# Restart on crash (the daemon also re-execs itself in place on config change):
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# Role alert channels (ntfy topics) — unguessable so they can't be read on public
+# ntfy.sh. MUST match the dashboard unit exactly, or pages route to a different topic.
+Environment=WISP_NTFY_TOPIC_OWNER=hansa-owner-35f027e3a8
+Environment=WISP_NTFY_TOPIC_OPERATOR=hansa-ops-428fe896b9
+Environment=WISP_NTFY_TOPIC_TECH=hansa-tech-87e2965d5e
+# Detection speed: 20s poll × 3 consecutive failures = DOWN within ~1 minute
+# (keeps the 3-strike flap suppression). Dashboard unit doesn't poll, so it's only here.
+Environment=WISP_POLL_INTERVAL_S=20
+# Other tunables (thresholds, escalation timings) can go here as env too.
+# The ICMP prober uses unprivileged ping sockets — no cap_net_raw needed; just enable
+# the kernel ping group once: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+# (persist in /etc/sysctl.d/). Then it can run as a non-root user:
+# User=wisp
+# Group=wisp
+
+[Install]
+WantedBy=multi-user.target

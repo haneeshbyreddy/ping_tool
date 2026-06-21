@@ -33,16 +33,16 @@ class ApiTest(unittest.TestCase):
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         with connect(self.cfg) as c:
             # Two co-located devices in Rampur + one in Sohna.
-            for did, name, ip, region, crit, cust, rev in [
-                (1, "Rampur Tower", "d1", "Rampur", 4, 140, 350.0),
-                (2, "Rampur Sector", "d2", "Rampur", 2, 60, 150.0),
-                (3, "Sohna Relay", "d3", "Sohna", 4, 110, 275.0),
+            for did, name, ip, region, crit in [
+                (1, "Rampur Tower", "d1", "Rampur", 4),
+                (2, "Rampur Sector", "d2", "Rampur", 2),
+                (3, "Sohna Relay", "d3", "Sohna", 4),
             ]:
                 c.execute(
                     "INSERT INTO devices (id,name,ip_address,criticality,region,"
-                    "technician_phone,customer_count,base_revenue_impact)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (did, name, ip, crit, region, "+91TECH", cust, rev),
+                    "technician_phone)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (did, name, ip, crit, region, "+91TECH"),
                 )
             c.commit()
 
@@ -177,6 +177,25 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(row["root_cause"], "Power Failure")
         self.assertEqual(row["resolution_notes"], "Genset refuel")
 
+    def test_dismiss_outage_clears_triage_keeps_history(self):
+        # open outage cannot be dismissed (nothing to discard yet)
+        oid = self._outage(1, self.now - timedelta(minutes=5))
+        self.assertFalse(api.dismiss_outage(oid, self.cfg))
+        # resolved + undocumented -> shows as pending_postmortem
+        rid = self._outage(2, self.now - timedelta(hours=2),
+                           resolved=self.now - timedelta(minutes=30))
+        self.assertIn("pending_postmortem", [i["status"] for i in api.triage_outages(self.cfg)])
+        # dismiss drops it off triage but the row (and its downtime) survive
+        self.assertTrue(api.dismiss_outage(rid, self.cfg))
+        self.assertNotIn(rid, [i["id"] for i in api.triage_outages(self.cfg)])
+        with connect(self.cfg) as c:
+            row = c.execute("SELECT resolved_at,resolution_notes FROM outages WHERE id=?",
+                            (rid,)).fetchone()
+        self.assertIsNotNone(row["resolved_at"])           # history intact
+        self.assertEqual(row["resolution_notes"], api.DISMISSED_NOTE)
+        # already-documented outage is not re-dismissed
+        self.assertFalse(api.dismiss_outage(rid, self.cfg))
+
 
     # -- device inventory CRUD --
     def test_create_validate_update_delete(self):
@@ -184,7 +203,6 @@ class ApiTest(unittest.TestCase):
         nid = api.create_device({
             "name": "New AP", "ip_address": "192.0.2.99", "device_type": "sector",
             "criticality": "2", "region": "Testville", "parent_device_id": "1",
-            "customer_count": "30", "base_revenue_impact": "75",
         }, self.cfg)
         rows = {d["id"]: d for d in api.list_devices(self.cfg)}
         self.assertIn(nid, rows)

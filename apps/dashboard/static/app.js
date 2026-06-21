@@ -24,6 +24,7 @@
 
   async function getJSON(url) {
     const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (r.status === 401) { requireLogin(); throw new Error("session expired"); }
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return r.json();
   }
@@ -34,6 +35,7 @@
       headers: { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    if (r.status === 401) { requireLogin(); return { ok: false, status: 401, data: {} }; }
     let data = {};
     try { data = await r.json(); } catch (e) { /* empty body */ }
     return { ok: r.ok, status: r.status, data };
@@ -43,13 +45,34 @@
 
   function fmtPct(n) { return (n == null ? "—" : Number(n).toFixed(2) + "%"); }
 
-  function fmtTime(ts) {
+  // Org/locale branding, populated from /api/auth/status (defaults until then).
+  const BRAND = { org_name: "HANSA", timezone: "UTC",
+    channels: { owner: "owner", operator: "operator", tech: "tech" } };
+
+  // Stored stamps are UTC: ISO with +00:00 (polls/outages) or space-separated naive
+  // (acks). Normalise to a real UTC instant, then render in the configured timezone.
+  function toUtcDate(ts) {
+    let s = String(ts).trim().replace(" ", "T");
+    if (!/(Z|[+-]\d\d:?\d\d)$/.test(s)) s += "Z";  // naive → treat as UTC
+    return new Date(s);
+  }
+
+  function fmtTime(ts, opts = {}) {
     if (!ts) return "—";
-    const d = new Date(String(ts).replace(" ", "T"));
+    const d = toUtcDate(ts);
     if (isNaN(d)) return ts;
-    const p = (x) => String(x).padStart(2, "0");
-    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
-      `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`;
+    const showTz = opts.tz !== false;   // pass {tz:false} to drop the zone suffix
+    try {
+      const fmt = {
+        timeZone: BRAND.timezone, year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      };
+      if (showTz) fmt.timeZoneName = "short";
+      return new Intl.DateTimeFormat("en-GB", fmt).format(d).replace(",", "");
+    } catch (e) {           // invalid tz → fall back to UTC
+      const s = d.toISOString().replace("T", " ").slice(0, 19);
+      return showTz ? s + " UTC" : s;
+    }
   }
 
   let _toastTimer = null;
@@ -75,6 +98,8 @@
   const NAV = [
     { path: "#/", icon: "dashboard", label: "Dashboard" },
     { path: "#/nodes", icon: "router", label: "Nodes" },
+    { path: "#/team", icon: "group", label: "Team" },
+    { path: "#/settings", icon: "settings", label: "Settings" },
     { path: "#/logs", icon: "terminal", label: "Logs" },
   ];
 
@@ -118,11 +143,17 @@
       <header class="w-full top-0 sticky bg-background border-b border-outline-variant flex justify-between items-center px-container-margin py-component-padding-y z-40 h-16 md:h-[57px]">
         <a href="#/" class="flex items-center gap-2 cursor-pointer active:opacity-80">
           ${icon("hub", { size: 28, cls: "text-primary" })}
-          <h1 class="font-headline-lg text-headline-lg font-bold tracking-tighter text-primary">HANSA</h1>
+          <h1 class="font-headline-lg text-headline-lg font-bold tracking-tighter text-primary">${esc(BRAND.org_name)}</h1>
         </a>
         <div class="flex items-center gap-2 text-on-surface-variant">
           <span id="uplink-chip" class="hidden"></span>
-          <div class="p-2 rounded-full flex items-center justify-center w-10 h-10 hover:bg-surface-container">${icon("account_circle", { size: 28 })}</div>
+          <div class="relative">
+            <button id="account-btn" class="p-2 rounded-full flex items-center justify-center w-10 h-10 hover:bg-surface-container active:scale-95 transition-transform">${icon("account_circle", { size: 28 })}</button>
+            <div id="account-menu" class="hidden absolute right-0 mt-2 w-56 bg-surface-container border border-outline-variant rounded-md shadow-lg z-50 py-1">
+              <div id="heartbeat" class="px-4 py-2.5 border-b border-outline-variant font-label-xs text-label-xs text-on-surface-variant flex items-center gap-2">${icon("monitoring", { size: 14 })} Monitor: checking…</div>
+              <button id="logout-btn" class="w-full text-left px-4 py-2.5 font-label-md text-label-md text-on-surface hover:bg-surface-container-high flex items-center gap-2">${icon("logout", { size: 18 })} Log out</button>
+            </div>
+          </div>
         </div>
       </header>
       <div class="flex flex-1 flex-col md:flex-row w-full max-w-[1920px] mx-auto pb-[80px] md:pb-0">
@@ -183,7 +214,7 @@
     </div>`;
   }
 
-  function triageCard(o) {
+  function triageCard(o, team = []) {
     const m = STATUS_META[o.status] || STATUS_META.unassigned;
     const head = `
       <div class="flex justify-between items-start">
@@ -192,16 +223,22 @@
           <div class="flex items-center gap-2 mt-1 flex-wrap">
             <span class="font-label-xs text-label-xs text-${m.text} border border-${m.text}/30 bg-${m.text}/10 px-2 py-0.5 rounded-sm">${m.tag}</span>
             <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("schedule", { size: 14 })} ${esc(o.duration_label)}</span>
-            <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("person", { size: 14 })} ~${o.customer_count}</span>
+            <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("event", { size: 14 })} ${fmtTime(o.started_at, { tz: false })}</span>
           </div>
         </div>
       </div>`;
 
     let action = "";
     if (o.status === "unassigned") {
+      const picker = team.length
+        ? `<select data-tech class="flex-1 bg-surface-container border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary appearance-none">
+             <option value="">Acknowledged by…</option>
+             ${team.map((w) => `<option value="${esc(w.name)}">${esc(w.name)} · ${esc(w.role)}</option>`).join("")}
+           </select>`
+        : `<input data-tech type="text" placeholder="Acknowledged by (your name)…" class="flex-1 bg-surface-container border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />`;
       action = `
         <div class="flex gap-2 w-full md:w-2/3" data-card="${o.id}">
-          <input data-tech type="text" placeholder="Acknowledged by (your name)…" class="flex-1 bg-surface-container border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />
+          ${picker}
           <button data-action="ack" class="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform whitespace-nowrap">Acknowledge</button>
         </div>`;
     } else if (o.status === "in_progress") {
@@ -224,7 +261,10 @@
             <label class="font-label-xs text-label-xs text-on-surface-variant">Resolution Details</label>
             <textarea data-notes rows="2" placeholder="Brief summary of the fix…" class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary resize-none"></textarea>
           </div>
-          <button data-action="postmortem" type="button" class="bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors w-full">Submit Log</button>
+          <div class="flex gap-2">
+            <button data-action="postmortem" type="button" class="flex-1 bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors">Submit Log</button>
+            <button data-action="dismiss" type="button" class="bg-transparent border border-error/40 text-error hover:bg-error/10 font-label-md text-label-md px-4 py-2 rounded-md transition-colors flex items-center gap-1" title="Discard without logging a post-mortem">${icon("delete", { size: 16 })} Delete</button>
+          </div>
         </form>`;
     }
 
@@ -251,15 +291,17 @@
 
     return async function load() {
       try {
-        const [s, triage] = await Promise.all([
+        const [s, triage, team] = await Promise.all([
           getJSON("/api/summary"), getJSON("/api/triage"),
+          getJSON("/api/workers").catch(() => []),
         ]);
         if (currentPath() !== "#/") return;
+        const responders = team.filter((w) => w.is_active);
         $("#summary", page).innerHTML = summaryCards(s);
         updateUplinkChip(s.uplink_down);
         $("#triage-count", page).textContent = `${triage.length} ITEM${triage.length === 1 ? "" : "S"}`;
         $("#triage", page).innerHTML = triage.length
-          ? triage.map((o) => triageCard(o)).join("")
+          ? triage.map((o) => triageCard(o, responders)).join("")
           : `<div class="border border-outline-variant bg-surface-container-low rounded-md p-6 flex items-center gap-3 text-on-surface-variant">
               ${icon("task_alt", { cls: "text-emerald-400" })}<span class="font-body-sm">All clear — no active outages.</span></div>`;
         wireTriage(page, load);
@@ -294,6 +336,17 @@
         const res = await postJSON(`/api/outages/${id}/postmortem`, { root_cause: root, notes });
         if (res.ok && res.data.ok) { toast("Post-mortem logged"); reload(); }
         else { toast("Submit failed", "error"); btn.disabled = false; }
+      });
+    });
+    page.querySelectorAll('[data-action="dismiss"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const form = btn.closest("[data-card]");
+        const id = form.getAttribute("data-card");
+        if (!confirm("Delete this outage from the list without logging a post-mortem? It stays in downtime history.")) return;
+        btn.disabled = true;
+        const res = await sendJSON("DELETE", `/api/outages/${id}`);
+        if (res.ok && res.data.ok) { toast("Outage dismissed"); reload(); }
+        else { toast("Dismiss failed (already logged?)", "error"); btn.disabled = false; }
       });
     });
   }
@@ -373,7 +426,6 @@
 
   // --- node inventory editor (add / edit / delete) --------------------------
   const DEVICE_TYPES = ["core", "tower", "relay", "sector", "backhaul"];
-  const CRIT_LABELS = { 1: "1 · lowest", 2: "2 · low", 3: "3 · medium", 4: "4 · high", 5: "5 · core" };
 
   function openModal(innerHtml) {
     const overlay = document.createElement("div");
@@ -411,7 +463,6 @@
     const isEdit = !!device;
     const d = device || {};
     const typeOpts = [{ value: "", label: "—" }].concat(DEVICE_TYPES.map((t) => ({ value: t, label: t })));
-    const critOpts = [1, 2, 3, 4, 5].map((n) => ({ value: n, label: CRIT_LABELS[n] }));
     const parentOpts = [{ value: "", label: "None (root)" }].concat(
       devices.filter((x) => x.id !== d.id).map((x) => ({ value: x.id, label: `${x.name} (#${x.id})` })));
 
@@ -426,12 +477,7 @@
         ${field("IP address", "ip_address", d.ip_address, { required: true, placeholder: "192.0.2.10" })}
         ${field("Type", "device_type", d.device_type, { options: typeOpts })}
         ${field("Region", "region", d.region, { placeholder: "village / area" })}
-        ${field("Criticality", "criticality", d.criticality != null ? d.criticality : 3, { options: critOpts })}
         ${field("Parent node", "parent_device_id", d.parent_device_id, { options: parentOpts, full: true })}
-        ${field("Power reference IP", "power_ref_ip", d.power_ref_ip, { placeholder: "same-mains node (power vs link)" })}
-        ${field("Technician phone", "technician_phone", d.technician_phone, { placeholder: "+91…" })}
-        ${field("Customers behind", "customer_count", d.customer_count != null ? d.customer_count : 0, { type: "number" })}
-        ${field("Revenue impact (₹/hr)", "base_revenue_impact", d.base_revenue_impact != null ? d.base_revenue_impact : 0, { type: "number", step: "1" })}
         <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
           <div>${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
           <div class="flex items-center gap-2">
@@ -603,25 +649,18 @@
 
   // --- Logs -----------------------------------------------------------------
   const logState = { q: "", offset: 0, limit: 25 };
-  const SEV = {
-    critical: { dot: "bg-error", text: "text-error", label: "Critical" },
-    warning: { dot: "bg-amber-500", text: "text-amber-500", label: "Warning" },
-    info: { dot: "bg-outline", text: "text-on-surface-variant", label: "Info" },
-  };
 
   function logRows(entries) {
     if (!entries.length) {
-      return `<tr><td colspan="7" class="px-4 text-center align-middle text-on-surface-variant font-body-sm" style="height:55vh">
+      return `<tr><td colspan="6" class="px-4 text-center align-middle text-on-surface-variant font-body-sm" style="height:55vh">
         <div class="flex flex-col items-center gap-2">${icon("search", { size: 28, cls: "text-outline" })}<span>No matching incidents.</span></div>
       </td></tr>`;
     }
     return entries.map((e) => {
-      const sv = SEV[e.severity] || SEV.info;
       return `<tr class="hover:bg-surface-container-high/50 transition-colors">
         <td class="px-4 py-3 text-on-surface">${esc(fmtTime(e.timestamp))}</td>
         <td class="px-4 py-3 text-primary">${esc(e.incident)}</td>
         <td class="px-4 py-3 text-on-surface-variant">${esc(e.region)} / ${esc(e.name)}</td>
-        <td class="px-4 py-3"><div class="flex items-center gap-2"><div class="w-2 h-2 rounded-full ${sv.dot}"></div><span class="${sv.text}">${sv.label}</span></div></td>
         <td class="px-4 py-3 text-on-surface-variant">${esc(e.duration_label)}</td>
         <td class="px-4 py-3 text-on-surface truncate max-w-[220px]" title="${esc(e.resolution_notes || "")}">${esc(e.root_cause)}</td>
         <td class="px-4 py-3 text-on-surface-variant">${esc(e.acknowledged_by || "—")}</td>
@@ -663,7 +702,6 @@
               <th class="px-4 py-3 font-semibold">Timestamp</th>
               <th class="px-4 py-3 font-semibold">Incident</th>
               <th class="px-4 py-3 font-semibold">Region / Node</th>
-              <th class="px-4 py-3 font-semibold">Severity</th>
               <th class="px-4 py-3 font-semibold">Duration</th>
               <th class="px-4 py-3 font-semibold">Root Cause</th>
               <th class="px-4 py-3 font-semibold">Acked By</th>
@@ -685,7 +723,7 @@
         $('[data-page="prev"]', page)?.addEventListener("click", () => { logState.offset = Math.max(0, logState.offset - logState.limit); load(); });
         $('[data-page="next"]', page)?.addEventListener("click", () => { logState.offset += logState.limit; load(); });
       } catch (e) {
-        body.innerHTML = `<tr><td colspan="7">${errorBox(e.message)}</td></tr>`;
+        body.innerHTML = `<tr><td colspan="6">${errorBox(e.message)}</td></tr>`;
       }
     }
 
@@ -697,8 +735,386 @@
     return load;
   }
 
+  // --- Team (worker directory; plan §8.5) -----------------------------------
+  const WORKER_ROLES = ["owner", "operator", "tech"];
+  const ROLE_CHIP = {
+    owner: "text-amber-400 border-amber-400/30 bg-amber-400/10",
+    operator: "text-blue-400 border-blue-400/30 bg-blue-400/10",
+    tech: "text-emerald-400 border-emerald-400/30 bg-emerald-400/10",
+  };
+
+  function workerCard(w) {
+    const chip = ROLE_CHIP[w.role] || ROLE_CHIP.tech;
+    const channel = BRAND.channels[w.role] || w.role;
+    const dim = w.is_active ? "" : "opacity-50";
+    return `<div data-worker="${w.id}" class="bg-surface border border-outline-variant rounded-md p-4 flex flex-col gap-2 hover:bg-surface-container-low transition-colors cursor-pointer ${dim}">
+      <div class="flex items-center justify-between gap-2">
+        <h4 class="font-body-lg text-body-lg text-primary font-medium truncate">${esc(w.name)}</h4>
+        <span class="font-label-xs text-label-xs ${chip} border px-2 py-0.5 rounded-sm uppercase">${esc(w.role)}</span>
+      </div>
+      <p class="font-body-sm text-body-sm text-on-surface-variant">${esc(w.region || "all regions")}${w.is_active ? "" : " · inactive"}</p>
+      <p class="font-mono-data text-on-surface-variant text-[11px] truncate">${icon("notifications", { size: 12, cls: "inline align-text-bottom" })} ${esc(channel)}</p>
+    </div>`;
+  }
+
+  function openWorkerModal(worker, onDone) {
+    const isEdit = !!worker;
+    const w = worker || {};
+    const roleOpts = WORKER_ROLES.map((r) => ({ value: r, label: r }));
+    const activeOpts = [{ value: 1, label: "Active" }, { value: 0, label: "Inactive" }];
+    const form = `
+      <div class="sticky top-0 bg-surface-container border-b border-outline-variant px-5 py-4 flex items-center justify-between">
+        <h3 class="font-headline-md text-headline-md text-primary flex items-center gap-2">
+          ${icon(isEdit ? "edit" : "add_circle", { size: 20 })} ${isEdit ? "Edit worker" : "Add worker"}</h3>
+        <button data-close class="text-on-surface-variant hover:text-primary p-1 rounded-full hover:bg-surface-container-high">${icon("close", { size: 20 })}</button>
+      </div>
+      <form data-worker-form class="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
+        ${field("Name", "name", w.name, { required: true, full: true, placeholder: "e.g. Suresh" })}
+        ${field("Role", "role", w.role || "tech", { options: roleOpts })}
+        ${field("Status", "is_active", w.is_active != null ? w.is_active : 1, { options: activeOpts })}
+        ${field("Region", "region", w.region, { placeholder: "village / area (blank = all)" })}
+        ${field("Notes", "notes", w.notes, { full: true, placeholder: "optional" })}
+        <div class="sm:col-span-2 text-label-xs text-on-surface-variant bg-surface-container-low border border-outline-variant rounded-md px-3 py-2">
+          ${icon("notifications", { size: 14, cls: "inline align-text-bottom" })}
+          Alerts route by <span class="text-primary">role</span> — this person subscribes to the
+          <span class="text-primary font-mono-data" data-role-channel>${esc(BRAND.channels[w.role || "tech"] || (w.role || "tech"))}</span> channel on ntfy.
+        <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
+          <div>${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
+          <div class="flex items-center gap-2">
+            <button type="button" data-close class="text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 py-2 rounded-md hover:bg-surface-container-high">Cancel</button>
+            <button type="submit" class="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform">${isEdit ? "Save changes" : "Add worker"}</button>
+          </div>
+        </div>
+      </form>`;
+
+    const { overlay, close } = openModal(form);
+    overlay.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
+    const roleSel = overlay.querySelector('[data-field="role"]');
+    const chanHint = overlay.querySelector("[data-role-channel]");
+    if (roleSel && chanHint) roleSel.addEventListener("change", () => {
+      chanHint.textContent = BRAND.channels[roleSel.value] || roleSel.value;
+    });
+    overlay.querySelector("[data-worker-form]").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const payload = {};
+      overlay.querySelectorAll("[data-field]").forEach((el) => { payload[el.getAttribute("data-field")] = el.value; });
+      const submitBtn = ev.target.querySelector('[type="submit"]');
+      submitBtn.disabled = true;
+      const res = isEdit
+        ? await sendJSON("PUT", `/api/workers/${w.id}`, payload)
+        : await sendJSON("POST", "/api/workers", payload);
+      if (res.ok && res.data.ok) { toast(isEdit ? "Worker updated" : "Worker added"); close(); onDone(); }
+      else { toast(res.data.error || res.data.reason || "Couldn't save worker", "error"); submitBtn.disabled = false; }
+    });
+
+    const delBtn = overlay.querySelector("[data-delete]");
+    if (delBtn) {
+      let armed = false, t;
+      delBtn.addEventListener("click", async () => {
+        if (!armed) {
+          armed = true;
+          delBtn.innerHTML = `${icon("delete", { size: 16 })} Tap again to confirm`;
+          delBtn.classList.add("bg-error", "text-on-error");
+          t = setTimeout(() => { armed = false; delBtn.innerHTML = `${icon("delete", { size: 16 })} Delete`; delBtn.classList.remove("bg-error", "text-on-error"); }, 3000);
+          return;
+        }
+        clearTimeout(t);
+        delBtn.disabled = true;
+        const res = await sendJSON("DELETE", `/api/workers/${w.id}`);
+        if (res.ok && res.data.ok) { toast("Worker deleted"); close(); onDone(); }
+        else { toast(res.data.error || res.data.reason || "Couldn't delete", "error"); delBtn.disabled = false; }
+      });
+    }
+  }
+
+  function renderTeam(page) {
+    page.innerHTML = `<div class="w-full max-w-5xl mx-auto px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6">
+      <header class="flex items-center justify-between gap-2">
+        <div>
+          <h2 class="font-display text-display text-primary">Team</h2>
+          <p class="font-body-lg text-body-lg text-on-surface-variant">Workers, roles, and alert routing.</p>
+        </div>
+        <button id="add-worker" class="flex items-center gap-1 bg-primary text-surface font-label-md text-label-md px-3 py-2 rounded-md active:scale-95 transition-transform whitespace-nowrap">${icon("add", { size: 16 })} Add worker</button>
+      </header>
+      <div id="team-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">${loading("team")}</div></div>`;
+
+    async function load() {
+      const grid = $("#team-grid", page);
+      try {
+        const workers = await getJSON("/api/workers");
+        if (currentPath() !== "#/team") return;
+        grid.innerHTML = workers.length
+          ? workers.map(workerCard).join("")
+          : `<div class="sm:col-span-2 lg:col-span-3 border border-outline-variant bg-surface-container-low rounded-md p-6 flex items-center gap-3 text-on-surface-variant">
+              ${icon("group", { cls: "text-outline" })}<span class="font-body-sm">No workers yet — add your owner and field technicians.</span></div>`;
+      } catch (e) { grid.innerHTML = errorBox(e.message); }
+    }
+
+    $("#add-worker", page).addEventListener("click", () => openWorkerModal(null, load));
+    $("#team-grid", page).addEventListener("click", async (ev) => {
+      const card = ev.target.closest("[data-worker]");
+      if (!card) return;
+      const id = Number(card.getAttribute("data-worker"));
+      try {
+        const workers = await getJSON("/api/workers");
+        const w = workers.find((x) => x.id === id);
+        if (w) openWorkerModal(w, load);
+      } catch (e) { toast("Couldn't load worker", "error"); }
+    });
+
+    return load;
+  }
+
+  // --- Settings (account / security / channel test) -------------------------
+  // Operational tunables (poll interval, thresholds, escalation timings, ntfy URL,
+  // org/locale) are configured via WISP_* environment variables and applied on
+  // restart — see config.py. This page keeps the in-UI essentials: PIN, channel
+  // test, and backup.
+  function renderSettings(page) {
+    page.innerHTML = `<div class="w-full max-w-4xl mx-auto px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6">
+      <header><h2 class="font-display text-display text-primary">Settings</h2>
+        <p class="font-body-lg text-body-lg text-on-surface-variant">Access, channel checks, and backup. Detection &amp; alerting tunables are set via environment variables (restart to apply).</p></header>
+      <div id="settings-body">${loading("settings")}</div></div>`;
+
+    let workers = [];
+
+    function channelsBlock() {
+      const base = (BRAND.ntfy_base_url || "https://ntfy.sh").replace(/\/$/, "");
+      const ch = BRAND.channels || {};
+      const row = (role, desc) => `<div class="flex items-center justify-between gap-2 py-1.5 border-b border-outline-variant/50 last:border-0">
+        <div><span class="font-label-xs text-label-xs uppercase ${(ROLE_CHIP[role] || ROLE_CHIP.tech)} border px-1.5 py-0.5 rounded-sm">${role}</span>
+          <span class="font-body-sm text-on-surface-variant ml-2">${desc}</span></div>
+        <code class="font-mono-data text-[11px] text-primary truncate max-w-[45%]" title="${esc(base)}/${esc(ch[role] || role)}">${esc(ch[role] || role)}</code>
+      </div>`;
+      return `<div class="mt-6 pt-5 border-t border-outline-variant flex flex-col gap-2">
+        <h4 class="font-headline-md text-headline-md text-primary flex items-center gap-2">${icon("hub", { size: 18 })} Alert channels</h4>
+        <p class="font-body-sm text-body-sm text-on-surface-variant">Each person subscribes in the ntfy app (server <code class="font-mono-data text-[11px]">${esc(base)}</code>) to the topic for their role.</p>
+        <div class="bg-surface-container-low border border-outline-variant rounded-md px-3 py-1">
+          ${row("owner", "escalations + uplink alerts")}
+          ${row("operator", "everything (full visibility)")}
+          ${row("tech", "device down / still-down / restored")}
+        </div>
+      </div>`;
+    }
+
+    function testSendBlock() {
+      const opts = WORKER_ROLES.map((r) =>
+        `<option value="${r}">${r} channel</option>`).join("");
+      return `<div class="mt-6 pt-5 border-t border-outline-variant flex flex-col gap-3">
+        <h4 class="font-headline-md text-headline-md text-primary flex items-center gap-2">${icon("notifications", { size: 18 })} Send test alert</h4>
+        <p class="font-body-sm text-body-sm text-on-surface-variant">Confirm a channel works before a real outage depends on it — fires a test push to that topic.</p>
+        <div class="flex flex-col sm:flex-row gap-2">
+          <select data-test-target class="flex-1 bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary appearance-none">${opts}</select>
+          <button id="send-test" class="bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors whitespace-nowrap">Send test</button>
+        </div>
+        <div id="test-result" class="font-label-xs text-label-xs"></div>
+      </div>`;
+    }
+
+    function backupBlock() {
+      return `<div class="mt-6 pt-5 border-t border-outline-variant flex flex-col gap-3">
+        <h4 class="font-headline-md text-headline-md text-primary flex items-center gap-2">${icon("download", { size: 18 })} Backup</h4>
+        <p class="font-body-sm text-body-sm text-on-surface-variant">Download a full copy of the database — config, PIN, team directory, and history.</p>
+        <a href="/api/backup" class="self-start inline-flex items-center gap-1 bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors">${icon("download", { size: 16 })} Download backup</a>
+      </div>`;
+    }
+
+    function pinForm() {
+      return `<div class="mt-6 pt-5 border-t border-outline-variant flex flex-col gap-3">
+        <h4 class="font-headline-md text-headline-md text-primary flex items-center gap-2">${icon("vpn_key", { size: 18 })} Change PIN</h4>
+        <form data-pin-form class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <input data-pin="old" type="password" placeholder="Current PIN" autocomplete="off" class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />
+          <input data-pin="new" type="password" placeholder="New PIN (min 4 digits)" autocomplete="new-password" class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />
+          <button type="submit" class="sm:col-span-2 bg-transparent border border-outline-variant text-primary hover:bg-surface-container font-label-md text-label-md px-4 py-2 rounded-md transition-colors">Update PIN</button>
+        </form></div>`;
+    }
+
+    function paint() {
+      if (currentPath() !== "#/settings") return;
+      $("#settings-body", page).innerHTML =
+        `<div class="flex flex-col gap-1">${pinForm()}${channelsBlock()}${testSendBlock()}${backupBlock()}</div>`;
+      wire();
+    }
+
+    function wire() {
+      const box = $("#settings-body", page);
+      const pf = $("[data-pin-form]", box);
+      if (pf) pf.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const oldp = $('[data-pin="old"]', pf).value;
+        const newp = $('[data-pin="new"]', pf).value;
+        const res = await postJSON("/api/settings/pin", { old: oldp, new: newp });
+        if (res.ok && res.data.ok) { toast("PIN updated"); pf.reset(); }
+        else { toast(res.data.error || "Couldn't update PIN", "error"); }
+      });
+      const st = $("#send-test", box);
+      if (st) st.addEventListener("click", async () => {
+        const target = $("[data-test-target]", box).value;
+        const rl = $("#test-result", box);
+        st.disabled = true;
+        rl.textContent = "Sending…";
+        rl.className = "font-label-xs text-label-xs text-on-surface-variant";
+        const res = await postJSON("/api/channels/test", { target });
+        if (res.ok) {
+          const ok = res.data.ok;
+          rl.textContent = (ok ? "✓ " : "✗ ") + (res.data.detail || "");
+          rl.className = "font-label-xs text-label-xs " + (ok ? "text-emerald-400" : "text-error");
+        } else {
+          rl.textContent = res.data.error || "Test failed";
+          rl.className = "font-label-xs text-label-xs text-error";
+        }
+        st.disabled = false;
+      });
+    }
+
+    return async function load() {
+      try { workers = await getJSON("/api/workers"); } catch (e) { workers = []; }
+      paint();
+    };
+  }
+
+  // --- auth gate (shared-PIN login; plan §8.2) ------------------------------
+  let _loginShown = false;
+
+  async function fetchAuthStatus() {
+    try {
+      const r = await fetch("/api/auth/status", { headers: { Accept: "application/json" } });
+      if (!r.ok) return { pin_set: true, authed: false };
+      const st = await r.json();
+      if (st.org_name) BRAND.org_name = st.org_name;
+      if (st.timezone) BRAND.timezone = st.timezone;
+      if (st.channels) BRAND.channels = st.channels;
+      if (st.ntfy_base_url) BRAND.ntfy_base_url = st.ntfy_base_url;
+      document.title = `${BRAND.org_name} — Network Monitor`;
+      return st;
+    } catch (e) { return { pin_set: true, authed: false }; }
+  }
+
+  // Called on a 401 anywhere, or at startup when not signed in. Replaces the whole
+  // app shell with a full-page PIN gate (first-run variant when no PIN exists yet).
+  async function requireLogin() {
+    if (_loginShown) return;
+    _loginShown = true;
+    clearInterval(_refreshTimer);
+    const st = await fetchAuthStatus();
+    renderLogin(!st.pin_set);
+  }
+
+  function renderLogin(setupMode) {
+    const root = document.getElementById("root");
+    const title = setupMode ? "Set a PIN" : "Enter PIN";
+    const hint = setupMode
+      ? "Choose a numeric PIN (at least 4 digits) to protect this dashboard."
+      : "Enter the shared PIN to access the dashboard.";
+    root.innerHTML = `
+      <div class="min-h-screen flex items-center justify-center px-4 bg-background">
+        <div class="w-full max-w-xs flex flex-col items-center gap-6">
+          <div class="flex items-center gap-2">${icon("hub", { size: 30, cls: "text-primary" })}
+            <h1 class="font-headline-lg text-headline-lg font-bold tracking-tighter text-primary">${esc(BRAND.org_name)}</h1></div>
+          <div class="w-full bg-surface-container border border-outline-variant rounded-xl p-6 flex flex-col gap-5">
+            <div class="flex flex-col items-center gap-2 text-center">
+              <div class="w-12 h-12 rounded-full bg-surface-container-high flex items-center justify-center text-primary">${icon(setupMode ? "vpn_key" : "lock", { size: 24 })}</div>
+              <h2 class="font-headline-md text-headline-md text-primary">${title}</h2>
+              <p class="font-body-sm text-body-sm text-on-surface-variant">${hint}</p>
+            </div>
+            <form id="pin-form" class="flex flex-col gap-4">
+              <input id="pin-input" type="password" inputmode="numeric" pattern="[0-9]*"
+                autocomplete="${setupMode ? "new-password" : "one-time-code"}" maxlength="12"
+                placeholder="••••" aria-label="PIN"
+                class="w-full text-center tracking-[0.5em] bg-surface border border-outline-variant text-primary text-headline-md rounded-md px-3 py-3 outline-none focus:ring-1 focus:ring-primary" />
+              <div id="login-err" class="hidden text-center font-label-xs text-label-xs text-error"></div>
+              <button id="pin-submit" type="submit" class="bg-primary text-surface font-label-md text-label-md py-3 rounded-md active:scale-95 transition disabled:opacity-40">${setupMode ? "Set PIN & continue" : "Unlock"}</button>
+            </form>
+          </div>
+        </div>
+      </div>`;
+
+    const input = $("#pin-input", root);
+    const err = $("#login-err", root);
+    const submit = $("#pin-submit", root);
+    const form = $("#pin-form", root);
+    const showErr = (m) => { err.textContent = m; err.classList.remove("hidden"); };
+
+    submit.disabled = true;
+    setTimeout(() => input.focus(), 50);   // pop the system keyboard
+    input.addEventListener("input", () => {
+      const cleaned = input.value.replace(/\D/g, "").slice(0, 12);  // digits only
+      if (cleaned !== input.value) input.value = cleaned;
+      err.classList.add("hidden");
+      submit.disabled = input.value.length < 4;
+    });
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const pin = input.value;
+      if (pin.length < 4) return;
+      submit.disabled = true;
+      const url = setupMode ? "/api/auth/setup" : "/api/login";
+      let r;
+      try {
+        r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+      } catch (e) { showErr("Network error — try again"); submit.disabled = false; return; }
+      const data = await r.json().catch(() => ({}));
+      if (r.ok && data.ok) {
+        _loginShown = false;
+        if (!location.hash) location.hash = "#/";
+        route();
+        return;
+      }
+      input.value = ""; submit.disabled = true;
+      showErr(data.error || (setupMode ? "Couldn't set PIN" : "Incorrect PIN"));
+    });
+  }
+
+  function fmtAge(s) {
+    if (s == null) return "no data yet";
+    if (s < 90) return `${s}s ago`;
+    if (s < 5400) return `${Math.round(s / 60)}m ago`;
+    return `${Math.round(s / 3600)}h ago`;
+  }
+
+  async function refreshHeartbeat() {
+    const hb = document.getElementById("heartbeat");
+    if (!hb) return;
+    try {
+      const s = await getJSON("/api/summary");
+      const age = s.monitor_age_s;
+      // Staleness is decided server-side (Config.stale_threshold_s) so the banner,
+      // the summary, and the watchdog that pages the owner all agree. Fall back to
+      // the old ~5-min heuristic only if an older server omits the flag.
+      const stale = s.monitor_stale != null
+        ? s.monitor_stale
+        : (age == null || age > 300);
+      hb.innerHTML = `${icon("monitoring", { size: 14 })} <span class="${stale ? "text-error" : "text-emerald-400"}">Monitor: ${stale ? "⚠ stale" : "healthy"}</span> · ${fmtAge(age)}`;
+    } catch (e) { /* leave the placeholder */ }
+  }
+
+  function wireHeader() {
+    const btn = document.getElementById("account-btn");
+    const menu = document.getElementById("account-menu");
+    if (!btn || !menu) return;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      menu.classList.toggle("hidden");
+      if (!menu.classList.contains("hidden")) refreshHeartbeat();
+    });
+    document.addEventListener("click", () => menu.classList.add("hidden"));
+    const lo = document.getElementById("logout-btn");
+    if (lo) lo.addEventListener("click", async () => {
+      await postJSON("/api/logout");
+      requireLogin();
+    });
+  }
+
   // --- router + auto-refresh ------------------------------------------------
-  const ROUTES = { "#/": renderDashboard, "#/nodes": renderNodes, "#/logs": renderLogs };
+  const ROUTES = {
+    "#/": renderDashboard,
+    "#/nodes": renderNodes,
+    "#/team": renderTeam,
+    "#/settings": renderSettings,
+    "#/logs": renderLogs,
+  };
+  const AUTO_REFRESH = new Set(["#/", "#/nodes"]);
   let _refreshTimer = null;
   let _activeLoad = null;
 
@@ -710,21 +1126,25 @@
   function route() {
     clearInterval(_refreshTimer);
     document.getElementById("root").innerHTML = shell();
+    wireHeader();
     const page = $("#page");
     const render = ROUTES[currentPath()] || renderDashboard;
     const load = render(page);
     _activeLoad = load;
     load();
-    // Logs is on-demand (search/paginate); Dashboard + Nodes auto-refresh.
-    if (currentPath() !== "#/logs") {
+    // Only the live views auto-refresh; Settings/Team/Logs are edited or on-demand,
+    // so a background reload would clobber in-progress form input.
+    if (AUTO_REFRESH.has(currentPath())) {
       _refreshTimer = setInterval(() => {
         if (!formFocused() && _activeLoad === load) load();
       }, 15000);
     }
   }
 
-  window.addEventListener("hashchange", route);
-  window.addEventListener("DOMContentLoaded", () => {
+  window.addEventListener("hashchange", () => { if (!_loginShown) route(); });
+  window.addEventListener("DOMContentLoaded", async () => {
+    const st = await fetchAuthStatus();
+    if (!st.authed) { renderLogin(!st.pin_set); return; }
     if (!location.hash) location.hash = "#/";
     route();
   });
