@@ -1,141 +1,151 @@
 # Deploying WISP
 
-How to ship and upgrade this monitor on a single always-on Linux box. Read alongside
-`README.md` (what it is / how to run) and `CLAUDE.md` (invariants). The systemd units in
-`deploy/` are the starting point; this doc is the production-grade version of them.
+How to run this monitor on a single always-on Linux box you own (your father's
+server). Read alongside `README.md` (what it is / how to run) and `CLAUDE.md`
+(invariants). The systemd units in `deploy/` are the starting point.
 
-## Verdict: the code is right-sized, not bloated
-
-For the record, so nobody "minimizes" it into a worse state later:
-
-- **~2,300 lines of source** (non-test) for a topology-aware FSM monitor + alerting ladder +
-  analytics + auth + dashboard API. That's lean.
-- **~1,900 lines / 58 tests.** The right ratio — this is what makes upgrades safe. Don't cut it.
-- **Near-zero dependency surface**: the dashboard/CLI/tests are pure stdlib; only the daemon
-  needs `icmplib` + `httpx`. For an on-prem appliance that's an asset, keep it.
-
-The layering (pure `MonitorEngine` with no I/O, DB-derived escalations, in-process hot reload,
-watchdog-watches-daemon) is hard-won correctness. **Do not flatten it to feel "minimal"** — that
-trades testability for a smaller tree and re-grows the structure six months later.
-
-The only real weight is `apps/dashboard/static/vendor/tailwind.js` (~419 KB, the Tailwind Play
-CDN runtime that JITs CSS in the browser) — ~95% of non-test bytes. It loads once over the LAN,
-so it's cosmetic, not a perf problem. Precompiling it to a ~15 KB static stylesheet is the only
-"minimization" with real payoff, and it costs a Node build step. Leave it until it annoys you.
+This is the **simple, single-box** deployment: one server, you control root, plain
+Python under systemd. No containers, no release pipeline, no code obfuscation — none
+of that earns its keep for one appliance you own.
 
 ## Why native systemd, not Docker
 
-This is a **network monitor**: it wants to sit on the host's real network stack. In a container
-you're forced into `network_mode: host` + `cap-add=NET_RAW` (or the ping-group sysctl on both
-host and container) just to ping correctly — at which point the container buys almost no isolation
-while adding a moving part. Containers win for fleets and noisy-neighbour isolation; this is one
-appliance doing one job. A directory install under systemd is simpler and more debuggable.
+This is a **network monitor** — it wants the host's real network stack. In a container
+you're forced into `network_mode: host` + the ping-group sysctl just to ping correctly,
+at which point the container buys almost no isolation while adding a moving part. A
+plain directory install under systemd is simpler and easier to debug.
 
-A single PyInstaller/zipapp binary also fights us here: SQLite migrations, vendored static assets,
-and a raw-socket C-ish dep (`icmplib`) make a directory install simpler than a frozen blob. Save
-binaries for boxes you can't SSH into.
+## What runs
 
-## Production layout (state leaves the release dir)
+Two long-lived processes, both pointed at the same SQLite DB (WAL lets them coexist):
 
-The single most important production change: **keep operator data out of the code directory** so
-an upgrade physically cannot touch it.
+- **`wisp-monitor`** — the polling daemon (`apps/daemon/main.py`). Needs the venv
+  (`icmplib` + `httpx`) and the kernel ping group enabled.
+- **`wisp-dashboard`** — the operator web UI (`apps/dashboard/main.py`). Pure stdlib,
+  but uses the venv too so the "Send test alert" button (httpx → ntfy) works.
 
-```
-/opt/wisp/
-├── releases/<git-tag>/      # each unpacked release (code + its .venv)
-└── current  ->  releases/<git-tag>/   # atomic symlink the services point at
+State lives under `data/` in the install dir: `wisp.db` (+ wal/shm) and `session_secret`.
+That directory is **git-ignored**, so upgrading with `git pull` never touches your
+database or history.
 
-/var/lib/wisp/               # STATE — never touched by a release
-├── wisp.db (+ wal/shm)
-└── session_secret           # 0600
-```
+## Quick install (one script)
 
-Set `WISP_DB_PATH=/var/lib/wisp/wisp.db` (and keep the session secret under `/var/lib/wisp`).
-Then "redeploy by swapping the folder" can never endanger the DB. (See the memory note: never
-wipe the DB.)
-
-## Shipping: private release tarball + scp (no public host)
-
-Chosen because the box has internet (deps are easy) but the **source must stay private** — no git
-hosting, nothing to leak. Flow:
-
-1. **Build on your machine** from a clean checkout → `wisp-<tag>.tar.gz`.
-2. **`scp` it to the box** — nothing is hosted anywhere.
-3. **`install.sh` on the box**: unpack to `releases/<tag>/`, `uv sync` (pulls the two deps from
-   PyPI — that's what the internet is for), flip `current` → new release, `systemctl restart`.
-4. **Rollback** = flip `current` back to the previous release and restart.
-
-Upgrades are then just: build → scp → install. Schema upgrades ride along automatically — the
-migration runner tracks `schema_migrations` and applies `migrations/000N_*.sql` forward on start.
-
-## On "don't leak my code" — be honest about the tiers
-
-If someone else has root on the box, Python source is **not** truly protected. Pick your tier:
-
-- **Your own appliance** (you control root): ship plain `.py`. The private tarball already solves
-  "leak" — nothing is hosted. Don't waste effort on obfuscation. ← most likely you.
-- **Customer controls the box, you want a speed bump:** ship **bytecode-only** (compile to `.pyc`,
-  delete the `.py`). Stops a casual `cat`, but `.pyc` decompiles back to near-source in seconds
-  (`decompyle3`/`uncompyle6`). A lock on a screen door.
-- **You think bytecode = protection:** it doesn't, and neither does PyInstaller (unpacks
-  trivially). Real protection is architectural — keep the secret-sauce logic server-side and ship
-  a thin client — not obfuscation.
-
-## Dependency pinning (don't get surprised on a remote box)
-
-`requirements.txt` currently uses `>=` ranges (`icmplib>=3.0`), which can pull a breaking major
-onto a box you can't easily debug. Use **`uv` with a lockfile** (`uv.lock`): reproducible, fast,
-manages the venv. `uv sync` on the box installs exactly what you tested.
-
-## First-time install on the box
+Once the code is on the box, a single idempotent script does all the OS setup, venv,
+sysctl, DB migrate, and systemd wiring — and re-running it after a `git pull` upgrades:
 
 ```bash
-# one-time host prep
-sudo useradd --system --home /var/lib/wisp --shell /usr/sbin/nologin wisp
-sudo mkdir -p /opt/wisp/releases /var/lib/wisp
-sudo chown -R wisp:wisp /var/lib/wisp
+# get the code to its final home (private repo → deploy key, or scp). Then:
+cd /opt/wisp
+sudo deploy/install.sh
+```
 
-# unprivileged ICMP (no root / no cap_net_raw needed for the daemon)
+It prints the dashboard URL and the firewall commands to run next. It deliberately does
+**not** clone the repo (that needs your credentials) or touch the firewall (that needs
+your LAN subnet — locking yourself out of SSH is no fun). Everything else is automatic.
+The manual walkthrough below is the same steps, broken out, if you want to understand or
+adjust any of them.
+
+## First-time install (manual walkthrough)
+
+Install to `/opt/wisp` (what the systemd units expect). Get the code there however you
+like — `git clone` the private repo with a deploy key, or `scp` a copy across.
+
+```bash
+# 1. put the code at /opt/wisp (private repo via SSH deploy key, or scp)
+sudo git clone git@github.com:haneeshbyreddy/ping_tool.git /opt/wisp
+cd /opt/wisp
+
+# 2. venv for the daemon's two deps (system Python is PEP 668-locked — never install globally)
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. let the daemon send ICMP as a normal user (unprivileged ping sockets — no root, no cap_net_raw)
 echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/99-wisp-ping.conf
 sudo sysctl --system
 
-# deploy the first release (see install.sh), then:
-sudo cp /opt/wisp/current/deploy/wisp-*.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now wisp-monitor wisp-dashboard
+# 4. create the DB + run migrations
+PYTHONPATH=src python -m wisp.database.client
+
+# 5. install + start both services
+sudo cp deploy/wisp-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wisp-monitor wisp-dashboard
 ```
 
-The dashboard is plain HTTP + a shared PIN — **keep it on the office LAN, off the public
-internet** (see `plan.md` §8.2).
+Check it came up:
+
+```bash
+systemctl status wisp-monitor wisp-dashboard
+journalctl -u wisp-monitor -f          # live daemon log
+```
+
+Then open the dashboard at `http://<box-lan-ip>:8000`, set the PIN on first visit, and
+add your real devices + team from the UI.
+
+> **Edit the units before installing if your paths differ.** The shipped
+> `deploy/wisp-*.service` assume `/opt/wisp` and the venv at `/opt/wisp/.venv`. They run
+> as root by default; to run as an unprivileged user, create one and uncomment the
+> `User=`/`Group=` lines (the ping-group sysctl above is what lets a non-root user ping).
+
+## The one security rule
+
+The dashboard is **plain HTTP + a shared PIN**. Keep it on the office LAN, **off the
+public internet** — no port-forward, no "just for me to check from outside." If your
+father needs to reach it remotely, put him on the LAN with a VPN (WireGuard / Tailscale);
+do not expose port 8000. (See `plan.md` §8.2.)
+
+## Alert channels (ntfy topics)
+
+Both units set the same three `WISP_NTFY_TOPIC_*` env vars — they **must match between
+the two units**, or pages route to a different topic than the dashboard shows. The
+defaults are unguessable strings so they can't be read on the public `ntfy.sh`. Each
+person subscribes (in the ntfy app) to the topic for their role. Change them by editing
+both unit files and `systemctl daemon-reload && systemctl restart wisp-monitor
+wisp-dashboard`.
 
 ## Upgrades
 
-```bash
-# on your machine
-scripts/build-release.sh v1.2.0           # -> dist/wisp-v1.2.0.tar.gz
-scp dist/wisp-v1.2.0.tar.gz box:/tmp/
+Because the DB lives in the git-ignored `data/` dir, upgrading is just pull + restart:
 
-# on the box
-sudo scripts/install.sh /tmp/wisp-v1.2.0.tar.gz   # unpack, uv sync, flip symlink, restart
+```bash
+cd /opt/wisp
+sudo git pull
+. .venv/bin/activate && pip install -r requirements.txt   # only if requirements changed
+sudo systemctl restart wisp-monitor wisp-dashboard
 ```
 
-`Restart=always` in the units covers crashes. Device-set changes (add/remove nodes from the UI)
-hot-reload in-process — no restart. **Config tunable (`WISP_*`) changes need a daemon restart.**
+Schema upgrades ride along automatically — the migration runner tracks
+`schema_migrations` and applies any new `migrations/000N_*.sql` forward on start.
 
-## TODO to make this real (scaffolding not yet built)
+- **Device-set changes** (add/remove nodes in the UI) hot-reload in-process — no restart.
+- **Config (`WISP_*`) changes** need a daemon restart to take effect.
+- `Restart=always` in the units covers crashes.
 
-- [ ] `WISP_DB_PATH` support in `config.py` (default `/var/lib/wisp/wisp.db`, dev falls back to `data/`)
-- [ ] `uv.lock` pinning `icmplib` + `httpx` + transitive deps
-- [ ] `scripts/build-release.sh` — clean checkout → versioned tarball (optional `--bytecode`)
-- [ ] `scripts/install.sh` — atomic `releases/<tag>` + `current` symlink swap, migrate, restart
-- [ ] Update `deploy/wisp-*.service` to point at `/opt/wisp/current` + `/var/lib/wisp` state
-- [ ] Fix doc drift (below)
+## Back up the database
 
-## Doc drift to fix (maintenance tax that compounds)
+The DB is the whole memory — PIN, team, device inventory, outage history. Two ways to
+keep a copy:
 
-`CLAUDE.md` is authoritative; reconcile these against it:
+- **From the UI:** Settings ▸ **Download backup** — a consistent `VACUUM INTO` snapshot
+  (safe to take while the daemon is writing).
+- **From the shell:** copy `data/wisp.db` while the services are stopped, or run
+  `sqlite3 data/wisp.db "VACUUM INTO 'wisp-backup.db'"` while they're live.
 
-- systemd unit comments say the daemon **"re-execs in place"** — it's actually **in-process hot
-  reload, no `os.execv`**.
-- `README.md` says Settings values are DB-editable and **"override the env var"** — config is
-  **env-var only, no DB settings layer**.
-- `README.md` default port is `8000`; `run.sh` defaults to `8080`. Pick one.
+Keep a backup off the box (the whole point is surviving a dead disk). Restoring is just
+dropping the file back at `data/wisp.db` and restarting.
+
+## Config (optional)
+
+Every tunable is a `WISP_*` env var read once at startup (full list + defaults in
+`src/wisp/config.py`). Set them in the systemd units' `[Service]` block as
+`Environment=WISP_…=…` and restart. The common ones:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (the units ship `20` for ~1-min detection) |
+| `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
+| `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
+| `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
+| `WISP_DB` | `data/wisp.db` | DB location — leave it unless you want state elsewhere |
+| `WISP_DASHBOARD_PIN` | — | seed the PIN on first run (else set it in the UI) |
