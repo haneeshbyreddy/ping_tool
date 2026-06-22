@@ -14,8 +14,6 @@ from wisp.ingress.probers import PingResult
 from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
-    LINK_CAUSE,
-    POWER_CAUSE,
     UNREACHABLE,
     UP,
     DeviceMeta,
@@ -44,8 +42,8 @@ DEAD_S = lambda ip="d": PingResult(ip, None, 100.0)
 
 def solo_device(**over) -> DeviceMeta:
     base = dict(
-        id=1, name="D1", ip_address="d", criticality=3, region="R",
-        parent_device_id=None, power_ref_ip=None, technician_phone="+910000000000",
+        id=1, name="D1", ip_address="d", region="R",
+        parent_device_id=None, technician_phone="+910000000000",
     )
     base.update(over)
     return DeviceMeta(**base)
@@ -103,8 +101,8 @@ class RecoveryHysteresis(unittest.TestCase):
 
 class Topology(unittest.TestCase):
     def setUp(self):
-        self.parent = solo_device(id=1, ip_address="p", power_ref_ip=None)
-        self.child = solo_device(id=2, ip_address="c", parent_device_id=1, power_ref_ip=None)
+        self.parent = solo_device(id=1, ip_address="p")
+        self.child = solo_device(id=2, ip_address="c", parent_device_id=1)
         self.eng = MonitorEngine([self.parent, self.child], CFG)
 
     def test_child_of_down_parent_is_unreachable(self):
@@ -116,24 +114,6 @@ class Topology(unittest.TestCase):
         opened = [e for e in r.events if isinstance(e, OutageOpened)]
         kinds = {e.device_id: e.state for e in opened}
         self.assertEqual(kinds.get(2), UNREACHABLE)
-
-
-class PowerVsLink(unittest.TestCase):
-    def test_power_outage_when_ref_dead(self):
-        dev = solo_device(power_ref_ip="ref")
-        eng = MonitorEngine([dev], CFG)
-        for _ in range(3):
-            r = feed(eng, {"d": DEAD_S(), "ref": DEAD_S("ref")})
-        opened = [e for e in r.events if isinstance(e, OutageOpened)][0]
-        self.assertEqual(opened.inferred_cause, POWER_CAUSE)
-
-    def test_link_fault_when_ref_alive(self):
-        dev = solo_device(power_ref_ip="ref")
-        eng = MonitorEngine([dev], CFG)
-        for _ in range(3):
-            r = feed(eng, {"d": DEAD_S(), "ref": UP_S("ref")})
-        opened = [e for e in r.events if isinstance(e, OutageOpened)][0]
-        self.assertEqual(opened.inferred_cause, LINK_CAUSE)
 
 
 class CanaryFreeze(unittest.TestCase):

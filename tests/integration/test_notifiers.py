@@ -22,7 +22,6 @@ from wisp.egress.notifiers import (
 )
 from wisp.core.state_machine import (
     DOWN,
-    POWER_CAUSE,
     UNREACHABLE,
     DeviceMeta,
     MonitorEngine,
@@ -31,7 +30,7 @@ from wisp.core.state_machine import (
 )
 
 T0 = "2026-01-01T00:00:00+00:00"
-T_LATER = "2026-01-01T00:25:00+00:00"   # past both realert(+10) and escalate(+20)
+T_LATER = "2026-01-01T01:30:00+00:00"   # past the first hourly escalation (+60)
 
 
 class RecordingNotifier:
@@ -52,8 +51,8 @@ class RecordingNotifier:
 
 def meta(**over) -> DeviceMeta:
     base = dict(
-        id=1, name="Tower", ip_address="d", criticality=4, region="Rampur",
-        parent_device_id=None, power_ref_ip=None, technician_phone="+91TECH",
+        id=1, name="Tower", ip_address="d", region="Rampur",
+        parent_device_id=None, technician_phone="+91TECH",
     )
     base.update(over)
     return DeviceMeta(**base)
@@ -64,15 +63,15 @@ class DispatcherTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(
             db_path=Path(self.tmp.name) / "t.db",
-            realert_after_min=10, escalate_owner_after_min=20, alert_dedupe_min=10,
+            escalate_every_min=60, alert_dedupe_min=10,
         )
         migrate(self.cfg)
         self.dev = meta()
         with connect(self.cfg) as c:
             c.execute(
-                "INSERT INTO devices (id,name,ip_address,criticality,region,"
-                "technician_phone) VALUES (?,?,?,?,?,?)",
-                (self.dev.id, self.dev.name, self.dev.ip_address, self.dev.criticality,
+                "INSERT INTO devices (id,name,ip_address,region,"
+                "technician_phone) VALUES (?,?,?,?,?)",
+                (self.dev.id, self.dev.name, self.dev.ip_address,
                  self.dev.region, self.dev.technician_phone),
             )
             c.commit()
@@ -83,11 +82,11 @@ class DispatcherTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _open_outage(self, state=DOWN, cause=POWER_CAUSE) -> int:
+    def _open_outage(self, state=DOWN) -> int:
         with connect(self.cfg) as c:
             cur = c.execute(
-                "INSERT INTO outages (device_id, started_at, final_state, inferred_cause)"
-                " VALUES (?,?,?,?)", (self.dev.id, T0, state, cause))
+                "INSERT INTO outages (device_id, started_at, final_state)"
+                " VALUES (?,?,?)", (self.dev.id, T0, state))
             c.commit()
             return cur.lastrowid
 
@@ -96,56 +95,80 @@ class DispatcherTest(unittest.TestCase):
             return [dict(r) for r in c.execute("SELECT * FROM alert_log ORDER BY id")]
 
     # --- tests ---
-    def test_alert_routes_logs_and_schedules_escalations(self):
+    def test_initial_page_is_operator_only_and_schedules_hourly(self):
         self._open_outage()
-        self.disp.dispatch([OutageOpened(1, DOWN, POWER_CAUSE)], T0)
-        # tech channel + a copy to the operator channel (operators see everything)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
+        # the immediate page goes to the operator channel ONLY
         self.assertEqual({s["recipient"] for s in self.notifier.sent},
-                         {self.cfg.ntfy_topic_tech, self.cfg.ntfy_topic_operator})
-        # the alert_log records one primary send, against the tech channel
+                         {self.cfg.ntfy_topic_operator})
         sent_rows = [r for r in self._alert_log() if r["status"] == "sent"]
         self.assertEqual(len(sent_rows), 1)
-        self.assertEqual(sent_rows[0]["recipient"], self.cfg.ntfy_topic_tech)
+        self.assertEqual(sent_rows[0]["recipient"], self.cfg.ntfy_topic_operator)
+        # one recurring all-hands escalation is queued
         with connect(self.cfg) as c:
-            esc = c.execute("SELECT kind FROM escalations ORDER BY kind").fetchall()
-        self.assertEqual({r["kind"] for r in esc}, {"escalate_to_owner", "realert"})
+            esc = c.execute("SELECT kind FROM escalations").fetchall()
+        self.assertEqual([r["kind"] for r in esc], ["hourly"])
 
     def test_unreachable_is_suppressed(self):
-        self._open_outage(state=UNREACHABLE, cause=None)
-        self.disp.dispatch([OutageOpened(1, UNREACHABLE, None)], T0)
+        self._open_outage(state=UNREACHABLE)
+        self.disp.dispatch([OutageOpened(1, UNREACHABLE)], T0)
         self.assertEqual(len(self.notifier.sent), 0)
         self.assertEqual(self._alert_log()[-1]["status"], "suppressed")
 
     def test_anti_spam_dedupe(self):
         self._open_outage()
-        self.disp.dispatch([OutageOpened(1, DOWN, POWER_CAUSE)], T0)
-        self.disp.dispatch([OutageOpened(1, DOWN, POWER_CAUSE)], T0)  # same window
-        # first dispatch fans out to tech + operator (2); second is suppressed
-        self.assertEqual(len(self.notifier.sent), 2)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)  # same window
+        # first dispatch pages the operator once; the second is suppressed
+        self.assertEqual(len(self.notifier.sent), 1)
         self.assertTrue(any(r["status"] == "suppressed" for r in self._alert_log()))
 
-    def test_escalation_fires_when_unacked(self):
+    def test_hourly_escalation_fans_out_to_all_channels_and_reschedules(self):
         self._open_outage()
-        self.disp.dispatch([OutageOpened(1, DOWN, POWER_CAUSE)], T0)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
         self.notifier.sent.clear()
         self.disp.sweep(T_LATER)
-        recipients = {s["recipient"] for s in self.notifier.sent}
-        # realert -> tech, owner escalation -> owner, both copied to operator
-        self.assertEqual(recipients, {self.cfg.ntfy_topic_tech,
-                                      self.cfg.ntfy_topic_owner,
-                                      self.cfg.ntfy_topic_operator})
+        # every channel gets the all-hands page
+        self.assertEqual({s["recipient"] for s in self.notifier.sent},
+                         {self.cfg.ntfy_topic_tech,
+                          self.cfg.ntfy_topic_owner,
+                          self.cfg.ntfy_topic_operator})
+        # the message states how long it's been down
+        self.assertTrue(any("1h" in s["title"] for s in self.notifier.sent))
+        # the loop keeps running: the escalation is rescheduled, not consumed
         with connect(self.cfg) as c:
             pending = c.execute(
                 "SELECT COUNT(*) FROM escalations WHERE executed_at IS NULL").fetchone()[0]
-        self.assertEqual(pending, 0)
+        self.assertEqual(pending, 1)
 
-    def test_ack_cancels_escalation(self):
+    def test_ack_does_not_stop_hourly_but_names_the_acker(self):
         oid = self._open_outage()
-        self.disp.dispatch([OutageOpened(1, DOWN, POWER_CAUSE)], T0)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
         self.notifier.sent.clear()
         self.assertTrue(acknowledge_outage(oid, "Suresh", self.cfg))
         self.disp.sweep(T_LATER)
-        self.assertEqual(len(self.notifier.sent), 0)  # acked -> nothing fires
+        # acked -> the hourly page still fires to everyone...
+        self.assertEqual({s["recipient"] for s in self.notifier.sent},
+                         {self.cfg.ntfy_topic_tech,
+                          self.cfg.ntfy_topic_owner,
+                          self.cfg.ntfy_topic_operator})
+        # ...and it names who acknowledged it
+        self.assertTrue(any("Suresh" in s["body"] for s in self.notifier.sent))
+
+    def test_resolved_outage_stops_the_hourly_loop(self):
+        self._open_outage()
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
+        with connect(self.cfg) as c:
+            c.execute("UPDATE outages SET resolved_at = ? WHERE device_id = ?",
+                      (T_LATER, 1))
+            c.commit()
+        self.notifier.sent.clear()
+        self.disp.sweep(T_LATER)
+        self.assertEqual(len(self.notifier.sent), 0)  # resolved -> nothing fires
+        with connect(self.cfg) as c:
+            pending = c.execute(
+                "SELECT COUNT(*) FROM escalations WHERE executed_at IS NULL").fetchone()[0]
+        self.assertEqual(pending, 0)  # the loop is cancelled
 
     def test_resolve_suppresses_restore_for_unreachable(self):
         with connect(self.cfg) as c:

@@ -33,16 +33,16 @@ class ApiTest(unittest.TestCase):
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         with connect(self.cfg) as c:
             # Two co-located devices in Rampur + one in Sohna.
-            for did, name, ip, region, crit in [
-                (1, "Rampur Tower", "d1", "Rampur", 4),
-                (2, "Rampur Sector", "d2", "Rampur", 2),
-                (3, "Sohna Relay", "d3", "Sohna", 4),
+            for did, name, ip, region in [
+                (1, "Rampur Tower", "d1", "Rampur"),
+                (2, "Rampur Sector", "d2", "Rampur"),
+                (3, "Sohna Relay", "d3", "Sohna"),
             ]:
                 c.execute(
-                    "INSERT INTO devices (id,name,ip_address,criticality,region,"
+                    "INSERT INTO devices (id,name,ip_address,region,"
                     "technician_phone)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (did, name, ip, crit, region, "+91TECH"),
+                    " VALUES (?,?,?,?,?)",
+                    (did, name, ip, region, "+91TECH"),
                 )
             c.commit()
 
@@ -60,14 +60,14 @@ class ApiTest(unittest.TestCase):
             c.commit()
 
     def _outage(self, device_id, started, resolved=None, state=DOWN,
-                cause="Likely Power Outage", acked_by=None, notes=None):
+                acked_by=None, notes=None):
         with connect(self.cfg) as c:
             c.execute(
                 "INSERT INTO outages (device_id,started_at,resolved_at,final_state,"
-                "inferred_cause,acknowledged_by,acknowledged_at,resolution_notes)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "acknowledged_by,acknowledged_at,resolution_notes)"
+                " VALUES (?,?,?,?,?,?,?)",
                 (device_id, _iso(started), _iso(resolved) if resolved else None,
-                 state, cause, acked_by, _iso(started) if acked_by else None, notes),
+                 state, acked_by, _iso(started) if acked_by else None, notes),
             )
             c.execute("SELECT last_insert_rowid() AS id")
             return c.execute("SELECT MAX(id) AS id FROM outages").fetchone()["id"]
@@ -130,14 +130,12 @@ class ApiTest(unittest.TestCase):
     def test_nodes_down_on_day(self):
         day = (self.now - timedelta(days=2))
         ds = day.date().isoformat()
-        # device 1 down for ~2h that day (power); device 3 down a different day
-        self._outage(1, day.replace(hour=1), resolved=day.replace(hour=3),
-                     cause="Likely Power Outage")
+        # device 1 down for ~2h that day; device 3 down a different day
+        self._outage(1, day.replace(hour=1), resolved=day.replace(hour=3))
         self._outage(3, self.now - timedelta(days=5),
                      resolved=self.now - timedelta(days=5) + timedelta(hours=1))
         down = api.nodes_down_on_day(self.cfg, ds)
         self.assertEqual([n["id"] for n in down], [1])
-        self.assertEqual(down[0]["cause"], "power")
         self.assertGreater(down[0]["down_s"], 0)
         # a clean day returns nothing
         clean = (self.now - timedelta(days=1)).date().isoformat()
@@ -196,23 +194,40 @@ class ApiTest(unittest.TestCase):
         # already-documented outage is not re-dismissed
         self.assertFalse(api.dismiss_outage(rid, self.cfg))
 
+    def test_postmortem_without_notes_clears_triage(self):
+        # logging a confirmed cause with an empty notes box must still drop the card
+        # off triage — "documented" hinges on the (required) root cause, not notes.
+        rid = self._outage(2, self.now - timedelta(hours=2),
+                           resolved=self.now - timedelta(minutes=10))
+        self.assertIn(rid, [i["id"] for i in api.triage_outages(self.cfg)])
+        self.assertTrue(api.submit_postmortem(rid, "Hardware Fault", "", self.cfg))
+        self.assertNotIn(rid, [i["id"] for i in api.triage_outages(self.cfg)])
+
+    # -- add-node reachability probe --
+    def test_check_reachable(self):
+        # malformed IP is rejected the same way create_device would (422)
+        with self.assertRaises(api.DeviceError):
+            api.check_reachable("not-an-ip", self.cfg)
+        # loopback should answer (or None if the box has no ping binary); never a
+        # hard failure, and the IP is echoed back for the UI.
+        res = api.check_reachable("127.0.0.1", self.cfg)
+        self.assertEqual(res["ip"], "127.0.0.1")
+        self.assertIn(res["reachable"], (True, None))
 
     # -- device inventory CRUD --
     def test_create_validate_update_delete(self):
         # create
         nid = api.create_device({
             "name": "New AP", "ip_address": "192.0.2.99", "device_type": "sector",
-            "criticality": "2", "region": "Testville", "parent_device_id": "1",
+            "region": "Testville", "parent_device_id": "1",
         }, self.cfg)
         rows = {d["id"]: d for d in api.list_devices(self.cfg)}
         self.assertIn(nid, rows)
-        self.assertEqual(rows[nid]["criticality"], 2)
         self.assertEqual(rows[nid]["parent_device_id"], 1)
 
         # validation
         for bad in ({"ip_address": "x"}, {"name": "n"},
-                    {"name": "n", "ip_address": "i", "device_type": "bogus"},
-                    {"name": "n", "ip_address": "i", "criticality": "9"}):
+                    {"name": "n", "ip_address": "i", "device_type": "bogus"}):
             with self.assertRaises(api.DeviceError):
                 api.create_device(bad, self.cfg)
 
@@ -223,7 +238,7 @@ class ApiTest(unittest.TestCase):
 
         # update (full replace, as the UI submits)
         self.assertTrue(api.update_device(nid, {
-            "name": "Renamed", "ip_address": "192.0.2.99", "criticality": "4"}, self.cfg))
+            "name": "Renamed", "ip_address": "192.0.2.99"}, self.cfg))
         self.assertEqual({d["id"]: d for d in api.list_devices(self.cfg)}[nid]["name"], "Renamed")
 
         # delete

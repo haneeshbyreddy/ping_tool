@@ -50,8 +50,8 @@ class WatchdogTest(unittest.TestCase):
     # --- fixtures ---
     def _device(self):
         with connect(self.cfg) as c:
-            c.execute("INSERT INTO devices (id,name,ip_address,criticality,region)"
-                      " VALUES (1,'Tower','10.0.0.1',4,'Rampur')")
+            c.execute("INSERT INTO devices (id,name,ip_address,region)"
+                      " VALUES (1,'Tower','10.0.0.1','Rampur')")
             c.commit()
 
     def _poll(self, age_s: int):

@@ -1,14 +1,12 @@
 """Layer 2 — Pattern Recognition.
 
 The brains: turns raw per-poll samples into confirmed states and outages, with
-flap suppression, recovery hysteresis, and three network-aware overrides:
+flap suppression, recovery hysteresis, and two network-aware overrides:
 
   * Uplink canary   — if our own internet is down, freeze everything and raise
                       ONE Uplink_Down instead of a storm of per-hub alerts.
   * Topology        — a child of a DOWN parent becomes UNREACHABLE (suppressed),
                       not separately DOWN.
-  * Power vs link   — a real DOWN is tagged 'Likely Power Outage' or
-                      'Link/Equipment Fault' so a tech brings the right gear.
 
 `MonitorEngine` is deliberately pure: it takes a dict of {ip: PingResult} plus a
 timestamp and returns committed states + a list of events. All DB reads (to build
@@ -32,19 +30,14 @@ DOWN = "DOWN"
 UNREACHABLE = "UNREACHABLE"
 DOWN_FAMILY = frozenset({DOWN, UNREACHABLE})
 
-POWER_CAUSE = "Likely Power Outage"
-LINK_CAUSE = "Link/Equipment Fault"
-
 
 @dataclass
 class DeviceMeta:
     id: int
     name: str
     ip_address: str
-    criticality: int
     region: str | None
     parent_device_id: int | None
-    power_ref_ip: str | None
     technician_phone: str | None
 
 
@@ -53,14 +46,12 @@ class DeviceMeta:
 class OutageOpened:
     device_id: int
     state: str            # DOWN or UNREACHABLE
-    inferred_cause: str | None
 
 
 @dataclass
 class OutageRecategorized:
     device_id: int
     state: str
-    inferred_cause: str | None
 
 
 @dataclass
@@ -192,26 +183,7 @@ class MonitorEngine:
     def required_ips(self) -> set[str]:
         ips = {d.ip_address for d in self.meta.values()}
         ips.add(self.cfg.canary_ip)
-        ips |= {d.power_ref_ip for d in self.meta.values() if d.power_ref_ip}
         return ips
-
-    def _infer_cause(
-        self, dev: DeviceMeta, committed: dict[int, str], results: dict[str, PingResult]
-    ) -> str:
-        ref = dev.power_ref_ip
-        # Direct evidence: the mains-power reference node is unreachable.
-        if ref and ref in results and results[ref].packet_loss >= 100.0:
-            return POWER_CAUSE
-        # Co-location heuristic: a whole multi-device site going dark together looks
-        # like power. Needs 2+ devices on the same mains — a lone device dropping is
-        # far more likely a link/equipment fault, so don't infer power from it.
-        if ref:
-            siblings = [m for m in self.meta.values() if m.power_ref_ip == ref]
-            if len(siblings) >= 2 and all(
-                committed.get(m.id, UP) in DOWN_FAMILY for m in siblings
-            ):
-                return POWER_CAUSE
-        return LINK_CAUSE
 
     def process_cycle(self, results: dict[str, PingResult], ts: str) -> CycleResult:
         cfg = self.cfg
@@ -255,13 +227,11 @@ class MonitorEngine:
             was_down = prev in DOWN_FAMILY
             is_down = new in DOWN_FAMILY
             if not was_down and is_down:
-                cause = self._infer_cause(dev, committed, results) if new == DOWN else None
-                events.append(OutageOpened(dev_id, new, cause))
+                events.append(OutageOpened(dev_id, new))
             elif was_down and not is_down:
                 events.append(OutageResolved(dev_id))
             elif was_down and is_down and prev != new:
-                cause = self._infer_cause(dev, committed, results) if new == DOWN else None
-                events.append(OutageRecategorized(dev_id, new, cause))
+                events.append(OutageRecategorized(dev_id, new))
 
         return CycleResult(states=committed, events=events, canary_down=False)
 
@@ -270,8 +240,7 @@ class MonitorEngine:
 def load_device_meta(cfg: Config = CONFIG) -> list[DeviceMeta]:
     with connect(cfg) as conn:
         rows = conn.execute(
-            "SELECT id, name, ip_address, criticality, region, parent_device_id,"
-            " power_ref_ip, technician_phone"
+            "SELECT id, name, ip_address, region, parent_device_id, technician_phone"
             " FROM devices WHERE is_active = 1 ORDER BY id"
         ).fetchall()
     return [DeviceMeta(**dict(r)) for r in rows]
@@ -310,15 +279,15 @@ def apply_events(conn: sqlite3.Connection, events: list[Event], ts: str) -> None
     for ev in events:
         if isinstance(ev, OutageOpened):
             conn.execute(
-                "INSERT INTO outages (device_id, started_at, final_state, inferred_cause)"
-                " VALUES (?,?,?,?)",
-                (ev.device_id, ts, ev.state, ev.inferred_cause),
+                "INSERT INTO outages (device_id, started_at, final_state)"
+                " VALUES (?,?,?)",
+                (ev.device_id, ts, ev.state),
             )
         elif isinstance(ev, OutageRecategorized):
             conn.execute(
-                "UPDATE outages SET final_state = ?, inferred_cause = COALESCE(?, inferred_cause)"
+                "UPDATE outages SET final_state = ?"
                 " WHERE device_id = ? AND resolved_at IS NULL",
-                (ev.state, ev.inferred_cause, ev.device_id),
+                (ev.state, ev.device_id),
             )
         elif isinstance(ev, OutageResolved):
             conn.execute(

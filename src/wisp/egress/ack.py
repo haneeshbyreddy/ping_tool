@@ -1,5 +1,6 @@
 """Acknowledge an outage from the terminal — the dev stand-in for an in-app
-/ack action. Acking stops the escalation ladder (no re-alert, no owner escalation).
+/ack action. Acking records who owns the outage (named in the recurring hourly
+all-hands re-page); it does NOT stop the re-pages — only recovery does.
 
     PYTHONPATH=src python -m wisp.egress.ack                 # list currently-open outages
     PYTHONPATH=src python -m wisp.egress.ack <outage_id> <your name>
@@ -12,7 +13,7 @@ from wisp.egress.notifiers import acknowledge_outage
 
 def _list_open() -> None:
     rows = connect().execute(
-        "SELECT o.id, d.name, d.region, o.final_state, o.inferred_cause, o.started_at,"
+        "SELECT o.id, d.name, d.region, o.final_state, o.started_at,"
         " o.acknowledged_by FROM outages o JOIN devices d ON d.id = o.device_id"
         " WHERE o.resolved_at IS NULL ORDER BY o.id"
     ).fetchall()
@@ -22,8 +23,7 @@ def _list_open() -> None:
     print("open outages:")
     for r in rows:
         ack = f" [acked by {r['acknowledged_by']}]" if r["acknowledged_by"] else ""
-        cause = r["inferred_cause"] or "-"
-        print(f"  #{r['id']}  {r['name']} ({r['region']})  {r['final_state']}  {cause}{ack}")
+        print(f"  #{r['id']}  {r['name']} ({r['region']})  {r['final_state']}{ack}")
 
 
 def main() -> None:
@@ -35,7 +35,8 @@ def main() -> None:
     outage_id = int(sys.argv[1])
     by = " ".join(sys.argv[2:])
     if acknowledge_outage(outage_id, by):
-        print(f"outage #{outage_id} acknowledged by {by}. Escalation stopped.")
+        print(f"outage #{outage_id} acknowledged by {by}. "
+              f"You'll be named in the hourly re-page until it recovers.")
     else:
         print(f"outage #{outage_id} not found or already resolved.")
 

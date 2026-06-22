@@ -1,9 +1,10 @@
 # Village WISP Monitor
 
 A network monitoring + alerting tool for a rural WiFi broadband operator. It pings the
-shared infrastructure (towers, relays, backhaul, core), figures out **what is down, where,
-and the likely cause** — power vs link/equipment — and pushes that to the operator and the
-right field technician, escalating if nobody responds.
+shared infrastructure (towers, relays, backhaul, core), figures out **what is down and
+where** (topology-aware, so a dead parent suppresses its children), and pages the operator
+immediately — then re-pages the whole team (owner + operator + tech) every hour the outage
+stays open, with the running duration, until it recovers.
 
 It polls with real ICMP and alerts over ntfy push. The dashboard + admin CLIs are pure
 stdlib; the **daemon** needs a small venv (`icmplib`/`httpx`) and the kernel ping group enabled.
@@ -35,12 +36,12 @@ python apps/daemon/main.py                           # real 60s cadence, forever
 
 # operator actions (CLI; the dashboard covers the live views):
 PYTHONPATH=src python -m wisp.egress.ack                # list open outages
-PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (stops escalation)
+PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named in the hourly re-page; doesn't stop it)
 
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 52 tests (pure stdlib)
+python -m unittest discover -s tests                 # 58 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -55,7 +56,7 @@ no build step, and no third-party Python deps. The daemon and the web server are
 dashboard reader coexist); all local state lives under `data/` (git-ignored).
 
 From the **Nodes** page you can add / edit / delete devices (the whole inventory —
-IP, type, criticality, parent, power-ref, technician) from the
+name, IP, type, region, parent) from the
 UI. Newly added or removed nodes start/stop being *monitored* automatically — the
 daemon re-reads the device set each cycle and rebuilds its engine in-process when it
 changes, within one poll cycle.
@@ -116,8 +117,8 @@ run.sh                    # one-shot setup + run for both runtimes
 |---|---|---|
 | `wisp.ingress.probers` | 1 Monitoring | pings devices (`IcmpProber`, real ICMP via icmplib) |
 | `apps.daemon.main` | 1 | 60s async poll loop; orchestrates everything |
-| `wisp.core.state_machine` | 2 Pattern | FSM + flap suppression, canary freeze, topology suppression, power-vs-link |
-| `wisp.egress.notifiers` / `wisp.egress.ack` | 4/5 Alerting | routing, anti-spam, T+10/T+20 escalation ladder, ack |
+| `wisp.core.state_machine` | 2 Pattern | FSM + flap suppression, canary freeze, topology suppression |
+| `wisp.egress.notifiers` / `wisp.egress.ack` | 4/5 Alerting | routing, anti-spam, hourly all-hands re-page until recovery, ack |
 | `wisp.core.analytics` | 3 BI | shared outage-window / uptime / offender query helpers for the dashboard |
 | `wisp.server.{services,routes}` + `apps.dashboard` | 6 Dashboard | JSON views + stdlib HTTP server for the self-contained UI |
 | `wisp.database.client` / `migrations/` | 5 Memory | WAL SQLite, durable outages/alerts/escalations |
@@ -129,8 +130,8 @@ run.sh                    # one-shot setup + run for both runtimes
 - **Uplink canary** — if our own internet is down, freeze everything and send ONE
   `UPLINK_DOWN` instead of a storm of per-tower alerts.
 - **Topology suppression** — a child of a down parent is `UNREACHABLE` (one alert, not forty).
-- **Power vs link** — a real DOWN is tagged "Likely Power Outage" or "Link/Equipment Fault"
-  so a tech brings the right gear.
+- **Post-mortem cause** — at resolution the operator records the confirmed root cause + notes
+  (there is no automatic power-vs-link guess).
 - **Escalation is restart-safe** — timers live in the DB, not memory; a crash can't drop them.
 
 ## Configuration (env vars, all optional)
@@ -139,7 +140,7 @@ run.sh                    # one-shot setup + run for both runtimes
 |---|---|---|
 | `WISP_POLL_INTERVAL_S` | `60` | seconds between polls |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
-| `WISP_REALERT_MIN` / `WISP_ESCALATE_MIN` | `10` / `20` | escalation timing |
+| `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |
 

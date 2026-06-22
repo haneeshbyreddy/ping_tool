@@ -19,7 +19,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # --- bootstrap: make the `wisp` package importable without installing ---
@@ -60,6 +60,30 @@ async def _gather_pings(prober: Prober, ips: list[str], count: int) -> dict[str,
 
     pairs = await asyncio.gather(*(one(ip) for ip in ips))
     return dict(pairs)
+
+
+def prune_old_polls(cfg: Config = CONFIG, *, now: datetime | None = None) -> int:
+    """Delete raw poll samples older than `cfg.poll_retention_days` so a 24/7
+    deployment reaches a steady-state DB size. Returns the number of rows removed.
+
+    Retention <= 0 disables pruning (keep everything). Only `poll_results` is
+    touched — the `outages` table is the permanent incident record and is left
+    alone, so analytics/history survive. Deleted pages go to SQLite's freelist and
+    are reused by future inserts, so the file stops growing without a VACUUM (run
+    one manually if you need to reclaim disk after shrinking retention)."""
+    days = cfg.poll_retention_days
+    if days <= 0:
+        return 0
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).isoformat(timespec="seconds")
+
+    def _do() -> int:
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "DELETE FROM poll_results WHERE timestamp < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount
+    return int(write_with_retry(_do) or 0)
 
 
 def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config) -> None:
@@ -126,8 +150,25 @@ async def run_forever(
         f"monitoring {len(engine.meta)} devices every {interval}s "
         f"[prober={cfg.prober}, notifier={cfg.notifier}] (Ctrl-C to stop)"
     )
+
+    # Retention sweep: prune old poll samples once a day so an always-on deployment
+    # holds a steady-state DB size. Run once at startup, then every PRUNE_EVERY_S.
+    # Guarded like everything else in this loop — a failed prune is logged, never
+    # fatal. Skipped for finite --cycles runs (smoke tests stay deterministic).
+    PRUNE_EVERY_S = 24 * 3600
+    next_prune = asyncio.get_running_loop().time()
+
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
+        if max_cycles is None and asyncio.get_running_loop().time() >= next_prune:
+            try:
+                removed = prune_old_polls(cfg)
+                if removed:
+                    print(f"retention: pruned {removed} poll sample(s) older than "
+                          f"{cfg.poll_retention_days}d")
+            except Exception:
+                log.exception("retention sweep failed; continuing")
+            next_prune = asyncio.get_running_loop().time() + PRUNE_EVERY_S
         # Device-set hot reload: rebuild the engine in-process when the active device
         # set changes (UI add/remove). build_engine rehydrates each FSM from the last
         # poll, so a rebuild never re-pages an open outage. (Skipped for finite runs.)

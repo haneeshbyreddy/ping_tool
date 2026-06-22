@@ -45,6 +45,29 @@
 
   function fmtPct(n) { return (n == null ? "—" : Number(n).toFixed(2) + "%"); }
 
+  // Mirror of core/analytics._fmt_dur so an open outage's elapsed time can tick
+  // client-side every second instead of waiting on the next server re-fetch.
+  function fmtDur(seconds) {
+    seconds = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  // Repaint every [data-since] element from its outage start so durations count
+  // up live. Cheap no-op when nothing is open; runs on a single global 1s timer.
+  function tickDurations() {
+    const now = Date.now();
+    document.querySelectorAll("[data-since]").forEach((el) => {
+      const started = toUtcDate(el.getAttribute("data-since"));
+      if (isNaN(started)) return;
+      el.textContent = fmtDur((now - started.getTime()) / 1000);
+    });
+  }
+
   // Org/locale branding, populated from /api/auth/status (defaults until then).
   const BRAND = { org_name: "HANSA", timezone: "UTC",
     channels: { owner: "owner", operator: "operator", tech: "tech" } };
@@ -216,13 +239,18 @@
 
   function triageCard(o, team = []) {
     const m = STATUS_META[o.status] || STATUS_META.unassigned;
+    // Open outages keep counting up (live ticker); a recovered one is final.
+    const live = o.status !== "pending_postmortem";
+    const durLabel = live
+      ? `<span data-since="${esc(o.started_at)}">${esc(o.duration_label)}</span>`
+      : esc(o.duration_label);
     const head = `
       <div class="flex justify-between items-start">
         <div>
           <h3 class="font-body-lg text-body-lg text-primary font-medium">${esc(o.name)} <span class="text-on-surface-variant font-normal">· ${esc(o.region)}</span></h3>
           <div class="flex items-center gap-2 mt-1 flex-wrap">
             <span class="font-label-xs text-label-xs text-${m.text} border border-${m.text}/30 bg-${m.text}/10 px-2 py-0.5 rounded-sm">${m.tag}</span>
-            <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("schedule", { size: 14 })} ${esc(o.duration_label)}</span>
+            <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("schedule", { size: 14 })} ${durLabel}</span>
             <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("event", { size: 14 })} ${fmtTime(o.started_at, { tz: false })}</span>
           </div>
         </div>
@@ -403,13 +431,9 @@
     }).join("");
   }
 
-  // Row variant for the heatmap drill-down: shows that day's downtime + cause
+  // Row variant for the heatmap drill-down: shows that day's downtime
   // instead of the live state.
   function dayNodeRow(n) {
-    const cause = n.cause === "power"
-      ? `<span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("bolt", { size: 14 })} Power</span>`
-      : (n.cause === "link"
-        ? `<span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("build", { size: 14 })} Link/Equipment</span>` : "");
     return `<div class="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3">
       <div class="flex items-center gap-3 min-w-0">
         <div class="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center shrink-0 text-error">${icon("wifi_off", { size: 18 })}</div>
@@ -418,7 +442,7 @@
           <p class="font-mono-data text-on-surface-variant mt-0.5 truncate text-[11px]">${esc(n.type || "node")} · ${esc(n.ip)} · ${esc(n.region)}</p>
         </div>
       </div>
-      <div class="flex items-center gap-3 shrink-0">${cause}
+      <div class="flex items-center gap-3 shrink-0">
         <span class="font-mono-data text-mono-data text-error flex items-center gap-1">${icon("schedule", { size: 14 })} ${esc(n.down_label)} down</span>
       </div>
     </div>`;
@@ -490,22 +514,44 @@
     const { overlay, close } = openModal(form);
     overlay.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", close));
 
-    overlay.querySelector("[data-node-form]").addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      const payload = {};
-      overlay.querySelectorAll("[data-field]").forEach((el) => { payload[el.getAttribute("data-field")] = el.value; });
-      const submitBtn = ev.target.querySelector('[type="submit"]');
-      submitBtn.disabled = true;
+    const submitBtn = overlay.querySelector('[type="submit"]');
+    const origLabel = submitBtn.innerHTML;
+    const spinner = (label) => `${icon("refresh", { size: 16, cls: "animate-spin" })} ${esc(label)}`;
+
+    async function saveDevice(payload) {
+      submitBtn.innerHTML = spinner("Saving…");
       const res = isEdit
         ? await sendJSON("PUT", `/api/devices/${d.id}`, payload)
         : await sendJSON("POST", "/api/devices", payload);
-      if (res.ok && res.data.ok) {
-        toast(isEdit ? "Node updated" : "Node added");
-        close(); onDone();
-      } else {
-        toast(res.data.error || res.data.reason || "Couldn't save node", "error");
-        submitBtn.disabled = false;
+      if (res.ok && res.data.ok) { toast(isEdit ? "Node updated" : "Node added"); close(); onDone(); return; }
+      toast(res.data.error || res.data.reason || "Couldn't save node", "error");
+      submitBtn.innerHTML = origLabel;
+      submitBtn.disabled = false;
+    }
+
+    overlay.querySelector("[data-node-form]").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const payload = {};
+      overlay.querySelectorAll("[data-field]").forEach((el) => { payload[el.getAttribute("data-field")] = el.value.trim(); });
+      submitBtn.disabled = true;
+
+      // On add, ping the address first and refuse the node if it doesn't answer —
+      // a wrong/typo'd address would otherwise sit forever looking like a permanent
+      // outage. The host must be up at provisioning time to be accepted.
+      if (!isEdit && payload.ip_address) {
+        submitBtn.innerHTML = spinner(`Pinging ${payload.ip_address}…`);
+        const chk = await postJSON("/api/devices/check", { ip_address: payload.ip_address });
+        if (chk.ok && chk.data.reachable === false) {
+          toast(`Couldn't reach ${payload.ip_address} — ${chk.data.detail}. Node not added.`, "error");
+          submitBtn.innerHTML = origLabel;
+          submitBtn.disabled = false;
+          return;
+        }
+        if (chk.ok && chk.data.reachable === true) {
+          toast(chk.data.detail);   // e.g. "host is up — 12.3 ms avg"
+        }
       }
+      await saveDevice(payload);
     });
 
     const delBtn = overlay.querySelector("[data-delete]");
@@ -778,6 +824,7 @@
           ${icon("notifications", { size: 14, cls: "inline align-text-bottom" })}
           Alerts route by <span class="text-primary">role</span> — this person subscribes to the
           <span class="text-primary font-mono-data" data-role-channel>${esc(BRAND.channels[w.role || "tech"] || (w.role || "tech"))}</span> channel on ntfy.
+        </div>
         <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
           <div>${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
           <div class="flex items-center gap-2">
@@ -1142,6 +1189,8 @@
   }
 
   window.addEventListener("hashchange", () => { if (!_loginShown) route(); });
+  // One global timer ticks every visible outage duration; harmless when none exist.
+  setInterval(tickDurations, 1000);
   window.addEventListener("DOMContentLoaded", async () => {
     const st = await fetchAuthStatus();
     if (!st.authed) { renderLogin(!st.pin_set); return; }

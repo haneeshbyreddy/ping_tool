@@ -45,6 +45,13 @@ class Config:
     # --- Polling -------------------------------------------------------------
     poll_interval_s: int = field(default_factory=lambda: _env_int("WISP_POLL_INTERVAL_S", 60))
     pings_per_poll: int = field(default_factory=lambda: _env_int("WISP_PINGS_PER_POLL", 5))
+    # Raw poll samples older than this are pruned by the daemon (once/day) so a
+    # 24/7 deployment reaches a steady-state DB size instead of growing forever.
+    # The `outages` table (the permanent incident record) is never touched.
+    # 0 = keep everything (pruning disabled).
+    poll_retention_days: int = field(
+        default_factory=lambda: _env_int("WISP_POLL_RETENTION_DAYS", 90)
+    )
 
     # --- Monitor watchdog (dead-monitor alarm) -------------------------------
     # If the newest poll is older than this, the monitor itself is considered
@@ -71,12 +78,15 @@ class Config:
     canary_ip: str = field(default_factory=lambda: _env("WISP_CANARY_IP", "1.1.1.1"))
 
     # --- Escalation timing (minutes) ----------------------------------------
-    realert_after_min: int = field(default_factory=lambda: _env_int("WISP_REALERT_MIN", 10))
-    escalate_owner_after_min: int = field(
-        default_factory=lambda: _env_int("WISP_ESCALATE_MIN", 20)
+    # A fresh DOWN pages the operator immediately; thereafter, while the outage
+    # is still open, an all-hands page (owner + operator + tech) fires every
+    # `escalate_every_min` minutes with the running duration (and who acked it,
+    # if anyone). Acknowledgement does NOT stop this clock — only recovery does.
+    escalate_every_min: int = field(
+        default_factory=lambda: _env_int("WISP_ESCALATE_EVERY_MIN", 60)
     )
-    # A recipient won't get the same device's alert more than once per this window
-    # (except the explicit escalation steps above).
+    # A recipient won't get the same device's initial alert more than once per this
+    # window (the recurring all-hands escalation bypasses this).
     alert_dedupe_min: int = field(default_factory=lambda: _env_int("WISP_ALERT_DEDUPE_MIN", 10))
 
     # --- Providers (real adapters: ICMP ping + ntfy push) --------------------

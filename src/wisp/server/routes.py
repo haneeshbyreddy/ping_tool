@@ -262,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return self._error(400, "invalid JSON body")
         try:
+            if path == "/api/devices/check":  # reachability probe before saving
+                res = services.check_reachable(body.get("ip_address") or body.get("ip", ""), CONFIG)
+                return self._send_json({"ok": True, **res})
             if path == "/api/devices":  # create a node
                 new_id = services.create_device(body, CONFIG)
                 return self._send_json({"ok": True, "id": new_id}, 201)

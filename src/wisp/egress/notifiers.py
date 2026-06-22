@@ -1,7 +1,10 @@
 """Layers 4 & 5 — alert dispatch.
 
-Engine events (OutageOpened/Resolved/Uplink…) become messages routed to the
-region technician, with a two-step escalation to the owner if nobody acks.
+Engine events (OutageOpened/Resolved/Uplink…) become messages. A fresh DOWN
+pages the operator immediately; while it stays down, a recurring all-hands page
+(owner + operator + tech) fires every `escalate_every_min` minutes with the
+running duration and who (if anyone) acknowledged it. Acknowledgement does not
+stop that clock — only recovery does.
 
   * Notifier   — the channel interface. NtfyNotifier sends real push
                  notifications via ntfy (httpx, lazy import).
@@ -156,6 +159,19 @@ class AlertDispatcher:
             self.notifier.send(self.topic_operator, title, body, priority)
         return res
 
+    def _broadcast(self, title: str, body: str, priority: int) -> NotifyResult:
+        """Send the same message to all three role channels (owner + operator +
+        tech) once each — the recurring all-hands escalation. Returns the result
+        of the owner send (the primary). Duplicate/blank topics are de-duped."""
+        topics = list(dict.fromkeys(
+            t for t in (self.topic_owner, self.topic_operator, self.topic_tech) if t))
+        primary = NotifyResult(False, "no channel configured")
+        for i, topic in enumerate(topics):
+            res = self.notifier.send(topic, title, body, priority)
+            if i == 0:
+                primary = res
+        return primary
+
     # -- small DB helpers --
     def _open_outage_id(self, conn, device_id: int) -> int | None:
         row = conn.execute(
@@ -181,8 +197,9 @@ class AlertDispatcher:
             (outage_id, device_id, self.notifier.channel, recipient, ts, status, payload),
         )
 
-    def _priority(self, criticality: int) -> int:
-        return max(1, min(5, criticality))
+    # Fixed ntfy priority for a device-down page (between a recovery notice at 3
+    # and an owner escalation at 5).
+    _DOWN_PRIORITY = 4
 
     # -- public API called by the daemon --
     def dispatch(self, events: list[Event], ts: str) -> None:
@@ -192,7 +209,7 @@ class AlertDispatcher:
             elif isinstance(ev, OutageRecategorized):
                 # promotion from UNREACHABLE -> real DOWN: treat as a fresh open
                 if ev.state == DOWN:
-                    self._on_open(OutageOpened(ev.device_id, DOWN, ev.inferred_cause), ts)
+                    self._on_open(OutageOpened(ev.device_id, DOWN), ts)
             elif isinstance(ev, OutageResolved):
                 self._on_resolved(ev, ts)
             elif isinstance(ev, UplinkDown):
@@ -204,15 +221,16 @@ class AlertDispatcher:
         dev = self.engine.meta[ev.device_id]
         if ev.state == UNREACHABLE:
             # topology-suppressed: record the decision, page no one
-            self._record(ev.device_id, self.topic_tech, "suppressed",
+            self._record(ev.device_id, self.topic_operator, "suppressed",
                          "UNREACHABLE (parent down)", ts)
             return
-        recipient = self.topic_tech
-        cause = ev.inferred_cause or "unknown"
+        # Immediate page goes to the OPERATOR only; everyone else is looped in by
+        # the recurring all-hands escalation once it has been down a while.
+        recipient = self.topic_operator
         title = f"🔴 DOWN — {dev.name} ({dev.region})"
-        body = (f"{'⚡POWER' if 'Power' in cause else '🔧LINK'} · crit {dev.criticality}")
+        body = f"No ping response from {dev.ip_address}"
 
-        # anti-spam (escalations bypass this)
+        # anti-spam (the recurring escalation bypasses this)
         def _do():
             with connect(self.cfg) as conn:
                 if self._recently_alerted(conn, recipient, ev.device_id, ts):
@@ -228,27 +246,26 @@ class AlertDispatcher:
         if oid is None:
             return  # was suppressed
 
-        res = self._publish("tech", title, body, self._priority(dev.criticality))
+        res = self._publish("operator", title, body, self._DOWN_PRIORITY)
 
         def _after():
             with connect(self.cfg) as conn:
                 self._log(conn, oid, ev.device_id, recipient,
                           "sent" if res.ok else "failed", body, ts)
-                # schedule the two escalation steps (restart-safe, idempotent)
-                for kind, mins in (("realert", self.cfg.realert_after_min),
-                                   ("escalate_to_owner", self.cfg.escalate_owner_after_min)):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO escalations (outage_id, kind, due_at)"
-                        " VALUES (?,?,?)",
-                        (oid, kind, _plus_minutes(ts, mins)),
-                    )
+                # schedule the first recurring all-hands escalation (restart-safe,
+                # idempotent; the sweeper pushes due_at forward each hour it fires)
+                conn.execute(
+                    "INSERT OR IGNORE INTO escalations (outage_id, kind, due_at)"
+                    " VALUES (?,?,?)",
+                    (oid, "hourly", _plus_minutes(ts, self.cfg.escalate_every_min)),
+                )
                 conn.commit()
 
         write_with_retry(_after)
 
     def _on_resolved(self, ev: OutageResolved, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
-        recipient = self.topic_tech
+        recipient = self.topic_operator
 
         with connect(self.cfg) as conn:
             row = conn.execute(
@@ -259,9 +276,10 @@ class AlertDispatcher:
         was_suppressed = row is not None and row["final_state"] == UNREACHABLE
 
         # Don't announce recovery for an outage we never paged about (UNREACHABLE).
+        # Otherwise tell every channel that was looped in by the escalation.
         if not was_suppressed:
-            self._publish("tech", f"✅ Restored — {dev.name} ({dev.region})",
-                          "Service back up", 3)
+            self._broadcast(f"✅ Restored — {dev.name} ({dev.region})",
+                            "Service back up", 3)
 
         def _do():
             with connect(self.cfg) as conn:
@@ -300,37 +318,65 @@ class AlertDispatcher:
     def sweep(self, now_ts: str) -> None:
         with connect(self.cfg) as conn:
             due = conn.execute(
-                "SELECT e.id, e.kind, o.id outage_id, o.device_id, o.acknowledged_at,"
-                " o.resolved_at FROM escalations e JOIN outages o ON o.id = e.outage_id"
+                "SELECT e.id, e.kind, o.id outage_id, o.device_id, o.started_at,"
+                " o.acknowledged_by, o.resolved_at"
+                " FROM escalations e JOIN outages o ON o.id = e.outage_id"
                 " WHERE e.executed_at IS NULL AND e.due_at <= ?",
                 (now_ts,),
             ).fetchall()
 
         for row in due:
-            settled = row["resolved_at"] is not None or row["acknowledged_at"] is not None
-            if not settled:
-                self._fire_escalation(row["kind"], row["device_id"], now_ts)
-            # mark executed regardless (settled ones are simply cancelled)
-            def _mark(eid=row["id"]):
-                with connect(self.cfg) as conn:
-                    conn.execute("UPDATE escalations SET executed_at = ? WHERE id = ?",
-                                 (now_ts, eid))
-                    conn.commit()
-            write_with_retry(_mark)
+            # A resolved outage cancels the loop; ack does NOT.
+            if row["resolved_at"] is not None or row["kind"] != "hourly":
+                self._mark_executed(row["id"], now_ts)
+                continue
+            self._fire_hourly(row, now_ts)
+            # reschedule for the next interval from *now* (don't burst-catch-up if
+            # the daemon was asleep) so the loop keeps running until recovery.
+            self._reschedule(row["id"], now_ts)
 
-    def _fire_escalation(self, kind: str, device_id: int, ts: str) -> None:
-        dev = self.engine.meta[device_id]
-        if kind == "realert":
-            recipient = self.topic_tech
-            self._publish("tech", f"⏰ STILL DOWN — {dev.name}",
-                          "No acknowledgement yet", self._priority(dev.criticality))
-            payload = "realert"
-        else:  # escalate_to_owner
-            recipient = self.topic_owner
-            self._publish("owner", f"⚠️ ESCALATION — {dev.name} ({dev.region})",
-                          "Unacknowledged outage", 5)
-            payload = "escalate_to_owner"
-        self._record(device_id, recipient, "sent", payload, ts)
+    def _mark_executed(self, esc_id: int, ts: str) -> None:
+        def _do():
+            with connect(self.cfg) as conn:
+                conn.execute("UPDATE escalations SET executed_at = ? WHERE id = ?",
+                             (ts, esc_id))
+                conn.commit()
+        write_with_retry(_do)
+
+    def _reschedule(self, esc_id: int, now_ts: str) -> None:
+        next_due = _plus_minutes(now_ts, self.cfg.escalate_every_min)
+        def _do():
+            with connect(self.cfg) as conn:
+                conn.execute("UPDATE escalations SET due_at = ? WHERE id = ?",
+                             (next_due, esc_id))
+                conn.commit()
+        write_with_retry(_do)
+
+    @staticmethod
+    def _fmt_elapsed(started_at: str, now_ts: str) -> str:
+        secs = max(0, int((_parse(now_ts) - _parse(started_at)).total_seconds()))
+        h, rem = divmod(secs, 3600)
+        m = rem // 60
+        if h and m:
+            return f"{h}h {m}m"
+        return f"{h}h" if h else f"{m}m"
+
+    def _fire_hourly(self, row, ts: str) -> None:
+        """The recurring all-hands page: every interval an outage stays open, tell
+        all three channels how long it's been down and who (if anyone) acked it."""
+        dev = self.engine.meta.get(row["device_id"])
+        if dev is None:
+            return
+        elapsed = self._fmt_elapsed(row["started_at"], ts)
+        ack = (f"Acknowledged by {row['acknowledged_by']}."
+               if row["acknowledged_by"] else "Not yet acknowledged.")
+        self._broadcast(
+            f"⏰ STILL DOWN ({elapsed}) — {dev.name} ({dev.region})",
+            f"{dev.name} ({dev.ip_address}) has been down for {elapsed}.\n{ack}",
+            5,
+        )
+        self._record(row["device_id"], self.topic_owner, "sent",
+                     f"hourly escalation ({elapsed})", ts)
 
 
 def acknowledge_outage(outage_id: int, by: str, cfg: Config = CONFIG) -> bool:

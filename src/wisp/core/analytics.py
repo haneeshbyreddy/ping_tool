@@ -51,7 +51,7 @@ def latest_states(conn) -> dict[int, str]:
 
 def _outages_in_window(conn, win_start: datetime, win_end: datetime) -> list[dict]:
     rows = conn.execute(
-        "SELECT o.*, d.name, d.region, d.criticality"
+        "SELECT o.*, d.name, d.region"
         " FROM outages o JOIN devices d ON d.id = o.device_id"
     ).fetchall()
     out = []

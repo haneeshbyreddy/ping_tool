@@ -2,7 +2,7 @@
 
 A small, reliable tool to watch the **shared network infrastructure** of a rural WiFi
 broadband operator (several villages) and instantly tell the operator
-and field technicians **what is down, where, and the likely cause** — over free push
+and field technicians **what is down and where** — over free push
 channels (ntfy). Runs on one always-on box, no cloud, no per-message costs.
 
 > **What's here:** the design *rationale* (the why), the remaining **Phase 7** go-live
@@ -13,7 +13,7 @@ channels (ntfy). Runs on one always-on box, no cloud, no per-message costs.
 ## Status
 
 Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8** (in-UI config, team
-directory, PIN gate, monitor lifecycle) are **done** — 67 tests. The build now targets a
+directory, PIN gate, monitor lifecycle) are **done** — 58 tests. The build now targets a
 **real environment**: the mock notifier and simulated prober (and the demo seeder) have
 been removed, so the daemon polls with `IcmpProber` and alerts via `NtfyNotifier`. The
 dashboard + tests remain pure stdlib; the daemon needs the venv (`icmplib`/`httpx`) and
@@ -35,9 +35,9 @@ the kernel ping group enabled. See "Going live" below.
 ### Re-scoped away from the original brief (and why)
 - **WhatsApp / SMS / Twilio / IVR → dropped from v1.** The goal is operator awareness, not
   end-user comms; we don't build it.
-- **"Potential Fiber Cut" → "Link / Equipment fault".** This is a *wireless* network; the
-  meaningful split is **power loss vs. wireless-link/equipment fault** — the single biggest
-  cause of rural downtime, and the most valuable signal we produce (see below).
+- **Automatic cause inference → dropped.** An earlier version tried to guess power-vs-link
+  from device co-location; it was never wired to the UI and has been removed. Cause is now an
+  operator-entered post-mortem fact, not a guess.
 
 ---
 
@@ -46,11 +46,11 @@ the kernel ping group enabled. See "Going live" below.
 ```
             Internet
                │
-        [ Core / Gateway ]              criticality 5
+        [ Core / Gateway ]
                │
-        [ Main Tower A ]  ── backhaul ──  [ Relay Tower B ]   criticality 4
+        [ Main Tower A ]  ── backhaul ──  [ Relay Tower B ]
             │     │                            │
-        [Relay] [Sector AP]               [Sector AP]         criticality 2-3
+        [Relay] [Sector AP]               [Sector AP]
 ```
 
 Each node is a `devices` row with a `parent_device_id`, so when a parent dies we mark its
@@ -66,24 +66,24 @@ reasoning they encode.
 - **Flap suppression / hysteresis.** A wireless link blips constantly; paging on a single
   bad poll would train everyone to ignore alerts. So DOWN needs 3 consecutive 100%-loss
   polls, DEGRADED needs 2, recovery needs 2 healthy — ~3 min to declare DOWN. That delay is
-  a deliberate trade: never cry wolf. Tunable per-criticality later.
+  a deliberate trade: never cry wolf.
 - **Uplink canary.** If our own office internet is down, every tower looks down. Pinging a
   canary first lets us send ONE `UPLINK_DOWN` and freeze transitions, instead of a storm —
   and means "our internet is down" never masquerades as "the towers are down."
 - **Topology suppression.** One "Tower A down" is actionable; forty "sector down under
   Tower A" alerts are noise. A child of a down parent becomes UNREACHABLE and is never paged.
-- **Power vs. link (the differentiator).** On a genuine DOWN we guess the cause: if *all*
-  co-located devices at a site drop together → **Likely Power Outage**; if some siblings stay
-  up → **Link/Equipment Fault**. An optional `power_ref_ip` (a node on mains only) sharpens
-  it. This tells a tech whether to grab a battery/genset or climb the tower for the radio,
-  and gives the owner the power-vs-equipment split to decide **batteries vs. radios** — the
-  headline rural business stat.
+- **Cause is operator-confirmed, not guessed.** An earlier version auto-tagged each DOWN as
+  "Likely Power Outage" vs "Link/Equipment Fault" from a `power_ref_ip` / co-location
+  heuristic, with a per-device `criticality`. Both were **removed** (migration `0005`): neither
+  was ever settable from the UI, so the guess was always inert. Cause is now captured by the
+  operator at resolution via the post-mortem (`root_cause` + `resolution_notes`) — a confirmed
+  fact, not an inference.
 - **Durable, restart-safe memory.** Outages, alerts, and escalation timers live in the DB
   (not in-memory timers), and the FSM rehydrates from the last poll on startup — a crash or a
   deliberate restart never drops an escalation or re-pages everyone.
 
-These four — flap suppression, canary, topology, power-vs-link — are the heart of the tool;
-everything else (BI, dashboard, in-UI config) is built around keeping them trustworthy.
+These three — flap suppression, canary, topology — are the heart of the tool; everything else
+(BI, dashboard, in-UI config) is built around keeping them trustworthy.
 
 ---
 
@@ -128,7 +128,5 @@ so this layers on without reworking the engine.
   of *your* uplink specifically)?
 - **Owner & techs:** real ntfy topics (and phone routing keys) per worker, so escalation routing
   is live (owner gets escalations + the daily digest).
-- **Power-ref nodes:** at sites with backup, is there a device on mains only (no UPS/genset)
-  we can ping? That makes the power-vs-link call much sharper.
 - **Later — end-user comms:** if/when wanted, which is realistic locally — SMS (DLT-registered)
   or WhatsApp — and do end users expect per-outage messages or a status page they check?

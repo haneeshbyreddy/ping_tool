@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 50 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 58 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -89,8 +89,10 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   `cfg.ntfy_topic_{owner,operator,tech}` (defaults `hansa-*`, env `WISP_NTFY_TOPIC_*`). A person
   subscribes to the topic for their role; there is **no per-person routing key**. `notifiers.role_topic`
   maps role→topic; `AlertDispatcher._publish(role, …)` sends to that topic **plus a copy to the operator
-  topic** (operators get full visibility). Mapping: device DOWN/re-alert/restored → `tech`; escalation +
-  uplink → `owner`; operator → everything. The old per-device `technician_phone` routing, `resolve_owner`,
+  topic** (operators get full visibility), while `AlertDispatcher._broadcast(…)` sends to **all three**
+  topics once each. Mapping: a fresh device DOWN pages **operator only** (`_publish("operator", …)`); the
+  recurring hourly escalation + the restore notice **broadcast to all three**; uplink down/restored →
+  `owner`. (See "Escalation model" below.) The old per-device `technician_phone` routing, `resolve_owner`,
   and `services.technicians()` are **gone** (the `devices.technician_phone` / `workers.phone` /
   `workers.ntfy_topic` columns still exist but are unused by routing). Workers are now just identity +
   role (`name/role/region/is_active/notes`); still can't remove the last active owner (`LastOwnerError`
@@ -109,10 +111,23 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   in `MonitorEngine.process_cycle` after `feed()`. Don't regress these counts.
 - **Topology order:** devices are processed parent-before-child (`_topological_order`) so a
   parent's new state is known when evaluating its children.
-- **Power-vs-link:** the co-location heuristic needs **2+ devices** sharing a `power_ref_ip`
-  (a lone device down = link fault, not power). A test enforces this — don't regress it.
+- **No automatic cause inference.** The engine does **not** guess why a device is down. The old
+  power-vs-link heuristic (`power_ref_ip`, `inferred_cause`, per-device `criticality`) was
+  removed (migration `0005`) — it was never settable from the UI. Cause is now only the
+  operator-entered post-mortem (`root_cause` / `resolution_notes`) at resolution. Don't
+  reintroduce an inferred cause or a `criticality` field.
+- **Escalation model (the alarm ladder):** a fresh DOWN pages the **operator only**, immediately
+  (`_on_open` → `_publish("operator", …)`, anti-spam deduped). It also queues **one** `escalations`
+  row of kind `"hourly"` due at `now + cfg.escalate_every_min` (default 60, env
+  `WISP_ESCALATE_EVERY_MIN`). Each `sweep` that finds it due while the outage is **still open** fires
+  `_fire_hourly` — an **all-hands broadcast** (owner + operator + tech) stating the running duration
+  and who acked it (if anyone) — then **reschedules the same row** to `now + interval` (it does *not*
+  mark it executed). **Acknowledgement does NOT stop this loop; only recovery does** — `_on_resolved`
+  marks the row executed (and broadcasts the restore). So don't reintroduce ack-cancels-escalation or
+  the old two-step `realert`/`escalate_to_owner` kinds.
 - **Escalations are DB-derived** (`escalations.due_at` + sweeper), not in-memory timers, so
-  restarts don't drop them. `UNIQUE(outage_id, kind)` keeps them idempotent.
+  restarts don't drop them. `UNIQUE(outage_id, kind)` keeps them idempotent (one `hourly` row per
+  outage, rescheduled in place rather than re-inserted).
 - **Restart safety:** `build_engine` rehydrates each FSM from the last `poll_results` row;
   breaking that re-pages everyone on restart.
 - **Timestamps:** poll/outage stamps are ISO8601 `+00:00`; SQLite `datetime('now')` (acks) is
@@ -123,9 +138,9 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 - **Dashboard layering:** `server/services.py` mirrors `core/analytics.py` but returns
   dicts/lists; `server/routes.py` is HTTP-only (runnable entry is `apps/dashboard/main.py`).
   Triage buckets: open+unacked = `unassigned`, open+acked = `in_progress`,
-  recovered+undocumented = `pending_postmortem`; UNREACHABLE is excluded (never paged). Active
-  cards deliberately **don't** show the inferred power/link cause (it's a guess) — the confirmed
-  cause is captured by the post-mortem dropdown at resolution. A `pending_postmortem` card can
+  recovered+undocumented = `pending_postmortem`; UNREACHABLE is excluded (never paged). The
+  confirmed cause is captured by the post-mortem dropdown at resolution (there is no automatic
+  cause guess anymore). A `pending_postmortem` card can
   instead be **dismissed** (DELETE `/api/outages/{id}` → `services.dismiss_outage`): it stamps a
   sentinel `resolution_notes` (`DISMISSED_NOTE`) so the row leaves triage but **stays in downtime
   history** — it's a soft clear, not a hard delete, so analytics are untouched.
@@ -142,7 +157,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (60 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (58 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides), `integration/test_notifiers`
 (dispatch/escalation/ack + the `send_with_retry` policy, temp DB + controlled time),
 `integration/test_analytics` (outage-window/downtime math), `integration/test_api` (services +

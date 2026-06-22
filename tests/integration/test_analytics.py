@@ -38,19 +38,19 @@ class WindowMath(unittest.TestCase):
                 (3, "Tower B"), (4, "Tower C"),
             ]:
                 c.execute(
-                    "INSERT INTO devices (id,name,ip_address,criticality,region)"
-                    " VALUES (?,?,?,3,'R')",
+                    "INSERT INTO devices (id,name,ip_address,region)"
+                    " VALUES (?,?,?,'R')",
                     (did, name, f"10.0.0.{did}"))
-            # Tower A: a 2-hour POWER outage, resolved
-            c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state,"
-                      "inferred_cause) VALUES (1,?,?,?,?)",
+            # Tower A: a 2-hour outage, resolved
+            c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state)"
+                      " VALUES (1,?,?,?)",
                       (iso(self.now - timedelta(hours=3)), iso(self.now - timedelta(hours=1)),
-                       DOWN, "Likely Power Outage"))
-            # Tower B: a 1-hour LINK outage, resolved
-            c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state,"
-                      "inferred_cause) VALUES (3,?,?,?,?)",
+                       DOWN))
+            # Tower B: a 1-hour outage, resolved
+            c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state)"
+                      " VALUES (3,?,?,?)",
                       (iso(self.now - timedelta(hours=2)), iso(self.now - timedelta(hours=1)),
-                       DOWN, "Link/Equipment Fault"))
+                       DOWN))
             # Sector A: UNREACHABLE (must be excluded from DOWN-only math)
             c.execute("INSERT INTO outages (device_id,started_at,resolved_at,final_state)"
                       " VALUES (2,?,?,?)",

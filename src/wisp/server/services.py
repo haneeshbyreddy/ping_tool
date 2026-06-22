@@ -11,6 +11,7 @@ deps); only the daemon's real ICMP prober + ntfy notifier require the venv.
 """
 from __future__ import annotations
 
+import ipaddress
 from datetime import datetime, timedelta, timezone
 
 from wisp.core.analytics import (
@@ -35,12 +36,6 @@ POSTMORTEM_WINDOW_H = 24
 
 
 # --- helpers ----------------------------------------------------------------
-def _cause_kind(inferred_cause: str | None) -> str:
-    """'power' | 'link' | 'unknown' — collapses the engine's cause string."""
-    if not inferred_cause:
-        return "unknown"
-    return "power" if inferred_cause.startswith("Likely") else "link"
-
 
 def _state_label(state: str) -> str:
     return {
@@ -61,22 +56,6 @@ def _payload_str(data: dict, key: str, err: type[ValueError], *,
     if required and not v:
         raise err(f"{key.replace('_', ' ')} is required")
     return v or default
-
-
-def _payload_int(data: dict, key: str, err: type[ValueError], *,
-                 lo=None, hi=None, default=0):
-    """Coerce a field to a bounded whole number, raising `err` on a non-number or
-    an out-of-range value."""
-    v = data.get(key, default)
-    if v in (None, ""):
-        v = default
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        raise err(f"{key.replace('_', ' ')} must be a whole number")
-    if lo is not None and v < lo or hi is not None and v > hi:
-        raise err(f"{key.replace('_', ' ')} must be between {lo} and {hi}")
-    return v
 
 
 # --- read views -------------------------------------------------------------
@@ -147,12 +126,12 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT o.id, o.device_id, o.started_at, o.resolved_at, o.final_state,"
-            " o.inferred_cause, o.acknowledged_by, o.acknowledged_at, o.root_cause,"
-            " o.resolution_notes, d.name, d.region, d.criticality,"
-            " d.technician_phone"
+            " o.acknowledged_by, o.acknowledged_at, o.root_cause,"
+            " o.resolution_notes, d.name, d.region"
             " FROM outages o JOIN devices d ON d.id = o.device_id"
             " WHERE o.final_state = ?"
-            "   AND (o.resolved_at IS NULL OR o.resolution_notes IS NULL)"
+            "   AND (o.resolved_at IS NULL"
+            "        OR (o.root_cause IS NULL AND o.resolution_notes IS NULL))"
             " ORDER BY o.id DESC",
             (DOWN,),
         ).fetchall()
@@ -176,18 +155,16 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             "name": r["name"],
             "region": r["region"],
             "status": status,
-            "cause": _cause_kind(r["inferred_cause"]),
-            "inferred_cause": r["inferred_cause"],
-            "criticality": r["criticality"],
             "assigned_to": r["acknowledged_by"],
             "started_at": r["started_at"],
             "duration_s": int(duration_s),
             "duration_label": _fmt_dur(duration_s),
         })
 
-    # impact-ranked: unassigned first, then by criticality
+    # impact-ranked: unassigned first, then in-progress, then post-mortem;
+    # within a bucket, longest-running first.
     order = {"unassigned": 0, "in_progress": 1, "pending_postmortem": 2}
-    items.sort(key=lambda i: (order.get(i["status"], 9), -i["criticality"]))
+    items.sort(key=lambda i: (order.get(i["status"], 9), -i["duration_s"]))
     return items
 
 
@@ -197,8 +174,8 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
     win_start = win_end - timedelta(hours=hours)
     with connect(cfg) as conn:
         devices = conn.execute(
-            "SELECT id, name, ip_address, device_type, region,"
-            " criticality FROM devices WHERE is_active=1 ORDER BY id"
+            "SELECT id, name, ip_address, device_type, region"
+            " FROM devices WHERE is_active=1 ORDER BY id"
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
         states = latest_states(conn)
@@ -215,7 +192,6 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             "ip": d["ip_address"],
             "type": d["device_type"],
             "region": d["region"],
-            "criticality": d["criticality"],
             "state": state,
             "state_label": _state_label(state),
             "uptime_pct": round(pct, 2),
@@ -253,8 +229,8 @@ def network_heatmap(cfg: Config = CONFIG, days: int = 30) -> list[dict]:
 
 def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
     """Devices that suffered a DOWN outage on the given UTC calendar day, with how
-    long they were down *that day* and the inferred cause — powers the Nodes page
-    heatmap drill-down. Empty list = nothing was down that day."""
+    long they were down *that day* — powers the Nodes page heatmap drill-down.
+    Empty list = nothing was down that day."""
     from datetime import datetime
     day_start = datetime.strptime(date_str, "%Y-%m-%d")  # naive UTC midnight
     # Don't count an ongoing outage past 'now' into the future (matters for today).
@@ -262,8 +238,8 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
     with connect(cfg) as conn:
         outages = _outages_in_window(conn, day_start, clip_end)
         meta = {r["id"]: r for r in conn.execute(
-            "SELECT id, name, ip_address, device_type, region,"
-            " criticality FROM devices WHERE is_active=1")}
+            "SELECT id, name, ip_address, device_type, region"
+            " FROM devices WHERE is_active=1")}
 
     per: dict[int, dict] = {}
     for o in outages:
@@ -273,9 +249,8 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
         e = min(o["_end"], clip_end)
         if e <= s:
             continue
-        agg = per.setdefault(o["device_id"], {"down_s": 0.0, "cause": o["inferred_cause"]})
+        agg = per.setdefault(o["device_id"], {"down_s": 0.0})
         agg["down_s"] += (e - s).total_seconds()
-        agg["cause"] = agg["cause"] or o["inferred_cause"]
 
     out: list[dict] = []
     for did, agg in per.items():
@@ -288,8 +263,6 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
             "ip": m["ip_address"],
             "type": m["device_type"],
             "region": m["region"],
-            "criticality": m["criticality"],
-            "cause": _cause_kind(agg["cause"]),
             "down_s": int(agg["down_s"]),
             "down_label": _fmt_dur(agg["down_s"]),
         })
@@ -305,7 +278,7 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT o.id, o.device_id, o.started_at, o.resolved_at, o.final_state,"
-            " o.inferred_cause, o.root_cause, o.resolution_notes, o.acknowledged_by,"
+            " o.root_cause, o.resolution_notes, o.acknowledged_by,"
             " d.name, d.region"
             " FROM outages o JOIN devices d ON d.id = o.device_id"
             " WHERE o.resolved_at IS NOT NULL ORDER BY o.id DESC"
@@ -313,7 +286,7 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
 
     matched = []
     for r in rows:
-        hay = f"{r['name']} {r['region']} {r['inferred_cause'] or ''} {r['root_cause'] or ''}".lower()
+        hay = f"{r['name']} {r['region']} {r['root_cause'] or ''}".lower()
         if q and q not in hay:
             continue
         dur = (_parse(r["resolved_at"]) - _parse(r["started_at"])).total_seconds()
@@ -327,7 +300,7 @@ def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
             "state": r["final_state"],
             "duration_s": int(dur),
             "duration_label": _fmt_dur(dur),
-            "root_cause": r["root_cause"] or r["inferred_cause"] or "—",
+            "root_cause": r["root_cause"] or "—",
             "resolution_notes": r["resolution_notes"],
             "acknowledged_by": r["acknowledged_by"],
         })
@@ -376,7 +349,7 @@ def dismiss_outage(outage_id: int, cfg: Config = CONFIG) -> bool:
             cur = conn.execute(
                 "UPDATE outages SET root_cause = ?, resolution_notes = ?"
                 " WHERE id = ? AND resolved_at IS NOT NULL"
-                "   AND resolution_notes IS NULL",
+                "   AND root_cause IS NULL AND resolution_notes IS NULL",
                 ("Dismissed", DISMISSED_NOTE, outage_id),
             )
             conn.commit()
@@ -534,12 +507,70 @@ def delete_worker(worker_id: int, cfg: Config = CONFIG) -> dict:
 
 # --- device inventory management (config from the UI) -----------------------
 DEVICE_TYPES = ("core", "tower", "relay", "sector", "backhaul")
-_DEVICE_FIELDS = ("name", "ip_address", "device_type", "criticality", "region",
-                  "parent_device_id", "power_ref_ip", "technician_phone")
+_DEVICE_FIELDS = ("name", "ip_address", "device_type", "region",
+                  "parent_device_id", "technician_phone")
 
 
 class DeviceError(ValueError):
     """A bad device payload (validation), surfaced to the UI as a 422."""
+
+
+# Snappy reachability probe for the add-node flow (kept small so the UI doesn't
+# hang on the spinner). Tuned for "is this a real, currently-up host?", not the
+# daemon's steady-state monitoring.
+_REACH_COUNT = 2
+_REACH_TIMEOUT_S = 1
+
+
+def check_reachable(ip: str, cfg: Config = CONFIG) -> dict:
+    """Quick ICMP reachability check for the UI before a node is saved — catches a
+    typo'd / wrong address that would otherwise sit there looking like a permanent
+    outage. Shells out to the system `ping` so the stdlib-only dashboard needs no
+    icmplib (the daemon's prober). Returns {reachable, detail, rtt_ms, ip}:
+
+      * reachable True  — host answered
+      * reachable False — no reply (could be a typo, or a real host that's down now;
+                          the UI offers "add anyway")
+      * reachable None  — couldn't probe (no `ping` binary); never blocks the add
+
+    Raises DeviceError on a malformed IP (same 422 the create path would give)."""
+    import re
+    import shutil
+    import subprocess
+
+    ip = (ip or "").strip()
+    try:
+        version = ipaddress.ip_address(ip).version
+    except ValueError:
+        raise DeviceError(f"'{ip}' is not a valid IP address")
+
+    binary = shutil.which("ping")
+    if not binary:
+        return {"reachable": None, "detail": "ping unavailable — reachability not checked",
+                "rtt_ms": None, "ip": ip}
+
+    cmd = [binary, "-c", str(_REACH_COUNT), "-W", str(_REACH_TIMEOUT_S)]
+    if version == 6:
+        cmd.append("-6")
+    cmd.append(ip)
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_REACH_COUNT * _REACH_TIMEOUT_S + 3,
+        )
+    except subprocess.TimeoutExpired:
+        return {"reachable": False, "detail": "no reply (timed out)", "rtt_ms": None, "ip": ip}
+    except OSError as exc:
+        return {"reachable": None, "detail": f"couldn't run ping: {exc}",
+                "rtt_ms": None, "ip": ip}
+
+    if proc.returncode == 0:
+        avg = re.search(r"=\s*[\d.]+/([\d.]+)/", proc.stdout or "")
+        rtt = round(float(avg.group(1)), 1) if avg else None
+        detail = f"host is up — {rtt} ms avg" if rtt is not None else "host is up"
+        return {"reachable": True, "detail": detail, "rtt_ms": rtt, "ip": ip}
+    return {"reachable": False, "detail": "no reply (100% packet loss)",
+            "rtt_ms": None, "ip": ip}
 
 
 def list_devices(cfg: Config = CONFIG) -> list[dict]:
@@ -547,8 +578,8 @@ def list_devices(cfg: Config = CONFIG) -> list[dict]:
     the Nodes-page inventory editor and the parent-node dropdown."""
     with connect(cfg) as conn:
         rows = conn.execute(
-            "SELECT d.id, d.name, d.ip_address, d.device_type, d.criticality, d.region,"
-            " d.is_active, d.parent_device_id, d.power_ref_ip, d.technician_phone,"
+            "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
+            " d.is_active, d.parent_device_id, d.technician_phone,"
             " p.name AS parent_name,"
             " (SELECT COUNT(*) FROM devices c WHERE c.parent_device_id = d.id) AS child_count"
             " FROM devices d LEFT JOIN devices p ON p.id = d.parent_device_id"
@@ -564,17 +595,18 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
     def _str(key, *, required=False, default=None):
         return _payload_str(data, key, DeviceError, required=required, default=default)
 
-    def _int(key, *, lo=None, hi=None, default=0):
-        return _payload_int(data, key, DeviceError, lo=lo, hi=hi, default=default)
-
     name = _str("name", required=True)
     ip_address = _str("ip_address", required=True)
+    # Reject anything that isn't a real IPv4/IPv6 address — a typo'd address would
+    # ping-fail forever and look like a permanent outage, so don't accept the node.
+    try:
+        ipaddress.ip_address(str(ip_address))
+    except ValueError:
+        raise DeviceError(f"'{ip_address}' is not a valid IP address")
     device_type = _str("device_type")
     if device_type and device_type not in DEVICE_TYPES:
         raise DeviceError(f"device type must be one of: {', '.join(DEVICE_TYPES)}")
-    criticality = _int("criticality", lo=1, hi=5, default=3)
     region = _str("region")
-    power_ref_ip = _str("power_ref_ip")
     technician_phone = _str("technician_phone")
 
     parent_raw = data.get("parent_device_id")
@@ -601,8 +633,8 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
 
     return {
         "name": name, "ip_address": ip_address, "device_type": device_type,
-        "criticality": criticality, "region": region, "parent_device_id": parent_id,
-        "power_ref_ip": power_ref_ip, "technician_phone": technician_phone,
+        "region": region, "parent_device_id": parent_id,
+        "technician_phone": technician_phone,
     }
 
 
