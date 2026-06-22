@@ -39,6 +39,11 @@ fi
 log "installing Python deps (icmplib, httpx)…"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q -r "$REPO_ROOT/requirements.txt"
+# Fail loud HERE if the venv is broken — a monitor that can't import its prober/
+# notifier must not reach "running" only to die on the first poll. Cheap insurance
+# on a firewalled/offline LAN box where a partial wheel would otherwise pass silently.
+"$VENV/bin/python" -c "import icmplib, httpx" \
+  || err "venv deps failed to import (icmplib/httpx) — check the pip output above (offline box? proxy needed?)"
 
 # --- 3. unprivileged ICMP (ping sockets, no root needed at runtime) ---------
 # Persist the setting AND apply it now. Apply only our key with `-w` rather than
