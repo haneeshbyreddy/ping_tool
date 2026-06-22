@@ -45,6 +45,35 @@ your LAN subnet — locking yourself out of SSH is no fun). Everything else is a
 The manual walkthrough below is the same steps, broken out, if you want to understand or
 adjust any of them.
 
+## Windows (native, no WSL)
+
+Prefer Linux — it's what this tool targets, and unprivileged ICMP "just works."
+But if the box must be Windows, `deploy/install.ps1` is the PowerShell sibling of
+`install.sh`: venv → deps → DB migrate → two **Scheduled Tasks** that auto-start at
+boot and restart on crash. Re-run after a `git pull` to upgrade.
+
+```powershell
+# From an ELEVATED PowerShell (Run as administrator), in the repo:
+powershell -ExecutionPolicy Bypass -File deploy\install.ps1
+# different port:   ... -File deploy\install.ps1 -Port 9000
+# remove the tasks: ... -File deploy\install.ps1 -Uninstall
+```
+
+Install Python from python.org first (tick **Add to PATH**). The script prints the
+dashboard URL and the `netsh` firewall command to lock it to your LAN.
+
+**The one Windows gotcha:** Windows has no unprivileged-ICMP path (no
+`ping_group_range`, no datagram ICMP sockets), so icmplib falls back to **raw sockets,
+which require Administrator**. That's why the tasks run as **SYSTEM** — it has the
+raw-socket right and starts before any user logs in. There's nothing to "enable" like
+the Linux ping group. We use Scheduled Tasks rather than NSSM so nothing has to be
+downloaded onto a locked-down box; they give the same auto-start + restart as the
+systemd units. Manage them with `Get-ScheduledTask WISP-*` / `Restart-ScheduledTask`.
+
+> Not verified on Windows hardware from this repo — the logic mirrors the tested
+> `install.sh`, but smoke-test it on your box (open the dashboard, fire a test alert)
+> before trusting it.
+
 ## First-time install (manual walkthrough)
 
 Install to `/opt/wisp` (what the systemd units expect). Get the code there however you
