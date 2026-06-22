@@ -28,7 +28,24 @@ State lives under `data/` in the install dir: `wisp.db` (+ wal/shm) and `session
 That directory is **git-ignored**, so upgrading with `git pull` never touches your
 database or history.
 
-## First-time install
+## Quick install (one script)
+
+Once the code is on the box, a single idempotent script does all the OS setup, venv,
+sysctl, DB migrate, and systemd wiring — and re-running it after a `git pull` upgrades:
+
+```bash
+# get the code to its final home (private repo → deploy key, or scp). Then:
+cd /opt/wisp
+sudo deploy/install.sh
+```
+
+It prints the dashboard URL and the firewall commands to run next. It deliberately does
+**not** clone the repo (that needs your credentials) or touch the firewall (that needs
+your LAN subnet — locking yourself out of SSH is no fun). Everything else is automatic.
+The manual walkthrough below is the same steps, broken out, if you want to understand or
+adjust any of them.
+
+## First-time install (manual walkthrough)
 
 Install to `/opt/wisp` (what the systemd units expect). Get the code there however you
 like — `git clone` the private repo with a deploy key, or `scp` a copy across.
