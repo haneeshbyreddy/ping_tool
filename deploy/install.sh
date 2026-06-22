@@ -41,9 +41,12 @@ log "installing Python deps (icmplib, httpx)…"
 "$VENV/bin/pip" install -q -r "$REPO_ROOT/requirements.txt"
 
 # --- 3. unprivileged ICMP (ping sockets, no root needed at runtime) ---------
+# Persist the setting AND apply it now. Apply only our key with `-w` rather than
+# `sysctl --system`, which re-applies every drop-in on the box — one unrelated
+# broken key (common in containers) would otherwise abort the whole install.
 log "enabling kernel ping group (unprivileged ICMP)…"
 echo 'net.ipv4.ping_group_range=0 2147483647' > /etc/sysctl.d/99-wisp-ping.conf
-sysctl --system >/dev/null
+sysctl -w net.ipv4.ping_group_range="0 2147483647" >/dev/null
 
 # --- 4. database (idempotent migrations) ------------------------------------
 log "creating / migrating database…"
@@ -59,8 +62,18 @@ for unit in wisp-monitor wisp-dashboard; do
       -e "s#/opt/wisp/apps#$REPO_ROOT/apps#g" \
       "$REPO_ROOT/deploy/$unit.service" > "/etc/systemd/system/$unit.service"
 done
-systemctl daemon-reload
-systemctl enable --now wisp-monitor wisp-dashboard
+
+# Only drive systemctl when systemd is actually the init (it isn't in many
+# containers / WSL). Otherwise install the units and tell the operator how to
+# start the two processes by hand, rather than hard-failing.
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl enable --now wisp-monitor wisp-dashboard
+  SYSTEMD=1
+else
+  log "systemd is not running here — units installed but not started."
+  SYSTEMD=0
+fi
 
 # --- done -------------------------------------------------------------------
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -68,12 +81,23 @@ PORT="$(awk -F'--port ' '/--port/{print $2; exit}' "$REPO_ROOT/deploy/wisp-dashb
 PORT="${PORT:-8000}"
 
 echo
-echo "✓ WISP is installed and running."
-echo
-systemctl --no-pager --lines=0 status wisp-monitor wisp-dashboard | sed -n '1,3p;/Active:/p' || true
-echo
-echo "  Dashboard:  http://${LAN_IP:-<box-lan-ip>}:${PORT}   (set the PIN on first visit)"
-echo "  Logs:       journalctl -u wisp-monitor -f"
+if [ "${SYSTEMD:-0}" -eq 1 ]; then
+  echo "✓ WISP is installed and running."
+  echo
+  systemctl --no-pager --lines=0 status wisp-monitor wisp-dashboard | sed -n '1,3p;/Active:/p' || true
+  echo
+  echo "  Dashboard:  http://${LAN_IP:-<box-lan-ip>}:${PORT}   (set the PIN on first visit)"
+  echo "  Logs:       journalctl -u wisp-monitor -f"
+else
+  echo "✓ WISP is installed (systemd not active here, so not started)."
+  echo
+  echo "  Start the two processes manually from $REPO_ROOT:"
+  echo "    .venv/bin/python apps/daemon/main.py &"
+  echo "    .venv/bin/python apps/dashboard/main.py --host 0.0.0.0 --port ${PORT}"
+  echo "  Or just: ./run.sh"
+  echo
+  echo "  Dashboard:  http://${LAN_IP:-<box-lan-ip>}:${PORT}   (set the PIN on first visit)"
+fi
 echo
 echo "  Next:"
 echo "   1. Lock the dashboard to your LAN (replace the subnet):"
