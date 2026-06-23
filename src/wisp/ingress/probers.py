@@ -36,6 +36,9 @@ class Prober(Protocol):
     def on_cycle_start(self) -> None:  # optional; default no-op in concrete classes
         ...
 
+    async def preflight(self) -> None:  # optional; verify the prober can actually probe
+        ...
+
 
 # --- Real ICMP prober -------------------------------------------------------
 
@@ -64,6 +67,14 @@ class IcmpProber:
 
     def on_cycle_start(self) -> None:
         return None
+
+    async def preflight(self) -> None:
+        """Fail loudly at startup if this box can't actually send ICMP — a missing
+        `icmplib` or a disabled ping group otherwise masquerades as every host
+        (and the internet canary) reading 100% loss, which silently freezes the
+        whole monitor. A loopback probe surfaces both as the same RuntimeError
+        `ping` would raise mid-cycle, so the daemon can refuse to start instead."""
+        await self.ping("127.0.0.1", count=1)
 
     async def ping(self, ip: str, count: int) -> PingResult:
         try:

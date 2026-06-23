@@ -5,6 +5,7 @@ Run:  python -m unittest discover -s tests   (from the project root)
 import os
 import sys
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
@@ -130,6 +131,22 @@ class CanaryFreeze(unittest.TestCase):
         # canary recovers -> UplinkRestored
         r3 = feed(eng, {"d": UP_S()}, canary_up=True)
         self.assertTrue(any(isinstance(e, UplinkRestored) for e in r3.events))
+
+    def test_freeze_disabled_still_pages_local_devices(self):
+        # WISP_CANARY_FREEZE=0: uplink-down is still flagged, but LAN gear keeps being
+        # evaluated and paged (the bug the operator hit — a dead canary blinding local
+        # detection).
+        cfg = replace(CFG, canary_freeze=False)
+        eng = MonitorEngine([solo_device()], cfg)
+        first = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertFalse(first.canary_down)  # not frozen
+        # first dead-canary cycle still raises exactly one UplinkDown for visibility
+        self.assertEqual(sum(isinstance(e, UplinkDown) for e in first.events), 1)
+        last = first
+        for _ in range(cfg.down_consecutive - 1):
+            last = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertEqual(last.states[1], DOWN)  # local device transitioned despite dead canary
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in last.events))
 
 
 if __name__ == "__main__":

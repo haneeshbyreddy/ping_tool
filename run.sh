@@ -18,7 +18,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PY="${PYTHON:-python3}"
+# Prefer the project venv — the daemon needs icmplib/httpx, and running it under a
+# bare system python silently degrades to "every host 100% loss / uplink down"
+# (the prober's import fails and is swallowed as a probe failure). Honour an explicit
+# $PYTHON, else use .venv if present, else fall back to system python3.
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+elif [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+else
+  PY="python3"
+fi
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 NO_DAEMON=0; SETUP_ONLY=0

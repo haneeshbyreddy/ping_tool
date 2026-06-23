@@ -1,0 +1,60 @@
+"""Daemon glue tests: the poll-gather error policy.
+
+Guards the regression where a broken prober (missing icmplib / disabled ping
+group) was silently reported as every host at 100% loss — which trips the canary
+freeze and makes a misconfigured monitor look like a total outage. A config-level
+RuntimeError must abort the cycle loudly; a genuine per-host error stays masked as
+100% loss so one bad host never sinks the whole cycle.
+"""
+import asyncio
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO / "src"))
+
+# apps/ isn't a package (the runtimes self-bootstrap), so load main.py by path.
+_spec = importlib.util.spec_from_file_location(
+    "wisp_daemon_main", _REPO / "apps" / "daemon" / "main.py")
+daemon = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(daemon)
+
+from wisp.ingress.probers import PingResult
+
+
+class _FakeProber:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour  # ip -> callable returning PingResult or raising
+
+    async def ping(self, ip, count):
+        return self._behaviour[ip]()
+
+
+class GatherPingsPolicy(unittest.TestCase):
+    def test_per_host_error_is_masked_as_loss(self):
+        def boom():
+            raise OSError("host unreachable")
+        prober = _FakeProber({
+            "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),
+            "10.0.0.2": boom,
+        })
+        out = asyncio.run(daemon._gather_pings(prober, ["10.0.0.1", "10.0.0.2"], 3))
+        self.assertEqual(out["10.0.0.1"].packet_loss, 0.0)
+        self.assertEqual(out["10.0.0.2"].packet_loss, 100.0)  # masked, cycle survives
+
+    def test_config_error_aborts_the_cycle(self):
+        def missing_dep():
+            raise RuntimeError("IcmpProber needs 'icmplib'")
+        prober = _FakeProber({
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+            "10.0.0.2": missing_dep,
+        })
+        # must NOT come back as a tidy dict of 100%-loss readings — it raises.
+        with self.assertRaises(RuntimeError):
+            asyncio.run(daemon._gather_pings(prober, ["1.1.1.1", "10.0.0.2"], 3))
+
+
+if __name__ == "__main__":
+    unittest.main()

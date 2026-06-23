@@ -54,8 +54,13 @@ async def _gather_pings(prober: Prober, ips: list[str], count: int) -> dict[str,
     async def one(ip: str) -> tuple[str, PingResult]:
         try:
             return ip, await prober.ping(ip, count)
+        except RuntimeError:
+            # A config/permission failure (icmplib missing, ping group off) is NOT a
+            # down host — masking it as 100% loss makes a broken monitor look like a
+            # total outage (and trips the canary freeze). Let it abort the cycle.
+            raise
         except Exception:
-            # One probe blowing up must never sink the cycle.
+            # A genuine per-host probe error must never sink the cycle.
             return ip, PingResult(ip, None, 100.0)
 
     pairs = await asyncio.gather(*(one(ip) for ip in ips))
@@ -144,6 +149,16 @@ async def run_forever(
     interval = cfg.poll_interval_s if interval is None else interval
     devices = load_device_meta(cfg)
     prober = build_prober(cfg)
+    # Verify the box can actually send ICMP before we trust a single reading. Without
+    # this, a missing icmplib / disabled ping group makes every host (and the canary)
+    # read 100% loss — a broken monitor that looks like a total outage. Fail loud.
+    preflight = getattr(prober, "preflight", None)
+    if preflight is not None:
+        try:
+            await preflight()
+        except RuntimeError as exc:
+            log.error("prober preflight failed — refusing to start: %s", exc)
+            raise SystemExit(2)
     engine = build_engine(cfg)
     dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
     print(

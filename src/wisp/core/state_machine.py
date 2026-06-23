@@ -190,19 +190,24 @@ class MonitorEngine:
         canary = results.get(cfg.canary_ip)
         canary_down = canary is not None and canary.packet_loss >= 100.0
 
-        # --- Canary freeze: suppress all local transitions ---
-        if canary_down:
-            events: list[Event] = []
-            if not self._uplink_active:
-                self._uplink_active = True
-                events.append(UplinkDown())
-            states = {dev_id: fsm.state for dev_id, fsm in self.fsm.items()}
-            return CycleResult(states=states, events=events, canary_down=True)
-
-        events = []
-        if self._uplink_active:
+        # --- Uplink edge detection (independent of the freeze policy) ---
+        events: list[Event] = []
+        if canary_down and not self._uplink_active:
+            self._uplink_active = True
+            events.append(UplinkDown())
+        elif not canary_down and self._uplink_active:
             self._uplink_active = False
             events.append(UplinkRestored())
+
+        # --- Canary freeze: when our own internet is down, optionally suppress all
+        # local transitions and raise just the one UplinkDown — avoids a storm of
+        # per-site pages when every remote site is unreachable *through* the dead
+        # uplink. Disabled (WISP_CANARY_FREEZE=0) for LAN-reachable gear that stays
+        # monitorable when the internet drops: the UplinkDown above still fires, but
+        # we fall through and evaluate local devices normally. ---
+        if canary_down and cfg.canary_freeze:
+            states = {dev_id: fsm.state for dev_id, fsm in self.fsm.items()}
+            return CycleResult(states=states, events=events, canary_down=True)
 
         committed: dict[int, str] = {}
         for dev_id in self._order:

@@ -32,6 +32,13 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw not in (None, "") else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Config:
     # --- Storage -------------------------------------------------------------
@@ -76,6 +83,14 @@ class Config:
 
     # --- Canary / uplink check ----------------------------------------------
     canary_ip: str = field(default_factory=lambda: _env("WISP_CANARY_IP", "1.1.1.1"))
+    # When the canary (our own internet) is down, freeze local monitoring and raise a
+    # single UplinkDown instead of a storm of per-site pages — right when every remote
+    # site is unreachable *through* the dead uplink. Set WISP_CANARY_FREEZE=0 for gear
+    # reachable on the LAN regardless of the internet: the UplinkDown/Restored notices
+    # still fire, but local devices keep being evaluated and paged.
+    canary_freeze: bool = field(
+        default_factory=lambda: _env_bool("WISP_CANARY_FREEZE", True)
+    )
 
     # --- Escalation timing (minutes) ----------------------------------------
     # A fresh DOWN pages the operator immediately; thereafter, while the outage
