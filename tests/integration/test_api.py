@@ -117,6 +117,18 @@ class ApiTest(unittest.TestCase):
         self.assertLess(nodes[1]["uptime_pct"], 90.0)
         self.assertEqual(nodes[2]["uptime_pct"], 100.0)
 
+    def test_nodes_list_carries_topology(self):
+        # device 2 hangs off device 1; the tree UI needs parent + child counts.
+        with connect(self.cfg) as c:
+            c.execute("UPDATE devices SET parent_device_id=1 WHERE id=2")
+            c.commit()
+        nodes = {n["id"]: n for n in api.nodes_list(self.cfg)}
+        self.assertEqual(nodes[2]["parent_device_id"], 1)
+        self.assertIsNone(nodes[1]["parent_device_id"])
+        self.assertEqual(nodes[1]["child_count"], 1)  # has device 2 beneath it
+        self.assertEqual(nodes[2]["child_count"], 0)
+        self.assertEqual(nodes[3]["child_count"], 0)
+
     # -- heatmap --
     def test_heatmap_states(self):
         self._poll(1, self.now)  # first data point is today

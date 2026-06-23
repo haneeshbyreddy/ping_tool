@@ -392,24 +392,50 @@
   }
 
   // --- Nodes ----------------------------------------------------------------
-  function nodeRow(n) {
-    const map = {
-      UP: { dot: "bg-primary", text: "text-primary", icon: "cell_tower", glow: "0 0 4px #ffffff", op: "" },
-      DEGRADED: { dot: "bg-error", text: "text-error", icon: "cell_tower", glow: "0 0 4px #ffb4ab", op: "" },
-      DOWN: { dot: "bg-error", text: "text-error", icon: "wifi_off", glow: "0 0 4px #ffb4ab", op: "" },
-      UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
-    };
-    const s = map[n.state] || map.UP;
+  const NODE_STATE_MAP = {
+    UP: { dot: "bg-primary", text: "text-primary", icon: "cell_tower", glow: "0 0 4px #ffffff", op: "" },
+    DEGRADED: { dot: "bg-error", text: "text-error", icon: "cell_tower", glow: "0 0 4px #ffb4ab", op: "" },
+    DOWN: { dot: "bg-error", text: "text-error", icon: "wifi_off", glow: "0 0 4px #ffb4ab", op: "" },
+    UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
+  };
+
+  // ctx: { depth, hasChildren, expanded, stats:{affected,total}, suppressedBy }
+  function nodeRow(n, ctx = {}) {
+    const { depth = 0, hasChildren = false, expanded = false, stats = null, suppressedBy = null } = ctx;
+    const s = NODE_STATE_MAP[n.state] || NODE_STATE_MAP.UP;
     const pctColor = n.uptime_pct >= 99.9 ? "text-primary" : (n.uptime_pct >= 95 ? "text-amber-400" : "text-error");
-    return `<div data-edit="${n.id}" title="Click to edit" class="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3 hover:bg-surface-container-low transition-colors group cursor-pointer ${s.op}">
-      <div class="flex items-center gap-3 min-w-0">
+
+    // disclosure caret for branches; an alignment spacer for leaves.
+    const caret = hasChildren
+      ? `<button data-toggle="${n.id}" title="${expanded ? "Collapse" : "Expand"} subtree"
+           class="shrink-0 w-5 h-5 flex items-center justify-center text-on-surface-variant hover:text-primary">${icon(expanded ? "expand_more" : "chevron_right", { size: 18 })}</button>`
+      : `<span class="shrink-0 w-5 h-5 inline-flex items-center justify-center text-outline">${depth > 0 ? icon("subdirectory_arrow_right", { size: 14 }) : ""}</span>`;
+
+    // roll-up chip on a collapsed branch: surface hidden trouble, else fan-out size.
+    let rollup = "";
+    if (hasChildren && !expanded && stats) {
+      rollup = stats.affected > 0
+        ? `<span class="font-label-xs text-label-xs text-error border border-error/30 bg-error/10 px-2 py-0.5 rounded-md whitespace-nowrap">${stats.affected} affected</span>`
+        : `<span class="font-label-xs text-label-xs text-outline whitespace-nowrap hidden sm:inline">${stats.total} downstream</span>`;
+    }
+
+    // why is this node UNREACHABLE? name the nearest DOWN ancestor.
+    const why = (n.state === "UNREACHABLE" && suppressedBy)
+      ? `<p class="font-label-xs text-label-xs text-outline mt-0.5 truncate flex items-center gap-1">${icon("subdirectory_arrow_right", { size: 12 })} suppressed · ${esc(suppressedBy.name)} is DOWN</p>`
+      : `<p class="font-mono-data text-on-surface-variant mt-0.5 truncate text-[11px]">${esc(n.type || "node")} · ${esc(n.ip)} · ${esc(n.region)}</p>`;
+
+    const indent = Math.min(depth, 6) * 16;
+    return `<div data-edit="${n.id}" title="Click to edit" style="margin-left:${indent}px" class="bg-surface border border-outline-variant rounded-md p-3 flex flex-row items-center justify-between gap-3 hover:bg-surface-container-low transition-colors group cursor-pointer ${s.op}">
+      <div class="flex items-center gap-2 min-w-0">
+        ${caret}
         <div class="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center shrink-0 ${s.text}">${icon(s.icon, { size: 18 })}</div>
         <div class="min-w-0">
           <h4 class="font-label-md text-label-md text-primary truncate">${esc(n.name)}</h4>
-          <p class="font-mono-data text-on-surface-variant mt-0.5 truncate text-[11px]">${esc(n.type || "node")} · ${esc(n.ip)} · ${esc(n.region)}</p>
+          ${why}
         </div>
       </div>
       <div class="flex items-center gap-3 shrink-0">
+        ${rollup}
         <div class="text-right hidden sm:block"><p class="font-mono-data ${pctColor}">${fmtPct(n.uptime_pct)}</p></div>
         <div class="flex items-center gap-1.5">
           <span class="w-2 h-2 rounded-full ${s.dot}" style="box-shadow:${s.glow}"></span>
@@ -418,6 +444,93 @@
         <span class="text-outline group-hover:text-primary transition-colors">${icon("edit", { size: 18 })}</span>
       </div>
     </div>`;
+  }
+
+  // --- node topology tree (collapse / expand, roll-up, suppression cause) ----
+  const NODE_STATE_RANK = { UP: 1, UNREACHABLE: 2, DEGRADED: 3, DOWN: 4 };
+  const NODE_EXPAND_KEY = "wisp.nodes.expand";  // { expanded:[ids], collapsed:[ids] }
+
+  function loadExpandPrefs() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(NODE_EXPAND_KEY) || "{}");
+      return { expanded: new Set(raw.expanded || []), collapsed: new Set(raw.collapsed || []) };
+    } catch { return { expanded: new Set(), collapsed: new Set() }; }
+  }
+  function saveExpandPrefs(prefs) {
+    try {
+      localStorage.setItem(NODE_EXPAND_KEY, JSON.stringify({
+        expanded: [...prefs.expanded], collapsed: [...prefs.collapsed],
+      }));
+    } catch { /* private mode / quota — tree just won't persist */ }
+  }
+
+  // Flat node list -> ordered rows honoring expand state, with per-node context.
+  function buildNodeRows(nodes, prefs) {
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const children = new Map();
+    const roots = [];
+    for (const n of nodes) {
+      const p = n.parent_device_id;
+      if (p != null && byId.has(p)) (children.get(p) || children.set(p, []).get(p)).push(n);
+      else roots.push(n);
+    }
+    // affected count + worst state across each subtree (descendants only).
+    const statsCache = new Map();
+    function stats(id) {
+      if (statsCache.has(id)) return statsCache.get(id);
+      const kids = children.get(id) || [];
+      let affected = 0, total = 0;
+      for (const k of kids) {
+        total += 1;
+        if (k.state !== "UP") affected += 1;
+        const sub = stats(k.id);
+        total += sub.total; affected += sub.affected;
+      }
+      const r = { affected, total };
+      statsCache.set(id, r);
+      return r;
+    }
+    // nearest ancestor that is itself DOWN (the real cause of a suppressed node).
+    function downAncestor(n) {
+      let p = n.parent_device_id;
+      while (p != null && byId.has(p)) {
+        const par = byId.get(p);
+        if (par.state === "DOWN") return par;
+        p = par.parent_device_id;
+      }
+      return null;
+    }
+    function isExpanded(id) {
+      if (prefs.collapsed.has(id)) return false;
+      if (prefs.expanded.has(id)) return true;
+      return stats(id).affected > 0;  // default: open branches with trouble
+    }
+
+    const rows = [];
+    function walk(list, depth) {
+      for (const n of list) {
+        const kids = children.get(n.id) || [];
+        const hasChildren = kids.length > 0;
+        const expanded = hasChildren && isExpanded(n.id);
+        rows.push({ node: n, ctx: {
+          depth, hasChildren, expanded,
+          stats: hasChildren ? stats(n.id) : null,
+          suppressedBy: n.state === "UNREACHABLE" ? downAncestor(n) : null,
+        } });
+        if (expanded) walk(kids, depth + 1);
+      }
+    }
+    walk(roots, 0);
+    return rows;
+  }
+
+  function toggleNodeExpand(id, prefs, currentlyExpanded) {
+    // record an explicit override opposite to the current rendered state.
+    prefs.expanded.delete(id);
+    prefs.collapsed.delete(id);
+    if (currentlyExpanded) prefs.collapsed.add(id);
+    else prefs.expanded.add(id);
+    saveExpandPrefs(prefs);
   }
 
   function heatmapCells(cells, selected) {
@@ -580,6 +693,7 @@
 
   function renderNodes(page) {
     let selectedDate = null;  // null = live view of all nodes; else a YYYY-MM-DD drill-down
+    const expandPrefs = loadExpandPrefs();
     page.innerHTML = `<div class="w-full max-w-5xl mx-auto flex flex-col gap-section-gap px-4 md:px-8 py-6 md:py-8">
       <header>
         <h2 class="font-display text-display text-primary mb-2">Nodes Management</h2>
@@ -633,7 +747,8 @@
           clear.classList.remove("flex");
           const nodes = await getJSON("/api/nodes");
           if (currentPath() !== "#/nodes") return;
-          box.innerHTML = nodes.map(nodeRow).join("");
+          const rows = buildNodeRows(nodes, expandPrefs);
+          box.innerHTML = rows.map((r) => nodeRow(r.node, r.ctx)).join("");
         }
       } catch (e) {
         box.innerHTML = errorBox(e.message);
@@ -675,9 +790,21 @@
       } catch (e) { toast("Couldn't load nodes", "error"); }
     });
 
+    // Caret toggle: flip the subtree's expand state and re-render (delegated).
+    $("#nodes", page).addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-toggle]");
+      if (!btn) return;
+      ev.stopPropagation();
+      const id = Number(btn.getAttribute("data-toggle"));
+      // a present "Collapse" title means it's currently expanded.
+      toggleNodeExpand(id, expandPrefs, btn.getAttribute("title").startsWith("Collapse"));
+      loadNodes();
+    });
+
     // Edit on row click (delegated, so it survives auto-refresh re-renders).
     // Only the live all-nodes view has [data-edit]; drill-down rows don't.
     $("#nodes", page).addEventListener("click", async (ev) => {
+      if (ev.target.closest("[data-toggle]")) return;  // caret handled above
       const row = ev.target.closest("[data-edit]");
       if (!row) return;
       const id = Number(row.getAttribute("data-edit"));

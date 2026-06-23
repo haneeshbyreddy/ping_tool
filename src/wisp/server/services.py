@@ -174,13 +174,20 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
     win_start = win_end - timedelta(hours=hours)
     with connect(cfg) as conn:
         devices = conn.execute(
-            "SELECT id, name, ip_address, device_type, region"
+            "SELECT id, name, ip_address, device_type, region, parent_device_id"
             " FROM devices WHERE is_active=1 ORDER BY id"
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
         states = latest_states(conn)
     down = _downtime_by_device(outages, win_start, win_end, only_down=False)
     window_s = (win_end - win_start).total_seconds()
+
+    # child counts over the active set, so the tree can show roll-up carets.
+    child_count: dict[int, int] = {}
+    for d in devices:
+        p = d["parent_device_id"]
+        if p is not None:
+            child_count[p] = child_count.get(p, 0) + 1
 
     out: list[dict] = []
     for d in devices:
@@ -192,6 +199,8 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             "ip": d["ip_address"],
             "type": d["device_type"],
             "region": d["region"],
+            "parent_device_id": d["parent_device_id"],
+            "child_count": child_count.get(d["id"], 0),
             "state": state,
             "state_label": _state_label(state),
             "uptime_pct": round(pct, 2),
