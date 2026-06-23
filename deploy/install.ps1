@@ -169,6 +169,12 @@ $settings  = New-ScheduledTaskSettingsSet `
 
 function Register-WispTask {
     param([string]$Name, [string]$Cmd, [string]$Desc)
+    # Stop any running instance FIRST. With MultipleInstances=IgnoreNew, Start is a
+    # no-op while the old process is alive — so on a re-run (upgrade) the old code
+    # would keep running even though -Force rewrote the definition on disk.
+    if (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    }
     $action = New-ScheduledTaskAction -Execute $Cmd -WorkingDirectory $RepoRoot
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Description $Desc -Force | Out-Null

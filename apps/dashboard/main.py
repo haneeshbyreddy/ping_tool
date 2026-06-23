@@ -36,13 +36,22 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Windows consoles / redirected pipes default to a legacy code page (cp1252/cp437)
+    # that can't encode the arrows & dashes in our log lines — that crashed the
+    # dashboard on startup. Force UTF-8 (replace any holdout glyph) so a stray
+    # character can never take the process down.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
     # The dashboard process watches the polling daemon: if the daemon dies, this
     # pages the owner instead of silently showing an all-green network.
     start_watchdog_thread(CONFIG)
 
     server = make_server(args.host, args.port)
-    print(f"HANSA dashboard → http://{args.host}:{args.port}  (db={CONFIG.db_path.name})")
+    print(f"HANSA dashboard -> http://{args.host}:{args.port}  (db={CONFIG.db_path.name})")
     print("Ctrl-C to stop.")
     try:
         server.serve_forever()

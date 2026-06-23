@@ -537,6 +537,7 @@ def check_reachable(ip: str, cfg: Config = CONFIG) -> dict:
     import re
     import shutil
     import subprocess
+    import sys
 
     ip = (ip or "").strip()
     try:
@@ -549,7 +550,13 @@ def check_reachable(ip: str, cfg: Config = CONFIG) -> dict:
         return {"reachable": None, "detail": "ping unavailable — reachability not checked",
                 "rtt_ms": None, "ip": ip}
 
-    cmd = [binary, "-c", str(_REACH_COUNT), "-W", str(_REACH_TIMEOUT_S)]
+    # Ping flags differ by OS: Linux uses "-c count / -W seconds"; Windows ping uses
+    # "-n count / -w milliseconds". Sending Linux flags to Windows ping makes every
+    # check read "no reply", which silently blocks adding ANY device.
+    if sys.platform.startswith("win"):
+        cmd = [binary, "-n", str(_REACH_COUNT), "-w", str(_REACH_TIMEOUT_S * 1000)]
+    else:
+        cmd = [binary, "-c", str(_REACH_COUNT), "-W", str(_REACH_TIMEOUT_S)]
     if version == 6:
         cmd.append("-6")
     cmd.append(ip)
@@ -564,10 +571,16 @@ def check_reachable(ip: str, cfg: Config = CONFIG) -> dict:
         return {"reachable": None, "detail": f"couldn't run ping: {exc}",
                 "rtt_ms": None, "ip": ip}
 
-    if proc.returncode == 0:
-        avg = re.search(r"=\s*[\d.]+/([\d.]+)/", proc.stdout or "")
+    out = proc.stdout or ""
+    # Windows ping can exit 0 while reporting "Destination host unreachable" / "100%
+    # loss" for a non-answering host, so don't trust the exit code alone there.
+    answered = proc.returncode == 0 and "unreachable" not in out.lower() \
+        and "100% loss" not in out.lower()
+    if answered:
+        # RTT line differs by OS: Linux "min/avg/max = .../12.3/...", Windows "Average = 12ms".
+        avg = re.search(r"=\s*[\d.]+/([\d.]+)/", out) or re.search(r"Average\s*=\s*(\d+)\s*ms", out)
         rtt = round(float(avg.group(1)), 1) if avg else None
-        detail = f"host is up — {rtt} ms avg" if rtt is not None else "host is up"
+        detail = f"host is up - {rtt} ms avg" if rtt is not None else "host is up"
         return {"reachable": True, "detail": detail, "rtt_ms": rtt, "ip": ip}
     return {"reachable": False, "detail": "no reply (100% packet loss)",
             "rtt_ms": None, "ip": ip}

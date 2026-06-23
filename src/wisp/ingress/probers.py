@@ -10,10 +10,16 @@ The Prober protocol is intentionally tiny: `async def ping(ip, count)`.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from wisp.config import CONFIG, Config
+
+# Linux/Unix offer unprivileged ICMP datagram sockets (the kernel ping group). Windows
+# has no such socket type, so icmplib must use raw sockets there — which require
+# Administrator/SYSTEM. Pick the right mode per OS rather than hardcoding one.
+_PRIVILEGED_ICMP = sys.platform.startswith("win")
 
 
 @dataclass(frozen=True)
@@ -38,16 +44,18 @@ class IcmpProber:
     dependency; an unreachable host becomes a 100%-loss reading rather than
     crashing the poll loop.
 
-    Uses *unprivileged* ICMP datagram sockets (`privileged=False`), so the daemon
-    runs as a normal user — no root, no `cap_net_raw`. This needs the kernel ping
-    group enabled once on the box:
+    On Linux/Unix it uses *unprivileged* ICMP datagram sockets, so the daemon runs
+    as a normal user — no root, no `cap_net_raw` — once the kernel ping group is
+    enabled on the box:
 
         sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
         # persist: echo 'net.ipv4.ping_group_range=0 2147483647' | \\
         #   sudo tee /etc/sysctl.d/99-wisp-ping.conf
 
-    A permission error (group not enabled) surfaces as a RuntimeError so the
-    misconfig is obvious rather than every device silently reading 'down'.
+    Windows has no unprivileged ICMP socket, so there it uses raw sockets and must
+    run elevated (Administrator/SYSTEM) — see `_PRIVILEGED_ICMP`. A permission error
+    surfaces as a RuntimeError so the misconfig is obvious rather than every device
+    silently reading 'down'.
     """
 
     def __init__(self, *, interval: float = 0.2, timeout: float = 1.0) -> None:
@@ -68,9 +76,14 @@ class IcmpProber:
         try:
             host = await async_ping(
                 ip, count=count, interval=self._interval,
-                timeout=self._timeout, privileged=False,
+                timeout=self._timeout, privileged=_PRIVILEGED_ICMP,
             )
-        except SocketPermissionError as exc:  # ping group not enabled on this box
+        except SocketPermissionError as exc:  # no socket permission on this box
+            if _PRIVILEGED_ICMP:  # Windows: raw sockets need elevation
+                raise RuntimeError(
+                    "ICMP on Windows needs raw sockets — run the monitor as "
+                    "Administrator/SYSTEM (the install.ps1 Scheduled Task does this)."
+                ) from exc
             raise RuntimeError(
                 "ICMP needs the kernel ping group enabled: "
                 'sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"'

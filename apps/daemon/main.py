@@ -177,7 +177,7 @@ async def run_forever(
             try:
                 current = load_device_meta(cfg)
                 if current != devices:
-                    print(f"device set changed ({len(current)} devices) — rebuilding monitor")
+                    print(f"device set changed ({len(current)} devices) - rebuilding monitor")
                     devices = current
                     engine = build_engine(cfg)
                     dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
@@ -210,6 +210,14 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Windows consoles / redirected pipes default to a legacy code page (cp1252/cp437)
+    # that can't encode the dashes & arrows in our log/print lines. Force UTF-8 so a
+    # stray glyph (e.g. a unicode device name) never crashes the polling loop.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
     migrate()
     try:
