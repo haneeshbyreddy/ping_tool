@@ -172,9 +172,16 @@ Every tunable is a `WISP_*` env var read once at startup (full list + defaults i
 
 | Var | Default | Meaning |
 |---|---|---|
-| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (the units ship `20` for ~1-min detection) |
+| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (the units ship `20` for ~1-min detection; detection = this × 3) |
+| `WISP_POLL_INTERVAL_ADAPTIVE` | `0` | `1` = poll every `WISP_POLL_INTERVAL_SMALL_S` (30) while the fleet ≤ `WISP_SMALL_FLEET_MAX` (1000), else fall back to `WISP_POLL_INTERVAL_S` |
+| `WISP_PINGS_PER_POLL` / `_INFRA` | `5` / `2` | echoes per poll for leaf CPEs / for aggregation gear (gentle on tower control planes) |
+| `WISP_MAX_INFLIGHT` | `256` | cap on concurrent probes — keeps a large fleet from exhausting file descriptors (raise `ulimit -n` too) |
+| `WISP_POLL_RETENTION_DAYS` | `90` | days of raw poll samples kept; hourly rollups (`poll_rollups`) are the long-term trend record |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_DB` | `data/wisp.db` | DB location — leave it unless you want state elsewhere |
 | `WISP_DASHBOARD_PIN` | — | seed the PIN on first run (else set it in the UI) |
+
+> At fleet scale (thousands of devices) also raise the open-file limit on the daemon
+> (`LimitNOFILE=65535` in the unit's `[Service]` block) so the bounded fan-out has headroom.

@@ -99,6 +99,23 @@ class ProbePlan(unittest.TestCase):
         self.assertEqual(eng.probe_plan()["d"], 5)
 
 
+class AdaptiveInterval(unittest.TestCase):
+    """Detection cadence scales with fleet size when adaptive mode is on: a small
+    deployment polls faster (quicker detection); a large one falls back to protect
+    the box. Off by default, so existing deployments are unchanged."""
+
+    def test_off_by_default(self):
+        cfg = Config(poll_interval_s=60, poll_interval_small_s=30, small_fleet_max=1000)
+        self.assertEqual(cfg.effective_interval(10), 60)
+        self.assertEqual(cfg.effective_interval(5000), 60)
+
+    def test_small_fleet_polls_faster_when_on(self):
+        cfg = Config(poll_interval_adaptive=True, poll_interval_s=60,
+                     poll_interval_small_s=30, small_fleet_max=1000)
+        self.assertEqual(cfg.effective_interval(1000), 30)   # at the threshold -> fast
+        self.assertEqual(cfg.effective_interval(1001), 60)   # above it -> protect the box
+
+
 class Degraded(unittest.TestCase):
     def test_degraded_needs_two_consecutive(self):
         eng = MonitorEngine([solo_device()], CFG)

@@ -172,8 +172,11 @@ async def run_forever(
     # plus the current device set. The device set is re-read each cycle so a UI add/
     # remove is picked up in-process (no restart); config tunables are env-var + restart
     # (see config.py — there is no DB settings layer).
-    interval = cfg.poll_interval_s if interval is None else interval
+    # A CLI --interval wins; otherwise the cadence is derived from the fleet size
+    # (adaptive mode lets a small fleet poll faster — see Config.effective_interval).
+    cli_interval = interval
     devices = load_device_meta(cfg)
+    interval = cli_interval if cli_interval is not None else cfg.effective_interval(len(devices))
     prober = build_prober(cfg)
     # Verify the box can actually send ICMP before we trust a single reading. Without
     # this, a missing icmplib / disabled ping group makes every host (and the canary)
@@ -237,6 +240,12 @@ async def run_forever(
                     devices = current
                     engine = build_engine(cfg)
                     dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
+                    # Fleet size may have crossed the adaptive threshold — retune cadence.
+                    if cli_interval is None:
+                        new_interval = cfg.effective_interval(len(current))
+                        if new_interval != interval:
+                            print(f"poll cadence -> {new_interval}s (fleet {len(current)} devices)")
+                            interval = new_interval
             except Exception:
                 log.exception("device-set reload failed; keeping current monitor")
         started = asyncio.get_running_loop().time()

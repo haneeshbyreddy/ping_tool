@@ -41,7 +41,7 @@ PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 58 tests (pure stdlib)
+python -m unittest discover -s tests                 # 77 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -70,9 +70,10 @@ the browser.
   **Change PIN**, and **Download backup**. Detection thresholds, escalation timing, the
   ntfy base URL, and org/timezone are configured via `WISP_*` environment variables and
   applied on restart (see Config below).
-- **Team** — workers as first-class entities (owner / operator / tech) with phone +
-  ntfy routing. The `owner` receives escalations; you can't remove
-  the last active owner.
+- **Team** — workers as first-class entities — identity + role (owner / operator / tech),
+  *not* per-person routing. Alerts go to **three fixed ntfy topics, one per role**
+  (`WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}`); a person subscribes to the topic for their
+  role. You can't remove the last active owner.
 - **Device-set hot reload** — the daemon re-reads the active device set each cycle and
   rebuilds its engine in-process when you add/remove a node (state rehydrates from the DB,
   so nobody is re-paged). No restart needed for inventory changes. Config tunable changes
@@ -98,7 +99,7 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── database/             # client.py (WAL conn + migration runner)
 ├── ingress/              # probers.py (real ICMP ping via icmplib)
 ├── egress/               # notifiers.py (alert dispatch), ack.py
-└── server/               # services.py (JSON data + device/worker/settings CRUD),
+└── server/               # services.py (JSON data + device/worker CRUD, rollup trends),
                           #   routes.py (HTTP + auth gate), auth.py (PIN + sessions)
 apps/
 ├── daemon/main.py        # worker runtime — the 60s polling loop
@@ -145,17 +146,31 @@ run.sh                    # one-shot setup + run for both runtimes
 
 | Var | Default | Meaning |
 |---|---|---|
-| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls |
+| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (detection = this × 3 to declare DOWN) |
+| `WISP_POLL_INTERVAL_ADAPTIVE` | `0` | `1` = poll faster on a small fleet (see below) |
+| `WISP_POLL_INTERVAL_SMALL_S` | `30` | cadence used while the fleet ≤ `WISP_SMALL_FLEET_MAX` (adaptive on) |
+| `WISP_SMALL_FLEET_MAX` | `1000` | fleet size at/below which the small cadence applies |
 | `WISP_PINGS_PER_POLL` | `5` | echoes per poll for leaf devices (CPEs) |
 | `WISP_PINGS_PER_POLL_INFRA` | `2` | echoes per poll for aggregation gear (any device that is a parent) |
 | `WISP_MAX_INFLIGHT` | `256` | max concurrent probes in flight (0 = unbounded); caps FD use at scale |
+| `WISP_POLL_RETENTION_DAYS` | `90` | days of raw poll samples kept (hourly rollups are the long-term trend record) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
+| `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |
 
-Full list in `config.py`. Most of these are now editable from **Settings** in the UI and
-the DB value overrides the env var (the env is bootstrap / a deploy-time override).
+**Config is env-var only** — every tunable is read once at startup into the frozen `Config`
+(`config.py` has the full list + defaults). There is no in-UI settings page and no DB config
+layer: change a value by exporting the env var and restarting the daemon. (Device/team edits
+*are* live in the UI; *tunables* are not.) The dashboard's **Settings** page is just the test
+alert, PIN change, and DB backup.
+
+**Faster detection for small deployments.** Detection latency is `poll_interval × 3` (DOWN
+needs 3 straight 100%-loss polls), so the 60s default is ~3 min. Either drop
+`WISP_POLL_INTERVAL_S` (e.g. `30` → ~90s) or set `WISP_POLL_INTERVAL_ADAPTIVE=1` and the daemon
+polls every 30s while the fleet is ≤1k and automatically backs off to 60s above that — it
+re-evaluates when you add/remove nodes, so no restart is needed when the fleet grows.
 
 ## Going live (on the always-on box)
 
@@ -163,9 +178,12 @@ the DB value overrides the env var (the env is bootstrap / a deploy-time overrid
    then enable unprivileged ICMP: `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`
    (persist it in `/etc/sysctl.d/`) so the daemon can ping without root.
 2. Enter the real device inventory + topology from the dashboard **Nodes** page.
-3. Set the ntfy base URL in **Settings ▸ Channels**, add your team (owner + techs with
-   their ntfy topics) on the **Team** page, then use **Send test alert** to confirm routing.
-4. Tune thresholds against how the real links actually blip (Settings ▸ Detection).
+3. Set the ntfy base URL and the three role topics (`WISP_NTFY_URL`,
+   `WISP_NTFY_TOPIC_*`) in the systemd units, add your team (owner + techs) on the **Team**
+   page so each person knows which role topic to subscribe to, then use **Settings ▸ Send
+   test alert** to confirm routing.
+4. Tune thresholds/cadence (`WISP_POLL_INTERVAL_S`, `WISP_LOSS_DEGRADED`, etc.) against how the
+   real links actually blip, then restart the daemon.
 5. Run both processes under systemd for auto-start and crash-restart:
    ```bash
    sudo cp deploy/wisp-*.service /etc/systemd/system/

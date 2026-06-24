@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 75 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 77 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -65,6 +65,14 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   in-progress hour. `services.device_trend` reads it for charts. `outages` stays the incident
   source of truth; this tier is analytics-only, so raw retention can be cut short without losing
   history.
+- **Adaptive cadence is fleet-size-derived, opt-in.** `Config.effective_interval(device_count)`
+  returns `poll_interval_small_s` (30) while the active fleet is `<= small_fleet_max` (1000) and
+  `poll_interval_adaptive` is on (`WISP_POLL_INTERVAL_ADAPTIVE`), else `poll_interval_s` (60).
+  Off by default — existing deployments are unchanged. The daemon computes it at startup and
+  **recomputes on device-set reload** (so crossing 1k retunes in-process), but a CLI `--interval`
+  always wins. Detection latency is `interval × down_consecutive`. Note `stale_threshold_s()`
+  still keys off `poll_interval_s` (the conservative ceiling), not the small cadence — fine, it's
+  a forgiving floor.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -181,7 +189,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (75 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (77 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra),
 `integration/test_notifiers` (dispatch/escalation/ack + the `send_with_retry` policy, temp DB +
 controlled time), `integration/test_analytics` (outage-window/downtime math),

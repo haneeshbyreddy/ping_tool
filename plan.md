@@ -12,12 +12,15 @@ channels (ntfy). Runs on one always-on box, no cloud, no per-message costs.
 
 ## Status
 
-Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8** (in-UI config, team
-directory, PIN gate, monitor lifecycle) are **done** — 58 tests. The build now targets a
-**real environment**: the mock notifier and simulated prober (and the demo seeder) have
-been removed, so the daemon polls with `IcmpProber` and alerts via `NtfyNotifier`. The
-dashboard + tests remain pure stdlib; the daemon needs the venv (`icmplib`/`httpx`) and
-the kernel ping group enabled. See "Going live" below.
+Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8** (team directory, PIN
+gate, monitor lifecycle) are **done** — 77 tests. The build now targets a **real
+environment**: the mock notifier and simulated prober (and the demo seeder) have been
+removed, so the daemon polls with `IcmpProber` and alerts via `NtfyNotifier`. Config is
+**env-var only** (a frozen `Config` read at startup — no DB settings layer). The build also
+carries the **fleet-scale** work: bounded probe fan-out, gentle probing of aggregation gear,
+optional adaptive cadence, and an hourly rollup tier (see "Scaling" below). The dashboard +
+tests remain pure stdlib; the daemon needs the venv (`icmplib`/`httpx`) and the kernel ping
+group enabled. See "Going live" below.
 
 ---
 
@@ -65,8 +68,11 @@ reasoning they encode.
 
 - **Flap suppression / hysteresis.** A wireless link blips constantly; paging on a single
   bad poll would train everyone to ignore alerts. So DOWN needs 3 consecutive 100%-loss
-  polls, DEGRADED needs 2, recovery needs 2 healthy — ~3 min to declare DOWN. That delay is
-  a deliberate trade: never cry wolf.
+  polls, DEGRADED needs 2, recovery needs 2 healthy — ~3 min to declare DOWN at the 60s
+  default. That delay is a deliberate trade: never cry wolf. Detection latency is
+  `poll_interval × down_consecutive`, so a small site can cut it by dropping the interval
+  (or `WISP_POLL_INTERVAL_ADAPTIVE=1`, which polls every 30s while the fleet is ≤1k and backs
+  off above that — faster where it's cheap, gentle where it isn't).
 - **Uplink canary.** If our own office internet is down, every tower looks down. Pinging a
   canary first lets us send ONE `UPLINK_DOWN` and freeze transitions, instead of a storm —
   and means "our internet is down" never masquerades as "the towers are down."
@@ -83,15 +89,34 @@ reasoning they encode.
   deliberate restart never drops an escalation or re-pages everyone.
 
 These three — flap suppression, canary, topology — are the heart of the tool; everything else
-(BI, dashboard, in-UI config) is built around keeping them trustworthy.
+(BI, dashboard, env-var config) is built around keeping them trustworthy.
+
+### Scaling (so the alarm stays trustworthy at fleet size)
+The same "never lie" principle drives the fleet-scale work; the code-level invariants are in
+`CLAUDE.md` §"Scaling invariants".
+- **Bounded probe fan-out.** Probes run under an `asyncio.Semaphore` (`WISP_MAX_INFLIGHT`,
+  default 256). An unbounded fan-out opens one ICMP socket per device per tick; past the
+  process FD limit the kernel refuses sockets and every excess probe reads as 100% loss — a
+  *fake mass outage exactly at peak fleet size*. Bounding it keeps a 10k-device fleet within
+  the poll window on a few hundred FDs.
+- **Gentle on aggregation gear.** A tower/switch/AP that backhauls hundreds of customers
+  rate-limits ICMP to its own control plane. Any device that is a *parent* of another is probed
+  with fewer echoes per poll (`WISP_PINGS_PER_POLL_INFRA`, default 2) so we don't read that
+  rate-limiting as phantom loss on the very box that matters most.
+- **Raw polls are scratch; rollups are the trend record.** Nothing reads the historical body of
+  `poll_results` (only the latest state per device + a forensic window), so the daemon folds it
+  hourly into compact `poll_rollups` (one row per device per hour). Trend charts read hours, not
+  a billion raw rows, and raw retention can be cut short without losing history. `outages` stays
+  the source of truth for incidents.
 
 ---
 
 ## Going live
 
 The real ICMP prober + ntfy notifier are now the only adapters; bringing it up on the
-always-on box is the remaining setup. The control plane is already built (Settings/Team/
-Channels in the dashboard, DB-backed config with daemon self-reload, systemd units, backup).
+always-on box is the remaining setup. The dashboard is the device/team control plane (Nodes +
+Team, with the daemon self-reloading the device set in-process); tunables are `WISP_*` env vars
+on the systemd units (no DB config layer). Backup is built in.
 
 1. **Dependencies:** `python3 -m venv .venv && . .venv/bin/activate && pip install -r
    requirements.txt` (`icmplib`/`httpx`). Never install globally (system Python is
@@ -101,13 +126,16 @@ Channels in the dashboard, DB-backed config with daemon self-reload, systemd uni
    `/etc/sysctl.d/`). No root, no `cap_net_raw`.
 3. **Inventory:** enter the real devices + parent→child topology from the dashboard **Nodes**
    page.
-4. **Channels:** the notifier is ntfy. Set the ntfy base URL in **Settings ▸ Channels**, add
-   workers (owner + region techs) with their ntfy topic on the **Team** page, then use **Send
-   test alert** to confirm routing *before* a real outage depends on it.
-5. **Run under systemd** (`deploy/wisp-*.service`) for auto-start and crash-restart. Settings
-   and node edits apply on their own (the daemon self-reloads). Keep the dashboard on the
-   office LAN (plain HTTP + PIN).
-6. **Tune thresholds** (Settings ▸ Detection) against how the real links actually blip.
+4. **Channels:** the notifier is ntfy. Set `WISP_NTFY_URL` and the three role topics
+   (`WISP_NTFY_TOPIC_*`) on the systemd units, add workers (owner + region techs) on the
+   **Team** page so each subscribes to their role's topic, then use **Settings ▸ Send test
+   alert** to confirm routing *before* a real outage depends on it.
+5. **Run under systemd** (`deploy/wisp-*.service`) for auto-start and crash-restart. Node edits
+   apply on their own (the daemon self-reloads the device set); `WISP_*` tunable changes need a
+   daemon restart. Keep the dashboard on the office LAN (plain HTTP + PIN).
+6. **Tune thresholds/cadence** (`WISP_POLL_INTERVAL_S`, `WISP_LOSS_DEGRADED`, … — or
+   `WISP_POLL_INTERVAL_ADAPTIVE=1` for faster detection on a small fleet) against how the real
+   links actually blip, then restart the daemon.
 
 ### What ping-only can't show (future SNMP/controller layer)
 Throughput/bandwidth, signal strength (RSSI/SNR), per-link usage, CPU/temperature. When
@@ -126,7 +154,8 @@ so this layers on without reworking the engine.
   "down" reading is the device or just the path to it.
 - **Canary target:** `1.1.1.1`, or the actual upstream provider gateway/BNG (a better signal
   of *your* uplink specifically)?
-- **Owner & techs:** real ntfy topics (and phone routing keys) per worker, so escalation routing
-  is live (owner gets escalations + the daily digest).
+- **Owner & techs:** the real ntfy topic names for the three roles (`WISP_NTFY_TOPIC_*`), so the
+  team subscribes to the right channels and escalation routing is live. Routing is role→topic;
+  there is no per-person key.
 - **Later — end-user comms:** if/when wanted, which is realistic locally — SMS (DLT-registered)
   or WhatsApp — and do end users expect per-outage messages or a status page they check?

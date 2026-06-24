@@ -51,6 +51,20 @@ class Config:
 
     # --- Polling -------------------------------------------------------------
     poll_interval_s: int = field(default_factory=lambda: _env_int("WISP_POLL_INTERVAL_S", 60))
+    # Detection latency is `poll_interval_s × down_consecutive` (3 polls to confirm
+    # DOWN). A small deployment can afford a faster cadence — and quicker detection —
+    # that a 10k-device box can't. Opt in with WISP_POLL_INTERVAL_ADAPTIVE=1: while the
+    # active fleet is at or below `small_fleet_max`, the daemon polls every
+    # `poll_interval_small_s` (default 30s → ~90s to declare DOWN); above it, it falls
+    # back to `poll_interval_s` to protect the box. Re-evaluated on device-set reload,
+    # so crossing the threshold retunes the cadence in-process (no restart).
+    poll_interval_adaptive: bool = field(
+        default_factory=lambda: _env_bool("WISP_POLL_INTERVAL_ADAPTIVE", False)
+    )
+    poll_interval_small_s: int = field(
+        default_factory=lambda: _env_int("WISP_POLL_INTERVAL_SMALL_S", 30)
+    )
+    small_fleet_max: int = field(default_factory=lambda: _env_int("WISP_SMALL_FLEET_MAX", 1000))
     pings_per_poll: int = field(default_factory=lambda: _env_int("WISP_PINGS_PER_POLL", 5))
     # Aggregation gear (towers/switches/APs — any device that is a *parent* of
     # another) is probed *gently*: fewer echoes per poll so we don't trip the ICMP
@@ -148,6 +162,15 @@ class Config:
 
     # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
+
+    def effective_interval(self, device_count: int) -> int:
+        """Poll cadence for the current fleet size. Adaptive mode off → just
+        `poll_interval_s`. On → a small fleet (<= small_fleet_max) polls every
+        `poll_interval_small_s` (faster detection), anything larger falls back to
+        `poll_interval_s` (protect the box). Detection latency = this × down_consecutive."""
+        if self.poll_interval_adaptive and device_count <= self.small_fleet_max:
+            return self.poll_interval_small_s
+        return self.poll_interval_s
 
     def stale_threshold_s(self) -> int:
         """Seconds without a fresh poll before the monitor is 'down'. Honours an
