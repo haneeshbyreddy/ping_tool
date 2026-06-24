@@ -74,6 +74,12 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(daemon.prune_old_polls(cfg, now=self.now), 0)
         self.assertEqual(self._count(), 1)
 
+    def test_default_retention_is_short(self):
+        # Raw polls are scratch; poll_rollups + outages are the durable record. The
+        # default window only needs to clear the hourly rollup cadence with margin,
+        # so it stays short (a long default silently hoards 10s of GB at fleet size).
+        self.assertEqual(Config().poll_retention_days, 7)
+
 
 if __name__ == "__main__":
     unittest.main()

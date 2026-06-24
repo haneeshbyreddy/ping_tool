@@ -154,7 +154,7 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_PINGS_PER_POLL` | `5` | echoes per poll for leaf devices (CPEs) |
 | `WISP_PINGS_PER_POLL_INFRA` | `2` | echoes per poll for aggregation gear (any device that is a parent) |
 | `WISP_MAX_INFLIGHT` | `256` | max concurrent probes in flight (0 = unbounded); caps FD use at scale |
-| `WISP_POLL_RETENTION_DAYS` | `90` | days of raw poll samples kept (hourly rollups are the long-term trend record) |
+| `WISP_POLL_RETENTION_DAYS` | `7` | days of raw poll samples kept (scratch; hourly rollups + `outages` are the durable record) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |

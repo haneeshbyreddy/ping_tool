@@ -93,10 +93,17 @@ class Config:
     )
     # Raw poll samples older than this are pruned by the daemon (once/day) so a
     # 24/7 deployment reaches a steady-state DB size instead of growing forever.
-    # The `outages` table (the permanent incident record) is never touched.
-    # 0 = keep everything (pruning disabled).
+    # Raw polls are *scratch*: the hourly `poll_rollups` are the long-term trend
+    # record (latency min/avg/max, mean loss, per-state counts) and `outages` is
+    # the permanent incident log — neither is pruned. Nothing reads raw rows older
+    # than the current un-folded hour (charts read rollups, history reads outages,
+    # FSM restart reads only the newest row), so a short window is plenty; it just
+    # has to clear the hourly rollup cadence so a prune never races a fold. 7 days
+    # leaves huge margin plus an ad-hoc forensic window. At ~1k devices the old
+    # 90-day default held ~130M rows (10s of GB) that answered no query. Raise it
+    # only if you add a sub-hour drill-down view. 0 = keep everything (pruning off).
     poll_retention_days: int = field(
-        default_factory=lambda: _env_int("WISP_POLL_RETENTION_DAYS", 90)
+        default_factory=lambda: _env_int("WISP_POLL_RETENTION_DAYS", 7)
     )
 
     # --- Monitor watchdog (dead-monitor alarm) -------------------------------
