@@ -73,7 +73,10 @@ the browser.
 - **Team** — workers as first-class entities — identity + role (owner / operator / tech),
   *not* per-person routing. Alerts go to **three fixed ntfy topics, one per role**
   (`WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}`); a person subscribes to the topic for their
-  role. You can't remove the last active owner.
+  role. You can't remove the last active owner. The Team page also carries an
+  **Attendance** board — a daily present-toggle for operators (who showed up, by date)
+  plus a recent-days grid. The day's on-duty operators are surfaced on each active
+  outage's triage card, so you can see who was around when it broke.
 - **Device-set hot reload** — the daemon re-reads the active device set each cycle and
   rebuilds its engine in-process when you add/remove a node (state rehydrates from the DB,
   so nobody is re-paged). No restart needed for inventory changes. Config tunable changes

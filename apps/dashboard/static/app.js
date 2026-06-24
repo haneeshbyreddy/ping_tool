@@ -249,6 +249,17 @@
     </p>`;
   }
 
+  // Operators marked present on the day this outage began — "who was around when it
+  // broke". Open outages started today say "today"; a recovered one names the day.
+  function onDutyLine(o) {
+    if (!o.on_duty || !o.on_duty.length) return "";
+    const when = o.status === "pending_postmortem" ? "that day" : "today";
+    return `<p class="font-label-xs text-label-xs text-on-surface-variant mt-1 flex items-start gap-1">
+      ${icon("group", { size: 13 })}
+      <span>On duty ${when}: ${o.on_duty.map(esc).join(", ")}</span>
+    </p>`;
+  }
+
   function triageCard(o, team = []) {
     const m = STATUS_META[o.status] || STATUS_META.unassigned;
     // Open outages keep counting up (live ticker); a recovered one is final.
@@ -266,6 +277,7 @@
             <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("event", { size: 14 })} ${fmtTime(o.started_at, { tz: false })}</span>
           </div>
           ${affectedLine(o.affected_children)}
+          ${onDutyLine(o)}
         </div>
       </div>`;
 
@@ -634,12 +646,12 @@
         ${field("Type", "device_type", d.device_type, { options: typeOpts })}
         ${field("Region", "region", d.region, { placeholder: "village / area" })}
         ${field("Parent node", "parent_device_id", d.parent_device_id, { options: parentOpts, full: true })}
-        <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
-          <div class="flex items-center gap-2">${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>
-            <button type="button" data-maint class="flex items-center gap-1 ${d.maintenance ? "text-primary border-primary/40 bg-primary/10" : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high"} border font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("pause_circle", { size: 16 })} ${d.maintenance ? "Resume monitoring" : "Maintenance"}</button>` : ""}</div>
-          <div class="flex items-center gap-2">
-            <button type="button" data-close class="text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 py-2 rounded-md hover:bg-surface-container-high">Cancel</button>
-            <button type="submit" class="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform">${isEdit ? "Save changes" : "Add node"}</button>
+        <div class="sm:col-span-2 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 mt-1 border-t border-outline-variant">
+          <div class="flex items-center gap-2">${isEdit ? `<button type="button" data-delete class="inline-flex items-center justify-center gap-1.5 h-9 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("delete", { size: 16 })} Delete</button>
+            <button type="button" data-maint class="inline-flex items-center justify-center gap-1.5 h-9 ${d.maintenance ? "text-primary border-primary/40 bg-primary/10" : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high"} border font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("pause_circle", { size: 16 })} ${d.maintenance ? "Resume" : "Maintenance"}</button>` : ""}</div>
+          <div class="flex items-center justify-end gap-2">
+            <button type="button" data-close class="inline-flex items-center justify-center h-9 text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 rounded-md hover:bg-surface-container-high whitespace-nowrap">Cancel</button>
+            <button type="submit" class="inline-flex items-center justify-center h-9 bg-primary text-surface font-label-md text-label-md px-4 rounded-md active:scale-95 transition-transform whitespace-nowrap">${isEdit ? "Save changes" : "Add node"}</button>
           </div>
         </div>
       </form>`;
@@ -990,11 +1002,11 @@
           Alerts route by <span class="text-primary">role</span> — this person subscribes to the
           <span class="text-primary font-mono-data" data-role-channel>${esc(BRAND.channels[w.role || "tech"] || (w.role || "tech"))}</span> channel on ntfy.
         </div>
-        <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
-          <div>${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
-          <div class="flex items-center gap-2">
-            <button type="button" data-close class="text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 py-2 rounded-md hover:bg-surface-container-high">Cancel</button>
-            <button type="submit" class="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform">${isEdit ? "Save changes" : "Add worker"}</button>
+        <div class="sm:col-span-2 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 mt-1 border-t border-outline-variant">
+          <div>${isEdit ? `<button type="button" data-delete class="inline-flex items-center justify-center gap-1.5 h-9 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
+          <div class="flex items-center justify-end gap-2">
+            <button type="button" data-close class="inline-flex items-center justify-center h-9 text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 rounded-md hover:bg-surface-container-high whitespace-nowrap">Cancel</button>
+            <button type="submit" class="inline-flex items-center justify-center h-9 bg-primary text-surface font-label-md text-label-md px-4 rounded-md active:scale-95 transition-transform whitespace-nowrap">${isEdit ? "Save changes" : "Add worker"}</button>
           </div>
         </div>
       </form>`;
@@ -1039,6 +1051,57 @@
     }
   }
 
+  // --- Attendance (daily operator roster) -----------------------------------
+  // A "who showed up" board: tap a name to toggle today's presence, plus a
+  // recent-days grid to visualise the pattern. Operators only (set by the API).
+  function attendanceView(att) {
+    const ops = att.operators || [];
+    if (!ops.length) {
+      return `<div class="border border-outline-variant bg-surface-container-low rounded-md p-5 flex items-center gap-3 text-on-surface-variant">
+        ${icon("group", { cls: "text-outline" })}
+        <span class="font-body-sm">No operators yet — add a worker with the <span class="text-primary">operator</span> role to track attendance.</span></div>`;
+    }
+    const presentCount = ops.filter((o) => o.present_today).length;
+    const chips = ops.map((o) => {
+      const on = o.present_today;
+      const cls = on
+        ? "text-emerald-400 border-emerald-400/40 bg-emerald-400/10"
+        : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high";
+      return `<button data-att="${o.id}" data-present="${on ? 1 : 0}" type="button"
+        class="inline-flex items-center gap-1.5 h-9 px-3 rounded-full border font-label-md text-label-md transition-colors whitespace-nowrap ${cls}">
+        ${icon(on ? "check_circle" : "add", { size: 16 })} ${esc(o.name)}</button>`;
+    }).join("");
+
+    const days = att.days || [];
+    // Compact operator × day grid: a filled square = present that day.
+    const headCells = days.map((d) => {
+      const isToday = d === att.today;
+      return `<th class="px-1 pb-1 font-normal text-center ${isToday ? "text-primary" : "text-outline"}">${d.slice(8)}</th>`;
+    }).join("");
+    const bodyRows = ops.map((o) => {
+      const set = new Set(o.present_days || []);
+      const cells = days.map((d) => {
+        const on = set.has(d);
+        return `<td class="px-1 py-0.5 text-center"><span class="inline-block w-2.5 h-2.5 rounded-sm ${on ? "bg-emerald-400" : "bg-surface-container-high"}" title="${esc(o.name)} · ${esc(d)}${on ? " · present" : ""}"></span></td>`;
+      }).join("");
+      return `<tr><td class="pr-3 py-0.5 text-on-surface-variant whitespace-nowrap font-label-xs text-label-xs">${esc(o.name)}</td>${cells}</tr>`;
+    }).join("");
+
+    return `<div class="flex flex-col gap-4">
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <span class="font-body-sm text-body-sm text-on-surface-variant">Today · ${esc(att.today)}</span>
+        <span class="font-label-xs text-label-xs bg-surface-container px-2 py-1 rounded-md border border-outline-variant">${presentCount} / ${ops.length} present</span>
+      </div>
+      <div class="flex flex-wrap gap-2">${chips}</div>
+      <div class="overflow-x-auto border-t border-outline-variant pt-3">
+        <table class="font-mono-data text-mono-data border-separate" style="border-spacing:0">
+          <thead><tr><th class="pr-3 pb-1 text-left font-normal text-outline font-label-xs text-label-xs">last ${days.length} days</th>${headCells}</tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
   function renderTeam(page) {
     page.innerHTML = `<div class="w-full max-w-5xl mx-auto px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6">
       <header class="flex items-center justify-between gap-2">
@@ -1048,9 +1111,16 @@
         </div>
         <button id="add-worker" class="flex items-center gap-1 bg-primary text-surface font-label-md text-label-md px-3 py-2 rounded-md active:scale-95 transition-transform whitespace-nowrap">${icon("add", { size: 16 })} Add worker</button>
       </header>
+
+      <section class="bg-surface border border-outline-variant rounded-md p-4 md:p-5 flex flex-col gap-3">
+        <div class="flex items-center gap-2">${icon("check_circle", { size: 18, cls: "text-on-surface-variant" })}
+          <h3 class="font-headline-md text-headline-md text-primary">Attendance</h3></div>
+        <div id="attendance-body">${loading("attendance")}</div>
+      </section>
+
       <div id="team-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">${loading("team")}</div></div>`;
 
-    async function load() {
+    async function loadTeam() {
       const grid = $("#team-grid", page);
       try {
         const workers = await getJSON("/api/workers");
@@ -1061,6 +1131,28 @@
               ${icon("group", { cls: "text-outline" })}<span class="font-body-sm">No workers yet — add your owner and field technicians.</span></div>`;
       } catch (e) { grid.innerHTML = errorBox(e.message); }
     }
+
+    async function loadAttendance() {
+      const body = $("#attendance-body", page);
+      try {
+        const att = await getJSON("/api/attendance");
+        if (currentPath() !== "#/team") return;
+        body.innerHTML = attendanceView(att);
+      } catch (e) { body.innerHTML = errorBox(e.message); }
+    }
+
+    function load() { loadTeam(); loadAttendance(); }
+
+    $("#attendance-body", page).addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("[data-att]");
+      if (!btn) return;
+      const id = Number(btn.getAttribute("data-att"));
+      const present = btn.getAttribute("data-present") !== "1";  // toggle
+      btn.disabled = true;
+      const res = await sendJSON("POST", "/api/attendance", { worker_id: id, present });
+      if (res.ok && res.data.ok) loadAttendance();
+      else { toast(res.data.error || res.data.reason || "Couldn't update attendance", "error"); btn.disabled = false; }
+    });
 
     $("#add-worker", page).addEventListener("click", () => openWorkerModal(null, load));
     $("#team-grid", page).addEventListener("click", async (ev) => {

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -263,6 +264,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(services.network_heatmap(CONFIG, days))
             if path == "/api/workers":
                 return self._send_json(services.list_workers(CONFIG))
+            if path == "/api/attendance":
+                return self._send_json(services.attendance_overview(CONFIG))
             if path == "/api/devices":
                 return self._send_json(services.list_devices(CONFIG))
             if path == "/api/logs":
@@ -330,6 +333,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "id": new_id}, 201)
             if path == "/api/channels/test":   # send a test alert (go-live check)
                 return self._send_json(services.test_channel(body.get("target", "owner"), CONFIG))
+            if path == "/api/attendance":      # toggle an operator present for a day
+                res = services.set_attendance(
+                    int(body.get("worker_id") or 0),
+                    bool(body.get("present")),
+                    str(body.get("day") or ""),
+                    CONFIG,
+                )
+                return self._send_json(res, 200 if res.get("ok") else 404)
 
             mm = _DEVICE_MAINT.match(path)     # pause/resume monitoring for one node
             if mm:
@@ -458,6 +469,23 @@ def _seed_pin_from_env() -> None:
                 pass  # a bad env PIN just leaves the first-run screen in place
 
 
+class _DashboardServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that doesn't dump a traceback for normal client
+    disconnects. Browsers and EventSource (`/api/events`) clients drop keep-alive
+    and SSE sockets constantly — navigate away, refresh, reconnect — and the stdlib
+    server logs a full stack trace per reset, which buries genuine errors in noise.
+    Swallow only the benign connection-teardown errors; surface everything else."""
+
+    daemon_threads = True   # don't let in-flight requests block Ctrl-C shutdown
+
+    def handle_error(self, request, client_address) -> None:  # noqa: D102
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_server(host: str, port: int) -> ThreadingHTTPServer:
     """Build (but don't start) the dashboard HTTP server. The runnable entry
     point in apps/dashboard/main.py owns the serve loop + CLI."""
@@ -465,4 +493,4 @@ def make_server(host: str, port: int) -> ThreadingHTTPServer:
         raise SystemExit(f"dashboard assets missing — expected {INDEX_HTML}")
     migrate(CONFIG)            # idempotent; ensures settings table exists for auth
     _seed_pin_from_env()
-    return ThreadingHTTPServer((host, port), Handler)
+    return _DashboardServer((host, port), Handler)

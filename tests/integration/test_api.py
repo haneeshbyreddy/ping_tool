@@ -324,5 +324,82 @@ class ApiTest(unittest.TestCase):
                 self.assertEqual(n, 0, f"{t} not purged")
 
 
+class AttendanceTest(unittest.TestCase):
+    """Daily operator attendance: the toggle, the roster view, the FK-safe delete,
+    and the triage 'who was on duty' cross-link."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(db_path=Path(self.tmp.name) / "t.db")
+        migrate(self.cfg)
+        self.today = datetime.now(timezone.utc).date().isoformat()
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO devices (id,name,ip_address,region)"
+                      " VALUES (1,'Rampur Tower','d1','Rampur')")
+            for wid, name, role in [
+                (1, "Ravi", "operator"), (2, "Meena", "operator"),
+                (3, "Arjun", "tech"), (4, "Hansa", "owner"),
+            ]:
+                c.execute("INSERT INTO workers (id,name,role) VALUES (?,?,?)",
+                          (wid, name, role))
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_toggle_present_and_absent(self):
+        # mark present (default = today), idempotent, then clear it.
+        self.assertTrue(api.set_attendance(1, True, "", self.cfg)["ok"])
+        self.assertTrue(api.set_attendance(1, True, "", self.cfg)["ok"])  # idempotent
+        ov = api.attendance_overview(self.cfg)
+        ravi = next(o for o in ov["operators"] if o["id"] == 1)
+        self.assertTrue(ravi["present_today"])
+        self.assertEqual(ov["today"], self.today)
+        # the toggle off removes the row
+        api.set_attendance(1, False, "", self.cfg)
+        ov = api.attendance_overview(self.cfg)
+        self.assertFalse(next(o for o in ov["operators"] if o["id"] == 1)["present_today"])
+
+    def test_overview_lists_only_active_operators(self):
+        ov = api.attendance_overview(self.cfg)
+        names = {o["name"] for o in ov["operators"]}
+        self.assertEqual(names, {"Ravi", "Meena"})  # tech + owner excluded
+        self.assertEqual(len(ov["days"]), 14)
+
+    def test_non_operator_rejected(self):
+        with self.assertRaises(api.WorkerError):
+            api.set_attendance(3, True, "", self.cfg)   # Arjun is a tech
+        self.assertEqual(api.set_attendance(999, True, "", self.cfg)["ok"], False)
+
+    def test_bad_day_rejected(self):
+        with self.assertRaises(api.WorkerError):
+            api.set_attendance(1, True, "24-06-2026", self.cfg)
+
+    def test_present_days_window(self):
+        old = (datetime.now(timezone.utc).date() - timedelta(days=3)).isoformat()
+        api.set_attendance(1, True, old, self.cfg)
+        api.set_attendance(1, True, "", self.cfg)
+        ravi = next(o for o in api.attendance_overview(self.cfg)["operators"]
+                    if o["id"] == 1)
+        self.assertEqual(ravi["present_days"], sorted([old, self.today]))
+
+    def test_triage_shows_on_duty(self):
+        api.set_attendance(1, True, "", self.cfg)  # Ravi present today
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO outages (device_id,started_at,final_state)"
+                      " VALUES (1,?, 'DOWN')",
+                      (datetime.now(timezone.utc).replace(microsecond=0).isoformat(),))
+            c.commit()
+        item = api.triage_outages(self.cfg)[0]
+        self.assertEqual(item["on_duty"], ["Ravi"])
+
+    def test_delete_worker_purges_attendance(self):
+        api.set_attendance(1, True, "", self.cfg)
+        self.assertEqual(api.delete_worker(1, self.cfg), {"ok": True})
+        with connect(self.cfg) as c:
+            n = c.execute("SELECT COUNT(*) FROM attendance WHERE worker_id=1").fetchone()[0]
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

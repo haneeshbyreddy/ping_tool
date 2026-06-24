@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 114 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 122 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -201,6 +201,20 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   role (`name/role/region/is_active/notes`); still can't remove the last active owner (`LastOwnerError`
   → 409). `services.test_channel(role)` fires a test push to a role's topic. The SPA learns the topic
   names from `/api/auth/status` (`channels`) and shows them on the Team + Settings pages.
+- **Operator attendance (daily present-toggle; migration 0010 `attendance`).** A roster of who
+  showed up, by **UTC calendar day** (same day convention as the heatmap, via `services._today`).
+  One row per `(worker_id, day)` = present that day; **absence is the absence of a row** (the toggle
+  DELETEs to mark not-present), `UNIQUE(worker_id, day)` makes marking idempotent. **Operators only**
+  — `set_attendance` 422s a non-operator worker; `attendance_overview`/`list_operators` filter
+  `role='operator' AND is_active=1`. API: `GET /api/attendance` (roster: `{today, days, operators:[…]}`
+  for the Team-page board) + `POST /api/attendance {worker_id, present, day?}` (toggle, day defaults
+  to today). The Team page renders the toggle chips + a recent-days grid; **triage cards carry
+  `on_duty`** — operators present on the outage's **start** day — so "who was around when it broke"
+  shows on the card (`onDutyLine` in app.js). Attendance writes do **not** bump `_data_version`
+  (they don't touch poll_results/outages/alert_log), so triage `on_duty` refreshes on the next poll /
+  15s fallback, not instantly — fine, it's not time-critical. **`attendance` REFERENCES `workers(id)`,
+  so `delete_worker` must clear a worker's attendance rows before the worker row** (same `foreign_keys=ON`
+  rule as the devices-FK tables). Tests: `integration/test_api` `AttendanceTest`.
 - **Secrets:** the only secret is the dashboard `pin_hash` (salted SHA-256 in the `settings`
   table), handled entirely by `server/auth.py` (set/verify via the PIN endpoints). No other
   config flows through the DB — everything else is env-var `Config` (see "Config" above).
@@ -287,6 +301,11 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   cookie). The SPA subscribes once (`startLive`/`liveReload` in app.js) and re-renders the live
   views on each event; a 15s poll remains only as a **fallback when the stream is down** (`_liveOk`).
   Don't reintroduce unconditional 15s polling. Tested over the real server in `integration/test_auth`.
+  Because EventSource + keep-alive clients drop sockets constantly (navigate away, refresh, reconnect),
+  the server is `routes._DashboardServer` (a `ThreadingHTTPServer` subclass) whose `handle_error`
+  **swallows benign connection-teardown errors** (`ConnectionReset`/`BrokenPipe`/`ConnectionAborted`)
+  instead of dumping a full traceback per disconnect — that noise otherwise buries real errors. It
+  still surfaces every other exception. Don't revert to the bare `ThreadingHTTPServer`.
 - **Web assets are vendored** under `apps/dashboard/static/` (no CDN, no build step); `routes.py`
   serves `index.html` from `templates/` and everything else from `static/`. The app is plain
   vanilla JS — Tailwind's Play-CDN runtime JITs classes off the live DOM, so dynamically-built
@@ -294,11 +313,12 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (114 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (122 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
 the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`
-(outage-window/downtime math), `integration/test_api` (services + device CRUD),
+(outage-window/downtime math), `integration/test_api` (services + device CRUD + `AttendanceTest`:
+operator present-toggle, roster window, operators-only guard, triage `on_duty`, FK-safe delete),
 `integration/test_watchdog` (dead-monitor alarm: stale→page, recover, restart no-repage,
 failed-send retry), `integration/test_daemon` (poll-gather error policy, concurrency-bound
 semaphore / per-IP count map, **+ fast-confirm: rapid DOWN confirm and blip-clears-without-paging**,

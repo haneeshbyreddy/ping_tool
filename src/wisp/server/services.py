@@ -37,6 +37,12 @@ POSTMORTEM_WINDOW_H = 24
 
 # --- helpers ----------------------------------------------------------------
 
+def _today() -> str:
+    """Today's UTC calendar day, 'YYYY-MM-DD' — the same UTC-day convention the
+    heatmap / nodes_down_on_day use, so attendance days line up with outage days."""
+    return _now().date().isoformat()
+
+
 def _state_label(state: str) -> str:
     return {
         UP: "Operational",
@@ -139,6 +145,22 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             "SELECT id, name, parent_device_id FROM devices WHERE is_active=1").fetchall()
         states = latest_states(conn)
 
+        # Who was on duty (operators marked present) on each outage's *start* day —
+        # surfaced on the triage card so the operator can see who was around when it
+        # broke. One query over just the days actually in the feed.
+        outage_days = {_parse(r["started_at"]).date().isoformat() for r in rows}
+        on_duty_by_day: dict[str, list[str]] = {}
+        if outage_days:
+            placeholders = ",".join("?" * len(outage_days))
+            for ar in conn.execute(
+                "SELECT a.day, w.name FROM attendance a"
+                " JOIN workers w ON w.id = a.worker_id"
+                f" WHERE w.role='operator' AND a.day IN ({placeholders})"
+                " ORDER BY w.name",
+                tuple(outage_days),
+            ):
+                on_duty_by_day.setdefault(ar["day"], []).append(ar["name"])
+
     # Blast radius: a child knocked UNREACHABLE behind a DOWN parent is topology-
     # suppressed (it gets no card of its own), so the operator can't see who else is
     # affected. Attribute each UNREACHABLE node to its nearest DOWN ancestor (root
@@ -192,6 +214,9 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             # children dragged UNREACHABLE behind this DOWN node (only while open)
             "affected_children": sorted(affected_by.get(r["device_id"], []))
             if open_outage else [],
+            # operators marked present on the day the outage began
+            "on_duty": on_duty_by_day.get(
+                _parse(r["started_at"]).date().isoformat(), []),
         })
 
     # impact-ranked: unassigned first, then in-progress, then post-mortem;
@@ -588,11 +613,98 @@ def delete_worker(worker_id: int, cfg: Config = CONFIG) -> dict:
 
     def _do():
         with connect(cfg) as conn:
+            # attendance REFERENCES workers(id); clear it first or foreign_keys=ON
+            # rejects the worker DELETE (same rule as delete_device's FK tables).
+            conn.execute("DELETE FROM attendance WHERE worker_id=?", (worker_id,))
             conn.execute("DELETE FROM workers WHERE id=?", (worker_id,))
             conn.commit()
             return True
     write_with_retry(_do)
     return {"ok": True}
+
+
+# --- attendance (daily operator roster; who showed up, by date) --------------
+# A "daily present toggle": one row per operator per UTC day they were present.
+# Surfaced on the Team page (today's roster + a recent-days grid) and on triage
+# cards ("who was on duty that day"). Operators only — the field staff a village
+# WISP rosters; owner/tech are excluded from the toggle (see set_attendance).
+
+def _valid_day(day: str) -> str:
+    """Coerce/validate a 'YYYY-MM-DD' day, defaulting to today (UTC)."""
+    day = (day or "").strip() or _today()
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        raise WorkerError("day must be YYYY-MM-DD")
+    return day
+
+
+def list_operators(cfg: Config = CONFIG) -> list[dict]:
+    """Active operators — the people whose attendance the roster tracks."""
+    with connect(cfg) as conn:
+        rows = conn.execute(
+            "SELECT id, name, region FROM workers"
+            " WHERE role='operator' AND is_active=1 ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+def attendance_overview(cfg: Config = CONFIG, days: int = 14) -> dict:
+    """Team-page roster view: active operators + a recent-day presence grid.
+
+    Returns {today, days:[oldest…today], operators:[{id, name, present_today,
+    present_days:[…]}]}. `present_days` is the subset of `days` the operator was
+    marked present, so the UI can paint a per-operator timeline."""
+    days = max(1, min(int(days or 14), 60))
+    end = _now().date()
+    window = [(end - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
+    today, win_start, win_set = window[-1], window[0], set(window)
+    with connect(cfg) as conn:
+        ops = conn.execute(
+            "SELECT id, name FROM workers WHERE role='operator' AND is_active=1"
+            " ORDER BY name").fetchall()
+        att = conn.execute(
+            "SELECT worker_id, day FROM attendance WHERE day >= ?",
+            (win_start,)).fetchall()
+    present: dict[int, set[str]] = {}
+    for r in att:
+        present.setdefault(r["worker_id"], set()).add(r["day"])
+    operators = [{
+        "id": o["id"],
+        "name": o["name"],
+        "present_today": today in present.get(o["id"], set()),
+        "present_days": sorted(d for d in present.get(o["id"], set()) if d in win_set),
+    } for o in ops]
+    return {"today": today, "days": window, "operators": operators}
+
+
+def set_attendance(worker_id: int, present: bool, day: str = "",
+                   cfg: Config = CONFIG) -> dict:
+    """Mark/unmark one operator present for a day (default today). Idempotent:
+    present=True does INSERT OR IGNORE, present=False DELETEs the row. Attendance is
+    operators-only — a non-operator worker is a 422 (WorkerError)."""
+    day = _valid_day(day)
+    with connect(cfg) as conn:
+        w = conn.execute(
+            "SELECT role FROM workers WHERE id=?", (worker_id,)).fetchone()
+    if not w:
+        return {"ok": False, "reason": "worker not found"}
+    if w["role"] != "operator":
+        raise WorkerError("attendance is tracked for operators only")
+
+    def _do():
+        with connect(cfg) as conn:
+            if present:
+                conn.execute(
+                    "INSERT OR IGNORE INTO attendance (worker_id, day) VALUES (?, ?)",
+                    (worker_id, day))
+            else:
+                conn.execute(
+                    "DELETE FROM attendance WHERE worker_id=? AND day=?",
+                    (worker_id, day))
+            conn.commit()
+            return True
+    write_with_retry(_do)
+    return {"ok": True, "worker_id": worker_id, "day": day, "present": bool(present)}
 
 
 # --- device inventory management (config from the UI) -----------------------
