@@ -52,6 +52,21 @@ class Config:
     # --- Polling -------------------------------------------------------------
     poll_interval_s: int = field(default_factory=lambda: _env_int("WISP_POLL_INTERVAL_S", 60))
     pings_per_poll: int = field(default_factory=lambda: _env_int("WISP_PINGS_PER_POLL", 5))
+    # Aggregation gear (towers/switches/APs — any device that is a *parent* of
+    # another) is probed *gently*: fewer echoes per poll so we don't trip the ICMP
+    # rate-limiter on its control plane and read phantom loss on the very box that
+    # backhauls hundreds of customers. Leaf CPEs + the canary get `pings_per_poll`.
+    pings_per_poll_infra: int = field(
+        default_factory=lambda: _env_int("WISP_PINGS_PER_POLL_INFRA", 2)
+    )
+    # Cap on concurrent in-flight probes. A naive fan-out opens one ICMP socket per
+    # device at once; past the process FD limit (`ulimit -n`) the kernel refuses new
+    # sockets and every excess probe reads as 100% loss — a self-inflicted mass
+    # outage exactly when the fleet is largest. Bounding the in-flight set lets 10k
+    # devices clear within the poll window on a few hundred FDs. 0 = unbounded.
+    probe_max_inflight: int = field(
+        default_factory=lambda: _env_int("WISP_MAX_INFLIGHT", 256)
+    )
     # Raw poll samples older than this are pruned by the daemon (once/day) so a
     # 24/7 deployment reaches a steady-state DB size instead of growing forever.
     # The `outages` table (the permanent incident record) is never touched.

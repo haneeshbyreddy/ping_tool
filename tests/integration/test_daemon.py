@@ -32,6 +32,45 @@ class _FakeProber:
         return self._behaviour[ip]()
 
 
+class _CountingProber:
+    """Records how many pings are in flight at once so a test can assert the
+    semaphore actually bounds the fan-out."""
+
+    def __init__(self):
+        self.inflight = 0
+        self.peak = 0
+
+    async def ping(self, ip, count):
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        try:
+            await asyncio.sleep(0.01)   # hold the slot so concurrency can build up
+            return PingResult(ip, 5.0, 0.0)
+        finally:
+            self.inflight -= 1
+
+
+class GatherConcurrencyBound(unittest.TestCase):
+    def test_semaphore_caps_inflight(self):
+        prober = _CountingProber()
+        ips = [f"10.0.0.{i}" for i in range(50)]
+        out = asyncio.run(daemon._gather_pings(prober, ips, 3, max_inflight=8))
+        self.assertEqual(len(out), 50)              # every host still probed
+        self.assertLessEqual(prober.peak, 8)        # never more than the cap in flight
+
+    def test_per_ip_count_map(self):
+        seen = {}
+
+        class _Rec:
+            async def ping(self, ip, count):
+                seen[ip] = count
+                return PingResult(ip, 1.0, 0.0)
+
+        counts = {"a": 2, "b": 5}
+        asyncio.run(daemon._gather_pings(_Rec(), ["a", "b"], counts, max_inflight=4))
+        self.assertEqual(seen, {"a": 2, "b": 5})    # gentle vs full honoured per IP
+
+
 class GatherPingsPolicy(unittest.TestCase):
     def test_per_host_error_is_masked_as_loss(self):
         def boom():

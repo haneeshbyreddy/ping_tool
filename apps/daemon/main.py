@@ -28,6 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from wisp.config import CONFIG, Config  # noqa: E402
 from wisp.database.client import connect, migrate, transaction, write_with_retry
+from wisp.core.rollup import roll_up
 from wisp.ingress.probers import PingResult, Prober, build_prober
 from wisp.egress.notifiers import AlertDispatcher, build_notifier
 from wisp.core.state_machine import (
@@ -50,18 +51,38 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def _gather_pings(prober: Prober, ips: list[str], count: int) -> dict[str, PingResult]:
+async def _gather_pings(
+    prober: Prober,
+    ips: list[str],
+    count: int | dict[str, int],
+    *,
+    max_inflight: int | None = None,
+) -> dict[str, PingResult]:
+    """Ping every IP, bounding how many probes are in flight at once.
+
+    `count` is either a uniform ping count or a per-IP map (the daemon passes a map
+    so aggregation gear is probed gently — see MonitorEngine.probe_plan). A naive
+    `gather` over every IP opens one socket each in a single tick; past the process
+    FD limit the kernel refuses new sockets and every excess probe reads 100% loss —
+    a fake mass outage. A semaphore caps the concurrent set so a 10k-device fleet
+    clears within the poll window on a few hundred FDs. `max_inflight` falsy =
+    unbounded (legacy behaviour; fine for tiny sets)."""
+    limit = max_inflight or len(ips) or 1
+    sem = asyncio.Semaphore(limit)
+
     async def one(ip: str) -> tuple[str, PingResult]:
-        try:
-            return ip, await prober.ping(ip, count)
-        except RuntimeError:
-            # A config/permission failure (icmplib missing, ping group off) is NOT a
-            # down host — masking it as 100% loss makes a broken monitor look like a
-            # total outage (and trips the canary freeze). Let it abort the cycle.
-            raise
-        except Exception:
-            # A genuine per-host probe error must never sink the cycle.
-            return ip, PingResult(ip, None, 100.0)
+        n = count[ip] if isinstance(count, dict) else count
+        async with sem:
+            try:
+                return ip, await prober.ping(ip, n)
+            except RuntimeError:
+                # A config/permission failure (icmplib missing, ping group off) is NOT
+                # a down host — masking it as 100% loss makes a broken monitor look
+                # like a total outage (and trips the canary freeze). Abort the cycle.
+                raise
+            except Exception:
+                # A genuine per-host probe error must never sink the cycle.
+                return ip, PingResult(ip, None, 100.0)
 
     pairs = await asyncio.gather(*(one(ip) for ip in ips))
     return dict(pairs)
@@ -111,7 +132,12 @@ async def run_cycle(
     overdue escalations. Returns the events emitted."""
     prober.on_cycle_start()
     ts = _utc_now_iso()
-    results = await _gather_pings(prober, sorted(engine.required_ips()), cfg.pings_per_poll)
+    # Per-IP plan: aggregation gear gets fewer echoes (gentle), and the in-flight set
+    # is bounded so a large fleet never exhausts file descriptors mid-cycle.
+    plan = engine.probe_plan()
+    results = await _gather_pings(
+        prober, sorted(plan), plan, max_inflight=cfg.probe_max_inflight
+    )
 
     result = engine.process_cycle(results, ts)
 
@@ -171,11 +197,18 @@ async def run_forever(
     # Guarded like everything else in this loop — a failed prune is logged, never
     # fatal. Skipped for finite --cycles runs (smoke tests stay deterministic).
     PRUNE_EVERY_S = 24 * 3600
-    next_prune = asyncio.get_running_loop().time()
+    # Fold raw polls into compact hourly rollups once an hour, so trend charts read
+    # ~1/(polls-per-hour) the rows and raw retention can be short without losing
+    # history. Guarded like the prune — a failed fold is logged, never fatal — and
+    # skipped for finite --cycles runs to keep smoke tests deterministic.
+    ROLLUP_EVERY_S = 3600
+    loop_clock = asyncio.get_running_loop().time
+    next_prune = loop_clock()
+    next_rollup = loop_clock()
 
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
-        if max_cycles is None and asyncio.get_running_loop().time() >= next_prune:
+        if max_cycles is None and loop_clock() >= next_prune:
             try:
                 removed = prune_old_polls(cfg)
                 if removed:
@@ -183,7 +216,15 @@ async def run_forever(
                           f"{cfg.poll_retention_days}d")
             except Exception:
                 log.exception("retention sweep failed; continuing")
-            next_prune = asyncio.get_running_loop().time() + PRUNE_EVERY_S
+            next_prune = loop_clock() + PRUNE_EVERY_S
+        if max_cycles is None and loop_clock() >= next_rollup:
+            try:
+                rolled = roll_up(cfg)
+                if rolled:
+                    print(f"rollup: folded {rolled} device-hour(s) into poll_rollups")
+            except Exception:
+                log.exception("hourly rollup failed; continuing")
+            next_rollup = loop_clock() + ROLLUP_EVERY_S
         # Device-set hot reload: rebuild the engine in-process when the active device
         # set changes (UI add/remove). build_engine rehydrates each FSM from the last
         # poll, so a rebuild never re-pages an open outage. (Skipped for finite runs.)

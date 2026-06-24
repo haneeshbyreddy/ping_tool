@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 58 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 75 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -41,6 +41,30 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   with one real impl each — `IcmpProber` (unprivileged ICMP via icmplib, needs the ping group) and
   `NtfyNotifier` (ntfy push, needs httpx). `build_prober`/`build_notifier` are the swap point;
   keep any new providers behind those interfaces.
+
+## Scaling invariants (don't regress at fleet size)
+
+- **Probe fan-out is bounded.** `apps/daemon/main.py:_gather_pings` runs probes under an
+  `asyncio.Semaphore(cfg.probe_max_inflight)` (`WISP_MAX_INFLIGHT`, default 256). The old
+  unbounded `gather` opened one ICMP socket *per device per tick* — past `ulimit -n` the kernel
+  refuses sockets and the generic-`Exception` guard masks each failure as 100% loss, i.e. a
+  **fake mass outage exactly at peak fleet size**. Don't reintroduce an unbounded fan-out; raise
+  `ulimit -n` on the box too.
+- **Aggregation gear is probed gently.** `MonitorEngine.probe_plan()` returns a per-IP ping count:
+  any device that is a **parent** of another (tower/switch/AP) gets `cfg.pings_per_poll_infra`
+  (`WISP_PINGS_PER_POLL_INFRA`, default 2), leaf CPEs + canary get `pings_per_poll` (5). Fewer
+  echoes = smaller burst into the box's control plane, so its ICMP rate-limiter doesn't read as
+  phantom loss. It's topology-derived (no schema/UI), keys match `required_ips()`, and `_gather_pings`
+  takes either a uniform int or this per-IP map. DOWN detection is unchanged (still 3 consecutive
+  100%-loss polls — "all-of-N lost").
+- **Raw polls are scratch; rollups are the trend record.** `core/rollup.roll_up` folds
+  `poll_results` into one `poll_rollups` row per device per hour (latency min/avg/max, mean loss,
+  per-state poll counts), run hourly from the daemon loop (guarded like the prune, skipped for
+  finite `--cycles`). It's a single `GROUP BY` (never pulls raw rows into Python), idempotent via a
+  `MAX(bucket)` watermark + `INSERT OR IGNORE` on the `(device_id, bucket)` PK, and never rolls the
+  in-progress hour. `services.device_trend` reads it for charts. `outages` stays the incident
+  source of truth; this tier is analytics-only, so raw retention can be cut short without losing
+  history.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -157,11 +181,14 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (58 tests). They mirror the
-layers: `unit/test_state_machine` (FSM + overrides), `integration/test_notifiers`
-(dispatch/escalation/ack + the `send_with_retry` policy, temp DB + controlled time),
-`integration/test_analytics` (outage-window/downtime math), `integration/test_api` (services +
-device CRUD), `integration/test_watchdog` (dead-monitor alarm: stale→page, recover, restart
-no-repage, failed-send retry). Add cases there — time-based paths (escalation, dedupe, staleness)
+Run `python -m unittest discover -s tests` after any logic change (75 tests). They mirror the
+layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra),
+`integration/test_notifiers` (dispatch/escalation/ack + the `send_with_retry` policy, temp DB +
+controlled time), `integration/test_analytics` (outage-window/downtime math),
+`integration/test_api` (services + device CRUD), `integration/test_watchdog` (dead-monitor alarm:
+stale→page, recover, restart no-repage, failed-send retry), `integration/test_daemon`
+(poll-gather error policy **+ the concurrency-bound semaphore / per-IP count map**),
+`integration/test_rollup` (hourly fold math, in-progress-hour skip, idempotency, `device_trend`).
+Add cases there — time-based paths (escalation, dedupe, staleness, rollup buckets)
 need the temp-DB + controlled-clock setup to surface. Tests inject a recording notifier double
 (no real ntfy/network); don't reintroduce a production mock channel.

@@ -76,6 +76,29 @@ class FlapSuppression(unittest.TestCase):
         self.assertFalse(r.events)
 
 
+class ProbePlan(unittest.TestCase):
+    """Aggregation gear (a parent of another device) is probed gently — fewer echoes
+    per poll — so its control plane doesn't trip its ICMP rate-limiter; leaf CPEs and
+    the canary keep the full sample count."""
+
+    CFG = Config(pings_per_poll=5, pings_per_poll_infra=2, canary_ip="1.1.1.1")
+
+    def test_parent_is_gentle_leaf_is_full(self):
+        tower = solo_device(id=1, ip_address="tower", parent_device_id=None)
+        cpe = solo_device(id=2, ip_address="cpe", parent_device_id=1)
+        eng = MonitorEngine([tower, cpe], self.CFG)
+        plan = eng.probe_plan()
+        self.assertEqual(plan["tower"], 2)        # parent -> gentle
+        self.assertEqual(plan["cpe"], 5)          # leaf -> full
+        self.assertEqual(plan["1.1.1.1"], 5)      # canary -> full
+        # keys must match what the daemon will actually ping
+        self.assertEqual(set(plan), eng.required_ips())
+
+    def test_childless_node_is_full(self):
+        eng = MonitorEngine([solo_device(id=1, ip_address="d")], self.CFG)
+        self.assertEqual(eng.probe_plan()["d"], 5)
+
+
 class Degraded(unittest.TestCase):
     def test_degraded_needs_two_consecutive(self):
         eng = MonitorEngine([solo_device()], CFG)

@@ -185,6 +185,26 @@ class MonitorEngine:
         ips.add(self.cfg.canary_ip)
         return ips
 
+    def probe_plan(self) -> dict[str, int]:
+        """Per-IP ping count for one cycle (keys == required_ips). Aggregation nodes
+        — any device that is a *parent* of another — are probed gently
+        (`pings_per_poll_infra`) so a tower/switch/AP control plane doesn't trip its
+        ICMP rate-limiter and report phantom loss; leaf CPEs and the canary get the
+        full `pings_per_poll`. Topology-derived, so no schema/UI change: a node
+        becomes 'infra' the moment something is parented under it."""
+        cfg = self.cfg
+        parent_ids = {
+            d.parent_device_id
+            for d in self.meta.values()
+            if d.parent_device_id is not None
+        }
+        plan: dict[str, int] = {
+            d.ip_address: (cfg.pings_per_poll_infra if d.id in parent_ids else cfg.pings_per_poll)
+            for d in self.meta.values()
+        }
+        plan[cfg.canary_ip] = cfg.pings_per_poll
+        return plan
+
     def process_cycle(self, results: dict[str, PingResult], ts: str) -> CycleResult:
         cfg = self.cfg
         canary = results.get(cfg.canary_ip)

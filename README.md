@@ -133,12 +133,22 @@ run.sh                    # one-shot setup + run for both runtimes
 - **Post-mortem cause** — at resolution the operator records the confirmed root cause + notes
   (there is no automatic power-vs-link guess).
 - **Escalation is restart-safe** — timers live in the DB, not memory; a crash can't drop them.
+- **Scales without lying** — probes are fanned out under a concurrency cap
+  (`WISP_MAX_INFLIGHT`) so a large fleet never exhausts file descriptors and fakes a mass
+  outage; aggregation gear (towers/switches/APs) is probed *gently* (`WISP_PINGS_PER_POLL_INFRA`)
+  so its control-plane ICMP rate-limiter doesn't read as phantom loss.
+- **Hourly rollups** — raw polls are hot scratch; the daemon folds them into compact
+  per-device/hour rows (`poll_rollups`) once an hour, so trend charts read hours, not a
+  billion raw samples (`services.device_trend`). Incidents still live in `outages`.
 
 ## Configuration (env vars, all optional)
 
 | Var | Default | Meaning |
 |---|---|---|
 | `WISP_POLL_INTERVAL_S` | `60` | seconds between polls |
+| `WISP_PINGS_PER_POLL` | `5` | echoes per poll for leaf devices (CPEs) |
+| `WISP_PINGS_PER_POLL_INFRA` | `2` | echoes per poll for aggregation gear (any device that is a parent) |
+| `WISP_MAX_INFLIGHT` | `256` | max concurrent probes in flight (0 = unbounded); caps FD use at scale |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |

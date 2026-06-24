@@ -279,6 +279,39 @@ def nodes_down_on_day(cfg: Config = CONFIG, date_str: str = "") -> list[dict]:
     return out
 
 
+def device_trend(cfg: Config = CONFIG, *, device_id: int = 0, hours: int = 168) -> list[dict]:
+    """Hourly latency/loss/uptime series for one device (default last 7 days),
+    oldest first — powers a per-device trend chart. Reads the compact `poll_rollups`
+    tier, not raw polls, so it stays cheap over long windows. Hours with no rollup
+    simply don't appear (gaps render as gaps); `uptime_pct` is the share of that
+    hour's polls that were UP."""
+    since = (_now() - timedelta(hours=hours)).replace(
+        minute=0, second=0, microsecond=0)
+    with connect(cfg) as conn:
+        rows = conn.execute(
+            "SELECT bucket, samples, latency_avg, latency_min, latency_max,"
+            " loss_avg, down_polls, degraded_polls, up_polls"
+            " FROM poll_rollups WHERE device_id = ? AND bucket >= ?"
+            " ORDER BY bucket",
+            (device_id, since.isoformat(timespec="seconds")),
+        ).fetchall()
+    series = []
+    for r in rows:
+        total = r["samples"] or 0
+        series.append({
+            "bucket": r["bucket"],
+            "latency_avg": r["latency_avg"],
+            "latency_min": r["latency_min"],
+            "latency_max": r["latency_max"],
+            "loss_avg": r["loss_avg"],
+            "uptime_pct": round(100.0 * r["up_polls"] / total, 1) if total else None,
+            "down_polls": r["down_polls"],
+            "degraded_polls": r["degraded_polls"],
+            "samples": total,
+        })
+    return series
+
+
 def logs(cfg: Config = CONFIG, *, query: str = "", limit: int = 25,
          offset: int = 0) -> dict:
     """Historical (resolved) outages for the Logs table, newest first, with a
