@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 80 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 114 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -71,17 +71,33 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   in-progress hour. `services.device_trend` reads it for charts. `outages` stays the incident
   source of truth; this tier is analytics-only, so raw retention can be cut short without losing
   history.
-- **Fast-confirm decouples detection from cadence.** `apps/daemon/main.py:_confirm_down` runs
-  after the full `process_cycle`: any device that read 100% loss but isn't yet in `DOWN_FAMILY`
-  is *re-probed on its own* every `cfg.retry_interval_s` (`WISP_RETRY_INTERVAL_S`, default 2s),
-  feeding each rapid sample back through `process_cycle(..., subset=…)` until it reaches
-  `down_consecutive` all-lost samples (→ DOWN, paged) or comes back reachable (→ suspicion
-  cleared, never paged). So detection is ~`(down_consecutive-1) × retry_interval` (≈4s), **not**
-  `down_consecutive × poll_interval`, and only suspects are re-probed — the healthy fleet keeps
-  its gentle cadence. It's gated off when the uplink is frozen (`result.canary_down`) and by
-  `retry_interval_s == 0`. The 3-sample hysteresis is **unchanged** — it's compressed in time, not
-  weakened; don't "optimize" it down to a single confirming probe. `_confirm_down` mutates the
-  `states`/`results` dicts in place so the persisted row shows the final probe.
+- **Fast-confirm + between-cycle watch together close the full detection gap.**
+  *Fast-confirm* (`_confirm_down`) fires after the full poll: any device at 100% loss but not yet
+  in `DOWN_FAMILY` is re-probed every `retry_interval_s` until it hits `down_consecutive`
+  all-lost samples (→ DOWN, paged) or recovers (blip, no page). This collapses samples 2–3 from
+  one poll interval each to `retry_interval_s` each. *But* sample 1 still comes from the regular
+  poll, so a device that goes down **after** the poll still waits up to `poll_interval_s` before
+  any sample lands.
+  *Between-cycle watch* (`_between_cycle_watch`) closes that remaining gap: during the inter-poll
+  sleep, `run_forever` probes the **whole fleet** with a **single echo** every `retry_interval_s`
+  and fast-confirms whichever direction flipped. End-to-end detection from when a device changes
+  is then ≤ `retry_interval_s × max(down_consecutive, recover_consecutive)` ≈ seconds, regardless
+  of where in the poll cycle it happens. Gated on `retry_interval_s > 0` and disabled for finite
+  `--cycles` runs. Both the detection probe AND the rapid confirmation probes use a **single echo**
+  (the consecutive-sample COUNT is the hysteresis, not pings-per-sample) so a dead host burns one
+  ICMP timeout per sample, not the plan's 5 — without this, DOWN re-confirms were dominated by
+  timeouts and ran ~3–4× slower than recovery. Only the regular full poll uses the per-IP plan (it
+  needs the multi-ping loss% for DEGRADED). Canary guard: if the canary reads 100% loss and
+  `canary_freeze` is on, the tick is skipped (same policy as fast-confirm).
+- **Detection is symmetric — down AND up are both fast.** `_confirm_down` (soft→hard) and
+  `_confirm_up` (hard→recovery) are mirror images: each re-probes only the transitioning subset
+  every `retry_interval_s` until the FSM commits (`down_consecutive` all-lost → DOWN, or
+  `recover_consecutive` non-lost → leaves `DOWN_FAMILY` → OutageResolved), or the condition
+  reverses (a blip/flap that never pages or never falsely recovers). `run_cycle` runs both after
+  the full poll; `_between_cycle_watch` runs both mid-gap (it probes DOWN devices too, so recovery
+  isn't stuck waiting for the next full poll — that was the old asymmetry). Both mutate
+  `states`/`results` in place so the persisted row reflects the final probe. Don't drop DOWN
+  devices from the between-cycle probe set or recovery goes back to `recover_consecutive × poll`.
 - **Adaptive cadence is fleet-size-derived, opt-in.** `Config.effective_interval(device_count)`
   returns `poll_interval_small_s` (30) while the active fleet is `<= small_fleet_max` (1000) and
   `poll_interval_adaptive` is on (`WISP_POLL_INTERVAL_ADAPTIVE`), else `poll_interval_s` (60).
@@ -91,8 +107,43 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   still keys off `poll_interval_s` (the conservative ceiling), not the small cadence — fine, it's
   a forgiving floor.
 
+## Per-link performance tier (soft "slow link" signal — separate from outages)
+
+- **A link slow/jittery vs its OWN baseline, while still pinging "up".** The FSM only
+  knows absolute thresholds; `core/baseline.evaluate_perf` (pure: trailing samples +
+  prior flag → verdict) flags a *sustained* deviation via median+MAD with symmetric
+  hysteresis (`perf_consecutive` deviating to enter, all-clean to leave). Glue is
+  `AlertDispatcher.perf_sweep` (reads the trailing `perf_window` of `poll_results`,
+  rehydrates `was_degraded` from `device_perf` so a restart never re-pages, upserts the
+  badge, and on an **edge** pages the **operator only** once). The daemon calls it once
+  per cycle after `dispatch`/`sweep`, isolated in its own try/except. A hard-DOWN device
+  clears its badge **silently** (the outage owns it). `WISP_PERF_ALERTS=0` keeps the
+  badge but mutes the page. Jitter comes from icmplib (`PingResult.jitter_ms`, needs ≥2
+  echoes — meaningful only on the multi-echo poll plan, ~0 on the 1-ping between-cycle
+  probe). `device_perf` (migration 0008) is the badge state; `poll_results.jitter_ms`
+  (0007) feeds the baseline. `services.nodes_list` exposes `perf` (None unless degraded).
+  Tests: `unit/test_baseline`, `integration/test_perf`.
+
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
+- **One logical poller per DB.** Each daemon has its own in-memory FSM, so a second
+  daemon against the same DB independently confirms every outage and double-pages.
+  `apps/daemon/main.py:main()` takes an OS advisory lock (`runtime/single_instance.py`,
+  `<db>.lock`) and exits (code 3) if another holds it; the kernel frees it on exit/crash.
+  Belt-and-braces: `apply_events` makes `OutageOpened` **idempotent** (won't insert a
+  second open row while one is unresolved), so a stray duplicate event can't stack
+  outages either. Tests: `integration/test_single_instance`.
+
+- **Uplink state is logged as a stable token, not the alert title.** `_send_owner(...,
+  payload=...)` records `"UPLINK_DOWN"` / `"UPLINK_RESTORED"` in `alert_log.payload`; the
+  rehydration query (`build_engine`) and the dashboard banner (`system_summary`) both key
+  off `"UPLINK_DOWN" in payload`. Don't fold the human title back into the payload or a
+  wording change silently breaks uplink detection. (There is still no dedicated uplink-state
+  column — the `alert_log` token is the source of truth.)
+- **Canary freeze is logged.** When `result.canary_down` (canary 100% loss + `canary_freeze`),
+  `run_cycle` logs a WARNING — the freeze skips ALL local detection that cycle, so a flaky
+  internet canary silently stalls detection; the log is how you tell that apart from "nothing
+  is actually down". Consider a LAN-reachable canary or `WISP_CANARY_FREEZE=0` for LAN gear.
 - **The daemon never dies on one bad cycle.** `apps/daemon/main.py:run_forever` wraps both
   the device-set reload and `run_cycle` in try/except that **logs and continues** — a DB lock,
   a probe library blowing up, or a bug skips that cycle, it does not kill the monitor. Keep any
@@ -139,8 +190,11 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   subscribes to the topic for their role; there is **no per-person routing key**. `notifiers.role_topic`
   maps role→topic; `AlertDispatcher._publish(role, …)` sends to that topic **plus a copy to the operator
   topic** (operators get full visibility), while `AlertDispatcher._broadcast(…)` sends to **all three**
-  topics once each. Mapping: a fresh device DOWN pages **operator only** (`_publish("operator", …)`); the
-  recurring hourly escalation + the restore notice **broadcast to all three**; uplink down/restored →
+  topics once each. Mapping: a fresh device DOWN pages **owner + operator** (`_publish("owner", …)`, which
+  is owner-topic + the operator copy) so the down page is as consistent as the restore (the owner used to
+  only hear about a DOWN an hour later via the escalation — the "DOWN less consistent than UP" report); the
+  recurring hourly escalation + the restore notice **broadcast to all three** (so the tech channel is only
+  looped in once it's been down a while); uplink down/restored →
   `owner`. (See "Escalation model" below.) The old per-device `technician_phone` routing, `resolve_owner`,
   and `services.technicians()` are **gone** (the `devices.technician_phone` / `workers.phone` /
   `workers.ntfy_topic` columns still exist but are unused by routing). Workers are now just identity +
@@ -167,8 +221,13 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   removed (migration `0005`) — it was never settable from the UI. Cause is now only the
   operator-entered post-mortem (`root_cause` / `resolution_notes`) at resolution. Don't
   reintroduce an inferred cause or a `criticality` field.
-- **Escalation model (the alarm ladder):** a fresh DOWN pages the **operator only**, immediately
-  (`_on_open` → `_publish("operator", …)`, anti-spam deduped). It also queues **one** `escalations`
+- **Escalation model (the alarm ladder):** a fresh DOWN pages **owner + operator**, immediately
+  (`_on_open` → `_publish("owner", …)` → owner topic + the operator copy; the tech channel is held back
+  to the hourly escalation). Dedupe is **per-outage** (`_already_paged`: was there
+  already a `sent` row for this `outage_id`?), NOT a time window — a device that recovers and fails
+  again is a new outage and pages again. (The old `alert_dedupe_min` window also counted restore
+  notices as "recently alerted", so any flapping device went silent after the first page — the
+  "no DOWN notification" bug. `alert_dedupe_min` is now unused.) It also queues **one** `escalations`
   row of kind `"hourly"` due at `now + cfg.escalate_every_min` (default 60, env
   `WISP_ESCALATE_EVERY_MIN`). Each `sweep` that finds it due while the outage is **still open** fires
   `_fire_hourly` — an **all-hands broadcast** (owner + operator + tech) stating the running duration
@@ -189,7 +248,12 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 - **Dashboard layering:** `server/services.py` mirrors `core/analytics.py` but returns
   dicts/lists; `server/routes.py` is HTTP-only (runnable entry is `apps/dashboard/main.py`).
   Triage buckets: open+unacked = `unassigned`, open+acked = `in_progress`,
-  recovered+undocumented = `pending_postmortem`; UNREACHABLE is excluded (never paged). The
+  recovered+undocumented = `pending_postmortem`; UNREACHABLE is excluded (never paged).
+  **Blast radius:** an UNREACHABLE child is topology-suppressed so it gets no card of its
+  own — `triage_outages` instead attributes each UNREACHABLE node to its nearest **DOWN**
+  ancestor (walk parents while they're UNREACHABLE; the first DOWN is the culprit) and
+  returns those names as `affected_children` on the **open** parent card (rendered by
+  `affectedLine` in app.js). Without this a downed parent hides who else is dark. The
   confirmed cause is captured by the post-mortem dropdown at resolution (there is no automatic
   cause guess anymore). A `pending_postmortem` card can
   instead be **dismissed** (DELETE `/api/outages/{id}` → `services.dismiss_outage`): it stamps a
@@ -198,9 +262,31 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 - **Device CRUD** (`services.create/update/delete_device`, validated via `DeviceError`→422):
   PUT is a full replace (the form submits every field); DELETE hard-deletes the node + its
   poll/outage/alert history in one txn but is **blocked (409) if it still has child nodes**.
+  **`delete_device` must delete from *every* table that `REFERENCES devices(id)` before the
+  device row** — currently `escalations`, `alert_log`, `outages`, `poll_results`,
+  `poll_rollups`, `device_perf` — or `foreign_keys=ON` rejects the final DELETE with
+  "FOREIGN KEY constraint failed". Adding a new devices-FK table? Add its delete here too.
   Added/removed nodes start/stop being monitored automatically: the daemon snapshots the device
   set at start and rebuilds its engine in-process when it changes — within one poll cycle (see
   "Config + device-set reload").
+- **Maintenance mode (`devices.maintenance`, migration 0009; `services.set_maintenance`, POST
+  `/api/devices/{id}/maintenance`).** Fully pauses one node's monitoring: `load_device_meta` filters
+  `maintenance=1` out of the active set, so the device-set reload **drops it from the engine in-process**
+  — the daemon stops pinging it and pages no one for it (any pending `escalations` row no-ops via
+  `_fire_hourly`'s `dev is None` guard). The node **stays in the inventory and on the Nodes dashboard**,
+  badged "maintenance" (`nodes_list`/`list_devices` expose the flag), so a paused node isn't mistaken for
+  a healthy live one — its shown `state` is its last reading (stale). A normal device edit (`update_device`,
+  `_DEVICE_FIELDS`) does **not** touch the flag; it's toggled only via `set_maintenance`. Caveat: putting an
+  already-DOWN node into maintenance leaves its open outage lingering in triage until you resume it (then
+  `build_engine` rehydrates + `_confirm_up` resolves it) or dismiss it.
+- **Live UI is push, not poll (SSE).** `GET /api/events` (`routes._serve_events`) is a
+  Server-Sent Events stream: a per-connection 1s loop emits a `changed` event whenever
+  `_data_version` (MAX(id) of `poll_results`/`outages`/`alert_log`) moves — i.e. every cycle and
+  instantly on a between-cycle DOWN/recovery. The body has no Content-Length (delimited by
+  `Connection: close`); it's gated by `_guard_api` like any `/api/*` (EventSource sends the session
+  cookie). The SPA subscribes once (`startLive`/`liveReload` in app.js) and re-renders the live
+  views on each event; a 15s poll remains only as a **fallback when the stream is down** (`_liveOk`).
+  Don't reintroduce unconditional 15s polling. Tested over the real server in `integration/test_auth`.
 - **Web assets are vendored** under `apps/dashboard/static/` (no CDN, no build step); `routes.py`
   serves `index.html` from `templates/` and everything else from `static/`. The app is plain
   vanilla JS — Tailwind's Play-CDN runtime JITs classes off the live DOM, so dynamically-built
@@ -208,15 +294,23 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (80 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (114 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
 the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`
 (outage-window/downtime math), `integration/test_api` (services + device CRUD),
 `integration/test_watchdog` (dead-monitor alarm: stale→page, recover, restart no-repage,
 failed-send retry), `integration/test_daemon` (poll-gather error policy, concurrency-bound
-semaphore / per-IP count map, **+ fast-confirm: rapid DOWN confirm and blip-clears-without-paging**),
-`integration/test_rollup` (hourly fold math, in-progress-hour skip, idempotency, `device_trend`).
+semaphore / per-IP count map, **+ fast-confirm: rapid DOWN confirm and blip-clears-without-paging**,
+**+ fast-recovery (`_confirm_up`): rapid UP confirm + flap-doesn't-recover**,
+**+ between-cycle watch: mid-gap failure pages, mid-gap recovery resolves, mid-gap blip doesn't page, canary freeze suppresses**),
+`integration/test_rollup` (hourly fold math, in-progress-hour skip, idempotency, `device_trend`),
+`unit/test_baseline` (pure perf-deviation detector: enter/hold/recover, floors, jitter,
+DOWN-excluded baseline), `integration/test_perf` (`perf_sweep`: operator-only edge page,
+badge in `device_perf`, DOWN-clears-silently, alerts gate, restart no-repage),
+`integration/test_single_instance` (the OS lock refuses a second daemon + idempotent
+`OutageOpened`), `integration/test_auth` (also covers the SSE `/api/events` stream: auth-gated
++ emits a `changed` event).
 Add cases there — time-based paths (escalation, dedupe, staleness, rollup buckets)
 need the temp-DB + controlled-clock setup to surface. Tests inject a recording notifier double
 (no real ntfy/network); don't reintroduce a production mock channel.

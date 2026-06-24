@@ -237,6 +237,18 @@
     </div>`;
   }
 
+  // Children dragged UNREACHABLE behind this DOWN node: they're topology-suppressed
+  // (no card of their own), so name the blast radius here. Cap the list, count the rest.
+  function affectedLine(children) {
+    if (!children || !children.length) return "";
+    const shown = children.slice(0, 4).map(esc).join(", ");
+    const more = children.length > 4 ? ` +${children.length - 4} more` : "";
+    return `<p class="font-label-xs text-label-xs text-on-surface-variant mt-1 flex items-start gap-1">
+      ${icon("account_tree", { size: 13 })}
+      <span><span class="text-error">${children.length} downstream node${children.length === 1 ? "" : "s"} unreachable:</span> ${shown}${more}</span>
+    </p>`;
+  }
+
   function triageCard(o, team = []) {
     const m = STATUS_META[o.status] || STATUS_META.unassigned;
     // Open outages keep counting up (live ticker); a recovered one is final.
@@ -253,6 +265,7 @@
             <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("schedule", { size: 14 })} ${durLabel}</span>
             <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("event", { size: 14 })} ${fmtTime(o.started_at, { tz: false })}</span>
           </div>
+          ${affectedLine(o.affected_children)}
         </div>
       </div>`;
 
@@ -394,7 +407,10 @@
   // --- Nodes ----------------------------------------------------------------
   const NODE_STATE_MAP = {
     UP: { dot: "bg-primary", text: "text-primary", icon: "cell_tower", glow: "0 0 4px #ffffff", op: "" },
-    DEGRADED: { dot: "bg-error", text: "text-error", icon: "cell_tower", glow: "0 0 4px #ffb4ab", op: "" },
+    // DEGRADED = still UP and replying, just sustained packet loss (>= WISP_LOSS_DEGRADED,
+    // default 5%) — a "flaky link" warning, not an outage (nobody is paged for it). Amber,
+    // not red, so it reads as caution and isn't mistaken for a DOWN node.
+    DEGRADED: { dot: "bg-amber-400", text: "text-amber-400", icon: "cell_tower", glow: "0 0 4px #fbbf24", op: "" },
     DOWN: { dot: "bg-error", text: "text-error", icon: "wifi_off", glow: "0 0 4px #ffb4ab", op: "" },
     UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
   };
@@ -403,7 +419,9 @@
   function nodeRow(n, ctx = {}) {
     const { depth = 0, hasChildren = false, expanded = false, stats = null, suppressedBy = null } = ctx;
     const s = NODE_STATE_MAP[n.state] || NODE_STATE_MAP.UP;
-    const pctColor = n.uptime_pct >= 99.9 ? "text-primary" : (n.uptime_pct >= 95 ? "text-amber-400" : "text-error");
+    // Uptime % is a 24h stat, not the live state — keep red off it so only an actual
+    // DOWN node reads red. Healthy = green, anything below = amber (caution).
+    const pctColor = n.uptime_pct >= 99.9 ? "text-primary" : "text-amber-400";
 
     // disclosure caret for branches; an alignment spacer for leaves.
     const caret = hasChildren
@@ -436,6 +454,7 @@
       </div>
       <div class="flex items-center gap-3 shrink-0">
         ${rollup}
+        ${n.maintenance ? `<span class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("pause_circle", { size: 12 })} maintenance</span>` : ""}
         <div class="text-right hidden sm:block"><p class="font-mono-data ${pctColor}">${fmtPct(n.uptime_pct)}</p></div>
         <div class="flex items-center gap-1.5">
           <span class="w-2 h-2 rounded-full ${s.dot}" style="box-shadow:${s.glow}"></span>
@@ -616,7 +635,8 @@
         ${field("Region", "region", d.region, { placeholder: "village / area" })}
         ${field("Parent node", "parent_device_id", d.parent_device_id, { options: parentOpts, full: true })}
         <div class="sm:col-span-2 flex items-center justify-between gap-2 pt-2 border-t border-outline-variant">
-          <div>${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>` : ""}</div>
+          <div class="flex items-center gap-2">${isEdit ? `<button type="button" data-delete class="flex items-center gap-1 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("delete", { size: 16 })} Delete</button>
+            <button type="button" data-maint class="flex items-center gap-1 ${d.maintenance ? "text-primary border-primary/40 bg-primary/10" : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high"} border font-label-md text-label-md px-3 py-2 rounded-md transition-colors">${icon("pause_circle", { size: 16 })} ${d.maintenance ? "Resume monitoring" : "Maintenance"}</button>` : ""}</div>
           <div class="flex items-center gap-2">
             <button type="button" data-close class="text-on-surface-variant hover:text-primary font-label-md text-label-md px-4 py-2 rounded-md hover:bg-surface-container-high">Cancel</button>
             <button type="submit" class="bg-primary text-surface font-label-md text-label-md px-4 py-2 rounded-md active:scale-95 transition-transform">${isEdit ? "Save changes" : "Add node"}</button>
@@ -666,6 +686,24 @@
       }
       await saveDevice(payload);
     });
+
+    const maintBtn = overlay.querySelector("[data-maint]");
+    if (maintBtn) {
+      maintBtn.addEventListener("click", async () => {
+        const turnOn = !d.maintenance;
+        maintBtn.disabled = true;
+        maintBtn.innerHTML = spinner(turnOn ? "Pausing…" : "Resuming…");
+        const res = await sendJSON("POST", `/api/devices/${d.id}/maintenance`, { maintenance: turnOn });
+        if (res.ok && res.data.ok) {
+          toast(turnOn ? "Node in maintenance — alerts paused" : "Monitoring resumed");
+          close();
+          onDone();
+        } else {
+          toast(res.data.error || res.data.reason || "Couldn't update maintenance", "error");
+          maintBtn.disabled = false;
+        }
+      });
+    }
 
     const delBtn = overlay.querySelector("[data-delete]");
     if (delBtn) {
@@ -1170,6 +1208,7 @@
     if (_loginShown) return;
     _loginShown = true;
     clearInterval(_refreshTimer);
+    stopLive();   // drop the SSE stream while signed out (it would just 401-loop)
     const st = await fetchAuthStatus();
     renderLogin(!st.pin_set);
   }
@@ -1291,10 +1330,39 @@
   const AUTO_REFRESH = new Set(["#/", "#/nodes"]);
   let _refreshTimer = null;
   let _activeLoad = null;
+  let _events = null;     // EventSource (server push)
+  let _liveOk = false;    // is the SSE stream currently connected?
 
   function formFocused() {
     const a = document.activeElement;
     return a && ["INPUT", "SELECT", "TEXTAREA"].includes(a.tagName);
+  }
+
+  // Re-render the current live view (skipped while a form is focused so a background
+  // refresh never clobbers in-progress input).
+  function liveReload() {
+    if (_loginShown) return;
+    if (AUTO_REFRESH.has(currentPath()) && !formFocused() && _activeLoad) _activeLoad();
+  }
+
+  // Push, not poll: subscribe once to the server's SSE stream. Every 'changed' event
+  // means the daemon wrote new data (a poll, a DOWN, a recovery), so re-render right
+  // then — the UI reflects state in ~1s instead of waiting for a 15s poll. EventSource
+  // auto-reconnects if the stream drops.
+  function startLive() {
+    if (_events || !("EventSource" in window)) return;
+    try {
+      const es = new EventSource("/api/events");
+      es.addEventListener("open", () => { _liveOk = true; });
+      es.addEventListener("changed", liveReload);
+      es.addEventListener("error", () => { _liveOk = false; });
+      _events = es;
+    } catch { _events = null; }
+  }
+
+  function stopLive() {
+    if (_events) { try { _events.close(); } catch {} _events = null; }
+    _liveOk = false;
   }
 
   function route() {
@@ -1306,11 +1374,12 @@
     const load = render(page);
     _activeLoad = load;
     load();
-    // Only the live views auto-refresh; Settings/Team/Logs are edited or on-demand,
-    // so a background reload would clobber in-progress form input.
+    startLive();   // idempotent — one stream for the whole session
+    // Fallback poll for the live views ONLY when push is unavailable (EventSource
+    // unsupported, or a proxy stripped the stream). A no-op while SSE is healthy.
     if (AUTO_REFRESH.has(currentPath())) {
       _refreshTimer = setInterval(() => {
-        if (!formFocused() && _activeLoad === load) load();
+        if (!_liveOk && !formFocused() && _activeLoad === load) load();
       }, 15000);
     }
   }

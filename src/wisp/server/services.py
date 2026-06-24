@@ -135,6 +135,36 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             " ORDER BY o.id DESC",
             (DOWN,),
         ).fetchall()
+        topo = conn.execute(
+            "SELECT id, name, parent_device_id FROM devices WHERE is_active=1").fetchall()
+        states = latest_states(conn)
+
+    # Blast radius: a child knocked UNREACHABLE behind a DOWN parent is topology-
+    # suppressed (it gets no card of its own), so the operator can't see who else is
+    # affected. Attribute each UNREACHABLE node to its nearest DOWN ancestor (root
+    # cause) and surface those names on that parent's card.
+    parent_of = {r["id"]: r["parent_device_id"] for r in topo}
+    name_of = {r["id"]: r["name"] for r in topo}
+
+    def _culprit(node_id: int) -> int | None:
+        seen: set[int] = set()
+        cur = parent_of.get(node_id)
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            st = states.get(cur)
+            if st == DOWN:
+                return cur
+            if st != UNREACHABLE:
+                return None  # a healthy/degraded ancestor breaks the suppression chain
+            cur = parent_of.get(cur)
+        return None
+
+    affected_by: dict[int, list[str]] = {}
+    for nid, st in states.items():
+        if st == UNREACHABLE:
+            culprit = _culprit(nid)
+            if culprit is not None:
+                affected_by.setdefault(culprit, []).append(name_of.get(nid, f"#{nid}"))
 
     items: list[dict] = []
     for r in rows:
@@ -159,6 +189,9 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
             "started_at": r["started_at"],
             "duration_s": int(duration_s),
             "duration_label": _fmt_dur(duration_s),
+            # children dragged UNREACHABLE behind this DOWN node (only while open)
+            "affected_children": sorted(affected_by.get(r["device_id"], []))
+            if open_outage else [],
         })
 
     # impact-ranked: unassigned first, then in-progress, then post-mortem;
@@ -174,8 +207,13 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
     win_start = win_end - timedelta(hours=hours)
     with connect(cfg) as conn:
         devices = conn.execute(
-            "SELECT id, name, ip_address, device_type, region, parent_device_id"
-            " FROM devices WHERE is_active=1 ORDER BY id"
+            "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
+            " d.parent_device_id, d.maintenance, pf.degraded AS perf_degraded,"
+            " pf.metric AS perf_metric,"
+            " pf.baseline_ms AS perf_baseline, pf.current_ms AS perf_current,"
+            " pf.since AS perf_since"
+            " FROM devices d LEFT JOIN device_perf pf ON pf.device_id = d.id"
+            " WHERE d.is_active=1 ORDER BY d.id"
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
         states = latest_states(conn)
@@ -201,10 +239,20 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             "region": d["region"],
             "parent_device_id": d["parent_device_id"],
             "child_count": child_count.get(d["id"], 0),
+            # In maintenance: not being polled, so `state` is its last reading (stale).
+            # The UI badges it so a paused node isn't mistaken for a live healthy one.
+            "maintenance": bool(d["maintenance"]),
             "state": state,
             "state_label": _state_label(state),
             "uptime_pct": round(pct, 2),
             "down_label": _fmt_dur(down.get(d["id"], 0.0)),
+            # Soft "slow link" badge (vs the link's own baseline); None unless degraded.
+            "perf": ({
+                "metric": d["perf_metric"],
+                "baseline_ms": d["perf_baseline"],
+                "current_ms": d["perf_current"],
+                "since": d["perf_since"],
+            } if d["perf_degraded"] else None),
         })
     return out
 
@@ -634,7 +682,7 @@ def list_devices(cfg: Config = CONFIG) -> list[dict]:
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
-            " d.is_active, d.parent_device_id, d.technician_phone,"
+            " d.is_active, d.maintenance, d.parent_device_id, d.technician_phone,"
             " p.name AS parent_name,"
             " (SELECT COUNT(*) FROM devices c WHERE c.parent_device_id = d.id) AS child_count"
             " FROM devices d LEFT JOIN devices p ON p.id = d.parent_device_id"
@@ -737,6 +785,23 @@ def update_device(device_id: int, data: dict, cfg: Config = CONFIG) -> bool:
     return bool(write_with_retry(_do))
 
 
+def set_maintenance(device_id: int, on: bool, cfg: Config = CONFIG) -> bool:
+    """Toggle a node's maintenance flag. In maintenance the daemon stops pinging the
+    node entirely (load_device_meta excludes maintenance=1) and so pages no one for
+    it; the device-set reload applies the change in-process within a poll cycle. The
+    node stays in the inventory and on the dashboard (badged) so it's clear it's
+    intentionally paused, not silently gone. Returns False if the node doesn't exist."""
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE devices SET maintenance=? WHERE id=? AND is_active=1",
+                (1 if on else 0, device_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
 def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
     """Remove a device and its monitoring history (polls/outages/alerts). Blocked
     if it still has child nodes — reassign or remove those first, so topology never
@@ -755,7 +820,10 @@ def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
     def _do():
         with connect(cfg) as conn:
             with transaction(conn):
-                # children first to satisfy foreign keys
+                # Delete every child row that REFERENCES devices(id) before the device
+                # itself, or foreign_keys=ON rejects the final DELETE. Any table added
+                # later with a devices FK (poll_rollups @0007, device_perf @0008) must be
+                # listed here too — that omission is exactly what broke node deletion.
                 conn.execute("DELETE FROM escalations WHERE outage_id IN"
                              " (SELECT id FROM outages WHERE device_id=?)", (device_id,))
                 conn.execute("DELETE FROM alert_log WHERE device_id=? OR outage_id IN"
@@ -763,6 +831,8 @@ def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
                              (device_id, device_id))
                 conn.execute("DELETE FROM outages WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM poll_results WHERE device_id=?", (device_id,))
+                conn.execute("DELETE FROM poll_rollups WHERE device_id=?", (device_id,))
+                conn.execute("DELETE FROM device_perf WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
             return True
     write_with_retry(_do)

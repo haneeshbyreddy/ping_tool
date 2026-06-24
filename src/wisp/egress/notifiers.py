@@ -26,6 +26,7 @@ from wisp.config import CONFIG, Config
 from wisp.database.client import connect, write_with_retry
 from wisp.core.state_machine import (
     DOWN,
+    DOWN_FAMILY,
     UNREACHABLE,
     Event,
     MonitorEngine,
@@ -181,12 +182,16 @@ class AlertDispatcher:
         ).fetchone()
         return row["id"] if row else None
 
-    def _recently_alerted(self, conn, recipient: str, device_id: int, ts: str) -> bool:
-        cutoff = _plus_minutes(ts, -self.cfg.alert_dedupe_min)
+    def _already_paged(self, conn, outage_id: int) -> bool:
+        """Has the initial DOWN page for THIS outage already gone out? Dedupe is
+        per-OUTAGE, not per-time-window: a device that recovers and fails again opens a
+        new outage (new id) and must page again. The old time-window check also counted
+        restore/escalation 'sent' rows, so any flapping device went silent after the
+        first page — exactly the 'no DOWN notification' bug. This only guards against a
+        duplicate OutageOpened for the *same* still-open outage."""
         row = conn.execute(
-            "SELECT 1 FROM alert_log WHERE recipient = ? AND device_id = ?"
-            " AND status = 'sent' AND sent_at >= ? LIMIT 1",
-            (recipient, device_id, cutoff),
+            "SELECT 1 FROM alert_log WHERE outage_id = ? AND status = 'sent' LIMIT 1",
+            (outage_id,),
         ).fetchone()
         return row is not None
 
@@ -213,9 +218,11 @@ class AlertDispatcher:
             elif isinstance(ev, OutageResolved):
                 self._on_resolved(ev, ts)
             elif isinstance(ev, UplinkDown):
-                self._send_owner("🚨 UPLINK_DOWN", "Our internet is down — local alerts frozen", ts, 5)
+                self._send_owner("🚨 UPLINK_DOWN", "Our internet is down — local alerts frozen",
+                                 ts, 5, payload="UPLINK_DOWN")
             elif isinstance(ev, UplinkRestored):
-                self._send_owner("✅ Uplink restored", "Monitoring resumed", ts, 3)
+                self._send_owner("✅ Uplink restored", "Monitoring resumed",
+                                 ts, 3, payload="UPLINK_RESTORED")
 
     def _on_open(self, ev: OutageOpened, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
@@ -224,29 +231,32 @@ class AlertDispatcher:
             self._record(ev.device_id, self.topic_operator, "suppressed",
                          "UNREACHABLE (parent down)", ts)
             return
-        # Immediate page goes to the OPERATOR only; everyone else is looped in by
-        # the recurring all-hands escalation once it has been down a while.
-        recipient = self.topic_operator
+        # Immediate page goes to the OWNER **and** OPERATOR so a fresh DOWN is as
+        # consistent as the restore broadcast (the owner used to only hear about a
+        # down via the hourly escalation an hour later). The tech channel is still
+        # held back until the recurring all-hands escalation. `_publish("owner", …)`
+        # sends to the owner topic + a copy to the operator topic — exactly the pair.
+        recipient = self.topic_owner
         title = f"🔴 DOWN — {dev.name} ({dev.region})"
         body = f"No ping response from {dev.ip_address}"
 
-        # anti-spam (the recurring escalation bypasses this)
+        # Page once PER OUTAGE (idempotent against a duplicate OutageOpened); a fresh
+        # outage after recovery has its own id, so it always pages.
         def _do():
             with connect(self.cfg) as conn:
-                if self._recently_alerted(conn, recipient, ev.device_id, ts):
-                    oid = self._open_outage_id(conn, ev.device_id)
+                oid = self._open_outage_id(conn, ev.device_id)
+                if oid is not None and self._already_paged(conn, oid):
                     self._log(conn, oid, ev.device_id, recipient, "suppressed",
-                              "dedupe window", ts)
+                              "already paged this outage", ts)
                     conn.commit()
                     return None
-                oid = self._open_outage_id(conn, ev.device_id)
                 return oid
 
         oid = write_with_retry(_do)
         if oid is None:
-            return  # was suppressed
+            return  # was suppressed (already paged this same outage)
 
-        res = self._publish("operator", title, body, self._DOWN_PRIORITY)
+        res = self._publish("owner", title, body, self._DOWN_PRIORITY)
 
         def _after():
             with connect(self.cfg) as conn:
@@ -304,13 +314,18 @@ class AlertDispatcher:
                 conn.commit()
         write_with_retry(_do)
 
-    def _send_owner(self, title: str, body: str, ts: str, priority: int) -> None:
+    def _send_owner(self, title: str, body: str, ts: str, priority: int,
+                    *, payload: str | None = None) -> None:
         res = self._publish("owner", title, body, priority)
+        # Log a STABLE machine token (e.g. "UPLINK_DOWN"/"UPLINK_RESTORED") rather than
+        # the human title, so uplink-state rehydration (build_engine) and the dashboard
+        # banner (system_summary) keep matching even if the title wording changes.
+        logged = payload if payload is not None else title
 
         def _do():
             with connect(self.cfg) as conn:
                 self._log(conn, None, None, self.topic_owner,
-                          "sent" if res.ok else "failed", title, ts)
+                          "sent" if res.ok else "failed", logged, ts)
                 conn.commit()
         write_with_retry(_do)
 
@@ -378,6 +393,80 @@ class AlertDispatcher:
         self._record(row["device_id"], self.topic_owner, "sent",
                      f"hourly escalation ({elapsed})", ts)
 
+    # -- per-link performance sweep (soft "slow link" signal) --
+    def perf_sweep(self, ts: str) -> None:
+        """Judge each link against its OWN rolling baseline and surface a *sustained*
+        slowdown/jitter while it still pings 'up'. Separate from the outage ladder: it
+        writes a dashboard badge (device_perf) every sweep and, only on an edge (enter
+        or leave the slow-link state), pages the OPERATOR once. A hard-DOWN device
+        clears its badge silently — the outage owns it. `was_degraded` is read back from
+        device_perf so a restart mid-degradation doesn't re-page."""
+        from wisp.core.baseline import Sample, evaluate_perf
+
+        cfg = self.cfg
+        for dev_id, dev in self.engine.meta.items():
+            with connect(cfg) as conn:
+                rows = conn.execute(
+                    "SELECT latency_ms, packet_loss, jitter_ms, state FROM poll_results"
+                    " WHERE device_id=? ORDER BY id DESC LIMIT ?",
+                    (dev_id, cfg.perf_window),
+                ).fetchall()
+                prior = conn.execute(
+                    "SELECT degraded, since FROM device_perf WHERE device_id=?",
+                    (dev_id,),
+                ).fetchone()
+            if not rows:
+                continue
+            was_degraded = bool(prior["degraded"]) if prior else False
+
+            # rows are newest-first; a hard-down link's perf is moot — clear silently.
+            if rows[0]["state"] in DOWN_FAMILY:
+                if was_degraded or prior is not None:
+                    self._write_perf(dev_id, False, None, None, None, None, ts)
+                continue
+
+            window = [
+                Sample(r["latency_ms"], r["packet_loss"], r["jitter_ms"], r["state"])
+                for r in reversed(rows)
+            ]
+            v = evaluate_perf(window, cfg, was_degraded=was_degraded)
+            # `since` marks when the current degraded episode began (held across holds).
+            since = (ts if (v.degraded and v.changed)
+                     else (prior["since"] if (prior and v.degraded) else None))
+            self._write_perf(dev_id, v.degraded, v.metric, v.baseline_ms,
+                             v.current_ms, since, ts)
+
+            if v.changed and cfg.perf_alerts:
+                if v.degraded:
+                    self._publish("operator",
+                                  f"🐌 Slow link — {dev.name} ({dev.region})",
+                                  v.reason, 3)
+                else:
+                    self._publish("operator",
+                                  f"✅ Recovered — {dev.name} ({dev.region})",
+                                  "Link performance back to baseline", 3)
+                self._record(dev_id, self.topic_operator, "sent",
+                             f"perf {'degraded' if v.degraded else 'recovered'}: {v.reason}",
+                             ts)
+
+    def _write_perf(self, device_id, degraded, metric, baseline_ms,
+                    current_ms, since, ts) -> None:
+        """Upsert one device_perf row (PK device_id) — the dashboard badge state."""
+        def _do():
+            with connect(self.cfg) as conn:
+                conn.execute(
+                    "INSERT INTO device_perf (device_id, degraded, metric, baseline_ms,"
+                    " current_ms, since, updated_at) VALUES (?,?,?,?,?,?,?)"
+                    " ON CONFLICT(device_id) DO UPDATE SET degraded=excluded.degraded,"
+                    " metric=excluded.metric, baseline_ms=excluded.baseline_ms,"
+                    " current_ms=excluded.current_ms, since=excluded.since,"
+                    " updated_at=excluded.updated_at",
+                    (device_id, 1 if degraded else 0, metric, baseline_ms,
+                     current_ms, since, ts),
+                )
+                conn.commit()
+        write_with_retry(_do)
+
 
 def acknowledge_outage(outage_id: int, by: str, cfg: Config = CONFIG) -> bool:
     """Mark an outage acknowledged — this is what stops the escalation ladder.
@@ -391,4 +480,4 @@ def acknowledge_outage(outage_id: int, by: str, cfg: Config = CONFIG) -> bool:
             )
             conn.commit()
             return cur.rowcount > 0
-    return write_with_retry(_do)
+    return bool(write_with_retry(_do))

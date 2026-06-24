@@ -129,6 +129,23 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(nodes[2]["child_count"], 0)
         self.assertEqual(nodes[3]["child_count"], 0)
 
+    def test_maintenance_pauses_polling_and_badges(self):
+        from wisp.core.state_machine import load_device_meta
+        # all three devices are polled to start
+        self.assertEqual({d.id for d in load_device_meta(self.cfg)}, {1, 2, 3})
+        # put device 2 in maintenance -> dropped from the polled set...
+        self.assertTrue(api.set_maintenance(2, True, self.cfg))
+        self.assertEqual({d.id for d in load_device_meta(self.cfg)}, {1, 3})
+        # ...still in the inventory + on the dashboard, badged
+        node2 = {n["id"]: n for n in api.nodes_list(self.cfg)}[2]
+        self.assertTrue(node2["maintenance"])
+        inv2 = {d["id"]: d for d in api.list_devices(self.cfg)}[2]
+        self.assertEqual(inv2["maintenance"], 1)
+        # resuming brings it back into the polled set
+        self.assertTrue(api.set_maintenance(2, False, self.cfg))
+        self.assertEqual({d.id for d in load_device_meta(self.cfg)}, {1, 2, 3})
+        self.assertFalse(api.set_maintenance(999, True, self.cfg))  # unknown id
+
     # -- heatmap --
     def test_heatmap_states(self):
         self._poll(1, self.now)  # first data point is today
@@ -272,6 +289,39 @@ class ApiTest(unittest.TestCase):
         with connect(self.cfg) as c:
             left = c.execute("SELECT COUNT(*) FROM outages WHERE device_id=2").fetchone()[0]
         self.assertEqual(left, 0)
+
+    def test_triage_names_suppressed_children(self):
+        # Topology: Rampur Sector (2) hangs off Rampur Tower (1). Tower goes DOWN,
+        # Sector is dragged UNREACHABLE (topology-suppressed -> no card of its own),
+        # so its name must surface as blast radius on the tower's triage card.
+        with connect(self.cfg) as c:
+            c.execute("UPDATE devices SET parent_device_id=1 WHERE id=2")
+            c.commit()
+        self._poll(1, self.now, state=DOWN, loss=100.0)
+        self._poll(2, self.now, state=UNREACHABLE, loss=100.0)
+        self._outage(1, self.now - timedelta(minutes=5))  # open DOWN on the tower
+
+        items = api.triage_outages(self.cfg)
+        tower = next(i for i in items if i["device_id"] == 1)
+        self.assertEqual(tower["affected_children"], ["Rampur Sector"])
+
+    def test_delete_purges_rollups_and_perf(self):
+        # Regression for the FK-constraint delete bug: a node with rollup + perf rows
+        # (both tables REFERENCE devices(id)) must delete cleanly.
+        with connect(self.cfg) as c:
+            c.execute(
+                "INSERT INTO poll_rollups (device_id,bucket,samples,loss_avg,"
+                "down_polls,degraded_polls,up_polls) VALUES (3,?,?,?,?,?,?)",
+                (_iso(self.now), 5, 0.0, 0, 0, 5))
+            c.execute("INSERT INTO device_perf (device_id,degraded,updated_at)"
+                      " VALUES (3,1,?)", (_iso(self.now),))
+            c.commit()
+        self.assertEqual(api.delete_device(3, self.cfg), {"ok": True})
+        with connect(self.cfg) as c:
+            for t in ("poll_rollups", "device_perf", "devices"):
+                col = "id" if t == "devices" else "device_id"
+                n = c.execute(f"SELECT COUNT(*) FROM {t} WHERE {col}=3").fetchone()[0]
+                self.assertEqual(n, 0, f"{t} not purged")
 
 
 if __name__ == "__main__":

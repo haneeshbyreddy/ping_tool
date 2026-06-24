@@ -52,12 +52,16 @@ export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 # public ntfy.sh; each person subscribes to the topic for their role. `:=` keeps
 # any value already set in the environment, so you can override per-host.
 export WISP_NTFY_TOPIC_OWNER="${WISP_NTFY_TOPIC_OWNER:=hansa-owner-35f027e3a8}"
-export WISP_NTFY_TOPIC_OPERATOR="${WISP_NTFY_TOPIC_OPERATOR:=hansa-ops-428fe896b9}"
+export WISP_NTFY_TOPIC_OPERATOR="${WISP_NTFY_TOPIC_OPERATOR:=hansa-ops-428fe896b8}"
 export WISP_NTFY_TOPIC_TECH="${WISP_NTFY_TOPIC_TECH:=hansa-tech-87e2965d5e}"
 
-# Detection speed: poll every 20s × 3 consecutive failures = DOWN within ~1 minute,
-# while keeping the 3-strike flap suppression (a single dropped ping won't page).
+# Detection speed: poll every 20s, but the between-cycle watch + fast-confirm probe
+# changed hosts every WISP_RETRY_INTERVAL_S and confirm in seconds (DOWN ~5s, UP ~4s)
+# without weakening the 3-strike flap suppression. The retry probes the whole fleet each
+# tick, so 1s is great for a small fleet; raise it (e.g. 2–3s) once you run hundreds of
+# nodes so the box isn't pinging everything every second.
 export WISP_POLL_INTERVAL_S="${WISP_POLL_INTERVAL_S:=20}"
+export WISP_RETRY_INTERVAL_S="${WISP_RETRY_INTERVAL_S:=1}"
 
 command -v "$PY" >/dev/null 2>&1 || { echo "error: '$PY' not found" >&2; exit 1; }
 echo "▸ using $("$PY" --version 2>&1)"

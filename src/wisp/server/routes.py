@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -47,6 +48,7 @@ _CONTENT_TYPES = {
 _OUTAGE_ACTION = re.compile(r"^/api/outages/(\d+)/(ack|postmortem)$")
 _OUTAGE_ITEM = re.compile(r"^/api/outages/(\d+)$")
 _DEVICE_ITEM = re.compile(r"^/api/devices/(\d+)$")
+_DEVICE_MAINT = re.compile(r"^/api/devices/(\d+)/maintenance$")
 _WORKER_ITEM = re.compile(r"^/api/workers/(\d+)$")
 
 # API endpoints reachable without a valid session (the login flow itself). Every
@@ -155,8 +157,63 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/backup":
                 return self._send_backup()
+            if path == "/api/events":
+                return self._serve_events()
             return self._handle_api_get(path, parse_qs(parsed.query))
         return self._serve_static(path)
+
+    # -- live push (Server-Sent Events) --------------------------------------
+    def _data_version(self) -> str:
+        """A cheap monotonic fingerprint of the data the live views render. It bumps
+        whenever a new poll/outage/alert row lands — every full cycle AND instantly on
+        a between-cycle DOWN/recovery — so an SSE client knows to re-fetch. Keyed on
+        MAX(id) of the three append-mostly tables (one trivial indexed read)."""
+        with connect(CONFIG) as conn:
+            r = conn.execute(
+                "SELECT (SELECT COALESCE(MAX(id),0) FROM poll_results) AS p,"
+                " (SELECT COALESCE(MAX(id),0) FROM outages) AS o,"
+                " (SELECT COALESCE(MAX(id),0) FROM alert_log) AS a"
+            ).fetchone()
+        return f"{r['p']}.{r['o']}.{r['a']}"
+
+    def _serve_events(self) -> None:
+        """Server-Sent Events stream: emit a `changed` event whenever `_data_version`
+        moves, so the dashboard updates the instant the daemon writes — no client-side
+        polling. The body has no Content-Length (delimited by connection close); the
+        browser's EventSource consumes events as they stream and auto-reconnects. The
+        per-connection 1s DB check is a single MAX(id) read, cheap for a few tabs."""
+        self.close_connection = True  # streaming socket; don't try to keep-alive it
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")  # stop nginx buffering the stream
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")          # client reconnect backoff (ms)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        last: str | None = None
+        idle = 0
+        while True:
+            try:
+                version = self._data_version()
+            except Exception:
+                version = last  # a transient DB hiccup must not kill the stream
+            try:
+                if version != last:
+                    last = version
+                    self.wfile.write(f"event: changed\ndata: {version}\n\n".encode())
+                    idle = 0
+                else:
+                    idle += 1
+                    if idle % 15 == 0:                    # ~15s heartbeat keeps it open
+                        self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return                                    # client went away
+            time.sleep(1.0)
 
     def _send_backup(self) -> None:
         try:
@@ -273,6 +330,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "id": new_id}, 201)
             if path == "/api/channels/test":   # send a test alert (go-live check)
                 return self._send_json(services.test_channel(body.get("target", "owner"), CONFIG))
+
+            mm = _DEVICE_MAINT.match(path)     # pause/resume monitoring for one node
+            if mm:
+                on = bool(body.get("maintenance"))
+                ok = services.set_maintenance(int(mm.group(1)), on, CONFIG)
+                return self._send_json({"ok": ok, "maintenance": on}, 200 if ok else 404)
 
             m = _OUTAGE_ACTION.match(path)
             if not m:

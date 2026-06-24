@@ -106,6 +106,30 @@ class Config:
         default_factory=lambda: _env_int("WISP_POLL_RETENTION_DAYS", 7)
     )
 
+    # --- Per-link performance baseline (soft "slow link" signal) -------------
+    # The FSM only knows UP/DEGRADED/DOWN against ABSOLUTE thresholds; this tier
+    # flags a link that is slow/jittery vs ITS OWN rolling baseline (median + MAD)
+    # even while it still pings "up" — the classic degrading-wireless-backhaul case.
+    # It's a soft heads-up (operator-only page once, plus a dashboard badge), kept
+    # entirely separate from the outage/escalation ladder. See core/baseline.py.
+    perf_window: int = field(default_factory=lambda: _env_int("WISP_PERF_WINDOW", 20))
+    # Min healthy samples needed to form a baseline before we'll judge a deviation.
+    perf_min_samples: int = field(default_factory=lambda: _env_int("WISP_PERF_MIN_SAMPLES", 10))
+    # Consecutive deviating samples to enter (and clean samples to leave) — hysteresis.
+    perf_consecutive: int = field(default_factory=lambda: _env_int("WISP_PERF_CONSECUTIVE", 3))
+    # A sample trips only if it's > factor× the baseline AND > baseline + k×MAD.
+    perf_deviation_factor: float = field(
+        default_factory=lambda: _env_float("WISP_PERF_DEVIATION_FACTOR", 3.0))
+    perf_mad_k: float = field(default_factory=lambda: _env_float("WISP_PERF_MAD_K", 5.0))
+    # Baselines below these floors are too small to judge a multiple of (avoids
+    # flagging 2ms→8ms as a "3× degradation").
+    perf_min_baseline_ms: float = field(
+        default_factory=lambda: _env_float("WISP_PERF_MIN_BASELINE_MS", 5.0))
+    perf_min_jitter_ms: float = field(
+        default_factory=lambda: _env_float("WISP_PERF_MIN_JITTER_MS", 3.0))
+    # Gate the operator push (the dashboard badge is always written). 0 = badge only.
+    perf_alerts: bool = field(default_factory=lambda: _env_bool("WISP_PERF_ALERTS", True))
+
     # --- Monitor watchdog (dead-monitor alarm) -------------------------------
     # If the newest poll is older than this, the monitor itself is considered
     # down and the watchdog pages the owner. 0 = auto (max(180s, 3 poll cycles)),

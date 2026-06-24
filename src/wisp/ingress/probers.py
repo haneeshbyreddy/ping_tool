@@ -27,6 +27,7 @@ class PingResult:
     ip: str
     latency_ms: float | None   # None when 100% loss
     packet_loss: float         # 0..100
+    jitter_ms: float | None = None  # mean RTT variation; feeds core/baseline.py
 
 
 @runtime_checkable
@@ -104,7 +105,11 @@ class IcmpProber:
             return PingResult(ip, None, 100.0)
         loss = round(host.packet_loss * 100, 1)
         latency = host.avg_rtt if host.packets_received else None
-        return PingResult(ip, latency, loss)
+        # icmplib computes jitter (mean abs diff between consecutive RTTs); it needs
+        # >=2 replies, so a single-ping probe yields 0.0 — only meaningful on the
+        # multi-echo poll plan. None when nothing came back.
+        jitter = getattr(host, "jitter", None) if host.packets_received else None
+        return PingResult(ip, latency, loss, jitter)
 
 
 def build_prober(cfg: Config = CONFIG) -> Prober:

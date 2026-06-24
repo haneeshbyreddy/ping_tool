@@ -29,6 +29,7 @@ from wisp.core.state_machine import (
     DeviceMeta,
     MonitorEngine,
     OutageOpened,
+    OutageResolved,
 )
 
 
@@ -80,6 +81,39 @@ class ConfirmDown(unittest.TestCase):
         self.assertFalse(events)
         self.assertEqual(results["a"].packet_loss, 0.0)         # persisted reading = the healthy retry
         self.assertEqual(prober.calls, 1)                       # stopped as soon as it cleared
+
+
+class ConfirmUp(unittest.TestCase):
+    """Fast hard-state -> recovery confirmation (mirror of ConfirmDown): a recovering
+    device is re-probed back-to-back and cleared in seconds; a fresh loss aborts it."""
+
+    def _setup(self, **over):
+        cfg = Config(recover_consecutive=2, retry_interval_s=0.001,
+                     canary_ip="1.1.1.1", **over)
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        eng.fsm[1].prime(DOWN)                                  # device was DOWN
+        results = {"a": PingResult("a", 10.0, 0.0)}             # sample 1: reachable
+        states = dict(eng.process_cycle(results, "t").states)  # still DOWN (needs 2)
+        self.assertEqual(states[1], DOWN)
+        return cfg, eng, results, states
+
+    def test_confirms_up_fast(self):
+        cfg, eng, results, states = self._setup()
+        prober = _ScriptProber({"a": [PingResult("a", 10.0, 0.0)]})  # stays reachable
+        events = asyncio.run(
+            daemon._confirm_up(prober, eng, eng.probe_plan(), results, states, "t", cfg))
+        self.assertEqual(states[1], UP)
+        self.assertTrue(any(isinstance(e, OutageResolved) for e in events))
+        self.assertEqual(prober.calls, 1)              # exactly recover_consecutive-1 retries
+
+    def test_flap_does_not_recover(self):
+        cfg, eng, results, states = self._setup()
+        prober = _ScriptProber({"a": [PingResult("a", None, 100.0)]})  # lost again → abort
+        events = asyncio.run(
+            daemon._confirm_up(prober, eng, eng.probe_plan(), results, states, "t", cfg))
+        self.assertEqual(states[1], DOWN)
+        self.assertFalse(events)
+        self.assertEqual(prober.calls, 1)
 
 
 class _FakeProber:
@@ -151,6 +185,114 @@ class GatherPingsPolicy(unittest.TestCase):
         # must NOT come back as a tidy dict of 100%-loss readings — it raises.
         with self.assertRaises(RuntimeError):
             asyncio.run(daemon._gather_pings(prober, ["1.1.1.1", "10.0.0.2"], 3))
+
+
+class BetweenCycleWatch(unittest.TestCase):
+    """Between-cycle watch: detects a device that fails mid-gap (not at poll time).
+
+    Verifies that _between_cycle_watch pages a device that goes down AFTER the
+    full poll — i.e. the path that fast-confirm alone cannot cover."""
+
+    def _cfg(self, **kw):
+        return Config(
+            down_consecutive=3,
+            retry_interval_s=0.001,
+            canary_ip="1.1.1.1",
+            canary_freeze=True,
+            **kw,
+        )
+
+    def _noop_dispatcher(self):
+        """Minimal dispatcher double that records dispatched events."""
+        class _D:
+            dispatched = []
+            def dispatch(self, events, ts): self.dispatched.extend(events)
+            def sweep(self, ts): pass
+        return _D()
+
+    def test_detects_midgap_failure_and_pages(self):
+        """A device UP at poll time, then 100% loss mid-gap → DOWN + OutageOpened."""
+        cfg = self._cfg()
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        # Device was UP at poll time (FSM starts in UP, streak 0).
+        dispatcher = self._noop_dispatcher()
+
+        # Script: canary healthy, device lost on the first between-cycle probe.
+        # _confirm_down will then fire 2 more probes (both lost) to reach DOWN.
+        prober = _ScriptProber({
+            "1.1.1.1": [PingResult("1.1.1.1", 5.0, 0.0)] * 10,
+            "a": [PingResult("a", None, 100.0)] * 10,   # all-lost from now on
+        })
+
+        # Run with sleep_for just long enough for one between-cycle tick.
+        asyncio.run(
+            daemon._between_cycle_watch(prober, eng, dispatcher, sleep_for=0.05, cfg=cfg)
+        )
+
+        self.assertEqual(eng.fsm[1].state, DOWN)
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in dispatcher.dispatched))
+
+    def test_detects_midgap_recovery(self):
+        """A device DOWN at poll time, then reachable mid-gap → UP + OutageResolved,
+        without waiting for the next full poll (recovery is now symmetric with DOWN)."""
+        cfg = self._cfg()  # recover_consecutive defaults to 2
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        eng.fsm[1].prime(DOWN)
+        dispatcher = self._noop_dispatcher()
+
+        # Canary + device reachable from now on (long scripts so the loop never starves).
+        prober = _ScriptProber({
+            "1.1.1.1": [PingResult("1.1.1.1", 5.0, 0.0)] * 500,
+            "a": [PingResult("a", 5.0, 0.0)] * 500,
+        })
+
+        asyncio.run(
+            daemon._between_cycle_watch(prober, eng, dispatcher, sleep_for=0.05, cfg=cfg)
+        )
+
+        self.assertEqual(eng.fsm[1].state, UP)
+        self.assertTrue(any(isinstance(e, OutageResolved) for e in dispatcher.dispatched))
+
+    def test_blip_midgap_does_not_page(self):
+        """One 100% loss then recovery mid-gap → no page (blip, not outage)."""
+        cfg = self._cfg()
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        dispatcher = self._noop_dispatcher()
+
+        # First between-cycle probe: 100% loss. First confirm retry: recovers.
+        # Then 200 healthy results so every remaining tick of the loop sees 0% loss
+        # and produces no suspects — queue exhaustion (→ 100% loss) must not fire.
+        _healthy = [PingResult("a", 5.0, 0.0)] * 200
+        prober = _ScriptProber({
+            "1.1.1.1": [PingResult("1.1.1.1", 5.0, 0.0)] * 300,
+            "a": [PingResult("a", None, 100.0)] + _healthy,
+        })
+
+        asyncio.run(
+            daemon._between_cycle_watch(prober, eng, dispatcher, sleep_for=0.05, cfg=cfg)
+        )
+
+        self.assertEqual(eng.fsm[1].state, UP)
+        self.assertFalse(dispatcher.dispatched)
+
+    def test_canary_freeze_suppresses_midgap_alarm(self):
+        """When the canary is down (canary_freeze=True) the watch skips suspect processing."""
+        cfg = self._cfg()  # canary_freeze=True is the default in _cfg
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        dispatcher = self._noop_dispatcher()
+
+        # Both canary and device are lost — uplink is down, not the device.
+        prober = _ScriptProber({
+            "1.1.1.1": [PingResult("1.1.1.1", None, 100.0)] * 10,
+            "a": [PingResult("a", None, 100.0)] * 10,
+        })
+
+        asyncio.run(
+            daemon._between_cycle_watch(prober, eng, dispatcher, sleep_for=0.05, cfg=cfg)
+        )
+
+        self.assertEqual(eng.fsm[1].state, UP)   # FSM untouched
+        self.assertFalse(dispatcher.dispatched)
 
 
 if __name__ == "__main__":

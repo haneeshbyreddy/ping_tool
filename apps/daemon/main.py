@@ -28,6 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from wisp.config import CONFIG, Config  # noqa: E402
 from wisp.database.client import connect, migrate, transaction, write_with_retry
+from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.core.rollup import roll_up
 from wisp.ingress.probers import PingResult, Prober, build_prober
 from wisp.egress.notifiers import AlertDispatcher, build_notifier
@@ -123,7 +124,7 @@ def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config) -> No
             with transaction(conn):
                 conn.executemany(
                     "INSERT INTO poll_results (device_id, timestamp, latency_ms,"
-                    " packet_loss, state) VALUES (?,?,?,?,?)",
+                    " packet_loss, jitter_ms, state) VALUES (?,?,?,?,?,?)",
                     rows,
                 )
                 apply_events(conn, events, ts)
@@ -163,7 +164,11 @@ async def _confirm_down(
     while suspects and attempts_left > 0:
         await asyncio.sleep(cfg.retry_interval_s)
         ips = sorted({engine.meta[d].ip_address for d in suspects})
-        counts = {ip: plan[ip] for ip in ips}
+        # Single fast echo: a dead host burns one ICMP timeout, not the plan's 5, so
+        # confirmation isn't dominated by timeouts. The hysteresis is the consecutive
+        # sample COUNT (down_consecutive), not the pings-per-sample. `plan` is kept for
+        # signature stability with the full-poll path.
+        counts = {ip: 1 for ip in ips}
         retry = await _gather_pings(
             prober, ips, counts, max_inflight=cfg.probe_max_inflight
         )
@@ -176,6 +181,61 @@ async def _confirm_down(
             d for d in suspects
             if outcome.states.get(d) not in DOWN_FAMILY
             and (retry.get(engine.meta[d].ip_address) or _LOST).packet_loss >= 100.0
+        }
+        attempts_left -= 1
+
+    return extra_events
+
+
+async def _confirm_up(
+    prober: Prober,
+    engine: MonitorEngine,
+    plan: dict[str, int],
+    results: dict[str, PingResult],
+    states: dict[int, str],
+    ts: str,
+    cfg: Config,
+) -> list[Event]:
+    """Fast hard-state → recovery confirmation — the mirror image of `_confirm_down`.
+
+    Recovery used to be the slow direction: a DOWN device was never re-probed between
+    full polls, so it took `recover_consecutive × poll_interval` to clear. This applies
+    the same back-to-back re-probe to the *up* direction: any device still in
+    `DOWN_FAMILY` that reads reachable is *suspected* recovered but not yet confirmed
+    (leaving DOWN needs `recover_consecutive` consecutive non-lost samples). Re-probe
+    just those every `retry_interval_s` until they either confirm recovery (leave
+    `DOWN_FAMILY` → OutageResolved, restore notice) or read 100% loss again (still down,
+    no flap). So UP is now detected in seconds, symmetric with DOWN.
+
+    Mutates `states`/`results` in place; returns any extra events the confirmation
+    produced (e.g. OutageResolved)."""
+    suspects = {
+        dev_id for dev_id, st in states.items()
+        if st in DOWN_FAMILY
+        and (results.get(engine.meta[dev_id].ip_address) or _LOST).packet_loss < 100.0
+    }
+    # The triggering pass already contributed the first non-lost sample, so at most
+    # recover_consecutive-1 more are needed to clear the hysteresis.
+    attempts_left = max(0, cfg.recover_consecutive - 1)
+    extra_events: list[Event] = []
+
+    while suspects and attempts_left > 0:
+        await asyncio.sleep(cfg.retry_interval_s)
+        ips = sorted({engine.meta[d].ip_address for d in suspects})
+        counts = {ip: 1 for ip in ips}   # single fast echo (see _confirm_down)
+        retry = await _gather_pings(
+            prober, ips, counts, max_inflight=cfg.probe_max_inflight
+        )
+        results.update(retry)  # carry the freshest reading into the persisted row
+        outcome = engine.process_cycle(retry, ts, subset=suspects)
+        extra_events.extend(outcome.events)
+        states.update(outcome.states)
+        # Keep retrying only those still down AND still reading reachable (a fresh 100%
+        # loss aborts the recovery — the link is flapping, leave it DOWN).
+        suspects = {
+            d for d in suspects
+            if outcome.states.get(d) in DOWN_FAMILY
+            and (retry.get(engine.meta[d].ip_address) or _LOST).packet_loss < 100.0
         }
         attempts_left -= 1
 
@@ -200,22 +260,120 @@ async def run_cycle(
     states = dict(result.states)
     events = list(result.events)
 
-    # Fast-confirm suspected DOWN in seconds instead of waiting whole poll intervals.
+    # Make the freeze visible: when the canary reads down and canary_freeze is on, the
+    # engine skips ALL local transitions this cycle (no DOWN detection, no fast-confirm).
+    # A flaky internet canary therefore silently stalls detection — log it loudly so the
+    # operator can see why nothing is being detected (and consider a LAN canary).
+    if result.canary_down:
+        log.warning("canary %s unreachable — uplink treated as down; local detection "
+                    "FROZEN this cycle (WISP_CANARY_FREEZE=1)", cfg.canary_ip)
+
+    # Fast-confirm transitions in seconds instead of waiting whole poll intervals:
+    # DOWN (soft→hard) and recovery (hard→up) both, so detection is symmetric.
     # Skipped when the uplink is frozen (no local transitions this cycle) or disabled.
     if cfg.retry_interval_s > 0 and not result.canary_down:
         events += await _confirm_down(prober, engine, plan, results, states, ts, cfg)
+        events += await _confirm_up(prober, engine, plan, results, states, ts, cfg)
 
     rows = []
     for dev_id, state in states.items():
         res = results.get(engine.meta[dev_id].ip_address)
         latency = res.latency_ms if res else None
         loss = res.packet_loss if res else 100.0
-        rows.append((dev_id, ts, latency, loss, state))
+        jitter = res.jitter_ms if res else None
+        rows.append((dev_id, ts, latency, loss, jitter, state))
 
     _persist(rows, events, ts, cfg)                 # poll_results + outages first
     dispatcher.dispatch(events, ts)                 # then network sends + alert_log
     dispatcher.sweep(ts)                            # fire any overdue escalations
+    # Soft per-link performance check (slow/jittery-but-up). Isolated so a perf-sweep
+    # hiccup never sinks the cycle's core detection/alerting above.
+    try:
+        dispatcher.perf_sweep(ts)
+    except Exception:
+        log.exception("perf sweep failed; continuing")
     return events
+
+
+async def _between_cycle_watch(
+    prober: Prober,
+    engine: MonitorEngine,
+    dispatcher: AlertDispatcher,
+    sleep_for: float,
+    cfg: Config,
+) -> None:
+    """Probe the whole fleet at retry_interval_s during the inter-poll gap.
+
+    fast-confirm only fires AFTER a full poll, so a transition that happens mid-gap
+    otherwise waits up to poll_interval_s before its first sample lands. This loop
+    closes that gap in BOTH directions: every retry_interval_s it pings every device
+    with a single echo (cheap), and the moment a healthy host reads 100% loss (or a
+    DOWN host reads reachable) it runs the matching fast-confirm path — same
+    hysteresis (down_consecutive / recover_consecutive), same canary guard. So a
+    failure *or* a recovery anywhere in the poll cycle is reflected in seconds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + sleep_for
+    plan = engine.probe_plan()
+    # One ping per device: enough to detect a 100%-loss/reachable flip without the full
+    # echo burst; the confirmation probes still use the per-IP plan.
+    one_ping: dict[str, int] = {ip: 1 for ip in plan}
+
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= cfg.retry_interval_s:
+            await asyncio.sleep(max(0.0, remaining))
+            return
+        await asyncio.sleep(cfg.retry_interval_s)
+
+        # Probe EVERY device — DOWN ones too, so recovery is caught mid-gap (not just
+        # at the next full poll). The DOWN set is usually small, so this is cheap.
+        all_ids = set(engine.fsm)
+        ips = sorted({engine.meta[d].ip_address for d in all_ids} | {cfg.canary_ip})
+        counts = {ip: one_ping.get(ip, 1) for ip in ips}
+        try:
+            probe_res = await _gather_pings(
+                prober, ips, counts, max_inflight=cfg.probe_max_inflight
+            )
+        except RuntimeError:
+            log.exception("between-cycle watch: ICMP error, skipping tick")
+            continue
+
+        canary_down = (probe_res.get(cfg.canary_ip) or _LOST).packet_loss >= 100.0
+        if canary_down and cfg.canary_freeze:
+            continue
+
+        def _loss(d: int) -> float:
+            return (probe_res.get(engine.meta[d].ip_address) or _LOST).packet_loss
+
+        # Healthy host suddenly all-lost → down suspect; DOWN host now reachable → up.
+        down_suspects = {d for d in all_ids
+                         if engine.fsm[d].state not in DOWN_FAMILY and _loss(d) >= 100.0}
+        up_suspects = {d for d in all_ids
+                       if engine.fsm[d].state in DOWN_FAMILY and _loss(d) < 100.0}
+        suspects = down_suspects | up_suspects
+        if not suspects:
+            continue
+
+        ts = _utc_now_iso()
+        # Feed sample 1 through the FSM (subset mode), then confirm each direction.
+        outcome = engine.process_cycle(probe_res, ts, subset=suspects)
+        states = dict(outcome.states)
+        events = list(outcome.events)
+        events += await _confirm_down(prober, engine, plan, probe_res, states, ts, cfg)
+        events += await _confirm_up(prober, engine, plan, probe_res, states, ts, cfg)
+
+        rows = [
+            (dev_id, ts,
+             (probe_res.get(engine.meta[dev_id].ip_address) or _LOST).latency_ms,
+             (probe_res.get(engine.meta[dev_id].ip_address) or _LOST).packet_loss,
+             (probe_res.get(engine.meta[dev_id].ip_address) or _LOST).jitter_ms,
+             st)
+            for dev_id, st in states.items()
+        ]
+        _persist(rows, events, ts, cfg)
+        if events:
+            dispatcher.dispatch(events, ts)
+            dispatcher.sweep(ts)
 
 
 def _print_cycle(cycle: int, states: dict[int, str]) -> None:
@@ -324,7 +482,19 @@ async def run_forever(
         if max_cycles is not None and cycle >= max_cycles:
             break
         elapsed = asyncio.get_running_loop().time() - started
-        await asyncio.sleep(max(0.0, interval - elapsed))
+        sleep_for = max(0.0, interval - elapsed)
+        # Between-cycle watch: probe non-DOWN devices at retry_interval_s so a
+        # device that fails mid-gap is caught in seconds, not at the next full
+        # poll. Disabled for finite --cycles runs (smoke tests) and when
+        # retry_interval_s == 0 (fast-confirm also disabled in that case).
+        if max_cycles is None and cfg.retry_interval_s > 0 and sleep_for > cfg.retry_interval_s:
+            try:
+                await _between_cycle_watch(prober, engine, dispatcher, sleep_for, cfg)
+            except Exception:
+                log.exception("between-cycle watch failed; sleeping instead")
+                await asyncio.sleep(sleep_for)
+        else:
+            await asyncio.sleep(sleep_for)
 
 
 def main() -> None:
@@ -349,10 +519,22 @@ def main() -> None:
             pass
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
     migrate()
+    # One logical poller per DB: each daemon has its own in-memory FSM, so a second
+    # one against the same DB independently confirms every outage and double-pages.
+    # An OS advisory lock next to the DB refuses the second start (auto-released by the
+    # kernel on exit/crash — no stale pidfile to reap).
+    guard = SingleInstance(f"{CONFIG.db_path}.lock")
+    try:
+        guard.acquire()
+    except AlreadyRunning as exc:
+        log.error("%s", exc)
+        raise SystemExit(3)
     try:
         asyncio.run(run_forever(interval=args.interval, max_cycles=args.cycles))
     except KeyboardInterrupt:
         print("\nstopped.")
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":

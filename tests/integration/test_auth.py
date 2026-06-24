@@ -134,6 +134,29 @@ class AuthHttpTest(unittest.TestCase):
         status, _, _ = self._req("POST", "/api/login", {"pin": "1234"})
         self.assertEqual(status, 429)
 
+    # -- live push (SSE) -----------------------------------------------------
+    def test_events_requires_auth(self):
+        status, data, _ = self._req("GET", "/api/events")
+        self.assertEqual(status, 401)          # gated like every other /api/*
+        self.assertIn("error", data)
+
+    def test_events_streams_changed(self):
+        _, _, set_cookie = self._req("POST", "/api/auth/setup", {"pin": "1234"})
+        cookie = self._cookie_value(set_cookie)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/events", headers={"Cookie": cookie})
+        resp = conn.getresponse()
+        try:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/event-stream", resp.getheader("Content-Type") or "")
+            # The first iteration writes the reconnect hint + an initial 'changed'
+            # event before sleeping, so a few readlines get them without blocking.
+            blob = b"".join(resp.fp.readline() for _ in range(4)).decode()
+            self.assertIn("event: changed", blob)
+            self.assertIn("data:", blob)
+        finally:
+            conn.close()
+
     # -- session expiry (direct, with injected clock) ------------------------
     def test_session_expires(self):
         token = auth.issue_session(self.cfg, now=1000.0)

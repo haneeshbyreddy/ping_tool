@@ -95,15 +95,16 @@ class DispatcherTest(unittest.TestCase):
             return [dict(r) for r in c.execute("SELECT * FROM alert_log ORDER BY id")]
 
     # --- tests ---
-    def test_initial_page_is_operator_only_and_schedules_hourly(self):
+    def test_initial_page_goes_to_owner_and_operator_and_schedules_hourly(self):
         self._open_outage()
         self.disp.dispatch([OutageOpened(1, DOWN)], T0)
-        # the immediate page goes to the operator channel ONLY
+        # the immediate page goes to BOTH owner and operator (consistent with the
+        # restore broadcast); the tech channel is held back to the hourly escalation
         self.assertEqual({s["recipient"] for s in self.notifier.sent},
-                         {self.cfg.ntfy_topic_operator})
+                         {self.cfg.ntfy_topic_owner, self.cfg.ntfy_topic_operator})
         sent_rows = [r for r in self._alert_log() if r["status"] == "sent"]
         self.assertEqual(len(sent_rows), 1)
-        self.assertEqual(sent_rows[0]["recipient"], self.cfg.ntfy_topic_operator)
+        self.assertEqual(sent_rows[0]["recipient"], self.cfg.ntfy_topic_owner)
         # one recurring all-hands escalation is queued
         with connect(self.cfg) as c:
             esc = c.execute("SELECT kind FROM escalations").fetchall()
@@ -118,10 +119,25 @@ class DispatcherTest(unittest.TestCase):
     def test_anti_spam_dedupe(self):
         self._open_outage()
         self.disp.dispatch([OutageOpened(1, DOWN)], T0)
-        self.disp.dispatch([OutageOpened(1, DOWN)], T0)  # same window
-        # first dispatch pages the operator once; the second is suppressed
-        self.assertEqual(len(self.notifier.sent), 1)
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)  # duplicate event, same outage
+        # first dispatch pages owner+operator once; the duplicate for the SAME outage
+        # is suppressed (no further sends)
+        self.assertEqual(len(self.notifier.sent), 2)
         self.assertTrue(any(r["status"] == "suppressed" for r in self._alert_log()))
+
+    def test_new_outage_after_recovery_pages_again(self):
+        # Regression: dedupe is per-OUTAGE, not a time window. A device that recovers
+        # and fails again opens a new outage and MUST page — the old window-based dedupe
+        # (which also counted restore notices) silently swallowed every repeat outage.
+        self._open_outage()
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
+        self.disp.dispatch([OutageResolved(1)], T0)      # recovers, closes outage 1
+        self.notifier.sent.clear()
+        self._open_outage()                               # fails again → new outage
+        self.disp.dispatch([OutageOpened(1, DOWN)], T0)
+        self.assertEqual(len(self.notifier.sent), 2)      # paged again, not suppressed
+        self.assertEqual({s["recipient"] for s in self.notifier.sent},
+                         {self.cfg.ntfy_topic_owner, self.cfg.ntfy_topic_operator})
 
     def test_hourly_escalation_fans_out_to_all_channels_and_reschedules(self):
         self._open_outage()

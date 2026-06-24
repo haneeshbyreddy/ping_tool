@@ -284,7 +284,10 @@ def load_device_meta(cfg: Config = CONFIG) -> list[DeviceMeta]:
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT id, name, ip_address, region, parent_device_id, technician_phone"
-            " FROM devices WHERE is_active = 1 ORDER BY id"
+            # maintenance=1 fully pauses a node: excluded from the active set so the
+            # daemon stops pinging it and pages no one for it (the device-set reload
+            # picks the change up in-process). Flip the flag back to resume.
+            " FROM devices WHERE is_active = 1 AND maintenance = 0 ORDER BY id"
         ).fetchall()
     return [DeviceMeta(**dict(r)) for r in rows]
 
@@ -321,10 +324,14 @@ def apply_events(conn: sqlite3.Connection, events: list[Event], ts: str) -> None
     row (resolve/recategorize no-op if none is open)."""
     for ev in events:
         if isinstance(ev, OutageOpened):
+            # Idempotent open: never stack a second open row for a device that already
+            # has an unresolved outage (a duplicate event, or a stray second poller).
+            # One open outage per device is the invariant the rest of the code assumes.
             conn.execute(
                 "INSERT INTO outages (device_id, started_at, final_state)"
-                " VALUES (?,?,?)",
-                (ev.device_id, ts, ev.state),
+                " SELECT ?,?,? WHERE NOT EXISTS ("
+                "   SELECT 1 FROM outages WHERE device_id=? AND resolved_at IS NULL)",
+                (ev.device_id, ts, ev.state, ev.device_id),
             )
         elif isinstance(ev, OutageRecategorized):
             conn.execute(
