@@ -65,6 +65,16 @@ class Config:
         default_factory=lambda: _env_int("WISP_POLL_INTERVAL_SMALL_S", 30)
     )
     small_fleet_max: int = field(default_factory=lambda: _env_int("WISP_SMALL_FLEET_MAX", 1000))
+    # Fast confirmation (soft-state → hard-state). When a poll reads 100% loss, the
+    # daemon re-probes *just that device* back-to-back every `retry_interval_s` until it
+    # has `down_consecutive` all-lost samples — so DOWN is confirmed in seconds instead
+    # of `down_consecutive` full poll intervals, without touching the healthy fleet's
+    # cadence or weakening flap suppression (still N consecutive all-lost samples). A
+    # reachable retry clears the suspicion, so a blip never pages. 0 disables it (one
+    # sample per poll, detection = down_consecutive × poll_interval as before).
+    retry_interval_s: float = field(
+        default_factory=lambda: _env_float("WISP_RETRY_INTERVAL_S", 2.0)
+    )
     pings_per_poll: int = field(default_factory=lambda: _env_int("WISP_PINGS_PER_POLL", 5))
     # Aggregation gear (towers/switches/APs — any device that is a *parent* of
     # another) is probed *gently*: fewer echoes per poll so we don't trip the ICMP

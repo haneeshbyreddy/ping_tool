@@ -13,7 +13,7 @@ channels (ntfy). Runs on one always-on box, no cloud, no per-message costs.
 ## Status
 
 Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8** (team directory, PIN
-gate, monitor lifecycle) are **done** — 77 tests. The build now targets a **real
+gate, monitor lifecycle) are **done** — 80 tests. The build now targets a **real
 environment**: the mock notifier and simulated prober (and the demo seeder) have been
 removed, so the daemon polls with `IcmpProber` and alerts via `NtfyNotifier`. Config is
 **env-var only** (a frozen `Config` read at startup — no DB settings layer). The build also
@@ -68,11 +68,11 @@ reasoning they encode.
 
 - **Flap suppression / hysteresis.** A wireless link blips constantly; paging on a single
   bad poll would train everyone to ignore alerts. So DOWN needs 3 consecutive 100%-loss
-  polls, DEGRADED needs 2, recovery needs 2 healthy — ~3 min to declare DOWN at the 60s
-  default. That delay is a deliberate trade: never cry wolf. Detection latency is
-  `poll_interval × down_consecutive`, so a small site can cut it by dropping the interval
-  (or `WISP_POLL_INTERVAL_ADAPTIVE=1`, which polls every 30s while the fleet is ≤1k and backs
-  off above that — faster where it's cheap, gentle where it isn't).
+  polls, DEGRADED needs 2, recovery needs 2 healthy. That confirmation is a deliberate trade:
+  never cry wolf. But the *3 samples* needn't be *3 minutes* — see "fast-confirm" below: those
+  three samples are gathered in seconds via rapid re-probe of the suspect alone, so we keep the
+  hysteresis and still detect in ~4s. The poll interval is then about steady-state probe load,
+  not detection latency.
 - **Uplink canary.** If our own office internet is down, every tower looks down. Pinging a
   canary first lets us send ONE `UPLINK_DOWN` and freeze transitions, instead of a storm —
   and means "our internet is down" never masquerades as "the towers are down."
@@ -108,6 +108,15 @@ The same "never lie" principle drives the fleet-scale work; the code-level invar
   hourly into compact `poll_rollups` (one row per device per hour). Trend charts read hours, not
   a billion raw rows, and raw retention can be cut short without losing history. `outages` stays
   the source of truth for incidents.
+- **Fast-confirm — detection in seconds, not minutes.** Detection used to be
+  `down_consecutive × poll_interval` (~3 min). Now, the instant a poll reads 100% loss, the
+  daemon re-probes *only that device* back-to-back every `WISP_RETRY_INTERVAL_S` (default 2s)
+  until it gathers the 3 all-lost samples (→ DOWN) or it comes back reachable (→ a blip, cleared,
+  never paged). Detection ≈ 4s, the healthy fleet keeps its gentle cadence, and the 3-sample
+  hysteresis is unchanged — this is the soft-state/hard-state model (cf. Nagios `retry_interval`),
+  just confirmation decoupled from the steady-state poll. The next rung, for gear we control, is
+  event-driven ingress (SNMP traps / controller webhooks / BFD) for sub-second — the prober/notifier
+  interfaces leave room for it without reworking the engine.
 
 ---
 

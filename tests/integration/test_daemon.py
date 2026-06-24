@@ -22,6 +22,64 @@ daemon = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(daemon)
 
 from wisp.ingress.probers import PingResult
+from wisp.config import Config
+from wisp.core.state_machine import (
+    DOWN,
+    UP,
+    DeviceMeta,
+    MonitorEngine,
+    OutageOpened,
+)
+
+
+def _meta(dev_id, ip, parent=None):
+    return DeviceMeta(id=dev_id, name=f"d{dev_id}", ip_address=ip, region="R",
+                      parent_device_id=parent, technician_phone=None)
+
+
+class _ScriptProber:
+    """Pops a queued PingResult per IP each ping; defaults to 100% loss when empty."""
+
+    def __init__(self, script):
+        self.script = {ip: list(q) for ip, q in script.items()}
+        self.calls = 0
+
+    async def ping(self, ip, count):
+        self.calls += 1
+        q = self.script.get(ip)
+        return q.pop(0) if q else PingResult(ip, None, 100.0)
+
+
+class ConfirmDown(unittest.TestCase):
+    """Fast soft-state -> hard-state confirmation: a suspected-down device is re-probed
+    back-to-back and confirmed in seconds; a reachable retry clears it without paging."""
+
+    def _setup(self, **over):
+        cfg = Config(down_consecutive=3, retry_interval_s=0.001, canary_ip="1.1.1.1", **over)
+        eng = MonitorEngine([_meta(1, "a")], cfg)
+        results = {"a": PingResult("a", None, 100.0)}
+        states = dict(eng.process_cycle(results, "t").states)   # main pass: streak 1, UP
+        self.assertEqual(states[1], UP)
+        return cfg, eng, results, states
+
+    def test_confirms_down_fast(self):
+        cfg, eng, results, states = self._setup()
+        prober = _ScriptProber({"a": [PingResult("a", None, 100.0)] * 2})  # stays lost
+        events = asyncio.run(
+            daemon._confirm_down(prober, eng, eng.probe_plan(), results, states, "t", cfg))
+        self.assertEqual(states[1], DOWN)
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in events))
+        self.assertEqual(prober.calls, 2)                       # exactly down_consecutive-1 retries
+
+    def test_blip_clears_without_paging(self):
+        cfg, eng, results, states = self._setup()
+        prober = _ScriptProber({"a": [PingResult("a", 10.0, 0.0)]})  # first retry recovers
+        events = asyncio.run(
+            daemon._confirm_down(prober, eng, eng.probe_plan(), results, states, "t", cfg))
+        self.assertEqual(states[1], UP)
+        self.assertFalse(events)
+        self.assertEqual(results["a"].packet_loss, 0.0)         # persisted reading = the healthy retry
+        self.assertEqual(prober.calls, 1)                       # stopped as soon as it cleared
 
 
 class _FakeProber:

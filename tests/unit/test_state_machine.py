@@ -99,6 +99,27 @@ class ProbePlan(unittest.TestCase):
         self.assertEqual(eng.probe_plan()["d"], 5)
 
 
+class ConfirmationPass(unittest.TestCase):
+    """The subset pass (process_cycle(subset=...)) advances ONLY the listed devices —
+    the daemon uses it to fast-confirm a suspected DOWN within one cycle without
+    disturbing the rest of the fleet."""
+
+    def test_subset_advances_only_listed_devices(self):
+        a = solo_device(id=1, ip_address="a")
+        b = solo_device(id=2, ip_address="b")
+        eng = MonitorEngine([a, b], CFG)
+        r = feed(eng, {"a": DEAD_S("a"), "b": DEAD_S("b")})   # both lost -> streak 1, UP
+        self.assertEqual((r.states[1], r.states[2]), (UP, UP))
+
+        # Confirm only device 1, twice more -> it hits down_consecutive (3) and opens.
+        eng.process_cycle({"a": DEAD_S("a")}, "t", subset={1})
+        r2 = eng.process_cycle({"a": DEAD_S("a")}, "t", subset={1})
+        self.assertEqual(r2.states, {1: DOWN})                # only the subset comes back
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in r2.events))
+        self.assertEqual(eng.fsm[2].state, UP)                # device 2 untouched
+        self.assertEqual(eng.fsm[2].down_streak, 1)           # still just its one lost sample
+
+
 class AdaptiveInterval(unittest.TestCase):
     """Detection cadence scales with fleet size when adaptive mode is on: a small
     deployment polls faster (quicker detection); a large one falls back to protect

@@ -34,6 +34,7 @@ from wisp.egress.notifiers import AlertDispatcher, build_notifier
 from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
+    DOWN_FAMILY,
     Event,
     UNREACHABLE,
     UP,
@@ -42,6 +43,10 @@ from wisp.core.state_machine import (
     build_engine,
     load_device_meta,
 )
+
+# A device with no reading at all is treated as fully lost (matches the engine's
+# missing-result default), so the confirmation pass never trips over a None.
+_LOST = PingResult("", None, 100.0)
 
 
 log = logging.getLogger("wisp.daemon")
@@ -125,6 +130,58 @@ def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config) -> No
     write_with_retry(_do)
 
 
+async def _confirm_down(
+    prober: Prober,
+    engine: MonitorEngine,
+    plan: dict[str, int],
+    results: dict[str, PingResult],
+    states: dict[int, str],
+    ts: str,
+    cfg: Config,
+) -> list[Event]:
+    """Fast soft-state → hard-state confirmation.
+
+    The main poll advanced every FSM by one sample. Any device that read 100% loss is
+    *suspected* down but not yet confirmed (DOWN needs `down_consecutive` consecutive
+    all-lost samples). Rather than wait a full poll interval for each remaining sample,
+    re-probe **just the suspects** back-to-back every `retry_interval_s` until they
+    either confirm DOWN or come back reachable (a blip — which clears the suspicion and
+    never pages). Detection collapses from `down_consecutive × poll_interval` to a few
+    seconds, and the healthy fleet is never re-probed.
+
+    Mutates `states` (and `results`, so the persisted reading reflects the final probe)
+    in place; returns any extra events (e.g. OutageOpened) the confirmation produced."""
+    suspects = {
+        dev_id for dev_id, st in states.items()
+        if st not in DOWN_FAMILY
+        and (results.get(engine.meta[dev_id].ip_address) or _LOST).packet_loss >= 100.0
+    }
+    # The main pass already contributed sample 1, so at most down_consecutive-1 more.
+    attempts_left = max(0, cfg.down_consecutive - 1)
+    extra_events: list[Event] = []
+
+    while suspects and attempts_left > 0:
+        await asyncio.sleep(cfg.retry_interval_s)
+        ips = sorted({engine.meta[d].ip_address for d in suspects})
+        counts = {ip: plan[ip] for ip in ips}
+        retry = await _gather_pings(
+            prober, ips, counts, max_inflight=cfg.probe_max_inflight
+        )
+        results.update(retry)  # carry the freshest reading into the persisted row
+        outcome = engine.process_cycle(retry, ts, subset=suspects)
+        extra_events.extend(outcome.events)
+        states.update(outcome.states)
+        # Keep retrying only those still all-lost and not yet confirmed down/unreachable.
+        suspects = {
+            d for d in suspects
+            if outcome.states.get(d) not in DOWN_FAMILY
+            and (retry.get(engine.meta[d].ip_address) or _LOST).packet_loss >= 100.0
+        }
+        attempts_left -= 1
+
+    return extra_events
+
+
 async def run_cycle(
     prober: Prober, engine: MonitorEngine, dispatcher: AlertDispatcher, cfg: Config = CONFIG
 ) -> list[Event]:
@@ -140,18 +197,25 @@ async def run_cycle(
     )
 
     result = engine.process_cycle(results, ts)
+    states = dict(result.states)
+    events = list(result.events)
+
+    # Fast-confirm suspected DOWN in seconds instead of waiting whole poll intervals.
+    # Skipped when the uplink is frozen (no local transitions this cycle) or disabled.
+    if cfg.retry_interval_s > 0 and not result.canary_down:
+        events += await _confirm_down(prober, engine, plan, results, states, ts, cfg)
 
     rows = []
-    for dev_id, state in result.states.items():
+    for dev_id, state in states.items():
         res = results.get(engine.meta[dev_id].ip_address)
         latency = res.latency_ms if res else None
         loss = res.packet_loss if res else 100.0
         rows.append((dev_id, ts, latency, loss, state))
 
-    _persist(rows, result.events, ts, cfg)          # poll_results + outages first
-    dispatcher.dispatch(result.events, ts)          # then network sends + alert_log
-    dispatcher.sweep(ts)                             # fire any overdue escalations
-    return result.events
+    _persist(rows, events, ts, cfg)                 # poll_results + outages first
+    dispatcher.dispatch(events, ts)                 # then network sends + alert_log
+    dispatcher.sweep(ts)                            # fire any overdue escalations
+    return events
 
 
 def _print_cycle(cycle: int, states: dict[int, str]) -> None:

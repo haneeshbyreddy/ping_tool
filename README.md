@@ -41,7 +41,7 @@ PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 77 tests (pure stdlib)
+python -m unittest discover -s tests                 # 80 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -146,7 +146,8 @@ run.sh                    # one-shot setup + run for both runtimes
 
 | Var | Default | Meaning |
 |---|---|---|
-| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (detection = this × 3 to declare DOWN) |
+| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (steady-state cadence; see fast-confirm below) |
+| `WISP_RETRY_INTERVAL_S` | `2` | fast-confirm: re-probe a lossy device every Ns until DOWN is confirmed (0 = off) |
 | `WISP_POLL_INTERVAL_ADAPTIVE` | `0` | `1` = poll faster on a small fleet (see below) |
 | `WISP_POLL_INTERVAL_SMALL_S` | `30` | cadence used while the fleet ≤ `WISP_SMALL_FLEET_MAX` (adaptive on) |
 | `WISP_SMALL_FLEET_MAX` | `1000` | fleet size at/below which the small cadence applies |
@@ -166,11 +167,18 @@ layer: change a value by exporting the env var and restarting the daemon. (Devic
 *are* live in the UI; *tunables* are not.) The dashboard's **Settings** page is just the test
 alert, PIN change, and DB backup.
 
-**Faster detection for small deployments.** Detection latency is `poll_interval × 3` (DOWN
-needs 3 straight 100%-loss polls), so the 60s default is ~3 min. Either drop
-`WISP_POLL_INTERVAL_S` (e.g. `30` → ~90s) or set `WISP_POLL_INTERVAL_ADAPTIVE=1` and the daemon
-polls every 30s while the fleet is ≤1k and automatically backs off to 60s above that — it
-re-evaluates when you add/remove nodes, so no restart is needed when the fleet grows.
+**How fast we detect DOWN.** DOWN still needs 3 consecutive 100%-loss samples (flap
+suppression), but those samples no longer wait a full poll interval each. **Fast-confirm**
+(`WISP_RETRY_INTERVAL_S`, default 2s, on by default) re-probes *only* the device that just read
+100% loss, back-to-back, until it either confirms DOWN or comes back reachable — so detection is
+**~4 seconds**, not `3 × poll_interval`, and the healthy fleet is never re-probed. A reachable
+retry clears the suspicion, so a blip never pages. Set `WISP_RETRY_INTERVAL_S=0` to disable it
+(detection falls back to `down_consecutive × poll_interval`).
+
+`WISP_POLL_INTERVAL_S` is therefore now mostly the **steady-state probe load** dial, not the
+detection-latency dial. For load control on a small fleet you can still set
+`WISP_POLL_INTERVAL_ADAPTIVE=1` (poll every 30s while ≤1k devices, auto-back-off above that,
+re-evaluated on device-set reload).
 
 ## Going live (on the always-on box)
 

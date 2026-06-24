@@ -172,7 +172,8 @@ Every tunable is a `WISP_*` env var read once at startup (full list + defaults i
 
 | Var | Default | Meaning |
 |---|---|---|
-| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (the units ship `20` for ~1-min detection; detection = this × 3) |
+| `WISP_POLL_INTERVAL_S` | `60` | steady-state seconds between polls (detection no longer hinges on this — see fast-confirm) |
+| `WISP_RETRY_INTERVAL_S` | `2` | fast-confirm: re-probe a lossy device every Ns until DOWN is confirmed (~4s detection); `0` disables |
 | `WISP_POLL_INTERVAL_ADAPTIVE` | `0` | `1` = poll every `WISP_POLL_INTERVAL_SMALL_S` (30) while the fleet ≤ `WISP_SMALL_FLEET_MAX` (1000), else fall back to `WISP_POLL_INTERVAL_S` |
 | `WISP_PINGS_PER_POLL` / `_INFRA` | `5` / `2` | echoes per poll for leaf CPEs / for aggregation gear (gentle on tower control planes) |
 | `WISP_MAX_INFLIGHT` | `256` | cap on concurrent probes — keeps a large fleet from exhausting file descriptors (raise `ulimit -n` too) |

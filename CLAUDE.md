@@ -9,7 +9,7 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 77 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle) — 80 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -35,6 +35,12 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 - `core/state_machine.py` `MonitorEngine` is **pure** — takes `{ip: PingResult}` + ts,
   returns committed states + `Event`s, no I/O. DB glue (`build_engine`, `apply_events`) is
   separate; that's what makes it unit-testable. Don't put DB/network calls in the engine.
+- **`process_cycle(results, ts, subset=None)` has two modes.** `subset=None` is the normal full
+  pass (every device + canary/uplink edge + freeze). A `set[int]` runs a **confirmation pass**:
+  it advances *only* those FSMs by one more sample (topological order preserved so a just-confirmed
+  parent still suppresses its children), skips the canary/uplink logic, and returns committed
+  states for the subset only. The daemon's fast-retry uses it; keep the full-pass path
+  byte-identical (it's the `subset is None` branch) so existing behaviour/tests don't move.
 - `egress/notifiers.py` `AlertDispatcher` does network sends OUTSIDE any DB transaction, then
   logs — so a slow API call never holds a write lock.
 - Prober/Notifier live behind small interfaces (`ingress/probers.py`, `egress/notifiers.py`)
@@ -65,6 +71,17 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   in-progress hour. `services.device_trend` reads it for charts. `outages` stays the incident
   source of truth; this tier is analytics-only, so raw retention can be cut short without losing
   history.
+- **Fast-confirm decouples detection from cadence.** `apps/daemon/main.py:_confirm_down` runs
+  after the full `process_cycle`: any device that read 100% loss but isn't yet in `DOWN_FAMILY`
+  is *re-probed on its own* every `cfg.retry_interval_s` (`WISP_RETRY_INTERVAL_S`, default 2s),
+  feeding each rapid sample back through `process_cycle(..., subset=…)` until it reaches
+  `down_consecutive` all-lost samples (→ DOWN, paged) or comes back reachable (→ suspicion
+  cleared, never paged). So detection is ~`(down_consecutive-1) × retry_interval` (≈4s), **not**
+  `down_consecutive × poll_interval`, and only suspects are re-probed — the healthy fleet keeps
+  its gentle cadence. It's gated off when the uplink is frozen (`result.canary_down`) and by
+  `retry_interval_s == 0`. The 3-sample hysteresis is **unchanged** — it's compressed in time, not
+  weakened; don't "optimize" it down to a single confirming probe. `_confirm_down` mutates the
+  `states`/`results` dicts in place so the persisted row shows the final probe.
 - **Adaptive cadence is fleet-size-derived, opt-in.** `Config.effective_interval(device_count)`
   returns `poll_interval_small_s` (30) while the active fleet is `<= small_fleet_max` (1000) and
   `poll_interval_adaptive` is on (`WISP_POLL_INTERVAL_ADAPTIVE`), else `poll_interval_s` (60).
@@ -140,7 +157,9 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   Constants live in `core/state_machine.py` — import them, don't hardcode strings.
 - **Flap suppression / hysteresis:** DOWN = 3 consecutive 100%-loss polls, DEGRADED = 2,
   recovery = 2 healthy. The FSM never emits `UNREACHABLE` — that's a topology override applied
-  in `MonitorEngine.process_cycle` after `feed()`. Don't regress these counts.
+  in `MonitorEngine.process_cycle` after `feed()`. Don't regress these counts. (Fast-confirm —
+  see Scaling — gathers DOWN's 3 samples in seconds via rapid re-probe, but the *count* is the
+  same; it changes when the samples arrive, not how many.)
 - **Topology order:** devices are processed parent-before-child (`_topological_order`) so a
   parent's new state is known when evaluating its children.
 - **No automatic cause inference.** The engine does **not** guess why a device is down. The old
@@ -189,13 +208,14 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (77 tests). They mirror the
-layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra),
-`integration/test_notifiers` (dispatch/escalation/ack + the `send_with_retry` policy, temp DB +
-controlled time), `integration/test_analytics` (outage-window/downtime math),
-`integration/test_api` (services + device CRUD), `integration/test_watchdog` (dead-monitor alarm:
-stale→page, recover, restart no-repage, failed-send retry), `integration/test_daemon`
-(poll-gather error policy **+ the concurrency-bound semaphore / per-IP count map**),
+Run `python -m unittest discover -s tests` after any logic change (80 tests). They mirror the
+layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
+confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
+the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`
+(outage-window/downtime math), `integration/test_api` (services + device CRUD),
+`integration/test_watchdog` (dead-monitor alarm: stale→page, recover, restart no-repage,
+failed-send retry), `integration/test_daemon` (poll-gather error policy, concurrency-bound
+semaphore / per-IP count map, **+ fast-confirm: rapid DOWN confirm and blip-clears-without-paging**),
 `integration/test_rollup` (hourly fold math, in-progress-hour skip, idempotency, `device_trend`).
 Add cases there — time-based paths (escalation, dedupe, staleness, rollup buckets)
 need the temp-DB + controlled-clock setup to surface. Tests inject a recording notifier double
