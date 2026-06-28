@@ -130,6 +130,13 @@ class Config:
     # Gate the operator push (the dashboard badge is always written). 0 = badge only.
     perf_alerts: bool = field(default_factory=lambda: _env_bool("WISP_PERF_ALERTS", True))
 
+    # --- Redundancy / on-backup signal (graph topology, Phase 9 Part A) -------
+    # When a node's PRIMARY uplink dies but a BACKUP path carries it, the node still
+    # pings "up" — no outage — but redundancy is gone ("one more failure is an outage").
+    # Like the perf tier this is a soft heads-up: the dashboard badge is always written;
+    # this gates the single operator page on the enter/leave edge. 0 = badge only.
+    backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
+
     # --- Monitor watchdog (dead-monitor alarm) -------------------------------
     # If the newest poll is older than this, the monitor itself is considered
     # down and the watchdog pages the owner. 0 = auto (max(180s, 3 poll cycles)),

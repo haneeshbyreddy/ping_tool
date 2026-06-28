@@ -401,5 +401,107 @@ class AttendanceTest(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
+class BackupLinkTest(unittest.TestCase):
+    """Phase 9 Part A — backup parent edges (device_links): CRUD + validation, the
+    full-edge cycle check, FK-safe delete (both directions), multi-parent blast-radius
+    attribution, and the on-backup node badge."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(db_path=Path(self.tmp.name) / "t.db")
+        migrate(self.cfg)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        with connect(self.cfg) as c:
+            # core(1) <- Tower A(2), Tower B(3); Relay(4) primary under Tower A.
+            for did, name, parent in [
+                (1, "Core", None), (2, "Tower A", 1), (3, "Tower B", 1), (4, "Relay", 2),
+            ]:
+                c.execute(
+                    "INSERT INTO devices (id,name,ip_address,region,parent_device_id)"
+                    " VALUES (?,?,?,?,?)", (did, name, f"d{did}", "Rampur", parent))
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _poll(self, device_id, state):
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO poll_results (device_id,timestamp,latency_ms,"
+                      "packet_loss,state) VALUES (?,?,?,?,?)",
+                      (device_id, _iso(self.now), 10.0, 0.0, state))
+            c.commit()
+
+    def _open_outage(self, device_id):
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO outages (device_id,started_at,final_state)"
+                      " VALUES (?,?, 'DOWN')",
+                      (device_id, _iso(self.now - timedelta(minutes=5))))
+            c.commit()
+
+    def test_add_remove_backup_link_and_list(self):
+        self.assertEqual(api.add_backup_link(4, 3, self.cfg), {"ok": True})
+        devs = {d["id"]: d for d in api.list_devices(self.cfg)}
+        self.assertEqual([b["id"] for b in devs[4]["backup_parents"]], [3])
+        # duplicate rejected
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(4, 3, self.cfg)
+        # remove (idempotent: second remove reports not-found)
+        self.assertEqual(api.remove_backup_link(4, 3, self.cfg), {"ok": True})
+        self.assertFalse(api.remove_backup_link(4, 3, self.cfg)["ok"])
+
+    def test_backup_validation(self):
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(4, 4, self.cfg)      # self
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(4, 2, self.cfg)      # 2 is already the primary parent
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(4, 999, self.cfg)    # parent doesn't exist
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(999, 3, self.cfg)    # child doesn't exist
+
+    def test_backup_link_cycle_rejected(self):
+        # Tower A(2) is the primary parent of Relay(4); a backup edge 2<-4 closes a loop.
+        with self.assertRaises(api.DeviceError):
+            api.add_backup_link(2, 4, self.cfg)
+
+    def test_delete_clears_links_both_directions(self):
+        api.add_backup_link(4, 3, self.cfg)   # Tower B(3) is a backup parent of Relay(4)
+        api.add_backup_link(3, 2, self.cfg)   # Tower A(2) is a backup parent of Tower B(3)
+        # Tower B(3) has no PRIMARY children, so the delete isn't blocked; it appears in
+        # device_links as both a child (of 2) and a parent (of 4).
+        self.assertEqual(api.delete_device(3, self.cfg), {"ok": True})
+        with connect(self.cfg) as c:
+            n = c.execute("SELECT COUNT(*) FROM device_links WHERE child_id=3 OR parent_id=3"
+                          ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_culprit_attributes_to_all_down_ancestors(self):
+        # Diamond: Relay(4) primary Tower A(2), backup Tower B(3). Both towers DOWN ->
+        # Relay is UNREACHABLE and named on BOTH tower triage cards.
+        api.add_backup_link(4, 3, self.cfg)
+        self._poll(2, DOWN)
+        self._poll(3, DOWN)
+        self._poll(4, UNREACHABLE)
+        self._open_outage(2)
+        self._open_outage(3)
+        items = {i["device_id"]: i for i in api.triage_outages(self.cfg)}
+        self.assertEqual(items[2]["affected_children"], ["Relay"])
+        self.assertEqual(items[3]["affected_children"], ["Relay"])
+
+    def test_nodes_list_on_backup_badge(self):
+        self._poll(4, UP)
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO device_redundancy (device_id,on_backup,"
+                      "primary_down_since,updated_at) VALUES (4,1,?,?)",
+                      (_iso(self.now), _iso(self.now)))
+            c.commit()
+        node = {n["id"]: n for n in api.nodes_list(self.cfg)}[4]
+        self.assertTrue(node["on_backup"])
+        # a hard-DOWN node never shows the on-backup badge (the outage owns it)
+        self._poll(4, DOWN)
+        node = {n["id"]: n for n in api.nodes_list(self.cfg)}[4]
+        self.assertFalse(node["on_backup"])
+
+
 if __name__ == "__main__":
     unittest.main()

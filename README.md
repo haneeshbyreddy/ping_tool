@@ -133,7 +133,14 @@ run.sh                    # one-shot setup + run for both runtimes
   Recovery needs 2 healthy polls (hysteresis). A single blip never pages anyone.
 - **Uplink canary** — if our own internet is down, freeze everything and send ONE
   `UPLINK_DOWN` instead of a storm of per-tower alerts.
-- **Topology suppression** — a child of a down parent is `UNREACHABLE` (one alert, not forty).
+- **Topology suppression** — a child is `UNREACHABLE` (one alert, not forty) only when
+  **every** parent is down. With a **backup line** (a second `device_links` edge), if the
+  primary path dies but a backup carries traffic the node is still genuinely reachable —
+  so it isn't suppressed, and "running on backup" is surfaced as its own soft signal.
+- **On-backup signal** — when a node's primary uplink fails but a backup parent keeps it
+  up, the dashboard badges it "on backup" and the operator gets a single heads-up page
+  ("redundancy is gone — one more failure is an outage"). It never enters the outage /
+  escalation ladder (`WISP_BACKUP_ALERTS=0` keeps the badge, mutes the page).
 - **Post-mortem cause** — at resolution the operator records the confirmed root cause + notes
   (there is no automatic power-vs-link guess).
 - **Escalation is restart-safe** — timers live in the DB, not memory; a crash can't drop them.
@@ -160,6 +167,7 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_POLL_RETENTION_DAYS` | `7` | days of raw poll samples kept (scratch; hourly rollups + `outages` are the durable record) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
+| `WISP_BACKUP_ALERTS` | `1` | `0` = keep the on-backup badge but mute the operator page |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |

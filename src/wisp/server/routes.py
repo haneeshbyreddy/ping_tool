@@ -50,6 +50,8 @@ _OUTAGE_ACTION = re.compile(r"^/api/outages/(\d+)/(ack|postmortem)$")
 _OUTAGE_ITEM = re.compile(r"^/api/outages/(\d+)$")
 _DEVICE_ITEM = re.compile(r"^/api/devices/(\d+)$")
 _DEVICE_MAINT = re.compile(r"^/api/devices/(\d+)/maintenance$")
+_DEVICE_LINKS = re.compile(r"^/api/devices/(\d+)/links$")
+_DEVICE_LINK_ITEM = re.compile(r"^/api/devices/(\d+)/links/(\d+)$")
 _WORKER_ITEM = re.compile(r"^/api/workers/(\d+)$")
 
 # API endpoints reachable without a valid session (the login flow itself). Every
@@ -348,6 +350,12 @@ class Handler(BaseHTTPRequestHandler):
                 ok = services.set_maintenance(int(mm.group(1)), on, CONFIG)
                 return self._send_json({"ok": ok, "maintenance": on}, 200 if ok else 404)
 
+            ml = _DEVICE_LINKS.match(path)     # add a backup parent edge
+            if ml:
+                res = services.add_backup_link(
+                    int(ml.group(1)), int(body.get("parent_id") or 0), CONFIG)
+                return self._send_json(res, 200 if res.get("ok") else 422)
+
             m = _OUTAGE_ACTION.match(path)
             if not m:
                 return self._error(404, "no such endpoint")
@@ -411,6 +419,11 @@ class Handler(BaseHTTPRequestHandler):
             mw = _WORKER_ITEM.match(path)
             if mw:
                 res = services.delete_worker(int(mw.group(1)), CONFIG)
+                return self._send_json(res, 200 if res.get("ok") else 404)
+            ml = _DEVICE_LINK_ITEM.match(path)   # remove a backup parent edge
+            if ml:
+                res = services.remove_backup_link(
+                    int(ml.group(1)), int(ml.group(2)), CONFIG)
                 return self._send_json(res, 200 if res.get("ok") else 404)
             mo = _OUTAGE_ITEM.match(path)
             if mo:  # dismiss a recovered outage without logging a post-mortem

@@ -466,6 +466,7 @@
       </div>
       <div class="flex items-center gap-3 shrink-0">
         ${rollup}
+        ${n.on_backup ? `<span title="Primary uplink down — running on a backup path. Redundancy is gone." class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("hub", { size: 12 })} on backup</span>` : ""}
         ${n.maintenance ? `<span class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("pause_circle", { size: 12 })} maintenance</span>` : ""}
         <div class="text-right hidden sm:block"><p class="font-mono-data ${pctColor}">${fmtPct(n.uptime_pct)}</p></div>
         <div class="flex items-center gap-1.5">
@@ -646,6 +647,15 @@
         ${field("Type", "device_type", d.device_type, { options: typeOpts })}
         ${field("Region", "region", d.region, { placeholder: "village / area" })}
         ${field("Parent node", "parent_device_id", d.parent_device_id, { options: parentOpts, full: true })}
+        ${isEdit ? `
+        <div class="sm:col-span-2 space-y-2">
+          <label class="font-label-xs text-label-xs text-on-surface-variant flex items-center gap-1">${icon("hub", { size: 13 })} Backup parents <span class="text-outline">— redundant uplinks (on-backup alerting)</span></label>
+          <div data-backup-list class="flex flex-col gap-1.5"></div>
+          <div class="flex items-center gap-2">
+            <select data-backup-select class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary appearance-none flex-1"></select>
+            <button type="button" data-backup-add class="inline-flex items-center justify-center gap-1 h-9 text-primary border border-outline-variant hover:bg-surface-container-high font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("add", { size: 16 })} Add</button>
+          </div>
+        </div>` : ""}
         <div class="sm:col-span-2 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 mt-1 border-t border-outline-variant">
           <div class="flex items-center gap-2">${isEdit ? `<button type="button" data-delete class="inline-flex items-center justify-center gap-1.5 h-9 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("delete", { size: 16 })} Delete</button>
             <button type="button" data-maint class="inline-flex items-center justify-center gap-1.5 h-9 ${d.maintenance ? "text-primary border-primary/40 bg-primary/10" : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high"} border font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("pause_circle", { size: 16 })} ${d.maintenance ? "Resume" : "Maintenance"}</button>` : ""}</div>
@@ -698,6 +708,62 @@
       }
       await saveDevice(payload);
     });
+
+    // --- backup parents (redundant uplinks) — edit mode only ----------------
+    const backupList = overlay.querySelector("[data-backup-list]");
+    if (backupList) {
+      let backups = (d.backup_parents || []).slice();   // [{id, name}]
+      const select = overlay.querySelector("[data-backup-select]");
+      const addBtn = overlay.querySelector("[data-backup-add]");
+      const nameOf = (id) => (devices.find((x) => x.id === id) || {}).name || `#${id}`;
+
+      function renderBackups() {
+        backupList.innerHTML = backups.length
+          ? backups.map((b) => `<div class="flex items-center justify-between gap-2 bg-surface border border-outline-variant rounded-md px-3 py-1.5">
+              <span class="font-label-md text-label-md text-primary truncate flex items-center gap-1.5">${icon("hub", { size: 14, cls: "text-amber-400" })} ${esc(b.name)}</span>
+              <button type="button" data-backup-remove="${b.id}" title="Remove backup link" class="text-on-surface-variant hover:text-error p-1 rounded-full hover:bg-error/10">${icon("close", { size: 16 })}</button></div>`).join("")
+          : `<p class="font-label-xs text-label-xs text-outline">No backup uplinks — this node has a single path to the core.</p>`;
+        // candidates: every other active node except self, the current primary, and
+        // nodes already wired as a backup.
+        const primaryId = Number(overlay.querySelector('[data-field="parent_device_id"]').value) || null;
+        const taken = new Set([d.id, primaryId, ...backups.map((b) => b.id)]);
+        const opts = devices.filter((x) => !taken.has(x.id));
+        select.innerHTML = opts.length
+          ? [`<option value="">Add a backup parent…</option>`].concat(
+              opts.map((x) => `<option value="${x.id}">${esc(x.name)} (#${x.id})</option>`)).join("")
+          : `<option value="">No eligible nodes</option>`;
+        select.disabled = !opts.length;
+        addBtn.disabled = !opts.length;
+      }
+
+      backupList.addEventListener("click", async (ev) => {
+        const btn = ev.target.closest("[data-backup-remove]");
+        if (!btn) return;
+        const pid = Number(btn.getAttribute("data-backup-remove"));
+        btn.disabled = true;
+        const res = await sendJSON("DELETE", `/api/devices/${d.id}/links/${pid}`);
+        if (res.ok && res.data.ok) {
+          backups = backups.filter((b) => b.id !== pid);
+          renderBackups(); toast("Backup link removed"); onDone();
+        } else { toast(res.data.error || res.data.reason || "Couldn't remove link", "error"); btn.disabled = false; }
+      });
+
+      addBtn.addEventListener("click", async () => {
+        const pid = Number(select.value);
+        if (!pid) return;
+        addBtn.disabled = true;
+        const res = await sendJSON("POST", `/api/devices/${d.id}/links`, { parent_id: pid });
+        if (res.ok && res.data.ok) {
+          backups.push({ id: pid, name: nameOf(pid) });
+          renderBackups(); toast("Backup link added"); onDone();
+        } else { toast(res.data.error || res.data.reason || "Couldn't add link", "error"); addBtn.disabled = false; }
+      });
+
+      // the candidate list depends on the chosen primary, so refresh when it changes.
+      const primarySel = overlay.querySelector('[data-field="parent_device_id"]');
+      if (primarySel) primarySel.addEventListener("change", renderBackups);
+      renderBackups();
+    }
 
     const maintBtn = overlay.querySelector("[data-maint]");
     if (maintBtn) {

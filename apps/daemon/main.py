@@ -292,6 +292,14 @@ async def run_cycle(
         dispatcher.perf_sweep(ts)
     except Exception:
         log.exception("perf sweep failed; continuing")
+    # On-backup signal (graph topology): persist the badge + page the operator on a
+    # primary→backup failover edge. Uses the engine's full-pass redundancy map but the
+    # FINAL states (post fast-confirm) so a node that confirmed hard DOWN never shows
+    # on-backup. Isolated like the perf sweep — a hiccup never sinks the cycle.
+    try:
+        dispatcher.redundancy_sweep(result.redundancy, states, ts)
+    except Exception:
+        log.exception("redundancy sweep failed; continuing")
     return events
 
 

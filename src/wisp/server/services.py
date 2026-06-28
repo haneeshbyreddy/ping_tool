@@ -143,6 +143,9 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
         ).fetchall()
         topo = conn.execute(
             "SELECT id, name, parent_device_id FROM devices WHERE is_active=1").fetchall()
+        backup_edges = conn.execute(
+            "SELECT child_id, parent_id FROM device_links"
+            " WHERE is_active=1 AND kind='backup'").fetchall()
         states = latest_states(conn)
 
         # Who was on duty (operators marked present) on each outage's *start* day —
@@ -165,27 +168,41 @@ def triage_outages(cfg: Config = CONFIG) -> list[dict]:
     # suppressed (it gets no card of its own), so the operator can't see who else is
     # affected. Attribute each UNREACHABLE node to its nearest DOWN ancestor (root
     # cause) and surface those names on that parent's card.
-    parent_of = {r["id"]: r["parent_device_id"] for r in topo}
+    # Every parent edge (primary + active backups), so attribution follows ALL paths:
+    # a child is dragged UNREACHABLE only when its whole upstream is dead, and the blast
+    # radius is credited to each nearest DOWN ancestor it sits behind.
+    parents_of: dict[int, list[int]] = {}
+    for r in topo:
+        if r["parent_device_id"] is not None:
+            parents_of.setdefault(r["id"], []).append(r["parent_device_id"])
+    for e in backup_edges:
+        parents_of.setdefault(e["child_id"], []).append(e["parent_id"])
     name_of = {r["id"]: r["name"] for r in topo}
 
-    def _culprit(node_id: int) -> int | None:
+    def _culprits(node_id: int) -> set[int]:
+        """Nearest DOWN ancestor(s) of an UNREACHABLE node: walk UP through every parent
+        that is itself UNREACHABLE; the first DOWN node on each path is a culprit. A
+        healthy/degraded ancestor breaks that path's suppression chain. With a single
+        parent this returns {the down parent}, exactly as before."""
+        found: set[int] = set()
         seen: set[int] = set()
-        cur = parent_of.get(node_id)
-        while cur is not None and cur not in seen:
+        stack = list(parents_of.get(node_id, []))
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
             seen.add(cur)
             st = states.get(cur)
             if st == DOWN:
-                return cur
-            if st != UNREACHABLE:
-                return None  # a healthy/degraded ancestor breaks the suppression chain
-            cur = parent_of.get(cur)
-        return None
+                found.add(cur)
+            elif st == UNREACHABLE:
+                stack.extend(parents_of.get(cur, []))
+        return found
 
     affected_by: dict[int, list[str]] = {}
     for nid, st in states.items():
         if st == UNREACHABLE:
-            culprit = _culprit(nid)
-            if culprit is not None:
+            for culprit in _culprits(nid):
                 affected_by.setdefault(culprit, []).append(name_of.get(nid, f"#{nid}"))
 
     items: list[dict] = []
@@ -236,8 +253,10 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             " d.parent_device_id, d.maintenance, pf.degraded AS perf_degraded,"
             " pf.metric AS perf_metric,"
             " pf.baseline_ms AS perf_baseline, pf.current_ms AS perf_current,"
-            " pf.since AS perf_since"
+            " pf.since AS perf_since,"
+            " rd.on_backup AS on_backup, rd.primary_down_since AS backup_since"
             " FROM devices d LEFT JOIN device_perf pf ON pf.device_id = d.id"
+            " LEFT JOIN device_redundancy rd ON rd.device_id = d.id"
             " WHERE d.is_active=1 ORDER BY d.id"
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
@@ -271,6 +290,10 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
             "state_label": _state_label(state),
             "uptime_pct": round(pct, 2),
             "down_label": _fmt_dur(down.get(d["id"], 0.0)),
+            # Running on a backup path (primary uplink down, backup carrying): a soft
+            # "redundancy gone" badge. Cleared if the node itself is hard DOWN.
+            "on_backup": bool(d["on_backup"]) and state not in (DOWN, UNREACHABLE),
+            "backup_since": d["backup_since"] if d["on_backup"] else None,
             # Soft "slow link" badge (vs the link's own baseline); None unless degraded.
             "perf": ({
                 "metric": d["perf_metric"],
@@ -789,8 +812,9 @@ def check_reachable(ip: str, cfg: Config = CONFIG) -> dict:
 
 
 def list_devices(cfg: Config = CONFIG) -> list[dict]:
-    """Full device records (every editable column) + each node's child count, for
-    the Nodes-page inventory editor and the parent-node dropdown."""
+    """Full device records (every editable column) + each node's child count + its
+    BACKUP parent edges, for the Nodes-page inventory editor and the parent-node
+    dropdown."""
     with connect(cfg) as conn:
         rows = conn.execute(
             "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
@@ -800,13 +824,88 @@ def list_devices(cfg: Config = CONFIG) -> list[dict]:
             " FROM devices d LEFT JOIN devices p ON p.id = d.parent_device_id"
             " WHERE d.is_active = 1 ORDER BY d.id"
         ).fetchall()
-    return [dict(r) for r in rows]
+        edges = conn.execute(
+            "SELECT l.child_id, l.parent_id, p.name AS parent_name"
+            " FROM device_links l JOIN devices p ON p.id = l.parent_id"
+            " WHERE l.is_active=1 AND l.kind='backup' AND p.is_active=1"
+            " ORDER BY p.name"
+        ).fetchall()
+    backups_by_child: dict[int, list[dict]] = {}
+    for e in edges:
+        backups_by_child.setdefault(e["child_id"], []).append(
+            {"id": e["parent_id"], "name": e["parent_name"]})
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["backup_parents"] = backups_by_child.get(r["id"], [])
+        out.append(d)
+    return out
+
+
+def add_backup_link(child_id: int, parent_id: int, cfg: Config = CONFIG) -> dict:
+    """Add a BACKUP parent edge (child runs a redundant uplink to `parent_id`). Validated
+    like the primary parent: both nodes must exist and be active, can't be the same node
+    or the existing primary, can't duplicate an edge, and must not close a topology loop
+    over the FULL edge set. Returns {ok}; raises DeviceError (422) on a bad edge."""
+    with connect(cfg) as conn:
+        meta = {r["id"]: r for r in conn.execute(
+            "SELECT id, parent_device_id FROM devices WHERE is_active=1")}
+        if child_id not in meta:
+            raise DeviceError("node not found")
+        if parent_id not in meta:
+            raise DeviceError("backup parent does not exist")
+        if parent_id == child_id:
+            raise DeviceError("a node can't be its own backup parent")
+        if meta[child_id]["parent_device_id"] == parent_id:
+            raise DeviceError("that node is already the primary parent")
+        parents = {cid: r["parent_device_id"] for cid, r in meta.items()}
+        backups = _backup_map(conn)
+        if parent_id in backups.get(child_id, set()):
+            raise DeviceError("that backup link already exists")
+        # cycle check: walk UP from the proposed parent over the existing edge set;
+        # reaching the child means the new edge would close a loop.
+        edges_of = _combined_edges(parents, backups)
+        stack, seen = [parent_id], set()
+        while stack:
+            cur = stack.pop()
+            if cur == child_id:
+                raise DeviceError("that backup link would create a topology loop")
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(edges_of.get(cur, ()))
+
+    def _do():
+        with connect(cfg) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO device_links (child_id, parent_id, kind)"
+                " VALUES (?,?,'backup')", (child_id, parent_id))
+            conn.commit()
+            return True
+    write_with_retry(_do)
+    return {"ok": True}
+
+
+def remove_backup_link(child_id: int, parent_id: int, cfg: Config = CONFIG) -> dict:
+    """Drop a BACKUP parent edge. Returns {ok, reason}."""
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "DELETE FROM device_links WHERE child_id=? AND parent_id=? AND kind='backup'",
+                (child_id, parent_id))
+            conn.commit()
+            return cur.rowcount > 0
+    ok = bool(write_with_retry(_do))
+    return {"ok": ok} if ok else {"ok": False, "reason": "backup link not found"}
 
 
 def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
-                          device_id: int | None) -> dict:
+                          device_id: int | None,
+                          backups: dict[int, set[int]] | None = None) -> dict:
     """Validate + normalise a device create/update payload. Raises DeviceError
-    with a human message on the first problem found."""
+    with a human message on the first problem found. `backups` (child -> parent ids,
+    from device_links) lets the cycle check span the FULL edge set, not just the
+    primary chain."""
     def _str(key, *, required=False, default=None):
         return _payload_str(data, key, DeviceError, required=required, default=default)
 
@@ -835,16 +934,20 @@ def _clean_device_payload(data: dict, *, parents: dict[int, int | None],
             raise DeviceError("parent node does not exist")
         if parent_id == device_id:
             raise DeviceError("a node can't be its own parent")
-        # walk the parent chain to reject cycles
-        cur = parent_id
-        seen = set()
-        while cur is not None:
+        # Reject cycles over the FULL edge set (primary + backup links), not just the
+        # primary chain: walk UP from the proposed parent following every parent edge;
+        # if we can reach this device, the new edge would close a topology loop.
+        edges_of = _combined_edges(parents, backups)
+        stack = [parent_id]
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
             if cur == device_id:
                 raise DeviceError("that parent would create a topology loop")
             if cur in seen:
-                break
+                continue
             seen.add(cur)
-            cur = parents.get(cur)
+            stack.extend(edges_of.get(cur, ()))
 
     return {
         "name": name, "ip_address": ip_address, "device_type": device_type,
@@ -858,11 +961,36 @@ def _parent_map(conn) -> dict[int, int | None]:
             for r in conn.execute("SELECT id, parent_device_id FROM devices")}
 
 
+def _backup_map(conn) -> dict[int, set[int]]:
+    """child_id -> set of BACKUP parent ids (active device_links edges)."""
+    out: dict[int, set[int]] = {}
+    for r in conn.execute(
+        "SELECT child_id, parent_id FROM device_links WHERE is_active=1 AND kind='backup'"
+    ):
+        out.setdefault(r["child_id"], set()).add(r["parent_id"])
+    return out
+
+
+def _combined_edges(parents: dict[int, int | None],
+                    backups: dict[int, set[int]] | None) -> dict[int, set[int]]:
+    """child_id -> all parent ids (primary + backups), for DAG cycle detection."""
+    edges: dict[int, set[int]] = {}
+    for cid, pid in parents.items():
+        s: set[int] = set()
+        if pid is not None:
+            s.add(pid)
+        if backups:
+            s |= backups.get(cid, set())
+        edges[cid] = s
+    return edges
+
+
 def create_device(data: dict, cfg: Config = CONFIG) -> int:
     """Insert a new device (UI 'Add node'). Returns the new id. Raises DeviceError
     on bad input."""
     with connect(cfg) as conn:
-        clean = _clean_device_payload(data, parents=_parent_map(conn), device_id=None)
+        clean = _clean_device_payload(data, parents=_parent_map(conn),
+                                      device_id=None, backups=_backup_map(conn))
 
     def _do():
         with connect(cfg) as conn:
@@ -883,7 +1011,8 @@ def update_device(device_id: int, data: dict, cfg: Config = CONFIG) -> bool:
             "SELECT 1 FROM devices WHERE id=? AND is_active=1", (device_id,)).fetchone()
         if not exists:
             return False
-        clean = _clean_device_payload(data, parents=_parent_map(conn), device_id=device_id)
+        clean = _clean_device_payload(data, parents=_parent_map(conn),
+                                      device_id=device_id, backups=_backup_map(conn))
 
     def _do():
         with connect(cfg) as conn:
@@ -945,6 +1074,11 @@ def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
                 conn.execute("DELETE FROM poll_results WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM poll_rollups WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM device_perf WHERE device_id=?", (device_id,))
+                # device_links REFERENCES devices(id) in BOTH columns — clear edges where
+                # this node is the child OR a (backup) parent before the device row.
+                conn.execute("DELETE FROM device_links WHERE child_id=? OR parent_id=?",
+                             (device_id, device_id))
+                conn.execute("DELETE FROM device_redundancy WHERE device_id=?", (device_id,))
                 conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
             return True
     write_with_retry(_do)

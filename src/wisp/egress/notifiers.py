@@ -449,6 +449,76 @@ class AlertDispatcher:
                              f"perf {'degraded' if v.degraded else 'recovered'}: {v.reason}",
                              ts)
 
+    # -- redundancy sweep (on-backup soft signal) --
+    def redundancy_sweep(self, redundancy: dict[int, bool], states: dict[int, str],
+                         ts: str) -> None:
+        """Persist the on-backup badge and, on an enter/leave edge, page the OPERATOR
+        once. Mirrors perf_sweep's discipline: badge always written (device_redundancy),
+        page only on a transition, restart-safe (prior on_backup read back from the DB so
+        a restart mid-failover never re-pages), and kept entirely off the outage/
+        escalation ladder (decision #1: on-backup is NOT louder).
+
+        `redundancy` (device_id -> on_backup) comes from the engine's full pass; `states`
+        is the cycle's FINAL committed states. A node that has itself gone DOWN can never
+        be "on backup" — its outage owns the story — so we force it off the badge here
+        (the engine computed on_backup from the soft full-pass state, before fast-confirm
+        may have driven it hard DOWN), and clear it *silently* (no operator page)."""
+        cfg = self.cfg
+        for dev_id, on_backup in redundancy.items():
+            dev = self.engine.meta.get(dev_id)
+            if dev is None:
+                continue
+            node_down = states.get(dev_id) in DOWN_FAMILY
+            eff = bool(on_backup) and not node_down
+
+            with connect(cfg) as conn:
+                prior = conn.execute(
+                    "SELECT on_backup, primary_down_since FROM device_redundancy"
+                    " WHERE device_id=?", (dev_id,),
+                ).fetchone()
+            was = bool(prior["on_backup"]) if prior else False
+            # `since` marks when the current on-backup episode began (held across holds).
+            since = (ts if (eff and not was)
+                     else (prior["primary_down_since"] if (prior and eff) else None))
+            self._write_redundancy(dev_id, eff, since, ts)
+
+            if eff == was:
+                continue  # no edge — badge refreshed, nobody paged
+            if eff:
+                if cfg.backup_alerts:
+                    self._publish(
+                        "operator",
+                        f"🔁 On backup — {dev.name} ({dev.region})",
+                        f"{dev.name} ({dev.ip_address}) lost its primary uplink and is "
+                        f"running on a backup path. It's still up, but redundancy is gone "
+                        f"— one more failure is an outage.", 3)
+                self._record(dev_id, self.topic_operator, "sent", "ON_BACKUP", ts)
+            elif not node_down:
+                # left on-backup because the primary path came back (not because the node
+                # itself died) — a clean "redundancy restored" heads-up.
+                if cfg.backup_alerts:
+                    self._publish(
+                        "operator",
+                        f"✅ Primary restored — {dev.name} ({dev.region})",
+                        "Primary uplink is back; running on the primary path again.", 3)
+                self._record(dev_id, self.topic_operator, "sent", "BACKUP_CLEARED", ts)
+            # else: node_down -> clear silently; the outage owns the alarm.
+
+    def _write_redundancy(self, device_id, on_backup, since, ts) -> None:
+        """Upsert one device_redundancy row (PK device_id) — the on-backup badge state."""
+        def _do():
+            with connect(self.cfg) as conn:
+                conn.execute(
+                    "INSERT INTO device_redundancy (device_id, on_backup,"
+                    " primary_down_since, updated_at) VALUES (?,?,?,?)"
+                    " ON CONFLICT(device_id) DO UPDATE SET on_backup=excluded.on_backup,"
+                    " primary_down_since=excluded.primary_down_since,"
+                    " updated_at=excluded.updated_at",
+                    (device_id, 1 if on_backup else 0, since, ts),
+                )
+                conn.commit()
+        write_with_retry(_do)
+
     def _write_perf(self, device_id, degraded, metric, baseline_ms,
                     current_ms, since, ts) -> None:
         """Upsert one device_perf row (PK device_id) — the dashboard badge state."""

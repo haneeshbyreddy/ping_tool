@@ -193,8 +193,25 @@ class BetweenCycleWatch(unittest.TestCase):
     Verifies that _between_cycle_watch pages a device that goes down AFTER the
     full poll — i.e. the path that fast-confirm alone cannot cover."""
 
+    def setUp(self):
+        # _between_cycle_watch persists poll_results (FK to devices), so back it with a
+        # migrated temp DB holding device 1 — never the shared default DB.
+        import tempfile
+        from pathlib import Path
+        from wisp.database.client import connect, migrate
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dbpath = Path(self.tmp.name) / "t.db"
+        migrate(Config(db_path=self.dbpath))
+        with connect(Config(db_path=self.dbpath)) as c:
+            c.execute("INSERT INTO devices (id,name,ip_address,region) VALUES (1,'d1','a','R')")
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def _cfg(self, **kw):
         return Config(
+            db_path=self.dbpath,
             down_consecutive=3,
             retry_interval_s=0.001,
             canary_ip="1.1.1.1",

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 from wisp.config import Config
 from wisp.ingress.probers import PingResult
 from wisp.core.state_machine import (
+    BACKUP,
     DEGRADED,
     DOWN,
     UNREACHABLE,
@@ -21,6 +22,7 @@ from wisp.core.state_machine import (
     MonitorEngine,
     OutageOpened,
     OutageResolved,
+    ParentEdge,
     UplinkDown,
     UplinkRestored,
 )
@@ -176,6 +178,96 @@ class Topology(unittest.TestCase):
         opened = [e for e in r.events if isinstance(e, OutageOpened)]
         kinds = {e.device_id: e.state for e in opened}
         self.assertEqual(kinds.get(2), UNREACHABLE)
+
+
+class GraphTopology(unittest.TestCase):
+    """Phase 9 Part A — backup lines. The suppression override goes from single-parent
+    to all-parents-down, and a new on-backup signal falls out of the committed parent
+    states. Single-parent behaviour is preserved byte-for-byte (the back-compat anchor
+    is the existing Topology test above)."""
+
+    @staticmethod
+    def _backup(parent_id):
+        return (ParentEdge(parent_id, BACKUP),)
+
+    def test_multi_parent_topological_order(self):
+        # Diamond: A(1) root; B(2) & C(3) under A; D(4) primary B, backup C.
+        a = solo_device(id=1, ip_address="a", parent_device_id=None)
+        b = solo_device(id=2, ip_address="b", parent_device_id=1)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1)
+        d = solo_device(id=4, ip_address="d4", parent_device_id=2, parents=self._backup(3))
+        order = MonitorEngine._topological_order([a, b, c, d])
+        # D must come after BOTH its parents (B and C), A before everyone.
+        self.assertLess(order.index(1), order.index(2))
+        self.assertLess(order.index(2), order.index(4))
+        self.assertLess(order.index(3), order.index(4))
+
+    def test_cycle_is_handled_best_effort(self):
+        # 1 -> 2 -> 1 via a backup edge: no crash, all nodes emitted.
+        a = solo_device(id=1, ip_address="a", parent_device_id=2)
+        b = solo_device(id=2, ip_address="b", parent_device_id=None, parents=self._backup(1))
+        order = MonitorEngine._topological_order([a, b])
+        self.assertEqual(set(order), {1, 2})
+
+    def _down(self, eng, ips, n=3):
+        r = None
+        for _ in range(n):
+            r = feed(eng, {ip: DEAD_S(ip) for ip in ips})
+        return r
+
+    def test_one_parent_alive_keeps_child_down_not_unreachable(self):
+        # Child has primary P(1, down) and backup Q(2, UP). Child won't answer -> a real
+        # fault (the backup path works, yet the node is dark), so it pages as DOWN.
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = None
+        for _ in range(3):
+            r = feed(eng, {"p": DEAD_S("p"), "q": UP_S("q"), "c": DEAD_S("c")})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], DOWN)           # genuine DOWN, NOT suppressed
+        self.assertNotEqual(r.states[3], UNREACHABLE)
+
+    def test_all_parents_down_suppresses_child(self):
+        # Both primary P(1) and backup Q(2) down -> child is topology-suppressed.
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = self._down(eng, ["p", "q", "c"])
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], UNREACHABLE)
+
+    def test_on_backup_enter_and_leave(self):
+        # Primary P(1) goes down while backup Q(2) stays up; child C(3) keeps pinging.
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = None
+        for _ in range(3):
+            r = feed(eng, {"p": DEAD_S("p"), "q": UP_S("q"), "c": UP_S("c")})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], UP)              # child itself is fine
+        self.assertTrue(r.redundancy[3])               # ...but running on backup
+        # only the redundancy-capable node appears in the map
+        self.assertNotIn(1, r.redundancy)
+        self.assertNotIn(2, r.redundancy)
+        # primary recovers -> leaves on-backup
+        for _ in range(2):
+            r = feed(eng, {"p": UP_S("p"), "q": UP_S("q"), "c": UP_S("c")})
+        self.assertEqual(r.states[1], UP)
+        self.assertFalse(r.redundancy[3])
+
+    def test_backup_parent_is_probed_gently(self):
+        # A node that is ONLY a backup parent still backhauls traffic -> gentle infra cadence.
+        cfg = Config(pings_per_poll=5, pings_per_poll_infra=2, canary_ip="1.1.1.1")
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)         # backup parent only
+        c = solo_device(id=3, ip_address="c", parent_device_id=None, parents=(ParentEdge(2, BACKUP),))
+        plan = MonitorEngine([q, c], cfg).probe_plan()
+        self.assertEqual(plan["q"], 2)   # backup parent -> gentle
+        self.assertEqual(plan["c"], 5)   # leaf -> full
 
 
 class CanaryFreeze(unittest.TestCase):

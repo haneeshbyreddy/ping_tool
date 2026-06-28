@@ -8,8 +8,9 @@ work, and open questions).
 
 ## Status
 
-Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard) **and Phase 8**
-(team directory, PIN gate, monitor lifecycle) — 122 tests. Config is env-var only (no
+Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
+(team directory, PIN gate, monitor lifecycle), and **Phase 9 Part A** (graph topology /
+backup lines + the on-backup signal) — 139 tests. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -123,6 +124,48 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   probe). `device_perf` (migration 0008) is the badge state; `poll_results.jitter_ms`
   (0007) feeds the baseline. `services.nodes_list` exposes `perf` (None unless degraded).
   Tests: `unit/test_baseline`, `integration/test_perf`.
+
+## Graph topology — backup lines + the on-backup signal (Phase 9 Part A)
+
+- **Two sources of truth, on purpose.** `devices.parent_device_id` stays the denormalized
+  **PRIMARY** parent (every existing tree/topo/`_culprit` query keeps working unchanged);
+  `device_links` (migration 0011) carries only the **extra redundancy edges** (`kind='backup'`,
+  `is_active`). `DeviceMeta.parents` loads *only* the backup edges; `DeviceMeta.effective_parents()`
+  combines primary + backups. There is **no primary backfill** in the migration — the primary
+  already lives on the device row, so duplicating it would just create rows nothing reads. Don't
+  start reading the primary out of `device_links`.
+- **Suppression is now all-parents-down, not single-parent.** `process_cycle` relabels a child
+  `UNREACHABLE` only when **every** monitored parent (primary OR backup) ∈ `DOWN_FAMILY`. If **any**
+  parent is alive yet the child won't answer, it's a genuine fault → stays `DOWN` and pages. With
+  exactly one parent this is byte-for-byte the old behaviour (the back-compat anchor is
+  `test_state_machine.Topology`). `_topological_order` is **Kahn's by in-degree** over the full edge
+  set (a node lands after *all* parents); cycles fall out as leftovers and are appended by id.
+  `probe_plan` treats a node as gentle-infra if it's **any** parent_id in the edge set (a backup-only
+  parent still backhauls).
+- **On-backup is computed in the engine, not a DB sweep.** `CycleResult.redundancy: dict[int,bool]`
+  (full pass only; `{}` under canary-freeze and in the subset/confirmation pass) flags each
+  redundancy-capable node where the **primary parent is down, a backup parent is alive, and the node
+  itself still pings**. The daemon persists the badge + pages via `AlertDispatcher.redundancy_sweep(
+  redundancy, states, ts)` — note it passes the **FINAL** states (post fast-confirm), so a node that
+  confirmed hard DOWN is forced off the badge (its outage owns the story) and cleared **silently**.
+- **redundancy_sweep clones the perf-tier discipline (decision #1: on-backup is NOT louder).** Badge
+  always written to `device_redundancy` (PK `device_id`, `on_backup`, `primary_down_since`); a single
+  **operator** page only on the enter/leave **edge**; restart-safe (prior `on_backup` rehydrated from
+  the table so a restart mid-failover never re-pages); **never** opens an outage or an escalation row.
+  `WISP_BACKUP_ALERTS=0` keeps the badge, mutes the page. `services.nodes_list` exposes `on_backup`
+  (suppressed in the view when the node is hard DOWN); `list_devices` exposes `backup_parents`.
+- **Edge CRUD + FK discipline.** `services.add_backup_link`/`remove_backup_link` (API
+  `POST`/`DELETE /api/devices/{id}/links[/{parent_id}]`): a backup edge can't be the node itself, its
+  existing primary, a duplicate, or close a loop (cycle check over the **combined** edge set, same
+  walk `_clean_device_payload` now uses via `_combined_edges`). `device_links` REFERENCES `devices(id)`
+  in **both** columns, so `delete_device` clears rows where the device is `child_id` **or** `parent_id`
+  (plus `device_redundancy`) before the device row. Blast radius (`triage_outages._culprits`) walks
+  **all** parents now — an UNREACHABLE node is credited to each nearest DOWN ancestor across every path.
+- **Tests:** `unit/test_state_machine.GraphTopology` (multi-parent order, all-parents-down vs
+  one-parent-alive, on-backup enter/leave, backup-parent gentle probing),
+  `integration/test_redundancy` (sweep edge page, badge, restart no-repage, node-down silent clear,
+  alerts gate, no-outage/no-escalation), `integration/test_api.BackupLinkTest` (edge CRUD + cycle +
+  FK-safe delete + diamond `_culprit` + on-backup badge).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -278,7 +321,8 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   poll/outage/alert history in one txn but is **blocked (409) if it still has child nodes**.
   **`delete_device` must delete from *every* table that `REFERENCES devices(id)` before the
   device row** — currently `escalations`, `alert_log`, `outages`, `poll_results`,
-  `poll_rollups`, `device_perf` — or `foreign_keys=ON` rejects the final DELETE with
+  `poll_rollups`, `device_perf`, `device_links` (**both** `child_id` and `parent_id`),
+  `device_redundancy` — or `foreign_keys=ON` rejects the final DELETE with
   "FOREIGN KEY constraint failed". Adding a new devices-FK table? Add its delete here too.
   Added/removed nodes start/stop being monitored automatically: the daemon snapshots the device
   set at start and rebuilds its engine in-process when it changes — within one poll cycle (see
@@ -313,7 +357,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (122 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (139 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
 the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`
