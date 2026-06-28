@@ -9,8 +9,10 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
-(team directory, PIN gate, monitor lifecycle), and **Phase 9 Part A** (graph topology /
-backup lines + the on-backup signal) — 139 tests. Config is env-var only (no
+(team directory, PIN gate, monitor lifecycle), and **Phase 9** — Part A (graph topology /
+backup lines + the on-backup signal) and Part B (SNMP port status) — 158 tests. The
+daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
+ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
 only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
@@ -167,6 +169,47 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   alerts gate, no-outage/no-escalation), `integration/test_api.BackupLinkTest` (edge CRUD + cycle +
   FK-safe delete + diamond `_culprit` + on-backup badge).
 
+## SNMP port status (Phase 9 Part B)
+
+- **A sibling ingress, NOT a Prober impl.** `Prober.ping(ip)` is one reading per IP; a switch
+  has N ports, so `ingress/snmp.py` is a parallel poller (`SnmpPoller` protocol +
+  `build_snmp_poller`). The wire format is parsed by a **pure** `parse_if_table(varbinds)` — that
+  (plus `PortStatus.is_down`) is the boundary the tests exercise with hand-built rows; **no real
+  SNMP in the suite**, exactly like the recording-notifier double. `PysnmpPoller` lazy-imports
+  `pysnmp` (asyncio HLAPI, `mpModel=1` = v2c) so the dashboard + tests stay pure-stdlib; only the
+  daemon venv gains `pysnmp` (in `requirements.txt`). Scope is **IF-MIB oper/admin only** — no
+  CPU/mem/temp. `snmp_community` is the **first per-device credential** in the DB (only the PIN hash
+  was before); low sensitivity (read-only v2c on a mgmt VLAN) but a conscious change.
+- **Own slow cadence, isolated.** The daemon runs `snmp_cycle` on a timed guard
+  (`WISP_SNMP_INTERVAL_S`, default 90s; 0 disables) next to the prune/rollup guards, skipped for
+  finite `--cycles` runs. Each switch walk is wrapped in its own try/except — **a dead/blocked switch
+  or a broken pysnmp must never sink the ICMP cycle.** `build_snmp_poller`/`PortMonitor` are built
+  once; `load_snmp_targets` is re-read each pass so a UI enable/disable applies with no restart.
+- **`egress/ports.PortMonitor` is the SNMP `AlertDispatcher`.** `sync_device(device_id, ports, ts)`
+  upserts every port into `switch_ports` (discovery: a new port lands `monitored=0`; the operator
+  ticks which to watch — you do NOT alarm on every access port). Operator-set fields (`monitored`,
+  `feeds_device_id`) are never overwritten by a walk. **Flap suppression is in-row** (`down_streak`/
+  `alarm`/`alarm_since`), so it's restart-safe: a monitored port needs `WISP_SNMP_DOWN_CONSECUTIVE`
+  (default 2) consecutive `oper=down while admin=up` walks to alarm (`is_down`). **admin-down is
+  silent** (intentional shut). Edge-only operator page (operator-only, like perf/redundancy), gated
+  by `WISP_SNMP_ALERTS` (state always written).
+- **Folding (decision #3): a monitored port-down does NOT raise a competing alarm.** If the port has
+  a `feeds_device_id` and that device has an **open outage**, the port-down *enriches* it —
+  `_stamp_cause` sets `outages.root_cause` via `COALESCE` (never clobbers a post-mortem) with the
+  physical cause. If the fed device has **no** open outage it's a *leading indicator* heads-up (ICMP
+  still owns outages — SNMP never opens one). A monitored port with no `feeds_device_id` pages a
+  plain operator heads-up. Recovery is a single edge page.
+- **FK discipline.** `switch_ports` REFERENCES `devices(id)` in **both** `device_id` and
+  `feeds_device_id`, so `delete_device` clears `switch_ports WHERE device_id=? OR feeds_device_id=?`
+  before the device row. Services: `set_snmp_config`, `list_switch_ports`, `set_port_monitored`
+  (re-arms detection: resets streak/alarm), `set_port_feeds` (validates target). API:
+  `POST /api/devices/{id}/snmp`, `GET /api/devices/{id}/ports`, `POST /api/ports/{id}/monitored`,
+  `POST /api/ports/{id}/feeds`; the Nodes modal carries the SNMP config + a ports panel.
+- **Tests:** `unit/test_snmp` (parser + is_down), `integration/test_ports` (discovery, flap
+  suppression, admin-down silent, fold-into-outage, leading indicator opens no outage, recovery,
+  alerts gate), `integration/test_api.SnmpPortApiTest` (config/validation, targets, toggles, FK
+  delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
+
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
 - **One logical poller per DB.** Each daemon has its own in-memory FSM, so a second
@@ -322,8 +365,9 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   **`delete_device` must delete from *every* table that `REFERENCES devices(id)` before the
   device row** — currently `escalations`, `alert_log`, `outages`, `poll_results`,
   `poll_rollups`, `device_perf`, `device_links` (**both** `child_id` and `parent_id`),
-  `device_redundancy` — or `foreign_keys=ON` rejects the final DELETE with
-  "FOREIGN KEY constraint failed". Adding a new devices-FK table? Add its delete here too.
+  `device_redundancy`, `switch_ports` (**both** `device_id` and `feeds_device_id`) — or
+  `foreign_keys=ON` rejects the final DELETE with "FOREIGN KEY constraint failed". Adding
+  a new devices-FK table? Add its delete here too.
   Added/removed nodes start/stop being monitored automatically: the daemon snapshots the device
   set at start and rebuilds its engine in-process when it changes — within one poll cycle (see
   "Config + device-set reload").
@@ -357,7 +401,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (139 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (158 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
 the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`

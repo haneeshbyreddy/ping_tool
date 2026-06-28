@@ -31,7 +31,9 @@ from wisp.database.client import connect, migrate, transaction, write_with_retry
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.core.rollup import roll_up
 from wisp.ingress.probers import PingResult, Prober, build_prober
+from wisp.ingress.snmp import SnmpPoller, build_snmp_poller, load_snmp_targets
 from wisp.egress.notifiers import AlertDispatcher, build_notifier
+from wisp.egress.ports import PortMonitor
 from wisp.core.state_machine import (
     DEGRADED,
     DOWN,
@@ -384,6 +386,29 @@ async def _between_cycle_watch(
             dispatcher.sweep(ts)
 
 
+async def snmp_cycle(poller: SnmpPoller, port_monitor: PortMonitor,
+                     cfg: Config = CONFIG) -> None:
+    """One SNMP pass: walk every snmp-enabled switch's ifTable and fold/alert monitored
+    port-downs. Each switch is isolated in its own try/except — a dead or blocked switch
+    (or a broken pysnmp) must NEVER sink the ICMP cycle. Runs on its own slow cadence
+    (WISP_SNMP_INTERVAL_S) since ports don't flap like radio links."""
+    for device_id, target in load_snmp_targets(cfg):
+        try:
+            ports = await poller.walk(target)
+        except Exception:
+            log.exception("SNMP walk failed for device %d (%s); continuing",
+                          device_id, target.ip)
+            continue
+        try:
+            for ev in port_monitor.sync_device(device_id, ports, _utc_now_iso()):
+                fold = (f" (folded into device {ev.folded_into}'s outage)"
+                        if ev.folded_into else "")
+                log.info("SNMP port %s %s on device %d%s",
+                         ev.port_label, ev.kind, device_id, fold)
+        except Exception:
+            log.exception("SNMP port sync failed for device %d; continuing", device_id)
+
+
 def _print_cycle(cycle: int, states: dict[int, str]) -> None:
     vals = list(states.values())
     print(
@@ -420,6 +445,11 @@ async def run_forever(
             raise SystemExit(2)
     engine = build_engine(cfg)
     dispatcher = AlertDispatcher(engine, build_notifier(cfg), cfg)
+    # SNMP port-status sibling ingress (graph topology Part B). Built once; targets are
+    # re-read each SNMP pass so a UI enable/disable applies without a restart. The
+    # PortMonitor only needs a notifier + cfg, so it survives a device-set rebuild.
+    snmp_poller = build_snmp_poller(cfg)
+    port_monitor = PortMonitor(build_notifier(cfg), cfg)
     print(
         f"monitoring {len(engine.meta)} devices every {interval}s "
         f"[prober={cfg.prober}, notifier={cfg.notifier}] (Ctrl-C to stop)"
@@ -438,6 +468,9 @@ async def run_forever(
     loop_clock = asyncio.get_running_loop().time
     next_prune = loop_clock()
     next_rollup = loop_clock()
+    # SNMP port walk: its own slow cadence, isolated like the prune/rollup guards (a
+    # broken walk never kills the monitor) and skipped for finite --cycles smoke runs.
+    next_snmp = loop_clock()
 
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
@@ -458,6 +491,13 @@ async def run_forever(
             except Exception:
                 log.exception("hourly rollup failed; continuing")
             next_rollup = loop_clock() + ROLLUP_EVERY_S
+        if (max_cycles is None and cfg.snmp_interval_s > 0
+                and loop_clock() >= next_snmp):
+            try:
+                await snmp_cycle(snmp_poller, port_monitor, cfg)
+            except Exception:
+                log.exception("SNMP cycle failed; continuing")
+            next_snmp = loop_clock() + cfg.snmp_interval_s
         # Device-set hot reload: rebuild the engine in-process when the active device
         # set changes (UI add/remove). build_engine rehydrates each FSM from the last
         # poll, so a rebuild never re-pages an open outage. (Skipped for finite runs.)

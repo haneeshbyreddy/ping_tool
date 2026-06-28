@@ -7,7 +7,8 @@ immediately — then re-pages the whole team (owner + operator + tech) every hou
 stays open, with the running duration, until it recovers.
 
 It polls with real ICMP and alerts over ntfy push. The dashboard + admin CLIs are pure
-stdlib; the **daemon** needs a small venv (`icmplib`/`httpx`) and the kernel ping group enabled.
+stdlib; the **daemon** needs a small venv (`icmplib`/`httpx`, plus `pysnmp` for the SNMP port
+ingress) and the kernel ping group enabled.
 See `plan.md` for the full design and `broadband-monitor-idea-doc` notes inside it.
 
 ## Quick start
@@ -141,6 +142,12 @@ run.sh                    # one-shot setup + run for both runtimes
   up, the dashboard badges it "on backup" and the operator gets a single heads-up page
   ("redundancy is gone — one more failure is an outage"). It never enters the outage /
   escalation ladder (`WISP_BACKUP_ALERTS=0` keeps the badge, mutes the page).
+- **SNMP port status** — for switches that speak SNMP (v2c), the daemon walks the IF-MIB
+  on its own slow cadence and watches the **operator-flagged uplink/infra ports**. A
+  monitored port going `oper=down` (while `admin=up`) is flap-suppressed, then — if that
+  port `feeds` a device with an open outage — **folds into that outage** as the physical
+  cause ("Port Gi0/2 → Tower B is down") instead of raising a competing alarm. ICMP stays
+  the outage owner; SNMP confirms/enriches. Enable per device + flag ports on the Nodes page.
 - **Post-mortem cause** — at resolution the operator records the confirmed root cause + notes
   (there is no automatic power-vs-link guess).
 - **Escalation is restart-safe** — timers live in the DB, not memory; a crash can't drop them.
@@ -168,6 +175,9 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_BACKUP_ALERTS` | `1` | `0` = keep the on-backup badge but mute the operator page |
+| `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = SNMP ingress off) |
+| `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks before a monitored port alarms |
+| `WISP_SNMP_ALERTS` | `1` | `0` = keep port state/badges but mute the operator page |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |

@@ -819,8 +819,10 @@ def list_devices(cfg: Config = CONFIG) -> list[dict]:
         rows = conn.execute(
             "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
             " d.is_active, d.maintenance, d.parent_device_id, d.technician_phone,"
+            " d.snmp_enabled, d.snmp_version, d.snmp_community, d.snmp_port,"
             " p.name AS parent_name,"
-            " (SELECT COUNT(*) FROM devices c WHERE c.parent_device_id = d.id) AS child_count"
+            " (SELECT COUNT(*) FROM devices c WHERE c.parent_device_id = d.id) AS child_count,"
+            " (SELECT COUNT(*) FROM switch_ports sp WHERE sp.device_id = d.id) AS port_count"
             " FROM devices d LEFT JOIN devices p ON p.id = d.parent_device_id"
             " WHERE d.is_active = 1 ORDER BY d.id"
         ).fetchall()
@@ -1043,6 +1045,112 @@ def set_maintenance(device_id: int, on: bool, cfg: Config = CONFIG) -> bool:
     return bool(write_with_retry(_do))
 
 
+# --- SNMP port status (Phase 9 Part B) --------------------------------------
+SNMP_VERSIONS = ("2c",)   # room for '3' later; v3 auth/priv is out of scope for now
+
+
+def set_snmp_config(device_id: int, data: dict, cfg: Config = CONFIG) -> bool:
+    """Set a device's SNMP config (enable + community + version + port). Kept separate
+    from the device CRUD full-replace so editing it never disturbs name/IP/topology.
+    Returns False if the node doesn't exist. Raises DeviceError on bad input."""
+    enabled = 0 if str(data.get("snmp_enabled", 0)) in ("0", "false", "False", "", "None") else 1
+    version = (str(data.get("snmp_version") or "2c")).strip().lower()
+    if version not in SNMP_VERSIONS:
+        raise DeviceError(f"SNMP version must be one of: {', '.join(SNMP_VERSIONS)}")
+    community = _payload_str(data, "snmp_community", DeviceError)
+    if enabled and not community:
+        raise DeviceError("an SNMP community is required to enable SNMP")
+    try:
+        port = int(data.get("snmp_port") or 161)
+    except (TypeError, ValueError):
+        raise DeviceError("SNMP port must be a number")
+    if not (1 <= port <= 65535):
+        raise DeviceError("SNMP port must be 1–65535")
+
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE devices SET snmp_enabled=?, snmp_version=?, snmp_community=?,"
+                " snmp_port=? WHERE id=? AND is_active=1",
+                (enabled, version, community, port, device_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
+def list_switch_ports(device_id: int, cfg: Config = CONFIG) -> list[dict]:
+    """Discovered ports for one switch (the dashboard SNMP panel): live oper/admin
+    status, the monitor flag, and which downstream device each port feeds."""
+    with connect(cfg) as conn:
+        rows = conn.execute(
+            "SELECT sp.id, sp.if_index, sp.if_name, sp.if_alias, sp.admin_status,"
+            " sp.oper_status, sp.monitored, sp.feeds_device_id, sp.alarm, sp.alarm_since,"
+            " sp.updated_at, f.name AS feeds_name"
+            " FROM switch_ports sp LEFT JOIN devices f ON f.id = sp.feeds_device_id"
+            " WHERE sp.device_id=? ORDER BY sp.if_index", (device_id,),
+        ).fetchall()
+    return [{
+        "id": r["id"],
+        "if_index": r["if_index"],
+        "if_name": r["if_name"],
+        "if_alias": r["if_alias"],
+        "admin_status": r["admin_status"],
+        "oper_status": r["oper_status"],
+        "monitored": bool(r["monitored"]),
+        "feeds_device_id": r["feeds_device_id"],
+        "feeds_name": r["feeds_name"],
+        "alarm": bool(r["alarm"]),
+        "alarm_since": r["alarm_since"],
+        "updated_at": r["updated_at"],
+    } for r in rows]
+
+
+def set_port_monitored(port_id: int, monitored: bool, cfg: Config = CONFIG) -> bool:
+    """Flag/unflag one port for alarming. Toggling re-arms detection from scratch
+    (resets the flap-suppression streak + clears any standing alarm), so an un-monitored
+    port never lingers in alarm and a freshly-monitored one isn't instantly down."""
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET monitored=?, down_streak=0, alarm=0,"
+                " alarm_since=NULL WHERE id=?", (1 if monitored else 0, port_id))
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
+def set_port_feeds(port_id: int, feeds_device_id, cfg: Config = CONFIG) -> bool:
+    """Map a port to the downstream device it feeds (or clear with None) — the bridge
+    that lets a monitored port-down fold into that device's outage. Raises DeviceError
+    if the target device doesn't exist or is the switch itself."""
+    fid = None
+    if feeds_device_id not in (None, "", "null", 0, "0"):
+        try:
+            fid = int(feeds_device_id)
+        except (TypeError, ValueError):
+            raise DeviceError("fed device is invalid")
+    with connect(cfg) as conn:
+        port = conn.execute(
+            "SELECT device_id FROM switch_ports WHERE id=?", (port_id,)).fetchone()
+        if not port:
+            return False
+        if fid is not None:
+            if not conn.execute("SELECT 1 FROM devices WHERE id=? AND is_active=1",
+                                (fid,)).fetchone():
+                raise DeviceError("fed device does not exist")
+            if fid == port["device_id"]:
+                raise DeviceError("a port can't feed its own switch")
+
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET feeds_device_id=? WHERE id=?", (fid, port_id))
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
 def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
     """Remove a device and its monitoring history (polls/outages/alerts). Blocked
     if it still has child nodes — reassign or remove those first, so topology never
@@ -1079,6 +1187,11 @@ def delete_device(device_id: int, cfg: Config = CONFIG) -> dict:
                 conn.execute("DELETE FROM device_links WHERE child_id=? OR parent_id=?",
                              (device_id, device_id))
                 conn.execute("DELETE FROM device_redundancy WHERE device_id=?", (device_id,))
+                # switch_ports REFERENCES devices(id) in BOTH device_id and
+                # feeds_device_id — clear a port whether this node is the switch OR the
+                # downstream device it feeds.
+                conn.execute("DELETE FROM switch_ports WHERE device_id=? OR feeds_device_id=?",
+                             (device_id, device_id))
                 conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
             return True
     write_with_retry(_do)

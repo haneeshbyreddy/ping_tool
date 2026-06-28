@@ -312,5 +312,59 @@ class BetweenCycleWatch(unittest.TestCase):
         self.assertFalse(dispatcher.dispatched)
 
 
+class SnmpCycleWiring(unittest.TestCase):
+    """Daemon glue for the SNMP task: a walk's ports are persisted, and a broken walk
+    (dead switch / pysnmp blowing up) is isolated so it never sinks the cycle."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from wisp.database.client import connect, migrate
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dbpath = Path(self.tmp.name) / "t.db"
+        migrate(Config(db_path=self.dbpath))
+        with connect(Config(db_path=self.dbpath)) as c:
+            c.execute("INSERT INTO devices (id,name,ip_address,region,snmp_enabled,"
+                      "snmp_community) VALUES (1,'Switch','10.0.0.1','R',1,'public')")
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _monitor(self, cfg):
+        from wisp.egress.ports import PortMonitor
+        from wisp.egress.notifiers import NotifyResult
+
+        class _N:
+            channel = "ntfy"
+            def send(self, *a):
+                return NotifyResult(True)
+        return PortMonitor(_N(), cfg)
+
+    def test_walk_persists_ports(self):
+        from wisp.database.client import connect
+        from wisp.ingress.snmp import PortStatus
+        cfg = Config(db_path=self.dbpath)
+
+        class _Poller:
+            async def walk(self, target):
+                return [PortStatus(2, "Gi0/2", None, "up", "down")]
+
+        asyncio.run(daemon.snmp_cycle(_Poller(), self._monitor(cfg), cfg))
+        with connect(cfg) as c:
+            n = c.execute("SELECT COUNT(*) FROM switch_ports WHERE device_id=1").fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_broken_walk_is_isolated(self):
+        cfg = Config(db_path=self.dbpath)
+
+        class _Boom:
+            async def walk(self, target):
+                raise RuntimeError("switch unreachable")
+
+        # must not raise — a dead switch never sinks the cycle
+        asyncio.run(daemon.snmp_cycle(_Boom(), self._monitor(cfg), cfg))
+
+
 if __name__ == "__main__":
     unittest.main()

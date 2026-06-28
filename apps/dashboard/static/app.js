@@ -656,6 +656,17 @@
             <button type="button" data-backup-add class="inline-flex items-center justify-center gap-1 h-9 text-primary border border-outline-variant hover:bg-surface-container-high font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("add", { size: 16 })} Add</button>
           </div>
         </div>` : ""}
+        ${isEdit ? `
+        <div class="sm:col-span-2 space-y-2 pt-2 border-t border-outline-variant">
+          <label class="font-label-xs text-label-xs text-on-surface-variant flex items-center gap-1">${icon("hub", { size: 13 })} SNMP port status <span class="text-outline">— v2c; monitored uplink ports fold into outages</span></label>
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 items-center">
+            <label class="flex items-center gap-2 text-body-sm text-primary px-1"><input type="checkbox" data-snmp-enabled ${d.snmp_enabled ? "checked" : ""} class="accent-primary w-4 h-4"> Enabled</label>
+            <input data-snmp-community value="${esc(d.snmp_community || "")}" placeholder="community (e.g. public)" class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />
+            <input data-snmp-port type="number" min="1" max="65535" value="${esc(d.snmp_port || 161)}" placeholder="161" class="w-full bg-surface border border-outline-variant text-primary text-body-sm rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-primary" />
+          </div>
+          <button type="button" data-snmp-save class="inline-flex items-center justify-center gap-1 h-9 text-primary border border-outline-variant hover:bg-surface-container-high font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("settings", { size: 16 })} Save SNMP</button>
+          <div data-ports-panel class="flex flex-col gap-1.5"></div>
+        </div>` : ""}
         <div class="sm:col-span-2 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 mt-1 border-t border-outline-variant">
           <div class="flex items-center gap-2">${isEdit ? `<button type="button" data-delete class="inline-flex items-center justify-center gap-1.5 h-9 text-error hover:bg-error/10 border border-error/30 font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("delete", { size: 16 })} Delete</button>
             <button type="button" data-maint class="inline-flex items-center justify-center gap-1.5 h-9 ${d.maintenance ? "text-primary border-primary/40 bg-primary/10" : "text-on-surface-variant border-outline-variant hover:bg-surface-container-high"} border font-label-md text-label-md px-3 rounded-md transition-colors whitespace-nowrap">${icon("pause_circle", { size: 16 })} ${d.maintenance ? "Resume" : "Maintenance"}</button>` : ""}</div>
@@ -763,6 +774,74 @@
       const primarySel = overlay.querySelector('[data-field="parent_device_id"]');
       if (primarySel) primarySel.addEventListener("change", renderBackups);
       renderBackups();
+    }
+
+    // --- SNMP config + discovered ports panel — edit mode only --------------
+    const portsPanel = overlay.querySelector("[data-ports-panel]");
+    if (portsPanel) {
+      const snmpSave = overlay.querySelector("[data-snmp-save]");
+      const enabledEl = overlay.querySelector("[data-snmp-enabled]");
+      const communityEl = overlay.querySelector("[data-snmp-community]");
+      const portEl = overlay.querySelector("[data-snmp-port]");
+      const OPER_CLS = { up: "text-primary", down: "text-error", lowerLayerDown: "text-error" };
+
+      function portRow(p) {
+        const oper = OPER_CLS[p.oper_status] || "text-amber-400";
+        const label = esc(p.if_name || `if${p.if_index}`) + (p.if_alias ? ` <span class="text-outline">· ${esc(p.if_alias)}</span>` : "");
+        const feedsOpts = [`<option value="">feeds: —</option>`].concat(
+          devices.filter((x) => x.id !== d.id).map((x) =>
+            `<option value="${x.id}" ${x.id === p.feeds_device_id ? "selected" : ""}>feeds: ${esc(x.name)}</option>`)).join("");
+        return `<div class="flex items-center justify-between gap-2 bg-surface border border-outline-variant rounded-md px-3 py-1.5">
+          <div class="min-w-0">
+            <p class="font-label-md text-label-md text-primary truncate">${label}</p>
+            <p class="font-mono-data text-[11px] ${oper}">oper ${esc(p.oper_status)} · admin ${esc(p.admin_status)}${p.alarm ? ' · <span class="text-error">ALARM</span>' : ""}</p>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <select data-port-feeds="${p.id}" class="bg-surface border border-outline-variant text-primary text-[11px] rounded-md px-1.5 py-1 appearance-none max-w-[8rem]">${feedsOpts}</select>
+            <label title="Alarm if this port goes down" class="flex items-center gap-1 text-label-xs text-on-surface-variant"><input type="checkbox" data-port-mon="${p.id}" ${p.monitored ? "checked" : ""} class="accent-primary w-4 h-4"> watch</label>
+          </div>
+        </div>`;
+      }
+
+      async function loadPorts() {
+        try {
+          const ports = await getJSON(`/api/devices/${d.id}/ports`);
+          portsPanel.innerHTML = ports.length
+            ? `<p class="font-label-xs text-label-xs text-on-surface-variant mt-1">${ports.length} port(s) discovered — tick the uplink/infra ports to watch:</p>` + ports.map(portRow).join("")
+            : `<p class="font-label-xs text-label-xs text-outline mt-1">No ports discovered yet${d.snmp_enabled ? " — the daemon walks SNMP on its own cadence." : " — enable SNMP and save."}</p>`;
+        } catch (e) { portsPanel.innerHTML = `<p class="font-label-xs text-label-xs text-error">Couldn't load ports</p>`; }
+      }
+
+      snmpSave.addEventListener("click", async () => {
+        snmpSave.disabled = true;
+        snmpSave.innerHTML = spinner("Saving…");
+        const res = await sendJSON("POST", `/api/devices/${d.id}/snmp`, {
+          snmp_enabled: enabledEl.checked ? 1 : 0,
+          snmp_version: "2c",
+          snmp_community: communityEl.value.trim(),
+          snmp_port: Number(portEl.value) || 161,
+        });
+        snmpSave.innerHTML = `${icon("settings", { size: 16 })} Save SNMP`;
+        snmpSave.disabled = false;
+        if (res.ok && res.data.ok) { toast("SNMP config saved"); d.snmp_enabled = enabledEl.checked ? 1 : 0; onDone(); }
+        else { toast(res.data.error || "Couldn't save SNMP", "error"); }
+      });
+
+      portsPanel.addEventListener("change", async (ev) => {
+        const mon = ev.target.closest("[data-port-mon]");
+        const feeds = ev.target.closest("[data-port-feeds]");
+        if (mon) {
+          const res = await sendJSON("POST", `/api/ports/${mon.getAttribute("data-port-mon")}/monitored`, { monitored: mon.checked });
+          if (res.ok && res.data.ok) { toast(mon.checked ? "Port watched" : "Port unwatched"); onDone(); }
+          else { toast("Couldn't update port", "error"); mon.checked = !mon.checked; }
+        } else if (feeds) {
+          const res = await sendJSON("POST", `/api/ports/${feeds.getAttribute("data-port-feeds")}/feeds`, { feeds_device_id: feeds.value || null });
+          if (res.ok && res.data.ok) toast("Port mapping saved");
+          else toast(res.data.error || "Couldn't map port", "error");
+        }
+      });
+
+      loadPorts();
     }
 
     const maintBtn = overlay.querySelector("[data-maint]");

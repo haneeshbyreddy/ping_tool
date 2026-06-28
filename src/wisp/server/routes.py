@@ -52,6 +52,10 @@ _DEVICE_ITEM = re.compile(r"^/api/devices/(\d+)$")
 _DEVICE_MAINT = re.compile(r"^/api/devices/(\d+)/maintenance$")
 _DEVICE_LINKS = re.compile(r"^/api/devices/(\d+)/links$")
 _DEVICE_LINK_ITEM = re.compile(r"^/api/devices/(\d+)/links/(\d+)$")
+_DEVICE_SNMP = re.compile(r"^/api/devices/(\d+)/snmp$")
+_DEVICE_PORTS = re.compile(r"^/api/devices/(\d+)/ports$")
+_PORT_MONITORED = re.compile(r"^/api/ports/(\d+)/monitored$")
+_PORT_FEEDS = re.compile(r"^/api/ports/(\d+)/feeds$")
 _WORKER_ITEM = re.compile(r"^/api/workers/(\d+)$")
 
 # API endpoints reachable without a valid session (the login flow itself). Every
@@ -270,6 +274,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(services.attendance_overview(CONFIG))
             if path == "/api/devices":
                 return self._send_json(services.list_devices(CONFIG))
+            mp = _DEVICE_PORTS.match(path)
+            if mp:   # discovered SNMP ports for one switch
+                return self._send_json(
+                    services.list_switch_ports(int(mp.group(1)), CONFIG))
             if path == "/api/logs":
                 return self._send_json(services.logs(
                     CONFIG,
@@ -355,6 +363,23 @@ class Handler(BaseHTTPRequestHandler):
                 res = services.add_backup_link(
                     int(ml.group(1)), int(body.get("parent_id") or 0), CONFIG)
                 return self._send_json(res, 200 if res.get("ok") else 422)
+
+            ms = _DEVICE_SNMP.match(path)      # set a device's SNMP config
+            if ms:
+                ok = services.set_snmp_config(int(ms.group(1)), body, CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 404)
+
+            mpm = _PORT_MONITORED.match(path)  # flag/unflag a port for alarming
+            if mpm:
+                ok = services.set_port_monitored(
+                    int(mpm.group(1)), bool(body.get("monitored")), CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 404)
+
+            mpf = _PORT_FEEDS.match(path)      # map a port -> downstream device
+            if mpf:
+                ok = services.set_port_feeds(
+                    int(mpf.group(1)), body.get("feeds_device_id"), CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 404)
 
             m = _OUTAGE_ACTION.match(path)
             if not m:

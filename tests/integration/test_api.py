@@ -503,5 +503,82 @@ class BackupLinkTest(unittest.TestCase):
         self.assertFalse(node["on_backup"])
 
 
+class SnmpPortApiTest(unittest.TestCase):
+    """Phase 9 Part B — SNMP services: device SNMP config, port discovery list, the
+    monitor + feeds toggles, and FK-safe delete of switch_ports (both directions)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(db_path=Path(self.tmp.name) / "t.db")
+        migrate(self.cfg)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        with connect(self.cfg) as c:
+            c.execute("INSERT INTO devices (id,name,ip_address,region) VALUES (1,'Switch','d1','R')")
+            c.execute("INSERT INTO devices (id,name,ip_address,region) VALUES (2,'Tower','d2','R')")
+            # a discovered port on the switch
+            c.execute("INSERT INTO switch_ports (device_id,if_index,if_name,admin_status,"
+                      "oper_status,updated_at) VALUES (1,2,'Gi0/2','up','up',?)",
+                      (_iso(self.now),))
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _port_id(self):
+        with connect(self.cfg) as c:
+            return c.execute("SELECT id FROM switch_ports WHERE device_id=1").fetchone()["id"]
+
+    def test_snmp_config_validation_and_save(self):
+        self.assertTrue(api.set_snmp_config(
+            1, {"snmp_enabled": 1, "snmp_community": "public", "snmp_port": 161}, self.cfg))
+        dev = {d["id"]: d for d in api.list_devices(self.cfg)}[1]
+        self.assertEqual(dev["snmp_enabled"], 1)
+        self.assertEqual(dev["snmp_community"], "public")
+        # enabling without a community is rejected
+        with self.assertRaises(api.DeviceError):
+            api.set_snmp_config(1, {"snmp_enabled": 1, "snmp_community": ""}, self.cfg)
+        # bad port / version rejected
+        with self.assertRaises(api.DeviceError):
+            api.set_snmp_config(1, {"snmp_enabled": 0, "snmp_port": 99999}, self.cfg)
+        with self.assertRaises(api.DeviceError):
+            api.set_snmp_config(1, {"snmp_enabled": 0, "snmp_version": "3"}, self.cfg)
+
+    def test_load_snmp_targets_only_enabled(self):
+        from wisp.ingress.snmp import load_snmp_targets
+        self.assertEqual(load_snmp_targets(self.cfg), [])     # none enabled yet
+        api.set_snmp_config(1, {"snmp_enabled": 1, "snmp_community": "public"}, self.cfg)
+        targets = load_snmp_targets(self.cfg)
+        self.assertEqual([t[0] for t in targets], [1])
+        self.assertEqual(targets[0][1].community, "public")
+
+    def test_port_monitor_and_feeds_toggles(self):
+        pid = self._port_id()
+        self.assertTrue(api.set_port_monitored(pid, True, self.cfg))
+        self.assertTrue(api.set_port_feeds(pid, 2, self.cfg))
+        port = api.list_switch_ports(1, self.cfg)[0]
+        self.assertTrue(port["monitored"])
+        self.assertEqual(port["feeds_device_id"], 2)
+        self.assertEqual(port["feeds_name"], "Tower")
+        # a port can't feed its own switch, and the target must exist
+        with self.assertRaises(api.DeviceError):
+            api.set_port_feeds(pid, 1, self.cfg)
+        with self.assertRaises(api.DeviceError):
+            api.set_port_feeds(pid, 999, self.cfg)
+        # clearing the mapping
+        self.assertTrue(api.set_port_feeds(pid, None, self.cfg))
+        self.assertIsNone(api.list_switch_ports(1, self.cfg)[0]["feeds_device_id"])
+
+    def test_delete_clears_switch_ports_both_directions(self):
+        pid = self._port_id()
+        api.set_port_feeds(pid, 2, self.cfg)   # switch(1) port feeds Tower(2)
+        # deleting the FED device (2) must clear the port's feeds reference cleanly
+        self.assertEqual(api.delete_device(2, self.cfg), {"ok": True})
+        # deleting the switch (1) removes its ports
+        self.assertEqual(api.delete_device(1, self.cfg), {"ok": True})
+        with connect(self.cfg) as c:
+            n = c.execute("SELECT COUNT(*) FROM switch_ports").fetchone()[0]
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
