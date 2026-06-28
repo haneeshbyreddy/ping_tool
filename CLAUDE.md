@@ -10,7 +10,7 @@ work, and open questions).
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
 (team directory, PIN gate, monitor lifecycle), and **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — 158 tests. The
+backup lines + the on-backup signal) and Part B (SNMP port status) — 161 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
@@ -205,10 +205,25 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   (re-arms detection: resets streak/alarm), `set_port_feeds` (validates target). API:
   `POST /api/devices/{id}/snmp`, `GET /api/devices/{id}/ports`, `POST /api/ports/{id}/monitored`,
   `POST /api/ports/{id}/feeds`; the Nodes modal carries the SNMP config + a ports panel.
+- **Surfaced live in the UI, not just the edit modal.** `nodes_list` (`/api/nodes`) now carries
+  a per-switch `ports: {total, monitored, down}` summary (`down` = monitored ports in `alarm=1`,
+  one GROUP BY — don't pull raw rows) + `snmp_enabled`, so a switch with a down monitored uplink no
+  longer looks identical to a healthy one (badge on the node row). `services.topology_graph`
+  (`GET /api/topology`) returns the whole network as `{nodes, edges}` for the **topology map** —
+  nodes **reuse `nodes_list`** (one source of truth for state), edges expose all three relationship
+  models as `kind` ∈ `primary`|`backup`|`port` (the port edge carries `port_label` + `down`), and
+  edges to inactive nodes are dropped so the map never dangles. The Nodes page has a **Tree ⇄ Map**
+  toggle (`app.js`, persisted in `localStorage`); the map is **pure SVG, no library** — a tidy-tree
+  layout of the primary topology with backup/port edges as overlay curves, pan/zoom via `viewBox`
+  math, and a node-click **read-only detail card** (live state + uplinks + which ports are down) with
+  an Edit button into the existing modal. A live SSE refresh preserves the current `viewBox` so it
+  doesn't reset pan/zoom. A date drill-down (heatmap) forces the list regardless of the toggle.
 - **Tests:** `unit/test_snmp` (parser + is_down), `integration/test_ports` (discovery, flap
   suppression, admin-down silent, fold-into-outage, leading indicator opens no outage, recovery,
   alerts gate), `integration/test_api.SnmpPortApiTest` (config/validation, targets, toggles, FK
-  delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
+  delete), `integration/test_api.TopologyTest` (per-switch port summary in `nodes_list`; the three
+  edge kinds + port `down` flag; dangling-edge drop on delete),
+  `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -401,7 +416,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (158 tests). They mirror the
+Run `python -m unittest discover -s tests` after any logic change (161 tests). They mirror the
 layers: `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence), `integration/test_notifiers` (dispatch/escalation/ack +
 the `send_with_retry` policy, temp DB + controlled time), `integration/test_analytics`

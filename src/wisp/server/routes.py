@@ -265,6 +265,8 @@ class Handler(BaseHTTPRequestHandler):
                 if day:
                     return self._send_json(services.nodes_down_on_day(CONFIG, day))
                 return self._send_json(services.nodes_list(CONFIG))
+            if path == "/api/topology":
+                return self._send_json(services.topology_graph(CONFIG))
             if path == "/api/heatmap":
                 days = int(_one("days", "30") or 30)
                 return self._send_json(services.network_heatmap(CONFIG, days))

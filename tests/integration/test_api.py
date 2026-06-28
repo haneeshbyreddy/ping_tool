@@ -580,5 +580,64 @@ class SnmpPortApiTest(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
+class TopologyTest(unittest.TestCase):
+    """Phase 9 — the topology-map data layer: nodes_list carries a live per-switch
+    port-health summary, and /api/topology returns the three edge kinds (primary
+    parent, backup uplink, SNMP port-feed) over one node set, dropping dangling edges."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(db_path=Path(self.tmp.name) / "t.db")
+        migrate(self.cfg)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        with connect(self.cfg) as c:
+            # Core(1) <- Tower A(2), Switch(3); Relay(4) primary under Tower A.
+            for did, name, parent in [
+                (1, "Core", None), (2, "Tower A", 1), (3, "Switch", 1), (4, "Relay", 2),
+            ]:
+                c.execute("INSERT INTO devices (id,name,ip_address,region,parent_device_id)"
+                          " VALUES (?,?,?,?,?)", (did, name, f"d{did}", "Rampur", parent))
+            # Relay(4) also runs a backup uplink to the Switch(3).
+            c.execute("INSERT INTO device_links (child_id,parent_id,kind,is_active)"
+                      " VALUES (4,3,'backup',1)")
+            # Switch(3): a monitored uplink port feeding Relay(4), currently alarming,
+            # plus a discovered-but-unwatched access port.
+            c.execute("INSERT INTO switch_ports (device_id,if_index,if_name,admin_status,"
+                      "oper_status,monitored,feeds_device_id,alarm,updated_at)"
+                      " VALUES (3,2,'Gi0/2','up','down',1,4,1,?)", (_iso(self.now),))
+            c.execute("INSERT INTO switch_ports (device_id,if_index,if_name,admin_status,"
+                      "oper_status,monitored,updated_at)"
+                      " VALUES (3,3,'Gi0/3','up','up',0,?)", (_iso(self.now),))
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_nodes_list_port_summary(self):
+        nodes = {n["id"]: n for n in api.nodes_list(self.cfg)}
+        self.assertEqual(nodes[3]["ports"], {"total": 2, "monitored": 1, "down": 1})
+        # a node with no ports carries None, not a zero summary
+        self.assertIsNone(nodes[1]["ports"])
+
+    def test_topology_graph_edges(self):
+        g = api.topology_graph(self.cfg)
+        self.assertEqual(len(g["nodes"]), 4)
+        kinds = lambda k: [(e["parent_id"], e["child_id"]) for e in g["edges"] if e["kind"] == k]
+        self.assertIn((1, 2), kinds("primary"))
+        self.assertIn((2, 4), kinds("primary"))    # Relay's primary parent is Tower A
+        self.assertIn((3, 4), kinds("backup"))     # Relay's backup parent is the Switch
+        ports = [e for e in g["edges"] if e["kind"] == "port"]
+        self.assertEqual(len(ports), 1)            # only the port with a feeds mapping
+        self.assertEqual((ports[0]["parent_id"], ports[0]["child_id"]), (3, 4))
+        self.assertTrue(ports[0]["down"])
+        self.assertIn("Gi0/2", ports[0]["port_label"])
+
+    def test_topology_drops_edges_to_inactive(self):
+        # deleting the fed device clears the port + backup edges without dangling
+        self.assertEqual(api.delete_device(4, self.cfg), {"ok": True})
+        g = api.topology_graph(self.cfg)
+        self.assertEqual([e for e in g["edges"] if e["kind"] in ("port", "backup")], [])
+
+
 if __name__ == "__main__":
     unittest.main()

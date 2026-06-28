@@ -250,7 +250,8 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
     with connect(cfg) as conn:
         devices = conn.execute(
             "SELECT d.id, d.name, d.ip_address, d.device_type, d.region,"
-            " d.parent_device_id, d.maintenance, pf.degraded AS perf_degraded,"
+            " d.parent_device_id, d.maintenance, d.snmp_enabled,"
+            " pf.degraded AS perf_degraded,"
             " pf.metric AS perf_metric,"
             " pf.baseline_ms AS perf_baseline, pf.current_ms AS perf_current,"
             " pf.since AS perf_since,"
@@ -261,6 +262,21 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
         ).fetchall()
         outages = _outages_in_window(conn, win_start, win_end)
         states = latest_states(conn)
+        # Per-switch port health in one GROUP BY (don't pull raw rows): total discovered,
+        # how many are monitored, and how many monitored ports are currently alarming. This
+        # is what makes a switch's port trouble visible LIVE on the Nodes tree/map instead
+        # of only inside the edit modal.
+        port_rows = conn.execute(
+            "SELECT device_id, COUNT(*) AS total,"
+            " SUM(CASE WHEN monitored=1 THEN 1 ELSE 0 END) AS monitored,"
+            " SUM(CASE WHEN monitored=1 AND alarm=1 THEN 1 ELSE 0 END) AS down"
+            " FROM switch_ports GROUP BY device_id"
+        ).fetchall()
+    ports_by_device = {
+        r["device_id"]: {"total": r["total"], "monitored": r["monitored"] or 0,
+                         "down": r["down"] or 0}
+        for r in port_rows
+    }
     down = _downtime_by_device(outages, win_start, win_end, only_down=False)
     window_s = (win_end - win_start).total_seconds()
 
@@ -301,8 +317,60 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
                 "current_ms": d["perf_current"],
                 "since": d["perf_since"],
             } if d["perf_degraded"] else None),
+            # SNMP port health, surfaced live so a switch with a down monitored uplink
+            # port no longer looks identical to a healthy one. None when the node has no
+            # discovered ports (SNMP off / not yet walked).
+            "snmp_enabled": bool(d["snmp_enabled"]),
+            "ports": ports_by_device.get(d["id"]),
         })
     return out
+
+
+def topology_graph(cfg: Config = CONFIG, hours: int = 24) -> dict:
+    """The whole network as a node-link graph for the topology map, in one payload.
+
+    Nodes reuse `nodes_list` (live state, uptime, on_backup/perf/maintenance badges, the
+    port-health summary) so there's a single source of truth for state. Edges expose the
+    THREE relationship models the indented tree can't draw on its own:
+
+      * ``primary`` — the denormalised ping parent (`devices.parent_device_id`).
+      * ``backup``  — redundant uplinks (`device_links`, kind='backup').
+      * ``port``    — the physical "this switch port feeds that device" link
+                      (`switch_ports.feeds_device_id`), carrying the port label + whether
+                      it is currently alarming. This is the physical layer SNMP unlocked.
+
+    Every edge is parent_id (upstream) -> child_id (downstream); edges to inactive nodes
+    are dropped so the map never dangles."""
+    nodes = nodes_list(cfg, hours)
+    active = {n["id"] for n in nodes}
+    edges: list[dict] = []
+    for n in nodes:
+        p = n["parent_device_id"]
+        if p is not None and p in active:
+            edges.append({"parent_id": p, "child_id": n["id"], "kind": "primary"})
+    with connect(cfg) as conn:
+        backups = conn.execute(
+            "SELECT child_id, parent_id FROM device_links"
+            " WHERE is_active=1 AND kind='backup'").fetchall()
+        feeds = conn.execute(
+            "SELECT device_id, feeds_device_id, if_index, if_name, if_alias,"
+            " monitored, alarm FROM switch_ports WHERE feeds_device_id IS NOT NULL"
+        ).fetchall()
+    for b in backups:
+        if b["child_id"] in active and b["parent_id"] in active:
+            edges.append({"parent_id": b["parent_id"], "child_id": b["child_id"],
+                          "kind": "backup"})
+    for f in feeds:
+        if f["device_id"] in active and f["feeds_device_id"] in active:
+            base = f["if_name"] or f"if{f['if_index']}"
+            label = f"{base} ({f['if_alias']})" if f["if_alias"] else base
+            edges.append({
+                "parent_id": f["device_id"], "child_id": f["feeds_device_id"],
+                "kind": "port", "port_label": label,
+                "monitored": bool(f["monitored"]),
+                "down": bool(f["monitored"] and f["alarm"]),
+            })
+    return {"nodes": nodes, "edges": edges}
 
 
 def network_heatmap(cfg: Config = CONFIG, days: int = 30) -> list[dict]:

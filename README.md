@@ -148,6 +148,13 @@ run.sh                    # one-shot setup + run for both runtimes
   port `feeds` a device with an open outage — **folds into that outage** as the physical
   cause ("Port Gi0/2 → Tower B is down") instead of raising a competing alarm. ICMP stays
   the outage owner; SNMP confirms/enriches. Enable per device + flag ports on the Nodes page.
+- **Topology map + live port health** — the Nodes page has a **Tree ⇄ Map** toggle. The map
+  is an interactive node-link graph (pan/zoom, click a node for a live detail card) that draws
+  all three relationship layers at once: the primary ping parent, **backup uplinks** (`device_links`),
+  and the physical **SNMP port-feed** links (`switch_ports.feeds_device_id`), colour-coded by state.
+  A switch's port trouble is now surfaced **live** on its row/node (a "2/8 ports down" badge), not
+  buried in the edit modal. Served by `GET /api/topology`; the per-switch port summary rides on
+  `GET /api/nodes`.
 - **Post-mortem cause** — at resolution the operator records the confirmed root cause + notes
   (there is no automatic power-vs-link guess).
 - **Escalation is restart-safe** — timers live in the DB, not memory; a crash can't drop them.

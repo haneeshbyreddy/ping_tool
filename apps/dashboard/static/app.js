@@ -427,6 +427,21 @@
     UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
   };
 
+  // SNMP port health, surfaced live on a switch's row (was previously only visible
+  // inside the edit modal). Red when a monitored uplink port is alarming; a muted count
+  // when ports are merely watched; nothing for a switch whose ports aren't watched yet.
+  function portBadge(n) {
+    const p = n.ports;
+    if (!p || !p.total) return "";
+    if (p.down > 0) {
+      return `<span title="${p.down} monitored port(s) down (SNMP)" class="font-label-xs text-label-xs text-error border border-error/30 bg-error/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("power_off", { size: 12 })} ${p.down}/${p.monitored} ports down</span>`;
+    }
+    if (p.monitored > 0) {
+      return `<span title="${p.monitored} of ${p.total} discovered port(s) watched (SNMP)" class="font-label-xs text-label-xs text-outline border border-outline-variant px-2 py-0.5 rounded-md whitespace-nowrap hidden sm:flex items-center gap-1">${icon("visibility", { size: 12 })} ${p.monitored} watched</span>`;
+    }
+    return "";
+  }
+
   // ctx: { depth, hasChildren, expanded, stats:{affected,total}, suppressedBy }
   function nodeRow(n, ctx = {}) {
     const { depth = 0, hasChildren = false, expanded = false, stats = null, suppressedBy = null } = ctx;
@@ -466,6 +481,7 @@
       </div>
       <div class="flex items-center gap-3 shrink-0">
         ${rollup}
+        ${portBadge(n)}
         ${n.on_backup ? `<span title="Primary uplink down — running on a backup path. Redundancy is gone." class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("hub", { size: 12 })} on backup</span>` : ""}
         ${n.maintenance ? `<span class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("pause_circle", { size: 12 })} maintenance</span>` : ""}
         <div class="text-right hidden sm:block"><p class="font-mono-data ${pctColor}">${fmtPct(n.uptime_pct)}</p></div>
@@ -886,8 +902,279 @@
     }
   }
 
+  // --- topology map (interactive node-link graph) ---------------------------
+  // The indented tree only draws the PRIMARY ping parent. The map draws all three
+  // relationship layers at once — primary parent, backup uplinks, and the physical
+  // switch-port→fed-device links SNMP discovered — over a tidy-tree layout, so an
+  // operator can see the physical shape of the network during an incident. Pure SVG,
+  // no library: layout is deterministic (children centered under their parent), pan/zoom
+  // is viewBox math.
+  const NODE_VIEW_KEY = "wisp.nodes.view";
+  function loadNodesView() {
+    try { return localStorage.getItem(NODE_VIEW_KEY) === "map" ? "map" : "tree"; }
+    catch { return "tree"; }
+  }
+  function saveNodesView(v) { try { localStorage.setItem(NODE_VIEW_KEY, v); } catch {} }
+  function nodeViewBtnCls(active) {
+    return `flex items-center gap-1 px-2.5 py-1 rounded-[5px] font-label-md text-label-md transition-colors ${active ? "bg-surface-container text-primary" : "text-on-surface-variant hover:text-primary"}`;
+  }
+
+  // Calm-when-healthy, loud-when-broken: a neutral border for UP/UNREACHABLE so trouble
+  // (amber DEGRADED, red DOWN) pops. The status dot still carries the exact state colour.
+  const TOPO_BORDER = { UP: "#444748", DEGRADED: "#fbbf24", DOWN: "#ffb4ab", UNREACHABLE: "#33373a" };
+  const TOPO_DOT = { UP: "#ffffff", DEGRADED: "#fbbf24", DOWN: "#ffb4ab", UNREACHABLE: "#8e9192" };
+  function edgeColor(node) {
+    if (!node) return "#444748";
+    if (node.state === "DOWN" || node.state === "UNREACHABLE") return "#ffb4ab";
+    if (node.state === "DEGRADED") return "#fbbf24";
+    return "#444748";
+  }
+  function topoTrunc(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+  // Tidy-tree layout over the PRIMARY topology: leaves get sequential x slots, a parent
+  // centers over its children, each root's tree laid side by side. Backup/port edges are
+  // overlays on top of these positions.
+  function layoutTopology(nodes) {
+    const NW = 172, NH = 54, HGAP = 28, LEVEL_Y = 112;
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const kids = new Map();
+    const roots = [];
+    for (const n of nodes) {
+      const p = n.parent_device_id;
+      if (p != null && byId.has(p)) (kids.get(p) || kids.set(p, []).get(p)).push(n);
+      else roots.push(n);
+    }
+    const byName = (a, b) => String(a.name).localeCompare(String(b.name));
+    roots.sort(byName);
+    for (const arr of kids.values()) arr.sort(byName);
+    const pos = new Map();
+    let cursor = 0;
+    function place(n, depth) {
+      const cs = kids.get(n.id) || [];
+      let left;
+      if (!cs.length) { left = cursor; cursor += NW + HGAP; }
+      else {
+        const ls = cs.map((c) => place(c, depth + 1));
+        left = (ls[0] + ls[ls.length - 1]) / 2;
+      }
+      pos.set(n.id, { left, top: depth * LEVEL_Y });
+      return left;
+    }
+    for (const r of roots) { place(r, 0); cursor += HGAP * 1.5; }
+    let maxR = 0, maxB = 0;
+    for (const p of pos.values()) { maxR = Math.max(maxR, p.left + NW); maxB = Math.max(maxB, p.top + NH); }
+    return { pos, NW, NH, width: maxR, height: maxB };
+  }
+
+  function topoCurve(a, b, bow) {
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    return `M ${a.x} ${a.y} Q ${mx + bow} ${my} ${b.x} ${b.y}`;
+  }
+
+  function topoEdge(e, L, byId) {
+    const a = L.pos.get(e.parent_id), b = L.pos.get(e.child_id);
+    if (!a || !b) return "";
+    const from = { x: a.left + L.NW / 2, y: a.top + L.NH };
+    const to = { x: b.left + L.NW / 2, y: b.top };
+    if (e.kind === "primary") {
+      return `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="${edgeColor(byId.get(e.child_id))}" stroke-width="1.6"/>`;
+    }
+    if (e.kind === "backup") {
+      return `<path d="${topoCurve(from, to, 55)}" fill="none" stroke="#fbbf24" stroke-width="1.6" stroke-dasharray="6 4" opacity="0.85"/>`;
+    }
+    // port-feed: physical link, teal (red when alarming), with the port label at the bow.
+    const col = e.down ? "#ffb4ab" : "#2dd4bf";
+    const mid = { x: (from.x + to.x) / 2 - 27, y: (from.y + to.y) / 2 };
+    return `<path d="${topoCurve(from, to, -55)}" fill="none" stroke="${col}" stroke-width="1.6" stroke-dasharray="2 3" opacity="0.9"/>`
+      + `<text x="${mid.x}" y="${mid.y}" fill="${col}" font-size="9.5" text-anchor="middle" font-weight="${e.down ? 700 : 400}">${esc(topoTrunc(e.port_label, 16))}</text>`;
+  }
+
+  function topoNode(n, L) {
+    const p = L.pos.get(n.id);
+    if (!p) return "";
+    const { left: x, top: y } = p, W = L.NW, H = L.NH;
+    const border = TOPO_BORDER[n.state] || "#444748";
+    const dot = TOPO_DOT[n.state] || "#ffffff";
+    const op = n.state === "UNREACHABLE" ? 0.6 : 1;
+    const dash = n.maintenance ? ` stroke-dasharray="5 3"` : "";
+    let bx = x + W - 13, badges = "";
+    if (n.ports && n.ports.down > 0) {
+      badges += `<circle cx="${bx}" cy="${y + 13}" r="7" fill="#ffb4ab"/><text x="${bx}" y="${y + 16.5}" fill="#141313" font-size="9" text-anchor="middle" font-weight="700">${n.ports.down}</text>`;
+      bx -= 17;
+    }
+    if (n.on_backup) { badges += `<circle cx="${bx}" cy="${y + 13}" r="5" fill="#fbbf24"/>`; }
+    const title = `${n.name} — ${n.state_label}`
+      + (n.on_backup ? " · on backup" : "") + (n.maintenance ? " · maintenance" : "")
+      + (n.ports && n.ports.down ? ` · ${n.ports.down} port(s) down` : "");
+    return `<g data-node="${n.id}" style="cursor:pointer" opacity="${op}">
+      <title>${esc(title)}</title>
+      <rect x="${x}" y="${y}" width="${W}" height="${H}" rx="9" fill="#201f1f" stroke="${border}" stroke-width="1.6"${dash}/>
+      <circle cx="${x + 15}" cy="${y + H / 2}" r="5" fill="${dot}"/>
+      <text x="${x + 28}" y="${y + 22}" fill="#e5e2e1" font-size="12.5" font-weight="600">${esc(topoTrunc(n.name, 19))}</text>
+      <text x="${x + 28}" y="${y + 39}" fill="#8e9192" font-size="10">${esc(topoTrunc((n.type || "node") + " · " + n.ip, 24))}</text>
+      ${badges}
+    </g>`;
+  }
+
+  function topoLegendRow(swatch, label) {
+    return `<div class="flex items-center gap-1.5"><span class="inline-block w-3 h-0.5 shrink-0" style="${swatch}"></span>${label}</div>`;
+  }
+  function topologyMap(data) {
+    const nodes = (data && data.nodes) || [];
+    if (!nodes.length) {
+      return `<div class="border border-outline-variant bg-surface-container-low rounded-md p-6 flex items-center gap-3 text-on-surface-variant">
+        ${icon("hub", { cls: "text-outline" })}<span class="font-body-sm">No nodes to map yet — add devices below.</span></div>`;
+    }
+    const L = layoutTopology(nodes);
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const edges = ((data && data.edges) || []).map((e) => topoEdge(e, L, byId)).join("");
+    const ns = nodes.map((n) => topoNode(n, L)).join("");
+    const pad = 52, vb = `${-pad} ${-pad} ${L.width + pad * 2} ${L.height + pad * 2}`;
+    const btn = "w-8 h-8 flex items-center justify-center bg-surface-container border border-outline-variant rounded-md text-on-surface-variant hover:text-primary hover:bg-surface-container-high transition-colors";
+    return `<div class="relative bg-surface-dim border border-outline-variant rounded-md overflow-hidden" style="height:min(70vh,640px)">
+      <svg id="topo-svg" class="w-full h-full select-none" style="cursor:grab;touch-action:none" viewBox="${vb}">
+        <g>${edges}</g><g>${ns}</g>
+      </svg>
+      <div class="absolute top-3 left-3 bg-surface-container/90 backdrop-blur border border-outline-variant rounded-md px-3 py-2 font-label-xs text-label-xs text-on-surface-variant flex flex-col gap-1 pointer-events-none">
+        ${topoLegendRow("background:#444748", "primary uplink")}
+        ${topoLegendRow("background:#fbbf24;height:0;border-top:2px dashed #fbbf24", "backup uplink")}
+        ${topoLegendRow("background:#2dd4bf;height:0;border-top:2px dashed #2dd4bf", "SNMP port feed")}
+        <div class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full" style="background:#ffb4ab"></span>down / port alarm</div>
+      </div>
+      <div class="absolute bottom-3 right-3 flex flex-col gap-1.5">
+        <button data-zoom="in" title="Zoom in" class="${btn}">${icon("add", { size: 18 })}</button>
+        <button data-zoom="out" title="Zoom out" class="${btn}">${icon("chevron_left", { size: 18, cls: "rotate-90" })}</button>
+        <button data-zoom="reset" title="Reset view" class="${btn}">${icon("refresh", { size: 16 })}</button>
+      </div>
+      <div class="absolute bottom-3 left-3 font-label-xs text-label-xs text-outline pointer-events-none">drag to pan · scroll to zoom · click a node</div>
+      <div id="topo-detail" class="hidden"></div>
+    </div>`;
+  }
+
+  function wireTopology(box, data, reload, onView) {
+    const svg = box.querySelector("#topo-svg");
+    if (!svg) return;
+    const p = svg.getAttribute("viewBox").split(" ").map(Number);
+    let vb = { x: p[0], y: p[1], w: p[2], h: p[3] };
+    const base = { ...vb };
+    const apply = () => { svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); if (onView) onView(svg.getAttribute("viewBox")); };
+    const zoomAt = (nx, ny, k) => {
+      const mx = vb.x + nx * vb.w, my = vb.y + ny * vb.h;
+      vb.w *= k; vb.h *= k; vb.x = mx - nx * vb.w; vb.y = my - ny * vb.h; apply();
+    };
+    svg.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const r = svg.getBoundingClientRect();
+      zoomAt((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, e.deltaY > 0 ? 1.12 : 0.89);
+    }, { passive: false });
+    let drag = null, moved = 0;
+    svg.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("[data-zoom]")) return;
+      drag = { x: e.clientX, y: e.clientY, vx: vb.x, vy: vb.y }; moved = 0;
+      try { svg.setPointerCapture(e.pointerId); } catch {}
+      svg.style.cursor = "grabbing";
+    });
+    svg.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const r = svg.getBoundingClientRect();
+      vb.x = drag.vx - (e.clientX - drag.x) / r.width * vb.w;
+      vb.y = drag.vy - (e.clientY - drag.y) / r.height * vb.h;
+      moved += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y);
+      apply();
+    });
+    const end = (e) => { if (drag) { try { svg.releasePointerCapture(e.pointerId); } catch {} } drag = null; svg.style.cursor = "grab"; };
+    svg.addEventListener("pointerup", end);
+    svg.addEventListener("pointercancel", end);
+    svg.addEventListener("click", (e) => {
+      if (moved > 6) return;   // it was a pan, not a click
+      const g = e.target.closest("[data-node]");
+      if (!g) return;
+      const node = (data.nodes || []).find((n) => n.id === Number(g.getAttribute("data-node")));
+      if (node) showTopoDetail(box, node, data, reload);
+    });
+    box.querySelectorAll("[data-zoom]").forEach((b) => b.addEventListener("click", () => {
+      const k = b.getAttribute("data-zoom");
+      if (k === "in") zoomAt(0.5, 0.5, 0.83);
+      else if (k === "out") zoomAt(0.5, 0.5, 1.2);
+      else { vb = { ...base }; apply(); }
+    }));
+  }
+
+  // Read-only detail card (monitoring-first): live state + what it feeds + which ports
+  // are down, with an Edit button into the full node modal where config lives.
+  function showTopoDetail(box, node, data, reload) {
+    const host = box.querySelector("#topo-detail");
+    if (!host) return;
+    const sm = NODE_STATE_MAP[node.state] || NODE_STATE_MAP.UP;
+    const ups = (data.edges || []).filter((e) => e.child_id === node.id);
+    const upHtml = ups.length ? ups.map((e) => {
+      const par = (data.nodes || []).find((n) => n.id === e.parent_id);
+      const nm = esc(par ? par.name : "#" + e.parent_id);
+      const tag = e.kind === "primary" ? "primary"
+        : e.kind === "backup" ? "backup" : "port" + (e.port_label ? " " + esc(topoTrunc(e.port_label, 12)) : "");
+      const col = e.kind === "backup" ? "text-amber-400" : e.kind === "port" ? "text-[#2dd4bf]" : "text-on-surface-variant";
+      return `<div class="flex items-center justify-between gap-2 text-label-xs"><span class="text-on-surface-variant truncate">${icon("subdirectory_arrow_right", { size: 12 })} ${nm}</span><span class="${col} shrink-0">${tag}</span></div>`;
+    }).join("") : `<p class="font-label-xs text-label-xs text-outline">No upstream links recorded.</p>`;
+    const flags = [];
+    if (node.on_backup) flags.push(`<span class="text-amber-400">${icon("hub", { size: 12 })} on backup</span>`);
+    if (node.perf) flags.push(`<span class="text-amber-400">${icon("bolt", { size: 12 })} slow link</span>`);
+    if (node.maintenance) flags.push(`<span class="text-amber-400">${icon("pause_circle", { size: 12 })} maintenance</span>`);
+    host.innerHTML = `<div class="absolute top-3 right-3 w-72 max-w-[88%] bg-surface-container border border-outline-variant rounded-md shadow-xl p-4 flex flex-col gap-3 z-20 animate-fade-in">
+      <div class="flex items-start justify-between gap-2">
+        <h4 class="font-label-md text-label-md text-primary truncate">${esc(node.name)}</h4>
+        <button data-topo-close class="text-on-surface-variant hover:text-primary -mt-1 -mr-1 p-1 rounded-full hover:bg-surface-container-high">${icon("close", { size: 16 })}</button>
+      </div>
+      <div class="flex items-center justify-between gap-2 font-label-xs text-label-xs">
+        <span class="font-mono-data text-on-surface-variant truncate">${esc(node.type || "node")} · ${esc(node.ip)} · ${esc(node.region)}</span>
+        <span class="${sm.text} flex items-center gap-1 shrink-0"><span class="w-2 h-2 rounded-full ${sm.dot}"></span>${esc(node.state_label)}</span>
+      </div>
+      <div class="flex items-center justify-between gap-2 font-label-xs text-label-xs">
+        <span class="text-on-surface-variant">24h uptime</span>
+        <span class="font-mono-data ${node.uptime_pct >= 99.9 ? "text-primary" : "text-amber-400"}">${fmtPct(node.uptime_pct)}</span>
+      </div>
+      ${flags.length ? `<div class="flex flex-wrap gap-2 font-label-xs text-label-xs">${flags.join("")}</div>` : ""}
+      <div class="flex flex-col gap-1 border-t border-outline-variant pt-2">
+        <span class="font-label-xs text-label-xs text-outline uppercase tracking-wide">Uplinks</span>${upHtml}</div>
+      ${node.ports && node.ports.total ? `<div id="topo-ports" class="flex flex-col gap-1 border-t border-outline-variant pt-2"><span class="font-label-xs text-label-xs text-outline">Loading ports…</span></div>` : ""}
+      <button data-topo-edit class="mt-1 inline-flex items-center justify-center gap-1 h-9 text-primary border border-outline-variant hover:bg-surface-container-high font-label-md text-label-md rounded-md transition-colors">${icon("edit", { size: 16 })} Edit node</button>
+    </div>`;
+    host.classList.remove("hidden");
+    host.querySelector("[data-topo-close]").addEventListener("click", () => { host.classList.add("hidden"); host.innerHTML = ""; });
+    host.querySelector("[data-topo-edit]").addEventListener("click", async () => {
+      try {
+        const devices = await getJSON("/api/devices");
+        const dev = devices.find((x) => x.id === node.id);
+        if (dev) openNodeModal(dev, devices, reload);
+      } catch { toast("Couldn't load node", "error"); }
+    });
+    if (node.ports && node.ports.total) loadTopoPorts(host, node);
+  }
+
+  async function loadTopoPorts(host, node) {
+    const el = host.querySelector("#topo-ports");
+    if (!el) return;
+    try {
+      const ports = await getJSON(`/api/devices/${node.id}/ports`);
+      const watched = ports.filter((p) => p.monitored);
+      if (!watched.length) {
+        el.innerHTML = `<span class="font-label-xs text-label-xs text-outline">${ports.length} port(s) discovered, none watched.</span>`;
+        return;
+      }
+      el.innerHTML = `<span class="font-label-xs text-label-xs text-outline uppercase tracking-wide">Watched ports</span>`
+        + watched.map((p) => {
+          const down = p.alarm;
+          const fed = p.feeds_name ? ` → ${esc(p.feeds_name)}` : "";
+          return `<div class="flex items-center justify-between gap-2 font-label-xs text-label-xs ${down ? "text-error" : "text-on-surface-variant"}">
+            <span class="truncate flex items-center gap-1">${icon(down ? "power_off" : "visibility", { size: 11 })} ${esc(p.if_name || ("if" + p.if_index))}${fed}</span>
+            <span class="shrink-0">${down ? "down" : esc(p.oper_status || "up")}</span></div>`;
+        }).join("");
+    } catch { el.innerHTML = `<span class="font-label-xs text-label-xs text-error">Couldn't load ports</span>`; }
+  }
+
   function renderNodes(page) {
     let selectedDate = null;  // null = live view of all nodes; else a YYYY-MM-DD drill-down
+    let view = loadNodesView();   // "tree" | "map" (persisted); a date drill-down forces the list
+    let topoVB = null;            // preserved viewBox so a live refresh doesn't reset pan/zoom
     const expandPrefs = loadExpandPrefs();
     page.innerHTML = `<div class="w-full max-w-5xl mx-auto flex flex-col gap-section-gap px-4 md:px-8 py-6 md:py-8">
       <header>
@@ -908,9 +1195,13 @@
         <p class="text-outline font-label-xs text-label-xs mt-2">Tip: click a day to see which nodes were down then.</p>
       </section>
       <section class="flex flex-col gap-4">
-        <div class="flex justify-between items-center gap-2">
+        <div class="flex justify-between items-center gap-2 flex-wrap">
           <h3 id="nodes-title" class="font-headline-md text-headline-md text-primary">Active Nodes</h3>
           <div class="flex items-center gap-2">
+            <div id="view-toggle" class="flex items-center bg-surface-container-low border border-outline-variant rounded-md p-0.5">
+              <button data-view="tree" class="${nodeViewBtnCls(false)}">${icon("subdirectory_arrow_right", { size: 15 })} Tree</button>
+              <button data-view="map" class="${nodeViewBtnCls(false)}">${icon("hub", { size: 15 })} Map</button>
+            </div>
             <button id="nodes-clear" class="hidden items-center gap-1 text-on-surface-variant hover:text-primary font-label-md text-label-md px-3 py-1.5 rounded-md border border-outline-variant hover:bg-surface-container transition-colors">
               ${icon("close", { size: 16 })} Show all</button>
             <button id="add-node" class="flex items-center gap-1 bg-primary text-surface font-label-md text-label-md px-3 py-1.5 rounded-md active:scale-95 transition-transform">
@@ -918,6 +1209,7 @@
           </div>
         </div>
         <div id="nodes" class="grid grid-cols-1 gap-2">${loading("nodes")}</div>
+        <div id="topo" class="hidden">${loading("topology")}</div>
       </section>
     </div>`;
 
@@ -962,7 +1254,8 @@
               const date = el.getAttribute("data-date");
               selectedDate = selectedDate === date ? null : date;
               paint();
-              loadNodes();
+              applyView();    // a date drill-down forces the list; clearing it returns to the chosen view
+              loadActive();
             });
           });
         };
@@ -970,13 +1263,54 @@
       } catch (e) { /* heatmap is best-effort; node list still loads */ }
     }
 
+    function isListView() { return !!selectedDate || view === "tree"; }
+    function loadActive() { return isListView() ? loadNodes() : loadTopology(); }
+
+    function applyView() {
+      const list = isListView();
+      $("#nodes", page).classList.toggle("hidden", !list);
+      $("#topo", page).classList.toggle("hidden", list);
+      const t = page.querySelector('[data-view="tree"]'), m = page.querySelector('[data-view="map"]');
+      if (t) t.className = nodeViewBtnCls(view === "tree");
+      if (m) m.className = nodeViewBtnCls(view === "map");
+    }
+
+    async function loadTopology() {
+      const box = $("#topo", page);
+      $("#nodes-title", page).textContent = "Network Map";
+      const clear = $("#nodes-clear", page);
+      clear.classList.add("hidden"); clear.classList.remove("flex");
+      const cur = box.querySelector("#topo-svg");
+      if (cur) topoVB = cur.getAttribute("viewBox");   // keep pan/zoom across a live refresh
+      try {
+        const data = await getJSON("/api/topology");
+        if (currentPath() !== "#/nodes") return;
+        box.innerHTML = topologyMap(data);
+        const svg = box.querySelector("#topo-svg");
+        if (svg && topoVB) svg.setAttribute("viewBox", topoVB);
+        wireTopology(box, data, afterChange, (vb) => { topoVB = vb; });
+      } catch (e) { box.innerHTML = errorBox(e.message); }
+    }
+
+    $("#view-toggle", page).addEventListener("click", (ev) => {
+      const b = ev.target.closest("[data-view]");
+      if (!b) return;
+      const v = b.getAttribute("data-view");
+      if (v === view) return;
+      view = v; saveNodesView(v);
+      if (v === "map" && selectedDate) { selectedDate = null; loadHeatmap(); }
+      applyView();
+      loadActive();
+    });
+
     $("#nodes-clear", page).addEventListener("click", () => {
       selectedDate = null;
       loadHeatmap();
-      loadNodes();
+      applyView();
+      loadActive();
     });
 
-    const afterChange = () => { loadHeatmap(); loadNodes(); };
+    const afterChange = () => { loadHeatmap(); loadActive(); };
 
     $("#add-node", page).addEventListener("click", async () => {
       try {
@@ -1010,8 +1344,9 @@
       } catch (e) { toast("Couldn't load node", "error"); }
     });
 
+    applyView();   // reflect the persisted Tree/Map choice before the first paint
     return async function load() {
-      await Promise.all([loadHeatmap(), loadNodes()]);
+      await Promise.all([loadHeatmap(), loadActive()]);
     };
   }
 
