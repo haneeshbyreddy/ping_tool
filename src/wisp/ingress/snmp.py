@@ -31,12 +31,18 @@ OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"          # fallback display name
 OID_IF_ADMIN = "1.3.6.1.2.1.2.2.1.7"          # ifAdminStatus
 OID_IF_OPER = "1.3.6.1.2.1.2.2.1.8"           # ifOperStatus
 OID_IF_LASTCHANGE = "1.3.6.1.2.1.2.2.1.9"     # ifLastChange (sysUpTime ticks)
+OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"          # ifSpeed (bits/sec, 32-bit; caps ~4.29 Gbps)
 OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"        # ifName (preferred display name)
+# ifXTable high-capacity (64-bit) byte counters — the bandwidth signal. The 32-bit
+# ifInOctets/ifOutOctets wrap in seconds on a fast link, so we only read the HC pair.
+OID_IF_HCIN = "1.3.6.1.2.1.31.1.1.1.6"        # ifHCInOctets (Counter64)
+OID_IF_HCOUT = "1.3.6.1.2.1.31.1.1.1.10"      # ifHCOutOctets (Counter64)
+OID_IF_HIGHSPEED = "1.3.6.1.2.1.31.1.1.1.15"  # ifHighSpeed (Mbits/sec; for >4.29 Gbps links)
 OID_IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"      # ifAlias (operator label -> what it feeds)
 
 WALK_COLUMNS = (
-    OID_IF_DESCR, OID_IF_ADMIN, OID_IF_OPER,
-    OID_IF_LASTCHANGE, OID_IF_NAME, OID_IF_ALIAS,
+    OID_IF_DESCR, OID_IF_ADMIN, OID_IF_OPER, OID_IF_LASTCHANGE, OID_IF_SPEED,
+    OID_IF_NAME, OID_IF_HCIN, OID_IF_HCOUT, OID_IF_HIGHSPEED, OID_IF_ALIAS,
 )
 
 # IF-MIB integer status -> label. 1=up is the only "good" oper state; a monitored port
@@ -65,6 +71,11 @@ class PortStatus:
     admin_status: str            # 'up' | 'down' | ...
     oper_status: str             # 'up' | 'down' | 'lowerLayerDown' | ...
     last_change: str | None = None  # raw ifLastChange ticks (as text), forensic only
+    # Bandwidth signal (ifXTable). Raw monotonic byte counters — the daemon diffs two
+    # samples to get a rate; speed_bps is the link's negotiated capacity (for utilization).
+    in_octets: int | None = None     # ifHCInOctets
+    out_octets: int | None = None    # ifHCOutOctets
+    speed_bps: int | None = None     # ifHighSpeed (Mbps→bps) or ifSpeed (bps)
 
     def is_down(self) -> bool:
         """The alarm condition: oper is down while admin is up (admin-down = intentional,
@@ -84,6 +95,33 @@ def _status_label(raw: str) -> str:
         return _IF_STATUS.get(int(s), "unknown")
     except (TypeError, ValueError):
         return s.lower() if s else "unknown"
+
+
+def _int_or_none(raw) -> int | None:
+    """Parse a counter/gauge varbind value (decimal text) to int, or None if absent/blank
+    /non-numeric. Counter64 values can exceed 2**63, so we keep them as Python ints."""
+    if raw in (None, ""):
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def throughput_bps(prev_octets: int | None, cur_octets: int | None,
+                   dt_seconds: float) -> float | None:
+    """Bits/sec from two byte (octet) counter samples `dt_seconds` apart. Pure + purely
+    numeric (the caller computes dt), so the suite unit-tests it without a DB or network.
+
+    Returns None when a rate can't be trusted: a missing sample, a non-positive interval,
+    or a counter that went backwards (a device reboot/reset or a 64-bit wrap) — better to
+    emit nothing than a phantom multi-Gbps spike from a counter reset."""
+    if prev_octets is None or cur_octets is None or dt_seconds <= 0:
+        return None
+    delta = cur_octets - prev_octets
+    if delta < 0:
+        return None
+    return (delta * 8.0) / dt_seconds
 
 
 def _index_after(oid: str, prefix: str) -> int | None:
@@ -110,6 +148,8 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
     routing = {
         OID_IF_DESCR: "descr", OID_IF_ADMIN: "admin", OID_IF_OPER: "oper",
         OID_IF_LASTCHANGE: "lastchange", OID_IF_NAME: "name", OID_IF_ALIAS: "alias",
+        OID_IF_SPEED: "speed", OID_IF_HCIN: "hcin", OID_IF_HCOUT: "hcout",
+        OID_IF_HIGHSPEED: "highspeed",
     }
     for oid, value in varbinds:
         for prefix, key in routing.items():
@@ -127,6 +167,10 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
         name = (c.get("name") or "").strip() or (c.get("descr") or "").strip() or None
         alias = (c.get("alias") or "").strip() or None
         last = (c.get("lastchange") or "").strip() or None
+        # Capacity: prefer ifHighSpeed (Mbps) for fast links; fall back to ifSpeed (bps).
+        hi = _int_or_none(c.get("highspeed"))
+        lo = _int_or_none(c.get("speed"))
+        speed_bps = (hi * 1_000_000) if hi else (lo if lo else None)
         ports.append(PortStatus(
             if_index=idx,
             if_name=name,
@@ -134,6 +178,9 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
             admin_status=_status_label(c.get("admin", "")),
             oper_status=_status_label(c.get("oper", "")),
             last_change=last,
+            in_octets=_int_or_none(c.get("hcin")),
+            out_octets=_int_or_none(c.get("hcout")),
+            speed_bps=speed_bps,
         ))
     return ports
 

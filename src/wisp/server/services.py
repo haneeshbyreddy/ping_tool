@@ -269,12 +269,13 @@ def nodes_list(cfg: Config = CONFIG, hours: int = 24) -> list[dict]:
         port_rows = conn.execute(
             "SELECT device_id, COUNT(*) AS total,"
             " SUM(CASE WHEN monitored=1 THEN 1 ELSE 0 END) AS monitored,"
-            " SUM(CASE WHEN monitored=1 AND alarm=1 THEN 1 ELSE 0 END) AS down"
+            " SUM(CASE WHEN monitored=1 AND alarm=1 THEN 1 ELSE 0 END) AS down,"
+            " SUM(CASE WHEN monitored=1 AND bw_alarm=1 THEN 1 ELSE 0 END) AS bw_low"
             " FROM switch_ports GROUP BY device_id"
         ).fetchall()
     ports_by_device = {
         r["device_id"]: {"total": r["total"], "monitored": r["monitored"] or 0,
-                         "down": r["down"] or 0}
+                         "down": r["down"] or 0, "bw_low": r["bw_low"] or 0}
         for r in port_rows
     }
     down = _downtime_by_device(outages, win_start, win_end, only_down=False)
@@ -1154,6 +1155,8 @@ def list_switch_ports(device_id: int, cfg: Config = CONFIG) -> list[dict]:
         rows = conn.execute(
             "SELECT sp.id, sp.if_index, sp.if_name, sp.if_alias, sp.admin_status,"
             " sp.oper_status, sp.monitored, sp.feeds_device_id, sp.alarm, sp.alarm_since,"
+            " sp.in_bps, sp.out_bps, sp.if_speed_bps, sp.bw_threshold_mbps,"
+            " sp.bw_direction, sp.bw_alarm, sp.bw_alarm_since,"
             " sp.updated_at, f.name AS feeds_name"
             " FROM switch_ports sp LEFT JOIN devices f ON f.id = sp.feeds_device_id"
             " WHERE sp.device_id=? ORDER BY sp.if_index", (device_id,),
@@ -1170,6 +1173,15 @@ def list_switch_ports(device_id: int, cfg: Config = CONFIG) -> list[dict]:
         "feeds_name": r["feeds_name"],
         "alarm": bool(r["alarm"]),
         "alarm_since": r["alarm_since"],
+        # Live bandwidth (current throughput from the last counter delta), in Mbps for the
+        # UI, plus the link's negotiated capacity and the operator-set low-bw threshold.
+        "in_mbps": round(r["in_bps"] / 1e6, 3) if r["in_bps"] is not None else None,
+        "out_mbps": round(r["out_bps"] / 1e6, 3) if r["out_bps"] is not None else None,
+        "link_mbps": round(r["if_speed_bps"] / 1e6, 1) if r["if_speed_bps"] else None,
+        "bw_threshold_mbps": r["bw_threshold_mbps"],
+        "bw_direction": r["bw_direction"] or "either",
+        "bw_alarm": bool(r["bw_alarm"]),
+        "bw_alarm_since": r["bw_alarm_since"],
         "updated_at": r["updated_at"],
     } for r in rows]
 
@@ -1214,6 +1226,40 @@ def set_port_feeds(port_id: int, feeds_device_id, cfg: Config = CONFIG) -> bool:
         with connect(cfg) as conn:
             cur = conn.execute(
                 "UPDATE switch_ports SET feeds_device_id=? WHERE id=?", (fid, port_id))
+            conn.commit()
+            return cur.rowcount > 0
+    return bool(write_with_retry(_do))
+
+
+BW_DIRECTIONS = ("in", "out", "either", "total")
+
+
+def set_port_bandwidth(port_id: int, threshold_mbps, direction=None,
+                       cfg: Config = CONFIG) -> bool:
+    """Assign (or clear) a port's low-bandwidth alarm threshold + watched direction. A
+    blank/None threshold clears the bandwidth alarm entirely; otherwise the daemon pages
+    when the port's throughput stays below `threshold_mbps` (in the chosen direction) for
+    `WISP_SNMP_BW_CONSECUTIVE` walks. Setting/changing it re-arms detection (resets the
+    bw streak + clears any standing alarm) so a new floor never inherits a stale alarm —
+    same discipline as set_port_monitored. Raises DeviceError on bad input."""
+    thr = None
+    if threshold_mbps not in (None, "", "null", "None"):
+        try:
+            thr = float(threshold_mbps)
+        except (TypeError, ValueError):
+            raise DeviceError("bandwidth threshold must be a number (Mbps)")
+        if thr < 0:
+            raise DeviceError("bandwidth threshold can't be negative")
+    direction = (str(direction).strip().lower() if direction else "either")
+    if direction not in BW_DIRECTIONS:
+        raise DeviceError(f"bandwidth direction must be one of: {', '.join(BW_DIRECTIONS)}")
+
+    def _do():
+        with connect(cfg) as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET bw_threshold_mbps=?, bw_direction=?,"
+                " bw_low_streak=0, bw_alarm=0, bw_alarm_since=NULL WHERE id=?",
+                (thr, direction, port_id))
             conn.commit()
             return cur.rowcount > 0
     return bool(write_with_retry(_do))

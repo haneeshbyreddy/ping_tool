@@ -56,6 +56,7 @@ _DEVICE_SNMP = re.compile(r"^/api/devices/(\d+)/snmp$")
 _DEVICE_PORTS = re.compile(r"^/api/devices/(\d+)/ports$")
 _PORT_MONITORED = re.compile(r"^/api/ports/(\d+)/monitored$")
 _PORT_FEEDS = re.compile(r"^/api/ports/(\d+)/feeds$")
+_PORT_BANDWIDTH = re.compile(r"^/api/ports/(\d+)/bandwidth$")
 _WORKER_ITEM = re.compile(r"^/api/workers/(\d+)$")
 
 # API endpoints reachable without a valid session (the login flow itself). Every
@@ -381,6 +382,13 @@ class Handler(BaseHTTPRequestHandler):
             if mpf:
                 ok = services.set_port_feeds(
                     int(mpf.group(1)), body.get("feeds_device_id"), CONFIG)
+                return self._send_json({"ok": ok}, 200 if ok else 404)
+
+            mpb = _PORT_BANDWIDTH.match(path)  # set a port's low-bandwidth threshold
+            if mpb:
+                ok = services.set_port_bandwidth(
+                    int(mpb.group(1)), body.get("threshold_mbps"),
+                    body.get("direction"), CONFIG)
                 return self._send_json({"ok": ok}, 200 if ok else 404)
 
             m = _OUTAGE_ACTION.match(path)

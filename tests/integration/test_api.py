@@ -568,6 +568,33 @@ class SnmpPortApiTest(unittest.TestCase):
         self.assertTrue(api.set_port_feeds(pid, None, self.cfg))
         self.assertIsNone(api.list_switch_ports(1, self.cfg)[0]["feeds_device_id"])
 
+    def test_set_port_bandwidth_validation_and_rearm(self):
+        pid = self._port_id()
+        # set a threshold + direction, then read it back via list_switch_ports
+        self.assertTrue(api.set_port_bandwidth(pid, 50, "out", self.cfg))
+        port = api.list_switch_ports(1, self.cfg)[0]
+        self.assertEqual(port["bw_threshold_mbps"], 50.0)
+        self.assertEqual(port["bw_direction"], "out")
+        self.assertFalse(port["bw_alarm"])
+        # a standing alarm is re-armed away when the threshold is changed
+        with connect(self.cfg) as c:
+            c.execute("UPDATE switch_ports SET bw_alarm=1, bw_low_streak=3 WHERE id=?", (pid,))
+            c.commit()
+        self.assertTrue(api.set_port_bandwidth(pid, 20, "either", self.cfg))
+        with connect(self.cfg) as c:
+            r = c.execute("SELECT bw_alarm, bw_low_streak FROM switch_ports WHERE id=?",
+                          (pid,)).fetchone()
+        self.assertEqual((r["bw_alarm"], r["bw_low_streak"]), (0, 0))
+        # clearing the threshold (blank) is allowed; bad inputs are rejected
+        self.assertTrue(api.set_port_bandwidth(pid, "", None, self.cfg))
+        self.assertIsNone(api.list_switch_ports(1, self.cfg)[0]["bw_threshold_mbps"])
+        with self.assertRaises(api.DeviceError):
+            api.set_port_bandwidth(pid, -5, "in", self.cfg)
+        with self.assertRaises(api.DeviceError):
+            api.set_port_bandwidth(pid, "fast", "in", self.cfg)
+        with self.assertRaises(api.DeviceError):
+            api.set_port_bandwidth(pid, 10, "sideways", self.cfg)
+
     def test_delete_clears_switch_ports_both_directions(self):
         pid = self._port_id()
         api.set_port_feeds(pid, 2, self.cfg)   # switch(1) port feeds Tower(2)
@@ -615,7 +642,8 @@ class TopologyTest(unittest.TestCase):
 
     def test_nodes_list_port_summary(self):
         nodes = {n["id"]: n for n in api.nodes_list(self.cfg)}
-        self.assertEqual(nodes[3]["ports"], {"total": 2, "monitored": 1, "down": 1})
+        self.assertEqual(nodes[3]["ports"],
+                         {"total": 2, "monitored": 1, "down": 1, "bw_low": 0})
         # a node with no ports carries None, not a zero summary
         self.assertIsNone(nodes[1]["ports"])
 

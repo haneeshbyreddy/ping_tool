@@ -206,9 +206,10 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   `POST /api/devices/{id}/snmp`, `GET /api/devices/{id}/ports`, `POST /api/ports/{id}/monitored`,
   `POST /api/ports/{id}/feeds`; the Nodes modal carries the SNMP config + a ports panel.
 - **Surfaced live in the UI, not just the edit modal.** `nodes_list` (`/api/nodes`) now carries
-  a per-switch `ports: {total, monitored, down}` summary (`down` = monitored ports in `alarm=1`,
-  one GROUP BY — don't pull raw rows) + `snmp_enabled`, so a switch with a down monitored uplink no
-  longer looks identical to a healthy one (badge on the node row). `services.topology_graph`
+  a per-switch `ports: {total, monitored, down, bw_low}` summary (`down` = monitored ports in
+  `alarm=1`; `bw_low` = monitored ports in `bw_alarm=1`; one GROUP BY — don't pull raw rows) +
+  `snmp_enabled`, so a switch with a down (or starved) monitored uplink no longer looks identical to
+  a healthy one (badge on the node row + map node). `services.topology_graph`
   (`GET /api/topology`) returns the whole network as `{nodes, edges}` for the **topology map** —
   nodes **reuse `nodes_list`** (one source of truth for state), edges expose all three relationship
   models as `kind` ∈ `primary`|`backup`|`port` (the port edge carries `port_label` + `down`), and
@@ -218,12 +219,39 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   math, and a node-click **read-only detail card** (live state + uplinks + which ports are down) with
   an Edit button into the existing modal. A live SSE refresh preserves the current `viewBox` so it
   doesn't reset pan/zoom. A date drill-down (heatmap) forces the list regardless of the toggle.
-- **Tests:** `unit/test_snmp` (parser + is_down), `integration/test_ports` (discovery, flap
-  suppression, admin-down silent, fold-into-outage, leading indicator opens no outage, recovery,
-  alerts gate), `integration/test_api.SnmpPortApiTest` (config/validation, targets, toggles, FK
-  delete), `integration/test_api.TopologyTest` (per-switch port summary in `nodes_list`; the three
-  edge kinds + port `down` flag; dangling-edge drop on delete),
-  `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
+- **Per-port bandwidth tier (orthogonal to oper/admin status).** The *same* walk now also reads the
+  ifXTable 64-bit byte counters (`ifHCInOctets`/`ifHCOutOctets`) + capacity (`ifHighSpeed`→bps, else
+  `ifSpeed`); `parse_if_table` carries them on `PortStatus` (`in_octets`/`out_octets`/`speed_bps`).
+  The **pure** `snmp.throughput_bps(prev, cur, dt)` turns two counter samples into bits/sec —
+  None on a missing sample, a non-positive interval, OR a backwards counter (reboot/wrap → emit
+  nothing, not a phantom spike). `PortMonitor.sync_device` diffs each port vs its **prior row**
+  (`in_octets`/`out_octets`/`counters_at`, stored as **TEXT** because a Counter64 can exceed SQLite's
+  signed-64 INTEGER range — the math is Python arbitrary-precision int), persists the live rate
+  (`in_bps`/`out_bps`/`if_speed_bps`), and runs a **second flap-suppressed alarm** alongside the
+  down one: a *monitored* port that is **oper=up** and has an operator-set `bw_threshold_mbps`
+  trips when its watched rate stays below it for `WISP_SNMP_BW_CONSECUTIVE` (default 3) walks.
+  `bw_direction` ∈ `in`|`out`|`either`|`total` (NULL ⇒ `either`) picks which rate matters — "for an
+  ISP, whichever is important" for that link. Operator-set fields (`bw_threshold_mbps`/`bw_direction`)
+  are **never** overwritten by a walk (like `monitored`/`feeds_device_id`); the alarm state
+  (`bw_low_streak`/`bw_alarm`/`bw_alarm_since`, migration 0013) is in-row so a restart never
+  re-pages. Edge-only **operator** page gated by `WISP_SNMP_BW_ALERTS` (state always written); it is
+  a **soft signal — never folds into / opens an outage** (the port still pings up; a hard port-down
+  is the down alarm's job). **A bw-alarmed port that then goes oper-down clears its bw badge
+  SILENTLY** (eligibility lost → the down alarm owns the story, no "bandwidth recovered" noise).
+  Services: `set_port_bandwidth(port_id, threshold_mbps, direction)` (re-arms detection like
+  `set_port_monitored`; validates), `list_switch_ports` exposes `in_mbps`/`out_mbps`/`link_mbps`/
+  `bw_threshold_mbps`/`bw_direction`/`bw_alarm`. API: `POST /api/ports/{id}/bandwidth`. The Nodes
+  modal ports panel shows live ↓/↑ Mbps + the threshold/direction inputs; the node row + map node
+  badge a `bw_low` count.
+- **Tests:** `unit/test_snmp` (parser + is_down + counter/speed capture + the pure `throughput_bps`
+  math: normal/first-sample/non-positive-dt/counter-reset/Counter64), `integration/test_ports`
+  (discovery, flap suppression, admin-down silent, fold-into-outage, leading indicator opens no
+  outage, recovery, alerts gate; **+ `PortBandwidthTest`**: rate-from-delta, low-bw flap suppression
+  + edge page, single-dip no-page, recovery, direction in/out, unmonitored never alarms, bw alerts
+  gate, port-down clears bw silently), `integration/test_api.SnmpPortApiTest` (config/validation,
+  targets, toggles, **bw threshold validation + re-arm**, FK delete), `integration/test_api.TopologyTest`
+  (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
+  on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

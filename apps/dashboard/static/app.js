@@ -427,14 +427,25 @@
     UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
   };
 
+  // Throughput formatter (Mbps in, switches to Gbps when large; em-dash when unknown).
+  function fmtMbps(v) {
+    if (v == null) return "—";
+    if (v >= 1000) return (v / 1000).toFixed(2) + " Gbps";
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " Mbps";
+  }
+
   // SNMP port health, surfaced live on a switch's row (was previously only visible
-  // inside the edit modal). Red when a monitored uplink port is alarming; a muted count
-  // when ports are merely watched; nothing for a switch whose ports aren't watched yet.
+  // inside the edit modal). Red when a monitored uplink port is alarming; amber when a
+  // monitored port is below its bandwidth threshold; a muted count when ports are merely
+  // watched; nothing for a switch whose ports aren't watched yet.
   function portBadge(n) {
     const p = n.ports;
     if (!p || !p.total) return "";
     if (p.down > 0) {
       return `<span title="${p.down} monitored port(s) down (SNMP)" class="font-label-xs text-label-xs text-error border border-error/30 bg-error/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("power_off", { size: 12 })} ${p.down}/${p.monitored} ports down</span>`;
+    }
+    if (p.bw_low > 0) {
+      return `<span title="${p.bw_low} monitored port(s) below bandwidth threshold (SNMP)" class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md whitespace-nowrap flex items-center gap-1">${icon("arrow_downward", { size: 12 })} ${p.bw_low} low bw</span>`;
     }
     if (p.monitored > 0) {
       return `<span title="${p.monitored} of ${p.total} discovered port(s) watched (SNMP)" class="font-label-xs text-label-xs text-outline border border-outline-variant px-2 py-0.5 rounded-md whitespace-nowrap hidden sm:flex items-center gap-1">${icon("visibility", { size: 12 })} ${p.monitored} watched</span>`;
@@ -807,14 +818,32 @@
         const feedsOpts = [`<option value="">feeds: —</option>`].concat(
           devices.filter((x) => x.id !== d.id).map((x) =>
             `<option value="${x.id}" ${x.id === p.feeds_device_id ? "selected" : ""}>feeds: ${esc(x.name)}</option>`)).join("");
-        return `<div class="flex items-center justify-between gap-2 bg-surface border border-outline-variant rounded-md px-3 py-1.5">
-          <div class="min-w-0">
-            <p class="font-label-md text-label-md text-primary truncate">${label}</p>
-            <p class="font-mono-data text-[11px] ${oper}">oper ${esc(p.oper_status)} · admin ${esc(p.admin_status)}${p.alarm ? ' · <span class="text-error">ALARM</span>' : ""}</p>
+        const dirOpts = ["either", "in", "out", "total"].map((dir) =>
+          `<option value="${dir}" ${(p.bw_direction || "either") === dir ? "selected" : ""}>${dir}</option>`).join("");
+        // Live throughput line (down/up arrows = in/out), link capacity, and the
+        // low-bandwidth badge when this monitored port is below its threshold.
+        const rate = `<span class="${p.bw_alarm ? "text-amber-400" : "text-on-surface-variant"}">↓ ${fmtMbps(p.in_mbps)} · ↑ ${fmtMbps(p.out_mbps)}</span>`
+          + (p.link_mbps ? ` <span class="text-outline">of ${fmtMbps(p.link_mbps)}</span>` : "")
+          + (p.bw_alarm ? ' · <span class="text-amber-400">LOW BW</span>' : "");
+        return `<div class="flex flex-col gap-1 bg-surface border border-outline-variant rounded-md px-3 py-1.5">
+          <div class="flex items-center justify-between gap-2">
+            <div class="min-w-0">
+              <p class="font-label-md text-label-md text-primary truncate">${label}</p>
+              <p class="font-mono-data text-[11px] ${oper}">oper ${esc(p.oper_status)} · admin ${esc(p.admin_status)}${p.alarm ? ' · <span class="text-error">ALARM</span>' : ""}</p>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <select data-port-feeds="${p.id}" class="bg-surface border border-outline-variant text-primary text-[11px] rounded-md px-1.5 py-1 appearance-none max-w-[8rem]">${feedsOpts}</select>
+              <label title="Alarm if this port goes down" class="flex items-center gap-1 text-label-xs text-on-surface-variant"><input type="checkbox" data-port-mon="${p.id}" ${p.monitored ? "checked" : ""} class="accent-primary w-4 h-4"> watch</label>
+            </div>
           </div>
-          <div class="flex items-center gap-2 shrink-0">
-            <select data-port-feeds="${p.id}" class="bg-surface border border-outline-variant text-primary text-[11px] rounded-md px-1.5 py-1 appearance-none max-w-[8rem]">${feedsOpts}</select>
-            <label title="Alarm if this port goes down" class="flex items-center gap-1 text-label-xs text-on-surface-variant"><input type="checkbox" data-port-mon="${p.id}" ${p.monitored ? "checked" : ""} class="accent-primary w-4 h-4"> watch</label>
+          <div class="flex items-center justify-between gap-2 flex-wrap border-t border-outline-variant/60 pt-1">
+            <p class="font-mono-data text-[11px] flex items-center gap-1">${icon("monitoring", { size: 12 })} ${rate}</p>
+            <div class="flex items-center gap-1 text-label-xs text-on-surface-variant" title="Page when throughput stays below this for the configured walks (needs 'watch')">
+              <span>min</span>
+              <input data-port-bw="${p.id}" type="number" min="0" step="any" value="${p.bw_threshold_mbps != null ? p.bw_threshold_mbps : ""}" placeholder="—" class="w-16 bg-surface border border-outline-variant text-primary text-[11px] rounded-md px-1.5 py-1 outline-none focus:ring-1 focus:ring-primary" />
+              <span>Mbps</span>
+              <select data-port-bwdir="${p.id}" class="bg-surface border border-outline-variant text-primary text-[11px] rounded-md px-1.5 py-1 appearance-none">${dirOpts}</select>
+            </div>
           </div>
         </div>`;
       }
@@ -846,6 +875,8 @@
       portsPanel.addEventListener("change", async (ev) => {
         const mon = ev.target.closest("[data-port-mon]");
         const feeds = ev.target.closest("[data-port-feeds]");
+        const bw = ev.target.closest("[data-port-bw]");
+        const bwdir = ev.target.closest("[data-port-bwdir]");
         if (mon) {
           const res = await sendJSON("POST", `/api/ports/${mon.getAttribute("data-port-mon")}/monitored`, { monitored: mon.checked });
           if (res.ok && res.data.ok) { toast(mon.checked ? "Port watched" : "Port unwatched"); onDone(); }
@@ -854,6 +885,17 @@
           const res = await sendJSON("POST", `/api/ports/${feeds.getAttribute("data-port-feeds")}/feeds`, { feeds_device_id: feeds.value || null });
           if (res.ok && res.data.ok) toast("Port mapping saved");
           else toast(res.data.error || "Couldn't map port", "error");
+        } else if (bw || bwdir) {
+          // The threshold + direction submit together (read the pair from the same row).
+          const pid = (bw || bwdir).getAttribute(bw ? "data-port-bw" : "data-port-bwdir");
+          const thr = portsPanel.querySelector(`[data-port-bw="${pid}"]`);
+          const dir = portsPanel.querySelector(`[data-port-bwdir="${pid}"]`);
+          const res = await sendJSON("POST", `/api/ports/${pid}/bandwidth`, {
+            threshold_mbps: thr && thr.value.trim() !== "" ? Number(thr.value) : null,
+            direction: dir ? dir.value : "either",
+          });
+          if (res.ok && res.data.ok) { toast(thr && thr.value.trim() !== "" ? "Bandwidth threshold set" : "Bandwidth alarm cleared"); onDone(); }
+          else toast(res.data.error || "Couldn't set threshold", "error");
         }
       });
 
@@ -1002,10 +1044,15 @@
       badges += `<circle cx="${bx}" cy="${y + 13}" r="7" fill="#ffb4ab"/><text x="${bx}" y="${y + 16.5}" fill="#141313" font-size="9" text-anchor="middle" font-weight="700">${n.ports.down}</text>`;
       bx -= 17;
     }
+    if (n.ports && n.ports.bw_low > 0) {   // amber = monitored port(s) below bandwidth threshold
+      badges += `<circle cx="${bx}" cy="${y + 13}" r="7" fill="#fbbf24"/><text x="${bx}" y="${y + 16.5}" fill="#141313" font-size="9" text-anchor="middle" font-weight="700">${n.ports.bw_low}</text>`;
+      bx -= 17;
+    }
     if (n.on_backup) { badges += `<circle cx="${bx}" cy="${y + 13}" r="5" fill="#fbbf24"/>`; }
     const title = `${n.name} — ${n.state_label}`
       + (n.on_backup ? " · on backup" : "") + (n.maintenance ? " · maintenance" : "")
-      + (n.ports && n.ports.down ? ` · ${n.ports.down} port(s) down` : "");
+      + (n.ports && n.ports.down ? ` · ${n.ports.down} port(s) down` : "")
+      + (n.ports && n.ports.bw_low ? ` · ${n.ports.bw_low} port(s) low bandwidth` : "");
     return `<g data-node="${n.id}" style="cursor:pointer" opacity="${op}">
       <title>${esc(title)}</title>
       <rect x="${x}" y="${y}" width="${W}" height="${H}" rx="9" fill="#201f1f" stroke="${border}" stroke-width="1.6"${dash}/>
@@ -1164,9 +1211,13 @@
         + watched.map((p) => {
           const down = p.alarm;
           const fed = p.feeds_name ? ` → ${esc(p.feeds_name)}` : "";
-          return `<div class="flex items-center justify-between gap-2 font-label-xs text-label-xs ${down ? "text-error" : "text-on-surface-variant"}">
+          // current throughput (amber when below its bandwidth threshold)
+          const rate = (p.in_mbps != null || p.out_mbps != null)
+            ? `<span class="font-mono-data ${p.bw_alarm ? "text-amber-400" : "text-outline"}">↓${fmtMbps(p.in_mbps)} ↑${fmtMbps(p.out_mbps)}</span>` : "";
+          const cls = down ? "text-error" : p.bw_alarm ? "text-amber-400" : "text-on-surface-variant";
+          return `<div class="flex items-center justify-between gap-2 font-label-xs text-label-xs ${cls}">
             <span class="truncate flex items-center gap-1">${icon(down ? "power_off" : "visibility", { size: 11 })} ${esc(p.if_name || ("if" + p.if_index))}${fed}</span>
-            <span class="shrink-0">${down ? "down" : esc(p.oper_status || "up")}</span></div>`;
+            <span class="shrink-0 flex items-center gap-2">${rate}<span>${down ? "down" : p.bw_alarm ? "low bw" : esc(p.oper_status || "up")}</span></span></div>`;
         }).join("");
     } catch { el.innerHTML = `<span class="font-label-xs text-label-xs text-error">Couldn't load ports</span>`; }
   }

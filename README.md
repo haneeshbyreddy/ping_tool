@@ -148,6 +148,13 @@ run.sh                    # one-shot setup + run for both runtimes
   port `feeds` a device with an open outage — **folds into that outage** as the physical
   cause ("Port Gi0/2 → Tower B is down") instead of raising a competing alarm. ICMP stays
   the outage owner; SNMP confirms/enriches. Enable per device + flag ports on the Nodes page.
+- **Per-port bandwidth + low-throughput alarm** — the same SNMP walk reads the 64-bit IF-MIB byte
+  counters and the daemon diffs them into a live throughput rate (in/out Mbps, shown on the ports
+  panel, the node row, and the topology map). Assign a per-port **minimum** threshold and the
+  **direction** that matters for that link (in / out / either / total); a monitored port whose rate
+  stays below it pages the operator (flap-suppressed, operator-only, `WISP_SNMP_BW_ALERTS=0` mutes
+  the page). It's a soft "this uplink went quiet" signal — a port still up but no longer carrying
+  traffic — and never opens an outage (a hard port-down is the down alarm's job).
 - **Topology map + live port health** — the Nodes page has a **Tree ⇄ Map** toggle. The map
   is an interactive node-link graph (pan/zoom, click a node for a live detail card) that draws
   all three relationship layers at once: the primary ping parent, **backup uplinks** (`device_links`),
@@ -185,6 +192,8 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = SNMP ingress off) |
 | `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks before a monitored port alarms |
 | `WISP_SNMP_ALERTS` | `1` | `0` = keep port state/badges but mute the operator page |
+| `WISP_SNMP_BW_CONSECUTIVE` | `3` | consecutive below-threshold walks before a monitored port's low-bandwidth alarm |
+| `WISP_SNMP_BW_ALERTS` | `1` | `0` = keep the low-bandwidth state/badge but mute the operator page |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |
