@@ -832,7 +832,9 @@ def set_attendance(worker_id: int, present: bool, day: str = "",
 
 
 # --- device inventory management (config from the UI) -----------------------
-DEVICE_TYPES = ("core", "tower", "relay", "sector", "backhaul")
+# ISP infrastructure categories (core -> edge -> access -> customer + transport).
+# Kept in lockstep with the same list in apps/dashboard/static/app.js (the form dropdown).
+DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
 _DEVICE_FIELDS = ("name", "ip_address", "device_type", "region",
                   "parent_device_id", "technician_phone")
 

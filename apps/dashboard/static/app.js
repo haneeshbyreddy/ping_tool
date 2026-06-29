@@ -418,11 +418,11 @@
 
   // --- Nodes ----------------------------------------------------------------
   const NODE_STATE_MAP = {
-    UP: { dot: "bg-primary", text: "text-primary", icon: "cell_tower", glow: "0 0 4px #ffffff", op: "" },
+    UP: { dot: "bg-primary", text: "text-primary", icon: "hub", glow: "0 0 4px #ffffff", op: "" },
     // DEGRADED = still UP and replying, just sustained packet loss (>= WISP_LOSS_DEGRADED,
     // default 5%) — a "flaky link" warning, not an outage (nobody is paged for it). Amber,
     // not red, so it reads as caution and isn't mistaken for a DOWN node.
-    DEGRADED: { dot: "bg-amber-400", text: "text-amber-400", icon: "cell_tower", glow: "0 0 4px #fbbf24", op: "" },
+    DEGRADED: { dot: "bg-amber-400", text: "text-amber-400", icon: "hub", glow: "0 0 4px #fbbf24", op: "" },
     DOWN: { dot: "bg-error", text: "text-error", icon: "wifi_off", glow: "0 0 4px #ffb4ab", op: "" },
     UNREACHABLE: { dot: "bg-outline", text: "text-outline", icon: "router", glow: "", op: "opacity-60" },
   };
@@ -621,7 +621,8 @@
   }
 
   // --- node inventory editor (add / edit / delete) --------------------------
-  const DEVICE_TYPES = ["core", "tower", "relay", "sector", "backhaul"];
+  // ISP infrastructure categories, ordered core -> edge -> access -> customer + transport.
+  const DEVICE_TYPES = ["core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul"];
 
   function openModal(innerHtml) {
     const overlay = document.createElement("div");
@@ -669,7 +670,7 @@
         <button data-close class="text-on-surface-variant hover:text-primary p-1 rounded-full hover:bg-surface-container-high">${icon("close", { size: 20 })}</button>
       </div>
       <form data-node-form class="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
-        ${field("Name", "name", d.name, { required: true, full: true, placeholder: "e.g. Rampur Main Tower" })}
+        ${field("Name", "name", d.name, { required: true, full: true, placeholder: "e.g. Rampur Core Router" })}
         ${field("IP address", "ip_address", d.ip_address, { required: true, placeholder: "192.0.2.10" })}
         ${field("Type", "device_type", d.device_type, { options: typeOpts })}
         ${field("Region", "region", d.region, { placeholder: "village / area" })}

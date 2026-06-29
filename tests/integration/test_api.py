@@ -247,7 +247,7 @@ class ApiTest(unittest.TestCase):
     def test_create_validate_update_delete(self):
         # create
         nid = api.create_device({
-            "name": "New AP", "ip_address": "192.0.2.99", "device_type": "sector",
+            "name": "New AP", "ip_address": "192.0.2.99", "device_type": "AP",
             "region": "Testville", "parent_device_id": "1",
         }, self.cfg)
         rows = {d["id"]: d for d in api.list_devices(self.cfg)}
