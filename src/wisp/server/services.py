@@ -344,6 +344,7 @@ def topology_graph(cfg: Config = CONFIG, hours: int = 24) -> dict:
     are dropped so the map never dangles."""
     nodes = nodes_list(cfg, hours)
     active = {n["id"] for n in nodes}
+    by_id = {n["id"]: n for n in nodes}
     edges: list[dict] = []
     for n in nodes:
         p = n["parent_device_id"]
@@ -353,24 +354,55 @@ def topology_graph(cfg: Config = CONFIG, hours: int = 24) -> dict:
         backups = conn.execute(
             "SELECT child_id, parent_id FROM device_links"
             " WHERE is_active=1 AND kind='backup'").fetchall()
-        feeds = conn.execute(
-            "SELECT device_id, feeds_device_id, if_index, if_name, if_alias,"
-            " monitored, alarm FROM switch_ports WHERE feeds_device_id IS NOT NULL"
+        # ALL discovered ports (not just the feeds): the map draws each switch as a
+        # faceplate of its ports, so it needs every port's live status + throughput, not
+        # only the ones mapped to a downstream device. One ordered read; the per-port
+        # cells + the port-feed edges are both derived from it.
+        port_rows = conn.execute(
+            "SELECT device_id, feeds_device_id, if_index, if_name, if_alias, admin_status,"
+            " oper_status, monitored, alarm, bw_alarm, in_bps, out_bps, if_speed_bps"
+            " FROM switch_ports ORDER BY device_id, if_index"
         ).fetchall()
     for b in backups:
         if b["child_id"] in active and b["parent_id"] in active:
             edges.append({"parent_id": b["parent_id"], "child_id": b["child_id"],
                           "kind": "backup"})
-    for f in feeds:
-        if f["device_id"] in active and f["feeds_device_id"] in active:
-            base = f["if_name"] or f"if{f['if_index']}"
-            label = f"{base} ({f['if_alias']})" if f["if_alias"] else base
+    ports_by_device: dict[int, list[dict]] = {}
+    for r in port_rows:
+        if r["device_id"] not in active:
+            continue
+        base = r["if_name"] or f"if{r['if_index']}"
+        label = f"{base} ({r['if_alias']})" if r["if_alias"] else base
+        mon = bool(r["monitored"])
+        # Faceplate cell status, ordered by severity: a monitored alarm wins, then a
+        # bandwidth alarm, then admin-shut, then link up/down. This is what colours each
+        # port cell (red / amber / grey / teal / dim) at a glance.
+        if mon and r["alarm"]:
+            status = "down"
+        elif mon and r["bw_alarm"]:
+            status = "bw_low"
+        elif (r["admin_status"] or "").lower() != "up":
+            status = "admin_down"
+        elif (r["oper_status"] or "").lower() == "up":
+            status = "up"
+        else:
+            status = "link_down"     # oper down but not monitored (an idle/unused port)
+        ports_by_device.setdefault(r["device_id"], []).append({
+            "if_index": r["if_index"], "label": label, "status": status,
+            "monitored": mon, "feeds_device_id": r["feeds_device_id"],
+            "in_mbps": round(r["in_bps"] / 1e6, 2) if r["in_bps"] is not None else None,
+            "out_mbps": round(r["out_bps"] / 1e6, 2) if r["out_bps"] is not None else None,
+            "link_mbps": round(r["if_speed_bps"] / 1e6, 1) if r["if_speed_bps"] else None,
+        })
+        # Port-feed edge: only the ports actually mapped to a downstream device.
+        if r["feeds_device_id"] in active:
             edges.append({
-                "parent_id": f["device_id"], "child_id": f["feeds_device_id"],
-                "kind": "port", "port_label": label,
-                "monitored": bool(f["monitored"]),
-                "down": bool(f["monitored"] and f["alarm"]),
+                "parent_id": r["device_id"], "child_id": r["feeds_device_id"],
+                "kind": "port", "port_label": label, "if_index": r["if_index"],
+                "monitored": mon, "down": bool(mon and r["alarm"]),
             })
+    for dev_id, plist in ports_by_device.items():
+        by_id[dev_id]["port_list"] = plist
     return {"nodes": nodes, "edges": edges}
 
 

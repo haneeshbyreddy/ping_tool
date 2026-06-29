@@ -660,6 +660,21 @@ class TopologyTest(unittest.TestCase):
         self.assertTrue(ports[0]["down"])
         self.assertIn("Gi0/2", ports[0]["port_label"])
 
+    def test_topology_attaches_port_faceplate(self):
+        # the map draws a switch faceplate, so every discovered port (watched or not)
+        # rides on the node with a status the cell colours by.
+        g = api.topology_graph(self.cfg)
+        sw = {n["id"]: n for n in g["nodes"]}[3]
+        self.assertEqual([p["if_index"] for p in sw["port_list"]], [2, 3])
+        by_idx = {p["if_index"]: p for p in sw["port_list"]}
+        self.assertEqual(by_idx[2]["status"], "down")     # monitored + alarming
+        self.assertTrue(by_idx[2]["monitored"])
+        self.assertEqual(by_idx[2]["feeds_device_id"], 4)
+        self.assertEqual(by_idx[3]["status"], "up")        # unwatched, oper up
+        self.assertFalse(by_idx[3]["monitored"])
+        # a node with no discovered ports carries no faceplate
+        self.assertNotIn("port_list", {n["id"]: n for n in g["nodes"]}[1])
+
     def test_topology_drops_edges_to_inactive(self):
         # deleting the fed device clears the port + backup edges without dangling
         self.assertEqual(api.delete_device(4, self.cfg), {"ok": True})

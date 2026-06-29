@@ -973,11 +973,51 @@
   }
   function topoTrunc(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 
+  // --- switch faceplate geometry (ports drawn as cells under the node) -------
+  // Each switch renders like a real device faceplate: a header (name/state) plus a grid
+  // of small port cells, one per discovered port, coloured by live status. Node WIDTH is
+  // fixed (keeps the tidy-tree slot maths simple); HEIGHT grows with the port count.
+  const TOPO_NW = 188, TOPO_HEADER_H = 46;
+  const PORTS_PER_ROW = 8, PCELL_W = 16, PCELL_H = 11, PCELL_GAP = 3;
+  const FACE_PAD_TOP = 8, FACE_FOOTER_H = 15, MAX_PORT_ROWS = 6;
+  // Faceplate cell palette — reads at a glance like switch port LEDs: teal = link up,
+  // red = monitored port down, amber = below bandwidth threshold, grey = admin-shut,
+  // dim = an idle/unused port (oper down but not watched).
+  const PORT_CELL = {
+    up:         { fill: "#0c2e29", stroke: "#2dd4bf" },
+    down:       { fill: "#3a1414", stroke: "#ffb4ab" },
+    bw_low:     { fill: "#332608", stroke: "#fbbf24" },
+    admin_down: { fill: "#262626", stroke: "#5a5e60" },
+    link_down:  { fill: "#1b1a1a", stroke: "#33373a" },
+  };
+  const PORT_STATUS_LABEL = {
+    up: "link up", down: "DOWN (monitored)", bw_low: "low bandwidth",
+    admin_down: "admin-down", link_down: "link down",
+  };
+  function topoPortsShown(n) { return (n.port_list || []).slice(0, MAX_PORT_ROWS * PORTS_PER_ROW); }
+  function nodeHeight(n) {
+    const c = topoPortsShown(n).length;
+    if (!c) return TOPO_HEADER_H;
+    const rows = Math.ceil(c / PORTS_PER_ROW);
+    return TOPO_HEADER_H + FACE_PAD_TOP + rows * PCELL_H + (rows - 1) * PCELL_GAP + FACE_FOOTER_H;
+  }
+  // Rect of the i-th port cell, given the node's top-left (x,y). The grid is centered in
+  // the node width; shared by the faceplate draw and the port-feed edge anchor.
+  function portCellRect(x, y, i) {
+    const col = i % PORTS_PER_ROW, row = Math.floor(i / PORTS_PER_ROW);
+    const gridW = PORTS_PER_ROW * PCELL_W + (PORTS_PER_ROW - 1) * PCELL_GAP;
+    const gx = x + (TOPO_NW - gridW) / 2;
+    return { x: gx + col * (PCELL_W + PCELL_GAP),
+             y: y + TOPO_HEADER_H + FACE_PAD_TOP + row * (PCELL_H + PCELL_GAP),
+             w: PCELL_W, h: PCELL_H };
+  }
+
   // Tidy-tree layout over the PRIMARY topology: leaves get sequential x slots, a parent
-  // centers over its children, each root's tree laid side by side. Backup/port edges are
-  // overlays on top of these positions.
+  // centers over its children, each root's tree laid side by side. Node heights vary
+  // (faceplates), so each depth's row is spaced by the TALLEST node in it. Backup/port
+  // edges are overlays on top of these positions.
   function layoutTopology(nodes) {
-    const NW = 172, NH = 54, HGAP = 28, LEVEL_Y = 112;
+    const NW = TOPO_NW, HGAP = 26, VGAP = 66;
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const kids = new Map();
     const roots = [];
@@ -989,23 +1029,32 @@
     const byName = (a, b) => String(a.name).localeCompare(String(b.name));
     roots.sort(byName);
     for (const arr of kids.values()) arr.sort(byName);
+    // depth per node, then the row Y of each depth from the tallest node above it.
+    const depth = new Map();
+    (function setDepth(list, d) {
+      for (const n of list) { depth.set(n.id, d); setDepth(kids.get(n.id) || [], d + 1); }
+    })(roots, 0);
+    const rowH = [];
+    for (const n of nodes) { const d = depth.get(n.id); rowH[d] = Math.max(rowH[d] || 0, nodeHeight(n)); }
+    const rowTop = []; let acc = 0;
+    for (let d = 0; d < rowH.length; d++) { rowTop[d] = acc; acc += (rowH[d] || TOPO_HEADER_H) + VGAP; }
     const pos = new Map();
     let cursor = 0;
-    function place(n, depth) {
+    function place(n) {
       const cs = kids.get(n.id) || [];
       let left;
       if (!cs.length) { left = cursor; cursor += NW + HGAP; }
       else {
-        const ls = cs.map((c) => place(c, depth + 1));
+        const ls = cs.map(place);
         left = (ls[0] + ls[ls.length - 1]) / 2;
       }
-      pos.set(n.id, { left, top: depth * LEVEL_Y });
+      pos.set(n.id, { left, top: rowTop[depth.get(n.id)], h: nodeHeight(n) });
       return left;
     }
-    for (const r of roots) { place(r, 0); cursor += HGAP * 1.5; }
+    for (const r of roots) { place(r); cursor += HGAP * 1.5; }
     let maxR = 0, maxB = 0;
-    for (const p of pos.values()) { maxR = Math.max(maxR, p.left + NW); maxB = Math.max(maxB, p.top + NH); }
-    return { pos, NW, NH, width: maxR, height: maxB };
+    for (const p of pos.values()) { maxR = Math.max(maxR, p.left + NW); maxB = Math.max(maxB, p.top + p.h); }
+    return { pos, NW, width: maxR, height: maxB };
   }
 
   function topoCurve(a, b, bow) {
@@ -1013,10 +1062,10 @@
     return `M ${a.x} ${a.y} Q ${mx + bow} ${my} ${b.x} ${b.y}`;
   }
 
-  function topoEdge(e, L, byId) {
+  function topoEdge(e, L, byId, anchors) {
     const a = L.pos.get(e.parent_id), b = L.pos.get(e.child_id);
     if (!a || !b) return "";
-    const from = { x: a.left + L.NW / 2, y: a.top + L.NH };
+    const from = { x: a.left + L.NW / 2, y: a.top + a.h };
     const to = { x: b.left + L.NW / 2, y: b.top };
     if (e.kind === "primary") {
       return `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="${edgeColor(byId.get(e.child_id))}" stroke-width="1.6"/>`;
@@ -1024,42 +1073,74 @@
     if (e.kind === "backup") {
       return `<path d="${topoCurve(from, to, 55)}" fill="none" stroke="#fbbf24" stroke-width="1.6" stroke-dasharray="6 4" opacity="0.85"/>`;
     }
-    // port-feed: physical link, teal (red when alarming), with the port label at the bow.
+    // port-feed: physical link, teal (red when alarming). Anchor it under the actual port
+    // cell's column on the faceplate, so the line visibly "drops" from that port.
+    const anchor = anchors && anchors.get(`${e.parent_id}:${e.if_index}`);
+    if (anchor) from.x = anchor.x;
     const col = e.down ? "#ffb4ab" : "#2dd4bf";
     const mid = { x: (from.x + to.x) / 2 - 27, y: (from.y + to.y) / 2 };
     return `<path d="${topoCurve(from, to, -55)}" fill="none" stroke="${col}" stroke-width="1.6" stroke-dasharray="2 3" opacity="0.9"/>`
       + `<text x="${mid.x}" y="${mid.y}" fill="${col}" font-size="9.5" text-anchor="middle" font-weight="${e.down ? 700 : 400}">${esc(topoTrunc(e.port_label, 16))}</text>`;
   }
 
+  // One faceplate cell = one switch port, coloured by live status; a watched port carries
+  // a bottom accent bar (it's "patched in"). Throughput + label live in the hover title.
+  function portCell(port, r) {
+    const c = PORT_CELL[port.status] || PORT_CELL.link_down;
+    const sw = port.monitored ? 1.4 : 0.7;
+    const thr = port.in_mbps != null ? ` · ↓${fmtMbps(port.in_mbps)} ↑${fmtMbps(port.out_mbps)}` : "";
+    const title = `${port.label} — ${PORT_STATUS_LABEL[port.status] || port.status}${thr}${port.monitored ? " · watched" : ""}`;
+    return `<g><title>${esc(title)}</title>`
+      + `<rect x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}" rx="2.5" fill="${c.fill}" stroke="${c.stroke}" stroke-width="${sw}"/>`
+      + (port.monitored ? `<rect x="${r.x + 2}" y="${r.y + r.h - 2.4}" width="${r.w - 4}" height="1.6" rx="0.8" fill="${c.stroke}"/>` : "")
+      + `</g>`;
+  }
+
   function topoNode(n, L) {
     const p = L.pos.get(n.id);
     if (!p) return "";
-    const { left: x, top: y } = p, W = L.NW, H = L.NH;
+    const { left: x, top: y, h: H } = p, W = L.NW;
     const border = TOPO_BORDER[n.state] || "#444748";
     const dot = TOPO_DOT[n.state] || "#ffffff";
     const op = n.state === "UNREACHABLE" ? 0.6 : 1;
     const dash = n.maintenance ? ` stroke-dasharray="5 3"` : "";
+    const shown = topoPortsShown(n);
+    const hasFace = shown.length > 0;
+    // header badges: on_backup always; the down/bw COUNT badges only when there's no
+    // faceplate (a switch's faceplate already colours its own bad ports, so the count
+    // circle would be redundant there).
     let bx = x + W - 13, badges = "";
-    if (n.ports && n.ports.down > 0) {
+    if (!hasFace && n.ports && n.ports.down > 0) {
       badges += `<circle cx="${bx}" cy="${y + 13}" r="7" fill="#ffb4ab"/><text x="${bx}" y="${y + 16.5}" fill="#141313" font-size="9" text-anchor="middle" font-weight="700">${n.ports.down}</text>`;
       bx -= 17;
     }
-    if (n.ports && n.ports.bw_low > 0) {   // amber = monitored port(s) below bandwidth threshold
+    if (!hasFace && n.ports && n.ports.bw_low > 0) {
       badges += `<circle cx="${bx}" cy="${y + 13}" r="7" fill="#fbbf24"/><text x="${bx}" y="${y + 16.5}" fill="#141313" font-size="9" text-anchor="middle" font-weight="700">${n.ports.bw_low}</text>`;
       bx -= 17;
     }
     if (n.on_backup) { badges += `<circle cx="${bx}" cy="${y + 13}" r="5" fill="#fbbf24"/>`; }
+    let face = "";
+    if (hasFace) {
+      const cells = shown.map((port, i) => portCell(port, portCellRect(x, y, i))).join("");
+      const sep = `<line x1="${x + 11}" y1="${y + TOPO_HEADER_H - 3}" x2="${x + W - 11}" y2="${y + TOPO_HEADER_H - 3}" stroke="#33373a" stroke-width="1"/>`;
+      const sm = n.ports || {};
+      const trouble = (sm.down || 0) + (sm.bw_low || 0);
+      const total = sm.total != null ? sm.total : (n.port_list || []).length;
+      const ftxt = `${total} ports · ${sm.monitored || 0} watched${trouble ? ` · ${trouble} alert` : ""}`;
+      const fcol = trouble ? (sm.down ? "#ffb4ab" : "#fbbf24") : "#8e9192";
+      face = sep + cells + `<text x="${x + W / 2}" y="${y + H - 5}" fill="${fcol}" font-size="9" text-anchor="middle" font-weight="${trouble ? 600 : 400}">${esc(ftxt)}</text>`;
+    }
     const title = `${n.name} — ${n.state_label}`
       + (n.on_backup ? " · on backup" : "") + (n.maintenance ? " · maintenance" : "")
       + (n.ports && n.ports.down ? ` · ${n.ports.down} port(s) down` : "")
       + (n.ports && n.ports.bw_low ? ` · ${n.ports.bw_low} port(s) low bandwidth` : "");
     return `<g data-node="${n.id}" style="cursor:pointer" opacity="${op}">
       <title>${esc(title)}</title>
-      <rect x="${x}" y="${y}" width="${W}" height="${H}" rx="9" fill="#201f1f" stroke="${border}" stroke-width="1.6"${dash}/>
-      <circle cx="${x + 15}" cy="${y + H / 2}" r="5" fill="${dot}"/>
-      <text x="${x + 28}" y="${y + 22}" fill="#e5e2e1" font-size="12.5" font-weight="600">${esc(topoTrunc(n.name, 19))}</text>
-      <text x="${x + 28}" y="${y + 39}" fill="#8e9192" font-size="10">${esc(topoTrunc((n.type || "node") + " · " + n.ip, 24))}</text>
-      ${badges}
+      <rect x="${x}" y="${y}" width="${W}" height="${H}" rx="10" fill="#201f1f" stroke="${border}" stroke-width="1.6"${dash}/>
+      <circle cx="${x + 15}" cy="${y + 23}" r="5" fill="${dot}"/>
+      <text x="${x + 28}" y="${y + 20}" fill="#e5e2e1" font-size="12.5" font-weight="600">${esc(topoTrunc(n.name, 20))}</text>
+      <text x="${x + 28}" y="${y + 36}" fill="#8e9192" font-size="10">${esc(topoTrunc((n.type || "node") + " · " + n.ip, 25))}</text>
+      ${badges}${face}
     </g>`;
   }
 
@@ -1074,9 +1155,19 @@
     }
     const L = layoutTopology(nodes);
     const byId = new Map(nodes.map((n) => [n.id, n]));
-    const edges = ((data && data.edges) || []).map((e) => topoEdge(e, L, byId)).join("");
+    // anchor each port-feed edge under its port cell's column on the faceplate.
+    const anchors = new Map();
+    for (const n of nodes) {
+      const pp = L.pos.get(n.id);
+      if (!pp) continue;
+      topoPortsShown(n).forEach((port, i) => {
+        const r = portCellRect(pp.left, pp.top, i);
+        anchors.set(`${n.id}:${port.if_index}`, { x: r.x + r.w / 2 });
+      });
+    }
+    const edges = ((data && data.edges) || []).map((e) => topoEdge(e, L, byId, anchors)).join("");
     const ns = nodes.map((n) => topoNode(n, L)).join("");
-    const pad = 52, vb = `${-pad} ${-pad} ${L.width + pad * 2} ${L.height + pad * 2}`;
+    const pad = 54, vb = `${-pad} ${-pad} ${L.width + pad * 2} ${L.height + pad * 2}`;
     const btn = "w-8 h-8 flex items-center justify-center bg-surface-container border border-outline-variant rounded-md text-on-surface-variant hover:text-primary hover:bg-surface-container-high transition-colors";
     return `<div class="relative bg-surface-dim border border-outline-variant rounded-md overflow-hidden" style="height:min(70vh,640px)">
       <svg id="topo-svg" class="w-full h-full select-none" style="cursor:grab;touch-action:none" viewBox="${vb}">
@@ -1087,6 +1178,13 @@
         ${topoLegendRow("background:#fbbf24;height:0;border-top:2px dashed #fbbf24", "backup uplink")}
         ${topoLegendRow("background:#2dd4bf;height:0;border-top:2px dashed #2dd4bf", "SNMP port feed")}
         <div class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full" style="background:#ffb4ab"></span>down / port alarm</div>
+        <div class="flex items-center gap-1.5 pt-1 mt-0.5 border-t border-outline-variant/40">
+          <span class="text-outline">ports</span>
+          <span title="link up" class="inline-block w-2.5 h-2 rounded-[2px]" style="background:#0c2e29;border:1px solid #2dd4bf"></span>
+          <span title="monitored port down" class="inline-block w-2.5 h-2 rounded-[2px]" style="background:#3a1414;border:1px solid #ffb4ab"></span>
+          <span title="low bandwidth" class="inline-block w-2.5 h-2 rounded-[2px]" style="background:#332608;border:1px solid #fbbf24"></span>
+          <span title="admin/idle" class="inline-block w-2.5 h-2 rounded-[2px]" style="background:#262626;border:1px solid #5a5e60"></span>
+        </div>
       </div>
       <div class="absolute bottom-3 right-3 flex flex-col gap-1.5">
         <button data-zoom="in" title="Zoom in" class="${btn}">${icon("add", { size: 18 })}</button>
