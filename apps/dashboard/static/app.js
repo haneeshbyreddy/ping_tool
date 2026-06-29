@@ -169,6 +169,7 @@
           <h1 class="font-headline-lg text-headline-lg font-bold tracking-tighter text-primary">${esc(BRAND.org_name)}</h1>
         </a>
         <div class="flex items-center gap-2 text-on-surface-variant">
+          <a href="#/" id="lowbw-chip" class="hidden"></a>
           <span id="uplink-chip" class="hidden"></span>
           <div class="relative">
             <button id="account-btn" class="p-2 rounded-full flex items-center justify-center w-10 h-10 hover:bg-surface-container active:scale-95 transition-transform">${icon("account_circle", { size: 28 })}</button>
@@ -332,6 +333,7 @@
           <h2 class="font-headline-md text-headline-md text-primary">Network Analytics</h2></div>
         <div id="summary">${loading("analytics")}</div>
       </section>
+      <div id="lowbw"></div>
       <section class="animate-fade-in">
         <div class="flex items-center justify-between mb-4">
           <div class="flex items-center gap-2">${icon("warning", { size: 20, cls: "text-error" })}
@@ -352,6 +354,19 @@
         const responders = team.filter((w) => w.is_active);
         $("#summary", page).innerHTML = summaryCards(s);
         updateUplinkChip(s.uplink_down);
+        // Low-bandwidth: render the card, refresh the header chip, and toast any port
+        // that newly crossed below its limit (skip the storm on the very first paint).
+        const low = s.low_bandwidth || [];
+        $("#lowbw", page).innerHTML = lowBandwidthCard(low);
+        updateLowBwChip(low);
+        const seen = new Set(low.map((p) => p.port_id));
+        if (_seenLowBw) {
+          for (const p of low) {
+            if (!_seenLowBw.has(p.port_id))
+              toast(`📉 Low bandwidth — ${p.switch_name} · ${p.label}`, "error");
+          }
+        }
+        _seenLowBw = seen;
         $("#triage-count", page).textContent = `${triage.length} ITEM${triage.length === 1 ? "" : "S"}`;
         $("#triage", page).innerHTML = triage.length
           ? triage.map((o) => triageCard(o, responders)).join("")
@@ -414,6 +429,49 @@
       chip.className = "hidden";
       chip.innerHTML = "";
     }
+  }
+
+  // Header chip: a persistent amber indicator (on every page) while any monitored port
+  // is below its bandwidth threshold. Mirrors the uplink chip; clicking it jumps home to
+  // the Low-Bandwidth card.
+  function updateLowBwChip(list) {
+    const chip = $("#lowbw-chip");
+    if (!chip) return;
+    const n = (list || []).length;
+    if (n) {
+      chip.className = "font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-1 rounded-md flex items-center gap-1 cursor-pointer hover:bg-amber-400/20";
+      chip.innerHTML = `${icon("arrow_downward", { size: 14 })} ${n} LOW BW`;
+    } else {
+      chip.className = "hidden";
+      chip.innerHTML = "";
+    }
+  }
+
+  // The dashboard "Low Bandwidth" card: shown only when monitored ports are below limit.
+  // Each row = switch · port, live ↓/↑ rate vs the threshold, and how long it's been low.
+  function lowBandwidthCard(list) {
+    if (!list || !list.length) return "";
+    const rows = list.map((p) => {
+      const dir = p.direction && p.direction !== "either" ? ` ${esc(p.direction)}` : "";
+      const limit = p.threshold_mbps != null ? `limit ${p.threshold_mbps} Mbps${dir}` : "";
+      const since = p.since
+        ? ` · low for <span data-since="${esc(p.since)}">—</span>` : "";
+      return `<div class="flex items-center justify-between gap-3 py-2 border-t border-amber-400/15 first:border-t-0 first:pt-0">
+        <div class="min-w-0">
+          <p class="font-label-md text-label-md text-primary truncate">${esc(p.switch_name)} <span class="text-on-surface-variant">· ${esc(p.label)}</span></p>
+          <p class="font-mono-data text-[11px] text-on-surface-variant">↓ ${fmtMbps(p.in_mbps)} · ↑ ${fmtMbps(p.out_mbps)} <span class="text-outline">(${limit})</span>${since}</p>
+        </div>
+        <span class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 rounded-md shrink-0 whitespace-nowrap flex items-center gap-1">${icon("arrow_downward", { size: 12 })} LOW BW</span>
+      </div>`;
+    }).join("");
+    return `<section class="animate-fade-in">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-2">${icon("monitoring", { size: 20, cls: "text-amber-400" })}
+          <h2 class="font-headline-md text-headline-md text-primary">Low Bandwidth</h2></div>
+        <span class="font-label-xs text-label-xs text-amber-400 border border-amber-400/30 bg-amber-400/10 px-2 py-1 rounded-md">${list.length} PORT${list.length === 1 ? "" : "S"}</span>
+      </div>
+      <div class="border border-amber-400/30 bg-amber-400/[0.04] rounded-md p-4">${rows}</div>
+    </section>`;
   }
 
   // --- Nodes ----------------------------------------------------------------
@@ -2054,6 +2112,8 @@
   let _activeLoad = null;
   let _events = null;     // EventSource (server push)
   let _liveOk = false;    // is the SSE stream currently connected?
+  let _seenLowBw = null;  // port_ids already low-bandwidth (null until first paint, so a
+                          // reload doesn't toast every standing alarm)
 
   function formFocused() {
     const a = document.activeElement;

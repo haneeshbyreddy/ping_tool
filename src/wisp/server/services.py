@@ -82,6 +82,30 @@ def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
         ).fetchone()
         last_poll = conn.execute(
             "SELECT MAX(timestamp) AS t FROM poll_results").fetchone()["t"]
+        # Monitored ports currently below their bandwidth threshold — feeds the dashboard
+        # "Low Bandwidth" card + header chip (and the in-app toast on a new one).
+        low_bw = conn.execute(
+            "SELECT sp.id, sp.device_id, d.name AS switch_name, sp.if_index, sp.if_name,"
+            " sp.if_alias, sp.in_bps, sp.out_bps, sp.bw_threshold_mbps, sp.bw_direction,"
+            " sp.bw_alarm_since"
+            " FROM switch_ports sp JOIN devices d ON d.id = sp.device_id"
+            " WHERE sp.monitored=1 AND sp.bw_alarm=1 AND d.is_active=1"
+            " ORDER BY sp.bw_alarm_since"
+        ).fetchall()
+
+    low_bandwidth = []
+    for r in low_bw:
+        base = r["if_name"] or f"if{r['if_index']}"
+        label = f"{base} ({r['if_alias']})" if r["if_alias"] else base
+        low_bandwidth.append({
+            "port_id": r["id"], "device_id": r["device_id"],
+            "switch_name": r["switch_name"], "label": label,
+            "in_mbps": round(r["in_bps"] / 1e6, 2) if r["in_bps"] is not None else None,
+            "out_mbps": round(r["out_bps"] / 1e6, 2) if r["out_bps"] is not None else None,
+            "threshold_mbps": r["bw_threshold_mbps"],
+            "direction": r["bw_direction"] or "either",
+            "since": r["bw_alarm_since"],
+        })
 
     window_s = (win_end - win_start).total_seconds()
     down_by_dev = _downtime_by_device(outages, win_start, win_end, only_down=True)
@@ -114,6 +138,7 @@ def system_summary(cfg: Config = CONFIG, hours: int = 24) -> dict:
         "monitor_age_s": monitor_age_s,
         "monitor_stale": monitor_stale,
         "stale_after_s": stale_after_s,
+        "low_bandwidth": low_bandwidth,
     }
 
 
@@ -1228,7 +1253,8 @@ def set_port_monitored(port_id: int, monitored: bool, cfg: Config = CONFIG) -> b
         with connect(cfg) as conn:
             cur = conn.execute(
                 "UPDATE switch_ports SET monitored=?, down_streak=0, alarm=0,"
-                " alarm_since=NULL WHERE id=?", (1 if monitored else 0, port_id))
+                " alarm_since=NULL, bw_low_streak=0, bw_alarm=0, bw_alarm_since=NULL"
+                " WHERE id=?", (1 if monitored else 0, port_id))
             conn.commit()
             return cur.rowcount > 0
     return bool(write_with_retry(_do))

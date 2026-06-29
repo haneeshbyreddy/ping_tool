@@ -243,6 +243,15 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   `bw_threshold_mbps`/`bw_direction`/`bw_alarm`. API: `POST /api/ports/{id}/bandwidth`. The Nodes
   modal ports panel shows live ↓/↑ Mbps + the threshold/direction inputs; the node row + map node
   badge a `bw_low` count.
+- **Surfaced on the main dashboard (operator-facing, real-time).** `system_summary` carries a
+  `low_bandwidth` list (one entry per monitored port currently in `bw_alarm`: switch, port label,
+  live in/out Mbps, threshold/direction, `bw_alarm_since`). The dashboard renders a **"Low Bandwidth"
+  card** (shown only when non-empty) + a persistent **header chip** on every page, and toasts a port
+  that *newly* crosses below limit (the SPA tracks seen `port_id`s so a reload doesn't re-toast a
+  standing alarm). It's **live**: `_data_version` now folds in `switch_ports.updated_at`, so each
+  walk pushes via SSE — combined with the faster default SNMP cadence (`WISP_SNMP_INTERVAL_S` 30s)
+  the rates + card refresh in near-real-time. The ntfy operator page on the edge is unchanged; this
+  is the in-app channel. `set_port_monitored` now also disarms the bw alarm (full re-arm on unwatch).
 - **Tests:** `unit/test_snmp` (parser + is_down + counter/speed capture + the pure `throughput_bps`
   math: normal/first-sample/non-positive-dt/counter-reset/Counter64), `integration/test_ports`
   (discovery, flap suppression, admin-down silent, fold-into-outage, leading indicator opens no
@@ -426,7 +435,9 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   `build_engine` rehydrates + `_confirm_up` resolves it) or dismiss it.
 - **Live UI is push, not poll (SSE).** `GET /api/events` (`routes._serve_events`) is a
   Server-Sent Events stream: a per-connection 1s loop emits a `changed` event whenever
-  `_data_version` (MAX(id) of `poll_results`/`outages`/`alert_log`) moves — i.e. every cycle and
+  `_data_version` (MAX(id) of `poll_results`/`outages`/`alert_log` + MAX(`updated_at`) of
+  `switch_ports` so an SNMP walk's port/bandwidth changes — which UPSERT in place, no new id —
+  also push the map/faceplate + Low-Bandwidth card live) moves — i.e. every cycle and
   instantly on a between-cycle DOWN/recovery. The body has no Content-Length (delimited by
   `Connection: close`); it's gated by `_guard_api` like any `/api/*` (EventSource sends the session
   cookie). The SPA subscribes once (`startLive`/`liveReload` in app.js) and re-renders the live

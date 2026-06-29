@@ -138,11 +138,12 @@ class Config:
     backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
 
     # --- SNMP port status (graph topology Part B; IF-MIB oper/admin only) ----
-    # A second, slower ingress: walk each snmp_enabled switch's ifTable and alarm on a
-    # *monitored* uplink/infra port that goes oper=down while admin=up. Ports don't flap
-    # like radio links and one bulk-walk per switch is cheap, so this runs on its own,
-    # much slower cadence than the ICMP poll. 0 disables the SNMP task entirely.
-    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 90))
+    # A second ingress: walk each snmp_enabled switch's ifTable for port status AND live
+    # bandwidth (byte-counter deltas). One bulk-walk per switch is cheap, so it runs on
+    # its own cadence. 30s gives near-real-time throughput on the dashboard (and ~3×30s to
+    # a bandwidth alarm); raise it to ease load on switches with many monitored ports, or
+    # lower it for fresher rates. 0 disables the SNMP task entirely.
+    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 30))
     # Flap suppression for ports: a monitored port must read down this many consecutive
     # walks before it alarms (mirrors the ICMP down_consecutive idea, gentler cadence).
     snmp_down_consecutive: int = field(

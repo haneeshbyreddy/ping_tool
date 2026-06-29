@@ -189,7 +189,7 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_BACKUP_ALERTS` | `1` | `0` = keep the on-backup badge but mute the operator page |
-| `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = SNMP ingress off) |
+| `WISP_SNMP_INTERVAL_S` | `30` | seconds between SNMP walks — port status + live bandwidth (0 = SNMP ingress off); raise to ease switch load, lower for fresher rates |
 | `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks before a monitored port alarms |
 | `WISP_SNMP_ALERTS` | `1` | `0` = keep port state/badges but mute the operator page |
 | `WISP_SNMP_BW_CONSECUTIVE` | `3` | consecutive below-threshold walks before a monitored port's low-bandwidth alarm |

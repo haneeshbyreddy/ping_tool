@@ -595,6 +595,29 @@ class SnmpPortApiTest(unittest.TestCase):
         with self.assertRaises(api.DeviceError):
             api.set_port_bandwidth(pid, 10, "sideways", self.cfg)
 
+    def test_system_summary_low_bandwidth(self):
+        pid = self._port_id()
+        api.set_port_monitored(pid, True, self.cfg)
+        api.set_port_bandwidth(pid, 100, "either", self.cfg)
+        with connect(self.cfg) as c:
+            c.execute("UPDATE switch_ports SET bw_alarm=1, bw_alarm_since=?, in_bps=?,"
+                      " out_bps=? WHERE id=?",
+                      (_iso(self.now), 5_000_000, 2_000_000, pid))
+            c.commit()
+        s = api.system_summary(self.cfg)
+        self.assertEqual(len(s["low_bandwidth"]), 1)
+        lb = s["low_bandwidth"][0]
+        self.assertEqual(lb["switch_name"], "Switch")
+        self.assertIn("Gi0/2", lb["label"])
+        self.assertEqual((lb["in_mbps"], lb["out_mbps"]), (5.0, 2.0))
+        self.assertEqual(lb["threshold_mbps"], 100.0)
+        # unwatching a port disarms its bw alarm AND drops it from the summary
+        api.set_port_monitored(pid, False, self.cfg)
+        self.assertEqual(api.system_summary(self.cfg)["low_bandwidth"], [])
+        with connect(self.cfg) as c:
+            self.assertEqual(
+                c.execute("SELECT bw_alarm FROM switch_ports WHERE id=?", (pid,)).fetchone()[0], 0)
+
     def test_delete_clears_switch_ports_both_directions(self):
         pid = self._port_id()
         api.set_port_feeds(pid, 2, self.cfg)   # switch(1) port feeds Tower(2)

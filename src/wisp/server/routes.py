@@ -175,14 +175,18 @@ class Handler(BaseHTTPRequestHandler):
         """A cheap monotonic fingerprint of the data the live views render. It bumps
         whenever a new poll/outage/alert row lands — every full cycle AND instantly on
         a between-cycle DOWN/recovery — so an SSE client knows to re-fetch. Keyed on
-        MAX(id) of the three append-mostly tables (one trivial indexed read)."""
+        MAX(id) of the three append-mostly tables, plus the newest `switch_ports`
+        write-stamp so an SNMP walk (port status + live bandwidth, which UPSERT in place
+        rather than append a new id) also pushes the map/faceplate + Low-Bandwidth card
+        live. One trivial read over small tables."""
         with connect(CONFIG) as conn:
             r = conn.execute(
                 "SELECT (SELECT COALESCE(MAX(id),0) FROM poll_results) AS p,"
                 " (SELECT COALESCE(MAX(id),0) FROM outages) AS o,"
-                " (SELECT COALESCE(MAX(id),0) FROM alert_log) AS a"
+                " (SELECT COALESCE(MAX(id),0) FROM alert_log) AS a,"
+                " (SELECT COALESCE(MAX(updated_at),'') FROM switch_ports) AS s"
             ).fetchone()
-        return f"{r['p']}.{r['o']}.{r['a']}"
+        return f"{r['p']}.{r['o']}.{r['a']}.{r['s']}"
 
     def _serve_events(self) -> None:
         """Server-Sent Events stream: emit a `changed` event whenever `_data_version`
