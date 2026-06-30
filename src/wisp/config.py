@@ -39,6 +39,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _hostname() -> str:
+    """Stable default node id when WISP_NODE_ID is unset (the box's hostname).
+    Falls back to a literal so identity is never empty even on a nameless host."""
+    import socket
+    try:
+        return socket.gethostname() or "edge"
+    except Exception:
+        return "edge"
+
+
 @dataclass(frozen=True)
 class Config:
     # --- Storage -------------------------------------------------------------
@@ -235,6 +245,51 @@ class Config:
     org_name: str = field(default_factory=lambda: _env("WISP_ORG_NAME", "HANSA Communications"))
     timezone: str = field(default_factory=lambda: _env("WISP_TIMEZONE", "Asia/Kolkata"))
 
+    # --- Central reporting (Phase 10 Part A — edge shipper + outbox) ----------
+    # THE back-compat anchor: WISP_CENTRAL_URL empty ⇒ this whole distributed layer
+    # is dormant and the edge is byte-for-byte today's standalone monitor (nothing is
+    # written to the outbox, no thread starts). Set it to the central ingest base URL
+    # (e.g. https://central.example.net) to turn the edge into a reporting node. The
+    # edge ALWAYS keeps detecting + paging locally; central only aggregates.
+    central_url: str = field(default_factory=lambda: _env("WISP_CENTRAL_URL", "").rstrip("/"))
+    # Stopgap auth until Part C's mTLS enrollment exists: a per-node shared secret sent
+    # as `Authorization: Bearer <token>`. The wire envelope is designed so mTLS slots in
+    # later without changing the record format. Keep it out of logs.
+    central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
+    # Edge identity. (tenant_id, node_id) is the durable identity central keys every
+    # record by; edge-local devices.id are per-SQLite and meaningless across nodes, so
+    # they ride along only as a per-node correlation id (central maps them in Part B).
+    # node_id defaults to the hostname so a fresh install still has a stable id.
+    tenant_id: str = field(default_factory=lambda: _env("WISP_TENANT_ID", "default"))
+    node_id: str = field(default_factory=lambda: _env("WISP_NODE_ID", "") or _hostname())
+    # Shipper cadence + batch size. The drain loop wakes this often; the heartbeat is
+    # sent on its own (usually slower) sub-timer. A batch caps how many outbox rows go in
+    # one POST so a large backlog drains in bounded chunks.
+    ship_interval_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_INTERVAL_S", 5.0))
+    ship_batch: int = field(default_factory=lambda: _env_int("WISP_SHIP_BATCH", 200))
+    heartbeat_interval_s: int = field(
+        default_factory=lambda: _env_int("WISP_HEARTBEAT_INTERVAL_S", 60))
+    # Exponential backoff bounds for a failing central (WAN cut, central down). Capped so
+    # a long outage doesn't stretch the retry to hours — when central returns, the backlog
+    # ships promptly. Isolated from the poll loop, so this never affects local detection.
+    ship_backoff_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_BACKOFF_S", 2.0))
+    ship_backoff_max_s: float = field(
+        default_factory=lambda: _env_float("WISP_SHIP_BACKOFF_MAX_S", 300.0))
+    ship_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_TIMEOUT_S", 10.0))
+    # Outbox high-water mark. Past this the shipper evicts the OLDEST 'rollup' rows (trend
+    # analytics, reconstructable) — never an unsent 'event' (an outage record is sacred).
+    # 0 = no cap (let it grow; an event is never dropped regardless).
+    outbox_max_rows: int = field(default_factory=lambda: _env_int("WISP_OUTBOX_MAX_ROWS", 100000))
+
+    # --- Central server (the aggregation plane — a separate process/deploy) ----
+    # Used only by apps/central; the edge ignores these. The central store is its OWN
+    # SQLite (the edge's stays untouched); Part B is where it may graduate to Postgres.
+    # It authenticates ingest with the same `central_token` the edges present.
+    central_db: Path = field(
+        default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
+    central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
+    central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
+
     # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
 
@@ -246,6 +301,12 @@ class Config:
         if self.poll_interval_adaptive and device_count <= self.small_fleet_max:
             return self.poll_interval_small_s
         return self.poll_interval_s
+
+    def central_enabled(self) -> bool:
+        """Is this edge reporting to a central server? Empty WISP_CENTRAL_URL ⇒ the
+        whole distributed layer is dormant (the Phase 10 back-compat anchor): no outbox
+        writes, no shipper thread, behaviour identical to the standalone monitor."""
+        return bool(self.central_url)
 
     def stale_threshold_s(self) -> int:
         """Seconds without a fresh poll before the monitor is 'down'. Honours an

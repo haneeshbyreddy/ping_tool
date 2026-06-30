@@ -9,15 +9,16 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
-(team directory, PIN gate, monitor lifecycle), and **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — 161 tests. The
+(team directory, PIN gate, monitor lifecycle), **Phase 9** — Part A (graph topology /
+backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Part A**
+(edge→central shipper + outbox + heartbeat + a skeleton central ingest server) — 214 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
-only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
-(`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
-Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
+only. **The dashboard + the central server + tests are still pure stdlib**, but the daemon needs
+the venv (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally**
+(system Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
 (`sysctl net.ipv4.ping_group_range="0 2147483647"`). There is no demo
 seeder anymore; populate real devices/team from the dashboard.
 
@@ -261,6 +262,62 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   targets, toggles, **bw threshold validation + re-arm**, FK delete), `integration/test_api.TopologyTest`
   (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
   on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
+
+## Central reporting — edge shipper + outbox (Phase 10 Part A)
+
+- **`WISP_CENTRAL_URL` empty ⇒ the whole distributed layer is dormant — THE back-compat anchor.**
+  `Config.central_enabled()` gates everything: nothing is written to `outbox`, no shipper thread
+  starts, the edge is byte-for-byte the standalone monitor. State that in any new test the way the
+  single-parent / mock-removal anchors are stated. The edge **always** keeps detecting + paging
+  locally; central only aggregates (it never runs an FSM, never pages — no double-paging).
+- **The outbox write rides the producer's transaction — never its own.** `database/outbox.py` is
+  pure DB glue (no network), which is why it lives under `database/` not `egress/` (so `core/rollup`
+  and the daemon enqueue without a backwards core→egress import). The daemon's `_persist` calls
+  `enqueue_events(conn, …)` **inside the same `transaction()`** as the `poll_results`/`apply_events`
+  write, and `roll_up` enqueues its folded rows **inside the fold txn** — so an outage/rollup record
+  and its shippable copy commit atomically or not at all (a record is never half-written then lost to
+  a crash). Don't move the enqueue outside that txn. Both enqueue sites are guarded by
+  `cfg.central_enabled()`.
+- **Two outbox kinds, asymmetric durability.** `'event'` (outage open/recat/resolve, uplink up/down)
+  is the real-time truth and is **never evicted**; `'rollup'` (an hourly `poll_rollups` row) is
+  reconstructable trend data and is what eviction sheds first. `evict_rollups` deletes only the oldest
+  `kind='rollup'` rows past `WISP_OUTBOX_MAX_ROWS` — if the backlog is all events it lets the queue
+  exceed the cap rather than drop an outage record. **Heartbeats are NOT an outbox kind** — they are
+  live liveness, sent direct by the shipper (a stale "I'm alive" is worthless).
+- **Shipper = the watchdog-thread pattern, isolated.** `egress/shipper.py`: a `Shipper` interface
+  with one real impl (`HttpShipper`, **httpx lazy-imported** like `NtfyNotifier`, bearer-token auth)
+  so the dashboard + central + tests stay pure-stdlib and tests inject a recording-shipper double —
+  **no real network to central in the suite** (exactly like the recording notifier). `ShipperWorker`
+  holds the testable logic (`drain_once`/`heartbeat_once`/`evict_once`, clock + shipper injectable);
+  `start_shipper_thread` runs it on a daemon thread from the *daemon* (the shipper belongs with the
+  thing producing records + whose liveness the heartbeat reports), **no-op when central is disabled**
+  and **skipped for finite `--cycles`** runs. Every cycle is in its own try/except — a WAN cut or a
+  dead central never touches the poll loop (the monitor stays the hardest thing to kill). The thread
+  object carries `.worker` so it can be stopped (shutdown/tests).
+- **At-least-once + idempotent central storage = effectively-once.** Delivery deletes an outbox row
+  **only on a central ack** of that row's id (`drain_once` acks `accepted_ids ∩ sent`; a partial
+  accept is "unhealthy" → backs off and retries the rest). Central (`central/store.py`) stores with
+  `UNIQUE(tenant_id, node_id, edge_id)` + `INSERT OR IGNORE`, so a re-delivered batch after a lost ack
+  stores nothing twice and re-acks. Edge identity is **`(tenant_id, node_id)`**; the edge-local
+  `device_id` rides along only as a per-node correlation id (central does NOT merge it into a global
+  id yet — that mapping is Part B). The wire envelope is **versioned** (`v`, default 1); central ingest
+  accepts `v ≤ MAX_WIRE_V` so a staged fleet rollout with mixed edge versions never breaks ingest.
+- **The central server is a SEPARATE process with its OWN SQLite.** `apps/central/main.py` +
+  `central/server.py` (pure-stdlib `ThreadingHTTPServer`): `POST /ingest`, `POST /heartbeat` (both
+  bearer-token gated, constant-time compare), `GET /api/fleet` (gated read view), `GET /healthz`
+  (unauthed). Writes go through one process-wide lock in `CentralStore` — the miniature of the plan's
+  "serialized ingest writer" (Part B is where it may become a real queue / Postgres; the **edge stays
+  SQLite+stdlib forever**). Auth is the static `WISP_CENTRAL_TOKEN` stopgap — mTLS enrollment is a
+  later part, and the envelope is shaped so the cert replaces the token with no wire change. Front it
+  with a TLS terminator in prod (it speaks plain HTTP to stay dependency-free).
+- **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
+  rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
+  rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the
+  central-disabled thread no-op + enabled thread starts), `integration/test_central` (store idempotency
+  + per-node id isolation + heartbeat upsert + fleet view; server auth/version/validation over a real
+  socket), `integration/test_daemon.CentralEnqueueTest` (the back-compat anchor: disabled = no outbox
+  rows, enabled = event enqueued in the poll txn), `integration/test_rollup` (fold enqueues rollups
+  only when central is on).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

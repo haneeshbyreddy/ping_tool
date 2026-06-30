@@ -492,6 +492,14 @@ in the PR/commit rather than guessing silently.
 > update `CLAUDE.md` + `README.md` so they describe the new reality, and keep the suite green
 > (`python -m unittest discover -s tests`) with new cases for every new path.
 
+> **Status — Part A shipped.** The edge shipper + `outbox` (migration 0015) + heartbeat + a
+> skeleton central ingest server (`apps/central`, `src/wisp/central`, `src/wisp/egress/shipper.py`,
+> `src/wisp/database/outbox.py`) are built and tested; `WISP_CENTRAL_URL` empty keeps every existing
+> deployment byte-for-byte standalone. Auth is the static-bearer-token stopgap (decision below).
+> Parts B (multi-tenant store + id mapping + cross-edge watchdog), C (per-org auth + dashboard), and
+> D (frozen binary + installers + supervisor self-update + CI/CD) remain. The code-level invariants
+> now live in `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
+
 ## The lens (what actually changes, and what doesn't)
 
 Today: **one daemon + one dashboard, one SQLite, one site, one shared PIN.** The target is

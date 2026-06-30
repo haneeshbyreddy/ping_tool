@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from wisp.config import CONFIG, Config
+from wisp.database import outbox
 from wisp.database.client import connect, transaction, write_with_retry
 
 # The bucket key is derived straight from the ISO8601 'YYYY-MM-DDTHH:MM:SS+00:00'
@@ -72,5 +73,21 @@ def roll_up(cfg: Config = CONFIG, *, now: datetime | None = None) -> int:
                     """,
                     (cutoff, last, last),
                 )
-                return cur.rowcount
+                rolled = cur.rowcount
+                # Central reporting (Phase 10 Part A): queue the freshly-folded rollup rows
+                # for the shipper in this SAME transaction (so the fold and its shippable
+                # records commit atomically). The window predicate matches the INSERT above,
+                # so it selects exactly the rows just folded. No-op unless central is on.
+                if rolled and cfg.central_enabled():
+                    new_rows = conn.execute(
+                        f"""
+                        SELECT device_id, bucket, samples, latency_avg, latency_min,
+                               latency_max, loss_avg, down_polls, degraded_polls, up_polls
+                        FROM poll_rollups
+                        WHERE bucket < ? AND (? IS NULL OR bucket > ?)
+                        """,
+                        (cutoff, last, last),
+                    ).fetchall()
+                    outbox.enqueue_rollups(conn, new_rows, now.isoformat(timespec="seconds"))
+                return rolled
     return int(write_with_retry(_do) or 0)

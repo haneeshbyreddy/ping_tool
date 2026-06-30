@@ -102,6 +102,31 @@ class RollupTest(unittest.TestCase):
         self.assertEqual(point["uptime_pct"], 50.0)       # 1 of 2 polls UP
         self.assertEqual(point["down_polls"], 1)
 
+    # --- Phase 10 Part A: the fold also queues its rows for the central shipper ---
+    def _outbox(self):
+        with connect(self.cfg) as c:
+            return c.execute("SELECT kind, payload FROM outbox ORDER BY id").fetchall()
+
+    def test_central_disabled_enqueues_nothing(self):
+        prev = self.now - timedelta(hours=1)
+        self._poll(1, prev + timedelta(minutes=5), 10.0, 0.0, "UP")
+        roll_up(self.cfg, now=self.now)                   # central_url empty -> dormant
+        self.assertEqual(self._outbox(), [])
+
+    def test_central_enabled_enqueues_rollups_in_fold_txn(self):
+        prev = self.now - timedelta(hours=1)
+        self._poll(1, prev + timedelta(minutes=5), 10.0, 0.0, "UP")
+        self._poll(2, prev + timedelta(minutes=5), 20.0, 0.0, "UP")
+        cfg = Config(db_path=self.cfg.db_path, central_url="https://central.test")
+        self.assertEqual(roll_up(cfg, now=self.now), 2)
+        rows = self._outbox()
+        self.assertEqual([r["kind"] for r in rows], ["rollup", "rollup"])
+        import json
+        rec = json.loads(rows[0]["payload"])
+        self.assertEqual(rec["type"], "Rollup")
+        self.assertIn("bucket", rec)
+        self.assertIn("device_id", rec)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,7 +42,7 @@ PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 80 tests (pure stdlib)
+python -m unittest discover -s tests                 # 214 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -99,16 +99,20 @@ the daemon uses the venv (see Quick start).
 ```
 src/wisp/                 # the engine package (import as `wisp.*`)
 ├── config.py             # frozen Config from env; CONFIG singleton
-├── core/                 # business logic — state_machine.py, analytics.py
-├── database/             # client.py (WAL conn + migration runner)
-├── ingress/              # probers.py (real ICMP ping via icmplib)
-├── egress/               # notifiers.py (alert dispatch), ack.py
+├── version.py            # the running build version (reported in the heartbeat)
+├── core/                 # business logic — state_machine.py, analytics.py, rollup.py
+├── database/             # client.py (WAL conn + migration runner), outbox.py (ship queue glue)
+├── ingress/              # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk)
+├── egress/               # notifiers.py (alert dispatch), ports.py, ack.py,
+│                         #   shipper.py (drains the outbox to central + heartbeats)
+├── central/             # the aggregation plane (Phase 10): store.py + server.py (ingest)
 └── server/               # services.py (JSON data + device/worker CRUD, rollup trends),
                           #   routes.py (HTTP + auth gate), auth.py (PIN + sessions)
 apps/
-├── daemon/main.py        # worker runtime — the 60s polling loop
-└── dashboard/            # web runtime — main.py + templates/ + static/{app.js,icons.js,vendor/}
-data/                     # wisp.db (+ wal/shm) + session_secret — git-ignored
+├── daemon/main.py        # worker runtime — the polling loop (+ the central shipper thread)
+├── dashboard/            # web runtime — main.py + templates/ + static/{app.js,icons.js,vendor/}
+└── central/main.py       # central server runtime — multi-edge ingest + fleet read view
+data/                     # wisp.db / central.db (+ wal/shm) + session_secret — git-ignored
 migrations/               # 000N_*.sql, applied in order, tracked in schema_migrations
 deploy/                   # systemd units (wisp-monitor.service, wisp-dashboard.service)
 tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
@@ -127,6 +131,7 @@ run.sh                    # one-shot setup + run for both runtimes
 | `wisp.core.analytics` | 3 BI | shared outage-window / uptime / offender query helpers for the dashboard |
 | `wisp.server.{services,routes}` + `apps.dashboard` | 6 Dashboard | JSON views + stdlib HTTP server for the self-contained UI |
 | `wisp.database.client` / `migrations/` | 5 Memory | WAL SQLite, durable outages/alerts/escalations |
+| `wisp.egress.shipper` / `wisp.central` / `apps.central` | 7 Fleet | (optional) edge→central outbox shipper + heartbeat; central ingest + fleet view |
 
 ## Key behaviors
 
@@ -172,6 +177,55 @@ run.sh                    # one-shot setup + run for both runtimes
 - **Hourly rollups** — raw polls are hot scratch; the daemon folds them into compact
   per-device/hour rows (`poll_rollups`) once an hour, so trend charts read hours, not a
   billion raw samples (`services.device_trend`). Incidents still live in `outages`.
+- **Central reporting (optional, off by default)** — set `WISP_CENTRAL_URL` and an edge
+  *also* reports its outage events + hourly rollups + a liveness heartbeat to a central
+  server, over a store-and-forward outbox (a WAN blip just grows the queue; an outage record
+  is never lost). The edge keeps detecting + paging **locally** — central only aggregates a
+  fleet-wide picture; it never runs an FSM and never pages. With `WISP_CENTRAL_URL` **unset**
+  the whole layer is dormant and the edge is byte-for-byte the standalone monitor. See below.
+
+## Central reporting (Phase 10 Part A — distributed mode, optional)
+
+By default this is **one box** — one daemon + one dashboard, standalone. Phase 10 lets many
+**edge** nodes (each is today's daemon, unchanged) report up to **one central** server for a
+fleet-wide view. It is strictly additive and **off unless `WISP_CENTRAL_URL` is set** — that
+empty-URL case is the hard back-compat anchor (no outbox writes, no shipper thread, identical
+behaviour).
+
+What ships, and how:
+- **The edge owns the page; central owns the picture.** Detection (FSM, fast-confirm,
+  between-cycle watch), topology suppression, the canary, SNMP, and **local ntfy alerting all
+  stay on the edge** — the WAN is most likely to break *during* an outage, so the alarm must
+  survive the thing it alarms about. Central never pages (no double-paging).
+- **Store-and-forward outbox.** The daemon enqueues outage **events** (in the *same
+  transaction* as the `poll_results`/`outages` write, so a record is never half-written) and
+  the hourly **rollups** into a local `outbox` table. A background **shipper thread** drains
+  it over HTTPS, deletes each row only on a central ack, exponentially backs off on failure,
+  and past a high-water mark evicts the oldest **rollups** only — an unsent **event** is an
+  outage record and is never dropped.
+- **Heartbeat.** Every `WISP_HEARTBEAT_INTERVAL_S` the shipper POSTs a live liveness +
+  health beat (version, last-poll time, fleet size, open-outage count, outbox backlog). It is
+  sent *direct* (not queued — a stale "I'm alive" is worthless) and is the signal a future
+  cross-edge watchdog keys off (box dead **or** WAN cut).
+- **Wire protocol.** A versioned JSON envelope (`v`, `tenant_id`, `node_id`, `kind`, …); the
+  edge identity is `(tenant_id, node_id)`. Auth is a bearer token (`WISP_CENTRAL_TOKEN`) for
+  now — mTLS enrollment is a later part; the envelope is shaped so it slots in without a wire
+  change. Delivery is at-least-once + central storage is idempotent on the edge's outbox id
+  (a lost ack just re-ships rows central already holds), i.e. effectively-once.
+
+Run the central server (a **separate** process, its own SQLite at `WISP_CENTRAL_DB`):
+```bash
+WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py        # ingest on :8443, plus a read view
+curl -H 'Authorization: Bearer s3cret' http://HOST:8443/api/fleet   # nodes + recent events
+```
+Then point an edge at it (on the daemon's systemd unit):
+```bash
+WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
+WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
+```
+Put the central server behind a TLS terminator (nginx/Caddy) in production — it speaks plain
+HTTP itself to stay dependency-free. The multi-tenant store/dashboard + per-org auth + the
+frozen-binary fleet rollout are later Phase 10 parts (see `plan.md`).
 
 ## Configuration (env vars, all optional)
 
@@ -197,6 +251,13 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |
+| `WISP_CENTRAL_URL` | — | central ingest base URL; **empty = standalone** (no reporting) |
+| `WISP_CENTRAL_TOKEN` | — | bearer token the edge presents / central requires |
+| `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity central keys records by |
+| `WISP_HEARTBEAT_INTERVAL_S` | `60` | seconds between liveness heartbeats |
+| `WISP_SHIP_INTERVAL_S` / `WISP_SHIP_BATCH` | `5` / `200` | shipper drain cadence + max records per POST |
+| `WISP_OUTBOX_MAX_ROWS` | `100000` | outbox high-water mark (evicts oldest rollups; never events; 0 = unbounded) |
+| `WISP_CENTRAL_DB` / `WISP_CENTRAL_BIND` / `WISP_CENTRAL_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central server store + listen address |
 
 **Config is env-var only** — every tunable is read once at startup into the frozen `Config`
 (`config.py` has the full list + defaults). There is no in-UI settings page and no DB config
