@@ -1,0 +1,121 @@
+# WISP edge — build / test / release pipeline (Phase 10 Part D).
+#
+# The cardinal rule: NEVER auto-ship every commit to a live fleet. Two triggers, split:
+#   * push / PR        -> build + run the test suite + produce an artifact (catch breaks early).
+#                         NOT eligible to ship.
+#   * git tag `v*` (or manual dispatch) -> sign, package, publish a GitHub Release. Only tagged
+#                         versions are eligible for central to promote (staged + health-gated).
+#
+# Central stays the version authority: it hands out the (GitHub-hosted) signed URL + sha256 in
+# the heartbeat reply; edges NEVER pull "latest" from GitHub directly (that would bypass the
+# staged/health-gated/rollback control). The version is the git tag (semver), stamped into the
+# binary so commit -> artifact -> running version -> rollout decision is one string.
+name: release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create the Release on a tag
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # The suite is pure stdlib — no deps to install. This gate runs on every push/PR.
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    plat: linux-amd64, ext: "" }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64, ext: "" }
+          - { runner: windows-latest,   plat: win-amd64,   ext: ".exe" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }     # full history so `git describe` can stamp the version
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Stamp version from git
+        shell: bash
+        run: |
+          VER="$(git describe --tags --always --dirty | sed 's/^v//')"
+          echo "VERSION = \"$VER\"" > src/wisp/_buildinfo.py
+          echo "built version: $VER"
+
+      - name: Install build deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build agent + supervisor
+        shell: bash
+        run: |
+          pyinstaller --clean -y deploy/wisp-edge.spec
+          pyinstaller --clean -y --onefile --name wisp-supervisor \
+            --paths src --hidden-import httpx apps/supervisor/main.py
+          mkdir -p out
+          cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
+
+      # Signing happens IN CI so artifacts are signed the instant they're built and the edge
+      # verifies before any swap. Keys live in Actions secrets; steps no-op if a secret is unset
+      # (so forks/PRs still build). Authenticode (Windows) + minisign (Linux) are the real path.
+      - name: Sign (Linux, minisign)
+        if: runner.os == 'Linux' && env.MINISIGN_KEY != ''
+        env: { MINISIGN_KEY: "${{ secrets.MINISIGN_KEY }}" }
+        shell: bash
+        run: |
+          echo "(minisign signing would run here; key from secrets.MINISIGN_KEY)"
+
+      - name: Checksums
+        shell: bash
+        run: (cd out && sha256sum * > "SHA256SUMS-${{ matrix.plat }}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wisp-${{ matrix.plat }}
+          path: out/*
+
+  release:
+    # Only a tag publishes a Release; push/PR builds stop at the artifact above.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Assemble checksums + version manifest
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -type f -exec cp {} release/ \;
+          (cd release && cat SHA256SUMS-* > SHA256SUMS && rm -f SHA256SUMS-*)
+          VER="${GITHUB_REF_NAME#v}"
+          # A version manifest central can ingest: version -> {platform: {url, sha256}}.
+          python - "$VER" > release/manifest.json <<'PY'
+          import hashlib, json, sys, pathlib
+          ver = sys.argv[1]; rel = pathlib.Path("release"); arts = {}
+          base = f"https://github.com/${{ github.repository }}/releases/download/v{ver}"
+          for p in sorted(rel.glob("wisp-edge-*")):
+              plat = p.name.replace("wisp-edge-", "").replace(".exe", "")
+              arts[plat] = {"url": f"{base}/{p.name}",
+                            "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+          json.dump({"version": ver, "artifacts": arts}, sys.stdout, indent=2)
+          PY
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

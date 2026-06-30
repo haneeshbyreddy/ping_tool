@@ -366,5 +366,60 @@ class SnmpCycleWiring(unittest.TestCase):
         asyncio.run(daemon.snmp_cycle(_Boom(), self._monitor(cfg), cfg))
 
 
+class CentralEnqueueTest(unittest.TestCase):
+    """Phase 10 Part A: the daemon's _persist enqueues shippable events into the outbox in
+    the SAME transaction as the poll/outage write — but ONLY when central is configured.
+    WISP_CENTRAL_URL empty ⇒ nothing is written to the outbox (the back-compat anchor)."""
+
+    def setUp(self):
+        import tempfile
+        from wisp.database.client import connect, migrate
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dbpath = Path(self.tmp.name) / "t.db"
+        migrate(Config(db_path=self.dbpath))
+        with connect(Config(db_path=self.dbpath)) as c:
+            c.execute("INSERT INTO devices (id,name,ip_address,region) VALUES (1,'d1','a','R')")
+            c.commit()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _outbox_count(self):
+        from wisp.database.client import connect
+        with connect(Config(db_path=self.dbpath)) as c:
+            return c.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+    def _persist_one(self, cfg):
+        ts = "2026-06-30T12:00:00+00:00"
+        rows = [(1, ts, None, 100.0, None, DOWN)]
+        meta = {1: _meta(1, "a")}
+        daemon._persist(rows, [OutageOpened(1, DOWN)], ts, cfg, meta)
+
+    def test_disabled_writes_no_outbox_rows(self):
+        cfg = Config(db_path=self.dbpath)   # central_url empty -> dormant
+        self.assertFalse(cfg.central_enabled())
+        self._persist_one(cfg)
+        from wisp.database.client import connect
+        with connect(cfg) as c:
+            # the poll row + outage are written as always...
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM poll_results").fetchone()[0], 1)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM outages").fetchone()[0], 1)
+        self.assertEqual(self._outbox_count(), 0)   # ...but nothing is queued (standalone)
+
+    def test_enabled_enqueues_event_in_same_txn(self):
+        cfg = Config(db_path=self.dbpath, central_url="https://central.test")
+        self.assertTrue(cfg.central_enabled())
+        self._persist_one(cfg)
+        from wisp.database.client import connect
+        with connect(cfg) as c:
+            row = c.execute("SELECT kind, payload FROM outbox").fetchone()
+        self.assertEqual(row["kind"], "event")
+        import json as _json
+        rec = _json.loads(row["payload"])
+        self.assertEqual(rec["type"], "OutageOpened")
+        self.assertEqual(rec["device_id"], 1)
+        self.assertEqual(rec["device_name"], "d1")   # denormalized from meta
+
+
 if __name__ == "__main__":
     unittest.main()

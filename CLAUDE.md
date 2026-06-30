@@ -9,15 +9,18 @@ work, and open questions).
 ## Status
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
-(team directory, PIN gate, monitor lifecycle), and **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — 161 tests. The
+(team directory, PIN gate, monitor lifecycle), **Phase 9** — Part A (graph topology /
+backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–D**
+(edge→central shipper + outbox + heartbeat; multi-tenant central store + global device-id
+mapping + cross-edge fleet watchdog; per-org dashboard + accounts + org-wide team/attendance;
+version authority + staged rollout + supervisor self-update + Linux/CI packaging) — 265 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
 dev path has been removed: the daemon now uses the **real** `IcmpProber` + `NtfyNotifier`
-only. **The dashboard + tests are still pure stdlib**, but the daemon needs the venv
-(`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
-Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
+only. **The dashboard + the central server + tests are still pure stdlib**, but the daemon needs
+the venv (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally**
+(system Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
 (`sysctl net.ipv4.ping_group_range="0 2147483647"`). There is no demo
 seeder anymore; populate real devices/team from the dashboard.
 
@@ -261,6 +264,139 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   targets, toggles, **bw threshold validation + re-arm**, FK delete), `integration/test_api.TopologyTest`
   (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
   on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
+
+## Central reporting — edge shipper + multi-tenant central + self-update (Phase 10 Parts A–D)
+
+- **`WISP_CENTRAL_URL` empty ⇒ the whole distributed layer is dormant — THE back-compat anchor.**
+  `Config.central_enabled()` gates everything: nothing is written to `outbox`, no shipper thread
+  starts, the edge is byte-for-byte the standalone monitor. State that in any new test the way the
+  single-parent / mock-removal anchors are stated. The edge **always** keeps detecting + paging
+  locally; central only aggregates (it never runs an FSM, never pages — no double-paging).
+- **The outbox write rides the producer's transaction — never its own.** `database/outbox.py` is
+  pure DB glue (no network), which is why it lives under `database/` not `egress/` (so `core/rollup`
+  and the daemon enqueue without a backwards core→egress import). The daemon's `_persist` calls
+  `enqueue_events(conn, …)` **inside the same `transaction()`** as the `poll_results`/`apply_events`
+  write, and `roll_up` enqueues its folded rows **inside the fold txn** — so an outage/rollup record
+  and its shippable copy commit atomically or not at all (a record is never half-written then lost to
+  a crash). Don't move the enqueue outside that txn. Both enqueue sites are guarded by
+  `cfg.central_enabled()`.
+- **Two outbox kinds, asymmetric durability.** `'event'` (outage open/recat/resolve, uplink up/down)
+  is the real-time truth and is **never evicted**; `'rollup'` (an hourly `poll_rollups` row) is
+  reconstructable trend data and is what eviction sheds first. `evict_rollups` deletes only the oldest
+  `kind='rollup'` rows past `WISP_OUTBOX_MAX_ROWS` — if the backlog is all events it lets the queue
+  exceed the cap rather than drop an outage record. **Heartbeats are NOT an outbox kind** — they are
+  live liveness, sent direct by the shipper (a stale "I'm alive" is worthless).
+- **Shipper = the watchdog-thread pattern, isolated.** `egress/shipper.py`: a `Shipper` interface
+  with one real impl (`HttpShipper`, **httpx lazy-imported** like `NtfyNotifier`, bearer-token auth)
+  so the dashboard + central + tests stay pure-stdlib and tests inject a recording-shipper double —
+  **no real network to central in the suite** (exactly like the recording notifier). `ShipperWorker`
+  holds the testable logic (`drain_once`/`heartbeat_once`/`evict_once`, clock + shipper injectable);
+  `start_shipper_thread` runs it on a daemon thread from the *daemon* (the shipper belongs with the
+  thing producing records + whose liveness the heartbeat reports), **no-op when central is disabled**
+  and **skipped for finite `--cycles`** runs. Every cycle is in its own try/except — a WAN cut or a
+  dead central never touches the poll loop (the monitor stays the hardest thing to kill). The thread
+  object carries `.worker` so it can be stopped (shutdown/tests).
+- **At-least-once + idempotent central storage = effectively-once.** Delivery deletes an outbox row
+  **only on a central ack** of that row's id (`drain_once` acks `accepted_ids ∩ sent`; a partial
+  accept is "unhealthy" → backs off and retries the rest). Central (`central/store.py`) stores with
+  `UNIQUE(tenant_id, node_id, edge_id)` + `INSERT OR IGNORE`, so a re-delivered batch after a lost ack
+  stores nothing twice and re-acks. The wire envelope is **versioned** (`v`, default 1); central ingest
+  accepts `v ≤ MAX_WIRE_V` so a staged fleet rollout with mixed edge versions never breaks ingest.
+- **The central server is a SEPARATE process with its OWN SQLite.** `apps/central/main.py` +
+  `central/server.py` (pure-stdlib `ThreadingHTTPServer`): `POST /ingest`, `POST /heartbeat`, and the
+  tenant-scoped read API `GET /api/{fleet,orgs,devices}` (all bearer-token gated, constant-time
+  compare; `?tenant=` narrows a read, absent = whole fleet), `GET /healthz` (unauthed). **Every write
+  goes through one process-wide lock in `CentralStore`** — the plan's "serialized ingest writer" in
+  miniature (Postgres behind the same method surface is the documented upgrade; the **edge stays
+  SQLite+stdlib forever**). Auth is the static `WISP_CENTRAL_TOKEN` stopgap — mTLS enrollment is a
+  later part, and the envelope is shaped so the cert replaces the token with no wire change. Front it
+  with a TLS terminator in prod (it speaks plain HTTP to stay dependency-free).
+- **(Part B) Identity & the global id map (decision #6).** Edge identity is **`(tenant_id, node_id)`**;
+  an edge's autoincrement `devices.id` is per-SQLite and **cannot be merged across nodes**, so central
+  keeps its OWN global id space: the `devices` table maps each `(tenant_id, node_id, edge_local_id)` →
+  a central `id` (UNIQUE on that triple), assigned on first sight and carrying the latest denormalized
+  name/ip/region (`_resolve_device`, called from `_insert_event`/`_insert_rollup`). The same
+  `edge_local_id` from two nodes therefore gets **two** global ids — never collides. `events`/`rollups`
+  keep the edge-local `device_id` and join the registry for the global id. Orgs are **auto-provisioned**
+  on first contact (`_ensure_org`); `set_org` names them + sets a per-org alert topic (Part C surfaces
+  it). **Every read takes an optional `tenant_id`** (`_scope`) — central is multi-tenant, nothing is
+  cross-tenant by default.
+- **(Part B) Cross-edge fleet watchdog = `MonitorWatchdog` one level up.** `central/watchdog.py`
+  `CentralWatchdog.check(now)` pages a node's **org** (`NODE_STALE`) when its heartbeat is older than
+  `WISP_CENTRAL_NODE_STALE_S` (box dead OR WAN cut), and once more (`NODE_OK`) when it resumes. Same
+  discipline as the edge watchdog: **transition-only**, **restart-safe** (per-node alarm rehydrated
+  from `node_alerts`, only `sent` rows count, so a central restart never re-pages a known-down node),
+  **conservative** (a recent `last_seen` never alarms), **failed page retried** (logged `failed`, not
+  stranded). Routes to the org's `ntfy_topic` else `cfg.central_ntfy_topic`; the ntfy send lazy-imports
+  httpx like the edge, tests inject a recording-notifier double. `start_central_watchdog_thread` runs
+  it on a daemon thread from `serve()`, sharing the server's `store` (so its writes take the same lock).
+- **(Part C) Two auth planes — keep them separate.** **Ingest** (`/ingest`, `/heartbeat`) stays
+  machine bearer-token (`WISP_CENTRAL_TOKEN`); the **dashboard** (`/api/*` + the SPA) uses per-user,
+  **identity-carrying** signed-cookie sessions (`central/auth.py`, reusing the edge's salted-SHA-256 +
+  HMAC crypto — the session token is `user_id.issued.sig`, and `resolve_session` re-looks-up the user
+  each request so a deactivation/role change takes effect immediately). The read endpoints accept
+  **either** a session **or** the bearer token (the token = a cross-tenant *machine reader*, for
+  curl/automation — keeps the Part B examples working); **writes never accept the token** — real
+  accounts only. Don't fold the two planes together or collapse the token into the cookie scheme.
+- **(Part C) Accounts are central-provisioned; every read is tenant-scoped.** `users.tenant_id IS NULL`
+  = a **superadmin** (the platform operator who onboards ISPs + seeds accounts via `central/admin.py`);
+  else an org account with a role. `_scope_tenant` **pins an org user to their own tenant** (a `?tenant=`
+  from them is ignored) and lets a superadmin see all / narrow with `?tenant=`; `_can_write` = superadmin
+  OR the org's own owner. **Team + attendance moved org-wide to central** (`org_workers`/`org_attendance`,
+  mirroring the edge model — "who's on duty" is an org fact) — but the **live per-outage paging ladder
+  stays on the edge** (decision #2 resilience: the edge owns the page, central owns the picture; do NOT
+  move immediate alerting to central). The dashboard is a self-contained pure-stdlib SPA under
+  `central/static/` (served unauthed; it renders its own login gate on a 401, like the edge). Login is
+  rate-limited by the edge's `LoginThrottle`.
+- **(Part D) Central is the version authority; rollouts are staged + health-gated + auto-rollback.**
+  `central/rollout.py` is pure decision logic over the store: `directive_for(...)` = what a node
+  should install now (None unless there's an active rollout, the node is eligible in the current
+  wave, it's behind the target, AND a release artifact exists for its `platform`); `evaluate(...)` =
+  the `canary→promoted→done|halted` state machine (promote only once **every canary reports the
+  target version with a fresh heartbeat**; auto-**halt** if a canary misses `rollout_health_window_s`).
+  The **heartbeat reply is the update channel** (no inbound holes): `server._heartbeat_reply` runs
+  `evaluate` then attaches the `{target_version, url, sha256}` directive. Releases/rollouts are
+  provisioned via `central/admin.py` (`publish-release`/`start-rollout`/`rollout-status`). The wire
+  envelope `v` stays the skew-tolerance seam — central accepts old+new during a rollout.
+- **(Part D) The supervisor self-updates the agent; the updater is NOT the thing being updated.**
+  `runtime/supervisor.py` `Supervisor.apply(directive)` is the swap state machine behind injected IO
+  (download/restart/health/clock, so it unit-tests with temp files): `needs_update` (pull on any
+  difference — central owns the target), `verify_sha256` (an unverified binary is **never** swapped —
+  the supply-chain gate), back up last-known-good → atomic `os.replace` → restart → **health-gate**
+  (`agent_health_deadline_s`) → **rollback** to LKG if it doesn't come back. The agent's shipper
+  drops the directive to `update_request.json` (atomic) via `_write_update_request`; it does **not**
+  self-update. The real-host wiring (httpx download, subprocess relaunch) is the thin
+  `apps/supervisor/main.py` (needs a frozen agent + systemd to exercise; logic is the tested part).
+  `apps/daemon/main.py --version` prints `VERSION` so the supervisor can query the installed build.
+- **(Part D) Packaging is two modes; identity lives OUTSIDE the binary.** The single-box venv path
+  (`deploy/install.sh` + `wisp-monitor`/`wisp-dashboard`) stays; the **fleet** path is a frozen
+  PyInstaller binary (`deploy/wisp-edge.spec` — force-includes the lazy `icmplib`/`httpx`/`pysnmp`)
+  run by the supervisor (`deploy/wisp-edge.service`), installed via `deploy/install-edge.sh`
+  (`curl|sh`: arch-detect → download → **verify sha256** → systemd → ICMP sysctl). Config/cert/DB live
+  in `/etc/wisp` so an update swaps **only** the binary. CI (`.github/workflows/release.yml`) tests on
+  every push/PR and **only a `v*` tag** signs/packages/publishes a Release + manifest; `wisp/_buildinfo.py`
+  is the CI-stamped `git describe` version (git-ignored; `wisp/version.py` prefers it, then `WISP_VERSION`,
+  then the hardcoded fallback). Windows installer + code-signing are scaffolded but need real CI/hosts.
+- **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
+  rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
+  rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the
+  central-disabled thread no-op + enabled thread starts), `integration/test_central` (store idempotency
+  + per-node id isolation + heartbeat upsert + fleet view; **Part B**: org auto-provision, global-id
+  mapping + same-edge-id-two-nodes-two-ids, device latest-state, tenant scoping, `set_org`; server
+  auth/version/validation + `/api/{orgs,devices}` + `?tenant=` scoping over a real socket),
+  `integration/test_central_watchdog` (stale→page, recover, transition-only, fresh-node-quiet, restart
+  no-repage, failed-send retry, per-org topic vs fallback), `integration/test_central_auth` (**Part C**:
+  password/account validation, session round-trip + tamper/expire, login flow + throttle, org-user
+  pinned vs superadmin-sees-all scoping, bearer-reads-as-machine, write authz owner/operator/superadmin,
+  team+attendance round-trip, ingest is bearer-not-session, static index served),
+  `integration/test_daemon.CentralEnqueueTest` (the back-compat anchor: disabled = no outbox rows,
+  enabled = event enqueued in the poll txn), `integration/test_rollup` (fold enqueues rollups only when
+  central is on), `integration/test_central_rollout` (**Part D**: directive eligibility — canary-only,
+  up-to-date/no-artifact/halted→none, promoted→all; the canary→promoted→done|halted state machine incl.
+  window-halt and silent-canary-halt), `unit/test_supervisor` (**Part D**: needs_update, verify_sha256,
+  apply happy-path/verify-fail-no-swap/unhealthy-rollback/skip, consume_request file), plus the shipper's
+  update-directive handoff (`test_shipper`: directive→supervisor, current-version ignored, no-directive
+  no-op; heartbeat carries version+platform).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

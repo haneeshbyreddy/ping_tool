@@ -42,7 +42,7 @@ PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 80 tests (pure stdlib)
+python -m unittest discover -s tests                 # 265 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -99,18 +99,25 @@ the daemon uses the venv (see Quick start).
 ```
 src/wisp/                 # the engine package (import as `wisp.*`)
 ├── config.py             # frozen Config from env; CONFIG singleton
-├── core/                 # business logic — state_machine.py, analytics.py
-├── database/             # client.py (WAL conn + migration runner)
-├── ingress/              # probers.py (real ICMP ping via icmplib)
-├── egress/               # notifiers.py (alert dispatch), ack.py
+├── version.py            # the running build version (reported in the heartbeat)
+├── core/                 # business logic — state_machine.py, analytics.py, rollup.py
+├── database/             # client.py (WAL conn + migration runner), outbox.py (ship queue glue)
+├── ingress/              # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk)
+├── egress/               # notifiers.py (alert dispatch), ports.py, ack.py,
+│                         #   shipper.py (drains the outbox to central + heartbeats + update channel)
+├── central/             # aggregation plane: store + server + watchdog + auth + admin CLI + rollout + static/
+├── runtime/              # single_instance.py, supervisor.py (agent self-update logic)
 └── server/               # services.py (JSON data + device/worker CRUD, rollup trends),
                           #   routes.py (HTTP + auth gate), auth.py (PIN + sessions)
 apps/
-├── daemon/main.py        # worker runtime — the 60s polling loop
-└── dashboard/            # web runtime — main.py + templates/ + static/{app.js,icons.js,vendor/}
-data/                     # wisp.db (+ wal/shm) + session_secret — git-ignored
+├── daemon/main.py        # worker runtime — the polling loop (+ the central shipper thread)
+├── dashboard/            # web runtime — main.py + templates/ + static/{app.js,icons.js,vendor/}
+├── central/main.py       # central server runtime — ingest + multi-tenant dashboard + watchdog
+└── supervisor/main.py    # edge supervisor — runs + self-updates the frozen agent (fleet path)
+data/                     # wisp.db / central.db (+ wal/shm) + session_secret — git-ignored
 migrations/               # 000N_*.sql, applied in order, tracked in schema_migrations
-deploy/                   # systemd units (wisp-monitor.service, wisp-dashboard.service)
+deploy/                   # systemd units + install scripts + PyInstaller spec (single-box + fleet)
+.github/workflows/        # release.yml — build/test on push/PR; sign+publish on a v* tag
 tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
 docs/  assets/            # incident post-mortem template; original design mockup
 run.sh                    # one-shot setup + run for both runtimes
@@ -127,6 +134,8 @@ run.sh                    # one-shot setup + run for both runtimes
 | `wisp.core.analytics` | 3 BI | shared outage-window / uptime / offender query helpers for the dashboard |
 | `wisp.server.{services,routes}` + `apps.dashboard` | 6 Dashboard | JSON views + stdlib HTTP server for the self-contained UI |
 | `wisp.database.client` / `migrations/` | 5 Memory | WAL SQLite, durable outages/alerts/escalations |
+| `wisp.egress.shipper` / `wisp.central` / `apps.central` | 7 Fleet | (optional) edge→central outbox shipper + heartbeat; multi-tenant ingest + dashboard + version authority |
+| `wisp.runtime.supervisor` / `apps.supervisor` | 8 Update | (optional) supervisor self-updates the frozen agent: verify → swap → health-gate → rollback |
 
 ## Key behaviors
 
@@ -172,6 +181,102 @@ run.sh                    # one-shot setup + run for both runtimes
 - **Hourly rollups** — raw polls are hot scratch; the daemon folds them into compact
   per-device/hour rows (`poll_rollups`) once an hour, so trend charts read hours, not a
   billion raw samples (`services.device_trend`). Incidents still live in `outages`.
+- **Central reporting (optional, off by default)** — set `WISP_CENTRAL_URL` and an edge
+  *also* reports its outage events + hourly rollups + a liveness heartbeat to a central
+  server, over a store-and-forward outbox (a WAN blip just grows the queue; an outage record
+  is never lost). The edge keeps detecting + paging **locally** — central only aggregates a
+  fleet-wide picture; it never runs an FSM and never pages. With `WISP_CENTRAL_URL` **unset**
+  the whole layer is dormant and the edge is byte-for-byte the standalone monitor. See below.
+
+## Central reporting (Phase 10 Parts A–D — distributed, multi-tenant; optional)
+
+By default this is **one box** — one daemon + one dashboard, standalone. Phase 10 lets many
+**edge** nodes (each is today's daemon, unchanged) across many ISPs/tenants report up to **one
+central** server with its **own multi-tenant dashboard**. It is strictly additive and **off
+unless `WISP_CENTRAL_URL` is set** — that empty-URL case is the hard back-compat anchor (no
+outbox writes, no shipper thread, identical behaviour).
+
+What ships, and how:
+- **The edge owns the page; central owns the picture.** Detection (FSM, fast-confirm,
+  between-cycle watch), topology suppression, the canary, SNMP, and **local ntfy alerting all
+  stay on the edge** — the WAN is most likely to break *during* an outage, so the alarm must
+  survive the thing it alarms about. Central never pages (no double-paging).
+- **Store-and-forward outbox.** The daemon enqueues outage **events** (in the *same
+  transaction* as the `poll_results`/`outages` write, so a record is never half-written) and
+  the hourly **rollups** into a local `outbox` table. A background **shipper thread** drains
+  it over HTTPS, deletes each row only on a central ack, exponentially backs off on failure,
+  and past a high-water mark evicts the oldest **rollups** only — an unsent **event** is an
+  outage record and is never dropped.
+- **Heartbeat.** Every `WISP_HEARTBEAT_INTERVAL_S` the shipper POSTs a live liveness +
+  health beat (version, last-poll time, fleet size, open-outage count, outbox backlog). It is
+  sent *direct* (not queued — a stale "I'm alive" is worthless) and is the signal a future
+  cross-edge watchdog keys off (box dead **or** WAN cut).
+- **Wire protocol.** A versioned JSON envelope (`v`, `tenant_id`, `node_id`, `kind`, …); the
+  edge identity is `(tenant_id, node_id)`. Auth is a bearer token (`WISP_CENTRAL_TOKEN`) for
+  now — mTLS enrollment is a later part; the envelope is shaped so it slots in without a wire
+  change. Delivery is at-least-once + central storage is idempotent on the edge's outbox id
+  (a lost ack just re-ships rows central already holds), i.e. effectively-once.
+
+**Multi-tenant central (Part B).** Central is keyed by `(tenant_id, node_id)`: orgs (ISPs)
+are auto-provisioned on first contact, every node belongs to an org, and **central assigns its
+own global device ids** — an edge's per-SQLite `device_id` can't be merged across nodes, so the
+central `devices` table maps each `(tenant, node, edge-local id)` to a global id (the same
+edge-local id from two nodes gets two global ids, never collides). The read API is **tenant-
+scoped** (`?tenant=` narrows any read; absent = whole fleet). A **cross-edge fleet watchdog**
+pages a node's org when its heartbeat goes stale (box dead or WAN cut) — the dead-monitor
+watchdog one level up, restart-safe and conservative, routing to the org's ntfy topic.
+
+**Per-org dashboard + accounts (Part C).** Central has its **own dashboard** (a separate,
+pure-stdlib SPA) with **per-org login accounts** — the edge's single shared PIN doesn't survive
+multi-tenancy. Two auth planes, deliberately separate: **ingest** stays a machine **bearer
+token** (`WISP_CENTRAL_TOKEN`), while the **dashboard** uses per-user, identity-carrying
+signed-cookie sessions. Accounts are **central-provisioned** (no public signup): a *superadmin*
+(the platform operator) onboards each ISP and seeds its accounts; org users are scoped to their
+tenant with a role (owner/operator/tech), and every dashboard read is auto-scoped to the
+caller's org (a superadmin sees all and can narrow with `?tenant=`). **Team + attendance are now
+org-wide central concepts** ("who's on duty" is an org fact); the live per-outage paging ladder
+stays **on the edge** (resilience — the edge owns the page, central owns the picture).
+
+Run the central server (a **separate** process, its own SQLite at `WISP_CENTRAL_DB`), then
+bootstrap the first account:
+```bash
+WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py                  # ingest + dashboard on :8443
+PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you   # then log in at /
+PYTHONPATH=src python -m wisp.central.admin create-user --tenant ispA --username asha --role owner
+# the read API also accepts the bearer token (curl / automation), treated as a cross-tenant reader:
+curl -H 'Authorization: Bearer s3cret' 'http://HOST:8443/api/devices?tenant=ispA'   # global device view
+```
+Then point an edge at it (on the daemon's systemd unit):
+```bash
+WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
+WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
+```
+Put the central server behind a TLS terminator (nginx/Caddy) in production — it speaks plain
+HTTP itself to stay dependency-free.
+
+**Fleet deploy + self-update (Part D).** Edges ship as a **frozen single binary** (PyInstaller —
+no Python/venv on the box); a small stable **supervisor** runs the **agent** and owns
+`download → verify(sha256) → atomic-swap → restart → health-gate → rollback`. Updates are
+**pull-based over the existing channel** (no inbound holes): the **heartbeat reply** carries
+`{target_version, url, sha256}`, the supervisor swaps only on a version mismatch, and an
+unverified or unhealthy binary is never kept (it rolls back to last-known-good). Central is the
+**version authority** with a **staged, health-gated rollout** — a canary subset updates first and
+the rollout **auto-promotes only once the canaries come back healthy on the target**, else it
+**auto-halts** ("update every node" never means "brick every node at once"):
+```bash
+PYTHONPATH=src python -m wisp.central.admin publish-release --version 0.11.0 \
+    --artifact linux-amd64 https://.../wisp-edge-linux-amd64 <sha256>
+PYTHONPATH=src python -m wisp.central.admin start-rollout --tenant ispA --version 0.11.0 --canary edge-a1
+PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
+```
+Linux install is `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
+(`deploy/install-edge.sh`: arch-detect → download → **verify sha256** → systemd unit → ICMP
+sysctl). CI (`.github/workflows/release.yml`) builds + tests on every push/PR and, **only on a
+`v*` tag**, signs/packages/publishes a Release with a version manifest central ingests — edges
+never pull GitHub "latest" directly (that would bypass the staged/rollback control). The
+single-box venv path (`deploy/install.sh`) still exists; the frozen binary is the *fleet* path.
+The two-deploy-modes split, Windows installer, and code-signing are documented in `plan.md` §D;
+the Windows/signing/native-runner pieces need real CI + hosts to exercise.
 
 ## Configuration (env vars, all optional)
 
@@ -197,6 +302,18 @@ run.sh                    # one-shot setup + run for both runtimes
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_NTFY_TOPIC_{OWNER,OPERATOR,TECH}` | `hansa-*` | the three role topics alerts route to |
 | `WISP_DASHBOARD_PIN` | — | seed the dashboard PIN on first run (else set it in the UI) |
+| `WISP_CENTRAL_URL` | — | central ingest base URL; **empty = standalone** (no reporting) |
+| `WISP_CENTRAL_TOKEN` | — | bearer token the edge presents / central requires |
+| `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity central keys records by |
+| `WISP_HEARTBEAT_INTERVAL_S` | `60` | seconds between liveness heartbeats |
+| `WISP_SHIP_INTERVAL_S` / `WISP_SHIP_BATCH` | `5` / `200` | shipper drain cadence + max records per POST |
+| `WISP_OUTBOX_MAX_ROWS` | `100000` | outbox high-water mark (evicts oldest rollups; never events; 0 = unbounded) |
+| `WISP_CENTRAL_DB` / `WISP_CENTRAL_BIND` / `WISP_CENTRAL_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central server store + listen address |
+| `WISP_CENTRAL_NODE_STALE_S` | `180` | central pages an org when a node's heartbeat is older than this (box dead / WAN cut) |
+| `WISP_CENTRAL_NTFY_TOPIC` | `wisp-central` | fallback fleet-watchdog topic when an org has set none |
+| `WISP_ROLLOUT_HEALTH_WINDOW_S` | `600` | how long a canary has to come back healthy on the target before the rollout auto-halts |
+| `WISP_AGENT_HEALTH_DEADLINE_S` | `300` | how long a freshly-swapped agent has to prove healthy before the supervisor rolls back |
+| `WISP_VERSION` | — | override the reported build version (CI stamps it from `git describe`) |
 
 **Config is env-var only** — every tunable is read once at startup into the frozen `Config`
 (`config.py` has the full list + defaults). There is no in-UI settings page and no DB config

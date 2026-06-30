@@ -28,6 +28,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from wisp.config import CONFIG, Config  # noqa: E402
 from wisp.database.client import connect, migrate, transaction, write_with_retry
+from wisp.database.outbox import enqueue_events
+from wisp.egress.shipper import start_shipper_thread
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.core.rollup import roll_up
 from wisp.ingress.probers import PingResult, Prober, build_prober
@@ -120,7 +122,8 @@ def prune_old_polls(cfg: Config = CONFIG, *, now: datetime | None = None) -> int
     return int(write_with_retry(_do) or 0)
 
 
-def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config) -> None:
+def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config,
+             meta: dict | None = None) -> None:
     def _do() -> None:
         with connect(cfg) as conn:
             with transaction(conn):
@@ -130,6 +133,13 @@ def _persist(rows: list[tuple], events: list[Event], ts: str, cfg: Config) -> No
                     rows,
                 )
                 apply_events(conn, events, ts)
+                # Central reporting (Phase 10 Part A): queue the outage/uplink events for
+                # the shipper IN THE SAME TRANSACTION as the outage rows that produced them,
+                # so an outage record is never half-written (committed locally but lost to a
+                # crash before it could ship). No-op unless WISP_CENTRAL_URL is set — the
+                # back-compat anchor (standalone edge writes nothing here).
+                if cfg.central_enabled():
+                    enqueue_events(conn, events, ts, meta)
     write_with_retry(_do)
 
 
@@ -285,7 +295,7 @@ async def run_cycle(
         jitter = res.jitter_ms if res else None
         rows.append((dev_id, ts, latency, loss, jitter, state))
 
-    _persist(rows, events, ts, cfg)                 # poll_results + outages first
+    _persist(rows, events, ts, cfg, engine.meta)    # poll_results + outages (+ outbox)
     dispatcher.dispatch(events, ts)                 # then network sends + alert_log
     dispatcher.sweep(ts)                            # fire any overdue escalations
     # Soft per-link performance check (slow/jittery-but-up). Isolated so a perf-sweep
@@ -380,7 +390,7 @@ async def _between_cycle_watch(
              st)
             for dev_id, st in states.items()
         ]
-        _persist(rows, events, ts, cfg)
+        _persist(rows, events, ts, cfg, engine.meta)
         if events:
             dispatcher.dispatch(events, ts)
             dispatcher.sweep(ts)
@@ -454,6 +464,15 @@ async def run_forever(
         f"monitoring {len(engine.meta)} devices every {interval}s "
         f"[prober={cfg.prober}, notifier={cfg.notifier}] (Ctrl-C to stop)"
     )
+
+    # Central reporting (Phase 10 Part A): a background shipper thread drains the outbox
+    # to the central server + heartbeats liveness, isolated so a WAN cut or a dead central
+    # never touches this poll loop. No-op when WISP_CENTRAL_URL is unset (the back-compat
+    # anchor) and skipped for finite --cycles smoke runs (deterministic, no network).
+    if max_cycles is None and cfg.central_enabled():
+        start_shipper_thread(cfg)
+        print(f"reporting to central {cfg.central_url} "
+              f"[tenant={cfg.tenant_id}, node={cfg.node_id}]")
 
     # Retention sweep: prune old poll samples once a day so an always-on deployment
     # holds a steady-state DB size. Run once at startup, then every PRUNE_EVERY_S.
@@ -551,7 +570,14 @@ def main() -> None:
                         help="seconds between polls (overrides config)")
     parser.add_argument("--cycles", type=int, default=None,
                         help="stop after N cycles (default: run forever)")
+    parser.add_argument("--version", action="store_true",
+                        help="print the build version and exit (the supervisor queries this)")
     args = parser.parse_args()
+
+    if args.version:
+        from wisp.version import VERSION
+        print(VERSION)
+        return
 
     logging.basicConfig(
         level=logging.INFO,
