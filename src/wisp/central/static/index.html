@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WISP Central</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --fg:#e2e8f0; --mut:#94a3b8;
+            --up:#22c55e; --down:#ef4444; --deg:#f59e0b; --acc:#38bdf8; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+    header { display:flex; align-items:center; gap:16px; padding:12px 20px;
+             background:var(--panel); border-bottom:1px solid var(--line); }
+    header h1 { font-size:16px; margin:0; color:var(--acc); }
+    header .spacer { flex:1; }
+    select, input, button { font:inherit; color:var(--fg); background:#0b1220;
+             border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+    button { cursor:pointer; background:#1d4ed8; border-color:#1d4ed8; }
+    button.ghost { background:transparent; border-color:var(--line); }
+    button:hover { filter:brightness(1.1); }
+    main { padding:20px; max-width:1100px; margin:0 auto; }
+    .grid { display:grid; gap:16px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+    .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.04em;
+               color:var(--mut); }
+    table { width:100%; border-collapse:collapse; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+    th { color:var(--mut); font-weight:600; font-size:12px; }
+    .pill { padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+    .UP{background:#052e1a;color:var(--up)} .DOWN,.UNREACHABLE{background:#3f1212;color:var(--down)}
+    .DEGRADED{background:#3a2a08;color:var(--deg)} .stale{background:#3f1212;color:var(--down)}
+    .ok{background:#052e1a;color:var(--up)}
+    .muted { color:var(--mut); }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .login { max-width:340px; margin:12vh auto; }
+    .login .card { display:grid; gap:10px; }
+    .err { color:var(--down); min-height:18px; }
+    .chip { font-size:12px; padding:2px 8px; border:1px solid var(--line); border-radius:999px;
+            cursor:pointer; background:#0b1220; }
+    .chip.on { background:#052e1a; color:var(--up); border-color:#14532d; }
+    .num { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script src="app.js"></script>
+</body>
+</html>

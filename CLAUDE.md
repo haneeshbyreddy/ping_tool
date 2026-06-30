@@ -10,9 +10,10 @@ work, and open questions).
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
 (team directory, PIN gate, monitor lifecycle), **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–B**
+backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–C**
 (edge→central shipper + outbox + heartbeat; multi-tenant central store + global device-id
-mapping + cross-edge fleet watchdog) — 230 tests. The
+mapping + cross-edge fleet watchdog; per-org dashboard + accounts + org-wide team/attendance) —
+244 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
@@ -264,7 +265,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
   on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
 
-## Central reporting — edge shipper + multi-tenant central store (Phase 10 Parts A–B)
+## Central reporting — edge shipper + multi-tenant central store + dashboard (Phase 10 Parts A–C)
 
 - **`WISP_CENTRAL_URL` empty ⇒ the whole distributed layer is dormant — THE back-compat anchor.**
   `Config.central_enabled()` gates everything: nothing is written to `outbox`, no shipper thread
@@ -329,6 +330,24 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   stranded). Routes to the org's `ntfy_topic` else `cfg.central_ntfy_topic`; the ntfy send lazy-imports
   httpx like the edge, tests inject a recording-notifier double. `start_central_watchdog_thread` runs
   it on a daemon thread from `serve()`, sharing the server's `store` (so its writes take the same lock).
+- **(Part C) Two auth planes — keep them separate.** **Ingest** (`/ingest`, `/heartbeat`) stays
+  machine bearer-token (`WISP_CENTRAL_TOKEN`); the **dashboard** (`/api/*` + the SPA) uses per-user,
+  **identity-carrying** signed-cookie sessions (`central/auth.py`, reusing the edge's salted-SHA-256 +
+  HMAC crypto — the session token is `user_id.issued.sig`, and `resolve_session` re-looks-up the user
+  each request so a deactivation/role change takes effect immediately). The read endpoints accept
+  **either** a session **or** the bearer token (the token = a cross-tenant *machine reader*, for
+  curl/automation — keeps the Part B examples working); **writes never accept the token** — real
+  accounts only. Don't fold the two planes together or collapse the token into the cookie scheme.
+- **(Part C) Accounts are central-provisioned; every read is tenant-scoped.** `users.tenant_id IS NULL`
+  = a **superadmin** (the platform operator who onboards ISPs + seeds accounts via `central/admin.py`);
+  else an org account with a role. `_scope_tenant` **pins an org user to their own tenant** (a `?tenant=`
+  from them is ignored) and lets a superadmin see all / narrow with `?tenant=`; `_can_write` = superadmin
+  OR the org's own owner. **Team + attendance moved org-wide to central** (`org_workers`/`org_attendance`,
+  mirroring the edge model — "who's on duty" is an org fact) — but the **live per-outage paging ladder
+  stays on the edge** (decision #2 resilience: the edge owns the page, central owns the picture; do NOT
+  move immediate alerting to central). The dashboard is a self-contained pure-stdlib SPA under
+  `central/static/` (served unauthed; it renders its own login gate on a 401, like the edge). Login is
+  rate-limited by the edge's `LoginThrottle`.
 - **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
   rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
   rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the
@@ -337,9 +356,13 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   mapping + same-edge-id-two-nodes-two-ids, device latest-state, tenant scoping, `set_org`; server
   auth/version/validation + `/api/{orgs,devices}` + `?tenant=` scoping over a real socket),
   `integration/test_central_watchdog` (stale→page, recover, transition-only, fresh-node-quiet, restart
-  no-repage, failed-send retry, per-org topic vs fallback), `integration/test_daemon.CentralEnqueueTest`
-  (the back-compat anchor: disabled = no outbox rows, enabled = event enqueued in the poll txn),
-  `integration/test_rollup` (fold enqueues rollups only when central is on).
+  no-repage, failed-send retry, per-org topic vs fallback), `integration/test_central_auth` (**Part C**:
+  password/account validation, session round-trip + tamper/expire, login flow + throttle, org-user
+  pinned vs superadmin-sees-all scoping, bearer-reads-as-machine, write authz owner/operator/superadmin,
+  team+attendance round-trip, ingest is bearer-not-session, static index served),
+  `integration/test_daemon.CentralEnqueueTest` (the back-compat anchor: disabled = no outbox rows,
+  enabled = event enqueued in the poll txn), `integration/test_rollup` (fold enqueues rollups only when
+  central is on).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

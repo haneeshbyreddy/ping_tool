@@ -51,7 +51,9 @@ def main() -> None:
     cfg = Config(**overrides) if overrides else CONFIG
 
     print(f"WISP central -> http://{cfg.central_bind}:{cfg.central_port}  "
-          f"(db={cfg.central_db.name})")
+          f"(ingest + dashboard; db={cfg.central_db.name})")
+    print("Bootstrap an account: PYTHONPATH=src python -m wisp.central.admin "
+          "create-superadmin --username <you>")
     print("Ctrl-C to stop.")
     serve(cfg)
 

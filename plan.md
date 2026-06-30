@@ -500,9 +500,15 @@ in the PR/commit rather than guessing silently.
 > central id), and the **cross-edge fleet watchdog** (`central/watchdog.py` — pages an org when a node's
 > heartbeat goes stale, restart-safe like the edge watchdog). The "serialized ingest writer" is a
 > process-wide lock in `CentralStore` (Postgres behind the same surface is the documented upgrade).
-> Auth is still the static-bearer-token stopgap. Parts C (per-org auth + multi-tenant dashboard) and
-> D (frozen binary + installers + supervisor self-update + CI/CD) remain. Code-level invariants live in
-> `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
+> Part C: the central **multi-tenant dashboard + per-org accounts** (`central/auth.py`,
+> `central/admin.py`, `central/static/`). Two auth planes — ingest stays the machine bearer token,
+> the dashboard uses identity-carrying signed-cookie sessions; accounts are central-provisioned
+> (superadmin onboards each ISP; org users scoped to their tenant with a role); every read is
+> tenant-scoped. **Team + attendance became org-wide central concepts** (decision honoured), but the
+> live per-outage paging ladder **stays on the edge** (decision #2 resilience — central owns the
+> picture, the edge owns the page). Only **Part D** (frozen binary + installers + supervisor
+> self-update + staged rollout + CI/CD) now remains. Code-level invariants live in `CLAUDE.md`
+> §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
 
 ## The lens (what actually changes, and what doesn't)
 

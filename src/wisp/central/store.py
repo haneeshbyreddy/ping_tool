@@ -96,6 +96,38 @@ CREATE TABLE IF NOT EXISTS node_alerts (
     detail     TEXT,
     created_at TEXT NOT NULL
 );
+-- Part C — dashboard login accounts. tenant_id NULL = a SUPERADMIN (the platform
+-- operator who onboards ISPs + provisions org accounts); else the account is scoped to
+-- one org. Passwords are salted SHA-256 (crypto in central/auth.py, like the edge PIN).
+CREATE TABLE IF NOT EXISTS users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id  TEXT,                       -- NULL => superadmin (cross-tenant)
+    username   TEXT NOT NULL UNIQUE,
+    pw_hash    TEXT NOT NULL,
+    pw_salt    TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT 'operator',  -- owner|operator|tech within the org
+    is_active  INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+-- Part C — the org-wide team roster + attendance ("who's on duty" is an org fact, so it
+-- lives centrally now, not per-edge). Mirrors the edge workers/attendance model.
+CREATE TABLE IF NOT EXISTS org_workers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id  TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT 'operator',
+    region     TEXT,
+    is_active  INTEGER NOT NULL DEFAULT 1,
+    notes      TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS org_attendance (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    worker_id INTEGER NOT NULL REFERENCES org_workers(id),
+    day       TEXT NOT NULL,               -- UTC calendar day; presence = a row exists
+    UNIQUE (worker_id, day)
+);
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(tenant_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(tenant_id, node_id, device_id, id);
 CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(tenant_id, node_id, id);
@@ -104,6 +136,17 @@ CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(tenant_id, node_id, id
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _recent_days(today: str, n: int) -> list[str]:
+    """The last `n` UTC calendar days ending at `today`, oldest first."""
+    from datetime import timedelta
+    base = datetime.strptime(today, "%Y-%m-%d")
+    return [(base - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(max(1, n) - 1, -1, -1)]
 
 
 class CentralStore:
@@ -327,3 +370,112 @@ class CentralStore:
                 " created_at) VALUES (?,?,?,?,?,?)",
                 (tenant_id, node_id, kind, status, detail, now))
             conn.commit()
+
+    # --- users / login accounts (Part C; crypto in central/auth.py) ---
+    def add_user(self, tenant_id: str | None, username: str, pw_hash: str,
+                 pw_salt: str, role: str = "operator") -> int:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO users (tenant_id, username, pw_hash, pw_salt, role,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (tenant_id, username, pw_hash, pw_salt, role, _now_iso()))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        return dict(row) if row else None
+
+    def get_user(self, user_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self, tenant_id: str | None = None) -> list[dict]:
+        scope, args = self._scope(tenant_id)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, tenant_id, username, role, is_active, created_at FROM users"
+                " WHERE 1=1" + scope + " ORDER BY tenant_id IS NOT NULL, tenant_id, username",
+                args)]
+
+    def set_user_password(self, user_id: int, pw_hash: str, pw_salt: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("UPDATE users SET pw_hash=?, pw_salt=? WHERE id=?",
+                         (pw_hash, pw_salt, user_id))
+            conn.commit()
+
+    def set_user_active(self, user_id: int, active: bool) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("UPDATE users SET is_active=? WHERE id=?",
+                         (1 if active else 0, user_id))
+            conn.commit()
+
+    def delete_user(self, user_id: int) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+
+    # --- org team roster + attendance (Part C — org-wide, was per-edge) ---
+    def add_worker(self, tenant_id: str, name: str, role: str = "operator",
+                   region: str | None = None, notes: str | None = None) -> int:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO org_workers (tenant_id, name, role, region, notes, created_at)"
+                " VALUES (?,?,?,?,?,?)", (tenant_id, name, role, region, notes, _now_iso()))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_workers(self, tenant_id: str) -> list[dict]:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, tenant_id, name, role, region, is_active, notes FROM org_workers"
+                " WHERE tenant_id=? ORDER BY role, name", (tenant_id,))]
+
+    def update_worker(self, worker_id: int, **fields) -> None:
+        allowed = ("name", "role", "region", "is_active", "notes")
+        sets = {k: fields[k] for k in allowed if k in fields}
+        if not sets:
+            return
+        cols = ", ".join(f"{k}=?" for k in sets)
+        with self._write_lock, self._connect() as conn:
+            conn.execute(f"UPDATE org_workers SET {cols} WHERE id=?",
+                         (*sets.values(), worker_id))
+            conn.commit()
+
+    def delete_worker(self, worker_id: int) -> None:
+        with self._write_lock, self._connect() as conn:
+            # FK: clear the worker's attendance rows before the worker row.
+            conn.execute("DELETE FROM org_attendance WHERE worker_id=?", (worker_id,))
+            conn.execute("DELETE FROM org_workers WHERE id=?", (worker_id,))
+            conn.commit()
+
+    def set_attendance(self, tenant_id: str, worker_id: int, present: bool,
+                       day: str | None = None) -> None:
+        day = day or _today()
+        with self._write_lock, self._connect() as conn:
+            if present:
+                conn.execute(
+                    "INSERT OR IGNORE INTO org_attendance (tenant_id, worker_id, day)"
+                    " VALUES (?,?,?)", (tenant_id, worker_id, day))
+            else:
+                conn.execute("DELETE FROM org_attendance WHERE worker_id=? AND day=?",
+                             (worker_id, day))
+            conn.commit()
+
+    def attendance_overview(self, tenant_id: str, days: int = 7,
+                            today: str | None = None) -> dict:
+        today = today or _today()
+        with self._connect() as conn:
+            ops = [dict(r) for r in conn.execute(
+                "SELECT id, name, role, region FROM org_workers"
+                " WHERE tenant_id=? AND is_active=1 AND role='operator' ORDER BY name",
+                (tenant_id,))]
+            present = {(r["worker_id"], r["day"]) for r in conn.execute(
+                "SELECT worker_id, day FROM org_attendance WHERE tenant_id=?", (tenant_id,))}
+        day_list = _recent_days(today, days)
+        for op in ops:
+            op["present_today"] = (op["id"], today) in present
+            op["days"] = {d: ((op["id"], d) in present) for d in day_list}
+        return {"today": today, "days": day_list, "operators": ops}
