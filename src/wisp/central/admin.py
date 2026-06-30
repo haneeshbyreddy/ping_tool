@@ -53,6 +53,21 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("list-users", help="list all accounts")
 
+    p = sub.add_parser("publish-release", help="register a version + its per-platform artifacts")
+    p.add_argument("--version", required=True)
+    p.add_argument("--channel", default="stable")
+    p.add_argument("--artifact", nargs=3, action="append", default=[],
+                   metavar=("PLATFORM", "URL", "SHA256"),
+                   help="e.g. --artifact linux-amd64 https://.../wisp-edge <sha256> (repeatable)")
+
+    p = sub.add_parser("start-rollout", help="begin a staged rollout to an org")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--canary", default="", help="comma-separated node_ids for the first wave")
+
+    p = sub.add_parser("rollout-status", help="show an org's rollout + node versions")
+    p.add_argument("--tenant", required=True)
+
     args = ap.parse_args(argv)
     store = CentralStore(CONFIG.central_db)
 
@@ -78,6 +93,29 @@ def main(argv: list[str] | None = None) -> int:
                 scope = "SUPERADMIN" if u["tenant_id"] is None else f"{u['tenant_id']}/{u['role']}"
                 active = "" if u["is_active"] else " (inactive)"
                 print(f"  {u['id']:>3}  {u['username']:<20} {scope}{active}")
+        elif args.cmd == "publish-release":
+            artifacts = {plat: {"url": url, "sha256": sha} for plat, url, sha in args.artifact}
+            store.set_release(args.version, artifacts, args.channel)
+            print(f"published {args.version} ({args.channel}) with "
+                  f"{len(artifacts)} artifact(s): {', '.join(artifacts) or '(none)'}")
+        elif args.cmd == "start-rollout":
+            if not store.get_release(args.version):
+                print(f"no such release {args.version!r} — publish it first", file=sys.stderr)
+                return 1
+            canary = [c.strip() for c in args.canary.split(",") if c.strip()]
+            store.set_rollout(args.tenant, args.version, canary, state="canary")
+            wave = f"canary {canary}" if canary else "fleet-wide (no canary)"
+            print(f"rollout of {args.version} to {args.tenant!r} started: {wave}")
+        elif args.cmd == "rollout-status":
+            r = store.get_rollout(args.tenant)
+            if not r:
+                print(f"no rollout for {args.tenant!r}")
+            else:
+                print(f"rollout -> {r['target_version']}  state={r['state']}  "
+                      f"canary={r['canary']}")
+            for n in store.node_versions(args.tenant):
+                print(f"  {n['node_id']:<16} version={n['version'] or '?':<10} "
+                      f"last_seen={n['last_seen']}")
     except auth.AuthError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

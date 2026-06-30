@@ -30,7 +30,7 @@ from typing import NamedTuple, Protocol
 from wisp.config import CONFIG, Config
 from wisp.database import outbox
 from wisp.database.client import connect, write_with_retry
-from wisp.version import VERSION
+from wisp.version import VERSION, platform_tag
 
 log = logging.getLogger("wisp.shipper")
 
@@ -44,6 +44,7 @@ class ShipResult(NamedTuple):
     accepted_ids: list[int] = []   # outbox ids central durably holds (-> safe to delete)
     status: int = 0
     detail: str = ""
+    body: dict | None = None       # the parsed reply (heartbeat carries the update directive)
 
 
 class Shipper(Protocol):
@@ -96,8 +97,8 @@ class HttpShipper:
         return ShipResult(True, [int(i) for i in accepted], status, "")
 
     def heartbeat(self, envelope: dict) -> ShipResult:
-        ok, status, _body, detail = self._post("/heartbeat", envelope)
-        return ShipResult(ok, [], status, detail)
+        ok, status, body, detail = self._post("/heartbeat", envelope)
+        return ShipResult(ok, [], status, detail, body)
 
 
 def build_shipper(cfg: Config = CONFIG) -> Shipper:
@@ -113,10 +114,14 @@ class ShipperWorker:
     with a temp DB + an injected `Shipper` double + an injected clock."""
 
     def __init__(self, cfg: Config = CONFIG, shipper: Shipper | None = None,
-                 clock=_time.monotonic) -> None:
+                 clock=_time.monotonic, on_update=None) -> None:
         self.cfg = cfg
         self.shipper = shipper or build_shipper(cfg)
         self._clock = clock
+        # Where a received update directive is handed off to the supervisor (the agent does NOT
+        # self-update — the updater isn't the thing being updated). Default: an atomic file in
+        # the persistent state dir the supervisor watches. Injectable for tests.
+        self._on_update = on_update or self._write_update_request
         self._stop = threading.Event()
 
     # --- envelopes ---
@@ -136,8 +141,20 @@ class ShipperWorker:
             open_outages = conn.execute(
                 "SELECT COUNT(*) FROM outages WHERE resolved_at IS NULL").fetchone()[0]
             backlog = outbox.count(conn)
-        return {"version": VERSION, "last_poll_ts": last_poll, "fleet_size": int(fleet),
-                "open_outages": int(open_outages), "outbox_backlog": int(backlog)}
+        return {"version": VERSION, "platform": platform_tag(), "last_poll_ts": last_poll,
+                "fleet_size": int(fleet), "open_outages": int(open_outages),
+                "outbox_backlog": int(backlog)}
+
+    def _write_update_request(self, directive: dict) -> None:
+        """Persist the update directive for the supervisor (atomic write next to the DB).
+        The supervisor — a separate, stable process — owns the actual swap + rollback."""
+        import json
+        import os
+        path = self.cfg.db_path.parent / "update_request.json"
+        tmp = path.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(directive))
+        os.replace(tmp, path)
 
     # --- one-shot operations (the unit-test seams) ---
     def heartbeat_once(self) -> bool:
@@ -146,6 +163,16 @@ class ShipperWorker:
         res = self.shipper.heartbeat(env)
         if not res.ok:
             log.debug("heartbeat to central failed: %s", res.detail)
+            return False
+        # The reply doubles as the update channel: if central wants this node on a newer
+        # version, hand the directive to the supervisor (it owns download→verify→swap→rollback).
+        directive = (res.body or {}).get("update") if res.body else None
+        if directive and directive.get("target_version") != VERSION:
+            try:
+                self._on_update(directive)
+                log.info("update directive received: -> %s", directive.get("target_version"))
+            except Exception:
+                log.exception("failed to record update directive")
         return res.ok
 
     def drain_once(self) -> tuple[bool, int]:

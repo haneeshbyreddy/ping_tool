@@ -301,6 +301,17 @@ class Config:
     # 0 = auto (max(30, node_stale/2)); how often the central watchdog re-evaluates liveness.
     central_watchdog_interval_s: int = field(
         default_factory=lambda: _env_int("WISP_CENTRAL_WATCHDOG_INTERVAL_S", 0))
+    # --- Staged rollout / self-update (Part D) -------------------------------
+    # How long a CANARY node has, after central tells it to update, to come back reporting the
+    # target version with a fresh heartbeat. If a canary misses that window the rollout
+    # auto-halts (it never promotes a bad version fleet-wide). "Update every node" must never
+    # mean "brick every node at once."
+    rollout_health_window_s: int = field(
+        default_factory=lambda: _env_int("WISP_ROLLOUT_HEALTH_WINDOW_S", 600))
+    # Edge supervisor: after swapping in a new agent binary, how long it has to prove healthy
+    # (its preflight + a successful heartbeat) before the supervisor rolls back to last-known-good.
+    agent_health_deadline_s: int = field(
+        default_factory=lambda: _env_int("WISP_AGENT_HEALTH_DEADLINE_S", 300))
 
     # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))

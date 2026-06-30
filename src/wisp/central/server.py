@@ -198,8 +198,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                         self._reply(200, {"accepted": store.ingest(tenant, node,
                                                                    env.get("records", []))})
                     else:
-                        store.record_heartbeat(tenant, node, env.get("body", {}))
-                        self._reply(200, {"ok": True})
+                        body = env.get("body", {})
+                        store.record_heartbeat(tenant, node, body)
+                        self._reply(200, self._heartbeat_reply(tenant, node, body))
                 except Exception:
                     log.exception("ingest failed for %s/%s", tenant, node)
                     self._reply(500, {"error": "internal error"})
@@ -223,6 +224,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
             except Exception:
                 log.exception("dashboard write failed: %s", route)
                 self._reply(500, {"error": "internal error"})
+
+        def _heartbeat_reply(self, tenant: str, node: str, body: dict) -> dict:
+            """The heartbeat reply doubles as the update channel (Part D): advance the org's
+            rollout and, if this node is due a newer version, hand it the signed directive."""
+            reply: dict = {"ok": True}
+            try:
+                from wisp.central import rollout
+                rollout.evaluate(store, tenant, cfg=cfg)
+                directive = rollout.directive_for(store, tenant, node, body.get("version"),
+                                                  body.get("platform"))
+                if directive:
+                    reply["update"] = directive
+            except Exception:
+                log.exception("rollout directive failed for %s/%s", tenant, node)
+            return reply
 
         # --- login ---
         def _login(self):

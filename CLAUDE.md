@@ -10,10 +10,10 @@ work, and open questions).
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
 (team directory, PIN gate, monitor lifecycle), **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–C**
+backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–D**
 (edge→central shipper + outbox + heartbeat; multi-tenant central store + global device-id
-mapping + cross-edge fleet watchdog; per-org dashboard + accounts + org-wide team/attendance) —
-244 tests. The
+mapping + cross-edge fleet watchdog; per-org dashboard + accounts + org-wide team/attendance;
+version authority + staged rollout + supervisor self-update + Linux/CI packaging) — 265 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
@@ -265,7 +265,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
   on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
 
-## Central reporting — edge shipper + multi-tenant central store + dashboard (Phase 10 Parts A–C)
+## Central reporting — edge shipper + multi-tenant central + self-update (Phase 10 Parts A–D)
 
 - **`WISP_CENTRAL_URL` empty ⇒ the whole distributed layer is dormant — THE back-compat anchor.**
   `Config.central_enabled()` gates everything: nothing is written to `outbox`, no shipper thread
@@ -348,6 +348,35 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   move immediate alerting to central). The dashboard is a self-contained pure-stdlib SPA under
   `central/static/` (served unauthed; it renders its own login gate on a 401, like the edge). Login is
   rate-limited by the edge's `LoginThrottle`.
+- **(Part D) Central is the version authority; rollouts are staged + health-gated + auto-rollback.**
+  `central/rollout.py` is pure decision logic over the store: `directive_for(...)` = what a node
+  should install now (None unless there's an active rollout, the node is eligible in the current
+  wave, it's behind the target, AND a release artifact exists for its `platform`); `evaluate(...)` =
+  the `canary→promoted→done|halted` state machine (promote only once **every canary reports the
+  target version with a fresh heartbeat**; auto-**halt** if a canary misses `rollout_health_window_s`).
+  The **heartbeat reply is the update channel** (no inbound holes): `server._heartbeat_reply` runs
+  `evaluate` then attaches the `{target_version, url, sha256}` directive. Releases/rollouts are
+  provisioned via `central/admin.py` (`publish-release`/`start-rollout`/`rollout-status`). The wire
+  envelope `v` stays the skew-tolerance seam — central accepts old+new during a rollout.
+- **(Part D) The supervisor self-updates the agent; the updater is NOT the thing being updated.**
+  `runtime/supervisor.py` `Supervisor.apply(directive)` is the swap state machine behind injected IO
+  (download/restart/health/clock, so it unit-tests with temp files): `needs_update` (pull on any
+  difference — central owns the target), `verify_sha256` (an unverified binary is **never** swapped —
+  the supply-chain gate), back up last-known-good → atomic `os.replace` → restart → **health-gate**
+  (`agent_health_deadline_s`) → **rollback** to LKG if it doesn't come back. The agent's shipper
+  drops the directive to `update_request.json` (atomic) via `_write_update_request`; it does **not**
+  self-update. The real-host wiring (httpx download, subprocess relaunch) is the thin
+  `apps/supervisor/main.py` (needs a frozen agent + systemd to exercise; logic is the tested part).
+  `apps/daemon/main.py --version` prints `VERSION` so the supervisor can query the installed build.
+- **(Part D) Packaging is two modes; identity lives OUTSIDE the binary.** The single-box venv path
+  (`deploy/install.sh` + `wisp-monitor`/`wisp-dashboard`) stays; the **fleet** path is a frozen
+  PyInstaller binary (`deploy/wisp-edge.spec` — force-includes the lazy `icmplib`/`httpx`/`pysnmp`)
+  run by the supervisor (`deploy/wisp-edge.service`), installed via `deploy/install-edge.sh`
+  (`curl|sh`: arch-detect → download → **verify sha256** → systemd → ICMP sysctl). Config/cert/DB live
+  in `/etc/wisp` so an update swaps **only** the binary. CI (`.github/workflows/release.yml`) tests on
+  every push/PR and **only a `v*` tag** signs/packages/publishes a Release + manifest; `wisp/_buildinfo.py`
+  is the CI-stamped `git describe` version (git-ignored; `wisp/version.py` prefers it, then `WISP_VERSION`,
+  then the hardcoded fallback). Windows installer + code-signing are scaffolded but need real CI/hosts.
 - **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
   rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
   rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the
@@ -362,7 +391,12 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   team+attendance round-trip, ingest is bearer-not-session, static index served),
   `integration/test_daemon.CentralEnqueueTest` (the back-compat anchor: disabled = no outbox rows,
   enabled = event enqueued in the poll txn), `integration/test_rollup` (fold enqueues rollups only when
-  central is on).
+  central is on), `integration/test_central_rollout` (**Part D**: directive eligibility — canary-only,
+  up-to-date/no-artifact/halted→none, promoted→all; the canary→promoted→done|halted state machine incl.
+  window-halt and silent-canary-halt), `unit/test_supervisor` (**Part D**: needs_update, verify_sha256,
+  apply happy-path/verify-fail-no-swap/unhealthy-rollback/skip, consume_request file), plus the shipper's
+  update-directive handoff (`test_shipper`: directive→supervisor, current-version ignored, no-directive
+  no-op; heartbeat carries version+platform).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

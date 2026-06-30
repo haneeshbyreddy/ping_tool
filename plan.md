@@ -506,9 +506,20 @@ in the PR/commit rather than guessing silently.
 > (superadmin onboards each ISP; org users scoped to their tenant with a role); every read is
 > tenant-scoped. **Team + attendance became org-wide central concepts** (decision honoured), but the
 > live per-outage paging ladder **stays on the edge** (decision #2 resilience — central owns the
-> picture, the edge owns the page). Only **Part D** (frozen binary + installers + supervisor
-> self-update + staged rollout + CI/CD) now remains. Code-level invariants live in `CLAUDE.md`
-> §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
+> picture, the edge owns the page).
+>
+> Part D — **the testable core is shipped**: central is the **version authority** with a
+> **staged, health-gated, auto-rollback rollout** (`central/rollout.py` — canary→promoted→done|halted),
+> the **heartbeat reply is the update channel** (carries `{target_version, url, sha256}`), and the edge
+> **supervisor** (`runtime/supervisor.py`) owns verify→atomic-swap→health-gate→rollback. All unit-tested
+> and validated end-to-end (publish → canary rollout → directive → supervisor apply → auto-promote →
+> done). The **deploy/CI scaffolding** is written — PyInstaller spec (`deploy/wisp-edge.spec`), fleet
+> systemd unit, `curl|sh` Linux installer (`deploy/install-edge.sh`), the supervisor entrypoint
+> (`apps/supervisor/main.py`), and the GitHub Actions release pipeline (`.github/workflows/release.yml`).
+> **What still needs real CI + hosts to exercise** (not runnable in this dev sandbox): the actual
+> PyInstaller multi-arch build, code-signing (Authenticode/minisign), the Windows Inno Setup installer,
+> and mTLS enrollment/cert-rotation (still on the static-bearer-token stopgap). Code-level invariants
+> live in `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
 
 ## The lens (what actually changes, and what doesn't)
 

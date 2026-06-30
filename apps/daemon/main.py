@@ -570,7 +570,14 @@ def main() -> None:
                         help="seconds between polls (overrides config)")
     parser.add_argument("--cycles", type=int, default=None,
                         help="stop after N cycles (default: run forever)")
+    parser.add_argument("--version", action="store_true",
+                        help="print the build version and exit (the supervisor queries this)")
     args = parser.parse_args()
+
+    if args.version:
+        from wisp.version import VERSION
+        print(VERSION)
+        return
 
     logging.basicConfig(
         level=logging.INFO,

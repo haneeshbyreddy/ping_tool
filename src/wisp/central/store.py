@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS org_attendance (
     day       TEXT NOT NULL,               -- UTC calendar day; presence = a row exists
     UNIQUE (worker_id, day)
 );
+-- Part D — the version authority. A published release + its per-platform signed artifacts,
+-- and one active staged rollout per org (canary subset first, promoted fleet-wide only after
+-- the canaries come back healthy on the target; auto-halts otherwise).
+CREATE TABLE IF NOT EXISTS releases (
+    version    TEXT PRIMARY KEY,
+    channel    TEXT NOT NULL DEFAULT 'stable',
+    artifacts  TEXT NOT NULL,             -- JSON {platform: {url, sha256}}
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rollouts (
+    tenant_id      TEXT PRIMARY KEY,
+    target_version TEXT NOT NULL,
+    canary         TEXT NOT NULL,         -- JSON list of node_ids (the first wave)
+    state          TEXT NOT NULL,         -- 'canary' | 'promoted' | 'done' | 'halted'
+    started_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    note           TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(tenant_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(tenant_id, node_id, device_id, id);
 CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(tenant_id, node_id, id);
@@ -479,3 +497,66 @@ class CentralStore:
             op["present_today"] = (op["id"], today) in present
             op["days"] = {d: ((op["id"], d) in present) for d in day_list}
         return {"today": today, "days": day_list, "operators": ops}
+
+    # --- releases / staged rollout (Part D version authority) ---
+    def set_release(self, version: str, artifacts: dict, channel: str = "stable") -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO releases (version, channel, artifacts, created_at)"
+                " VALUES (?,?,?,?) ON CONFLICT(version) DO UPDATE SET"
+                " channel=excluded.channel, artifacts=excluded.artifacts",
+                (version, channel, json.dumps(artifacts, separators=(",", ":")), _now_iso()))
+            conn.commit()
+
+    def get_release(self, version: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        out["artifacts"] = json.loads(out["artifacts"])
+        return out
+
+    def list_releases(self) -> list[dict]:
+        with self._connect() as conn:
+            return [{"version": r["version"], "channel": r["channel"],
+                     "created_at": r["created_at"]}
+                    for r in conn.execute(
+                        "SELECT version, channel, created_at FROM releases ORDER BY created_at DESC")]
+
+    def set_rollout(self, tenant_id: str, target_version: str, canary: list,
+                    state: str = "canary", note: str | None = None,
+                    now: str | None = None) -> None:
+        now = now or _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO rollouts (tenant_id, target_version, canary, state, started_at,"
+                " updated_at, note) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(tenant_id) DO UPDATE SET target_version=excluded.target_version,"
+                " canary=excluded.canary, state=excluded.state, started_at=excluded.started_at,"
+                " updated_at=excluded.updated_at, note=excluded.note",
+                (tenant_id, target_version, json.dumps(canary), state, now, now, note))
+            conn.commit()
+
+    def update_rollout_state(self, tenant_id: str, state: str, now: str | None = None) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("UPDATE rollouts SET state=?, updated_at=? WHERE tenant_id=?",
+                         (state, now or _now_iso(), tenant_id))
+            conn.commit()
+
+    def get_rollout(self, tenant_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM rollouts WHERE tenant_id=?",
+                               (tenant_id,)).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        out["canary"] = json.loads(out["canary"])
+        return out
+
+    def node_versions(self, tenant_id: str) -> list[dict]:
+        """Every node's (node_id, version, last_seen) — the rollout evaluator's input."""
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT node_id, version, last_seen FROM nodes WHERE tenant_id=?",
+                (tenant_id,))]

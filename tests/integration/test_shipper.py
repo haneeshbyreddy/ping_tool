@@ -19,9 +19,10 @@ TS = "2026-06-30T12:00:00+00:00"
 
 
 class RecordingShipper:
-    def __init__(self, ok=True, accept="all"):
+    def __init__(self, ok=True, accept="all", hb_body=None):
         self.ok = ok
         self.accept = accept           # "all" | "first" | "none"
+        self.hb_body = hb_body         # the heartbeat reply body (e.g. an update directive)
         self.batches: list[dict] = []
         self.heartbeats: list[dict] = []
 
@@ -35,7 +36,7 @@ class RecordingShipper:
 
     def heartbeat(self, envelope) -> ShipResult:
         self.heartbeats.append(envelope)
-        return ShipResult(self.ok, [], 200 if self.ok else 0, "")
+        return ShipResult(self.ok, [], 200 if self.ok else 0, "", self.hb_body)
 
 
 class ShipperTest(unittest.TestCase):
@@ -120,6 +121,35 @@ class ShipperTest(unittest.TestCase):
         self.assertEqual(body["last_poll_ts"], TS)
         self.assertEqual(body["outbox_backlog"], 2)
         self.assertIn("version", body)
+
+    def test_heartbeat_includes_version_and_platform(self):
+        ship = RecordingShipper()
+        ShipperWorker(self.cfg, ship).heartbeat_once()
+        body = ship.heartbeats[0]["body"]
+        self.assertIn("version", body)
+        self.assertIn("platform", body)
+
+    # --- update directive (Part D) ---
+    def test_update_directive_handed_to_supervisor(self):
+        from wisp.version import VERSION
+        ship = RecordingShipper(hb_body={"ok": True,
+            "update": {"target_version": "99.0.0", "url": "u", "sha256": "s"}})
+        got = []
+        worker = ShipperWorker(self.cfg, ship, on_update=got.append)
+        self.assertTrue(worker.heartbeat_once())
+        self.assertEqual(got, [{"target_version": "99.0.0", "url": "u", "sha256": "s"}])
+        # a directive for the version we already run is ignored (no needless swap)
+        ship2 = RecordingShipper(hb_body={"ok": True,
+            "update": {"target_version": VERSION, "url": "u", "sha256": "s"}})
+        got2 = []
+        ShipperWorker(self.cfg, ship2, on_update=got2.append).heartbeat_once()
+        self.assertEqual(got2, [])
+
+    def test_no_update_directive_is_noop(self):
+        ship = RecordingShipper(hb_body={"ok": True})
+        got = []
+        ShipperWorker(self.cfg, ship, on_update=got.append).heartbeat_once()
+        self.assertEqual(got, [])
 
     # --- eviction ---
     def test_evict_enforces_cap_dropping_rollups(self):

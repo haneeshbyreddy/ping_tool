@@ -1,0 +1,32 @@
+# WISP Edge (fleet path) — the SUPERVISOR, which launches + self-updates the agent.
+#
+# This is the *frozen-binary fleet* deploy mode (the supervisor owns agent updates over the
+# central mTLS/bearer channel). The on-prem single-box mode still uses wisp-monitor.service +
+# the venv (see install.sh). Config + identity live OUTSIDE the binary in /etc/wisp/ so an
+# update swaps the binary, never the cert/DB/config.
+#
+#   sudo cp deploy/wisp-edge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-edge
+#
+[Unit]
+Description=WISP Edge supervisor (manages + self-updates the polling agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The supervisor binary (or the dev module). It launches the agent at WISP_AGENT_BIN.
+ExecStart=/opt/wisp/bin/wisp-supervisor
+Environment=WISP_AGENT_BIN=/opt/wisp/bin/wisp-edge
+# Persistent state + identity dir (DB, mTLS cert, node_id) — survives binary swaps.
+Environment=WISP_DB=/etc/wisp/wisp.db
+EnvironmentFile=-/etc/wisp/edge.env
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# Unprivileged ICMP via the kernel ping group (set by install-edge.sh); no cap_net_raw needed.
+# User=wisp
+# Group=wisp
+
+[Install]
+WantedBy=multi-user.target
