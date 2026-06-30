@@ -481,3 +481,246 @@ in the PR/commit rather than guessing silently.
   from their `ifAlias` labels, so discovery can pre-suggest them.
 - **The real redundant paths**: which towers/relays have a backup line, primary vs backup, and
   does the backup ride a switch port we can watch (so Part B can confirm Part A)?
+
+---
+
+# Phase 10 — Edge nodes + central server (distributed, multi-tenant)
+
+> **For the next session that implements this.** A design brief, not a spec. The calls in
+> "Locked decisions" are made — honour them. Everything else is a recommendation; where you see
+> *(your call)* read the code and decide. The hard rule still stands: when you ship a part,
+> update `CLAUDE.md` + `README.md` so they describe the new reality, and keep the suite green
+> (`python -m unittest discover -s tests`) with new cases for every new path.
+
+## The lens (what actually changes, and what doesn't)
+
+Today: **one daemon + one dashboard, one SQLite, one site, one shared PIN.** The target is
+**many edge nodes** (each is *today's daemon*, almost unchanged) across **many ISPs/tenants**,
+all reporting to **one central server** (aggregation + a multi-tenant dashboard + fleet updates).
+
+The pivot that makes this tractable: **the edge IS today's appliance plus a shipper; the central
+server is a NEW, separate plane.** We are not rewriting `MonitorEngine`, the FSM, fast-confirm,
+the SNMP ingress, or local ntfy alerting — those stay on the edge, where the prober is. Central
+is additive. The back-compat anchor (state it in tests, like single-parent in Phase 9): with
+`WISP_CENTRAL_URL` unset, an edge is **byte-for-byte today's standalone monitor** — the entire
+distributed layer is dormant.
+
+```
+  ISP "A" site                                  Central (multi-tenant)
+  ┌──────────────────────────┐                  ┌───────────────────────────┐
+  │ edge-a1  (today's daemon) │                  │ ingest API  (outbox sink) │
+  │  IcmpProber + FSM + SNMP  │── pages ntfy     │      │                    │
+  │  + NtfyNotifier (LOCAL) ──┼──► (operators)   │      ▼                    │
+  │  + OUTBOX shipper ────────┼── mTLS, edge ───►│ central store (per-tenant)│
+  │  local SQLite + outbox    │   initiated      │      │                    │
+  │  + SUPERVISOR (updates) ◄─┼── version/url ───┤      ▼                    │
+  └──────────────────────────┘   in heartbeat   │ multi-tenant dashboard    │
+  ┌──────────────────────────┐   reply          │ + cross-edge watchdog     │
+  │ edge-a2 ...               │                  │ + version authority       │
+  └──────────────────────────┘                  │   (staged rollout)        │
+  ISP "B": edge-b1, edge-b2 ──────────────────► └───────────────────────────┘
+```
+
+## Locked decisions (made — do not relitigate)
+
+1. **Smart edges, aggregating centre.** Detection (FSM, fast-confirm, between-cycle watch),
+   topology suppression, the canary, SNMP, and **immediate alerting all stay on the edge.** The
+   detection loop is a tight prober↔FSM loop; crossing the WAN for it would destroy the
+   seconds-level detection. Topology is per-site. Central never runs an FSM.
+2. **The edge pages its own devices over ntfy immediately; central owns the org-wide view.**
+   Resilience first: the WAN is most likely to break *during* an ISP's outage, and the alarm must
+   survive the thing it alarms about. Central owns cross-edge correlation, the multi-tenant
+   dashboard, the fleet/heartbeat watchdog, and the analytics rollup. **No double-paging** — the
+   edge owns the page, central owns the picture. (The org-wide escalation/attendance question is
+   deferred to Part C; for the first cut escalation stays on the edge too.)
+3. **Transport: HTTPS + mTLS, edge-initiated outbound ONLY.** The edge dials central; central
+   never connects in. Zero inbound firewall holes at any site (edges live behind ISP NAT/CGNAT).
+   The client cert *is* the node's identity *is* its enrollment — one mechanism for encryption +
+   authn. (WireGuard+HTTP was the alternative; rejected — more ops, identity still separate.)
+4. **Store-and-forward outbox on the edge (SQLite).** The daemon writes records to a local
+   `outbox` transactionally; a shipper drains it and deletes on ack. A WAN blip just grows the
+   outbox. We never lose an outage record to a dropped socket (same durability discipline as the
+   DB-derived escalations).
+5. **Ship events + hourly rollups + heartbeat — NOT raw polls.** `poll_results` is local scratch
+   (already true per "Scaling"); `poll_rollups` is the trend record; `Event`s are the real-time
+   truth. Central pulls a raw window on demand only when an operator drills into an incident.
+6. **Edge identity is `(tenant_id, node_id)`; central assigns global ids.** Edge autoincrement
+   `devices.id` are per-SQLite and **cannot be merged.** Central keeps a mapping
+   `(tenant_id, node_id, edge_local_id) → central_global_id`. Settle this *before* writing ingest.
+7. **Deploy the edge as a frozen single binary** (PyInstaller, per platform/arch) — no Python,
+   no venv, no PEP668 on the edge box. Windows = a service installer; Linux = `curl|sh` + systemd.
+   The existing `deploy/install.{sh,ps1}` (venv + git-pull) **stays** for the on-prem single-box
+   build; the frozen binary is the *fleet* path. Two deploy modes, both supported.
+8. **Updates are pull-based over the existing mTLS channel; central is the version authority;
+   rollouts are staged + health-gated + auto-rollback.** A small stable **supervisor** owns
+   swapping the **agent** binary (the updater is not the thing being updated).
+
+## Part A — edge shipper + outbox (additive, standalone-safe; ship FIRST)
+
+- **`WISP_CENTRAL_URL` empty ⇒ today's behaviour, nothing runs.** This is the safety switch and
+  the test anchor.
+- **`outbox` table** (new migration, idempotent/forward-only): `id, kind, payload(JSON TEXT),
+  created_at, attempts, sent_at`. The daemon, inside the *same* transaction that writes
+  `poll_results`/applies events, also enqueues the shippable records (events; hourly, the rollup
+  rows). One writer, no new lock contention.
+- **Shipper**: a background thread (mirror `start_watchdog_thread`) that drains the outbox to
+  central over mTLS, deletes on 2xx ack, exponential-backs-off on failure, and **caps** the outbox
+  (oldest-rollup eviction past a high-water mark — never evict unsent `Event`s; an outage record
+  is sacred). Isolated try/except — a shipper hiccup never touches the poll loop.
+- **Heartbeat**: every cycle (or every N s) POST `{node_id, version, last_poll_ts, fleet_size,
+  health}`. This doubles as the **liveness signal** (Part B watchdog) and the **update channel**
+  (Part D — the reply carries the target version). 
+- **Wire protocol**: a **versioned envelope** (`v`, `tenant_id`, `node_id`, `kind`, `body`). Ingest
+  must accept old+new `v` during a rollout (version skew is normal in a fleet). Keep it JSON for v1
+  *(your call on msgpack/protobuf later if volume demands)*.
+- **Skeleton central ingest** to receive + persist into a central store (Part B). At this stage
+  central is just a mirror — value (a fleet-wide read view) before any auth/alerting change.
+
+## Part B — central ingest + multi-tenant store + fleet watchdog
+
+- **Tenant/org + node entities.** `org` (the ISP), `node` (an edge, belongs to an org), every
+  device/outage/rollup row carries `tenant_id` + `node_id`. Scope **every** central query by tenant
+  — this is the bulk of the work and it's all central-side; the edge barely changes.
+- **Serialized ingest writer.** Many edges → one central store. Start SQLite behind a single
+  writer thread/queue (WAL won't save you from many concurrent writers). **Postgres is the
+  expected central upgrade** when tenant count grows — design the data layer so central can swap
+  the backend; *the edge stays SQLite+stdlib forever.* *(your call on when to make the cut.)*
+- **Id mapping** per decision #6.
+- **Cross-edge watchdog = `MonitorWatchdog` one level up.** Today the dashboard pages when
+  `poll_results` goes stale; central pages (per-org) when a **node's heartbeat** goes stale — box
+  dead *or* WAN cut. Reuse the restart-safe/conservative logic. Nearly free, high value.
+
+## Part C — central multi-tenant dashboard + auth
+
+- **The single shared PIN does not survive.** Need per-org accounts (and within an org, the role
+  model you already have). `server/auth.py` is the seam; this is a real authn change.
+- **Reuse the existing dashboard**, scoped by tenant, against the aggregated store. Edge-local
+  dashboards can stay (LAN debugging) or be disabled per policy.
+- Decide here whether **escalation/attendance/team** become org-wide central concepts or stay
+  per-edge *(product call — recommend central, since "who's on duty" is an org fact)*.
+
+## Part D — Deployment & updates (the operator's explicit ask)
+
+### Edge artifact — frozen single binary
+- **PyInstaller**, one artifact per platform/arch: `win-amd64`, `linux-amd64`, **`linux-arm64`**
+  (Raspberry Pi / ARM mini-PCs — confirm in scope). Bundle `icmplib` + `pysnmp` (force-include the
+  lazy imports). No venv, no system Python, no PEP668 fight on a box you don't control.
+- **Config + identity live OUTSIDE the binary** in a stable dir that **survives updates**:
+  `/etc/wisp/` (Linux) / `%ProgramData%\Wisp\` (Windows), `0600` — holds the mTLS client cert/key,
+  `node_id`, `central_url`, and `WISP_*` overrides. An update swaps the binary, **never** the
+  config/cert/DB.
+
+### Windows — service installer
+- An **Inno Setup `.exe`** (or MSI) that: drops the agent + supervisor, registers a service that
+  is **auto-start + restart-on-failure**, running as **SYSTEM** (Windows has no unprivileged ICMP —
+  icmplib forces raw sockets needing admin; this is already documented in `deploy/install.ps1`, so
+  reuse that rationale). Scheduled-Task-as-SYSTEM (today's approach) is an acceptable fallback that
+  needs no third-party service wrapper *(your call: native service vs Scheduled Task vs bundled
+  NSSM — the Scheduled Task path is already proven here)*.
+- **Code signing (Authenticode)** to avoid SmartScreen warnings on a fleet install — flag whether
+  a signing cert exists; unsigned is a deployment-friction landmine.
+
+### Linux — `curl | sh`
+- `curl -fsSL https://central/install.sh | sh -s -- --token <ENROLL> --central https://...`:
+  detect arch → download the matching binary → **verify sha256 (+ signature)** → drop a systemd
+  unit (model on the existing `deploy/wisp-monitor.service`) → set `ping_group_range` sysctl →
+  enroll with the token → `systemctl enable --now`.
+- **Supply-chain honesty:** `curl|sh` is a real risk surface. Serve over HTTPS, publish + verify a
+  sha256, and **sign the binary** (minisign/GPG) with the public key pinned in the script. Don't
+  ship an unverified pipe-to-shell.
+
+### Enrollment baked into install (ties to decision #3)
+- One-shot: the install token is exchanged at first contact for the **mTLS client cert** bound to
+  `(org, node)`. Central issues + can revoke; plan **cert rotation** (the agent renews over the
+  channel before expiry). Until Part C's enrollment exists, Part A can run on a static
+  per-node key/`WISP_*` env as a stopgap.
+
+### Updates — pull-based, staged, health-gated (the part they care about most)
+- **Two-part install: a stable `supervisor` + the `agent` it manages.** The OS service runs the
+  *supervisor*; the supervisor launches/monitors the agent and owns
+  **download → verify → atomic-swap → restart → rollback**. This solves "how does a binary update
+  itself while running" — the updater isn't the thing being updated. The supervisor changes rarely;
+  agent updates are the common path.
+- **Pull model over the existing channel (no inbound access):** the **heartbeat reply** carries
+  `{target_version, signed_url, sha256}`. If it differs from the running version, the supervisor
+  downloads to a temp path, **verifies signature + checksum**, atomically renames into place,
+  restarts the agent, and **gates on the agent's existing `preflight()` + first successful
+  heartbeat** within N minutes. On failure → **roll back to last-known-good** (keep the previous
+  binary) and report the failure up. This is exactly how Tailscale-class agents self-update behind
+  NAT.
+- **Central is the version authority, with control:** per-org / per-node version **pinning** and
+  **staged rollout** — canary a few nodes first, watch their post-update heartbeats, and **halt the
+  rollout automatically if updated nodes fail to come back healthy.** "Update every node" must
+  never mean "brick every node at once." *(your call on the rollout policy knobs.)*
+- **Version skew is normal**: central ingest accepts old + new envelope versions throughout a
+  rollout (decision #5/Part A wire protocol).
+
+### CI/CD & release — GitHub Actions builds the artifacts (the "factory")
+The pipeline is the *other half* of the update story, not an alternative to it: **CI builds +
+signs + packages + publishes; central dispatches (staged rollout); the supervisor installs.** They
+compose — CI feeds central feeds the edges. Edges **never** pull GitHub "latest" directly (that
+would bypass the staged/health-gated/rollback control in "Updates" above); central stays the
+version authority and hands out the (GitHub-hosted) signed URL in the heartbeat reply.
+
+- **Build matrix on native runners**, one job per platform/arch:
+  | Runner | Artifact |
+  |---|---|
+  | `windows-latest` | signed `.exe` (PyInstaller) + Inno Setup installer |
+  | `ubuntu-latest` | `linux-amd64` binary + `.deb` |
+  | `ubuntu-24.04-arm` (GitHub hosted arm64 Linux runner) | `linux-arm64` binary + `.deb` (Pi) |
+  Plus `sha256SUMS` + detached signatures + a **version manifest** (`version → {url, sha256}`),
+  all attached to a **GitHub Release**. Use **nfpm** for the `.deb` (config-driven, no fpm/Ruby;
+  drops the binary + systemd unit + a postinst that enables the service; gives `.rpm` for free).
+- **Versioning = the git tag (semver), single source of truth.** CI stamps it into the binary at
+  build (`_version.py` from `git describe`), so every artifact maps to exactly one commit. The edge
+  **reports this version in its heartbeat**; central compares it to the target it's rolling out; the
+  supervisor pulls only on a mismatch. One string ties commit → artifact → running version →
+  rollout decision.
+- **Two triggers, deliberately split** (the cardinal rule — never auto-ship every commit to a live
+  fleet):
+  - **push / PR** → build + run the test suite + produce an artifact (catches build breaks early,
+    gives you something to smoke-test). Not eligible to ship.
+  - **git tag `v*` (or manual `workflow_dispatch`)** → sign, package, publish a Release. Only
+    tagged versions are eligible for central to promote.
+- **Signing happens in CI** — Authenticode (Windows) + minisign/GPG (Linux) keys live in **Actions
+  secrets**, so artifacts are signed the instant they're built and the edge verifies before any
+  swap. This is also what makes the `curl|sh` install trustworthy.
+- **Secondary native path:** publish the `.deb` to a hosted **apt repo** (central or GitHub Pages)
+  so initial install / standalone boxes can use `apt install wisp-edge` + `apt upgrade`. Keep the
+  **agent self-update (central-mediated) as PRIMARY** for the managed fleet; the apt path is for
+  bootstrap + manual boxes — **don't run two competing auto-updaters against the same node.**
+
+## Sequencing (each step independently shippable)
+
+1. **Part A** — edge outbox + shipper + heartbeat + skeleton central ingest. Value (fleet read
+   view) with **no** auth/alerting change; `WISP_CENTRAL_URL` empty keeps every existing
+   deployment identical.
+2. **Part D packaging** — frozen binary + Linux `curl|sh` + Windows installer, so Part A edges can
+   actually be rolled out at sites. (Enrollment can be a stopgap static key here.)
+3. **Part B** — multi-tenant central store + id mapping + cross-edge watchdog.
+4. **Part C** — per-org auth + multi-tenant dashboard (+ decide org-wide escalation).
+5. **Part D updates** — supervisor + pull-based self-update + staged/health-gated rollout +
+   cert rotation. Transport scale (a queue/NATS) only if edge volume demands it.
+
+## Invariants you must not break (plus the existing set in `CLAUDE.md`)
+
+- **`WISP_CENTRAL_URL` unset ⇒ byte-identical standalone behaviour.** The distributed layer is
+  strictly additive and off by default. This is the new back-compat anchor.
+- **The edge stays SQLite + frozen-stdlib; only the *central* store may graduate to Postgres.**
+- **Updating the agent binary never touches the DB, config, or mTLS cert** (separate dirs).
+- **A shipper/heartbeat hiccup never sinks the poll cycle** — same try/except discipline as every
+  other per-cycle task; the monitor is the hardest thing in the system to kill.
+- **Outbox eviction never drops an unsent `Event`** (an outage record is the source of truth).
+- **Tests inject doubles — no real network to central in the suite** (recording-shipper double,
+  exactly like the recording notifier). Mirror the `tests/` layers.
+
+## Open questions for the operator (surface before building Part B+)
+
+- **Account model:** does central provision orgs (you onboard each ISP), or self-serve signup?
+- **Where does central live** (your VPS/cloud), its domain, and the **CA** that issues edge mTLS
+  certs (self-managed CA vs a public one)?
+- **Code signing:** do you have (or want) an Authenticode cert for Windows + a signing key for the
+  Linux binary? Affects install friction and the `curl|sh` trust story.
+- **Arch list:** is Raspberry Pi / ARM64 in scope (it changes the build matrix)?
+- **Update policy:** fully automatic per org, or operator-approved rollouts? Canary size?
+- **Data residency / retention** at central across tenants (one big store vs per-tenant DBs).
