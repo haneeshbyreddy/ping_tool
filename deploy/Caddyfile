@@ -1,0 +1,13 @@
+# Caddy in front of the WISP central server — terminates TLS (auto Let's Encrypt) and proxies
+# plain HTTP to the container on the internal compose network. Used by docker-compose.central.yml.
+#
+# {$CENTRAL_DOMAIN} / {$ACME_EMAIL} come from deploy/.env. Caddy obtains + renews the cert with
+# no extra config the moment DNS for the domain points at this host.
+{
+	email {$ACME_EMAIL}
+}
+
+{$CENTRAL_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy central:8443
+}

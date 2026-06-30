@@ -1,0 +1,55 @@
+# One-command central hosting: the WISP central server behind Caddy for automatic HTTPS
+# (Let's Encrypt). This is the recommended shape for a small GCE VM — see deploy/central-gcloud.md.
+#
+#   # 1. point a DNS A record at the VM's external IP (central.example.net -> 34.x.x.x)
+#   # 2. create deploy/.env (NOT committed) with the two required values:
+#   #      WISP_CENTRAL_TOKEN=<openssl rand -hex 32>
+#   #      CENTRAL_DOMAIN=central.example.net
+#   #      ACME_EMAIL=you@example.net
+#   # 3. bring it up from the repo root:
+#   docker compose -f deploy/docker-compose.central.yml up -d --build
+#   # 4. bootstrap the first account:
+#   docker compose -f deploy/docker-compose.central.yml exec central \
+#       central-entrypoint admin create-superadmin --username you
+#
+# Caddy fetches + renews the TLS cert automatically; central never sees plain-internet traffic.
+services:
+  central:
+    build:
+      context: ..
+      dockerfile: deploy/central.Dockerfile
+    image: wisp-central:latest
+    restart: unless-stopped
+    environment:
+      WISP_CENTRAL_TOKEN: ${WISP_CENTRAL_TOKEN:?set WISP_CENTRAL_TOKEN in deploy/.env}
+      WISP_CENTRAL_DB: /data/central.db
+      # Tunables (optional) — match these to your fleet; see config.py for the full list.
+      WISP_CENTRAL_NODE_STALE_S: ${WISP_CENTRAL_NODE_STALE_S:-180}
+      WISP_CENTRAL_NTFY_TOPIC: ${WISP_CENTRAL_NTFY_TOPIC:-wisp-central}
+    volumes:
+      # The SQLite DB (+ wal/shm) AND central_session_secret live here — keep it persistent.
+      - central-data:/data
+    # No published ports: only Caddy talks to it, on the internal network.
+    expose:
+      - "8443"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - central
+    ports:
+      - "80:80"     # ACME HTTP-01 challenge + HTTP->HTTPS redirect
+      - "443:443"   # the real dashboard/ingest endpoint
+    environment:
+      CENTRAL_DOMAIN: ${CENTRAL_DOMAIN:?set CENTRAL_DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data       # issued certs (persist so renewals survive restarts)
+      - caddy-config:/config
+
+volumes:
+  central-data:
+  caddy-data:
+  caddy-config:

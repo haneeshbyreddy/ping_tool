@@ -8,6 +8,12 @@ This is the **simple, single-box** deployment: one server, you control root, pla
 Python under systemd. No containers, no release pipeline, no code obfuscation — none
 of that earns its keep for one appliance you own.
 
+> **Deploying the multi-site / cloud build instead?** This file is the standalone edge.
+> For the distributed system (Phase 10) see: `deploy/central-gcloud.md` (host the central
+> server on Google Cloud), `deploy/ci-cd.md` (the GitHub Actions release pipeline), and
+> `README.md` §"Fleet deploy" (frozen-binary edges: `deploy/install-edge.sh`, the `.deb`,
+> and the Windows `deploy/wisp-edge.iss` installer).
+
 ## Why native systemd, not Docker
 
 This is a **network monitor** — it wants the host's real network stack. In a container

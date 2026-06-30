@@ -372,11 +372,37 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   (`deploy/install.sh` + `wisp-monitor`/`wisp-dashboard`) stays; the **fleet** path is a frozen
   PyInstaller binary (`deploy/wisp-edge.spec` — force-includes the lazy `icmplib`/`httpx`/`pysnmp`)
   run by the supervisor (`deploy/wisp-edge.service`), installed via `deploy/install-edge.sh`
-  (`curl|sh`: arch-detect → download → **verify sha256** → systemd → ICMP sysctl). Config/cert/DB live
-  in `/etc/wisp` so an update swaps **only** the binary. CI (`.github/workflows/release.yml`) tests on
-  every push/PR and **only a `v*` tag** signs/packages/publishes a Release + manifest; `wisp/_buildinfo.py`
-  is the CI-stamped `git describe` version (git-ignored; `wisp/version.py` prefers it, then `WISP_VERSION`,
-  then the hardcoded fallback). Windows installer + code-signing are scaffolded but need real CI/hosts.
+  (`curl|sh`: arch-detect → download → **verify sha256** → systemd → ICMP sysctl), the native package
+  (**nfpm** — `deploy/nfpm.yaml` + `nfpm-postinstall.sh`/`nfpm-preremove.sh`, emits .deb **and** .rpm;
+  enables-but-doesn't-start the unit since the per-fleet token isn't in the package), or on Windows the
+  **Inno Setup** installer (`deploy/wisp-edge.iss` + `wisp-edge-launcher.cmd` +
+  `register-wisp-edge-task.ps1`: installs agent+supervisor, writes `%ProgramData%\Wisp\edge.env` from
+  `/central=//token=//tenant=//node=` install params **only if absent** — an upgrade preserves identity,
+  same rule as install-edge.sh — and registers a **SYSTEM** boot Scheduled Task, restart-on-crash, via
+  PowerShell `Register-ScheduledTask`; SYSTEM because Windows has no unprivileged ICMP, the proven
+  install.ps1 rationale). Config/cert/DB live in `/etc/wisp` (Linux) / `%ProgramData%\Wisp` (Windows) so
+  an update swaps **only** the binary. CI (`.github/workflows/release.yml`) tests on every push/PR and
+  **only a `v*` tag** signs/packages/publishes a Release + manifest (the manifest lists only the raw
+  **agent** binaries — not the installer/.deb — those aren't supervisor-pullable) **and pushes the
+  central image to GHCR**; `wisp/_buildinfo.py` is the CI-stamped `git describe` version (git-ignored;
+  `wisp/version.py` prefers it, then `WISP_VERSION`, then the hardcoded fallback). **Still needs real
+  CI runners + a Windows host + a signing cert to *exercise*:** the PyInstaller multi-arch build, the
+  Inno compile, and Authenticode/minisign signing (the sign steps no-op without the secret). Setup
+  walkthrough: `deploy/ci-cd.md`.
+- **(Part D) Central hosts in a container; the EDGE never does.** The edge needs the host network
+  stack for ICMP/SNMP (see `deploy.md` "Why native systemd, not Docker") — so it stays native systemd
+  and there is **no edge Dockerfile, on purpose**. Central is a plain HTTP aggregation service, so it
+  *is* containerized: `deploy/central.Dockerfile` is a slim non-root image (pure stdlib +
+  `requirements-central.txt` = just httpx for the watchdog ntfy send — **no icmplib/pysnmp**, central
+  never probes), entry `deploy/central-entrypoint.sh` (`serve` default | `admin <cmd>` for the
+  provisioning CLI | passthrough). **The DB AND the session secret both live in `WISP_CENTRAL_DB`'s dir
+  (`central_session_secret`), so `/data` MUST be a persistent volume** — lose it and you lose fleet
+  history *and* log everyone out. Central is **single-writer SQLite ⇒ scale-to-one** (one instance only;
+  the documented scale path is Cloud SQL Postgres behind `CentralStore`). `deploy/docker-compose.central.yml`
+  + `deploy/Caddyfile` = central behind auto-HTTPS Caddy in one command (8443 stays internal, only
+  80/443 published). GCP playbook: `deploy/central-gcloud.md` (Compute Engine VM recommended; Cloud Run
+  only pinned to one instance with a durable `/data` mount). The central store self-manages its schema
+  (no edge `migrations/` in the image). Don't add an edge Dockerfile or run 2+ central instances on one DB.
 - **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
   rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
   rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the

@@ -1,0 +1,10 @@
+# Central server deps (apps/central) — the AGGREGATION plane only.
+#
+# Central is otherwise pure stdlib: ingest, the multi-tenant store (SQLite), the dashboard,
+# auth, the rollout authority. The ONE runtime dep is httpx, which the fleet watchdog
+# lazy-imports to page an org over ntfy when a node's heartbeat goes stale. It does NOT need
+# icmplib or pysnmp — those are edge-only (the central never pings or walks SNMP).
+#
+# Use this (not requirements.txt) for the central container/host so the image stays slim:
+#     python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-central.txt
+httpx>=0.27

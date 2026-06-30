@@ -116,8 +116,9 @@ apps/
 └── supervisor/main.py    # edge supervisor — runs + self-updates the frozen agent (fleet path)
 data/                     # wisp.db / central.db (+ wal/shm) + session_secret — git-ignored
 migrations/               # 000N_*.sql, applied in order, tracked in schema_migrations
-deploy/                   # systemd units + install scripts + PyInstaller spec (single-box + fleet)
-.github/workflows/        # release.yml — build/test on push/PR; sign+publish on a v* tag
+deploy/                   # systemd units + install scripts + PyInstaller spec + Inno installer +
+                          #   nfpm (.deb/.rpm) + central Dockerfile/compose + gcloud & CI/CD guides
+.github/workflows/        # release.yml — build/test on push/PR; sign+publish (+ GHCR image) on a v* tag
 tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
 docs/  assets/            # incident post-mortem template; original design mockup
 run.sh                    # one-shot setup + run for both runtimes
@@ -271,12 +272,26 @@ PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
 ```
 Linux install is `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
 (`deploy/install-edge.sh`: arch-detect → download → **verify sha256** → systemd unit → ICMP
-sysctl). CI (`.github/workflows/release.yml`) builds + tests on every push/PR and, **only on a
-`v*` tag**, signs/packages/publishes a Release with a version manifest central ingests — edges
-never pull GitHub "latest" directly (that would bypass the staged/rollback control). The
-single-box venv path (`deploy/install.sh`) still exists; the frozen binary is the *fleet* path.
-The two-deploy-modes split, Windows installer, and code-signing are documented in `plan.md` §D;
-the Windows/signing/native-runner pieces need real CI + hosts to exercise.
+sysctl), or the native package (`apt install ./wisp-edge_*.deb`, built by **nfpm** —
+`deploy/nfpm.yaml`); Windows is the signed **Inno Setup** installer (`deploy/wisp-edge.iss` —
+drops agent+supervisor, writes identity to `%ProgramData%\Wisp`, registers a SYSTEM boot task).
+CI (`.github/workflows/release.yml`) builds + tests on every push/PR and, **only on a `v*` tag**,
+signs/packages/publishes a Release with a version manifest central ingests (and pushes the central
+image to GHCR) — edges never pull GitHub "latest" directly (that would bypass the staged/rollback
+control). See `deploy/ci-cd.md` for the full pipeline + secrets walkthrough. The single-box venv
+path (`deploy/install.sh`) still exists; the frozen binary is the *fleet* path. **The PyInstaller
+multi-arch build, Authenticode/minisign signing, and the Windows installer build still need real CI
+runners + a Windows host + a signing cert to *exercise*** — the configs are written and the logic
+is unit-tested.
+
+**Hosting central in the cloud.** Central is a plain HTTP service (no ICMP), so unlike the edge it
+*does* belong in a container: `deploy/central.Dockerfile` builds a slim, non-root image (pure
+stdlib + httpx for the watchdog) with the DB + session secret on a `/data` volume.
+`deploy/docker-compose.central.yml` + `deploy/Caddyfile` bring it up behind automatic-HTTPS Caddy
+in one command, and `deploy/central-gcloud.md` is the full Google Cloud playbook (a small Compute
+Engine VM is the recommended shape — central is single-writer SQLite, so it's scale-to-one until
+the documented Postgres upgrade; Cloud Run is covered with its caveats). The image is published to
+`ghcr.io/<owner>/ping_tool/central` on each tag.
 
 ## Configuration (env vars, all optional)
 

@@ -513,13 +513,21 @@ in the PR/commit rather than guessing silently.
 > the **heartbeat reply is the update channel** (carries `{target_version, url, sha256}`), and the edge
 > **supervisor** (`runtime/supervisor.py`) owns verify→atomic-swap→health-gate→rollback. All unit-tested
 > and validated end-to-end (publish → canary rollout → directive → supervisor apply → auto-promote →
-> done). The **deploy/CI scaffolding** is written — PyInstaller spec (`deploy/wisp-edge.spec`), fleet
-> systemd unit, `curl|sh` Linux installer (`deploy/install-edge.sh`), the supervisor entrypoint
-> (`apps/supervisor/main.py`), and the GitHub Actions release pipeline (`.github/workflows/release.yml`).
-> **What still needs real CI + hosts to exercise** (not runnable in this dev sandbox): the actual
-> PyInstaller multi-arch build, code-signing (Authenticode/minisign), the Windows Inno Setup installer,
-> and mTLS enrollment/cert-rotation (still on the static-bearer-token stopgap). Code-level invariants
-> live in `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
+> done). The **deploy + CI/CD + cloud-hosting layer is now written end-to-end** — PyInstaller spec
+> (`deploy/wisp-edge.spec`), fleet systemd unit, `curl|sh` Linux installer (`deploy/install-edge.sh`),
+> the **native package** (nfpm: `deploy/nfpm.yaml` → .deb/.rpm), the **Windows Inno Setup installer**
+> (`deploy/wisp-edge.iss` + launcher + SYSTEM-task PowerShell), the supervisor entrypoint
+> (`apps/supervisor/main.py`), the GitHub Actions release pipeline (`.github/workflows/release.yml` —
+> now also builds the installer + packages and pushes a **central image to GHCR** on a tag), a CI/CD
+> setup guide (`deploy/ci-cd.md`), and the **containerized central** for cloud hosting
+> (`deploy/central.Dockerfile` + `docker-compose.central.yml` + `Caddyfile`, with the full GCP playbook
+> in `deploy/central-gcloud.md`; the central image was build-and-run smoke-tested here). The container
+> deliberately covers **central only** — the edge stays native systemd (it needs the host net stack for
+> ICMP/SNMP). **What still needs real CI runners + hosts + a cert to *exercise*** (configs are written,
+> logic is unit-tested, not runnable in this dev sandbox): the actual PyInstaller multi-arch build, the
+> Inno compile on Windows, code-signing (Authenticode/minisign), and mTLS enrollment/cert-rotation
+> (still on the static-bearer-token stopgap). Code-level invariants live in `CLAUDE.md` §"Central
+> reporting"; this brief stays the *why*, per the repo's docs rule.
 
 ## The lens (what actually changes, and what doesn't)
 

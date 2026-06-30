@@ -1,0 +1,39 @@
+# nfpm config — builds the native Linux package (.deb / .rpm) for the WISP edge fleet path.
+#
+# nfpm is config-driven (no fpm/Ruby) and emits .deb AND .rpm from this one file. It is the
+# SECONDARY install path (bootstrap + manual boxes: `apt install ./wisp-edge_*.deb`); the PRIMARY
+# managed-fleet update path is the supervisor's central-mediated self-update. Don't run two
+# auto-updaters against one node — the .deb installs + enables the service; central drives upgrades.
+#
+# Build per arch in CI (the binaries must already be in ./out/ from the PyInstaller job):
+#   VERSION=1.2.3 PKG_ARCH=amd64 PKG_PLAT=linux-amd64 nfpm pkg -p deb -f deploy/nfpm.yaml -t out/
+#   VERSION=1.2.3 PKG_ARCH=arm64 PKG_PLAT=linux-arm64 nfpm pkg -p deb -f deploy/nfpm.yaml -t out/
+name: wisp-edge
+arch: ${PKG_ARCH}            # amd64 | arm64
+platform: linux
+version: ${VERSION}
+version_schema: none        # take VERSION verbatim (it's the git describe / tag string)
+section: net
+priority: optional
+maintainer: WISP <noreply@users.noreply.github.com>
+description: |
+  WISP edge — network-monitor agent + self-update supervisor (frozen-binary fleet path).
+  Pings the shared WISP infrastructure, pages operators locally over ntfy, and reports
+  events/rollups/heartbeats to a central server. The supervisor self-updates the agent.
+homepage: https://github.com/haneeshbyreddy/ping_tool
+license: Proprietary
+
+contents:
+  - src: ./out/wisp-edge-${PKG_PLAT}
+    dst: /opt/wisp/bin/wisp-edge
+    file_info: { mode: 0755 }
+  - src: ./out/wisp-supervisor-${PKG_PLAT}
+    dst: /opt/wisp/bin/wisp-supervisor
+    file_info: { mode: 0755 }
+  - src: ./deploy/wisp-edge.service
+    dst: /etc/systemd/system/wisp-edge.service
+    type: config|noreplace    # never clobber a locally-edited unit on upgrade
+
+scripts:
+  postinstall: ./deploy/nfpm-postinstall.sh
+  preremove: ./deploy/nfpm-preremove.sh

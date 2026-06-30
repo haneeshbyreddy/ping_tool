@@ -1,0 +1,20 @@
+# Keep the central image build context small + reproducible. The Dockerfile copies only
+# src/ + apps/central/, but a tight context speeds builds and avoids leaking local state.
+.git
+.github
+data/
+*.db
+*.db-wal
+*.db-shm
+.venv/
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+tests/
+docs/
+assets/
+.env
+# Never bake a CI-stamped edge version into the central image.
+src/wisp/_buildinfo.py

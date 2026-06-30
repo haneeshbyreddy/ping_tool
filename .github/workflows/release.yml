@@ -3,13 +3,16 @@
 # The cardinal rule: NEVER auto-ship every commit to a live fleet. Two triggers, split:
 #   * push / PR        -> build + run the test suite + produce an artifact (catch breaks early).
 #                         NOT eligible to ship.
-#   * git tag `v*` (or manual dispatch) -> sign, package, publish a GitHub Release. Only tagged
-#                         versions are eligible for central to promote (staged + health-gated).
+#   * git tag `v*` (or manual dispatch) -> sign, package, publish a GitHub Release + the central
+#                         image. Only tagged versions are eligible for central to promote (staged
+#                         + health-gated).
 #
 # Central stays the version authority: it hands out the (GitHub-hosted) signed URL + sha256 in
 # the heartbeat reply; edges NEVER pull "latest" from GitHub directly (that would bypass the
 # staged/health-gated/rollback control). The version is the git tag (semver), stamped into the
 # binary so commit -> artifact -> running version -> rollout decision is one string.
+#
+# Full setup walkthrough (secrets, runners, how the manifest feeds central): deploy/ci-cd.md.
 name: release
 
 on:
@@ -21,6 +24,7 @@ on:
 
 permissions:
   contents: write          # needed to create the Release on a tag
+  packages: write          # push the central image to GHCR on a tag
 
 jobs:
   test:
@@ -39,9 +43,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest,    plat: linux-amd64, ext: "" }
-          - { runner: ubuntu-24.04-arm, plat: linux-arm64, ext: "" }
-          - { runner: windows-latest,   plat: win-amd64,   ext: ".exe" }
+          - { runner: ubuntu-latest,    plat: linux-amd64, ext: "",     pkg_arch: amd64 }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64, ext: "",     pkg_arch: arm64 }
+          - { runner: windows-latest,   plat: win-amd64,   ext: ".exe", pkg_arch: "" }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -50,10 +54,12 @@ jobs:
         with: { python-version: "3.12" }
 
       - name: Stamp version from git
+        id: ver
         shell: bash
         run: |
           VER="$(git describe --tags --always --dirty | sed 's/^v//')"
           echo "VERSION = \"$VER\"" > src/wisp/_buildinfo.py
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "built version: $VER"
 
       - name: Install build deps
@@ -68,6 +74,39 @@ jobs:
           mkdir -p out
           cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
           cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
+
+      # --- Linux native package (.deb + .rpm) via nfpm -----------------------
+      # The SECONDARY install path (bootstrap / manual boxes); the managed fleet updates via the
+      # supervisor. nfpm is config-driven (deploy/nfpm.yaml) and emits both formats from one file.
+      - name: Build .deb / .rpm (nfpm)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.ver }}
+          PKG_ARCH: ${{ matrix.pkg_arch }}
+          PKG_PLAT: ${{ matrix.plat }}
+        run: |
+          NFPM_VERSION=2.41.0
+          case "$(uname -m)" in
+            x86_64)  NARCH=x86_64;;
+            aarch64) NARCH=arm64;;
+            *) echo "unexpected host arch $(uname -m)"; exit 1;;
+          esac
+          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NARCH}.tar.gz" | tar -xz nfpm
+          ./nfpm pkg -p deb -f deploy/nfpm.yaml -t out/
+          ./nfpm pkg -p rpm -f deploy/nfpm.yaml -t out/
+
+      # --- Windows installer (Inno Setup) ------------------------------------
+      # Stages the two frozen .exe next to the .iss (its [Files] use relative Source paths), then
+      # compiles. Code signing is wired via SignTool on the iscc line in CI — see deploy/ci-cd.md.
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Copy-Item dist\wisp-edge.exe, dist\wisp-supervisor.exe deploy\
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.ver.outputs.ver }}" deploy\wisp-edge.iss
+          Copy-Item dist\wisp-edge-setup-*.exe out\
 
       # Signing happens IN CI so artifacts are signed the instant they're built and the edge
       # verifies before any swap. Keys live in Actions secrets; steps no-op if a secret is unset
@@ -88,6 +127,34 @@ jobs:
           name: wisp-${{ matrix.plat }}
           path: out/*
 
+  # The central server image — built + pushed to GHCR only on a tag (it is the cloud half of the
+  # system; the edge artifacts above are the fleet half). Hosting: deploy/central-gcloud.md.
+  central-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3       # for the arm64 leg of the multi-arch build
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/central.Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}/central:latest
+            ghcr.io/${{ github.repository }}/central:${{ github.ref_name }}
+
   release:
     # Only a tag publishes a Release; push/PR builds stop at the artifact above.
     if: startsWith(github.ref, 'refs/tags/v')
@@ -103,12 +170,15 @@ jobs:
           find dist -type f -exec cp {} release/ \;
           (cd release && cat SHA256SUMS-* > SHA256SUMS && rm -f SHA256SUMS-*)
           VER="${GITHUB_REF_NAME#v}"
-          # A version manifest central can ingest: version -> {platform: {url, sha256}}.
+          # A version manifest central can ingest: version -> {platform: {url, sha256}}. Only the
+          # raw AGENT binaries belong here (what the supervisor pulls) — not the installer/.deb.
           python - "$VER" > release/manifest.json <<'PY'
           import hashlib, json, sys, pathlib
           ver = sys.argv[1]; rel = pathlib.Path("release"); arts = {}
           base = f"https://github.com/${{ github.repository }}/releases/download/v{ver}"
           for p in sorted(rel.glob("wisp-edge-*")):
+              if "setup" in p.name or p.suffix in (".deb", ".rpm"):
+                  continue  # installer / native packages aren't supervisor-pullable artifacts
               plat = p.name.replace("wisp-edge-", "").replace(".exe", "")
               arts[plat] = {"url": f"{base}/{p.name}",
                             "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
