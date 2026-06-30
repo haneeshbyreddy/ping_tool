@@ -76,6 +76,60 @@ class CentralStoreTest(unittest.TestCase):
         names = [e["device_name"] for e in self.store.fleet()["recent_events"]]
         self.assertEqual(names, ["B", "A"])
 
+    # --- Part B: orgs, the global id mapping, tenant scoping ---
+    def test_org_auto_provisioned_on_first_contact(self):
+        self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5)])
+        self.store.record_heartbeat("ispB", "edge-9", {"fleet_size": 1})
+        tenants = {o["tenant_id"] for o in self.store.orgs()}
+        self.assertEqual(tenants, {"ispA", "ispB"})
+
+    def test_device_registry_assigns_one_global_id_per_edge_device(self):
+        # same (tenant,node,edge_local_id) across two events -> ONE global id, metadata kept.
+        self.store.ingest("ispA", "edge-1",
+                          [_evt(1, device_id=5, device_name="Tower", device_ip="10.0.0.5")])
+        self.store.ingest("ispA", "edge-1", [_evt(2, device_id=5, state="UP")])
+        devs = self.store.devices("ispA")
+        self.assertEqual(len(devs), 1)
+        d = devs[0]
+        self.assertEqual(d["edge_local_id"], 5)
+        self.assertEqual(d["name"], "Tower")         # denormalized name retained
+        self.assertEqual(d["ip"], "10.0.0.5")
+        self.assertTrue(isinstance(d["id"], int))    # a central GLOBAL id
+
+    def test_same_edge_local_id_two_nodes_two_global_ids(self):
+        self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5, device_name="A")])
+        self.store.ingest("ispA", "edge-2", [_evt(1, device_id=5, device_name="B")])
+        gids = {d["id"] for d in self.store.devices("ispA")}
+        self.assertEqual(len(gids), 2)               # per-node ids never collide globally
+
+    def test_device_latest_state(self):
+        self.store.ingest("ispA", "edge-1",
+                          [_evt(1, device_id=5, state="DOWN", type="OutageOpened")])
+        self.store.ingest("ispA", "edge-1",
+                          [_evt(2, device_id=5, state="UP", type="OutageResolved")])
+        d = self.store.devices("ispA")[0]
+        self.assertEqual(d["last_state"], "UP")
+        self.assertEqual(d["last_event"], "OutageResolved")
+
+    def test_tenant_scoping_filters_reads(self):
+        self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5, device_name="A")])
+        self.store.ingest("ispB", "edge-1", [_evt(1, device_id=7, device_name="B")])
+        self.assertEqual(len(self.store.devices("ispA")), 1)
+        self.assertEqual(len(self.store.devices()), 2)               # unscoped = all tenants
+        self.assertEqual([n["tenant_id"] for n in self.store.fleet("ispB")["nodes"]], ["ispB"])
+
+    def test_uplink_event_has_no_device_row(self):
+        self.store.ingest("ispA", "edge-1", [_evt(1, type="UplinkDown")])  # no device_id
+        self.assertEqual(self.store.devices("ispA"), [])
+
+    def test_set_org_topic(self):
+        self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5)])
+        self.store.set_org("ispA", name="ISP A", ntfy_topic="ispA-ops")
+        self.assertEqual(self.store.org_topic("ispA"), "ispA-ops")
+        org = next(o for o in self.store.orgs() if o["tenant_id"] == "ispA")
+        self.assertEqual(org["name"], "ISP A")
+        self.assertEqual(org["node_count"], 1)
+
 
 class CentralServerTest(unittest.TestCase):
     def setUp(self):
@@ -163,6 +217,28 @@ class CentralServerTest(unittest.TestCase):
         # unauthed fleet view is refused
         status, _ = self._req("GET", "/api/fleet")
         self.assertEqual(status, 401)
+
+    def test_orgs_and_devices_endpoints(self):
+        self._req("POST", "/ingest",
+                  _batch([_evt(1, device_id=5, device_name="Tower")]), token="s3cret")
+        status, body = self._req("GET", "/api/orgs", token="s3cret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["orgs"][0]["tenant_id"], "ispA")
+        status, body = self._req("GET", "/api/devices", token="s3cret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["devices"][0]["name"], "Tower")
+        self.assertIn("id", body["devices"][0])           # global id surfaced
+        # both require the token
+        self.assertEqual(self._req("GET", "/api/devices")[0], 401)
+
+    def test_fleet_tenant_query_param_scopes(self):
+        self._req("POST", "/ingest", _batch([_evt(1, device_name="A")]), token="s3cret")
+        env = {"v": 1, "tenant_id": "ispB", "node_id": "edge-1", "kind": "batch",
+               "records": [_evt(1, device_name="B")]}
+        self._req("POST", "/ingest", env, token="s3cret")
+        status, body = self._req("GET", "/api/fleet?tenant=ispB", token="s3cret")
+        self.assertEqual(status, 200)
+        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispB"})
 
 
 if __name__ == "__main__":

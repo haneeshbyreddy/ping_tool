@@ -289,6 +289,18 @@ class Config:
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
+    # Cross-edge fleet watchdog (Part B): central pages (per-org) when a node's heartbeat
+    # goes silent — box dead OR WAN cut. A node is "stale" after this many seconds without a
+    # heartbeat; keep it a comfortable multiple of WISP_HEARTBEAT_INTERVAL_S so one missed
+    # beat never false-alarms (default 180 = 3 × the 60s default heartbeat).
+    central_node_stale_s: int = field(
+        default_factory=lambda: _env_int("WISP_CENTRAL_NODE_STALE_S", 180))
+    # Fallback ntfy topic for the fleet watchdog when an org has set no per-org topic.
+    central_ntfy_topic: str = field(
+        default_factory=lambda: _env("WISP_CENTRAL_NTFY_TOPIC", "wisp-central"))
+    # 0 = auto (max(30, node_stale/2)); how often the central watchdog re-evaluates liveness.
+    central_watchdog_interval_s: int = field(
+        default_factory=lambda: _env_int("WISP_CENTRAL_WATCHDOG_INTERVAL_S", 0))
 
     # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))

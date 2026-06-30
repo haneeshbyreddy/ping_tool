@@ -42,7 +42,7 @@ PYTHONPATH=src python -m wisp.egress.ack <id> "Your Name"   # acknowledge (named
 # operator dashboard (browser UI over the same live DB; pure stdlib):
 python apps/dashboard/main.py                        # http://127.0.0.1:8000  (Ctrl-C to stop)
 
-python -m unittest discover -s tests                 # 214 tests (pure stdlib)
+python -m unittest discover -s tests                 # 230 tests (pure stdlib)
 ```
 
 **First visit** sets a dashboard **PIN** (shared, gates the whole UI); after that, the
@@ -105,7 +105,7 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── ingress/              # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk)
 ├── egress/               # notifiers.py (alert dispatch), ports.py, ack.py,
 │                         #   shipper.py (drains the outbox to central + heartbeats)
-├── central/             # the aggregation plane (Phase 10): store.py + server.py (ingest)
+├── central/             # the aggregation plane (Phase 10): store.py + server.py + watchdog.py
 └── server/               # services.py (JSON data + device/worker CRUD, rollup trends),
                           #   routes.py (HTTP + auth gate), auth.py (PIN + sessions)
 apps/
@@ -184,13 +184,13 @@ run.sh                    # one-shot setup + run for both runtimes
   fleet-wide picture; it never runs an FSM and never pages. With `WISP_CENTRAL_URL` **unset**
   the whole layer is dormant and the edge is byte-for-byte the standalone monitor. See below.
 
-## Central reporting (Phase 10 Part A — distributed mode, optional)
+## Central reporting (Phase 10 Parts A–B — distributed, multi-tenant; optional)
 
 By default this is **one box** — one daemon + one dashboard, standalone. Phase 10 lets many
-**edge** nodes (each is today's daemon, unchanged) report up to **one central** server for a
-fleet-wide view. It is strictly additive and **off unless `WISP_CENTRAL_URL` is set** — that
-empty-URL case is the hard back-compat anchor (no outbox writes, no shipper thread, identical
-behaviour).
+**edge** nodes (each is today's daemon, unchanged) across many ISPs/tenants report up to **one
+central** server for a fleet-wide, multi-tenant view. It is strictly additive and **off unless
+`WISP_CENTRAL_URL` is set** — that empty-URL case is the hard back-compat anchor (no outbox
+writes, no shipper thread, identical behaviour).
 
 What ships, and how:
 - **The edge owns the page; central owns the picture.** Detection (FSM, fast-confirm,
@@ -213,10 +213,21 @@ What ships, and how:
   change. Delivery is at-least-once + central storage is idempotent on the edge's outbox id
   (a lost ack just re-ships rows central already holds), i.e. effectively-once.
 
+**Multi-tenant central (Part B).** Central is keyed by `(tenant_id, node_id)`: orgs (ISPs)
+are auto-provisioned on first contact, every node belongs to an org, and **central assigns its
+own global device ids** — an edge's per-SQLite `device_id` can't be merged across nodes, so the
+central `devices` table maps each `(tenant, node, edge-local id)` to a global id (the same
+edge-local id from two nodes gets two global ids, never collides). The read API is **tenant-
+scoped** (`?tenant=` narrows any read; absent = whole fleet). A **cross-edge fleet watchdog**
+pages a node's org when its heartbeat goes stale (box dead or WAN cut) — the dead-monitor
+watchdog one level up, restart-safe and conservative, routing to the org's ntfy topic.
+
 Run the central server (a **separate** process, its own SQLite at `WISP_CENTRAL_DB`):
 ```bash
-WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py        # ingest on :8443, plus a read view
-curl -H 'Authorization: Bearer s3cret' http://HOST:8443/api/fleet   # nodes + recent events
+WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py            # ingest + read API on :8443
+curl -H 'Authorization: Bearer s3cret' http://HOST:8443/api/fleet            # nodes + recent events
+curl -H 'Authorization: Bearer s3cret' http://HOST:8443/api/orgs             # the tenants
+curl -H 'Authorization: Bearer s3cret' 'http://HOST:8443/api/devices?tenant=ispA'  # global device view
 ```
 Then point an edge at it (on the daemon's systemd unit):
 ```bash
@@ -224,8 +235,8 @@ WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
 WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
 ```
 Put the central server behind a TLS terminator (nginx/Caddy) in production — it speaks plain
-HTTP itself to stay dependency-free. The multi-tenant store/dashboard + per-org auth + the
-frozen-binary fleet rollout are later Phase 10 parts (see `plan.md`).
+HTTP itself to stay dependency-free. The per-org **dashboard + auth** (Part C) and the
+frozen-binary fleet **rollout/self-update** (Part D) are the remaining Phase 10 parts (`plan.md`).
 
 ## Configuration (env vars, all optional)
 
@@ -258,6 +269,8 @@ frozen-binary fleet rollout are later Phase 10 parts (see `plan.md`).
 | `WISP_SHIP_INTERVAL_S` / `WISP_SHIP_BATCH` | `5` / `200` | shipper drain cadence + max records per POST |
 | `WISP_OUTBOX_MAX_ROWS` | `100000` | outbox high-water mark (evicts oldest rollups; never events; 0 = unbounded) |
 | `WISP_CENTRAL_DB` / `WISP_CENTRAL_BIND` / `WISP_CENTRAL_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central server store + listen address |
+| `WISP_CENTRAL_NODE_STALE_S` | `180` | central pages an org when a node's heartbeat is older than this (box dead / WAN cut) |
+| `WISP_CENTRAL_NTFY_TOPIC` | `wisp-central` | fallback fleet-watchdog topic when an org has set none |
 
 **Config is env-var only** — every tunable is read once at startup into the frozen `Config`
 (`config.py` has the full list + defaults). There is no in-UI settings page and no DB config

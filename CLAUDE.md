@@ -10,8 +10,9 @@ work, and open questions).
 
 Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8**
 (team directory, PIN gate, monitor lifecycle), **Phase 9** — Part A (graph topology /
-backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Part A**
-(edge→central shipper + outbox + heartbeat + a skeleton central ingest server) — 214 tests. The
+backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–B**
+(edge→central shipper + outbox + heartbeat; multi-tenant central store + global device-id
+mapping + cross-edge fleet watchdog) — 230 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
@@ -263,7 +264,7 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   (per-switch port summary incl. `bw_low`; the three edge kinds + port `down` flag; dangling-edge drop
   on delete), `integration/test_daemon.SnmpCycleWiring` (persist + broken-walk isolation).
 
-## Central reporting — edge shipper + outbox (Phase 10 Part A)
+## Central reporting — edge shipper + multi-tenant central store (Phase 10 Parts A–B)
 
 - **`WISP_CENTRAL_URL` empty ⇒ the whole distributed layer is dormant — THE back-compat anchor.**
   `Config.central_enabled()` gates everything: nothing is written to `outbox`, no shipper thread
@@ -298,26 +299,47 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   **only on a central ack** of that row's id (`drain_once` acks `accepted_ids ∩ sent`; a partial
   accept is "unhealthy" → backs off and retries the rest). Central (`central/store.py`) stores with
   `UNIQUE(tenant_id, node_id, edge_id)` + `INSERT OR IGNORE`, so a re-delivered batch after a lost ack
-  stores nothing twice and re-acks. Edge identity is **`(tenant_id, node_id)`**; the edge-local
-  `device_id` rides along only as a per-node correlation id (central does NOT merge it into a global
-  id yet — that mapping is Part B). The wire envelope is **versioned** (`v`, default 1); central ingest
+  stores nothing twice and re-acks. The wire envelope is **versioned** (`v`, default 1); central ingest
   accepts `v ≤ MAX_WIRE_V` so a staged fleet rollout with mixed edge versions never breaks ingest.
 - **The central server is a SEPARATE process with its OWN SQLite.** `apps/central/main.py` +
-  `central/server.py` (pure-stdlib `ThreadingHTTPServer`): `POST /ingest`, `POST /heartbeat` (both
-  bearer-token gated, constant-time compare), `GET /api/fleet` (gated read view), `GET /healthz`
-  (unauthed). Writes go through one process-wide lock in `CentralStore` — the miniature of the plan's
-  "serialized ingest writer" (Part B is where it may become a real queue / Postgres; the **edge stays
+  `central/server.py` (pure-stdlib `ThreadingHTTPServer`): `POST /ingest`, `POST /heartbeat`, and the
+  tenant-scoped read API `GET /api/{fleet,orgs,devices}` (all bearer-token gated, constant-time
+  compare; `?tenant=` narrows a read, absent = whole fleet), `GET /healthz` (unauthed). **Every write
+  goes through one process-wide lock in `CentralStore`** — the plan's "serialized ingest writer" in
+  miniature (Postgres behind the same method surface is the documented upgrade; the **edge stays
   SQLite+stdlib forever**). Auth is the static `WISP_CENTRAL_TOKEN` stopgap — mTLS enrollment is a
   later part, and the envelope is shaped so the cert replaces the token with no wire change. Front it
   with a TLS terminator in prod (it speaks plain HTTP to stay dependency-free).
+- **(Part B) Identity & the global id map (decision #6).** Edge identity is **`(tenant_id, node_id)`**;
+  an edge's autoincrement `devices.id` is per-SQLite and **cannot be merged across nodes**, so central
+  keeps its OWN global id space: the `devices` table maps each `(tenant_id, node_id, edge_local_id)` →
+  a central `id` (UNIQUE on that triple), assigned on first sight and carrying the latest denormalized
+  name/ip/region (`_resolve_device`, called from `_insert_event`/`_insert_rollup`). The same
+  `edge_local_id` from two nodes therefore gets **two** global ids — never collides. `events`/`rollups`
+  keep the edge-local `device_id` and join the registry for the global id. Orgs are **auto-provisioned**
+  on first contact (`_ensure_org`); `set_org` names them + sets a per-org alert topic (Part C surfaces
+  it). **Every read takes an optional `tenant_id`** (`_scope`) — central is multi-tenant, nothing is
+  cross-tenant by default.
+- **(Part B) Cross-edge fleet watchdog = `MonitorWatchdog` one level up.** `central/watchdog.py`
+  `CentralWatchdog.check(now)` pages a node's **org** (`NODE_STALE`) when its heartbeat is older than
+  `WISP_CENTRAL_NODE_STALE_S` (box dead OR WAN cut), and once more (`NODE_OK`) when it resumes. Same
+  discipline as the edge watchdog: **transition-only**, **restart-safe** (per-node alarm rehydrated
+  from `node_alerts`, only `sent` rows count, so a central restart never re-pages a known-down node),
+  **conservative** (a recent `last_seen` never alarms), **failed page retried** (logged `failed`, not
+  stranded). Routes to the org's `ntfy_topic` else `cfg.central_ntfy_topic`; the ntfy send lazy-imports
+  httpx like the edge, tests inject a recording-notifier double. `start_central_watchdog_thread` runs
+  it on a daemon thread from `serve()`, sharing the server's `store` (so its writes take the same lock).
 - **Tests:** `unit/test_outbox` (record shaping, txn-scoped enqueue + rollback-with-caller, evict
   rollups-not-events, drain helpers), `integration/test_shipper` (drain/ack-delete, failed-ship keeps
   rows + bumps attempts, partial-accept unhealthy, heartbeat body from DB, eviction at cap, the
   central-disabled thread no-op + enabled thread starts), `integration/test_central` (store idempotency
-  + per-node id isolation + heartbeat upsert + fleet view; server auth/version/validation over a real
-  socket), `integration/test_daemon.CentralEnqueueTest` (the back-compat anchor: disabled = no outbox
-  rows, enabled = event enqueued in the poll txn), `integration/test_rollup` (fold enqueues rollups
-  only when central is on).
+  + per-node id isolation + heartbeat upsert + fleet view; **Part B**: org auto-provision, global-id
+  mapping + same-edge-id-two-nodes-two-ids, device latest-state, tenant scoping, `set_org`; server
+  auth/version/validation + `/api/{orgs,devices}` + `?tenant=` scoping over a real socket),
+  `integration/test_central_watchdog` (stale→page, recover, transition-only, fresh-node-quiet, restart
+  no-repage, failed-send retry, per-org topic vs fallback), `integration/test_daemon.CentralEnqueueTest`
+  (the back-compat anchor: disabled = no outbox rows, enabled = event enqueued in the poll txn),
+  `integration/test_rollup` (fold enqueues rollups only when central is on).
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 

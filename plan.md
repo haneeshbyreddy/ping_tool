@@ -492,13 +492,17 @@ in the PR/commit rather than guessing silently.
 > update `CLAUDE.md` + `README.md` so they describe the new reality, and keep the suite green
 > (`python -m unittest discover -s tests`) with new cases for every new path.
 
-> **Status — Part A shipped.** The edge shipper + `outbox` (migration 0015) + heartbeat + a
-> skeleton central ingest server (`apps/central`, `src/wisp/central`, `src/wisp/egress/shipper.py`,
-> `src/wisp/database/outbox.py`) are built and tested; `WISP_CENTRAL_URL` empty keeps every existing
-> deployment byte-for-byte standalone. Auth is the static-bearer-token stopgap (decision below).
-> Parts B (multi-tenant store + id mapping + cross-edge watchdog), C (per-org auth + dashboard), and
-> D (frozen binary + installers + supervisor self-update + CI/CD) remain. The code-level invariants
-> now live in `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
+> **Status — Parts A + B shipped.** Part A: the edge shipper + `outbox` (migration 0015) + heartbeat +
+> a skeleton central ingest server (`apps/central`, `src/wisp/central`, `src/wisp/egress/shipper.py`,
+> `src/wisp/database/outbox.py`); `WISP_CENTRAL_URL` empty keeps every existing deployment byte-for-byte
+> standalone. Part B: the multi-tenant central store (orgs auto-provisioned, every read tenant-scoped),
+> the **global device-id mapping** per decision #6 (`devices` table maps `(tenant,node,edge-local id)`→a
+> central id), and the **cross-edge fleet watchdog** (`central/watchdog.py` — pages an org when a node's
+> heartbeat goes stale, restart-safe like the edge watchdog). The "serialized ingest writer" is a
+> process-wide lock in `CentralStore` (Postgres behind the same surface is the documented upgrade).
+> Auth is still the static-bearer-token stopgap. Parts C (per-org auth + multi-tenant dashboard) and
+> D (frozen binary + installers + supervisor self-update + CI/CD) remain. Code-level invariants live in
+> `CLAUDE.md` §"Central reporting"; this brief stays the *why*, per the repo's docs rule.
 
 ## The lens (what actually changes, and what doesn't)
 

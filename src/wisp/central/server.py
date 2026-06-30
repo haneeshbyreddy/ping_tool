@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
 from wisp.central.store import CentralStore
@@ -89,14 +90,25 @@ def _make_handler(cfg: Config, store: CentralStore):
 
         # --- routing ---
         def do_GET(self):
-            if self.path == "/healthz":
+            parsed = urlparse(self.path)
+            route = parsed.path
+            if route == "/healthz":
                 self._reply(200, {"ok": True, "counts": store.counts()})
                 return
-            if self.path == "/api/fleet":
+            # Everything below is the tenant-scoped read API (a `?tenant=` filter narrows it;
+            # absent = the whole fleet, cross-tenant). Part C layers per-org auth on top.
+            if route in ("/api/fleet", "/api/orgs", "/api/devices"):
                 if not self._authed():
                     self._reply(401, {"error": "unauthorized"})
                     return
-                self._reply(200, store.fleet())
+                qs = parse_qs(parsed.query)
+                tenant = (qs.get("tenant") or [None])[0]
+                if route == "/api/fleet":
+                    self._reply(200, store.fleet(tenant_id=tenant))
+                elif route == "/api/orgs":
+                    self._reply(200, {"orgs": store.orgs()})
+                else:
+                    self._reply(200, {"devices": store.devices(tenant_id=tenant)})
                 return
             self._reply(404, {"error": "not found"})
 
@@ -141,6 +153,10 @@ def serve(cfg: Config = CONFIG) -> None:
         log.warning("WISP_CENTRAL_TOKEN is empty — ingest is UNAUTHENTICATED. Set a token "
                     "before exposing central beyond a trusted network.")
     httpd = make_server(cfg)
+    # Cross-edge fleet watchdog (Part B): pages an org when one of its nodes' heartbeats goes
+    # stale. Shares the server's store so its reads/writes serialize through the same lock.
+    from wisp.central.watchdog import start_central_watchdog_thread
+    start_central_watchdog_thread(cfg, httpd.store)  # type: ignore[attr-defined]
     log.info("central ingest listening on %s:%d (db=%s)",
              cfg.central_bind, cfg.central_port, cfg.central_db)
     try:
