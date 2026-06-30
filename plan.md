@@ -655,6 +655,41 @@ distributed layer is dormant.
 - **Version skew is normal**: central ingest accepts old + new envelope versions throughout a
   rollout (decision #5/Part A wire protocol).
 
+### CI/CD & release — GitHub Actions builds the artifacts (the "factory")
+The pipeline is the *other half* of the update story, not an alternative to it: **CI builds +
+signs + packages + publishes; central dispatches (staged rollout); the supervisor installs.** They
+compose — CI feeds central feeds the edges. Edges **never** pull GitHub "latest" directly (that
+would bypass the staged/health-gated/rollback control in "Updates" above); central stays the
+version authority and hands out the (GitHub-hosted) signed URL in the heartbeat reply.
+
+- **Build matrix on native runners**, one job per platform/arch:
+  | Runner | Artifact |
+  |---|---|
+  | `windows-latest` | signed `.exe` (PyInstaller) + Inno Setup installer |
+  | `ubuntu-latest` | `linux-amd64` binary + `.deb` |
+  | `ubuntu-24.04-arm` (GitHub hosted arm64 Linux runner) | `linux-arm64` binary + `.deb` (Pi) |
+  Plus `sha256SUMS` + detached signatures + a **version manifest** (`version → {url, sha256}`),
+  all attached to a **GitHub Release**. Use **nfpm** for the `.deb` (config-driven, no fpm/Ruby;
+  drops the binary + systemd unit + a postinst that enables the service; gives `.rpm` for free).
+- **Versioning = the git tag (semver), single source of truth.** CI stamps it into the binary at
+  build (`_version.py` from `git describe`), so every artifact maps to exactly one commit. The edge
+  **reports this version in its heartbeat**; central compares it to the target it's rolling out; the
+  supervisor pulls only on a mismatch. One string ties commit → artifact → running version →
+  rollout decision.
+- **Two triggers, deliberately split** (the cardinal rule — never auto-ship every commit to a live
+  fleet):
+  - **push / PR** → build + run the test suite + produce an artifact (catches build breaks early,
+    gives you something to smoke-test). Not eligible to ship.
+  - **git tag `v*` (or manual `workflow_dispatch`)** → sign, package, publish a Release. Only
+    tagged versions are eligible for central to promote.
+- **Signing happens in CI** — Authenticode (Windows) + minisign/GPG (Linux) keys live in **Actions
+  secrets**, so artifacts are signed the instant they're built and the edge verifies before any
+  swap. This is also what makes the `curl|sh` install trustworthy.
+- **Secondary native path:** publish the `.deb` to a hosted **apt repo** (central or GitHub Pages)
+  so initial install / standalone boxes can use `apt install wisp-edge` + `apt upgrade`. Keep the
+  **agent self-update (central-mediated) as PRIMARY** for the managed fleet; the apt path is for
+  bootstrap + manual boxes — **don't run two competing auto-updaters against the same node.**
+
 ## Sequencing (each step independently shippable)
 
 1. **Part A** — edge outbox + shipper + heartbeat + skeleton central ingest. Value (fleet read
