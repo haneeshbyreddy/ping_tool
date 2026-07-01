@@ -5,109 +5,122 @@ gotchas that aren't obvious from the code. For everything else, don't duplicate 
 read it: `README.md` (what it is, how to run it, the directory layout, the module/layer
 map, config, behaviors) and `plan.md` (design rationale, what's done, what's next).
 
-## Status
+## Architecture at a glance
 
-**The edge is a thin probe, full stop; central runs the brain, for every tenant.** This is
-the whole platform now, not an add-on to some other mode — there is exactly one daemon mode
-(`WISP_CENTRAL_BRAIN=1` + `WISP_CENTRAL_URL`, and it's effectively mandatory: the daemon has
-no other path). An earlier single-box version of this tool (one daemon + one local dashboard,
-no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
-deleted wholesale, not just deprecated. See "Removed" below before assuming a described
-behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 283 tests.
+Central runs the brain, for every tenant. The edge is a thin probe, full stop — there is
+exactly one daemon mode (`WISP_CENTRAL_BRAIN=1` + `WISP_CENTRAL_URL`, effectively
+mandatory: the daemon has no other path). It fetches its topology from central, probes
+with real ICMP under a bounded-concurrency fan-out, and reports raw per-IP samples back.
+No local database, dashboard, PIN, or FSM lives on the edge box.
 
-**Central's own management plane and FSM/alerting are done and tested end to end**, including
-the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
-management plane" and "Central runs the brain" below. Verify claims about what's done against
-the code, not just this file (an earlier draft of this doc called the fast-confirm round-trip
-"deferred" after it had already shipped — that drift is exactly the kind of thing to watch for).
+Central owns the FSM, topology-aware suppression, fast-confirm detection, the alerting
+ladder, the multi-tenant dashboard, and the fleet's version/rollout state. ISPs log into
+central's own dashboard with a per-org account, manage their device topology/team/alert
+routing there, and self-service-register the physical nodes they run — one ISP can run
+one node or many, each with its own enrollment credential. See "Central management
+plane", "Central runs the brain", and "Self-service node enrollment" below for the
+detail; `plan.md` for the design rationale and what's left.
 
-**SNMP port status (incl. bandwidth), historical rollups/trend analytics, the per-link
-performance baseline, and the on-backup redundancy signal are all now wired end to end,
-on central** — see "SNMP port folding", "Historical rollups", "Per-link performance
-baseline", and "On-backup redundancy" below. Every soft-signal tier the old single-box
-edge had now has a central-side equivalent. **mTLS enrollment is also done** (see
-"mTLS enrollment" below) — edge↔central ingest auth is bearer token and/or mTLS now,
-either satisfies it. What's left in plan.md is real hosting (needs the operator's
-provider/region/domain) and the last mile of fleet-update hardening (a real signing
-keypair/cert + a genuine tagged release run on real hardware) — not more engineering
-that can be done sight-unseen in this repo. See `plan.md` for the full list.
+310 tests, `python -m unittest discover -s tests`. Verify claims about what's done
+against the code, not just this file — a stale doc claiming something is "deferred"
+after it's already shipped (or vice versa) is exactly the kind of drift to watch for.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
-(`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
-Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
-(`sysctl net.ipv4.ping_group_range="0 2147483647"`).
+(`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally**
+(system Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged
+ICMP (`sysctl net.ipv4.ping_group_range="0 2147483647"`). See `plan.md` for what's not
+yet done: real production hosting (needs the operator's provider/region/domain) and the
+last mile of fleet-update signing (a real minisign keypair + Windows code-signing cert as
+CI secrets, plus a genuine tagged release run tested on real hardware) — not more
+engineering that can be done sight-unseen in this repo.
 
-## Removed in Phase C (don't go looking for these)
+## Removed — don't go looking for these
 
-Deleted wholesale, not moved: `apps/dashboard/` (the edge's local web UI), `src/wisp/server/`
-(its routes/services/auth/watchdog — `LoginThrottle` was the one piece still needed and now
-lives in `central/auth.py`), `egress/shipper.py` + `database/outbox.py` (Phase 10's
-store-and-forward outbox — obsolete once the edge ships raw samples instead of finished
-events), `egress/ports.py` + `egress/ack.py`, `core/rollup.py`, and the `AlertDispatcher`
-class + `role_topic`/`acknowledge_outage` out of `egress/notifiers.py` (that file now holds
-only the ntfy **channel** — `NtfyNotifier`, `send_with_retry`, `build_notifier` — which
-central's own dispatcher imports; the DB-coupled alerting *policy* is `central/dispatch.py`'s
-`CentralAlertDispatcher`). `apps/daemon/main.py` lost `run_forever`, `run_cycle`,
-`_confirm_down`/`_confirm_up`, `_between_cycle_watch`, `_persist`, `prune_old_polls`,
-`snmp_cycle` — everything that existed to drive a **local** `MonitorEngine`. What's left is
-just the probe loop: `_gather_pings`, `_gentle_probe_plan`, `run_cycle_central_brain`,
-`run_forever_central_brain`, `_follow_recheck`.
+An earlier, single-tenant version of this tool (one daemon + one local dashboard, no
+central server at all) existed and was fully retired; its code was deleted wholesale, not
+deprecated or left behind a flag. If you're looking for that old design's detail, it's in
+git history, not this file. Gone:
 
-`core/state_machine.py`, `core/analytics.py`, `core/baseline.py`, and `database/client.py`
-(+ `migrations/`) are **still in the tree, untouched** — central imports the state machine
-and analytics helpers directly (`central/engine.py`, `central/dispatch.py`,
-`central/rollout.py`, `central/watchdog.py` all import from them), and `state_machine.py`
-itself hard-imports `database/client.py`'s `connect` for its own DB-glue functions
-(`build_engine`/`apply_events`/`load_device_meta` — the edge-local versions, still tested by
-`unit/test_state_machine.py`, just no longer called by the daemon; central has its own
-equivalents in `central/engine.py`). Don't delete these thinking they're edge-only — grep
-before removing anything reused this widely.
+- `apps/dashboard/` (the edge's own local web UI), `src/wisp/server/` (its
+  routes/services/auth/watchdog — `LoginThrottle` was the one piece still needed and now
+  lives in `central/auth.py`).
+- `egress/shipper.py` + `database/outbox.py` (the old store-and-forward outbox — moot
+  once the edge ships raw samples instead of finished events), `egress/ports.py` +
+  `egress/ack.py`, `core/rollup.py`.
+- The `AlertDispatcher` class + `role_topic`/`acknowledge_outage` out of
+  `egress/notifiers.py` — that file now holds only the ntfy **channel**
+  (`NtfyNotifier`, `send_with_retry`, `build_notifier`), which central's own dispatcher
+  imports. The DB-coupled alerting *policy* lives in `central/dispatch.py`'s
+  `CentralAlertDispatcher` instead.
+- Everything in `apps/daemon/main.py` that used to drive a **local** `MonitorEngine`:
+  `run_forever`, `run_cycle`, `_confirm_down`/`_confirm_up`, `_between_cycle_watch`,
+  `_persist`, `prune_old_polls`, `snmp_cycle`. What's left is just the probe loop:
+  `_gather_pings`, `_gentle_probe_plan`, `run_cycle_central_brain`,
+  `run_forever_central_brain`, `_follow_recheck`.
+- The entire legacy per-edge SQLite layer: `src/wisp/database/` (`client.py` — WAL conn +
+  migration runner) and `migrations/*.sql`. Nothing calls it anymore now that the edge
+  keeps no database of its own; central has its own schema (`central/store.py`) built
+  independently. Along with it: `core/state_machine.py`'s old DB-glue functions
+  (`load_device_meta`/`build_engine`/`apply_events`, distinct from central's own
+  same-named functions in `central/engine.py`, which are what's actually called) and
+  `ingress/snmp.py`'s `load_snmp_targets` (had zero callers, not even a test). `core/
+  state_machine.py`, `core/analytics.py` (now just the shared `_parse`/`_now` timestamp
+  helpers), and `core/baseline.py` are still very much alive — central imports them
+  directly (`central/engine.py`, `central/dispatch.py`, `central/rollout.py`,
+  `central/watchdog.py`, `central/perf.py`) — it was only their DB-glue tail that was
+  edge-only dead weight. Grep before deleting anything in `core/` — it's reused more
+  widely than a first glance suggests.
+- The single-box install path: `deploy/install.sh`, `deploy/install.ps1`,
+  `deploy/wisp-monitor.service`. Every edge node — an ISP's first or its fifth — now
+  installs the same way, through the frozen-binary fleet path (`deploy/install-edge.sh`
+  / `install-edge.ps1` + `wisp-edge.service`, self-updating via the supervisor). There is
+  no separate "simple" install mode to choose between anymore.
 
-`runtime/supervisor.py`, `apps/supervisor/main.py`, and the whole staged-rollout / self-update
-feature are **untouched** — orthogonal to the FSM/dashboard removal.
+`runtime/supervisor.py`, `apps/supervisor/main.py`, and the whole staged-rollout /
+self-update feature are untouched by any of the above — orthogonal to the
+dashboard/FSM/single-box removal.
 
-## Fleet update hardening (plan.md item 5, in progress)
+## Fleet update signing
 
-- **There are now FOUR install scripts, two per OS — know which is which before touching
-  any of them.** `deploy/install.sh` / `deploy/install.ps1` = single-box, source checkout +
-  venv, no self-update. `deploy/install-edge.sh` / `deploy/install-edge.ps1` = the fleet
-  path: frozen binary + the supervisor (`runtime/supervisor.py`) owns self-update, staged
-  rollout applies. `install-edge.ps1` didn't exist before this item — don't assume the
-  Windows fleet path is still a gap; only the actual signing keys/hardware validation are.
+- **Two install scripts, one per OS.** `deploy/install-edge.sh` (Linux) /
+  `deploy/install-edge.ps1` (Windows): frozen binary + the supervisor
+  (`runtime/supervisor.py`) owns self-update, staged rollout applies. Both exist and are
+  exercised for real on every push via CI's `build` job (unsigned).
 - **CI signing (`.github/workflows/release.yml`) is real, not a placeholder, but still
-  needs real secrets to produce a signed artifact.** Authenticode signs the Windows `.exe`s
-  directly (per-binary, in `build`, needs `WINDOWS_CODESIGN_PFX`/`_PASSWORD`); minisign
-  signs the assembled `SHA256SUMS` **once** in `release` (needs `MINISIGN_KEY` — generate
-  with `minisign -G -W`, i.e. **no password**, since CI can't answer a passphrase prompt).
-  One minisign signature over the checksums manifest covers every platform's artifact
-  transitively (each is already sha256-checked against that same file) — don't add a
-  per-artifact `.minisig`, that's redundant. Both steps are `if: env.<SECRET> != ''`
-  no-ops when unset, so forks/PRs still build unsigned — same policy the old placeholder had.
+  needs real secrets to produce a signed artifact.** Authenticode signs the Windows
+  `.exe`s directly (per-binary, in `build`, needs `WINDOWS_CODESIGN_PFX`/`_PASSWORD`);
+  minisign signs the assembled `SHA256SUMS` **once** in `release` (needs `MINISIGN_KEY` —
+  generate with `minisign -G -W`, i.e. **no password**, since CI can't answer a
+  passphrase prompt). One minisign signature over the checksums manifest covers every
+  platform's artifact transitively (each is already sha256-checked against that same
+  file) — don't add a per-artifact `.minisig`, that's redundant. Both steps are
+  `if: env.<SECRET> != ''` no-ops when unset, so forks/PRs still build unsigned.
 - **The minisign PUBLIC key is not a secret — commit it to `deploy/minisign.pub`** once a
   real keypair exists; don't fabricate a placeholder file there (an invalid pubkey would
   make both installers hard-fail signature verification even on a legitimately-unsigned
   release, since the file's mere presence is what triggers the check).
-- **Both fleet installers are self-activating on signing, not hard-required yet.** No
-  pubkey/signature published (Linux) or an Authenticode status of `NotSigned` (Windows) is a
-  warning + sha256-only fallback — but a signature that IS present and doesn't verify is a
-  hard `err`/`Die`. This is deliberate so today's unsigned releases keep installing while
-  the operator hasn't set up keys, and installers start enforcing automatically the moment
-  they do, with no installer-script change needed.
-- **`deploy/wisp-edge.spec`'s `Analysis` paths are built off `os.path.dirname(SPECPATH)`, not
-  bare relative strings — don't revert that.** PyInstaller resolves a *loaded* `.spec` file's
-  relative paths against the spec's own directory (`deploy/`), not the cwd `pyinstaller` was
-  run from; a first real CI run (pushing this very item's branch) failed with `script
-  '.../deploy/apps/daemon/main.py' not found` because the old spec used bare
-  `["apps/daemon/main.py"]` / `pathex=["src"]`. The inline supervisor build in
-  `release.yml` (`pyinstaller --onefile --name wisp-supervisor ... apps/supervisor/main.py`,
-  no `.spec` file) doesn't have this problem — CLI-invoked PyInstaller without a spec
-  resolves relative to cwd, which IS the repo root in that step.
-- **None of this has run against a real signing key or real Windows/Linux hardware** — that
-  needs the platform operator's actual minisign keypair + code-signing cert (not something
-  to fabricate in a coding session) and a genuine `v*` tag release. The multi-arch
-  PyInstaller build itself (unsigned) DOES validate for real on every push via the existing
-  `build` job — that part doesn't need secrets to exercise.
+- **Both fleet installers are self-activating on signing, not hard-required.** No
+  pubkey/signature published (Linux) or an Authenticode status of `NotSigned` (Windows) is
+  a warning + sha256-only fallback — but a signature that IS present and doesn't verify is
+  a hard `err`/`Die`. This lets today's unsigned releases keep installing while the
+  operator hasn't set up keys, and installers start enforcing automatically the moment
+  they do, with no installer-script change needed. Same pattern mTLS enrollment (below)
+  and self-service node tokens use for their own auth gates.
+- **`deploy/wisp-edge.spec`'s `Analysis` paths are built off `os.path.dirname(SPECPATH)`,
+  not bare relative strings — don't revert that.** PyInstaller resolves a *loaded* `.spec`
+  file's relative paths against the spec's own directory (`deploy/`), not the cwd
+  `pyinstaller` was run from — `Analysis(["apps/daemon/main.py"], pathex=["src"], ...)`
+  with bare strings looks in `deploy/apps/...` / `deploy/src` instead of the repo root,
+  caught only by pushing to real CI runners with PyInstaller actually installed. The
+  inline supervisor build in `release.yml` (`pyinstaller --onefile --name
+  wisp-supervisor ... apps/supervisor/main.py`, no `.spec` file) doesn't have this problem
+  — CLI-invoked PyInstaller without a spec resolves relative to cwd, which IS the repo
+  root in that step.
+- **None of this has run against a real signing key or real Windows/Linux hardware** —
+  that needs the platform operator's actual minisign keypair + code-signing cert (not
+  something to fabricate in a coding session) and a genuine `v*` tag release. The
+  multi-arch PyInstaller build itself (unsigned) DOES validate for real on every push via
+  the existing `build` job — that part doesn't need secrets to exercise.
 
 ## Imports & paths (the main trap)
 
@@ -125,20 +138,31 @@ Src layout, zero-install. What bites:
 ## Engine invariants (don't break)
 
 - `core/state_machine.py` `MonitorEngine` is **pure** — takes `{ip: PingResult}` + ts,
-  returns committed states + `Event`s, no I/O. DB glue (`build_engine`, `apply_events`) is
-  separate; that's what makes it unit-testable. Don't put DB/network calls in the engine.
-  Central reuses this module **unchanged** — the FSM doesn't know or care whether it's fed
-  by a single-tenant SQLite or central's multi-tenant one (see "Central runs the brain").
-- **`process_cycle(results, ts, subset=None)` has two modes.** `subset=None` is the normal full
-  pass (every device + canary/uplink edge + freeze). A `set[int]` runs a **confirmation pass**:
-  it advances *only* those FSMs by one more sample (topological order preserved so a just-confirmed
-  parent still suppresses its children), skips the canary/uplink logic, and returns committed
-  states for the subset only. Central's fast-confirm recheck path uses this (see
-  `central/engine.py:run_cycle`'s `subset` param). Keep the full-pass path byte-identical
-  (it's the `subset is None` branch) so existing behaviour/tests don't move.
+  returns committed states + `Event`s, no I/O of its own. Central owns building/
+  rehydrating it and persisting its events (`central/engine.py`); that separation is what
+  makes the FSM unit-testable with no database at all. Don't put DB/network calls in the
+  engine itself.
+- **`process_cycle(results, ts, subset=None)` has two modes.** `subset=None` is the normal
+  full pass (every device + canary/uplink edge + freeze). A `set[int]` runs a
+  **confirmation pass**: it advances *only* those FSMs by one more sample (topological
+  order preserved so a just-confirmed parent still suppresses its children), skips the
+  canary/uplink logic, and returns committed states for the subset only. Central's
+  fast-confirm recheck path uses this (see `central/engine.py:run_cycle`'s `subset`
+  param). Keep the full-pass path byte-identical (it's the `subset is None` branch) so
+  existing behaviour/tests don't move.
+- **`probe_plan()` is a reference the edge approximates, not something central calls.**
+  Nothing in the runtime path invokes `MonitorEngine.probe_plan()` directly — the edge
+  computes its own per-cycle ping counts client-side (`apps/daemon/main.py:
+  _gentle_probe_plan`) from the topology `GET /edge/devices` hands it, since it has no
+  local engine to ask. `probe_plan()` is unit-tested directly and is the "correct"
+  behavior `_gentle_probe_plan` mirrors — including counting a BACKUP parent edge as
+  "infra" too (`effective_parents()`), which `_gentle_probe_plan` currently can't do
+  since `GET /edge/devices`'s topology reply only carries the primary `parent_device_id`,
+  not backup edges. Small, known, low-priority gap — not a regression to chase down
+  urgently, since a backup-path device is typically also a primary parent of something
+  else already.
 - `central/dispatch.py`'s `CentralAlertDispatcher` does network sends OUTSIDE any DB
-  transaction, then logs — so a slow API call never holds a write lock. Same discipline the
-  old edge `AlertDispatcher` had before Phase C.
+  transaction, then logs — so a slow API call never holds a write lock.
 - Prober/Notifier live behind small interfaces (`ingress/probers.py`, `egress/notifiers.py`)
   with one real impl each — `IcmpProber` (unprivileged ICMP via icmplib, needs the ping group) and
   `NtfyNotifier` (ntfy push, needs httpx). `build_prober`/`build_notifier` are the swap point;
@@ -157,8 +181,8 @@ Src layout, zero-install. What bites:
   any device that is a **parent** of another (tower/switch/AP) gets `cfg.pings_per_poll_infra`
   (`WISP_PINGS_PER_POLL_INFRA`, default 2), leaf CPEs + canary get `pings_per_poll` (5). Fewer
   echoes = smaller burst into the box's control plane, so its ICMP rate-limiter doesn't read
-  as phantom loss. No backup edges yet (Phase A/B `org_devices` has primary-only parents), so
-  this is exactly the primary-chain case of the real `probe_plan`.
+  as phantom loss. See "Engine invariants" above for the backup-parent gap in this
+  client-side approximation.
 - **The fast-confirm round trip is central-driven, not edge-timed.** `central/engine.py`'s
   `compute_recheck` names the suspect IPs (down streak started but not yet confirmed, or a
   recovery streak started but not yet confirmed) in the reply to `POST /report`; the edge's
@@ -173,34 +197,35 @@ Src layout, zero-install. What bites:
   returns `poll_interval_small_s` (30) while the active fleet is `<= small_fleet_max` (1000) and
   `poll_interval_adaptive` is on (`WISP_POLL_INTERVAL_ADAPTIVE`), else `poll_interval_s` (60).
   Off by default. `run_forever_central_brain` computes it at startup from central's reported
-  topology size and does **not** currently retune it on a later topology change mid-run (that
-  refinement wasn't part of the Phase C scope — flag it if it matters to you). Detection latency
-  floor is `interval × down_consecutive`, though fast-confirm usually beats that in practice.
+  topology size and does **not** currently retune it on a later topology change mid-run — flag
+  it if it matters to you. Detection latency floor is `interval × down_consecutive`, though
+  fast-confirm usually beats that in practice.
 
-## Central management plane — device inventory, team, settings (New Architecture Phase A)
+## Central management plane — device inventory, team, settings
 
 - **`org_devices` (central) and `devices` (central) are TWO DIFFERENT TABLES — don't
-  conflate them.** `devices` (Phase 10 Part B legacy naming — the table predates Phase C) is
-  the edge-ingest global id map: rows exist only for a device an edge has actually reported
-  an event/rollup for, keyed by `(tenant_id, node_id, edge_local_id)`. `org_devices` (Phase A)
-  is the ISP-managed topology an org builds by hand from the central dashboard — it exists
-  **before and independent of** any edge ever connecting, has its own autoincrement id space,
-  and is what central-brain mode's engine (`central/engine.py`) runs the FSM against. The API
-  reflects the split: `GET /api/devices` = the legacy edge-ingest registry (read-only, no
-  CRUD, populated only by edges NOT in central-brain mode — there are none of those anymore
-  post-Phase-C, so in practice this stays empty on a Phase-C-only fleet), `GET/POST
-  /api/inventory*` = the org-managed topology (full CRUD, what the dashboard's Nodes page
-  uses). Adding a field that belongs to one to the other is the classic mistake here.
-- **Phase A has no backup/redundancy links.** `central/inventory.py`'s cycle check walks the
-  PRIMARY parent chain only. The edge's old `device_links`-equivalent redundancy concept was
-  deleted in Phase C along with the rest of the perf/redundancy soft-signal tier — don't add
-  it to central until there's live detection to fail over between two paths.
-- **`central/inventory.py` mirrors the edge's OLD validation, not its storage.** Pure functions
-  (`clean_device_payload`, `clean_snmp_payload`) — no DB, unit-tested directly
-  (`tests/unit/test_central_inventory.py`). `clean_device_payload`'s `parents` map must already
-  be scoped to one tenant by the caller (`CentralStore.org_device_parent_map`) — a cross-tenant
-  id is never in the map, so it just looks like "parent node does not exist" rather than needing
-  an explicit tenant check.
+  conflate them.** `devices` (legacy naming — the table predates the multi-tenant
+  redesign) is the edge-ingest global id map: rows exist only for a device an edge has
+  actually reported an event/rollup for, keyed by `(tenant_id, node_id, edge_local_id)`.
+  `org_devices` is the ISP-managed topology an org builds by hand from the central
+  dashboard — it exists **before and independent of** any edge ever connecting, has its
+  own autoincrement id space, and is what central-brain mode's engine
+  (`central/engine.py`) runs the FSM against. The API reflects the split: `GET
+  /api/devices` = the legacy edge-ingest registry (read-only, no CRUD, populated only by
+  edges NOT in central-brain mode — there are none of those, so in practice this stays
+  empty), `GET/POST /api/inventory*` = the org-managed topology (full CRUD, what the
+  dashboard's **Nodes** page uses — note this is a DIFFERENT "Nodes" than the **Edge
+  Nodes** page described under "Self-service node enrollment" below; one is device
+  topology, the other is physical-probe enrollment credentials). Adding a field that
+  belongs to one to the other is the classic mistake here.
+- **`central/inventory.py` is pure validation, no storage.** Pure functions
+  (`clean_device_payload`, `clean_snmp_payload`, `clean_node_id`) — no DB, unit-tested
+  directly (`tests/unit/test_central_inventory.py`). `clean_device_payload`'s `parents`
+  map must already be scoped to one tenant by the caller
+  (`CentralStore.org_device_parent_map`) — a cross-tenant id is never in the map, so it
+  just looks like "parent node does not exist" rather than needing an explicit tenant
+  check. `clean_backup_link`'s cycle check walks the FULL edge set (primary + existing
+  backups), not just the primary parent chain.
 - **Every `org_devices` write in `central/server.py` re-derives the tenant from the DB row,
   not the request body**, via `store.device_tenant(id)`. A body's `tenant_id` is only trusted
   for *create* (where there's no row yet to derive it from); for update/delete/maintenance/snmp
@@ -225,12 +250,10 @@ Src layout, zero-install. What bites:
   just the `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` — that only helps a fresh DB.
   `CentralStore.__init__` runs `_ensure_columns(conn, table, coldefs)` (checks `PRAGMA
   table_info`, `ALTER TABLE ADD COLUMN` for anything missing) right after `executescript`.
-  Add any new column there too, or an existing `central.db` silently keeps the old schema
-  (this is exactly how the item-3 bandwidth columns — `bw_threshold_mbps`, `in_octets`,
-  etc. — got added onto the item-1 `switch_ports` table without a real migration runner).
-  A brand-new TABLE (like `org_device_links`/`device_perf_samples`) needs no such
-  migration — `CREATE TABLE IF NOT EXISTS` alone is enough since there's no existing row
-  shape to reconcile.
+  Add any new column there too, or an existing `central.db` silently keeps the old schema.
+  A brand-new TABLE (like `org_device_links`/`device_perf_samples`/`node_tokens`) needs no
+  such migration — `CREATE TABLE IF NOT EXISTS` alone is enough since there's no existing
+  row shape to reconcile.
 - **`central/server.py`'s dashboard writes send real pushes (`/api/test-alert`), so
   `make_server`/`_make_handler` take an injectable `notifier`** (defaults to
   `build_notifier(cfg)`, the lazy-httpx-import `NtfyNotifier`) — tests inject a recording
@@ -242,9 +265,9 @@ Src layout, zero-install. What bites:
   other dashboard read uses. It reports every ACTIVE device the tenant has configured
   (via `list_org_devices`), not just ones with an outage, so a device with a clean window
   still shows 100% uptime rather than being silently absent. UNREACHABLE outages are
-  excluded from the downtime sum (mirrors the edge's old `only_down=True` default) — a
-  topology-suppressed child isn't "unreliable" on its own account.
-- **Tests:** `unit/test_central_inventory` (pure payload/cycle validation),
+  excluded from the downtime sum — a topology-suppressed child isn't "unreliable" on its
+  own account.
+- **Tests:** `unit/test_central_inventory` (pure payload/cycle/node-id validation),
   `integration/test_central.OrgDevicesTest` (CRUD round-trip, tenant isolation, parent-map
   scoping, children-block delete, maintenance/SNMP toggles), `integration/test_central_auth`
   (`/api/inventory*` CRUD + 422/403 + cross-tenant-write-rejected over HTTP, `/api/orgs`
@@ -259,24 +282,24 @@ Src layout, zero-install. What bites:
   sample has no latency but still counts loss/down, different hours land in different
   buckets, prune keeps only recent buckets, tenant isolation).
 
-## Central runs the brain (New Architecture Phase B — the ONLY edge mode, post-Phase-C)
+## Central runs the brain (the only edge mode)
 
-- **`core/state_machine.MonitorEngine` is reused UNCHANGED — only its DB glue is new.** The
-  FSM itself doesn't know or care whether it's fed by a local SQLite or central's
-  multi-tenant one. `central/engine.py`'s `load_device_meta`/`build_engine`/`apply_events` are
-  the central-native equivalents of the same-named functions at the bottom of
-  `core/state_machine.py`, over `org_devices`/`device_states`/`outages` instead of
-  `devices`/`poll_results`/`outages`. Same for `central/dispatch.py`'s `CentralAlertDispatcher`
-  vs. the old edge `AlertDispatcher` (deleted in Phase C) — same policy (dedupe-per-outage,
-  owner+operator on open, all-three on the hourly escalation and on resolve, ack-doesn't-stop-
-  only-recovery-does), different DB layer.
+- **`core/state_machine.MonitorEngine` is reused UNCHANGED — only its DB glue is
+  central-native.** The FSM itself doesn't know or care whether it's fed by a local
+  SQLite or central's multi-tenant one. `central/engine.py`'s
+  `load_device_meta`/`build_engine`/`apply_events` build/rehydrate/persist against
+  `org_devices`/`device_states`/`outages`. `central/dispatch.py`'s
+  `CentralAlertDispatcher` is the alerting policy (dedupe-per-outage, owner+operator on
+  open, all-three on the hourly escalation and on resolve, ack-doesn't-stop-
+  only-recovery-does).
 - **`EngineRegistry` exists because central's HTTP handling is stateless per-request but the
   FSM's flap-suppression counters are NOT.** A device's `down_streak` must accumulate across
   an edge's successive `POST /report` calls, or it could never reach `down_consecutive` — one
   HTTP request only ever feeds the engine ONE sample. `EngineRegistry` (in `central/engine.py`)
   holds one live `MonitorEngine` per tenant in memory. It rebuilds a tenant's engine only when
-  that tenant's topology actually changed (a cheap `(id, parent_device_id)` fingerprint
-  recomputed every `.get()`), and a fresh/rebuilt engine rehydrates FSM state from
+  that tenant's topology actually changed (a cheap fingerprint over `(id, parent_device_id,
+  d.parents)` recomputed every `.get()` — `d.parents` covers backup-link add/remove too, a
+  topology change like any other), and a fresh/rebuilt engine rehydrates FSM state from
   `device_states` (restart-safe). One `EngineRegistry` lives per central server process,
   threaded into `_make_handler` alongside the injectable `notifier` — don't build a new one
   per request.
@@ -286,8 +309,8 @@ Src layout, zero-install. What bites:
   `{"v":1,"tenant_id":…,"node_id":…,"ts":…,"mode":"full"|"recheck","pings":{"<ip>":{
   "loss_pct":…,"latency_ms":…,"jitter_ms":…}}}` — the edge doesn't need to know or send
   central's device ids at all, it only needs to know which IPs to probe (from
-  `GET /edge/devices`, bearer-authed, returns that tenant's active `org_devices` topology +
-  `cfg.canary_ip`). A `"recheck"` report carries samples for ONLY the suspect IPs named in a
+  `GET /edge/devices`, returns that tenant's active `org_devices` topology + `cfg.canary_ip`).
+  A `"recheck"` report carries samples for ONLY the suspect IPs named in a
   prior reply, and a reply to it may carry ANOTHER `recheck` hint — the edge's
   `_follow_recheck` just keeps following it until empty (round cap as a safety net against a
   central-side bug wedging the probe loop, not the normal termination path).
@@ -300,18 +323,19 @@ Src layout, zero-install. What bites:
   for a tenant silently stop advancing if that tenant's edge goes fully stale — accepted since
   the fleet watchdog (`central/watchdog.py`) already separately pages the org when a node's
   heartbeat goes stale; that's a different alarm for a different failure.
-- **The daemon has exactly one mode now — know this before touching `apps/daemon/main.py`.**
+- **The daemon has exactly one mode — know this before touching `apps/daemon/main.py`.**
   `main()` unconditionally runs `run_forever_central_brain` behind a `SingleInstance` lock
   (`<db_path>.central-brain.lock` — no schema to migrate, since central-brain mode makes zero
-  local DB writes). It fetches its topology from `GET /edge/devices` (re-fetched every cycle,
-  skipped for finite `--cycles` runs — a fetch hiccup keeps the last-known set rather than
-  probing nothing), probes with `_gather_pings`/`build_prober` (including the gentle-infra
-  cadence via `_gentle_probe_plan`), and `POST /report`s the raw per-IP results, following any
-  `recheck` hint via `_follow_recheck`. Central's `central/engine.py` + `central/dispatch.py`
-  do 100% of the detecting and paging.
-- **SNMP port folding is wired end to end (plan.md item 1, no longer deferred).** The edge
-  walks its snmp-enabled `org_devices` (config now travels on `GET /edge/devices`'s topology
-  reply — `snmp_enabled`/`snmp_community`/`snmp_port`/`snmp_version` — since the edge has no
+  local DB writes; `db_path` itself is now just a per-node data-directory anchor, not an
+  actual database — see "Config" below). It fetches its topology from `GET /edge/devices`
+  (re-fetched every cycle, skipped for finite `--cycles` runs — a fetch hiccup keeps the
+  last-known set rather than probing nothing), probes with `_gather_pings`/`build_prober`
+  (including the gentle-infra cadence via `_gentle_probe_plan`), and `POST /report`s the raw
+  per-IP results, following any `recheck` hint via `_follow_recheck`. Central's
+  `central/engine.py` + `central/dispatch.py` do 100% of the detecting and paging.
+- **SNMP port folding is wired end to end.** The edge walks its snmp-enabled
+  `org_devices` (config travels on `GET /edge/devices`'s topology reply —
+  `snmp_enabled`/`snmp_community`/`snmp_port`/`snmp_version` — since the edge has no
   local DB of its own to read credentials from) on its OWN slow cadence
   (`cfg.snmp_interval_s`, default 90s, independent of `poll_interval_s` — ports don't flap
   like radio links), via `apps/daemon/main.py:_gather_snmp_ports`, and attaches the haul to
@@ -320,88 +344,87 @@ Src layout, zero-install. What bites:
   (`try/except` inside `_gather_snmp_ports`) and never sinks the ICMP cycle, same discipline
   as `_gather_pings`. Central's `central/ports.py:CentralPortMonitor` (run from
   `central/server.py:_report`, AFTER the ICMP cycle commits so `open_outage_id` reflects
-  this cycle's outages) is the direct port of the old single-box `egress/ports.py` onto
-  `CentralStore`'s tenant-scoped `switch_ports` table: monitored-only (discovery alone never
-  alarms), admin-down stays silent (reuses `PortStatus.is_down()` verbatim — never re-derive
-  that predicate on the central side of the wire), and one alarm not two (a monitored
-  port-down folds into the `feeds_device_id` device's open outage via
-  `store.stamp_outage_cause` — COALESCE, never clobbers an operator's post-mortem — instead
-  of raising a competing alarm; no open outage yet = a leading-indicator operator heads-up;
-  SNMP never opens an outage itself, ICMP/the FSM still owns that exclusively). A device id
-  in the wire's `ports` key that isn't in the reporting tenant's own `eng.meta` is silently
-  ignored (`_report:_ingest_ports`) — the same re-derive-tenant-from-what-we-already-know
+  this cycle's outages) writes into `CentralStore`'s tenant-scoped `switch_ports` table:
+  monitored-only (discovery alone never alarms), admin-down stays silent (reuses
+  `PortStatus.is_down()` verbatim — never re-derive that predicate on the central side of
+  the wire), and one alarm not two (a monitored port-down folds into the
+  `feeds_device_id` device's open outage via `store.stamp_outage_cause` — COALESCE, never
+  clobbers an operator's post-mortem — instead of raising a competing alarm; no open
+  outage yet = a leading-indicator operator heads-up; SNMP never opens an outage itself,
+  ICMP/the FSM still owns that exclusively). A device id in the wire's `ports` key that
+  isn't in the reporting tenant's own `eng.meta` is silently ignored
+  (`_report:_ingest_ports`) — the same re-derive-tenant-from-what-we-already-know
   discipline as `org_devices` writes, so tenant A can't attribute a port reading to tenant
   B's device. Operator-only page, gated by `cfg.snmp_alerts` (state is always written); no
-  escalation ladder of its own. **Bandwidth is wired too (plan.md item 3).** The same walk's
-  64-bit octet counters (`in_octets`/`out_octets`/`speed_bps`, already parsed by
-  `ingress/snmp.py`, now carried on the wire alongside status) get diffed by
-  `central/ports.py`'s `throughput_bps` into a live in/out rate; a MONITORED port whose
-  rate falls below its operator-assigned per-port threshold
-  (`bw_threshold_mbps`/`bw_direction`, `GET/POST /api/inventory/ports/bandwidth`,
-  `clean_port_bandwidth_payload`) for `cfg.snmp_bw_consecutive` walks alarms — its OWN
-  streak (`bw_low_streak`/`bw_alarm`), separate from the port-down streak, since traffic is
-  burstier than link state. Never judged on a down/admin-down port (`bw_eligible` requires
-  `oper_status == "up" and not down`) — that alarm already owns the story, so a bw-alarmed
-  port going down clears its bw badge SILENTLY (no confusing "bandwidth recovered" chaser).
-  Gated by `cfg.snmp_bw_alerts`; the `switch_ports` row (`in_bps`/`out_bps`/`counters_at`)
-  is always written.
-- **Historical rollups/trend analytics are wired (plan.md item 2, both slices).**
+  escalation ladder of its own. **Bandwidth is wired too.** The same walk's 64-bit octet
+  counters (`in_octets`/`out_octets`/`speed_bps`, already parsed by `ingress/snmp.py`, now
+  carried on the wire alongside status) get diffed by `central/ports.py`'s
+  `throughput_bps` into a live in/out rate; a MONITORED port whose rate falls below its
+  operator-assigned per-port threshold (`bw_threshold_mbps`/`bw_direction`, `GET/POST
+  /api/inventory/ports/bandwidth`, `clean_port_bandwidth_payload`) for
+  `cfg.snmp_bw_consecutive` walks alarms — its OWN streak (`bw_low_streak`/`bw_alarm`),
+  separate from the port-down streak, since traffic is burstier than link state. Never
+  judged on a down/admin-down port (`bw_eligible` requires `oper_status == "up" and not
+  down`) — that alarm already owns the story, so a bw-alarmed port going down clears its
+  bw badge SILENTLY (no confusing "bandwidth recovered" chaser). Gated by
+  `cfg.snmp_bw_alerts`; the `switch_ports` row (`in_bps`/`out_bps`/`counters_at`) is
+  always written.
+- **Historical rollups/trend analytics are wired, in two slices.**
   `central/analytics.py:device_reliability` (`GET /api/analytics?days=`) is pure
   outage-history math — no new storage, since central already retains full outage history
   in central-brain mode; it reports every ACTIVE configured device (not just ones with an
   outage) and excludes UNREACHABLE outages from the downtime sum (a topology-suppressed
   artifact of a dead parent, not that device's own fault). `central/rollup.py` is the
   latency/loss TREND chart (`GET /api/analytics/trend?device_id=&days=`): hourly buckets,
-  30-day retention (both decided, not configurable via env — this is a platform-wide
-  policy, not per-org). `record_cycle` folds straight off `_report`'s already-computed
-  per-device samples on every "full" report (never a recheck — that would badly skew an
-  hour's average with the fast-confirm subset's rapid re-probes), as running sums
+  30-day retention (both platform-wide policy, not configurable per org).
+  `record_cycle` folds straight off `_report`'s already-computed per-device samples on
+  every "full" report (never a recheck — that would badly skew an hour's average with the
+  fast-confirm subset's rapid re-probes), as running sums
   (`latency_sum`/`loss_sum`/`down_samples`) rather than storing raw samples — averages are
   computed at READ time. `start_central_rollup_prune_thread` runs a daily sweep, started
   in `central/server.py:serve()` right alongside the fleet watchdog thread.
-- **Per-link performance baseline is wired (plan.md item 3).** `central/perf.py` reuses
-  `core/baseline.py`'s pure median+MAD deviation math (`evaluate_perf`) VERBATIM — none of
-  that math changed. Central's own contribution is the trailing-sample window:
-  `device_perf_samples` is a bounded per-(tenant, device) ring buffer (`store.
-  record_perf_sample` inserts then trims to the newest `cfg.perf_window` rows in the SAME
-  write), deliberately NOT `central/rollup.py`'s hourly buckets — an hourly average would
-  smear out exactly the intra-hour slowdown this tier exists to catch; don't conflate the
-  two storages. `record_and_evaluate` runs once per full-report cycle (never a recheck),
-  appends this cycle's sample, evaluates the window, and persists the badge
-  (`device_perf`, restart-safe — a hard-DOWN device's perf is moot and clears its badge
-  SILENTLY, the outage owns that story). Operator-only page on the enter/leave edge, gated
-  by `cfg.perf_alerts`.
-- **On-backup redundancy is wired (plan.md item 3) — and needed ZERO engine changes.**
+- **Per-link performance baseline.** `central/perf.py` reuses `core/baseline.py`'s pure
+  median+MAD deviation math (`evaluate_perf`) VERBATIM. Central's own contribution is the
+  trailing-sample window: `device_perf_samples` is a bounded per-(tenant, device) ring
+  buffer (`store.record_perf_sample` inserts then trims to the newest `cfg.perf_window`
+  rows in the SAME write), deliberately NOT `central/rollup.py`'s hourly buckets — an
+  hourly average would smear out exactly the intra-hour slowdown this tier exists to
+  catch; don't conflate the two storages. `record_and_evaluate` runs once per full-report
+  cycle (never a recheck), appends this cycle's sample, evaluates the window, and
+  persists the badge (`device_perf`, restart-safe — a hard-DOWN device's perf is moot and
+  clears its badge SILENTLY, the outage owns that story). Operator-only page on the
+  enter/leave edge, gated by `cfg.perf_alerts`.
+- **On-backup redundancy needed ZERO engine changes.**
   `core/state_machine.MonitorEngine` already computed `CycleResult.redundancy` generically
-  in its full pass (`DeviceMeta.effective_parents()` combining the primary parent with any
-  BACKUP `ParentEdge`s) from an earlier, still-untouched phase of the old single-box tool —
-  central's entire job here was wiring the extra edge in: `org_device_links` (mirrors the
-  old `device_links` table, tenant-scoped, `kind='backup'`), `central/inventory.py:
-  clean_backup_link` (the topology-loop check over the FULL edge set — primary + existing
-  backups — mirroring the old `add_backup_link`), and `central/engine.py:load_device_meta`
-  populating `DeviceMeta.parents` from `store.org_device_backup_edges`. **`EngineRegistry`'s
-  topology fingerprint now includes `d.parents`, not just `d.parent_device_id`** — a
-  backup-link add/remove is a topology change like any other and must trigger a rebuild,
-  same as a reparent. `central/redundancy.py:sweep` is the direct port of the old edge's
-  `AlertDispatcher.redundancy_sweep`: persists the `device_redundancy` badge every full
-  cycle (restart-safe), pages the operator once on the enter/leave edge, and — same
-  invariant as every soft-signal tier — NEVER opens an outage or touches the escalation
-  ladder; a node that's itself gone hard DOWN clears its badge SILENTLY (the outage owns
-  that story, not this). Gated by `cfg.backup_alerts`. Dashboard CRUD:
-  `GET/POST /api/inventory/links*`, `GET /api/inventory/redundancy?device_id=`.
-- **Every soft-signal tier the old single-box edge had now exists on central.** SNMP port
-  status + bandwidth, outage-history SLA reporting, the latency/loss trend, the per-link
-  performance baseline, and on-backup redundancy are all wired. Nothing is deliberately
-  deferred at the detection-tier level anymore — see plan.md for what's left (production
-  deployment, fleet-update hardening, mTLS), which is groundwork, not new tiers.
+  (`DeviceMeta.effective_parents()` combining the primary parent with any BACKUP
+  `ParentEdge`s) — the work here was purely wiring the extra edge in: `org_device_links`
+  (tenant-scoped, `kind='backup'`), `central/inventory.py:clean_backup_link` (the
+  topology-loop check over the FULL edge set — primary + existing backups), and
+  `central/engine.py:load_device_meta` populating `DeviceMeta.parents` from
+  `store.org_device_backup_edges`. **`EngineRegistry`'s topology fingerprint includes
+  `d.parents`, not just `d.parent_device_id`** — a backup-link add/remove is a topology
+  change like any other and must trigger a rebuild, same as a reparent.
+  `central/redundancy.py:sweep` persists the `device_redundancy` badge every full cycle
+  (restart-safe), pages the operator once on the enter/leave edge, and — same invariant
+  as every soft-signal tier — NEVER opens an outage or touches the escalation ladder; a
+  node that's itself gone hard DOWN clears its badge SILENTLY (the outage owns that
+  story, not this). Gated by `cfg.backup_alerts`. Dashboard CRUD:
+  `GET/POST /api/inventory/links*`, `GET /api/inventory/redundancy?device_id=`. See
+  "Engine invariants" above for the one place this isn't fully threaded through yet (the
+  edge's client-side gentle-probe approximation).
+- **Every soft-signal tier this platform's edge ever had now exists on central.** SNMP
+  port status + bandwidth, outage-history SLA reporting, the latency/loss trend, the
+  per-link performance baseline, and on-backup redundancy are all wired. Nothing is
+  deliberately deferred at the detection-tier level — see `plan.md` for what's left
+  (production hosting, fleet-update signing), which is groundwork, not new tiers.
 - **Tests:** `integration/test_central_brain.py` — `CentralEngineTest` (topology mapping
   excludes maintenance, restart rehydration doesn't re-page, `EngineRegistry` streak
   persistence across calls + rebuild-on-topology-change + per-tenant isolation),
-  `CentralAlertDispatcherTest` (mirrors the old edge notifier tests: owner+operator on open,
-  UNREACHABLE suppressed, per-outage dedupe, new-outage-after-recovery pages again, resolve
-  broadcasts to all three (silent if from UNREACHABLE), hourly escalation fans out +
-  reschedules, ack doesn't stop it but recovery does, a missing topic is a soft no-op not a
-  crash), `ReportEndpointTest` (`GET /edge/devices` + `POST /report` end-to-end over a real
+  `CentralAlertDispatcherTest` (owner+operator on open, UNREACHABLE suppressed,
+  per-outage dedupe, new-outage-after-recovery pages again, resolve broadcasts to all
+  three (silent if from UNREACHABLE), hourly escalation fans out + reschedules, ack
+  doesn't stop it but recovery does, a missing topic is a soft no-op not a crash),
+  `ReportEndpointTest` (`GET /edge/devices` + `POST /report` end-to-end over a real
   socket, bearer-gated, tenant isolation, canary freeze over HTTP, the recheck round trip
   including fast-confirm-within-two-rechecks and a blip clearing the hint without confirming,
   plus SNMP port folding over HTTP: a monitored port-down folds into an open outage's
@@ -417,20 +440,18 @@ Src layout, zero-install. What bites:
   `Config.central_brain_enabled()` requires both flags, `_gather_snmp_ports`/
   `run_cycle_central_brain(snmp_poller=...)` walk only snmp-enabled devices, attach the haul
   to the same full report, and isolate a dead switch's walk failure from the ICMP cycle.
-  `integration/test_central_ports.py` (mirrors the old single-box `test_ports.py` against
-  `CentralPortMonitor`/`CentralStore`): discovery lands unmonitored, flap-suppressed
+  `integration/test_central_ports.py` (discovery lands unmonitored, flap-suppressed
   monitored-down, a single blip never alarms, admin-down stays silent, fold-into-open-outage
   vs. leading-indicator-no-outage, recovery pages once, the `snmp_alerts` gate mutes the page
   but still writes state, a missing operator topic is a soft no-op; `BandwidthTest`
   (counter-delta rate math, flap-suppressed below-threshold alarm, direction selection,
   recovery, the `snmp_bw_alerts` gate, a bw-alarmed port going down clears silently).
-  `integration/test_central_redundancy.py` (mirrors the old `test_redundancy.py`): a
-  single operator page on enter, one recovered notice on leave, a hard-DOWN node clears
-  the badge silently, the `backup_alerts` gate, restart doesn't re-page, tenant isolation.
-  `integration/test_central_perf.py` (mirrors the old `test_perf.py`): sustained
-  degradation pages once, recovery sends one notice, a hard-DOWN device clears the perf
-  badge silently, the `perf_alerts` gate, restart doesn't re-page (the window survives in
-  the DB), tenant isolation.
+  `integration/test_central_redundancy.py`: a single operator page on enter, one
+  recovered notice on leave, a hard-DOWN node clears the badge silently, the
+  `backup_alerts` gate, restart doesn't re-page, tenant isolation.
+  `integration/test_central_perf.py`: sustained degradation pages once, recovery sends
+  one notice, a hard-DOWN device clears the perf badge silently, the `perf_alerts` gate,
+  restart doesn't re-page (the window survives in the DB), tenant isolation.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -438,9 +459,10 @@ Src layout, zero-install. What bites:
   (`runtime/single_instance.py`, `<db_path>.central-brain.lock`) and exits (code 3) if another
   holds it; the kernel frees it on exit/crash. Two probes for the same tenant would just
   double-*report*, which is wasteful and confusing even though central's per-outage dedupe
-  makes it harmless. Tests: `integration/test_single_instance` (the OS lock itself + idempotent
-  `OutageOpened` in `apply_events`, exercised against the shared `state_machine.py`/
-  `database/client.py` glue that both the old edge and central's engine module build on).
+  (`store.open_outage_if_absent`, `WHERE NOT EXISTS`) makes it harmless. Tests:
+  `integration/test_single_instance` (the OS lock itself); the idempotent-open invariant
+  is covered directly against `CentralStore` in `integration/test_central.py`'s
+  `CentralStoreTest`.
 - **A page must not vanish to a blip.** `NtfyNotifier.send` retries via the pure
   `send_with_retry(attempt, attempts, backoff, sleep)` helper: network/timeout/5xx are
   **retryable** (exponential backoff), a **4xx fails fast** (bad topic/config won't self-heal).
@@ -452,11 +474,10 @@ Src layout, zero-install. What bites:
   kill the probe. Keep any new per-cycle work inside that guard. `_gather_pings` separately
   swallows per-probe errors (but re-raises a `RuntimeError` config/permission failure loudly —
   see its docstring).
-- **Cross-edge fleet watchdog is central's job now (`central/watchdog.py`).** There is no
-  edge-side dead-monitor watchdog anymore (the old `server/watchdog.py` was deleted with the
-  rest of `server/` in Phase C) — central's `CentralWatchdog.check(now)` pages a node's org
-  when its heartbeat is stale (box dead or WAN cut), restart-safe and transition-only. See
-  "Central management plane" area of `central/`.
+- **Cross-edge fleet watchdog is central's job.** `central/watchdog.py`'s
+  `CentralWatchdog.check(now)` pages a node's org when its heartbeat is stale (box dead or
+  WAN cut), restart-safe and transition-only. There is no edge-side dead-monitor watchdog —
+  the edge doesn't run anything that would need one.
 
 ## Config (env-var only)
 
@@ -465,19 +486,69 @@ Src layout, zero-install. What bites:
   either side. Change a tunable by exporting the env var and restarting.
 - **`Config` is shared between the edge and central processes** — don't assume a field is
   edge-only or central-only just from where you first see it used; grep both `apps/daemon/` and
-  `src/wisp/central/` before deleting or renaming a field. (This bit the Phase C config trim:
-  `escalate_every_min`, `session_timeout_h`, `canary_ip`, and `retry_interval_s` all looked
-  edge-only in isolation but are read by `central/server.py`/`central/dispatch.py` too.)
-- **Device topology, team, and per-org alert routing are live in central's dashboard, not env
-  vars.** Only process-level tunables (poll cadence, retry interval, thresholds, concurrency
-  caps) are `WISP_*` — see `README.md`'s Configuration table for the current field list.
-- **Edge→central ingest auth is `WISP_CENTRAL_TOKEN` (bearer) and/or mTLS** (see "mTLS
-  enrollment" below) — either satisfies it. Plus whatever central's own dashboard
-  session secret is (`central/auth.py`, a file under `data/`, 0600). There is no PIN
-  anymore — that was the edge dashboard's auth model, deleted in Phase C; central uses
-  per-user accounts (see "Central runs the brain" / `central/auth.py`).
+  `src/wisp/central/` before deleting or renaming a field (`escalate_every_min`,
+  `session_timeout_h`, `canary_ip`, and `retry_interval_s` all look edge-only in isolation
+  but are read by `central/server.py`/`central/dispatch.py` too).
+- **Device topology, team, per-org alert routing, and node enrollment credentials are
+  live in central's dashboard, not env vars.** Only process-level tunables (poll cadence,
+  retry interval, thresholds, concurrency caps) are `WISP_*` — see `README.md`'s
+  Configuration table for the current field list.
+- **`db_path` (`WISP_DB`) is not a database anymore — just a per-node data-directory
+  anchor.** The edge keeps no database of its own; this path is where the single-instance
+  lock file (`apps/daemon/main.py`) and the supervisor's transient download/
+  update-request files (`apps/supervisor/main.py`) live.
+- **Edge→central ingest auth is any ONE of three:** the global bearer token
+  (`WISP_CENTRAL_TOKEN`), a self-service per-node token an ISP issues from its own
+  dashboard (see "Self-service node enrollment" below), or mTLS (see "mTLS enrollment"
+  below). Plus whatever central's own dashboard session secret is (`central/auth.py`, a
+  file under `data/`, 0600). There is no PIN — central uses per-user accounts (see
+  "Central runs the brain" / `central/auth.py`).
 
-## mTLS enrollment (plan.md item 6, done — replaces the bearer-token-only stopgap)
+## Self-service node enrollment
+
+- **An ISP owner/operator registers a node from the dashboard's "Edge Nodes" tab** (not
+  the "Nodes" tab — that's device topology, see "Central management plane" above) —
+  `POST /api/nodes` issues a fresh credential shown exactly once, `/api/nodes/rotate`
+  replaces it, `/api/nodes/revoke` deactivates it. This is the third option alongside the
+  platform superadmin running `central.admin enroll-edge` (mTLS) or handing out the one
+  shared `WISP_CENTRAL_TOKEN` — an ISP that wants to self-serve doesn't need either.
+- **Only a SHA-256 hash of the token is ever stored (`node_tokens` table,
+  `central/store.py`), never the plaintext** — same discipline as any API-key UX
+  (GitHub PATs, Stripe keys): the plaintext is shown once, at issue time, and can't be
+  retrieved again, only rotated. A fast hash is fine here (unlike a user password) since
+  the token is already ~256 bits of generated entropy (`secrets.token_urlsafe(32)`), not
+  something to defend against a low-entropy-guessing attack.
+- **The token rides the EXACT SAME `Authorization: Bearer <token>` header the edge
+  already sends** — `HttpCentralClient`/`install-edge.sh`/`install-edge.ps1` needed zero
+  changes. Central just checks a presented bearer against three sources instead of one:
+  `central/server.py`'s `_ingest_ok(tenant, node)` tries the global token
+  (`_token_ok`), then a self-service per-node token (`_node_token_identity` →
+  `store.resolve_node_token`, deriving identity FROM the credential and comparing
+  against the claimed tenant/node — same discipline as mTLS's `_peer_identity`, never
+  trust the envelope's claim alone), then a verified mTLS cert. Any one satisfies it.
+- **A node that HAS registered its own credential is gated on presenting it, even on a
+  deployment with neither the global token nor mTLS configured.** Without this,
+  self-service registration would be decorative on any install that never set up the
+  other two mechanisms — `store.node_token_registered(tenant, node)` is checked as a
+  hard "credential required" gate before falling back to the open trusted-network
+  default (`central/server.py:_ingest_ok`'s last line). An UNREGISTERED node still gets
+  that open default, unchanged from before this feature existed.
+- **`central/inventory.py:clean_node_id`** validates the id an ISP types in (1–64 chars,
+  starts with a letter/digit, otherwise letters/digits/`.`/`_`/`-` only) — deliberately
+  boring since it becomes a systemd identity, a path segment under `/etc/wisp` on the
+  edge box, and a bare wire value.
+- **Tests:** `unit/test_central_inventory` (`clean_node_id`), `integration/test_central.
+  NodeTokenTest` (issue/resolve/rotate-invalidates-old/revoke-keeps-row-but-stops-
+  resolving/reissue-after-revoke-reactivates/tenant-isolation/heartbeat-join),
+  `integration/test_central_node_enrollment.py` (dashboard write-gating — owner/
+  superadmin only, 422 on duplicate/bad-id/rotate-of-unregistered, 404 on
+  revoke-of-unregistered, tenant-scoped list — and the ingest-auth integration: a freshly
+  issued token really does authenticate `/report`/`/edge/devices`, rejects a
+  wrong-tenant or wrong-node claim, stops working once revoked, coexists with the global
+  token, and — in a deployment with neither the global token nor mTLS configured — an
+  unregistered node stays open while a registered one is hard-gated on its own token).
+
+## mTLS enrollment (replaces the bearer-token-only stopgap)
 
 - **`central/pki.py` shells out to `openssl` rather than adding `cryptography` as a
   project dependency.** Cert issuance (`central.admin init-ca`/`enroll-edge`) is a
@@ -490,27 +561,25 @@ Src layout, zero-install. What bites:
 - **Identity is CN-encoded, not a new wire field.** An edge's client cert CommonName is
   `tenant_id:node_id` (`pki.edge_common_name`/`pki.peer_identity`) — central decodes it
   off the verified `ssl.SSLSocket.getpeercert()` at the TCP layer, so `POST /report`'s
-  JSON envelope is completely unchanged. This is the "envelope is versioned so mTLS
-  slots in later" promise from the original design actually cashed in.
-- **Either bearer token or a verified matching cert satisfies ingest auth — not both
-  required.** `central/server.py`'s `_ingest_ok(tenant, node)` checks `_token_ok()`
-  first, then falls back to `_peer_identity()` (cert CN must match the CLAIMED tenant,
-  and node where the route has one — `/edge/devices` has no node in its query, so
-  that check is tenant-only there; `/ingest`/`/heartbeat`/`/report` check both). If
-  NEITHER `WISP_CENTRAL_TOKEN` nor `WISP_CENTRAL_CLIENT_CA` is configured, ingest stays
-  fully open — the same trusted-network default from before mTLS existed, unchanged.
-  This is the same self-activating/coexistence pattern as the fleet installers'
-  minisign/Authenticode checks (see "Fleet update hardening" below): turning mTLS on
-  is opt-in, never a hard cutover that could lock out an unmigrated edge fleet.
-- **Central terminates TLS itself now, when configured — stdlib `ssl`, no new
+  JSON envelope is completely unchanged.
+- **The bearer token, a self-service per-node token, or a verified matching cert — any
+  one satisfies ingest auth**, none required. `central/server.py`'s `_ingest_ok(tenant,
+  node)` checks the global token, then a self-service token, then falls back to
+  `_peer_identity()` (cert CN must match the CLAIMED tenant, and node where the route has
+  one — `/edge/devices` has no node in its query, so that check is tenant-only there;
+  `/ingest`/`/heartbeat`/`/report` check both). If NONE of the three is
+  configured/registered, ingest stays fully open — the same trusted-network default from
+  before any of this existed. Turning any one of them on is opt-in, never a hard cutover
+  that could lock out an unmigrated edge fleet.
+- **Central terminates TLS itself when configured — stdlib `ssl`, no new
   dependency.** `make_server` wraps the listener in a `_TLSThreadingHTTPServer` only
   when `WISP_CENTRAL_TLS_CERT`/`_KEY` are BOTH set; if neither is set (the default),
-  central serves plain HTTP exactly as it always has — every existing test and deploy
-  keeps working unchanged. `WISP_CENTRAL_CLIENT_CA` is independent of that: it turns on
-  `CERT_OPTIONAL` client-cert verification (requested, not required — dashboard
-  browsers and not-yet-enrolled edges have none and still connect fine) once TLS
-  itself is on. A terminator (nginx/Caddy) in front is still a valid choice too — this
-  doesn't retire that option, it adds a stdlib-only path that doesn't need one.
+  central serves plain HTTP exactly as it always has. `WISP_CENTRAL_CLIENT_CA` is
+  independent of that: it turns on `CERT_OPTIONAL` client-cert verification (requested,
+  not required — dashboard browsers and not-yet-enrolled edges have none and still
+  connect fine) once TLS itself is on. A terminator (nginx/Caddy) in front is still a
+  valid choice too — this doesn't retire that option, it adds a stdlib-only path that
+  doesn't need one.
 - **The TLS handshake happens inside each request's own worker thread, not the shared
   accept loop.** `_TLSThreadingHTTPServer` overrides `finish_request` (not
   `get_request`) to call `ssl_context.wrap_socket` — `ThreadingMixIn` already calls
@@ -558,7 +627,7 @@ Src layout, zero-install. What bites:
 - **No automatic cause inference.** The engine does **not** guess why a device is down. Cause
   is only ever an operator-entered post-mortem at resolution (a central dashboard field) — don't
   reintroduce an inferred cause.
-- **Escalation model (the alarm ladder), now on central:** a fresh DOWN pages **owner +
+- **Escalation model (the alarm ladder):** a fresh DOWN pages **owner +
   operator**, immediately (`CentralAlertDispatcher._on_open` → `_publish("owner", …)` → owner
   topic + the operator copy; the tech channel is held back to the hourly escalation). Dedupe is
   **per-outage** (was there already a `sent` row for this outage id?), NOT a time window — a
@@ -575,22 +644,22 @@ Src layout, zero-install. What bites:
 - **Timestamps:** poll/outage stamps are ISO8601 `+00:00`; SQLite `datetime('now')` (acks) is
   space-separated naive. `core/analytics._parse` normalises both to naive UTC — reuse it (it's
   also what `central/rollout.py` and `central/watchdog.py` import for the same reason).
-- **Schema changes:** central's own schema (`central/store.py`'s `_SCHEMA` + `_ensure_columns`)
-  is separate from the legacy `migrations/000N_*.sql` runner (`database/client.py`), which
-  still exists only because `core/state_machine.py`'s DB-glue functions are built against it
-  and are still unit-tested. Don't confuse the two schemas.
+- **Schema changes:** central's own schema (`central/store.py`'s `_SCHEMA` +
+  `_ensure_columns`) is the only schema in this codebase now — see "Central management
+  plane" above for the column-migration convention new fields need.
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (283 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (310 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
 `unit/test_baseline` (pure perf-deviation math — now wired by `central/perf.py`; see
 "Per-link performance baseline" above), `unit/test_snmp` (pure SNMP parser/throughput math,
 incl. `is_down()` — the same predicate `central/ports.py` reuses for the folding alarm
-condition), `unit/test_supervisor` (Part D, untouched by
-Phase C), `unit/test_central_inventory` (pure central payload/cycle validation, incl.
+condition), `unit/test_supervisor` (the self-update logic, untouched by anything above),
+`unit/test_central_inventory` (pure central payload/cycle/node-id validation, incl.
 `clean_backup_link`'s full-edge-set cycle check and `clean_port_bandwidth_payload`),
+`unit/test_central_pki` (CA/cert issuance + CN decode — see "mTLS enrollment"),
 `integration/test_daemon` (the edge's shared `_gather_pings`: concurrency-bound semaphore,
 per-IP count map, the config-error-vs-per-host-error policy), `integration/test_daemon_central_brain`
 (the edge probe loop end to end against a recording central client double, incl. the SNMP
@@ -599,13 +668,15 @@ task's `_gather_snmp_ports`/dead-switch isolation), `integration/test_central_po
 leading-indicator, recovery, the alerts gate, plus the bandwidth tier's throughput/alarm
 math), `integration/test_central_redundancy` (the on-backup sweep against `CentralStore`),
 `integration/test_central_perf` (the perf-baseline sweep against `CentralStore`),
-`integration/test_notifiers`
+`integration/test_central_mtls` (real-TLS-socket mTLS auth — see "mTLS enrollment"),
+`integration/test_central_node_enrollment` (self-service token issuance/auth — see
+"Self-service node enrollment"), `integration/test_notifiers`
 (the `send_with_retry` policy — pure, no DB/network), `integration/test_single_instance` (the OS
-lock + idempotent `OutageOpened`), `integration/test_analytics` (outage-window/downtime math,
-the edge-schema version `central/analytics.py` mirrors), `integration/test_central_analytics`
-(the same math over `CentralStore`'s tenant-scoped `outages`, feeding `GET /api/analytics`,
-plus `central/rollup.py`'s hourly trend-bucket folding/pruning feeding `GET
-/api/analytics/trend`), `integration/test_central*` (store, auth, brain, rollout, watchdog — see
-"Central runs the brain" / "Central management plane" for what each covers). Tests inject a
-recording notifier/client double where a real network call would otherwise be needed — no real
-ntfy/central network in the suite.
+lock — see "Reliability invariants" for where the idempotent-open coverage now lives),
+`integration/test_central_analytics`
+(outage-window/downtime math over `CentralStore`'s tenant-scoped `outages`, feeding `GET
+/api/analytics`, plus `central/rollup.py`'s hourly trend-bucket folding/pruning feeding
+`GET /api/analytics/trend`), `integration/test_central*` (store, auth, brain, rollout,
+watchdog — see "Central runs the brain" / "Central management plane" for what each
+covers). Tests inject a recording notifier/client double where a real network call
+would otherwise be needed — no real ntfy/central network in the suite.

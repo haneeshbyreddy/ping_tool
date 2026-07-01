@@ -83,9 +83,12 @@ def _gentle_probe_plan(devices: list[dict], canary_ip: str, cfg: Config) -> dict
     """Per-IP ping count, mirroring `MonitorEngine.probe_plan()`'s gentle-infra rule
     (any node that is somebody's parent gets fewer echoes so a switch/tower's ICMP
     rate-limiter doesn't read as phantom loss) — computed client-side from the
-    central-supplied topology since there's no local engine to ask. No backup edges yet
-    (Phase A/B org_devices has primary-only parents), so this is exactly the primary-chain
-    case of the real probe_plan."""
+    central-supplied topology since there's no local engine to ask. Only sees PRIMARY
+    parents: `GET /edge/devices` (`store.org_device_topology`) doesn't carry backup edges
+    (`org_device_links`), so a device that's a parent ONLY on a backup path (never a
+    primary parent of anything) doesn't get the gentle cadence here — a known small gap,
+    not central's `probe_plan()` itself (which does see both), and not urgent since a
+    backup-path device is typically also a primary parent of something else already."""
     parent_ids = {d["parent_device_id"] for d in devices if d["parent_device_id"] is not None}
     plan = {d["ip_address"]: (cfg.pings_per_poll_infra if d["id"] in parent_ids
                               else cfg.pings_per_poll)

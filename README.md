@@ -61,6 +61,12 @@ browser dashboard — nothing on the edge box needs touching after install.
   parent), full CRUD from the UI. A newly added/removed/reparented device
   applies to the live probe within one poll cycle (the edge re-fetches its
   topology from central every cycle — no edge restart needed).
+- **Edge Nodes** — distinct from the **Nodes** page above (that's device
+  topology; this is the physical probes themselves). An owner/operator
+  registers a new node here and gets back a one-time enrollment token to
+  install with — self-service, no platform superadmin required. An ISP can
+  register as many nodes as it runs; rotate or revoke a node's credential
+  from the same page.
 - **Team** — workers as identity + role (owner / operator / tech), *not*
   per-person routing. Alerts route to **three per-org ntfy topics, one per
   role**, set from **Settings**; a person subscribes to the topic for their

@@ -19,7 +19,10 @@ run locally beyond the probe.
 - **Central management plane** — ISPs manage device topology, team, and per-org alert
   settings from the central dashboard, independent of any edge. Accounts are
   central-provisioned: a superadmin onboards each ISP; org users are scoped to their own
-  tenant with a role (owner/operator/tech).
+  tenant with a role (owner/operator/tech). An owner/operator can also self-service
+  register the physical nodes their org runs — one ISP, one or many nodes — straight
+  from the dashboard's Edge Nodes tab, getting back a per-node credential without the
+  platform superadmin having to hand out anything out of band.
 - **Central runs the brain** — `MonitorEngine` (the FSM) and the alerting ladder run on
   central, fed by raw per-IP samples the edge probes report over `POST /report`. This
   includes the fast-confirm round trip (central names a suspect IP in its reply; the edge
@@ -34,7 +37,7 @@ run locally beyond the probe.
   end-to-end in tests. What's *not* exercised outside CI: the actual multi-arch
   PyInstaller build, code-signing, and the Windows installer on real hardware.
 
-283 tests, `python -m unittest discover -s tests`.
+310 tests, `python -m unittest discover -s tests`.
 
 ## The model: what changed from a single-box tool
 
@@ -130,8 +133,8 @@ them trustworthy at scale, across many ISPs, without any of them stepping on eac
 | **What we monitor** | Shared infrastructure — towers, relays, backhaul, core, switches. Not end-user routers (yet). |
 | **Alert channels** | **ntfy** only. Three fixed topics per org (owner/operator/tech); a fresh DOWN pages owner+operator, the hourly escalation broadcasts to all three until recovery. |
 | **Multi-tenancy** | Non-negotiable. An org user must never see another org's data; every central read is tenant-scoped. |
-| **Where the edge runs** | On-prem at the ISP, one probe process, no local DB/dashboard. Frozen-binary (fleet, PyInstaller + supervisor) or venv (single box, systemd) — both talk the same wire protocol to central. |
-| **Transport** | The edge dials central; central never connects in. Bearer-token auth (`WISP_CENTRAL_TOKEN`) and/or mTLS (`central.admin init-ca`/`enroll-edge`, see item 6) — either satisfies ingest auth, so mTLS is opt-in, not a forced cutover. |
+| **Where the edge runs** | On-prem at the ISP, one probe process per node, no local DB/dashboard. Every node — an ISP's first or its fifth — deploys the same way: frozen-binary + the self-updating supervisor (PyInstaller, `install-edge.sh`/`.ps1`). No separate "simple" install mode. |
+| **Transport** | The edge dials central; central never connects in. Ingest auth is any one of: the global bearer token (`WISP_CENTRAL_TOKEN`), a self-service per-node token an ISP issues from its own dashboard, or mTLS (`central.admin init-ca`/`enroll-edge`, see item 6) — any one satisfies it, so none of the three is a forced cutover off the others. |
 | **Updates** | Pull-based over the existing heartbeat/report channel (no inbound holes). Central is the version authority; rollouts are staged + health-gated + auto-rollback. |
 | **Realism** | Probers & notifiers sit behind small interfaces (`build_prober`/`build_notifier`); the real ICMP prober + ntfy notifier are the only impls. Tests inject recording doubles instead of hitting the network. |
 
@@ -204,8 +207,9 @@ groundwork that hasn't been done yet. In rough priority order:
    - `deploy/install-edge.sh` (Linux fleet installer) now verifies the minisign signature
      over `SHA256SUMS` when a public key + signature are published (self-activating —
      sha256-only until then, hard-fails if a signature IS present but invalid).
-   - `deploy/install-edge.ps1` — **new**, the Windows fleet installer that didn't exist
-     before (only the single-box venv installer, `install.ps1`, existed). Downloads the
+   - `deploy/install-edge.ps1` is the Windows fleet installer (the single-box venv
+     installer this repo used to also carry, `install.ps1`, is gone — every node deploys
+     through the fleet path now, see CLAUDE.md's "Removed" section). Downloads the
      signed win-amd64 binaries, verifies sha256 + Authenticode (same self-activating
      policy), installs under Program Files, and runs the **supervisor** (not the agent
      directly) via a Scheduled Task as SYSTEM — the Windows analogue of `wisp-edge.service`.
@@ -247,6 +251,17 @@ groundwork that hasn't been done yet. In rough priority order:
    rotation tooling yet (revoking means re-running `enroll-edge` with a fresh keypair
    and rotating the CA if a cert is compromised) — fine at today's fleet size; revisit
    if that becomes a real operational need.
+7. ~~**Self-service node registration from the dashboard**~~ **Done.** An ISP owner/
+   operator no longer needs the platform superadmin to hand out a credential out of
+   band (CLI `enroll-edge`, or the one shared `WISP_CENTRAL_TOKEN`) to add a node —
+   `POST /api/nodes` (dashboard's Edge Nodes tab) issues a fresh per-node token, shown
+   once, that rides the exact same `Authorization: Bearer` header the edge already
+   sends — zero changes to `install-edge.sh`/`.ps1` or `HttpCentralClient`. Only a
+   SHA-256 hash is ever stored (`node_tokens` table); `/rotate` and `/revoke` round out
+   the lifecycle. Coexists with the global token and mTLS (any one satisfies ingest
+   auth), but a node that HAS registered its own token is required to present it even
+   on a deployment with neither of the other two configured — otherwise self-service
+   registration would be decorative. See CLAUDE.md's "Self-service node enrollment".
 
 None of these block the platform from running today — `WISP_CENTRAL_BRAIN=1` +
 `WISP_CENTRAL_URL` is a complete, working loop. They're the gap between "works" and
