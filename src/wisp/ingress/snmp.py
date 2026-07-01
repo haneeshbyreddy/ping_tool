@@ -231,23 +231,3 @@ class PysnmpPoller:
 
 def build_snmp_poller(cfg: Config = CONFIG) -> SnmpPoller:
     return PysnmpPoller(cfg)
-
-
-def load_snmp_targets(cfg: Config = CONFIG) -> list[tuple[int, SnmpTarget]]:
-    """(device_id, SnmpTarget) for every active, non-maintenance device that has SNMP
-    enabled and a community set. DB glue (mirrors load_device_meta) so the daemon's SNMP
-    task can re-read targets each cycle — an enable/disable from the UI is picked up with
-    no restart."""
-    from wisp.database.client import connect
-    with connect(cfg) as conn:
-        rows = conn.execute(
-            "SELECT id, ip_address, snmp_community, snmp_port, snmp_version FROM devices"
-            " WHERE is_active=1 AND maintenance=0 AND snmp_enabled=1"
-            "   AND snmp_community IS NOT NULL AND snmp_community <> ''"
-        ).fetchall()
-    return [
-        (r["id"], SnmpTarget(
-            ip=r["ip_address"], community=r["snmp_community"],
-            port=r["snmp_port"] or 161, version=r["snmp_version"] or "2c"))
-        for r in rows
-    ]

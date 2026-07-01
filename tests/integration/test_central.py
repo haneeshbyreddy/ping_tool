@@ -52,6 +52,37 @@ class CentralStoreTest(unittest.TestCase):
         self.store.ingest("ispA", "edge-2", [_evt(1, device_id=5)])
         self.assertEqual(self.store.counts()["events"], 2)
 
+    def _device(self):
+        return self.store.create_org_device("ispA", {
+            "name": "Tower", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+
+    def test_open_outage_if_absent_does_not_stack(self):
+        """A second open (e.g. a stray duplicate poller, or a redundant call from the
+        engine) must not create a second open row while one is already open for that
+        device — the same invariant `central/engine.py`'s `apply_events` relies on."""
+        dev = self._device()
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:34:54+00:00", "DOWN")
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:34:57+00:00", "DOWN")
+        self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
+        with self.store._connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM outages WHERE tenant_id='ispA' AND device_id=?"
+                " AND resolved_at IS NULL", (dev,)).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_open_outage_reopens_after_resolve(self):
+        dev = self._device()
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        self.store.resolve_outage("ispA", dev, "2026-06-23T08:05:00+00:00")
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T09:00:00+00:00", "DOWN")
+        with self.store._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM outages WHERE tenant_id='ispA' AND device_id=?",
+                (dev,)).fetchone()[0]
+        self.assertEqual(total, 2)
+        self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
+
     def test_heartbeat_upserts_node(self):
         self.store.record_heartbeat("ispA", "edge-1",
                                     {"version": "0.10.0", "fleet_size": 7, "open_outages": 1,

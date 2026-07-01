@@ -16,11 +16,9 @@
     rollback, see runtime/supervisor.py) from then on, the same as the Linux fleet path's
     wisp-edge.service.
 
-    This is distinct from deploy/install.ps1, which sets up the *single-box venv* path
-    (running apps/daemon/main.py from a source checkout) — that script has no frozen
-    binary, no supervisor, and no self-update. Use THIS script for a fleet of many Windows
-    edges managed by central's staged rollout; use install.ps1 for a one-off box run from
-    a git checkout.
+    This is the only supported Windows edge install path — every node an ISP deploys,
+    whether it's their first or their fifth, goes through this installer and gets the
+    supervisor's self-update for free.
 
 .PARAMETER Central
     Central base URL, e.g. https://central.example.net

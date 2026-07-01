@@ -9,19 +9,18 @@ flap suppression, recovery hysteresis, and two network-aware overrides:
                       not separately DOWN.
 
 `MonitorEngine` is deliberately pure: it takes a dict of {ip: PingResult} plus a
-timestamp and returns committed states + a list of events. All DB reads (to build
-and rehydrate it) and DB writes (applying events) live in the small functions at
-the bottom, so the decision logic can be unit-tested with no database.
+timestamp and returns committed states + a list of events, with no I/O of its own —
+`central/engine.py` owns building/rehydrating it and persisting its events against
+central's multi-tenant store, so the decision logic here can be unit-tested with no
+database at all.
 """
 from __future__ import annotations
 
-import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from wisp.config import CONFIG, Config
-from wisp.database.client import connect
 from wisp.ingress.probers import PingResult
 
 # --- States -----------------------------------------------------------------
@@ -358,82 +357,3 @@ class MonitorEngine:
         return CycleResult(
             states=committed, events=events, canary_down=False, redundancy=redundancy)
 
-
-# --- DB glue: build/rehydrate the engine, and apply its events --------------
-def load_device_meta(cfg: Config = CONFIG) -> list[DeviceMeta]:
-    with connect(cfg) as conn:
-        rows = conn.execute(
-            "SELECT id, name, ip_address, region, parent_device_id, technician_phone"
-            # maintenance=1 fully pauses a node: excluded from the active set so the
-            # daemon stops pinging it and pages no one for it (the device-set reload
-            # picks the change up in-process). Flip the flag back to resume.
-            " FROM devices WHERE is_active = 1 AND maintenance = 0 ORDER BY id"
-        ).fetchall()
-        # Backup edges only — the primary parent already lives on the device row
-        # (parent_device_id). A second tiny query/join keyed to the same active set.
-        edges = conn.execute(
-            "SELECT child_id, parent_id FROM device_links"
-            " WHERE is_active = 1 AND kind = ? ORDER BY parent_id",
-            (BACKUP,),
-        ).fetchall()
-    backups: dict[int, list[ParentEdge]] = {}
-    for e in edges:
-        backups.setdefault(e["child_id"], []).append(ParentEdge(e["parent_id"], BACKUP))
-    return [
-        DeviceMeta(parents=tuple(backups.get(r["id"], ())), **dict(r))
-        for r in rows
-    ]
-
-
-def build_engine(cfg: Config = CONFIG) -> MonitorEngine:
-    """Construct the engine and rehydrate each FSM from the last recorded state
-    so a restart continues instead of re-paging everyone."""
-    devices = load_device_meta(cfg)
-    engine = MonitorEngine(devices, cfg)
-    with connect(cfg) as conn:
-        for dev_id in engine.fsm:
-            row = conn.execute(
-                "SELECT state FROM poll_results WHERE device_id = ?"
-                " ORDER BY id DESC LIMIT 1",
-                (dev_id,),
-            ).fetchone()
-            if row:
-                engine.fsm[dev_id].prime(row["state"])
-        # Rehydrate uplink state: if the last uplink log entry was UPLINK_DOWN,
-        # mark the engine as uplink-active so the next healthy cycle emits
-        # UplinkRestored and clears the dashboard badge.
-        uplink_row = conn.execute(
-            "SELECT payload FROM alert_log"
-            " WHERE payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%'"
-            " ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if uplink_row and "UPLINK_DOWN" in (uplink_row["payload"] or ""):
-            engine._uplink_active = True
-    return engine
-
-
-def apply_events(conn: sqlite3.Connection, events: list[Event], ts: str) -> None:
-    """Persist outage open/close/recategorize. Idempotent against the open-outage
-    row (resolve/recategorize no-op if none is open)."""
-    for ev in events:
-        if isinstance(ev, OutageOpened):
-            # Idempotent open: never stack a second open row for a device that already
-            # has an unresolved outage (a duplicate event, or a stray second poller).
-            # One open outage per device is the invariant the rest of the code assumes.
-            conn.execute(
-                "INSERT INTO outages (device_id, started_at, final_state)"
-                " SELECT ?,?,? WHERE NOT EXISTS ("
-                "   SELECT 1 FROM outages WHERE device_id=? AND resolved_at IS NULL)",
-                (ev.device_id, ts, ev.state, ev.device_id),
-            )
-        elif isinstance(ev, OutageRecategorized):
-            conn.execute(
-                "UPDATE outages SET final_state = ?"
-                " WHERE device_id = ? AND resolved_at IS NULL",
-                (ev.state, ev.device_id),
-            )
-        elif isinstance(ev, OutageResolved):
-            conn.execute(
-                "UPDATE outages SET resolved_at = ? WHERE device_id = ? AND resolved_at IS NULL",
-                (ts, ev.device_id),
-            )

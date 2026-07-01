@@ -52,12 +52,12 @@ def _hostname() -> str:
 @dataclass(frozen=True)
 class Config:
     # --- Storage -------------------------------------------------------------
+    # The edge keeps no database of its own — this is just the per-node data directory
+    # anchor: the single-instance lock file (`apps/daemon/main.py`) and the supervisor's
+    # transient download/update-request files (`apps/supervisor/main.py`) live next to it.
     db_path: Path = field(
         default_factory=lambda: Path(_env("WISP_DB", str(DATA_DIR / "wisp.db")))
     )
-    migrations_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "migrations")
-    # SQLite waits this long for a competing writer before raising "database is locked".
-    busy_timeout_ms: int = field(default_factory=lambda: _env_int("WISP_BUSY_TIMEOUT_MS", 5000))
 
     # --- Polling -------------------------------------------------------------
     poll_interval_s: int = field(default_factory=lambda: _env_int("WISP_POLL_INTERVAL_S", 60))

@@ -1,9 +1,8 @@
-# WISP Edge (fleet path) — the SUPERVISOR, which launches + self-updates the agent.
+# WISP Edge — the SUPERVISOR, which launches + self-updates the agent.
 #
-# This is the *frozen-binary fleet* deploy mode (the supervisor owns agent updates over the
-# central mTLS/bearer channel). The on-prem single-box mode still uses wisp-monitor.service +
-# the venv (see install.sh). Config + identity live OUTSIDE the binary in /etc/wisp/ so an
-# update swaps the binary, never the cert/DB/config.
+# The supervisor owns agent updates over the central mTLS/bearer channel (see
+# install-edge.sh/install-edge.ps1). Config + identity live OUTSIDE the binary in
+# /etc/wisp/ so an update swaps the binary, never the cert/DB/config.
 #
 #   sudo cp deploy/wisp-edge.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-edge

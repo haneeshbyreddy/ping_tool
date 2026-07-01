@@ -84,7 +84,6 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── config.py             # frozen Config from env; CONFIG singleton
 ├── version.py            # the running build version (reported in the heartbeat)
 ├── core/                 # state_machine.py (FSM, reused by central), analytics.py, baseline.py
-├── database/             # client.py (WAL conn + migration runner; used by state_machine's DB glue)
 ├── ingress/               # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk;
 │                          #   walked by the edge daemon, folded/alerted by central/ports.py)
 ├── egress/               # notifiers.py — the ntfy channel (NtfyNotifier/send_with_retry),
@@ -105,11 +104,8 @@ apps/
 │                          #   fast-confirm hints); no local FSM, DB, or dashboard
 ├── central/main.py       # central server runtime — ingest + multi-tenant dashboard + watchdog
 └── supervisor/main.py    # edge supervisor — runs + self-updates the frozen agent (fleet path)
-data/                     # central.db (+ wal/shm) + session_secret — git-ignored
-migrations/               # 000N_*.sql for central's underlying wisp.database.client schema (see
-                           #   core/state_machine.py's DB-glue tests) — central's own store.py
-                           #   schema is separate (executescript in central/store.py)
-deploy/                   # systemd units + install scripts + PyInstaller spec (single-box + fleet)
+data/                     # central.db (+ wal/shm) + session_secret + pki/ — git-ignored
+deploy/                   # wisp-edge.service, install-edge.sh/.ps1, PyInstaller spec
 .github/workflows/        # release.yml — build/test on push/PR; sign+publish on a v* tag
 tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
 docs/  assets/            # incident post-mortem template; original design mockup
@@ -197,7 +193,8 @@ PYTHONPATH=src python -m wisp.central.admin create-user --tenant ispA --username
 curl -H 'Authorization: Bearer s3cret' 'http://HOST:8443/api/devices?tenant=ispA'
 ```
 ```bash
-# on the edge box's systemd unit (deploy/wisp-monitor.service):
+# the wire itself — same env vars whether wisp-edge.service launches this via the
+# supervisor (see "Fleet deploy" below) or you're running it directly for local dev:
 WISP_CENTRAL_BRAIN=1 WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
 WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
 ```
@@ -219,12 +216,12 @@ vars to set on central. `enroll-edge` issues one client cert per edge and prints
 alternative to the bearer token — set both during rollout, drop the token fleet-wide once
 every edge is enrolled.
 
-**Fleet deploy + self-update.** Edges can instead ship as a **frozen single binary**
-(PyInstaller — no Python/venv on the box); a small stable **supervisor** runs the agent
-and owns `download → verify(sha256) → atomic-swap → restart → health-gate → rollback`.
-Central is the **version authority** with a staged, health-gated rollout — a canary
-subset updates first and the rollout auto-promotes only once the canaries come back
-healthy on the target, else it auto-halts:
+**Fleet deploy + self-update.** Every edge — an ISP's first node or its fifth — ships as
+a **frozen single binary** (PyInstaller — no Python/venv on the box); a small stable
+**supervisor** runs the agent and owns `download → verify(sha256) → atomic-swap →
+restart → health-gate → rollback`. Central is the **version authority** with a staged,
+health-gated rollout — a canary subset updates first and the rollout auto-promotes only
+once the canaries come back healthy on the target, else it auto-halts:
 ```bash
 PYTHONPATH=src python -m wisp.central.admin publish-release --version 0.11.0 \
     --artifact linux-amd64 https://.../wisp-edge-linux-amd64 <sha256>
@@ -233,14 +230,14 @@ PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
 ```
 Linux install is `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
 (`deploy/install-edge.sh`: arch-detect → download → **verify sha256** (+ minisign over
-`SHA256SUMS` if published) → systemd unit → ICMP sysctl). The Windows fleet path is
+`SHA256SUMS` if published) → systemd unit → ICMP sysctl). The Windows install is
 `deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`: download → **verify
 sha256** (+ Authenticode if the binaries are signed) → install under Program Files →
-Scheduled Task running the **supervisor** (not the agent directly) as SYSTEM — the
-frozen-binary sibling of `install.ps1`, which is the *single-box venv* path instead (no
-supervisor, no self-update). CI (`.github/workflows/release.yml`) builds + tests on every
-push/PR and, **only on a `v*` tag**, signs/packages/publishes a Release with a version
-manifest central ingests:
+Scheduled Task running the **supervisor** (not the agent directly) as SYSTEM. Both are
+the *only* supported install path — there's no separate single-box mode to choose
+between; an ISP running one node and an ISP running fifty install the same way. CI
+(`.github/workflows/release.yml`) builds + tests on every push/PR and, **only on a `v*`
+tag**, signs/packages/publishes a Release with a version manifest central ingests:
 - **Authenticode** (Windows `.exe`s, in the `build` job, gated on the
   `WINDOWS_CODESIGN_PFX`/`WINDOWS_CODESIGN_PASSWORD` secrets) — embedded per-binary so
   SmartScreen/AV and `install-edge.ps1`'s `Get-AuthenticodeSignature` check see a real chain.
@@ -254,9 +251,6 @@ manifest central ingests:
 Both signing steps are **no-ops until their secrets are set** (so forks/PRs still build
 unsigned) — see `plan.md` item 5 for what's still needed to actually turn them on (real keys,
 validating the signed artifacts on real hardware).
-The single-box venv path (`deploy/install.sh` / `deploy/install.ps1`) still exists for a
-simpler systemd/Scheduled-Task-managed probe; the frozen binary + supervisor
-(`install-edge.sh` / `install-edge.ps1`) is the *fleet* path.
 
 ## Configuration (env vars, all optional)
 
@@ -308,18 +302,24 @@ fast-confirm reply names the suspect IP and the edge re-probes it every
 `WISP_RETRY_INTERVAL_S` until confirmed or cleared — detection in seconds, not
 `down_consecutive × poll_interval`. Set `WISP_RETRY_INTERVAL_S=0` to disable it.
 
-## Going live (edge box)
+## Going live (deploying a node)
 
-1. `sudo deploy/install.sh` on the edge box — installs deps, the venv, the unprivileged
-   ICMP sysctl, and the `wisp-monitor` systemd unit (see the script for what it does).
-2. `sudo systemctl edit --full wisp-monitor` and set `WISP_CENTRAL_URL` /
-   `WISP_CENTRAL_TOKEN` / `WISP_TENANT_ID` (and optionally `WISP_NODE_ID`) to the values
-   your central operator gave you, then `sudo systemctl enable --now wisp-monitor`.
-3. From the **central** dashboard: enter the real device inventory + topology (Nodes),
+An ISP can run one node or many — the install path is the same either way:
+
+1. On the edge box:
+   ```bash
+   curl -fsSL https://YOUR-CENTRAL/install-edge.sh | sudo sh -s -- \
+       --central https://central.example.net --token <ENROLL> --tenant ispA --node edge-a1
+   ```
+   (Windows: `deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`.) This
+   installs the frozen agent + supervisor, writes identity/config to `/etc/wisp`
+   (untouched by future updates), enables unprivileged ICMP, and starts the service —
+   see "Fleet deploy + self-update" above for exactly what it verifies.
+2. From the **central** dashboard: enter the real device inventory + topology (Nodes),
    add your team (Team), set the three role ntfy topics (Settings) and confirm routing
    with **Send test alert**.
-4. Tune thresholds/cadence (`WISP_POLL_INTERVAL_S`, etc.) against how the real links
-   actually blip, then restart `wisp-monitor`.
-
-For a fleet of many edges instead of one box at a time, see "Fleet deploy + self-update"
-above.
+3. Tune thresholds/cadence (`WISP_POLL_INTERVAL_S`, etc.) in `/etc/wisp/edge.env` against
+   how the real links actually blip, then restart the service.
+4. Adding a second (third, tenth…) node for the same ISP is the same one-liner with a
+   different `--node`; central tells each one what to probe, so nothing about step 1
+   changes as the fleet grows.
