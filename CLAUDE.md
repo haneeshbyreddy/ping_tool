@@ -14,7 +14,7 @@ no other path). An earlier single-box version of this tool (one daemon + one loc
 no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
 deleted wholesale, not just deprecated. See "Removed" below before assuming a described
 behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 206 tests.
+history, not this file. 215 tests.
 
 **Central's own management plane and FSM/alerting are done and tested end to end**, including
 the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
@@ -185,12 +185,22 @@ Src layout, zero-install. What bites:
   `build_notifier(cfg)`, the lazy-httpx-import `NtfyNotifier`) — tests inject a recording
   double, no real network in the suite. Follow this constructor-injection pattern for anything
   else central needs to send.
+- **`GET /api/analytics?days=` is outage-history math, not a new store of its own** —
+  `central/analytics.py:device_reliability` reads straight off the existing `outages`
+  table (`store.outages_in_window`), tenant-scoped through the SAME `_scope_tenant` every
+  other dashboard read uses. It reports every ACTIVE device the tenant has configured
+  (via `list_org_devices`), not just ones with an outage, so a device with a clean window
+  still shows 100% uptime rather than being silently absent. UNREACHABLE outages are
+  excluded from the downtime sum (mirrors the edge's old `only_down=True` default) — a
+  topology-suppressed child isn't "unreliable" on its own account.
 - **Tests:** `unit/test_central_inventory` (pure payload/cycle validation),
   `integration/test_central.OrgDevicesTest` (CRUD round-trip, tenant isolation, parent-map
   scoping, children-block delete, maintenance/SNMP toggles), `integration/test_central_auth`
   (`/api/inventory*` CRUD + 422/403 + cross-tenant-write-rejected over HTTP, `/api/orgs`
   tenant-scoping + superadmin narrow, org role-topic round-trip, `/api/test-alert` via the
-  injected recording notifier + missing-topic 422 + write-gated).
+  injected recording notifier + missing-topic 422 + write-gated, `/api/analytics` tenant
+  scoping + superadmin narrow), `integration/test_central_analytics` (window-overlap math,
+  DOWN-only excludes UNREACHABLE, a zero-outage device reports 100% up, tenant isolation).
 
 ## Central runs the brain (New Architecture Phase B — the ONLY edge mode, post-Phase-C)
 
@@ -380,7 +390,7 @@ Src layout, zero-install. What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (206 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (215 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
 `unit/test_baseline` (pure perf-deviation math — module kept, not currently wired into anything
@@ -396,7 +406,9 @@ task's `_gather_snmp_ports`/dead-switch isolation), `integration/test_central_po
 leading-indicator, recovery, the alerts gate), `integration/test_notifiers`
 (the `send_with_retry` policy — pure, no DB/network), `integration/test_single_instance` (the OS
 lock + idempotent `OutageOpened`), `integration/test_analytics` (outage-window/downtime math,
-shared by central), `integration/test_central*` (store, auth, brain, rollout, watchdog — see
+the edge-schema version `central/analytics.py` mirrors), `integration/test_central_analytics`
+(the same math over `CentralStore`'s tenant-scoped `outages`, feeding `GET /api/analytics`),
+`integration/test_central*` (store, auth, brain, rollout, watchdog — see
 "Central runs the brain" / "Central management plane" for what each covers). Tests inject a
 recording notifier/client double where a real network call would otherwise be needed — no real
 ntfy/central network in the suite.

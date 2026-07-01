@@ -833,6 +833,19 @@ class CentralStore:
                 " AND resolved_at IS NULL", (ts, tenant_id, device_id))
             conn.commit()
 
+    def outages_in_window(self, tenant_id: str, since: str, until: str) -> list[dict]:
+        """Every outage overlapping [since, until] for one tenant (open or resolved) —
+        the input to `central/analytics.py`'s downtime/SLA math. An open outage
+        (`resolved_at IS NULL`) always overlaps, since it's still ongoing."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT o.*, d.name, d.region FROM outages o"
+                " JOIN org_devices d ON d.id = o.device_id"
+                " WHERE o.tenant_id=? AND (o.resolved_at IS NULL OR o.resolved_at >= ?)"
+                " AND o.started_at <= ? ORDER BY o.started_at",
+                (tenant_id, since, until)).fetchall()
+        return [dict(r) for r in rows]
+
     def last_resolved_state(self, tenant_id: str, device_id: int) -> str | None:
         """The `final_state` of the most recently resolved outage — used to tell a
         genuine recovery from an UNREACHABLE outage we never paged about."""

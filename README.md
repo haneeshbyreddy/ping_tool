@@ -90,8 +90,9 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── egress/               # notifiers.py — the ntfy channel (NtfyNotifier/send_with_retry),
 │                          #   shared by the edge probe's error paths and central's dispatcher
 ├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), ports.py (SNMP
-│                          #   port folding), store (multi-tenant SQLite), server.py (ingest +
-│                          #   dashboard API), watchdog, auth, admin CLI, rollout, inventory,
+│                          #   port folding), analytics.py (outage-derived downtime/SLA),
+│                          #   store (multi-tenant SQLite), server.py (ingest + dashboard
+│                          #   API), watchdog, auth, admin CLI, rollout, inventory,
 │                          #   static/ (the dashboard SPA)
 └── runtime/               # central_client.py (edge's central HTTP client), single_instance.py,
                            #   supervisor.py (agent self-update logic)
@@ -147,6 +148,12 @@ run.sh                    # local dev: central + one edge probe together
   one-shot operator heads-up — never a second, competing alarm. Admin-down ports and
   unmonitored (undiscovered) ports stay silent. See `CLAUDE.md`'s "Central runs the
   brain" for the full rule set.
+- **Outage-derived SLA reporting** — `GET /api/analytics?days=` answers "how reliable
+  was Tower A over the last N days" straight off the outage history central already
+  keeps: per-device downtime seconds, uptime %, and outage count (UNREACHABLE outages
+  don't count against a device's own uptime — that's a topology-suppressed artifact of
+  a dead parent, not this device's fault). No new storage; a device with zero outages
+  in the window still reports 100% up.
 - **Escalation is restart-safe** — timers live in central's DB, not memory; a crash
   can't drop them. A fresh DOWN pages owner+operator immediately; while it stays open,
   an all-hands page (owner+operator+tech) fires every `WISP_ESCALATE_EVERY_MIN` with the

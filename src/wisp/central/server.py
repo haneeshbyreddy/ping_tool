@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
 from wisp.central import auth, inventory
+from wisp.central import analytics as central_analytics
 from wisp.central import engine as central_engine
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
@@ -194,6 +195,24 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 self._reply(200, {"ports": store.list_switch_ports(tenant, did)})
+                return
+            if route == "/api/analytics":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = self._scope_tenant(user, qs)
+                if not tenant:
+                    self._reply(400, {"error": "tenant required"})
+                    return
+                try:
+                    days = int((qs.get("days") or [30])[0])
+                except (TypeError, ValueError):
+                    days = 30
+                since, until = central_analytics.window(days)
+                self._reply(200, {"since": since, "until": until,
+                                  "devices": central_analytics.device_reliability(
+                                      store, tenant, since, until)})
                 return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users"):

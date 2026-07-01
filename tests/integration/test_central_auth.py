@@ -338,6 +338,36 @@ class CentralAuthHttpTest(unittest.TestCase):
         status, _, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=op)
         self.assertEqual(status, 403)
 
+    # --- /api/analytics (plan.md item 2's first slice: outage-derived downtime/SLA) ---
+    def test_analytics_requires_auth(self):
+        self.assertEqual(self._req("GET", "/api/analytics")[0], 401)
+
+    def test_analytics_is_tenant_scoped_for_org_users(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Tower", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        other = self.store.create_org_device("ispB", {
+            "name": "Other", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("GET", "/api/analytics", cookie=own)
+        self.assertEqual(status, 200)
+        ids = {d["device_id"] for d in body["devices"]}
+        self.assertIn(dev, ids)
+        self.assertNotIn(other, ids)
+        # an org user can't peek at another tenant via ?tenant=
+        status, body, _ = self._req("GET", "/api/analytics?tenant=ispB", cookie=own)
+        self.assertNotIn(other, {d["device_id"] for d in body["devices"]})
+
+    def test_analytics_superadmin_can_narrow(self):
+        self.store.create_org_device("ispB", {
+            "name": "Other", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        _, root = self._login("root", "rootpassword")
+        status, body, _ = self._req("GET", "/api/analytics?tenant=ispB&days=7", cookie=root)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["devices"][0]["name"], "Other")
+
     # --- static (unauthed) ---
     def test_static_index_served(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
