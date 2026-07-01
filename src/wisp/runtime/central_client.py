@@ -63,14 +63,18 @@ class HttpCentralClient:
     def fetch_devices(self) -> dict:
         """{'devices': [{'id','name','ip_address','region','parent_device_id'}, …],
         'canary_ip': …} — this tenant's ISP-managed topology (org_devices), the thing the
-        edge now probes instead of a locally-configured device list."""
+        edge now probes instead of a locally-configured device list. Sending our own
+        node_id lets central filter to just what THIS node is assigned to (device
+        assignment, CLAUDE.md's multi-edge-per-tenant feature) — unassigned devices
+        still come back to everyone, so a tenant that's never used assignment sees no
+        change at all."""
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover
             raise CentralClientError(f"httpx missing: {exc}") from exc
         try:
             resp = httpx.get(f"{self.base}/edge/devices",
-                             params={"tenant_id": self.tenant_id},
+                             params={"tenant_id": self.tenant_id, "node_id": self.node_id},
                              headers=self._headers(), timeout=self.timeout,
                              **self._tls_kwargs())
             resp.raise_for_status()

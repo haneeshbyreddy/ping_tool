@@ -133,6 +133,32 @@ class NodeEnrollmentHttpTest(unittest.TestCase):
                                  {"tenant_id": "ispA", "node_id": "ghost"}, cookie=cookie)
         self.assertEqual(status, 404)
 
+    def test_delete_unregistered_is_404(self):
+        _, cookie = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("POST", "/api/nodes/delete",
+                                 {"tenant_id": "ispA", "node_id": "ghost"}, cookie=cookie)
+        self.assertEqual(status, 404)
+
+    def test_delete_removes_it_from_the_list_and_stops_ingest(self):
+        _, cookie = self._login("owner", "ownerpassword")
+        _, reg, _ = self._req("POST", "/api/nodes",
+                              {"tenant_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
+        status, _, _ = self._req("POST", "/api/nodes/delete",
+                                 {"tenant_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
+        self.assertEqual(status, 200)
+        _, body, _ = self._req("GET", "/api/nodes", cookie=cookie)
+        self.assertEqual(body["nodes"], [])
+        status, _ = self._report("ispA", "edge-a1", token=reg["token"])
+        self.assertEqual(status, 401)
+
+    def test_delete_requires_owner_or_superadmin(self):
+        _, cookie = self._login("owner", "ownerpassword")
+        self._req("POST", "/api/nodes", {"tenant_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
+        _, oper_cookie = self._login("oper", "operpassword")
+        status, _, _ = self._req("POST", "/api/nodes/delete",
+                                 {"tenant_id": "ispA", "node_id": "edge-a1"}, cookie=oper_cookie)
+        self.assertEqual(status, 403)
+
     def test_list_is_tenant_scoped(self):
         _, cookie_a = self._login("owner", "ownerpassword")
         _, cookie_b = self._login("bowner", "bownerpassword")

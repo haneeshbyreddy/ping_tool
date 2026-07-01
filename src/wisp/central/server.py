@@ -255,6 +255,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            # No cache headers at all lets browsers cache heuristically (seen in practice:
+            # a stale app.js survived a plain reload after a dashboard fix) — force revalidation.
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(data)
             return True
@@ -305,8 +308,17 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not self._ingest_ok(tenant):
                     self._reply(401, {"error": "unauthorized"})
                     return
-                self._reply(200, {"devices": store.org_device_topology(tenant),
-                                  "canary_ip": cfg.canary_ip})
+                devices = store.org_device_topology(tenant)
+                # Device assignment (CLAUDE.md's multi-edge-per-tenant feature): a node
+                # only needs to know what IT should probe — unassigned devices (every
+                # node's concern, the default) plus whatever's explicitly assigned to
+                # it. Omitting node_id (older/misconfigured client) keeps today's
+                # unfiltered behavior rather than 400ing.
+                node = (qs.get("node_id") or [None])[0]
+                if node:
+                    devices = [d for d in devices
+                              if d.get("assigned_node_id") in (None, node)]
+                self._reply(200, {"devices": devices, "canary_ip": cfg.canary_ip})
                 return
             if route == "/api/inventory/ports":
                 user = self._reader()
@@ -572,6 +584,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                               float(v.get("loss_pct", 100.0)), v.get("jitter_ms"))
                 for ip, v in pings.items()
             }
+            # Central's own clock, not the edge-reported `ts` — keeps last_seen immune
+            # to edge clock drift, same as record_heartbeat/ingest's `now`.
+            store.touch_node(tenant, env.get("node_id", ""))
             eng = registry.get(tenant)
             mode = env.get("mode") or "full"
             if mode == "recheck":
@@ -580,7 +595,14 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 cycle = central_engine.run_cycle(store, tenant, eng, results, ts,
                                                  subset=subset)
             else:
-                cycle = central_engine.run_cycle(store, tenant, eng, results, ts)
+                # Device assignment: this report only speaks for the reporting node's
+                # own devices (assigned-to-it + unassigned) — see
+                # MonitorEngine.process_cycle's expected_ips docstring for why a device
+                # assigned elsewhere must be skipped, not scored 100% loss, when it's
+                # absent from THIS report.
+                expected = store.node_expected_ips(tenant, env.get("node_id", ""))
+                cycle = central_engine.run_cycle(store, tenant, eng, results, ts,
+                                                 expected_ips=expected)
 
             disp = CentralAlertDispatcher(store, tenant, eng, notifier, cfg)
             disp.dispatch(cycle.events, ts)
@@ -691,6 +713,18 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 ok = store.revoke_node_token(tenant, node_id)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
+            if route == "/api/nodes/delete":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                node_id = inventory.clean_node_id(body.get("node_id"))
+                ok = store.delete_node_token(tenant, node_id)
+                if ok:
+                    self._reply(200, {"ok": True})
+                else:
+                    self._reply(404, {"ok": False, "error": f"{node_id!r} isn't registered"})
+                return
             # team
             if route == "/api/team":
                 tenant = body.get("tenant_id") or user["tenant_id"]
@@ -783,7 +817,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 clean = inventory.clean_device_payload(
-                    body, parents=store.org_device_parent_map(tenant), device_id=None)
+                    body, parents=store.org_device_parent_map(tenant), device_id=None,
+                    registered_nodes=store.registered_node_ids(tenant))
                 did = store.create_org_device(tenant, clean)
                 self._reply(200, {"id": did})
                 return
@@ -794,7 +829,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 parents = store.org_device_parent_map(tenant)
-                clean = inventory.clean_device_payload(body, parents=parents, device_id=did)
+                clean = inventory.clean_device_payload(
+                    body, parents=parents, device_id=did,
+                    registered_nodes=store.registered_node_ids(tenant))
                 ok = store.update_org_device(tenant, did, clean)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return

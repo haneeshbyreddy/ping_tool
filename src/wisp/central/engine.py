@@ -121,7 +121,8 @@ class EngineRegistry:
 
 def run_cycle(store, tenant_id: str, engine: MonitorEngine,
              results: dict[str, PingResult], ts: str,
-             subset: set[int] | None = None) -> CycleResult:
+             subset: set[int] | None = None,
+             expected_ips: set[str] | None = None) -> CycleResult:
     """One tenant's report -> one engine cycle -> persisted outages + live state. Takes
     an already-fetched engine (from `EngineRegistry.get`) rather than the registry
     itself, so the caller (central/server.py) can reuse the SAME engine instance for the
@@ -134,8 +135,13 @@ def run_cycle(store, tenant_id: str, engine: MonitorEngine,
     `subset` param): when given, only those device ids advance — used for a fast-confirm
     "recheck" report, which only carries samples for the suspect IPs, not the whole
     fleet. `cycle.states` (and so the `device_states` write below) is naturally already
-    scoped to just the fed devices in that case — nothing else needs to change."""
-    cycle = engine.process_cycle(results, ts, subset=subset)
+    scoped to just the fed devices in that case — nothing else needs to change.
+
+    `expected_ips` (full pass only — device assignment, CLAUDE.md's multi-edge-per-tenant
+    feature) narrows which devices THIS report can commit; see
+    `MonitorEngine.process_cycle`'s own docstring for why that's the right place to skip
+    an out-of-scope device instead of scoring it 100% loss."""
+    cycle = engine.process_cycle(results, ts, subset=subset, expected_ips=expected_ips)
     apply_events(store, tenant_id, cycle.events, ts)
     rows = []
     for dev_id, state in cycle.states.items():

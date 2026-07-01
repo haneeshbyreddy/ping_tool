@@ -376,6 +376,59 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(body["devices"][0]["ip_address"], "10.0.0.1")
         self.assertIn("canary_ip", body)
 
+    def test_edge_devices_filters_by_assigned_node(self):
+        did_a = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        self.store.create_org_device("ispA", {
+            "name": "B", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-2"})
+        self.store.create_org_device("ispA", {
+            "name": "C-unassigned", "ip_address": "10.0.0.3", "device_type": None,
+            "region": None, "parent_device_id": None})
+
+        status, body = self._req("GET", "/edge/devices?tenant_id=ispA&node_id=edge-1")
+        self.assertEqual(status, 200)
+        ips = {d["ip_address"] for d in body["devices"]}
+        # edge-1 gets its own assigned device plus the unassigned one, NOT edge-2's.
+        self.assertEqual(ips, {"10.0.0.1", "10.0.0.3"})
+
+        # Omitting node_id keeps today's unfiltered behavior (older/misconfigured client).
+        status, body = self._req("GET", "/edge/devices?tenant_id=ispA")
+        self.assertEqual({d["ip_address"] for d in body["devices"]},
+                        {"10.0.0.1", "10.0.0.2", "10.0.0.3"})
+
+    def test_report_from_unassigned_node_never_scores_other_nodes_device_down(self):
+        """Device assignment's whole point: an edge's report must not falsely tank a
+        device it was never asked to cover, even across many consecutive reports."""
+        self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        self.store.create_org_device("ispA", {
+            "name": "B", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-2"})
+
+        # edge-1 reports only its own device, several times — enough that a naive
+        # "missing IP = 100% loss" full pass would have committed B as DOWN by now.
+        for _ in range(5):
+            status, _ = self._req("POST", "/report", {
+                "v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+                "pings": {"10.0.0.1": {"loss_pct": 0, "latency_ms": 5.0}}})
+            self.assertEqual(status, 200)
+
+        states = self.store.device_states("ispA")
+        b_id = next(d["id"] for d in self.store.list_org_devices("ispA")
+                   if d["ip_address"] == "10.0.0.2")
+        self.assertNotIn(b_id, states)  # never touched, not a phantom DOWN
+
+        # edge-2's own report for B works normally.
+        status, _ = self._req("POST", "/report", {
+            "v": 1, "tenant_id": "ispA", "node_id": "edge-2",
+            "pings": {"10.0.0.2": {"loss_pct": 0, "latency_ms": 5.0}}})
+        self.assertEqual(status, 200)
+        states = self.store.device_states("ispA")
+        self.assertEqual(states[b_id]["state"], "UP")
+
     def test_report_requires_bearer(self):
         status, _ = self._req("POST", "/report", {"v": 1}, token=None)
         self.assertEqual(status, 401)

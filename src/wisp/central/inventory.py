@@ -41,9 +41,18 @@ def _str(data: dict, key: str, *, required: bool = False, default=None):
 
 
 def clean_device_payload(data: dict, *, parents: dict[int, int | None],
-                         device_id: int | None) -> dict:
+                         device_id: int | None,
+                         registered_nodes: set[str] | None = None) -> dict:
     """Validate + normalise a create/update payload against one tenant's current parent
-    map. Raises InventoryError on the first problem. `device_id` is None on create."""
+    map. Raises InventoryError on the first problem. `device_id` is None on create.
+
+    `registered_nodes` (the tenant's own edge-node/wisp-client ids, from
+    `store.registered_node_ids`) validates an optional `assigned_node_id` — which
+    specific edge node probes this device (CLAUDE.md's multi-edge-per-tenant device
+    assignment). Blank/absent means unassigned (every node covers it, the default).
+    Callers that don't pass `registered_nodes` (None) skip this check entirely — only
+    `central/server.py`'s real inventory routes need it, tests exercising unrelated
+    fields shouldn't have to thread a node set through."""
     name = _str(data, "name", required=True)
     ip_address = _str(data, "ip_address", required=True)
     try:
@@ -77,8 +86,14 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             seen.add(cur)
             cur = parents.get(cur)
 
+    assigned_node_id = _str(data, "assigned_node_id")
+    if (assigned_node_id and registered_nodes is not None
+            and assigned_node_id not in registered_nodes):
+        raise InventoryError("assigned wisp client does not exist")
+
     return {"name": name, "ip_address": ip_address, "device_type": device_type,
-            "region": region, "parent_device_id": parent_id}
+            "region": region, "parent_device_id": parent_id,
+            "assigned_node_id": assigned_node_id}
 
 
 def clean_backup_link(child_id: int, parent_id: int, *,

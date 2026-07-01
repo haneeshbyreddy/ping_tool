@@ -122,6 +122,42 @@ class ConfirmationPass(unittest.TestCase):
         self.assertEqual(eng.fsm[2].down_streak, 1)           # still just its one lost sample
 
 
+class DeviceAssignment(unittest.TestCase):
+    """`expected_ips` (central's multi-edge-per-tenant device assignment) narrows a full
+    pass to only the devices THIS report is authoritative for — a device outside that
+    set must be skipped entirely (state untouched, no event), not scored 100% loss just
+    because this particular report didn't mention it."""
+
+    def test_out_of_scope_device_untouched_not_scored_down(self):
+        a = solo_device(id=1, ip_address="a")   # assigned to node1 (by caller's scoping)
+        b = solo_device(id=2, ip_address="b")   # assigned to node2
+        eng = MonitorEngine([a, b], CFG)
+        # node1's reports only ever carry "a" — expected_ips={"a"} mirrors
+        # store.node_expected_ips for a node with no unassigned devices in play.
+        for _ in range(3):
+            r = feed_scoped(eng, {"a": DEAD_S("a")}, expected_ips={"a"})
+        self.assertEqual(r.states, {1: DOWN})           # only the in-scope device commits
+        self.assertEqual(eng.fsm[2].state, UP)           # untouched, not defaulted to lost
+        self.assertEqual(eng.fsm[2].down_streak, 0)      # never fed, no phantom streak
+
+    def test_none_still_defaults_missing_ip_to_lost(self):
+        # Without expected_ips (every existing caller), a device missing from this
+        # cycle's results is NOT skipped — it defaults to 100% loss, same as always.
+        a = solo_device(id=1, ip_address="a")
+        b = solo_device(id=2, ip_address="b")
+        eng = MonitorEngine([a, b], CFG)
+        r = feed(eng, {"a": DEAD_S("a")})  # "b" missing, expected_ips=None (default)
+        self.assertEqual(r.states, {1: UP, 2: UP})  # one lost sample, not enough to commit
+        self.assertEqual(eng.fsm[2].down_streak, 1)  # but it WAS fed — a real streak
+
+
+def feed_scoped(engine: MonitorEngine, samples_by_ip, expected_ips, canary_up=True):
+    results = dict(samples_by_ip)
+    results[CFG.canary_ip] = UP_S("1.1.1.1") if canary_up else DEAD_S("1.1.1.1")
+    return engine.process_cycle(results, ts="2026-01-01T00:00:00+00:00",
+                                expected_ips=expected_ips)
+
+
 class AdaptiveInterval(unittest.TestCase):
     """Detection cadence scales with fleet size when adaptive mode is on: a small
     deployment polls faster (quicker detection); a large one falls back to protect

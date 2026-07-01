@@ -57,7 +57,7 @@ async function api(path, method = "GET", body) {
   const r = await fetch(path, opt);
   if (r.status === 401) { ME = null; renderLogin(); throw new Error("unauthorized"); }
   const data = r.headers.get("content-type")?.includes("json") ? await r.json() : {};
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  if (!r.ok) throw new Error(data.error || data.reason || `HTTP ${r.status}`);
   return data;
 }
 
@@ -177,7 +177,7 @@ const PAGES = [
   ["overview", "Overview", "dashboard"],
   ["nodes", "Nodes", "router"],
   ["outages", "Outages", "warning"],
-  ["agents", "Edge Nodes", "cell_tower"],
+  ["agents", "Wisp Clients", "cell_tower"],
   ["team", "Team", "group"],
   ["settings", "Settings", "settings"],
   ["logs", "Logs", "terminal"],
@@ -325,7 +325,7 @@ function statsCard(nodes, summary) {
   return h(`<div class="grid grid-cols-2 md:grid-cols-4 gap-4">
     <div class="col-span-2 border border-outline-variant bg-surface-container-low rounded-md p-4 flex flex-col justify-between">
       <div class="flex justify-between items-start mb-2">
-        <span class="font-label-md text-label-md text-on-surface-variant uppercase tracking-wider">Edge Nodes</span>
+        <span class="font-label-md text-label-md text-on-surface-variant uppercase tracking-wider">Wisp Clients</span>
         ${icon("shield", { size: 16, cls: "text-primary" })}
       </div>
       <div class="flex items-baseline gap-1">
@@ -369,9 +369,9 @@ function lowBandwidthCard(list) {
 
 function nodesCard(nodes) {
   const stale = (n) => n.last_seen && (Date.now() - Date.parse(n.last_seen)) / 1000 > 180;
-  return h(card(`${sectionHeader(`Edge nodes (${nodes.length})`, "cell_tower")}
+  return h(card(`${sectionHeader(`Wisp Clients (${nodes.length})`, "cell_tower")}
     <table class="w-full border-collapse"><tr>
-      <th class="${TH}">Org</th><th class="${TH}">Node</th><th class="${TH}">Version</th>
+      <th class="${TH}">Org</th><th class="${TH}">Client</th><th class="${TH}">Version</th>
       <th class="${TH}">Fleet</th><th class="${TH}">Open</th><th class="${TH}">Last seen</th></tr>
     ${nodes.map(n => `<tr>
       <td class="${TD}">${esc(n.tenant_id)}</td><td class="${TD}">${esc(n.node_id)}</td>
@@ -379,28 +379,28 @@ function nodesCard(nodes) {
       <td class="${TD} font-mono-data text-mono-data">${n.fleet_size ?? "—"}</td>
       <td class="${TD}">${n.open_outages ? pill(n.open_outages, "down") : "0"}</td>
       <td class="${TD}">${pill(ago(n.last_seen), stale(n) ? "down" : "ok")}</td>
-    </tr>`).join("") || `<tr><td colspan=6 class="${TD} text-on-surface-variant">No nodes yet.</td></tr>`}
+    </tr>`).join("") || `<tr><td colspan=6 class="${TD} text-on-surface-variant">No wisp clients yet.</td></tr>`}
   </table>`));
 }
 
 function devicesCard(devices) {
-  return h(card(`${sectionHeader(`Live device registry (${devices.length})`, "router")}
-    <div class="font-label-xs text-label-xs text-on-surface-variant mb-3">Reported by connected edges. Configure topology on the <b>Nodes</b> page.</div>
+  return h(card(`${sectionHeader(`Live node registry (${devices.length})`, "router")}
+    <div class="font-label-xs text-label-xs text-on-surface-variant mb-3">Reported by connected wisp clients. Configure topology on the <b>Nodes</b> page.</div>
     <table class="w-full border-collapse">
-    <tr><th class="${TH}">#</th><th class="${TH}">Org / Node</th><th class="${TH}">Name</th><th class="${TH}">IP</th><th class="${TH}">State</th></tr>
+    <tr><th class="${TH}">#</th><th class="${TH}">Org / Client</th><th class="${TH}">Name</th><th class="${TH}">IP</th><th class="${TH}">State</th></tr>
     ${devices.map(d => `<tr>
       <td class="${TD} font-mono-data text-mono-data text-on-surface-variant">${d.id}</td>
       <td class="${TD} text-on-surface-variant">${esc(d.tenant_id)} / ${esc(d.node_id)}</td>
       <td class="${TD}">${esc(d.name || "—")}</td><td class="${TD} font-mono-data text-mono-data text-on-surface-variant">${esc(d.ip || "—")}</td>
       <td class="${TD}">${d.last_state ? pill(d.last_state, STATE_TONE[d.last_state] || "muted") : "—"}</td>
-    </tr>`).join("") || `<tr><td colspan=5 class="${TD} text-on-surface-variant">No devices reported yet.</td></tr>`}
+    </tr>`).join("") || `<tr><td colspan=5 class="${TD} text-on-surface-variant">No nodes reported yet.</td></tr>`}
   </table>`));
 }
 
 function eventsCard(events) {
   return h(card(`${sectionHeader("Recent events", "schedule")}
     <table class="w-full border-collapse">
-    <tr><th class="${TH}">Org / Node</th><th class="${TH}">Type</th><th class="${TH}">Device</th><th class="${TH}">State</th><th class="${TH}">When</th></tr>
+    <tr><th class="${TH}">Org / Client</th><th class="${TH}">Type</th><th class="${TH}">Node</th><th class="${TH}">State</th><th class="${TH}">When</th></tr>
     ${events.map(e => `<tr>
       <td class="${TD} text-on-surface-variant">${esc(e.tenant_id)} / ${esc(e.node_id)}</td>
       <td class="${TD}">${esc(e.type || "—")}</td><td class="${TD}">${esc(e.device_name || e.device_id || "—")}</td>
@@ -414,8 +414,10 @@ function eventsCard(events) {
 async function renderNodesPage(main) {
   const t = scope();
   if (!t) { main.replaceChildren(needsOrgCard()); return; }
-  const { devices } = await api(`/api/inventory${tq(t)}`);
-  main.replaceChildren(nodesPageCard(devices, t));
+  const [{ devices }, { nodes }] = await Promise.all([
+    api(`/api/inventory${tq(t)}`), api(`/api/nodes${tq(t)}`),
+  ]);
+  main.replaceChildren(nodesPageCard(devices, t, nodes));
 }
 
 function treeOrder(devices) {
@@ -437,18 +439,23 @@ function treeOrder(devices) {
   return out;
 }
 
-function nodesPageCard(devices, tenant) {
+function nodesPageCard(devices, tenant, wispClients) {
+  const clients = wispClients || [];
   const ordered = treeOrder(devices);
   const write = canWrite();
   const editing = NODE_EDIT;
+  const clientLabel = (id) => id
+    ? (clients.some(c => c.node_id === id) ? esc(id) : `${esc(id)} (revoked)`)
+    : "— any —";
   const card_ = h(card(`${sectionHeader(`Nodes — ${tenant} (${devices.length})`, "router")}
     <table class="w-full border-collapse">
-    <tr><th class="${TH}">Name</th><th class="${TH}">Type</th><th class="${TH}">IP</th><th class="${TH}">Region</th><th class="${TH}">Badges</th>${write ? `<th class="${TH}"></th>` : ""}</tr>
+    <tr><th class="${TH}">Name</th><th class="${TH}">Type</th><th class="${TH}">IP</th><th class="${TH}">Region</th><th class="${TH}">Wisp Client</th><th class="${TH}">Badges</th>${write ? `<th class="${TH}"></th>` : ""}</tr>
     ${ordered.map(d => `<tr>
       <td class="${TD}" style="padding-left:${12 + d._depth * 18}px">${d._depth ? `${icon("subdirectory_arrow_right", { size: 14, cls: "text-outline inline -mt-1" })} ` : ""}${esc(d.name)}</td>
       <td class="${TD} text-on-surface-variant">${esc(d.device_type || "—")}</td>
       <td class="${TD} font-mono-data text-mono-data text-on-surface-variant">${esc(d.ip_address)}</td>
       <td class="${TD} text-on-surface-variant">${esc(d.region || "—")}</td>
+      <td class="${TD} font-mono-data text-mono-data text-on-surface-variant">${clientLabel(d.assigned_node_id)}</td>
       <td class="${TD} flex flex-wrap gap-1">${d.maintenance ? pill("maintenance", "warn") : ""}
           ${d.snmp_enabled ? pill("SNMP", "ok") : ""}
           ${d.child_count ? pill(`${d.child_count} child`, "muted") : ""}</td>
@@ -457,13 +464,15 @@ function nodesPageCard(devices, tenant) {
           <button class="${GHOST}" data-maint="${d.id}" data-on="${d.maintenance ? 0 : 1}">${icon("pause_circle", { size: 14 })}</button>
           <button class="${GHOST}" data-del="${d.id}">${icon("delete", { size: 14 })}</button>
         </div></td>` : ""}
-    </tr>`).join("") || `<tr><td colspan=${write ? 6 : 5} class="${TD} text-on-surface-variant">No nodes yet — add one below.</td></tr>`}
+    </tr>`).join("") || `<tr><td colspan=${write ? 7 : 6} class="${TD} text-on-surface-variant">No nodes yet — add one below.</td></tr>`}
     </table>`));
 
   if (write) {
     const parentOpts = devices.filter(d => !editing || d.id !== editing.id)
       .map(d => `<option value="${d.id}" ${editing?.parent_device_id === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("");
     const typeOpts = DEVICE_TYPES.map(tp => `<option ${editing?.device_type === tp ? "selected" : ""}>${tp}</option>`).join("");
+    const clientOpts = clients.filter(c => !c.revoked_at)
+      .map(c => `<option value="${esc(c.node_id)}" ${editing?.assigned_node_id === c.node_id ? "selected" : ""}>${esc(c.node_id)}</option>`).join("");
     const form = h(card(`${sectionHeader(editing ? `Edit — ${editing.name}` : "Add node", "add_circle")}
       <div class="flex flex-wrap gap-2">
         <input id="fn" placeholder="name" value="${editing ? esc(editing.name) : ""}" class="${FIELD}" style="width:160px">
@@ -471,6 +480,9 @@ function nodesPageCard(devices, tenant) {
         <select id="ftype" class="${FIELD}"><option value="">(type)</option>${typeOpts}</select>
         <input id="freg" placeholder="region" value="${editing ? esc(editing.region || "") : ""}" class="${FIELD}" style="width:120px">
         <select id="fparent" class="${FIELD}"><option value="">— none (root) —</option>${parentOpts}</select>
+        <select id="fclient" class="${FIELD}" title="Which Wisp Client probes this node — leave as 'any' unless you're splitting monitoring across multiple clients">
+          <option value="">— any wisp client —</option>${clientOpts}
+        </select>
       </div>
       ${editing ? `<div class="flex flex-wrap items-center gap-2 mt-3">
         <label class="font-label-md text-label-md text-on-surface-variant flex items-center gap-1.5"><input type="checkbox" id="fsnmp" ${editing.snmp_enabled ? "checked" : ""}> SNMP enabled</label>
@@ -489,6 +501,7 @@ function nodesPageCard(devices, tenant) {
         tenant_id: tenant, name: $("#fn", form).value.trim(), ip_address: $("#fip", form).value.trim(),
         device_type: $("#ftype", form).value || null, region: $("#freg", form).value.trim() || null,
         parent_device_id: $("#fparent", form).value || null,
+        assigned_node_id: $("#fclient", form).value || null,
       };
       try {
         if (editing) {
@@ -632,7 +645,7 @@ function logsRows(events) {
 }
 
 function logsTableInner(events) {
-  return `<tr><th class="${TH}">Node</th><th class="${TH}">Type</th><th class="${TH}">Device</th><th class="${TH}">State</th><th class="${TH}">When</th></tr>
+  return `<tr><th class="${TH}">Client</th><th class="${TH}">Type</th><th class="${TH}">Node</th><th class="${TH}">State</th><th class="${TH}">When</th></tr>
     ${logsRows(events)}`;
 }
 
@@ -665,7 +678,7 @@ function logsPageCard(events, tenant) {
   return wrap;
 }
 
-// --- Edge Nodes page: self-service enrollment for physical probes -------------------
+// --- Wisp Clients page: self-service enrollment for physical probes -------------------
 async function renderAgentsPage(main) {
   const t = scope();
   if (!t) { main.replaceChildren(needsOrgCard()); return; }
@@ -673,9 +686,16 @@ async function renderAgentsPage(main) {
   main.replaceChildren(agentsPageCard(nodes, t));
 }
 
-function installCmd(tenant, nodeId, tok) {
-  return `curl -fsSL https://YOUR-CENTRAL/install-edge.sh | sudo sh -s -- \\\n`
-       + `    --central https://YOUR-CENTRAL --token ${tok} --tenant ${tenant} --node ${nodeId}`;
+function installCmdLinux(tenant, nodeId, tok) {
+  const c = location.origin;
+  return `curl -fsSL ${c}/install-edge-src.sh | sudo sh -s -- \\\n`
+       + `    --central ${c} --token ${tok} --tenant ${tenant} --node ${nodeId}`;
+}
+
+function installCmdWindows(tenant, nodeId, tok) {
+  const c = location.origin;
+  return `& ([scriptblock]::Create((irm ${c}/install-edge-src.ps1))) \`\n`
+       + `    -Central ${c} -Token ${tok} -Tenant ${tenant} -Node ${nodeId}`;
 }
 
 function agentsPageCard(nodes, tenant) {
@@ -686,11 +706,11 @@ function agentsPageCard(nodes, tenant) {
     : pill("never connected", "muted");
   const wrap = document.createElement("div");
   wrap.className = "flex flex-col gap-4";
-  const listCard = h(card(`${sectionHeader(`Edge nodes — ${tenant} (${nodes.length})`, "cell_tower")}
-    <div class="font-label-xs text-label-xs text-on-surface-variant mb-3">The physical probes this org has registered,
-      and their enrollment credentials. What each one MONITORS is configured on the
-      <b>Nodes</b> tab — this page is only about a probe's identity/credential.</div>
-    <table class="w-full border-collapse"><tr><th class="${TH}">Node id</th><th class="${TH}">Status</th><th class="${TH}">Version</th><th class="${TH}">Registered</th>${write ? `<th class="${TH}"></th>` : ""}</tr>
+  const listCard = h(card(`${sectionHeader(`Wisp Clients — ${tenant} (${nodes.length})`, "cell_tower")}
+    <div class="font-label-xs text-label-xs text-on-surface-variant mb-3">The Wisp Clients (physical probes) this org
+      has registered, and their enrollment credentials. What each one MONITORS is configured on the
+      <b>Nodes</b> tab — this page is only about a client's identity/credential.</div>
+    <table class="w-full border-collapse"><tr><th class="${TH}">Client ID</th><th class="${TH}">Status</th><th class="${TH}">Version</th><th class="${TH}">Registered</th>${write ? `<th class="${TH}"></th>` : ""}</tr>
     ${nodes.map(n => `<tr>
       <td class="${TD}">${esc(n.node_id)}</td>
       <td class="${TD}">${status(n)}</td>
@@ -699,8 +719,9 @@ function agentsPageCard(nodes, tenant) {
       ${write ? `<td class="${TD}"><div class="flex gap-1.5">
           <button class="${GHOST}" data-rotate="${esc(n.node_id)}">${icon("vpn_key", { size: 14 })}</button>
           ${n.revoked_at ? "" : `<button class="${GHOST}" data-revoke="${esc(n.node_id)}">${icon("power_off", { size: 14 })}</button>`}
+          <button class="${GHOST}" data-delclient="${esc(n.node_id)}">${icon("delete", { size: 14 })}</button>
         </div></td>` : ""}
-    </tr>`).join("") || `<tr><td colspan=${write ? 5 : 4} class="${TD} text-on-surface-variant">No nodes registered yet — add one below.</td></tr>`}
+    </tr>`).join("") || `<tr><td colspan=${write ? 5 : 4} class="${TD} text-on-surface-variant">No wisp clients registered yet — add one below.</td></tr>`}
     </table>`));
   wrap.append(listCard);
 
@@ -710,18 +731,20 @@ function agentsPageCard(nodes, tenant) {
     const reveal = h(card(`${sectionHeader("Save this now — it won't be shown again", "vpn_key")}
       <div class="font-body-sm text-body-sm text-on-surface-variant">Token for <b class="text-primary">${esc(AGENT_REVEAL.node_id)}</b>:</div>
       <div class="my-2"><code class="font-mono-data text-mono-data bg-surface border border-outline-variant rounded-md px-2 py-1 break-all">${esc(AGENT_REVEAL.token)}</code></div>
-      <div class="font-label-xs text-label-xs text-on-surface-variant mt-2">Run this on the edge box (or its Windows
-        equivalent, <code>install-edge.ps1</code>):</div>
+      <div class="font-label-xs text-label-xs text-on-surface-variant mt-2">Linux (run as root on the wisp client machine):</div>
       <pre class="whitespace-pre-wrap bg-surface border border-outline-variant rounded-md p-3 font-mono-data text-[12px] my-2">${esc(
-        installCmd(tenant, AGENT_REVEAL.node_id, AGENT_REVEAL.token))}</pre>
+        installCmdLinux(tenant, AGENT_REVEAL.node_id, AGENT_REVEAL.token))}</pre>
+      <div class="font-label-xs text-label-xs text-on-surface-variant mt-2">Windows (run in an admin PowerShell on the wisp client machine):</div>
+      <pre class="whitespace-pre-wrap bg-surface border border-outline-variant rounded-md p-3 font-mono-data text-[12px] my-2">${esc(
+        installCmdWindows(tenant, AGENT_REVEAL.node_id, AGENT_REVEAL.token))}</pre>
       <button class="${GHOST}" id="agentdismiss">I've saved it</button>`));
     $("#agentdismiss", reveal).onclick = () => { AGENT_REVEAL = null; refresh(); };
     wrap.append(reveal);
   }
 
-  const form = h(card(`${sectionHeader("Register a new node", "add_circle")}
+  const form = h(card(`${sectionHeader("Register a new wisp client", "add_circle")}
     <div class="flex gap-2">
-      <input id="anid" placeholder="node id, e.g. edge-a1" class="${FIELD}" style="width:200px">
+      <input id="anid" placeholder="wisp client id, e.g. edge-a1" class="${FIELD}" style="width:200px">
       <button id="anadd" class="${BTN}">Register</button>
     </div>
     <div class="font-label-xs text-label-xs text-error mt-2 min-h-[14px]" id="anerr"></div>`));
@@ -729,7 +752,7 @@ function agentsPageCard(nodes, tenant) {
     const anerr = $("#anerr", form);
     anerr.textContent = "";
     const nodeId = $("#anid", form).value.trim();
-    if (!nodeId) { anerr.textContent = "node id is required"; return; }
+    if (!nodeId) { anerr.textContent = "wisp client id is required"; return; }
     try {
       const r = await api("/api/nodes", "POST", { tenant_id: tenant, node_id: nodeId });
       AGENT_REVEAL = { node_id: r.node_id, token: r.token };
@@ -750,6 +773,15 @@ function agentsPageCard(nodes, tenant) {
     if (!confirm(`Revoke ${b.dataset.revoke}'s token? It will stop reporting until re-enrolled.`)) return;
     await api("/api/nodes/revoke", "POST", { tenant_id: tenant, node_id: b.dataset.revoke });
     refresh();
+  });
+  listCard.querySelectorAll("[data-delclient]").forEach(b => b.onclick = async () => {
+    if (!confirm(`Delete wisp client ${b.dataset.delclient} permanently? Its credential `
+               + `stops working for good (unlike revoke, it can't resume by rotating) — `
+               + `any node assigned to it goes back to "any client".`)) return;
+    try {
+      await api("/api/nodes/delete", "POST", { tenant_id: tenant, node_id: b.dataset.delclient });
+      refresh();
+    } catch (e) { alert(e.message); }
   });
   return wrap;
 }

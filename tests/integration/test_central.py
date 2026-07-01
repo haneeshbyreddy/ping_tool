@@ -278,6 +278,32 @@ class NodeTokenTest(unittest.TestCase):
         self.assertEqual(len(self.store.list_node_tokens("ispA")), 1)
         self.assertEqual(len(self.store.list_node_tokens("ispB")), 1)
 
+    def test_delete_removes_the_row_entirely(self):
+        token = self.store.issue_node_token("ispA", "edge-1")
+        self.assertTrue(self.store.delete_node_token("ispA", "edge-1"))
+        self.assertIsNone(self.store.resolve_node_token(token))
+        self.assertIsNone(self.store.get_node_token_status("ispA", "edge-1"))  # gone, not just revoked
+
+    def test_delete_of_never_registered_node_is_false(self):
+        self.assertFalse(self.store.delete_node_token("ispA", "ghost"))
+
+    def test_delete_unassigns_devices_pointed_at_it(self):
+        did = self.store.create_org_device("ispA", {
+            "name": "CPE", "ip_address": "10.0.0.5", "device_type": None, "region": None,
+            "parent_device_id": None, "assigned_node_id": "edge-1"})
+        self.store.issue_node_token("ispA", "edge-1")
+        self.store.delete_node_token("ispA", "edge-1")
+        dev = next(d for d in self.store.list_org_devices("ispA") if d["id"] == did)
+        self.assertIsNone(dev["assigned_node_id"])  # falls back to "every client covers it"
+
+    def test_delete_does_not_touch_other_tenants_or_nodes(self):
+        self.store.issue_node_token("ispA", "edge-1")
+        self.store.issue_node_token("ispA", "edge-2")
+        self.store.issue_node_token("ispB", "edge-1")
+        self.store.delete_node_token("ispA", "edge-1")
+        self.assertEqual({r["node_id"] for r in self.store.list_node_tokens("ispA")}, {"edge-2"})
+        self.assertEqual({r["node_id"] for r in self.store.list_node_tokens("ispB")}, {"edge-1"})
+
     def test_list_joins_heartbeat_info(self):
         self.store.issue_node_token("ispA", "edge-1")
         self.store.issue_node_token("ispA", "edge-2")
@@ -351,6 +377,44 @@ class OrgDevicesTest(unittest.TestCase):
             "region": None, "parent_device_id": None})
         pmap = self.store.org_device_parent_map("ispA")
         self.assertEqual(set(pmap.keys()), {a})
+
+    def test_delete_cascades_every_dependent_table(self):
+        # A device that's actually been probed accumulates rows in a handful of OTHER
+        # tables that carry a live FK on org_devices(id) — deleting it must clean all
+        # of them up first, or sqlite's FK constraint blocks the DELETE outright
+        # (IntegrityError) for literally any device that ever had a single report.
+        switch = self.store.create_org_device("ispA", {
+            "name": "Switch", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        d = self.store.create_org_device("ispA", {
+            "name": "CPE", "ip_address": "10.0.0.10", "device_type": None,
+            "region": None, "parent_device_id": None})
+        backup = self.store.create_org_device("ispA", {
+            "name": "Backup parent", "ip_address": "10.0.0.11", "device_type": None,
+            "region": None, "parent_device_id": None})
+
+        self.store.write_device_states("ispA", [(d, "DOWN", None, 100.0, None)], "t1")
+        self.store.open_outage_if_absent("ispA", d, "t1", "DOWN")
+        self.store.fold_device_rollups([("ispA", d, "2026-01-01T00", None, 100.0, 1)])
+        self.store.record_perf_sample("ispA", d, "t1", 20.0, 0.0, 1.0, "UP", 20)
+        self.store.write_device_perf("ispA", d, True, "latency", 20.0, 400.0, "t1", "t1")
+        self.store.write_device_redundancy("ispA", d, True, "t1", "t1")
+        self.store.create_backup_link("ispA", d, backup)
+        # `switch` feeds INTO d (a port on the switch feeds this device) — the OTHER
+        # direction of dependency, via feeds_device_id rather than device_id.
+        self.store.upsert_switch_port("ispA", switch, 1, "eth1", None, "up", "up",
+                                      None, 0, False, None, "t1")
+        self.store.set_port_feeds("ispA", self.store.list_switch_ports("ispA", switch)[0]["id"], d)
+
+        result = self.store.delete_org_device("ispA", d)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(self.store.get_org_device("ispA", d))
+        # the switch port that fed it survives, just un-fed rather than orphaned
+        ports = self.store.list_switch_ports("ispA", switch)
+        self.assertEqual(len(ports), 1)
+        self.assertIsNone(ports[0]["feeds_device_id"])
+        # deleting the OTHER end (the backup parent) still works too — no dangling link
+        self.assertTrue(self.store.delete_org_device("ispA", backup)["ok"])
 
     def test_maintenance_and_snmp_toggle(self):
         d = self.store.create_org_device("ispA", {

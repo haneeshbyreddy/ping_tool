@@ -77,6 +77,32 @@ class CleanDevicePayloadTest(unittest.TestCase):
                 {"name": "CPE", "ip_address": "10.0.0.3", "parent_device_id": 42},
                 parents={1: None}, device_id=None)
 
+    def test_assigned_node_defaults_to_unassigned(self):
+        clean = clean_device_payload(
+            {"name": "CPE", "ip_address": "10.0.0.3"}, parents={}, device_id=None,
+            registered_nodes={"edge-1"})
+        self.assertIsNone(clean["assigned_node_id"])
+
+    def test_assigned_node_must_be_registered(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "CPE", "ip_address": "10.0.0.3", "assigned_node_id": "ghost"},
+                parents={}, device_id=None, registered_nodes={"edge-1"})
+
+    def test_assigned_node_accepted_when_registered(self):
+        clean = clean_device_payload(
+            {"name": "CPE", "ip_address": "10.0.0.3", "assigned_node_id": "edge-1"},
+            parents={}, device_id=None, registered_nodes={"edge-1"})
+        self.assertEqual(clean["assigned_node_id"], "edge-1")
+
+    def test_assigned_node_skips_validation_when_registered_nodes_omitted(self):
+        # Callers that don't care about assignment (most existing tests) shouldn't have
+        # to thread a node set through just to exercise unrelated fields.
+        clean = clean_device_payload(
+            {"name": "CPE", "ip_address": "10.0.0.3", "assigned_node_id": "anything"},
+            parents={}, device_id=None)
+        self.assertEqual(clean["assigned_node_id"], "anything")
+
 
 class CleanSnmpPayloadTest(unittest.TestCase):
     def test_disabled_needs_no_community(self):

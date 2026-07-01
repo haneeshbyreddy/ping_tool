@@ -160,6 +160,9 @@ CREATE TABLE IF NOT EXISTS org_devices (
     device_type      TEXT,
     region           TEXT,
     parent_device_id INTEGER REFERENCES org_devices(id),
+    assigned_node_id TEXT,             -- which registered edge node probes this device;
+                                        -- NULL = every node for this tenant covers it
+                                        -- (default, pre-assignment behavior)
     maintenance      INTEGER NOT NULL DEFAULT 0,
     snmp_enabled     INTEGER NOT NULL DEFAULT 0,
     snmp_version     TEXT NOT NULL DEFAULT '2c',
@@ -396,6 +399,8 @@ class CentralStore:
                 ("in_bps", "REAL"), ("out_bps", "REAL"),
                 ("bw_low_streak", "INTEGER NOT NULL DEFAULT 0"),
                 ("bw_alarm", "INTEGER NOT NULL DEFAULT 0"), ("bw_alarm_since", "TEXT")))
+            self._ensure_columns(conn, "org_devices", (
+                ("assigned_node_id", "TEXT"),))
             conn.commit()
 
     @staticmethod
@@ -415,6 +420,19 @@ class CentralStore:
         return conn
 
     # --- ingest (writers — all serialized through _write_lock) ---
+    def touch_node(self, tenant_id: str, node_id: str, now: str | None = None) -> None:
+        """Record edge liveness for the fleet watchdog + Edge Nodes dashboard's
+        last-seen. Called from `/report` on every report (full AND recheck) — the ONLY
+        heartbeat a central-brain edge ever sends. `/heartbeat`/`/ingest` (which also
+        touch `nodes`) are legacy pre-central-brain routes no current edge calls, so
+        without this a central-brain node's `last_seen` never updates and both the
+        dashboard and `CentralWatchdog` stay permanently blind to it."""
+        now = now or _now_iso()
+        with self._write_lock, self._connect() as conn:
+            self._ensure_org(conn, tenant_id, now)
+            self._touch_node(conn, tenant_id, node_id, now)
+            conn.commit()
+
     def record_heartbeat(self, tenant_id: str, node_id: str, body: dict,
                          now: str | None = None) -> None:
         now = now or _now_iso()
@@ -682,6 +700,25 @@ class CentralStore:
             conn.commit()
         return cur.rowcount > 0
 
+    def delete_node_token(self, tenant_id: str, node_id: str) -> bool:
+        """Permanently forgets this wisp client's identity — unlike `revoke_node_token`
+        (which keeps the row so a rotated credential can resume under the same
+        identity), this is for a client that's never coming back. Any device
+        explicitly assigned to it (`org_devices.assigned_node_id`) is unassigned
+        (falls back to NULL = every node covers it) rather than silently orphaned —
+        a hard-deleted node_id can never satisfy `node_expected_ips` again, so leaving
+        the assignment in place would quietly stop that device from being monitored by
+        anyone. Returns True if a row existed to delete."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE org_devices SET assigned_node_id=NULL"
+                " WHERE tenant_id=? AND assigned_node_id=?", (tenant_id, node_id))
+            cur = conn.execute(
+                "DELETE FROM node_tokens WHERE tenant_id=? AND node_id=?",
+                (tenant_id, node_id))
+            conn.commit()
+        return cur.rowcount > 0
+
     def list_node_tokens(self, tenant_id: str) -> list[dict]:
         """This tenant's registered node identities, left-joined with the `nodes`
         heartbeat table so the dashboard can show "never connected" vs. live/version/
@@ -893,8 +930,8 @@ class CentralStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT d.id, d.tenant_id, d.name, d.ip_address, d.device_type, d.region,"
-                " d.parent_device_id, d.maintenance, d.snmp_enabled, d.snmp_version,"
-                " d.snmp_community, d.snmp_port,"
+                " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
+                " d.snmp_version, d.snmp_community, d.snmp_port,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count"
                 " FROM org_devices d WHERE d.tenant_id=? AND d.is_active=1 ORDER BY d.id",
@@ -926,6 +963,29 @@ class CentralStore:
                                (device_id,)).fetchone()
         return row["tenant_id"] if row else None
 
+    def registered_node_ids(self, tenant_id: str) -> set[str]:
+        """This tenant's registered edge-node (wisp client) ids, for validating an
+        `assigned_node_id` on a device payload — includes revoked ones too (revoking a
+        credential is a separate concern from what a device is tagged with)."""
+        with self._connect() as conn:
+            return {r["node_id"] for r in conn.execute(
+                "SELECT node_id FROM node_tokens WHERE tenant_id=?", (tenant_id,))}
+
+    def node_expected_ips(self, tenant_id: str, node_id: str) -> set[str]:
+        """IPs this specific edge node is responsible for: devices explicitly assigned
+        to it, plus every UNASSIGNED device (default — every node covers it, identical
+        to pre-assignment behavior). Feeds `MonitorEngine.process_cycle`'s
+        `expected_ips` via `central/engine.py:run_cycle` so a device assigned to a
+        DIFFERENT node is skipped by this report rather than scored 100% loss for not
+        showing up in it. Same active/not-in-maintenance filter as
+        `org_device_topology`, since a paused or deleted device isn't anyone's concern."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ip_address FROM org_devices WHERE tenant_id=? AND is_active=1"
+                " AND maintenance=0 AND (assigned_node_id IS NULL OR assigned_node_id=?)",
+                (tenant_id, node_id)).fetchall()
+        return {r["ip_address"] for r in rows}
+
     def org_device_parent_map(self, tenant_id: str) -> dict[int, int | None]:
         """id -> parent_device_id over one tenant's active devices — the cycle-check input
         for `central/inventory.py` (never crosses tenants: an org can't loop through
@@ -939,9 +999,10 @@ class CentralStore:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO org_devices (tenant_id, name, ip_address, device_type, region,"
-                " parent_device_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                " parent_device_id, assigned_node_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (tenant_id, clean["name"], clean["ip_address"], clean["device_type"],
-                 clean["region"], clean["parent_device_id"], _now_iso()))
+                 clean["region"], clean["parent_device_id"], clean.get("assigned_node_id"),
+                 _now_iso()))
             conn.commit()
             return int(cur.lastrowid)
 
@@ -949,9 +1010,11 @@ class CentralStore:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
-                " parent_device_id=? WHERE id=? AND tenant_id=? AND is_active=1",
+                " parent_device_id=?, assigned_node_id=? WHERE id=? AND tenant_id=?"
+                " AND is_active=1",
                 (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
-                 clean["parent_device_id"], device_id, tenant_id))
+                 clean["parent_device_id"], clean.get("assigned_node_id"),
+                 device_id, tenant_id))
             conn.commit()
             return cur.rowcount > 0
 
@@ -975,7 +1038,18 @@ class CentralStore:
 
     def delete_org_device(self, tenant_id: str, device_id: int) -> dict:
         """Hard-delete a configured device. Blocked (like the edge) if it still has child
-        nodes, so topology never dangles. Returns {ok, reason}."""
+        nodes, so topology never dangles. Returns {ok, reason}.
+
+        Genuinely permanent (the dashboard's own confirm dialog says so), so this
+        cascades every OTHER table with a live FK on `org_devices(id)` first —
+        `device_states`, `outages` (+ their `alert_log`/`escalations` rows, which
+        reference `outage_id` without an enforced FK, so they'd otherwise survive as
+        silent orphans), `device_rollups`, `switch_ports` (both its own device_id AND
+        any OTHER port's `feeds_device_id` pointing here), `org_device_links` (either
+        side), `device_redundancy`, `device_perf_samples`, `device_perf`. Skipping any
+        of these previously left the plain `DELETE FROM org_devices` tripping sqlite's
+        FK constraint (`IntegrityError`) for literally any device that had ever been
+        probed even once — i.e. every real device."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM org_devices WHERE id=? AND tenant_id=? AND is_active=1",
@@ -990,6 +1064,30 @@ class CentralStore:
             return {"ok": False,
                     "reason": f"node has {children} child node(s); reassign them first"}
         with self._write_lock, self._connect() as conn:
+            outage_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM outages WHERE tenant_id=? AND device_id=?",
+                (tenant_id, device_id))]
+            for oid in outage_ids:
+                conn.execute("DELETE FROM alert_log WHERE outage_id=?", (oid,))
+                conn.execute("DELETE FROM escalations WHERE outage_id=?", (oid,))
+            conn.execute("DELETE FROM outages WHERE tenant_id=? AND device_id=?",
+                        (tenant_id, device_id))
+            conn.execute("DELETE FROM device_states WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM device_rollups WHERE tenant_id=? AND device_id=?",
+                        (tenant_id, device_id))
+            conn.execute(
+                "UPDATE switch_ports SET feeds_device_id=NULL"
+                " WHERE tenant_id=? AND feeds_device_id=?", (tenant_id, device_id))
+            conn.execute("DELETE FROM switch_ports WHERE tenant_id=? AND device_id=?",
+                        (tenant_id, device_id))
+            conn.execute(
+                "DELETE FROM org_device_links"
+                " WHERE tenant_id=? AND (child_id=? OR parent_id=?)",
+                (tenant_id, device_id, device_id))
+            conn.execute("DELETE FROM device_redundancy WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM device_perf_samples WHERE tenant_id=? AND device_id=?",
+                        (tenant_id, device_id))
+            conn.execute("DELETE FROM device_perf WHERE device_id=?", (device_id,))
             conn.execute("DELETE FROM org_devices WHERE id=? AND tenant_id=?",
                          (device_id, tenant_id))
             conn.commit()
@@ -1007,8 +1105,8 @@ class CentralStore:
         switch's IF-MIB itself, the same way it hands over `canary_ip`."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, ip_address, region, parent_device_id, snmp_enabled,"
-                " snmp_version, snmp_community, snmp_port FROM org_devices"
+                "SELECT id, name, ip_address, region, parent_device_id, assigned_node_id,"
+                " snmp_enabled, snmp_version, snmp_community, snmp_port FROM org_devices"
                 " WHERE tenant_id=? AND is_active=1 AND maintenance=0 ORDER BY id",
                 (tenant_id,)).fetchall()
         return [dict(r) for r in rows]

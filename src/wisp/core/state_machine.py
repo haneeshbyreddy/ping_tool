@@ -253,7 +253,8 @@ class MonitorEngine:
         return plan
 
     def process_cycle(
-        self, results: dict[str, PingResult], ts: str, subset: set[int] | None = None
+        self, results: dict[str, PingResult], ts: str, subset: set[int] | None = None,
+        expected_ips: set[str] | None = None,
     ) -> CycleResult:
         """Advance the FSMs by one sample and return the committed states + events.
 
@@ -262,7 +263,16 @@ class MonitorEngine:
         pass**: it advances *only* those FSMs by one more sample (used by the daemon's
         fast-retry path to confirm a suspected DOWN within seconds), leaving every other
         device's committed state untouched and skipping the canary/uplink logic that the
-        full pass already handled this cycle."""
+        full pass already handled this cycle.
+
+        `expected_ips`, on a full pass only, narrows which devices this particular
+        report is authoritative for (central's multi-edge-per-tenant device assignment —
+        see `central/store.py:node_expected_ips`). A device whose ip ISN'T in
+        `expected_ips` is skipped entirely — no feed(), no committed entry, no event —
+        rather than defaulting to the missing-sample 100%-loss fallback below, so a
+        device assigned to a DIFFERENT edge never looks falsely DOWN just because THIS
+        report didn't mention it. `None` (every existing caller) means "every device is
+        this report's concern", identical to before this parameter existed."""
         cfg = self.cfg
         events: list[Event] = []
         canary_down = False
@@ -291,7 +301,10 @@ class MonitorEngine:
                 # on-backup badge holds until the uplink is back) — same policy as
                 # fast-confirm being skipped under the freeze.
                 return CycleResult(states=states, events=events, canary_down=True)
-            order = self._order
+            order = self._order if expected_ips is None else [
+                dev_id for dev_id in self._order
+                if self.meta[dev_id].ip_address in expected_ips
+            ]
         else:
             # Confirmation pass: advance only the suspected devices, in topological
             # order so a parent confirmed down this pass still suppresses its children.
