@@ -2,7 +2,7 @@
 #
 # HANSA — local dev: run central + one edge probe together.
 #
-# The edge no longer has its own dashboard/DB (new-plan.md Phase C) — central IS
+# The edge no longer has its own dashboard/DB (see plan.md) — central IS
 # the product now. This starts a local central server (foreground) and, unless
 # --no-daemon, an edge probe in central-brain mode (background) pointed at it.
 # Ctrl-C stops both.

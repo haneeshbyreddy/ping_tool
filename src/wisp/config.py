@@ -124,7 +124,7 @@ class Config:
         default_factory=lambda: _env_float("WISP_PERF_MIN_JITTER_MS", 3.0))
 
     # --- SNMP ingress (graph topology Part B; IF-MIB oper/admin only) --------
-    # `ingress/snmp.py`'s poller — kept per new-plan.md Phase C, but not yet wired into
+    # `ingress/snmp.py`'s poller — kept per plan.md's "what's next", but not yet wired into
     # the central-brain daemon loop (central's /report doesn't accept port data yet;
     # that's a separate follow-up). SNMP request timeout per walk, kept short since a
     # dead switch must never block anything else.

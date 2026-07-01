@@ -7,7 +7,7 @@
     Takes you from "code is on the box" to "the edge probe auto-starts on boot": venv,
     the probe's deps, and a Scheduled Task (the Windows stand-in for the systemd unit)
     that runs as SYSTEM and restarts on crash. There is no local dashboard/DB on the
-    edge anymore (new-plan.md Phase C) — this box only probes and reports to a central
+    edge anymore (see plan.md) — this box only probes and reports to a central
     server; you'll edit the generated launcher with your central URL/token/tenant
     before starting it. Idempotent — safe to re-run to upgrade after a `git pull`.
 

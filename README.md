@@ -11,9 +11,8 @@ alerting of its own.
 
 ISPs log into the central dashboard with their own account, add their device
 topology and team, and see live outages/history there — nothing to manage on
-the edge box beyond keeping the probe running. See `new-plan.md` for the
-migration this platform is built around and `plan.md` for the original
-single-box design history.
+the edge box beyond keeping the probe running. See `plan.md` for the design
+rationale, what's done, and what's next.
 
 ## Quick start (local dev — central + one edge probe)
 

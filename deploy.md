@@ -5,7 +5,7 @@ How to run the edge probe on an always-on Linux box. Read alongside `README.md`
 `deploy/` is the starting point.
 
 This covers the **edge box only** — a thin probe with no local database, PIN, or
-dashboard (new-plan.md Phase C). Device topology, team, alert routing, and outage
+dashboard (see `plan.md`). Device topology, team, alert routing, and outage
 history all live on the **central server**'s dashboard, which is a separate deploy
 (see README's "Central server + edge setup"; central is meant to run somewhere
 always-available, e.g. a small GCP VM, not on the same box you're provisioning here).

@@ -140,10 +140,10 @@ def run_cycle(store, tenant_id: str, engine: MonitorEngine,
 
 def compute_recheck(engine: MonitorEngine, cycle: CycleResult,
                     results: dict[str, PingResult], cfg: Config = CONFIG) -> dict:
-    """The fast-confirm round-trip hint (new-plan.md Phase B): which IPs are worth
-    re-probing right away, mirroring the standalone daemon's own `_confirm_down`/
-    `_confirm_up` suspect-set logic exactly, just IP-keyed (the wire convention) instead
-    of device-id-keyed.
+    """The fast-confirm round-trip hint (see plan.md's design rationale): which IPs are
+    worth re-probing right away, mirroring the same suspect-set logic the old single-box
+    daemon's `_confirm_down`/`_confirm_up` used before Phase C moved the FSM here — just
+    IP-keyed (the wire convention) instead of device-id-keyed.
 
     * `down_ips` — committed state NOT in DOWN_FAMILY, but this cycle's sample was 100%
       loss (a down-streak started but hasn't reached `down_consecutive` yet).

@@ -5,7 +5,7 @@
 # Does everything from "code is on the box" to "the edge probe running under
 # systemd": OS deps, venv, unprivileged-ICMP sysctl, the systemd unit. There is
 # no local dashboard or database on the edge anymore — this box only probes and
-# reports to a central server (see new-plan.md Phase C). Idempotent — safe to
+# reports to a central server (see plan.md). Idempotent — safe to
 # re-run to upgrade after a `git pull`.
 #
 # Usage (run from the repo, as root):

@@ -3,32 +3,33 @@
 Working notes for Claude Code in this repo — **only** the conventions, invariants, and
 gotchas that aren't obvious from the code. For everything else, don't duplicate it here,
 read it: `README.md` (what it is, how to run it, the directory layout, the module/layer
-map, config, behaviors), `new-plan.md` (the migration this platform is built around), and
-`plan.md` (the original single-box design history, for archaeology).
+map, config, behaviors) and `plan.md` (design rationale, what's done, what's next).
 
 ## Status
 
-**Phase C is done: the edge is a thin probe, full stop.** The migration described in
-`new-plan.md` is complete — central-brain mode (`WISP_CENTRAL_BRAIN=1` + `WISP_CENTRAL_URL`)
-is no longer one of several daemon modes, it's the **only** one. Standalone mode, Phase 10's
-local-FSM + outbox/shipper aggregation mode, and the edge's local dashboard/server/DB are all
-**deleted**, not just unused — see "Removed in Phase C" below before assuming a described
-behavior still lives on the edge. 191 tests.
+**The edge is a thin probe, full stop; central runs the brain, for every tenant.** This is
+the whole platform now, not an add-on to some other mode — there is exactly one daemon mode
+(`WISP_CENTRAL_BRAIN=1` + `WISP_CENTRAL_URL`, and it's effectively mandatory: the daemon has
+no other path). An earlier single-box version of this tool (one daemon + one local dashboard,
+no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
+deleted wholesale, not just deprecated. See "Removed" below before assuming a described
+behavior still lives on the edge; if you're looking for that old design's detail, it's in git
+history, not this file. 191 tests.
 
-What's still true: **Phase A** (central's own ISP-managed device topology, team, and per-org
-alert settings — see "Central management plane") and **Phase B** (central's own FSM +
-alerting, consuming raw probe reports from the edge — see "Central runs the brain") are both
-done and tested end to end, including the fast-confirm round-trip and canary/uplink freeze
-(earlier notes here called both "deferred v1 gaps" — that was stale; verify claims like that
-against the code, not just this file, since this file can drift too).
+**Central's own management plane and FSM/alerting are done and tested end to end**, including
+the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
+management plane" and "Central runs the brain" below. Verify claims about what's done against
+the code, not just this file (an earlier draft of this doc called the fast-confirm round-trip
+"deferred" after it had already shipped — that drift is exactly the kind of thing to watch for).
 
 Still genuinely missing on central (not yet built anywhere, edge or central): SNMP port
 status/bandwidth, the per-link performance baseline, and the on-backup redundancy signal.
-These existed on the OLD edge (deleted in Phase C, see below) and were never ported to
+These existed on the old single-box edge (deleted, see below) and were never ported to
 central — central would need its own trailing-sample storage to reintroduce them, which
-doesn't exist yet. `ingress/snmp.py`'s poller is kept in the tree (per `new-plan.md`'s
-explicit Phase C "keep" list) but is **not wired into the daemon loop** — central's
-`/report` doesn't accept port data yet, so this is dormant code waiting on a follow-up.
+doesn't exist yet. `ingress/snmp.py`'s poller is kept in the tree (see `plan.md`'s "what's
+next") but is **not wired into the daemon loop** — central's `/report` doesn't accept port
+data yet, so this is dormant code waiting on a follow-up. See `plan.md` for the full list of
+what's next and in what order.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
@@ -62,8 +63,7 @@ equivalents in `central/engine.py`). Don't delete these thinking they're edge-on
 before removing anything reused this widely.
 
 `runtime/supervisor.py`, `apps/supervisor/main.py`, and the whole staged-rollout / self-update
-feature (Part D) are **untouched** — orthogonal to the FSM/dashboard removal, not mentioned in
-`new-plan.md`'s Phase C scope.
+feature are **untouched** — orthogonal to the FSM/dashboard removal.
 
 ## Imports & paths (the main trap)
 

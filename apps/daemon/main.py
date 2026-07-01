@@ -1,4 +1,4 @@
-"""Daemon runtime — the edge's thin probe loop (new-plan.md Phase C).
+"""Daemon runtime — the edge's thin probe loop (see plan.md).
 
 The edge no longer runs a local FSM, alerting, or dashboard: it only learns what
 to ping from central (`GET /edge/devices`) and reports the raw per-IP samples
