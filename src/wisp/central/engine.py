@@ -36,7 +36,7 @@ from wisp.ingress.probers import PingResult
 
 
 def load_device_meta(store, tenant_id: str) -> list[DeviceMeta]:
-    """DeviceMeta's BACKUP parent edges (plan.md item 3) come from `org_device_links` —
+    """DeviceMeta's BACKUP parent edges (CLAUDE.md item 3) come from `org_device_links` —
     the PRIMARY parent stays `parent_device_id`, unchanged. The engine itself needed NO
     changes to support this: `DeviceMeta.effective_parents()`/topology suppression/
     redundancy math were all built generically in Phase 9 already; central's job is just
@@ -151,7 +151,7 @@ def run_cycle(store, tenant_id: str, engine: MonitorEngine,
 
 def compute_recheck(engine: MonitorEngine, cycle: CycleResult,
                     results: dict[str, PingResult], cfg: Config = CONFIG) -> dict:
-    """The fast-confirm round-trip hint (see plan.md's design rationale): which IPs are
+    """The fast-confirm round-trip hint (see CLAUDE.md's design rationale): which IPs are
     worth re-probing right away, mirroring the same suspect-set logic the old single-box
     daemon's `_confirm_down`/`_confirm_up` used before Phase C moved the FSM here — just
     IP-keyed (the wire convention) instead of device-id-keyed.

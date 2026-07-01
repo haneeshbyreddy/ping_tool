@@ -476,7 +476,7 @@ class ReportEndpointTest(unittest.TestCase):
         status, resp = self._req("POST", "/report", body)
         self.assertTrue(any("restored" in s["title"].lower() for s in self.notifier.sent))
 
-    # -- SNMP port folding, over the real socket (plan.md item 1) --
+    # -- SNMP port folding, over the real socket (CLAUDE.md item 1) --
     def _report_with_ports(self, tenant, device_id, ports, ip="10.0.0.9"):
         body = {"v": 1, "tenant_id": tenant, "node_id": "edge-1",
                 "pings": {ip: {"loss_pct": 0.0, "latency_ms": 5.0}},
@@ -510,7 +510,7 @@ class ReportEndpointTest(unittest.TestCase):
             o = conn.execute("SELECT root_cause FROM outages WHERE id=?", (oid,)).fetchone()
         self.assertIn("Port", o["root_cause"])
 
-    # -- hourly latency/loss trend rollup (plan.md item 2, second slice) --
+    # -- hourly latency/loss trend rollup (CLAUDE.md item 2, second slice) --
     def test_full_report_folds_a_trend_bucket_recheck_does_not(self):
         dev = self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
@@ -550,7 +550,7 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(self.store.list_switch_ports("ispA", other_switch), [])
         self.assertEqual(self.store.list_switch_ports("ispB", other_switch), [])
 
-    # -- on-backup redundancy signal, over the real socket (plan.md item 3) --
+    # -- on-backup redundancy signal, over the real socket (CLAUDE.md item 3) --
     def test_report_drives_on_backup_badge_end_to_end(self):
         primary = self.store.create_org_device("ispA", {
             "name": "Primary", "ip_address": "10.0.0.1", "device_type": None,

@@ -1,4 +1,4 @@
-"""Central-side SNMP port folding (plan.md item 1, done) + per-port bandwidth (plan.md
+"""Central-side SNMP port folding (CLAUDE.md item 1, done) + per-port bandwidth (CLAUDE.md
 item 3's SNMP-bandwidth follow-up).
 
 Mirrors the old single-box `egress/ports.py` (`PortMonitor`) one-for-one, ported onto

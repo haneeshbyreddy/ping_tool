@@ -197,8 +197,8 @@ CREATE TABLE IF NOT EXISTS outages (
     resolution_notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outages_open ON outages(tenant_id, device_id, resolved_at);
--- plan.md item 2, second slice: hourly latency/packet-loss trend (30-day retention,
--- hourly buckets — both decided; see plan.md). Folded incrementally at each "full"
+-- CLAUDE.md item 2, second slice: hourly latency/packet-loss trend (30-day retention,
+-- hourly buckets — both decided; see CLAUDE.md). Folded incrementally at each "full"
 -- report cycle (never a recheck — see central/rollup.py), so no raw per-poll history
 -- needs to live here, just running sums per (tenant, device, hour). Averages are
 -- computed at READ time (`CentralStore.device_rollup_series`), not stored, so the
@@ -259,7 +259,7 @@ CREATE TABLE IF NOT EXISTS rollouts (
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(tenant_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(tenant_id, node_id, device_id, id);
 CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(tenant_id, node_id, id);
--- Phase C follow-up — SNMP port status, central-side (plan.md item 1). One row per
+-- Phase C follow-up — SNMP port status, central-side (CLAUDE.md item 1). One row per
 -- discovered switch port, mirrors the old single-box `switch_ports` table one-for-one
 -- but tenant-scoped: `device_id`/`feeds_device_id` are `org_devices` ids. Discovery
 -- (every walked port) lands `monitored=0`; the operator ticks which ports to watch —
@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS switch_ports (
     alarm           INTEGER NOT NULL DEFAULT 0,
     alarm_since     TEXT,
     updated_at      TEXT,
-    -- plan.md item 3: per-port throughput (bandwidth), orthogonal to oper/admin status.
+    -- CLAUDE.md item 3: per-port throughput (bandwidth), orthogonal to oper/admin status.
     -- Operator-set (never touched by a walk): bw_threshold_mbps/bw_direction. Walk-
     -- refreshed: the raw octet counters (TEXT — Counter64 can exceed SQLite's signed-64
     -- INTEGER range) + the last computed rates. Flap-suppressed like the port-down path,
@@ -303,7 +303,7 @@ CREATE TABLE IF NOT EXISTS switch_ports (
 );
 CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(tenant_id, device_id);
 CREATE INDEX IF NOT EXISTS idx_switch_ports_feeds ON switch_ports(tenant_id, feeds_device_id);
--- plan.md item 3: graph topology backup edges, central-side. Mirrors the old single-box
+-- CLAUDE.md item 3: graph topology backup edges, central-side. Mirrors the old single-box
 -- `device_links` one-for-one, tenant-scoped: the PRIMARY parent stays the single source
 -- of truth on `org_devices.parent_device_id` (every existing tree/topo query keeps
 -- working unchanged); this table carries only the EXTRA redundancy edges
@@ -330,7 +330,7 @@ CREATE TABLE IF NOT EXISTS device_redundancy (
     primary_down_since TEXT,
     updated_at         TEXT NOT NULL
 );
--- plan.md item 3: per-link performance baseline, central-side (core/baseline.py's pure
+-- CLAUDE.md item 3: per-link performance baseline, central-side (core/baseline.py's pure
 -- median+MAD deviation math, unchanged — central's job is just the trailing-sample
 -- window + badge). device_perf_samples is a BOUNDED per-device ring buffer (trimmed to
 -- the newest cfg.perf_window rows after every insert — central/perf.py), not a full
@@ -837,7 +837,7 @@ class CentralStore:
     def list_org_devices(self, tenant_id: str) -> list[dict]:
         """Every active device an org has configured, plus each node's child count (for
         the Nodes-page tree + the parent-node dropdown) and its BACKUP parent ids
-        (plan.md item 3's graph topology — the PRIMARY parent is still just
+        (CLAUDE.md item 3's graph topology — the PRIMARY parent is still just
         `parent_device_id` above; `backup_parents` is the extra redundancy edge set)."""
         with self._connect() as conn:
             rows = conn.execute(
@@ -1057,7 +1057,7 @@ class CentralStore:
                 (tenant_id, since, until)).fetchall()
         return [dict(r) for r in rows]
 
-    # -- hourly latency/loss rollups (plan.md item 2, second slice) --
+    # -- hourly latency/loss rollups (CLAUDE.md item 2, second slice) --
     def fold_device_rollups(self, entries: list[tuple]) -> None:
         """`entries`: (tenant_id, device_id, bucket, latency_ms, loss_pct, down) tuples,
         one per device sampled this cycle — accumulated into that hour's running row
@@ -1188,7 +1188,7 @@ class CentralStore:
             conn.execute("UPDATE escalations SET due_at=? WHERE id=?", (due_at, esc_id))
             conn.commit()
 
-    # --- SNMP port status (central-side, plan.md item 1) ------------------------
+    # --- SNMP port status (central-side, CLAUDE.md item 1) ------------------------
     def list_switch_ports(self, tenant_id: str, device_id: int) -> list[dict]:
         """Every discovered port on one switch — `central/ports.py`'s per-cycle read
         of prior state (streak/alarm/monitored/feeds) before folding this walk's
@@ -1219,7 +1219,7 @@ class CentralStore:
 
         `bw`, when given, is `(in_octets, out_octets, counters_at, in_bps, out_bps,
         bw_low_streak, bw_alarm, bw_alarm_since)` — the throughput half of the same
-        walk (plan.md item 3), written in the SAME upsert so a port's status and
+        walk (CLAUDE.md item 3), written in the SAME upsert so a port's status and
         bandwidth reading never disagree about which walk they came from."""
         in_octets = out_octets = counters_at = in_bps = out_bps = None
         bw_low_streak, bw_alarm, bw_alarm_since = 0, False, None
@@ -1281,7 +1281,7 @@ class CentralStore:
             conn.commit()
             return cur.rowcount > 0
 
-    # --- graph topology: backup edges (plan.md item 3) --------------------------
+    # --- graph topology: backup edges (CLAUDE.md item 3) --------------------------
     def org_device_backup_map(self, tenant_id: str) -> dict[int, set[int]]:
         """child_id -> set of active BACKUP parent ids, scoped to one tenant — the
         cycle-check input for `central/inventory.py:clean_backup_link` (never crosses
@@ -1319,7 +1319,7 @@ class CentralStore:
             conn.commit()
             return cur.rowcount > 0
 
-    # --- on-backup redundancy badge (plan.md item 3) -----------------------------
+    # --- on-backup redundancy badge (CLAUDE.md item 3) -----------------------------
     def device_redundancy_state(self, tenant_id: str, device_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -1339,7 +1339,7 @@ class CentralStore:
                 (device_id, tenant_id, 1 if on_backup else 0, since, ts))
             conn.commit()
 
-    # --- per-link performance baseline (plan.md item 3) --------------------------
+    # --- per-link performance baseline (CLAUDE.md item 3) --------------------------
     def record_perf_sample(self, tenant_id: str, device_id: int, ts: str,
                            latency_ms: float | None, packet_loss: float | None,
                            jitter_ms: float | None, state: str, keep: int) -> None:

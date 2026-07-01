@@ -1,7 +1,7 @@
-"""Central-side hourly latency/packet-loss rollups (plan.md item 2, second slice — the
+"""Central-side hourly latency/packet-loss rollups (CLAUDE.md item 2, second slice — the
 trend-chart piece the outage-derived SLA slice in `central/analytics.py` deliberately
 left open, since it needs its own time-series storage). Retention: 30 days.
-Granularity: hourly buckets. Both decided; see plan.md's "Open questions".
+Granularity: hourly buckets. Both decided; see CLAUDE.md's "Open questions".
 
 Folded incrementally at each "full" `POST /report` cycle (never a `recheck` — that's
 just the fast-confirm suspect subset sampled every couple seconds, which would badly
@@ -56,7 +56,7 @@ def record_cycle(store, tenant_id: str, eng, cycle, results: dict, ts: str) -> N
 
 def prune_old_rollups(store, now: str | None = None) -> int:
     """Delete every bucket older than RETENTION_DAYS, across all tenants — retention is
-    a platform-wide policy for this slice, not per-org (see plan.md)."""
+    a platform-wide policy for this slice, not per-org (see CLAUDE.md)."""
     end = _parse(now) if now else datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = (end - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
     return store.prune_rollups_older_than(cutoff)

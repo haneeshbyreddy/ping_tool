@@ -1,4 +1,4 @@
-"""Central-side on-backup redundancy signal (plan.md item 3).
+"""Central-side on-backup redundancy signal (CLAUDE.md item 3).
 
 A device with a BACKUP parent edge (`org_device_links`, kind='backup' — see
 `central/inventory.py:clean_backup_link` / `central/engine.py:load_device_meta`) that

@@ -123,7 +123,7 @@ class DeviceReliabilityTest(unittest.TestCase):
 
 class DeviceRollupTest(unittest.TestCase):
     """central/rollup.py: hourly latency/loss buckets folded incrementally at report
-    time (30-day retention, hourly granularity — plan.md item 2's second slice)."""
+    time (30-day retention, hourly granularity — CLAUDE.md item 2's second slice)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

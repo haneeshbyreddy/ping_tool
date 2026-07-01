@@ -338,7 +338,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         status, _, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=op)
         self.assertEqual(status, 403)
 
-    # --- /api/analytics (plan.md item 2's first slice: outage-derived downtime/SLA) ---
+    # --- /api/analytics (CLAUDE.md item 2's first slice: outage-derived downtime/SLA) ---
     def test_analytics_requires_auth(self):
         self.assertEqual(self._req("GET", "/api/analytics")[0], 401)
 
@@ -368,7 +368,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["name"], "Other")
 
-    # --- graph topology: backup links + port bandwidth config (plan.md item 3) ---
+    # --- graph topology: backup links + port bandwidth config (CLAUDE.md item 3) ---
     def test_backup_link_round_trip_and_cross_tenant_rejected(self):
         _, own = self._login("owner", "ownerpassword")
         primary = self.store.create_org_device("ispA", {

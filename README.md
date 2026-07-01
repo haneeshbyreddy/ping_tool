@@ -1,331 +1,201 @@
 # Village WISP Monitor
 
-A multi-tenant network monitoring + alerting platform for rural WiFi broadband
-operators (ISPs). Central runs the brain: the FSM, topology-aware suppression
-(a dead parent's children don't page separately), fast-confirm detection, and
-the ntfy alerting ladder (owner+operator immediately, then owner+operator+tech
-every hour the outage stays open) all run on a central server you operate. Each
-ISP's edge box is a **thin probe** — it pings its network with real ICMP and
-reports raw results to central; it carries no local database, dashboard, or
-alerting of its own.
+Multi-tenant network monitoring + alerting for rural WiFi ISPs. **Central runs the
+brain** — FSM, topology-aware suppression, fast-confirm detection, the ntfy alerting
+ladder, multi-tenant dashboard — for every tenant it serves. Each ISP's **edge box is a
+thin probe**: real ICMP, reports raw results to central, no local DB/dashboard/FSM of
+its own. See `CLAUDE.md` for design rationale, status, and invariants.
 
-ISPs log into the central dashboard with their own account, add their device
-topology and team, and see live outages/history there — nothing to manage on
-the edge box beyond keeping the probe running. See `plan.md` for the design
-rationale, what's done, and what's next.
-
-## Quick start (local dev — central + one edge probe)
+## Quick start (local dev)
 
 ```bash
-# one-time: deps for the edge probe (ICMP + central HTTP)
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-# let the probe send ICMP as a normal user (unprivileged ping sockets):
-sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
-echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/99-wisp-ping.conf
-```
+sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"   # unprivileged ICMP
 
-**Fastest path:** `./run.sh` — starts a local central server on
-`http://127.0.0.1:8080` and, alongside it, an edge probe in central-brain mode
-pointed at it. Central starts with no orgs/devices; create a superadmin, log
-in, and add your first device from the dashboard's **Nodes** page:
-
-```bash
+./run.sh   # starts central (127.0.0.1:8080) + one edge probe pointed at it
 PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you --password ...
+# log in, add your first device from the dashboard's Nodes page
+
+python -m unittest discover -s tests   # 310 tests, pure stdlib
 ```
 
-The `wisp` package lives under `src/` (a *src layout*) but nothing is
-installed — the two runtimes (`apps/daemon`, `apps/central`) put `src/` on the
-path themselves; the admin CLI uses `PYTHONPATH=src python -m …`.
+`src/wisp` is a *src layout*, not installed — `apps/daemon` and `apps/central` add
+`src/` to `sys.path` themselves; the admin CLI needs `PYTHONPATH=src`.
 
-```bash
-# run central and an edge probe separately (what run.sh does under the hood):
-python apps/central/main.py --host 0.0.0.0 --port 8443
+## Central dashboard
 
-WISP_CENTRAL_BRAIN=1 WISP_CENTRAL_URL=http://127.0.0.1:8443 \
-WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
-
-python -m unittest discover -s tests                 # pure stdlib
-```
-
-The central dashboard is **fully self-contained** — pure stdlib, no build
-step, no third-party Python deps for the dashboard itself (the edge probe
-needs the small venv above). All central state lives under `data/central.db`
-(git-ignored).
-
-## Central dashboard (control plane)
-
-An ISP owner/operator runs and reconfigures everything from the central
-browser dashboard — nothing on the edge box needs touching after install.
-
-- **Nodes** — the device inventory + topology (name, IP, type, region,
-  parent), full CRUD from the UI. A newly added/removed/reparented device
-  applies to the live probe within one poll cycle (the edge re-fetches its
-  topology from central every cycle — no edge restart needed).
-- **Edge Nodes** — distinct from the **Nodes** page above (that's device
-  topology; this is the physical probes themselves). An owner/operator
-  registers a new node here and gets back a one-time enrollment token to
-  install with — self-service, no platform superadmin required. An ISP can
-  register as many nodes as it runs; rotate or revoke a node's credential
-  from the same page.
-- **Team** — workers as identity + role (owner / operator / tech), *not*
-  per-person routing. Alerts route to **three per-org ntfy topics, one per
-  role**, set from **Settings**; a person subscribes to the topic for their
-  role. Team also carries org-wide **Attendance** (a daily present-toggle for
-  operators).
-- **Settings** — each org's three role ntfy topics + a **Send test alert**
-  button.
-- **Accounts** — central-provisioned (no public signup): a *superadmin* (the
-  platform operator, `wisp.central.admin create-superadmin`) onboards each ISP
-  and seeds its accounts (`create-user --tenant … --role owner|operator|tech`);
-  org users only ever see their own tenant's data.
+- **Nodes** — device topology (name, IP, type, region, parent/backup). Changes apply
+  within one poll cycle, no edge restart.
+- **Edge Nodes** — physical probe enrollment (distinct from **Nodes**). Owner/operator
+  self-registers a node, gets a one-time token; rotate/revoke from the same page.
+- **Team** — workers as identity + role (owner/operator/tech); alerts route to one ntfy
+  topic per role, set in **Settings**. Also carries daily operator attendance.
+- **Settings** — the three role ntfy topics + a test-alert button.
+- **Accounts** — central-provisioned only: a superadmin onboards each ISP
+  (`central.admin create-superadmin`/`create-user`); org users see only their tenant.
 
 ## Layout
 
-A *src layout*: the engine is an importable `wisp` package; the two runtimes
-that drive it live under `apps/`. Central is pure stdlib; the edge probe uses
-the venv (see Quick start).
-
 ```
-src/wisp/                 # the engine package (import as `wisp.*`)
-├── config.py             # frozen Config from env; CONFIG singleton
-├── version.py            # the running build version (reported in the heartbeat)
-├── core/                 # state_machine.py (FSM, reused by central), analytics.py, baseline.py
-├── ingress/               # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk;
-│                          #   walked by the edge daemon, folded/alerted by central/ports.py)
-├── egress/               # notifiers.py — the ntfy channel (NtfyNotifier/send_with_retry),
-│                          #   shared by the edge probe's error paths and central's dispatcher
-├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), ports.py (SNMP
-│                          #   port status + bandwidth folding), redundancy.py (on-backup
-│                          #   signal), perf.py (per-link performance baseline),
-│                          #   analytics.py (outage-derived downtime/SLA), rollup.py
-│                          #   (hourly latency/loss trend, 30d retention), pki.py (internal
-│                          #   CA for mTLS enrollment), store (multi-tenant SQLite),
-│                          #   server.py (ingest + dashboard API, optional TLS/mTLS
-│                          #   termination), watchdog, auth, admin CLI, rollout, inventory,
-│                          #   static/ (the dashboard SPA)
-└── runtime/               # central_client.py (edge's central HTTP client), single_instance.py,
-                           #   supervisor.py (agent self-update logic)
+src/wisp/
+├── config.py, version.py
+├── core/        # state_machine.py (FSM, shared), analytics.py, baseline.py
+├── ingress/     # probers.py (ICMP), snmp.py (IF-MIB walk)
+├── egress/      # notifiers.py (ntfy channel)
+├── central/     # the brain: engine, dispatch, ports, redundancy, perf, analytics,
+│                #   rollup, pki, store, server, watchdog, auth, admin CLI, rollout,
+│                #   inventory, static/ (dashboard SPA)
+└── runtime/     # central_client.py, single_instance.py, supervisor.py
 apps/
-├── daemon/main.py        # the edge runtime — thin probe loop only (probe, report, follow
-│                          #   fast-confirm hints); no local FSM, DB, or dashboard
-├── central/main.py       # central server runtime — ingest + multi-tenant dashboard + watchdog
-└── supervisor/main.py    # edge supervisor — runs + self-updates the frozen agent (fleet path)
-data/                     # central.db (+ wal/shm) + session_secret + pki/ — git-ignored
-deploy/                   # wisp-edge.service, install-edge.sh/.ps1, PyInstaller spec
-.github/workflows/        # release.yml — build/test on push/PR; sign+publish on a v* tag
-tests/{unit,integration}/ # unittest — `python -m unittest discover -s tests`
-docs/  assets/            # incident post-mortem template; original design mockup
-run.sh                    # local dev: central + one edge probe together
+├── daemon/main.py      # edge: probe loop only
+├── central/main.py     # central: ingest + dashboard + watchdog
+└── supervisor/main.py  # edge supervisor (self-update)
+data/        # central.db + session_secret + pki/ — git-ignored
+deploy/      # wisp-edge.service, install-edge.sh/.ps1, PyInstaller spec
+tests/{unit,integration}/
+assets/      # original design mockup
+run.sh
 ```
 
-## How it works (the layers)
+## Key behaviors (central)
 
-| Module | Layer | Does |
-|---|---|---|
-| `wisp.ingress.probers` | 1 Monitoring | pings devices (`IcmpProber`, real ICMP via icmplib) |
-| `apps.daemon.main` | 1 | the edge's thin probe loop — probe, `POST /report`, follow fast-confirm hints |
-| `wisp.core.state_machine` | 2 Pattern | FSM + flap suppression, canary freeze, topology suppression (reused verbatim by central) |
-| `wisp.central.engine` | 2 | central-native DB glue over the FSM: per-tenant `EngineRegistry`, `compute_recheck` |
-| `wisp.central.dispatch` | 4/5 Alerting | routing, anti-spam, hourly all-hands re-page until recovery — central's `AlertDispatcher` |
-| `wisp.egress.notifiers` | 4 | the ntfy channel itself (`NtfyNotifier`, retry policy) — used by central's dispatcher |
-| `wisp.central.store` | 5 Memory | central's own multi-tenant SQLite: org topology, team, live device state, outages |
-| `wisp.central.server` / `apps.central` | 6 Dashboard + Ingest | `GET/POST /api/*` for the SPA, `POST /report` + `GET /edge/devices` for edges |
-| `wisp.runtime.supervisor` / `apps.supervisor` | 8 Update | (optional) supervisor self-updates the frozen agent: verify → swap → health-gate → rollback |
+- **Flap suppression** — DOWN after 3 consecutive 100%-loss samples, DEGRADED after 2,
+  recovery after 2 healthy. A single blip never pages.
+- **Fast-confirm** — central names a suspect IP in its `/report` reply; the edge
+  re-probes just that IP every `WISP_RETRY_INTERVAL_S` until confirmed/cleared —
+  detection in seconds, not `poll_interval × down_consecutive`.
+- **Uplink canary** — edge's own internet down → central freezes that tenant's cycle,
+  sends one `UPLINK_DOWN` instead of a storm.
+- **Topology suppression** — a child is `UNREACHABLE` (silent) only when every parent
+  (primary + backup) is down; any live parent means a real fault, still pages.
+- **On-backup redundancy** — a device reachable only via its backup parent gets one
+  operator heads-up, never an outage; clears silently if it goes hard DOWN.
+- **Per-link performance baseline** — pages once on sustained deviation from a rolling
+  median+MAD latency/jitter baseline, even within FSM thresholds.
+- **SNMP port + bandwidth** — edge walks snmp-enabled switches on its own slow cadence;
+  central folds a monitored port-down into the open outage (or a heads-up if none), and
+  alarms sustained low throughput against a per-port threshold. Admin-down/unmonitored
+  stays silent. Full rules: `CLAUDE.md`.
+- **Outage-derived SLA + trend** — `GET /api/analytics?days=` (per-device uptime/outage
+  count, UNREACHABLE excluded) and `GET /api/analytics/trend?device_id=&days=` (hourly
+  latency/loss buckets, 30-day retention) — both computed off data central already keeps.
+- **Escalation is restart-safe** — DB-backed timers. Fresh DOWN pages owner+operator;
+  all-hands (owner+operator+tech) re-page every `WISP_ESCALATE_EVERY_MIN` while open.
+  Ack doesn't stop it, only recovery does.
+- **Scales without lying** — bounded probe fan-out (`WISP_MAX_INFLIGHT`) and gentle
+  infra probing (`WISP_PINGS_PER_POLL_INFRA`) keep a large fleet from faking a mass
+  outage or reading rate-limiting as loss.
+- **Multi-tenant, always** — every read/write is tenant-scoped; a superadmin can narrow
+  with `?tenant=`.
 
-## Key behaviors (running on central)
+## Central + edge setup
 
-- **Flap suppression** — DOWN only after 3 straight 100%-loss samples; DEGRADED after 2.
-  Recovery needs 2 healthy samples (hysteresis). A single blip never pages anyone.
-- **Fast-confirm round trip** — when a device looks suspect, central's reply to
-  `POST /report` carries a `recheck` hint naming just that IP; the edge re-probes it
-  every `WISP_RETRY_INTERVAL_S` and reports back until the FSM confirms or clears it —
-  so detection collapses from `poll_interval × down_consecutive` to a few seconds
-  without touching the healthy fleet's cadence.
-- **Uplink canary** — if an edge's own internet is down, central freezes that tenant's
-  detection for the cycle and sends ONE `UPLINK_DOWN` instead of a storm of per-site alerts.
-- **Topology suppression** — a child is `UNREACHABLE` (one alert, not forty) only when
-  every monitored parent (primary AND any backup) is down; a genuinely-down device with
-  any live parent still pages.
-- **On-backup redundancy** — a device with a configured BACKUP parent (Nodes page) that
-  loses its primary uplink but is still reachable via the backup is "running on backup":
-  a one-shot operator heads-up (redundancy is gone, one more failure is an outage), never
-  an outage itself. Clears silently if the node itself goes hard DOWN — the outage owns
-  that story.
-- **Per-link performance baseline** — a link running well under the FSM's absolute
-  thresholds can still be sitting far above ITS OWN normal latency/jitter; central judges
-  each link against a rolling median+MAD baseline and pages the operator once on a
-  sustained (not single-sample) deviation, clearing once the link is back within baseline.
-- **SNMP port folding + bandwidth** — the edge walks its snmp-enabled switches on its own
-  slow cadence (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval) and reports
-  port + throughput readings alongside its pings; central folds a monitored port-down into
-  the open outage it feeds (stamping the physical cause) or, with no open outage yet,
-  sends a one-shot operator heads-up — never a second, competing alarm. A monitored port
-  whose throughput falls below its operator-assigned threshold alarms separately (its own
-  flap-suppressed streak). Admin-down ports, unmonitored ports, and bandwidth on a
-  down/admin-down port all stay silent. See `CLAUDE.md`'s "Central runs the brain" for the
-  full rule set.
-- **Outage-derived SLA reporting** — `GET /api/analytics?days=` answers "how reliable
-  was Tower A over the last N days" straight off the outage history central already
-  keeps: per-device downtime seconds, uptime %, and outage count (UNREACHABLE outages
-  don't count against a device's own uptime — that's a topology-suppressed artifact of
-  a dead parent, not this device's fault). No new storage; a device with zero outages
-  in the window still reports 100% up.
-- **Latency/loss trend** — `GET /api/analytics/trend?device_id=&days=` returns hourly
-  average-latency/loss/down-percentage buckets (30-day retention, pruned by a daily
-  background sweep), folded incrementally from each "full" report cycle's samples —
-  never a recheck, which would skew an hour's average with its rapid re-probe of just
-  the suspect subset.
-- **Escalation is restart-safe** — timers live in central's DB, not memory; a crash
-  can't drop them. A fresh DOWN pages owner+operator immediately; while it stays open,
-  an all-hands page (owner+operator+tech) fires every `WISP_ESCALATE_EVERY_MIN` with the
-  running duration. Acknowledgement doesn't stop the clock — only recovery does.
-- **Scales without lying** — probes fan out under a concurrency cap
-  (`WISP_MAX_INFLIGHT`) so a large fleet never exhausts file descriptors and fakes a mass
-  outage; aggregation gear (towers/switches/APs) is probed *gently*
-  (`WISP_PINGS_PER_POLL_INFRA`) so its control-plane ICMP rate-limiter doesn't read as
-  phantom loss.
-- **Multi-tenant, always.** Central is keyed by tenant; an org user only ever sees their
-  own org's devices/team/outages. A superadmin sees all and can narrow with `?tenant=`.
-
-## Central server + edge setup
-
-Run the central server (its own SQLite at `WISP_CENTRAL_DB`), bootstrap accounts, then
-point an edge at it:
 ```bash
 WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py --host 0.0.0.0 --port 8443
-PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you   # then log in at /
+PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you
 PYTHONPATH=src python -m wisp.central.admin create-user --tenant ispA --username asha --role owner
-# the read API also accepts the bearer token (curl / automation), treated as a cross-tenant reader:
-curl -H 'Authorization: Bearer s3cret' 'http://HOST:8443/api/devices?tenant=ispA'
-```
-```bash
-# the wire itself — same env vars whether wisp-edge.service launches this via the
-# supervisor (see "Fleet deploy" below) or you're running it directly for local dev:
+
 WISP_CENTRAL_BRAIN=1 WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
 WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
 ```
-Put the central server behind a TLS terminator (nginx/Caddy) in production, or let central
-terminate TLS itself (see "mTLS enrollment" below) — either works; it speaks plain HTTP only
-when neither is configured, to stay dependency-free by default.
 
-**mTLS enrollment** (replaces the bearer-token-only stopgap; either still works standalone,
-and both can be set at once during a migration):
+Put a TLS terminator (nginx/Caddy) in front of central, or let it terminate TLS itself
+via `WISP_CENTRAL_TLS_CERT`/`_KEY` (+ `WISP_CENTRAL_CLIENT_CA` for mTLS). Plain HTTP by
+default to stay dependency-free.
+
+**mTLS enrollment** (alternative to the bearer token; either or both can be active):
 ```bash
 PYTHONPATH=src python -m wisp.central.admin init-ca --host central.example.net
 PYTHONPATH=src python -m wisp.central.admin enroll-edge --tenant ispA --node edge-a1
 ```
-`init-ca` creates a small internal CA (via `openssl` — no new Python dependency) plus
-central's own server cert, and prints the `WISP_CENTRAL_TLS_CERT`/`_KEY`/`_CLIENT_CA` env
-vars to set on central. `enroll-edge` issues one client cert per edge and prints the
-`WISP_CENTRAL_CLIENT_CERT`/`_KEY`/`WISP_CENTRAL_CA_CERT` vars to set on that edge box. Once
-`WISP_CENTRAL_CLIENT_CA` is set, a verified client cert satisfies ingest auth as an
-alternative to the bearer token — set both during rollout, drop the token fleet-wide once
-every edge is enrolled.
+Each command prints the env vars to set on its respective side.
 
-**Fleet deploy + self-update.** Every edge — an ISP's first node or its fifth — ships as
-a **frozen single binary** (PyInstaller — no Python/venv on the box); a small stable
-**supervisor** runs the agent and owns `download → verify(sha256) → atomic-swap →
-restart → health-gate → rollback`. Central is the **version authority** with a staged,
-health-gated rollout — a canary subset updates first and the rollout auto-promotes only
-once the canaries come back healthy on the target, else it auto-halts:
+**Fleet deploy + self-update.** Every edge ships as a frozen binary (PyInstaller); a
+small supervisor owns `download → verify(sha256[+minisign]) → atomic-swap → restart →
+health-gate → rollback`. Central is the version authority with a staged, canary-first,
+health-gated rollout:
 ```bash
 PYTHONPATH=src python -m wisp.central.admin publish-release --version 0.11.0 \
     --artifact linux-amd64 https://.../wisp-edge-linux-amd64 <sha256>
 PYTHONPATH=src python -m wisp.central.admin start-rollout --tenant ispA --version 0.11.0 --canary edge-a1
 PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
 ```
-Linux install is `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
-(`deploy/install-edge.sh`: arch-detect → download → **verify sha256** (+ minisign over
-`SHA256SUMS` if published) → systemd unit → ICMP sysctl). The Windows install is
-`deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`: download → **verify
-sha256** (+ Authenticode if the binaries are signed) → install under Program Files →
-Scheduled Task running the **supervisor** (not the agent directly) as SYSTEM. Both are
-the *only* supported install path — there's no separate single-box mode to choose
-between; an ISP running one node and an ISP running fifty install the same way. CI
-(`.github/workflows/release.yml`) builds + tests on every push/PR and, **only on a `v*`
-tag**, signs/packages/publishes a Release with a version manifest central ingests:
-- **Authenticode** (Windows `.exe`s, in the `build` job, gated on the
-  `WINDOWS_CODESIGN_PFX`/`WINDOWS_CODESIGN_PASSWORD` secrets) — embedded per-binary so
-  SmartScreen/AV and `install-edge.ps1`'s `Get-AuthenticodeSignature` check see a real chain.
-- **minisign** (all platforms, in the `release` job, gated on the `MINISIGN_KEY` secret — a
-  **password-less** secret key, `minisign -G -W`, since CI has no terminal for a passphrase
-  prompt) signs the assembled `SHA256SUMS` **once**; every artifact is already sha256-checked
-  against that file, so one signature covers all of them transitively. Commit the public half
-  to `deploy/minisign.pub` once you've generated a real keypair — neither installer treats a
-  missing key/signature as fatal (an unsigned release still verifies by sha256 alone, same as
-  before this existed), but both hard-fail if a signature IS published and doesn't verify.
-Both signing steps are **no-ops until their secrets are set** (so forks/PRs still build
-unsigned) — see `plan.md` item 5 for what's still needed to actually turn them on (real keys,
-validating the signed artifacts on real hardware).
+Install: `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
+(`deploy/install-edge.sh`) or `deploy/install-edge.ps1` on Windows — see "Going live"
+below. Both are the only supported install path (no separate single-box mode). CI
+(`.github/workflows/release.yml`) builds+tests every push/PR; on a `v*` tag it also
+signs (Authenticode on Windows binaries, minisign over `SHA256SUMS`) — no-ops until
+`WINDOWS_CODESIGN_PFX`/`MINISIGN_KEY` secrets are set, so unsigned forks/PRs still build.
 
 ## Configuration (env vars, all optional)
 
+Full list + defaults: `src/wisp/config.py`. The ones worth knowing up front:
+
 | Var | Default | Meaning |
 |---|---|---|
-| `WISP_POLL_INTERVAL_S` | `60` | seconds between polls (steady-state cadence; see fast-confirm below) |
-| `WISP_RETRY_INTERVAL_S` | `2` | fast-confirm: re-probe a named suspect every Ns until central confirms/clears it (0 = off) |
-| `WISP_POLL_INTERVAL_ADAPTIVE` | `0` | `1` = poll faster on a small fleet (see below) |
-| `WISP_POLL_INTERVAL_SMALL_S` | `30` | cadence used while the fleet ≤ `WISP_SMALL_FLEET_MAX` (adaptive on) |
-| `WISP_SMALL_FLEET_MAX` | `1000` | fleet size at/below which the small cadence applies |
-| `WISP_PINGS_PER_POLL` | `5` | echoes per poll for leaf devices (CPEs) |
-| `WISP_PINGS_PER_POLL_INFRA` | `2` | echoes per poll for aggregation gear (any device that is a parent) |
-| `WISP_MAX_INFLIGHT` | `256` | max concurrent probes in flight (0 = unbounded); caps FD use at scale |
-| `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = off); independent of the ICMP poll cadence |
-| `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks a *monitored* port needs before central alarms it |
-| `WISP_SNMP_ALERTS` | `1` | `0` = mute the operator port-down page (the `switch_ports` state is still written) |
-| `WISP_SNMP_BW_CONSECUTIVE` | `3` | consecutive below-threshold walks before central alarms a monitored port's low bandwidth |
-| `WISP_SNMP_BW_ALERTS` | `1` | `0` = mute the operator low-bandwidth page (the rate is still recorded) |
-| `WISP_SNMP_TIMEOUT_S` | `2.0` | per-switch SNMP request timeout (a dead switch must never block the ICMP cycle) |
-| `WISP_PERF_ALERTS` | `1` | `0` = mute the operator slow-link page (the `device_perf` badge is still written); the baseline math's own tunables (`WISP_PERF_WINDOW`/`_MIN_SAMPLES`/`_CONSECUTIVE`/`_DEVIATION_FACTOR`/`_MAD_K`/`_MIN_BASELINE_MS`/`_MIN_JITTER_MS`) rarely need changing from `config.py`'s defaults |
-| `WISP_BACKUP_ALERTS` | `1` | `0` = mute the operator on-backup page (the `device_redundancy` badge is still written) |
+| `WISP_POLL_INTERVAL_S` | `60` | steady-state seconds between polls |
+| `WISP_RETRY_INTERVAL_S` | `2` | fast-confirm re-probe interval (`0` = off) |
+| `WISP_PINGS_PER_POLL` / `_INFRA` | `5` / `2` | echoes per poll: leaf CPE / aggregation gear |
+| `WISP_MAX_INFLIGHT` | `256` | concurrent probe cap (`0` = unbounded) |
+| `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (`0` = off) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
-| `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
-| `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
-| `WISP_CENTRAL_BRAIN` | `0` | `1` = run the edge as a thin probe (needs `WISP_CENTRAL_URL` too — this is the only mode) |
-| `WISP_CENTRAL_URL` | — | central base URL the edge probes report to |
-| `WISP_CENTRAL_TOKEN` | — | bearer token the edge presents / central requires for ingest (coexists with mTLS below — either satisfies auth) |
-| `WISP_CENTRAL_CLIENT_CERT` / `_KEY` / `WISP_CENTRAL_CA_CERT` | — | edge's mTLS client cert/key (from `enroll-edge`) + the CA to verify central's server cert against |
-| `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity central keys records by |
-| `WISP_CENTRAL_DB` / `WISP_CENTRAL_BIND` / `WISP_CENTRAL_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central server store + listen address |
-| `WISP_CENTRAL_TLS_CERT` / `_KEY` | — | central's own TLS server cert/key; both empty (default) = plain HTTP, unchanged from before mTLS existed |
-| `WISP_CENTRAL_CLIENT_CA` | — | CA to verify a presented edge client cert against (mTLS); empty = ingest stays bearer-token-only even over HTTPS |
-| `WISP_CENTRAL_PKI_DIR` | `data/pki` | where `central.admin init-ca`/`enroll-edge` read/write the CA + issued certs |
-| `WISP_CENTRAL_NODE_STALE_S` | `180` | central pages an org when a node's heartbeat is older than this (box dead / WAN cut) |
-| `WISP_CENTRAL_NTFY_TOPIC` | `wisp-central` | fallback fleet-watchdog topic when an org has set none |
-| `WISP_ROLLOUT_HEALTH_WINDOW_S` | `600` | how long a canary has to come back healthy on the target before the rollout auto-halts |
-| `WISP_AGENT_HEALTH_DEADLINE_S` | `300` | how long a freshly-swapped agent has to prove healthy before the supervisor rolls back |
-| `WISP_VERSION` | — | override the reported build version (CI stamps it from `git describe`) |
+| `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages |
+| `WISP_CENTRAL_BRAIN` / `_URL` / `_TOKEN` | `0` / — / — | edge mode switch + central address + ingest auth |
+| `WISP_CENTRAL_CLIENT_CERT`/`_KEY`/`_CA_CERT` | — | edge's mTLS identity (from `enroll-edge`) |
+| `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity |
+| `WISP_CENTRAL_DB` / `_BIND` / `_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central store + listen address |
+| `WISP_CENTRAL_TLS_CERT`/`_KEY`/`_CLIENT_CA` | — | central-terminated TLS + mTLS verification |
+| `WISP_CENTRAL_NODE_STALE_S` | `180` | fleet-watchdog staleness threshold |
 
-**Config is env-var only** — every tunable is read once at startup into the frozen
-`Config` (`config.py` has the full list + defaults). There is no in-UI settings page and
-no DB config layer: change a value by exporting the env var and restarting the edge
-probe. Per-org alert topics, device topology, and team *are* live in the central
-dashboard; process-level tunables above are not.
+Config is env-var only, read once at startup into the frozen `Config` — no in-UI
+settings page. Device topology, team, and per-org alert routing *are* live in the
+central dashboard.
 
-**How fast we detect DOWN.** DOWN still needs 3 consecutive 100%-loss samples (flap
-suppression), but those samples don't wait a full poll interval each: central's
-fast-confirm reply names the suspect IP and the edge re-probes it every
-`WISP_RETRY_INTERVAL_S` until confirmed or cleared — detection in seconds, not
-`down_consecutive × poll_interval`. Set `WISP_RETRY_INTERVAL_S=0` to disable it.
+## Going live (deploying an edge node)
 
-## Going live (deploying a node)
+A **native install, not Docker** — this is a network monitor that wants the host's real
+network stack; a container would need `network_mode: host` plus the ping-group sysctl
+just to ping correctly, buying no real isolation for an extra moving part.
 
-An ISP can run one node or many — the install path is the same either way:
-
-1. On the edge box:
+1. On the edge box, run the fleet installer with your enrollment token:
    ```bash
    curl -fsSL https://YOUR-CENTRAL/install-edge.sh | sudo sh -s -- \
        --central https://central.example.net --token <ENROLL> --tenant ispA --node edge-a1
    ```
-   (Windows: `deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`.) This
-   installs the frozen agent + supervisor, writes identity/config to `/etc/wisp`
-   (untouched by future updates), enables unprivileged ICMP, and starts the service —
-   see "Fleet deploy + self-update" above for exactly what it verifies.
-2. From the **central** dashboard: enter the real device inventory + topology (Nodes),
-   add your team (Team), set the three role ntfy topics (Settings) and confirm routing
-   with **Send test alert**.
-3. Tune thresholds/cadence (`WISP_POLL_INTERVAL_S`, etc.) in `/etc/wisp/edge.env` against
-   how the real links actually blip, then restart the service.
-4. Adding a second (third, tenth…) node for the same ISP is the same one-liner with a
-   different `--node`; central tells each one what to probe, so nothing about step 1
-   changes as the fleet grows.
+   (Windows: `deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`, run
+   elevated.) This detects arch, verifies sha256 (+ minisign/Authenticode if published),
+   installs the agent + supervisor under `/opt/wisp` (`Program Files` on Windows),
+   writes identity/config to `/etc/wisp` (untouched by future updates), enables
+   unprivileged ICMP, and starts the service — `wisp-edge.service` on Linux runs the
+   **supervisor**, not the agent directly, so it can self-update. On Windows there's no
+   unprivileged-ICMP path (no ping-group, no datagram sockets), so icmplib needs raw
+   sockets — that's why the Scheduled Task runs as SYSTEM. Not verified on real Windows
+   hardware from this repo; smoke-test before trusting it.
+2. In central's dashboard: enter real topology (Nodes), team (Team), role ntfy topics
+   (Settings), confirm with **Send test alert**.
+3. Tune cadence/thresholds in `/etc/wisp/edge.env` against real link behavior, then
+   restart the service (`systemctl restart wisp-edge`). Agent version bumps instead flow
+   through the supervisor's self-update — no manual restart needed for those. Device
+   topology changes apply within one poll cycle with no edge restart at all.
+4. Additional nodes for the same ISP repeat step 1 with a different `--node` — central
+   tells each one what to probe.
+
+## Incident post-mortem (template)
+
+Use one write-up per significant outage — the dashboard already captures root
+cause/resolution notes on its *Pending post-mortem* card; this is for the longer human
+narrative on repeat offenders or multi-site events. Copy this list per incident:
+
+- **Summary** — incident ID, date/time (UTC), duration (down → restored), site(s),
+  severity, who acknowledged.
+- **What happened** — short narrative: what was seen, when the alert fired, who
+  responded.
+- **Detection** — how it was found (dashboard/ntfy); did the FSM classify it correctly
+  (the engine never guesses cause — that's operator-entered at resolution only).
+- **Timeline** — first 100%-loss poll → DOWN confirmed/alert sent → acknowledged →
+  root cause found → restored.
+- **Root cause** — what actually broke (power / fiber-backhaul / hardware /
+  weather-RF / other) and why; note if topology suppression helped or misled.
+- **Resolution** — what the technician did to restore service.
+- **Follow-ups** — preventive action; threshold/topology tuning if the FSM
+  mis-classified; inventory fix in the dashboard if metadata was wrong.

@@ -152,7 +152,7 @@ class Config:
     # A monitored port-down/restored always updates switch_ports; this gates whether
     # central actually PAGES the operator about it (state is written either way).
     snmp_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_ALERTS", True))
-    # --- Per-port bandwidth (throughput) low-threshold alarm (plan.md item 3) -----
+    # --- Per-port bandwidth (throughput) low-threshold alarm (CLAUDE.md item 3) -----
     # Orthogonal to oper/admin status: each walk reads the 64-bit byte counters and
     # central diffs them into a rate (bits/sec). A monitored port whose rate falls
     # below its operator-assigned threshold for this many consecutive walks alarms —
@@ -163,7 +163,7 @@ class Config:
     # Gate the low-bandwidth page (the switch_ports bw state is always written).
     snmp_bw_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_BW_ALERTS", True))
 
-    # --- State-machine thresholds (see plan.md §"State machine") -------------
+    # --- State-machine thresholds (see CLAUDE.md §"State machine") -------------
     latency_threshold_ms: float = field(
         default_factory=lambda: _env_float("WISP_LATENCY_MS", 150.0)
     )
@@ -219,7 +219,7 @@ class Config:
     # fallback/coexistence path, not the only option): a per-node shared secret sent as
     # `Authorization: Bearer <token>`. Keep it out of logs.
     central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
-    # --- mTLS enrollment (plan.md item 6) — the edge's half -------------------
+    # --- mTLS enrollment (CLAUDE.md item 6) — the edge's half -------------------
     # Client identity for the ingest TLS handshake, issued by `central.admin
     # enroll-edge` (see central/pki.py). Empty ⇒ the edge presents no client cert and
     # falls back to the bearer token above — both can be set at once during a
@@ -252,7 +252,7 @@ class Config:
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
-    # --- mTLS enrollment (plan.md item 6) — central's half --------------------
+    # --- mTLS enrollment (CLAUDE.md item 6) — central's half --------------------
     # Central's own TLS identity. Both empty (the default) ⇒ central serves plain
     # HTTP exactly as before — fully backward compatible; every existing deploy and
     # test keeps working unchanged. Set both to switch the listener to HTTPS (a cert

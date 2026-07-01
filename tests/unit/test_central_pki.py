@@ -1,4 +1,4 @@
-"""Tests for the internal mTLS CA (plan.md item 6, central/pki.py). Real `openssl`
+"""Tests for the internal mTLS CA (CLAUDE.md item 6, central/pki.py). Real `openssl`
 subprocess calls against a tmp dir (no network, no server) — skipped if `openssl` isn't
 on PATH, mirroring how the rest of the suite skips real-network/real-hardware paths.
 

@@ -495,21 +495,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # Escalation sweeping is time-gated (due_at) and idempotent, but a recheck
                 # burst can fire several rounds a second — no need to re-check on every one.
                 disp.sweep(ts)
-                # SNMP port folding (plan.md item 1): only a "full" report carries a
+                # SNMP port folding (CLAUDE.md item 1): only a "full" report carries a
                 # `ports` key (the edge's own slow SNMP cadence, independent of ICMP's
                 # poll_interval_s — see apps/daemon/main.py's _gather_snmp_ports), run
                 # AFTER the ICMP cycle commits so open_outage_id reflects this cycle's
                 # outages, not last cycle's.
                 self._ingest_ports(tenant, eng, env.get("ports"), ts)
-                # Hourly latency/loss trend rollup (plan.md item 2, second slice) — full
+                # Hourly latency/loss trend rollup (CLAUDE.md item 2, second slice) — full
                 # reports only, so a recheck's rapid re-probe of a suspect subset never
                 # skews an hour's average.
                 central_rollup.record_cycle(store, tenant, eng, cycle, results, ts)
-                # Per-link performance baseline (plan.md item 3) — same full-report-only
+                # Per-link performance baseline (CLAUDE.md item 3) — same full-report-only
                 # gating; a recheck's suspect subset isn't a meaningful perf sample.
                 central_perf.record_and_evaluate(store, tenant, eng, cycle, results, ts,
                                                  notifier, cfg)
-                # On-backup redundancy signal (plan.md item 3) — cycle.redundancy is
+                # On-backup redundancy signal (CLAUDE.md item 3) — cycle.redundancy is
                 # only ever populated on a full pass (see MonitorEngine.process_cycle),
                 # so this is a no-op on a recheck even without the mode gate above.
                 central_redundancy.sweep(store, tenant, eng, cycle.redundancy,
@@ -749,7 +749,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     tenant, pid, clean["threshold_mbps"], clean["direction"])
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
-            # graph topology: backup (redundancy) parent edges (plan.md item 3)
+            # graph topology: backup (redundancy) parent edges (CLAUDE.md item 3)
             if route == "/api/inventory/links":
                 child_id = int(body.get("child_id") or 0)
                 parent_id = int(body.get("parent_id") or 0)

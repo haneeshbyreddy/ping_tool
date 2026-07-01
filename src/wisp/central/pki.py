@@ -1,4 +1,4 @@
-"""A minimal internal CA for edge<->central mTLS enrollment (plan.md item 6),
+"""A minimal internal CA for edge<->central mTLS enrollment (CLAUDE.md item 6),
 replacing the bearer-token stopgap.
 
 Deliberately shells out to the `openssl` CLI rather than adding `cryptography` as a

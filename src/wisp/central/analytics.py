@@ -1,4 +1,4 @@
-"""Central-side historical analytics (plan.md item 2, first slice): outage-history-
+"""Central-side historical analytics (CLAUDE.md item 2, first slice): outage-history-
 derived downtime/uptime/SLA reporting.
 
 Deliberately scoped to what the EXISTING `outages` table can already answer — "how
@@ -9,7 +9,7 @@ full outage history (nothing prunes it in central-brain mode).
 
 What this does NOT do: a latency/packet-loss TREND chart. `device_states` only holds
 each device's latest sample (overwritten every cycle, not a history), so a trend line
-needs its own time-series storage — and plan.md flags the rollup granularity/retention
+needs its own time-series storage — and CLAUDE.md flags the rollup granularity/retention
 call as a still-open product decision. Don't conflate the two; this module answers "was
 it down, and for how long", not "how has its latency looked over time".
 """

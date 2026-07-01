@@ -1,4 +1,4 @@
-"""mTLS enrollment end-to-end over a REAL TLS socket (plan.md item 6) — mirrors
+"""mTLS enrollment end-to-end over a REAL TLS socket (CLAUDE.md item 6) — mirrors
 tests/integration/test_central_brain.py's ReportEndpointTest style (real
 `make_server` + `http.client`, no mocking of the auth path), but with the listener
 actually wrapped in TLS via `central/pki.py`'s issued certs. Skipped if `openssl`

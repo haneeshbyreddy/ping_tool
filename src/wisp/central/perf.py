@@ -1,4 +1,4 @@
-"""Central-side per-link performance baseline (plan.md item 3).
+"""Central-side per-link performance baseline (CLAUDE.md item 3).
 
 Reuses `core/baseline.py`'s pure median+MAD deviation math (`evaluate_perf`) verbatim —
 identical to the old single-box edge's soft "slow link" signal: a link running well

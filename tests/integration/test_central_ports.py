@@ -180,7 +180,7 @@ class CentralPortMonitorTest(unittest.TestCase):
 
 
 class BandwidthTest(unittest.TestCase):
-    """Per-port throughput (plan.md item 3): counter-delta rate math, flap-suppressed
+    """Per-port throughput (CLAUDE.md item 3): counter-delta rate math, flap-suppressed
     below-threshold alarm, direction selection, recovery, the alerts gate, and the
     silent clear when a bw-alarmed port goes down. Mirrors the old single-box
     test_ports.py's BandwidthTest one-for-one."""

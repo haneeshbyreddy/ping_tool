@@ -7,7 +7,7 @@ pure function of a payload + the tenant's current parent map), so it lives here,
 unit-testable without a DB — exactly like the edge's SNMP-payload cleaner.
 
 `clean_device_payload`'s cycle check walks the PRIMARY parent chain only — a device's
-`parent_device_id`. `clean_backup_link` (plan.md item 3) is the sibling validator for the
+`parent_device_id`. `clean_backup_link` (CLAUDE.md item 3) is the sibling validator for the
 EXTRA redundancy edge (`org_device_links`, kind='backup'): its cycle check walks the FULL
 edge set (primary + existing backups), mirroring the old single-box `add_backup_link`.
 `parents`/`backups` must already be scoped to one tenant — the caller

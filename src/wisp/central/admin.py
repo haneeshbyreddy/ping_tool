@@ -13,7 +13,7 @@ rest (org users, team, attendance) from the console.
 A password may be passed with --password or, more safely, omitted to be prompted (no shell
 history). The central DB is WISP_CENTRAL_DB (env), same as the server.
 
-mTLS enrollment (plan.md item 6 — replaces the bearer-token stopgap; see central/pki.py):
+mTLS enrollment (CLAUDE.md item 6 — replaces the bearer-token stopgap; see central/pki.py):
 
     PYTHONPATH=src python -m wisp.central.admin init-ca --host central.example.net
     PYTHONPATH=src python -m wisp.central.admin enroll-edge --tenant ispA --node edge-a1

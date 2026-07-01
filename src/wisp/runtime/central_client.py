@@ -39,7 +39,7 @@ class HttpCentralClient:
         self.tenant_id = cfg.tenant_id
         self.node_id = cfg.node_id
         self.timeout = cfg.ship_timeout_s
-        # mTLS enrollment (plan.md item 6): a cert issued by `central.admin enroll-edge`.
+        # mTLS enrollment (CLAUDE.md item 6): a cert issued by `central.admin enroll-edge`.
         # Coexists with the bearer token above — central accepts either, so setting
         # these isn't a hard cutover off the token (see central/server.py's `_ingest_ok`).
         self.client_cert = cfg.central_client_cert
