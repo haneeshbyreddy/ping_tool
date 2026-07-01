@@ -30,6 +30,11 @@ from wisp.config import CONFIG, Config  # noqa: E402
 from wisp.database.client import connect, migrate, transaction, write_with_retry
 from wisp.database.outbox import enqueue_events
 from wisp.egress.shipper import start_shipper_thread
+from wisp.runtime.central_client import (
+    CentralBrainClient,
+    CentralClientError,
+    build_central_client,
+)
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.core.rollup import roll_up
 from wisp.ingress.probers import PingResult, Prober, build_prober
@@ -396,6 +401,155 @@ async def _between_cycle_watch(
             dispatcher.sweep(ts)
 
 
+# --- New-architecture Phase B: central-brain mode (WISP_CENTRAL_BRAIN=1) ----------------
+# The edge becomes a thin probe: no local MonitorEngine, no local AlertDispatcher, no
+# local outages/alert_log — it only learns what to ping (from central's GET
+# /edge/devices) and reports the raw per-IP samples (POST /report). Everything below this
+# banner is a SEPARATE loop from run_cycle/run_forever above; central_brain_enabled()
+# picks one or the other in main(), and the standalone + Phase-10 paths are byte-for-byte
+# unchanged (see config.py's central_brain_mode docstring).
+#
+# Deliberately NOT ported to this mode yet (v1 scope — see CLAUDE.md): fast-confirm /
+# between-cycle watch (their whole point is accelerating a LOCAL FSM's confirmation; there
+# is no local FSM here, and the round-trip hint central would need to send back
+# — "recheck this device" — isn't built), the hourly rollup/prune sweeps (nothing is
+# written locally to roll up or prune), and SNMP. Detection latency in this mode is
+# `poll_interval_s × down_consecutive` (central's engine still enforces the same
+# consecutive-sample hysteresis — it just only gets one new sample per report).
+
+def _gentle_probe_plan(devices: list[dict], canary_ip: str, cfg: Config) -> dict[str, int]:
+    """Per-IP ping count, mirroring `MonitorEngine.probe_plan()`'s gentle-infra rule
+    (any node that is somebody's parent gets fewer echoes so a switch/tower's ICMP
+    rate-limiter doesn't read as phantom loss) — computed client-side from the
+    central-supplied topology since there's no local engine to ask. No backup edges yet
+    (Phase A/B org_devices has primary-only parents), so this is exactly the primary-chain
+    case of the real probe_plan."""
+    parent_ids = {d["parent_device_id"] for d in devices if d["parent_device_id"] is not None}
+    plan = {d["ip_address"]: (cfg.pings_per_poll_infra if d["id"] in parent_ids
+                              else cfg.pings_per_poll)
+            for d in devices}
+    plan[canary_ip] = cfg.pings_per_poll
+    return plan
+
+
+def _pings_payload(results: dict[str, PingResult]) -> dict:
+    return {
+        ip: {"loss_pct": r.packet_loss, "latency_ms": r.latency_ms, "jitter_ms": r.jitter_ms}
+        for ip, r in results.items()
+    }
+
+
+async def _follow_recheck(
+    prober: Prober, client: CentralBrainClient, reply: dict, cfg: Config,
+) -> None:
+    """The fast-confirm round trip: while central's reply carries a `recheck` hint
+    (from `central/engine.py:compute_recheck`), re-probe JUST those suspect IPs with a
+    single fast echo — mirrors the standalone daemon's `_confirm_down`/`_confirm_up`
+    re-probing suspects every `retry_interval_s`, except the FSM advancing them lives on
+    central now, not here. `compute_recheck` guarantees this terminates on its own (a
+    suspect leaves the hint the moment it confirms or clears), but a fixed round cap
+    guards against a central-side bug ever wedging the probe loop."""
+    rounds = 0
+    cap = max(cfg.down_consecutive, cfg.recover_consecutive) + 2   # generous safety margin
+    recheck = reply.get("recheck")
+    while recheck and rounds < cap:
+        interval = recheck.get("interval_s") or cfg.retry_interval_s
+        ips = sorted(set(recheck.get("down_ips") or []) | set(recheck.get("up_ips") or []))
+        if interval <= 0 or not ips:
+            return
+        await asyncio.sleep(interval)
+        counts = {ip: 1 for ip in ips}   # single fast echo — see _confirm_down's comment
+        probe_res = await _gather_pings(
+            prober, ips, counts, max_inflight=cfg.probe_max_inflight
+        )
+        try:
+            reply = client.report(_pings_payload(probe_res), _utc_now_iso(), mode="recheck")
+        except CentralClientError as exc:
+            log.warning("central recheck report failed: %s", exc)
+            return
+        recheck = reply.get("recheck")
+        rounds += 1
+
+
+async def run_cycle_central_brain(
+    prober: Prober, client: CentralBrainClient, devices: list[dict], canary_ip: str,
+    cfg: Config = CONFIG,
+) -> None:
+    """One central-brain cycle: probe this tenant's topology (+ canary), report the raw
+    results, then follow any fast-confirm hint central sends back. All detection/alerting
+    happens on central — this function has no opinion on UP/DOWN, it just samples,
+    ships, and (if asked) re-samples the suspects a few seconds later."""
+    prober.on_cycle_start()
+    ts = _utc_now_iso()
+    plan = _gentle_probe_plan(devices, canary_ip, cfg)
+    results = await _gather_pings(
+        prober, sorted(plan), plan, max_inflight=cfg.probe_max_inflight
+    )
+    try:
+        reply = client.report(_pings_payload(results), ts)
+    except CentralClientError as exc:
+        # A WAN cut or a dead central must never crash the probe loop — just skip this
+        # report and try again next cycle (mirrors the shipper's own isolation).
+        log.warning("central report failed: %s", exc)
+        return
+    if cfg.retry_interval_s > 0:
+        await _follow_recheck(prober, client, reply, cfg)
+
+
+async def run_forever_central_brain(
+    cfg: Config = CONFIG, *, interval: float | None = None, max_cycles: int | None = None,
+) -> None:
+    client = build_central_client(cfg)
+    prober = build_prober(cfg)
+    preflight = getattr(prober, "preflight", None)
+    if preflight is not None:
+        try:
+            await preflight()
+        except RuntimeError as exc:
+            log.error("prober preflight failed — refusing to start: %s", exc)
+            raise SystemExit(2)
+
+    try:
+        topo = client.fetch_devices()
+    except CentralClientError as exc:
+        log.error("could not fetch the device list from central — refusing to start: %s", exc)
+        raise SystemExit(2)
+    devices = topo.get("devices") or []
+    canary_ip = topo.get("canary_ip") or cfg.canary_ip
+
+    cli_interval = interval
+    interval = cli_interval if cli_interval is not None else cfg.effective_interval(len(devices))
+    print(
+        f"central-brain mode: probing {len(devices)} device(s) for "
+        f"{cfg.tenant_id}/{cfg.node_id} every {interval}s -> {cfg.central_url} "
+        f"[prober={cfg.prober}] (Ctrl-C to stop)"
+    )
+
+    cycle = 0
+    while max_cycles is None or cycle < max_cycles:
+        # Topology hot-reload: re-fetch each cycle (like the standalone daemon's own
+        # device-set reload) so a central-side add/remove/reparent applies without a
+        # restart. A hiccup keeps the last-known set rather than probing nothing.
+        if max_cycles is None:
+            try:
+                topo = client.fetch_devices()
+                devices = topo.get("devices") or devices
+                canary_ip = topo.get("canary_ip") or canary_ip
+            except CentralClientError as exc:
+                log.warning("topology refresh failed, probing last-known set: %s", exc)
+        started = asyncio.get_running_loop().time()
+        try:
+            await run_cycle_central_brain(prober, client, devices, canary_ip, cfg)
+        except Exception:
+            log.exception("central-brain cycle %d failed; continuing", cycle + 1)
+        cycle += 1
+        print(f"cycle {cycle:>3} | reported {len(devices)} device(s) to central")
+        if max_cycles is not None and cycle >= max_cycles:
+            break
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+
 async def snmp_cycle(poller: SnmpPoller, port_monitor: PortMonitor,
                      cfg: Config = CONFIG) -> None:
     """One SNMP pass: walk every snmp-enabled switch's ifTable and fold/alert monitored
@@ -592,11 +746,32 @@ def main() -> None:
         except (AttributeError, ValueError):
             pass
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every ntfy POST
+
+    # One logical poller per (db OR tenant/node): two pollers racing the same target
+    # double-detect and double-page (in central-brain mode, double-*report*, which is
+    # wasteful and confusing even though central's ingest is idempotent per outage).
+    # An OS advisory lock refuses the second start (auto-released by the kernel on
+    # exit/crash — no stale pidfile to reap).
+    if CONFIG.central_brain_enabled():
+        # Central-brain mode makes no local DB writes at all, so there's no schema to
+        # migrate — the lock file is the only thing that needs a directory, and
+        # SingleInstance creates its own parent dir.
+        guard = SingleInstance(f"{CONFIG.db_path}.central-brain.lock")
+        try:
+            guard.acquire()
+        except AlreadyRunning as exc:
+            log.error("%s", exc)
+            raise SystemExit(3)
+        try:
+            asyncio.run(run_forever_central_brain(
+                interval=args.interval, max_cycles=args.cycles))
+        except KeyboardInterrupt:
+            print("\nstopped.")
+        finally:
+            guard.release()
+        return
+
     migrate()
-    # One logical poller per DB: each daemon has its own in-memory FSM, so a second
-    # one against the same DB independently confirms every outage and double-pages.
-    # An OS advisory lock next to the DB refuses the second start (auto-released by the
-    # kernel on exit/crash — no stale pidfile to reap).
     guard = SingleInstance(f"{CONFIG.db_path}.lock")
     try:
         guard.acquire()

@@ -13,6 +13,10 @@
              background:var(--panel); border-bottom:1px solid var(--line); }
     header h1 { font-size:16px; margin:0; color:var(--acc); }
     header .spacer { flex:1; }
+    .tabs { display:flex; gap:4px; padding:10px 20px 0; max-width:1100px; margin:0 auto; }
+    .tab { background:transparent; border:1px solid transparent; border-bottom:none;
+           border-radius:8px 8px 0 0; color:var(--mut); }
+    .tab.active { background:var(--panel); color:var(--fg); border-color:var(--line); }
     select, input, button { font:inherit; color:var(--fg); background:#0b1220;
              border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
     button { cursor:pointer; background:#1d4ed8; border-color:#1d4ed8; }
@@ -26,12 +30,14 @@
     table { width:100%; border-collapse:collapse; }
     th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
     th { color:var(--mut); font-weight:600; font-size:12px; }
-    .pill { padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+    .pill { padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; margin-right:4px; }
     .UP{background:#052e1a;color:var(--up)} .DOWN,.UNREACHABLE{background:#3f1212;color:var(--down)}
     .DEGRADED{background:#3a2a08;color:var(--deg)} .stale{background:#3f1212;color:var(--down)}
-    .ok{background:#052e1a;color:var(--up)}
+    .ok{background:#052e1a;color:var(--up)} .maint{background:#3a2a08;color:var(--deg)}
+    .muted-pill{background:#0b1220;color:var(--mut)}
     .muted { color:var(--mut); }
     .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    label { font-size:13px; }
     .login { max-width:340px; margin:12vh auto; }
     .login .card { display:grid; gap:10px; }
     .err { color:var(--down); min-height:18px; }

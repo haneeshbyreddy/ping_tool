@@ -1,0 +1,88 @@
+"""Phase B — the edge's half of "central runs the brain": learn what to probe from
+central, report raw per-IP results back. No FSM, no alerting — that's central/engine.py +
+central/dispatch.py on the other end (central/server.py's `GET /edge/devices` and
+`POST /report`).
+
+Mirrors the `egress/shipper.py` adapter discipline exactly: a tiny `Protocol` with one
+real impl (`HttpCentralClient`, httpx lazy-imported like `NtfyNotifier`/`HttpShipper`) so
+the daemon stays importable without the venv and tests inject a recording double — no real
+network to central in the suite.
+"""
+from __future__ import annotations
+
+from typing import Protocol
+
+from wisp.config import CONFIG, Config
+from wisp.egress.shipper import WIRE_V
+
+
+class CentralClientError(RuntimeError):
+    """A central call failed outright (network/HTTP/bad response). The caller decides
+    the fallback — refuse to start on the first fetch, or skip a cycle and retry next
+    tick; this never crashes the poll loop."""
+
+
+class CentralBrainClient(Protocol):
+    def fetch_devices(self) -> dict: ...
+    def report(self, pings: dict, ts: str, *, mode: str = "full") -> dict: ...
+
+
+class HttpCentralClient:
+    def __init__(self, cfg: Config = CONFIG) -> None:
+        self.base = cfg.central_url.rstrip("/")
+        self.token = cfg.central_token
+        self.tenant_id = cfg.tenant_id
+        self.node_id = cfg.node_id
+        self.timeout = cfg.ship_timeout_s
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def fetch_devices(self) -> dict:
+        """{'devices': [{'id','name','ip_address','region','parent_device_id'}, …],
+        'canary_ip': …} — this tenant's ISP-managed topology (org_devices), the thing the
+        edge now probes instead of a locally-configured device list."""
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover
+            raise CentralClientError(f"httpx missing: {exc}") from exc
+        try:
+            resp = httpx.get(f"{self.base}/edge/devices",
+                             params={"tenant_id": self.tenant_id},
+                             headers=self._headers(), timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except CentralClientError:
+            raise
+        except Exception as exc:
+            raise CentralClientError(str(exc)) from exc
+
+    def report(self, pings: dict, ts: str, *, mode: str = "full") -> dict:
+        """Ship one cycle's raw per-IP results ({ip: {loss_pct, latency_ms, jitter_ms}}).
+        `mode="full"` (default) is a normal poll; `mode="recheck"` carries samples for
+        ONLY the fast-confirm suspect IPs central named in a prior reply's `recheck` hint.
+        Either way central may reply with ANOTHER `recheck` hint
+        ({'recheck': {'down_ips','up_ips','interval_s'}}) — the caller
+        (apps/daemon/main.py's central-brain loop) follows it until a reply omits one."""
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover
+            raise CentralClientError(f"httpx missing: {exc}") from exc
+        env = {"v": WIRE_V, "tenant_id": self.tenant_id, "node_id": self.node_id,
+              "ts": ts, "mode": mode, "pings": pings}
+        try:
+            resp = httpx.post(f"{self.base}/report", json=env,
+                              headers=self._headers(), timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+        except CentralClientError:
+            raise
+        except Exception as exc:
+            raise CentralClientError(str(exc)) from exc
+
+
+def build_central_client(cfg: Config = CONFIG) -> CentralBrainClient:
+    return HttpCentralClient(cfg)

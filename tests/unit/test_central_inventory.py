@@ -1,0 +1,98 @@
+"""Tests for the pure central device-inventory validation (Phase A). No DB, no network —
+mirrors tests/unit/test_baseline.py.
+
+Run:  python -m unittest discover -s tests   (from the project root)
+"""
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
+
+from wisp.central.inventory import InventoryError, clean_device_payload, clean_snmp_payload
+
+
+class CleanDevicePayloadTest(unittest.TestCase):
+    def test_requires_name_and_ip(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload({"ip_address": "10.0.0.1"}, parents={}, device_id=None)
+        with self.assertRaises(InventoryError):
+            clean_device_payload({"name": "Tower"}, parents={}, device_id=None)
+
+    def test_rejects_bad_ip(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload({"name": "Tower", "ip_address": "not-an-ip"},
+                                 parents={}, device_id=None)
+
+    def test_rejects_bad_device_type(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "Tower", "ip_address": "10.0.0.1", "device_type": "spaceship"},
+                parents={}, device_id=None)
+
+    def test_accepts_valid_minimal_payload(self):
+        clean = clean_device_payload(
+            {"name": "Tower", "ip_address": "10.0.0.1"}, parents={}, device_id=None)
+        self.assertEqual(clean["name"], "Tower")
+        self.assertIsNone(clean["parent_device_id"])
+
+    def test_parent_must_exist(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "CPE", "ip_address": "10.0.0.2", "parent_device_id": 99},
+                parents={1: None}, device_id=None)
+
+    def test_self_parent_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "Tower", "ip_address": "10.0.0.1", "parent_device_id": 1},
+                parents={1: None}, device_id=1)
+
+    def test_cycle_rejected(self):
+        # 1 -> None (root), 2 -> 1. Making 1's parent 2 would close a loop.
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "Root", "ip_address": "10.0.0.1", "parent_device_id": 2},
+                parents={1: None, 2: 1}, device_id=1)
+
+    def test_valid_parent_accepted(self):
+        clean = clean_device_payload(
+            {"name": "CPE", "ip_address": "10.0.0.3", "parent_device_id": 1},
+            parents={1: None}, device_id=None)
+        self.assertEqual(clean["parent_device_id"], 1)
+
+    def test_cross_tenant_id_looks_like_missing_parent(self):
+        # `parents` is always scoped to one tenant by the caller — an id from another org
+        # simply isn't in the map, so it's rejected the same as any nonexistent id.
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "CPE", "ip_address": "10.0.0.3", "parent_device_id": 42},
+                parents={1: None}, device_id=None)
+
+
+class CleanSnmpPayloadTest(unittest.TestCase):
+    def test_disabled_needs_no_community(self):
+        clean = clean_snmp_payload({"snmp_enabled": 0})
+        self.assertEqual(clean["snmp_enabled"], 0)
+
+    def test_enabled_requires_community(self):
+        with self.assertRaises(InventoryError):
+            clean_snmp_payload({"snmp_enabled": 1})
+
+    def test_enabled_with_community_ok(self):
+        clean = clean_snmp_payload({"snmp_enabled": 1, "snmp_community": "public"})
+        self.assertEqual(clean["snmp_community"], "public")
+        self.assertEqual(clean["snmp_port"], 161)
+
+    def test_bad_version_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_snmp_payload({"snmp_enabled": 1, "snmp_community": "x", "snmp_version": "3"})
+
+    def test_bad_port_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_snmp_payload({"snmp_enabled": 1, "snmp_community": "x", "snmp_port": 70000})
+
+
+if __name__ == "__main__":
+    unittest.main()

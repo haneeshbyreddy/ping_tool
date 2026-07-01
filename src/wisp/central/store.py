@@ -29,9 +29,12 @@ from pathlib import Path
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orgs (
-    tenant_id  TEXT PRIMARY KEY,
-    name       TEXT,
-    ntfy_topic TEXT,                       -- per-org page target for the fleet watchdog
+    tenant_id        TEXT PRIMARY KEY,
+    name             TEXT,
+    ntfy_topic       TEXT,                 -- per-org page target for the fleet watchdog
+    ntfy_topic_owner    TEXT,              -- Phase A: per-role outage routing (Phase B pages these)
+    ntfy_topic_operator TEXT,
+    ntfy_topic_tech     TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS nodes (
@@ -128,6 +131,77 @@ CREATE TABLE IF NOT EXISTS org_attendance (
     day       TEXT NOT NULL,               -- UTC calendar day; presence = a row exists
     UNIQUE (worker_id, day)
 );
+-- Phase A — the ISP-managed device topology (the management plane an org builds from the
+-- central dashboard, independent of any edge). NOT the same table as `devices` above: that
+-- one is the edge-ingest global id map (Phase B/C will populate live state onto it via
+-- edge_local_id); this one is what the ISP configures by hand before any edge ever reports.
+CREATE TABLE IF NOT EXISTS org_devices (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id        TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    ip_address       TEXT NOT NULL,
+    device_type      TEXT,
+    region           TEXT,
+    parent_device_id INTEGER REFERENCES org_devices(id),
+    maintenance      INTEGER NOT NULL DEFAULT 0,
+    snmp_enabled     INTEGER NOT NULL DEFAULT 0,
+    snmp_version     TEXT NOT NULL DEFAULT '2c',
+    snmp_community   TEXT,
+    snmp_port        INTEGER NOT NULL DEFAULT 161,
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_org_devices_tenant ON org_devices(tenant_id, is_active);
+-- Phase B — central runs the brain. One MonitorEngine per tenant (central/engine.py)
+-- feeds off org_devices topology and commits here every report; this is the FSM output
+-- store the edge's `poll_results`/`devices.state` played on the standalone box.
+CREATE TABLE IF NOT EXISTS device_states (
+    device_id   INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    tenant_id   TEXT NOT NULL,
+    state       TEXT NOT NULL,          -- UP | DEGRADED | DOWN | UNREACHABLE
+    latency_ms  REAL,
+    packet_loss REAL,
+    jitter_ms   REAL,
+    updated_at  TEXT NOT NULL
+);
+-- Mirrors the edge's outages/alert_log/escalations one-for-one (same lifecycle, same
+-- escalation ladder in central/dispatch.py) but tenant-scoped, since central is the
+-- multi-tenant aggregation point now running detection for every org at once.
+CREATE TABLE IF NOT EXISTS outages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id        TEXT NOT NULL,
+    device_id        INTEGER NOT NULL REFERENCES org_devices(id),
+    started_at       TEXT NOT NULL,
+    resolved_at      TEXT,
+    final_state      TEXT NOT NULL,
+    acknowledged_by  TEXT,
+    acknowledged_at  TEXT,
+    root_cause       TEXT,
+    resolution_notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outages_open ON outages(tenant_id, device_id, resolved_at);
+CREATE TABLE IF NOT EXISTS alert_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id  TEXT NOT NULL,
+    outage_id  INTEGER,
+    device_id  INTEGER,
+    channel    TEXT,
+    recipient  TEXT,
+    sent_at    TEXT,
+    status     TEXT,
+    payload    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alert_log_outage ON alert_log(outage_id);
+CREATE TABLE IF NOT EXISTS escalations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id   TEXT NOT NULL,
+    outage_id   INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    due_at      TEXT NOT NULL,
+    executed_at TEXT,
+    UNIQUE (outage_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_escalations_due ON escalations(executed_at, due_at);
 -- Part D — the version authority. A published release + its per-platform signed artifacts,
 -- and one active staged rollout per org (canary subset first, promoted fleet-wide only after
 -- the canaries come back healthy on the target; auto-halts otherwise).
@@ -174,7 +248,19 @@ class CentralStore:
         self._write_lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._ensure_columns(conn, "orgs", (
+                ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_operator", "TEXT"),
+                ("ntfy_topic_tech", "TEXT")))
             conn.commit()
+
+    @staticmethod
+    def _ensure_columns(conn, table: str, coldefs: tuple[tuple[str, str], ...]) -> None:
+        """Add any of `coldefs` missing from `table` (name, SQL type) — a DB created before
+        a column existed doesn't get it from CREATE TABLE IF NOT EXISTS."""
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, sqltype in coldefs:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sqltype}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5.0)
@@ -292,13 +378,20 @@ class CentralStore:
 
     # --- org admin (Part C will surface this; available now for provisioning) ---
     def set_org(self, tenant_id: str, name: str | None = None,
-                ntfy_topic: str | None = None) -> None:
+                ntfy_topic: str | None = None, ntfy_topic_owner: str | None = None,
+                ntfy_topic_operator: str | None = None, ntfy_topic_tech: str | None = None
+                ) -> None:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             self._ensure_org(conn, tenant_id, now)
             conn.execute(
-                "UPDATE orgs SET name=COALESCE(?, name), ntfy_topic=COALESCE(?, ntfy_topic)"
-                " WHERE tenant_id=?", (name, ntfy_topic, tenant_id))
+                "UPDATE orgs SET name=COALESCE(?, name), ntfy_topic=COALESCE(?, ntfy_topic),"
+                " ntfy_topic_owner=COALESCE(?, ntfy_topic_owner),"
+                " ntfy_topic_operator=COALESCE(?, ntfy_topic_operator),"
+                " ntfy_topic_tech=COALESCE(?, ntfy_topic_tech)"
+                " WHERE tenant_id=?",
+                (name, ntfy_topic, ntfy_topic_owner, ntfy_topic_operator, ntfy_topic_tech,
+                 tenant_id))
             conn.commit()
 
     def org_topic(self, tenant_id: str) -> str | None:
@@ -307,10 +400,24 @@ class CentralStore:
                                (tenant_id,)).fetchone()
         return row["ntfy_topic"] if row else None
 
+    def org_role_topic(self, tenant_id: str, role: str) -> str | None:
+        """The org's ntfy topic for one alert role (owner/operator/tech) — Phase B's
+        AlertDispatcher will route pages through this; Phase A's Settings page + test-alert
+        use it now."""
+        col = {"owner": "ntfy_topic_owner", "operator": "ntfy_topic_operator",
+               "tech": "ntfy_topic_tech"}.get(role)
+        if not col:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT {col} FROM orgs WHERE tenant_id=?",
+                               (tenant_id,)).fetchone()
+        return row[col] if row else None
+
     def orgs(self) -> list[dict]:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
-                "SELECT o.tenant_id, o.name, o.ntfy_topic,"
+                "SELECT o.tenant_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
+                " o.ntfy_topic_operator, o.ntfy_topic_tech,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.tenant_id=o.tenant_id) AS node_count"
                 " FROM orgs o ORDER BY o.tenant_id")]
 
@@ -497,6 +604,266 @@ class CentralStore:
             op["present_today"] = (op["id"], today) in present
             op["days"] = {d: ((op["id"], d) in present) for d in day_list}
         return {"today": today, "days": day_list, "operators": ops}
+
+    # --- Phase A: ISP-managed device topology (org_devices) ---------------------
+    def list_org_devices(self, tenant_id: str) -> list[dict]:
+        """Every active device an org has configured, plus each node's child count (for
+        the Nodes-page tree + the parent-node dropdown)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.id, d.tenant_id, d.name, d.ip_address, d.device_type, d.region,"
+                " d.parent_device_id, d.maintenance, d.snmp_enabled, d.snmp_version,"
+                " d.snmp_community, d.snmp_port,"
+                " (SELECT COUNT(*) FROM org_devices c"
+                "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count"
+                " FROM org_devices d WHERE d.tenant_id=? AND d.is_active=1 ORDER BY d.id",
+                (tenant_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_org_device(self, tenant_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM org_devices WHERE id=? AND tenant_id=? AND is_active=1",
+                (device_id, tenant_id)).fetchone()
+        return dict(row) if row else None
+
+    def device_tenant(self, device_id: int) -> str | None:
+        """The owning tenant of an org_devices row (so a write can be authorized against
+        the right org before it's known which org's device this id belongs to)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT tenant_id FROM org_devices WHERE id=?",
+                               (device_id,)).fetchone()
+        return row["tenant_id"] if row else None
+
+    def org_device_parent_map(self, tenant_id: str) -> dict[int, int | None]:
+        """id -> parent_device_id over one tenant's active devices — the cycle-check input
+        for `central/inventory.py` (never crosses tenants: an org can't loop through
+        another org's topology)."""
+        with self._connect() as conn:
+            return {r["id"]: r["parent_device_id"] for r in conn.execute(
+                "SELECT id, parent_device_id FROM org_devices"
+                " WHERE tenant_id=? AND is_active=1", (tenant_id,))}
+
+    def create_org_device(self, tenant_id: str, clean: dict) -> int:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO org_devices (tenant_id, name, ip_address, device_type, region,"
+                " parent_device_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                (tenant_id, clean["name"], clean["ip_address"], clean["device_type"],
+                 clean["region"], clean["parent_device_id"], _now_iso()))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def update_org_device(self, tenant_id: str, device_id: int, clean: dict) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
+                " parent_device_id=? WHERE id=? AND tenant_id=? AND is_active=1",
+                (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
+                 clean["parent_device_id"], device_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_org_device_maintenance(self, tenant_id: str, device_id: int, on: bool) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET maintenance=? WHERE id=? AND tenant_id=? AND is_active=1",
+                (1 if on else 0, device_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_org_device_snmp(self, tenant_id: str, device_id: int, clean: dict) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET snmp_enabled=?, snmp_version=?, snmp_community=?,"
+                " snmp_port=? WHERE id=? AND tenant_id=? AND is_active=1",
+                (clean["snmp_enabled"], clean["snmp_version"], clean["snmp_community"],
+                 clean["snmp_port"], device_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def delete_org_device(self, tenant_id: str, device_id: int) -> dict:
+        """Hard-delete a configured device. Blocked (like the edge) if it still has child
+        nodes, so topology never dangles. Returns {ok, reason}."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM org_devices WHERE id=? AND tenant_id=? AND is_active=1",
+                (device_id, tenant_id)).fetchone()
+            if not row:
+                return {"ok": False, "reason": "device not found"}
+            children = conn.execute(
+                "SELECT COUNT(*) FROM org_devices"
+                " WHERE parent_device_id=? AND tenant_id=? AND is_active=1",
+                (device_id, tenant_id)).fetchone()[0]
+        if children:
+            return {"ok": False,
+                    "reason": f"node has {children} child node(s); reassign them first"}
+        with self._write_lock, self._connect() as conn:
+            conn.execute("DELETE FROM org_devices WHERE id=? AND tenant_id=?",
+                         (device_id, tenant_id))
+            conn.commit()
+        return {"ok": True}
+
+    # --- Phase B: central runs the brain (per-tenant engine + live state) -------
+    def org_device_topology(self, tenant_id: str) -> list[dict]:
+        """The device set `central/engine.py` builds a MonitorEngine from: active,
+        NOT in maintenance (mirrors the edge's `load_device_meta` filter exactly — a
+        paused node drops out of detection). Unlike `list_org_devices` (the Nodes-page
+        listing, which must still SHOW a maintenance device with its badge), this feeds
+        the FSM, so maintenance rows are excluded here, not just flagged."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, ip_address, region, parent_device_id FROM org_devices"
+                " WHERE tenant_id=? AND is_active=1 AND maintenance=0 ORDER BY id",
+                (tenant_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def device_states(self, tenant_id: str) -> dict[int, dict]:
+        """device_id -> its last committed FSM row, for engine rehydration after a
+        central restart (mirrors the edge's `poll_results` last-row lookup — but this
+        table already holds only the current state, so it's a direct read)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id, state, latency_ms, packet_loss, jitter_ms FROM"
+                " device_states WHERE tenant_id=?", (tenant_id,)).fetchall()
+        return {r["device_id"]: dict(r) for r in rows}
+
+    def write_device_states(self, tenant_id: str, rows: list[tuple], ts: str) -> None:
+        """Bulk-upsert this cycle's committed FSM state (one row per device):
+        `rows` is [(device_id, state, latency_ms, packet_loss, jitter_ms), ...]."""
+        if not rows:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO device_states (device_id, tenant_id, state, latency_ms,"
+                " packet_loss, jitter_ms, updated_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET state=excluded.state,"
+                " latency_ms=excluded.latency_ms, packet_loss=excluded.packet_loss,"
+                " jitter_ms=excluded.jitter_ms, updated_at=excluded.updated_at",
+                [(did, tenant_id, state, lat, loss, jit, ts)
+                 for did, state, lat, loss, jit in rows])
+            conn.commit()
+
+    def uplink_active(self, tenant_id: str) -> bool:
+        """Restart-safe rehydration of the per-tenant uplink/canary flag: was the last
+        UPLINK_* log entry a DOWN? Mirrors the edge's `build_engine` alert_log read."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM alert_log WHERE tenant_id=? AND"
+                " (payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%')"
+                " ORDER BY id DESC LIMIT 1", (tenant_id,)).fetchone()
+        return bool(row and "UPLINK_DOWN" in (row["payload"] or ""))
+
+    # -- outages (mirrors core/state_machine.apply_events, tenant-scoped) --
+    def open_outage_id(self, tenant_id: str, device_id: int) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM outages WHERE tenant_id=? AND device_id=?"
+                " AND resolved_at IS NULL ORDER BY id DESC LIMIT 1",
+                (tenant_id, device_id)).fetchone()
+        return row["id"] if row else None
+
+    def open_outage_if_absent(self, tenant_id: str, device_id: int, ts: str,
+                              state: str) -> None:
+        """Idempotent open: never stack a second open row for a device that already has
+        one unresolved (same invariant as the edge's `apply_events`)."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO outages (tenant_id, device_id, started_at, final_state)"
+                " SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM outages"
+                " WHERE tenant_id=? AND device_id=? AND resolved_at IS NULL)",
+                (tenant_id, device_id, ts, state, tenant_id, device_id))
+            conn.commit()
+
+    def recategorize_outage(self, tenant_id: str, device_id: int, state: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE outages SET final_state=? WHERE tenant_id=? AND device_id=?"
+                " AND resolved_at IS NULL", (state, tenant_id, device_id))
+            conn.commit()
+
+    def resolve_outage(self, tenant_id: str, device_id: int, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE outages SET resolved_at=? WHERE tenant_id=? AND device_id=?"
+                " AND resolved_at IS NULL", (ts, tenant_id, device_id))
+            conn.commit()
+
+    def last_resolved_state(self, tenant_id: str, device_id: int) -> str | None:
+        """The `final_state` of the most recently resolved outage — used to tell a
+        genuine recovery from an UNREACHABLE outage we never paged about."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT final_state FROM outages WHERE tenant_id=? AND device_id=?"
+                " AND resolved_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (tenant_id, device_id)).fetchone()
+        return row["final_state"] if row else None
+
+    def acknowledge_outage(self, tenant_id: str, outage_id: int, by: str) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE outages SET acknowledged_at=COALESCE(acknowledged_at, ?),"
+                " acknowledged_by=? WHERE id=? AND tenant_id=? AND resolved_at IS NULL",
+                (_now_iso(), by, outage_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    # -- alert log + escalation ladder (mirrors egress/notifiers.AlertDispatcher) --
+    def already_paged(self, outage_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM alert_log WHERE outage_id=? AND status='sent' LIMIT 1",
+                (outage_id,)).fetchone()
+        return row is not None
+
+    def log_alert(self, tenant_id: str, outage_id: int | None, device_id: int | None,
+                  channel: str, recipient: str | None, status: str, payload: str,
+                  ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO alert_log (tenant_id, outage_id, device_id, channel,"
+                " recipient, sent_at, status, payload) VALUES (?,?,?,?,?,?,?,?)",
+                (tenant_id, outage_id, device_id, channel, recipient, ts, status, payload))
+            conn.commit()
+
+    def schedule_escalation(self, tenant_id: str, outage_id: int, kind: str,
+                            due_at: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO escalations (tenant_id, outage_id, kind, due_at)"
+                " VALUES (?,?,?,?)", (tenant_id, outage_id, kind, due_at))
+            conn.commit()
+
+    def due_escalations(self, tenant_id: str, now_ts: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.id, e.kind, o.id AS outage_id, o.device_id, o.started_at,"
+                " o.acknowledged_by, o.resolved_at FROM escalations e"
+                " JOIN outages o ON o.id = e.outage_id"
+                " WHERE e.tenant_id=? AND e.executed_at IS NULL AND e.due_at <= ?",
+                (tenant_id, now_ts)).fetchall()
+        return [dict(r) for r in rows]
+
+    def cancel_pending_escalations(self, tenant_id: str, device_id: int, ts: str) -> None:
+        """Cancel any pending escalation rows tied to this device's now-resolved
+        outage(s) — recovery stops the hourly ladder (ack alone does not)."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE escalations SET executed_at=? WHERE tenant_id=?"
+                " AND executed_at IS NULL AND outage_id IN (SELECT id FROM outages"
+                " WHERE tenant_id=? AND device_id=? AND resolved_at IS NOT NULL)",
+                (ts, tenant_id, tenant_id, device_id))
+            conn.commit()
+
+    def mark_escalation_executed(self, esc_id: int, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("UPDATE escalations SET executed_at=? WHERE id=?", (ts, esc_id))
+            conn.commit()
+
+    def reschedule_escalation(self, esc_id: int, due_at: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute("UPDATE escalations SET due_at=? WHERE id=?", (due_at, esc_id))
+            conn.commit()
 
     # --- releases / staged rollout (Part D version authority) ---
     def set_release(self, version: str, artifacts: dict, channel: str = "stable") -> None:

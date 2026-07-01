@@ -19,6 +19,21 @@ from wisp.config import Config
 from wisp.central import auth
 from wisp.central.store import CentralStore
 from wisp.central.server import make_server
+from wisp.egress.notifiers import NotifyResult
+
+
+class RecordingNotifier:
+    """No real network — mirrors the recording double used in test_central_watchdog."""
+    channel = "ntfy"
+
+    def __init__(self, ok: bool = True) -> None:
+        self.ok = ok
+        self.sent: list[dict] = []
+
+    def send(self, recipient, title, body, priority) -> NotifyResult:
+        self.sent.append({"recipient": recipient, "title": title,
+                          "body": body, "priority": priority})
+        return NotifyResult(self.ok)
 
 
 class CentralAuthUnitTest(unittest.TestCase):
@@ -77,7 +92,8 @@ class CentralAuthHttpTest(unittest.TestCase):
             "body": {"type": "OutageOpened", "device_id": 5, "device_name": "Tower", "state": "DOWN"}}])
         self.store.ingest("ispB", "edge-1", [{"id": 1, "kind": "event",
             "body": {"type": "OutageOpened", "device_id": 9, "device_name": "Relay", "state": "DOWN"}}])
-        self.server = make_server(self.cfg, self.store)
+        self.notifier = RecordingNotifier()
+        self.server = make_server(self.cfg, self.store, notifier=self.notifier)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -193,6 +209,134 @@ class CentralAuthHttpTest(unittest.TestCase):
                "body": {"fleet_size": 1}}
         self.assertEqual(self._req("POST", "/heartbeat", env, cookie=op)[0], 401)
         self.assertEqual(self._req("POST", "/heartbeat", env, token="tok")[0], 200)
+
+    # --- /api/orgs must never leak another tenant's row to an org user ---
+    def test_orgs_endpoint_is_tenant_scoped_for_org_users(self):
+        self.store.set_org("ispA", ntfy_topic_owner="secret-a-topic")
+        self.store.set_org("ispB", ntfy_topic_owner="secret-b-topic")
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("GET", "/api/orgs", cookie=own)
+        self.assertEqual(status, 200)
+        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispA"])
+        self.assertEqual(body["orgs"][0]["ntfy_topic_owner"], "secret-a-topic")
+        # even asking for another org explicitly doesn't leak it (org users are pinned)
+        status, body, _ = self._req("GET", "/api/orgs?tenant=ispB", cookie=own)
+        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispA"])
+
+    def test_superadmin_orgs_sees_all_or_narrows(self):
+        self.store.set_org("ispA", name="A"); self.store.set_org("ispB", name="B")
+        _, root = self._login("root", "rootpassword")
+        _, body, _ = self._req("GET", "/api/orgs", cookie=root)
+        self.assertEqual({o["tenant_id"] for o in body["orgs"]}, {"ispA", "ispB"})
+        _, body, _ = self._req("GET", "/api/orgs?tenant=ispB", cookie=root)
+        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispB"])
+
+    # --- Phase A: device inventory (management plane) ---
+    def test_inventory_create_update_delete_round_trip(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/inventory",
+            {"name": "Core", "ip_address": "10.0.0.1", "device_type": "core"}, cookie=own)
+        self.assertEqual(status, 200)
+        root_id = body["id"]
+        status, body, _ = self._req("POST", "/api/inventory",
+            {"name": "Tower", "ip_address": "10.0.0.2", "parent_device_id": root_id}, cookie=own)
+        self.assertEqual(status, 200)
+        child_id = body["id"]
+
+        status, body, _ = self._req("GET", "/api/inventory", cookie=own)
+        self.assertEqual(status, 200)
+        self.assertEqual({d["id"] for d in body["devices"]}, {root_id, child_id})
+
+        status, body, _ = self._req("POST", "/api/inventory/update",
+            {"id": child_id, "name": "Tower 1", "ip_address": "10.0.0.2",
+             "parent_device_id": root_id}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+        # blocked while root still has a child
+        status, body, _ = self._req("POST", "/api/inventory/delete", {"id": root_id}, cookie=own)
+        self.assertEqual(status, 409)
+        self._req("POST", "/api/inventory/delete", {"id": child_id}, cookie=own)
+        status, body, _ = self._req("POST", "/api/inventory/delete", {"id": root_id}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+    def test_inventory_rejects_bad_payload_with_422(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/inventory",
+            {"name": "Bad", "ip_address": "not-an-ip"}, cookie=own)
+        self.assertEqual(status, 422)
+        self.assertIn("error", body)
+
+    def test_inventory_operator_cannot_write_owner_can(self):
+        _, op = self._login("oper", "operpassword")
+        status, _, _ = self._req("POST", "/api/inventory",
+            {"name": "X", "ip_address": "10.0.0.5"}, cookie=op)
+        self.assertEqual(status, 403)
+
+    def test_inventory_write_cannot_cross_tenant(self):
+        _, own = self._login("owner", "ownerpassword")
+        _, body, _ = self._req("POST", "/api/inventory",
+            {"name": "A", "ip_address": "10.0.0.1"}, cookie=own)
+        dev_id = body["id"]
+        # ispB has no owner logged in here, but even ispA's owner can't touch it via
+        # tenant_id override — a device's tenant is derived from the row, not the body.
+        status, _, _ = self._req("POST", "/api/inventory",
+            {"tenant_id": "ispB", "name": "B", "ip_address": "10.0.1.1"}, cookie=own)
+        self.assertEqual(status, 403)
+        status, _, _ = self._req("GET", "/api/inventory?tenant=ispB", cookie=own)
+        # org user pinned: ispB's inventory (empty) is what they'd see, not a leak of ispA's
+        self.assertEqual(status, 200)
+
+    def test_inventory_maintenance_and_snmp(self):
+        _, own = self._login("owner", "ownerpassword")
+        _, body, _ = self._req("POST", "/api/inventory",
+            {"name": "Sw1", "ip_address": "10.0.0.9", "device_type": "switch"}, cookie=own)
+        did = body["id"]
+        status, body, _ = self._req("POST", "/api/inventory/maintenance",
+            {"id": did, "on": True}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        status, body, _ = self._req("POST", "/api/inventory/snmp",
+            {"id": did, "snmp_enabled": True, "snmp_community": "public"}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        status, body, _ = self._req("POST", "/api/inventory/snmp",
+            {"id": did, "snmp_enabled": True}, cookie=own)   # missing community
+        self.assertEqual(status, 422)
+
+    # --- Phase A: org role topics + test alert ---
+    def test_org_role_topics_round_trip(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/org",
+            {"ntfy_topic_owner": "a-owner", "ntfy_topic_operator": "a-op"}, cookie=own)
+        self.assertEqual(status, 200)
+        status, body, _ = self._req("GET", "/api/orgs", cookie=own)
+        org = body["orgs"][0]
+        self.assertEqual(org["ntfy_topic_owner"], "a-owner")
+        self.assertEqual(org["ntfy_topic_operator"], "a-op")
+
+    def test_test_alert_sends_via_injected_notifier(self):
+        _, own = self._login("owner", "ownerpassword")
+        self._req("POST", "/api/org", {"ntfy_topic_owner": "a-owner-topic"}, cookie=own)
+        status, body, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.notifier.sent[0]["recipient"], "a-owner-topic")
+
+    def test_test_alert_requires_configured_topic(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/test-alert", {"role": "tech"}, cookie=own)
+        self.assertEqual(status, 422)
+        self.assertEqual(len(self.notifier.sent), 0)
+
+    def test_test_alert_operator_cannot_send(self):
+        _, own = self._login("owner", "ownerpassword")
+        self._req("POST", "/api/org", {"ntfy_topic_owner": "a-owner-topic"}, cookie=own)
+        _, op = self._login("oper", "operpassword")
+        status, _, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=op)
+        self.assertEqual(status, 403)
 
     # --- static (unauthed) ---
     def test_static_index_served(self):

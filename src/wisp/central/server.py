@@ -1,8 +1,10 @@
-"""Central server (Phase 10 Parts A–C) — ingest + a multi-tenant dashboard, pure stdlib.
+"""Central server (Phase 10 Parts A–C; Phase B raw-report ingest) — ingest + a
+multi-tenant dashboard, pure stdlib.
 
 Two auth planes, deliberately separate:
-  * **Ingest** (`POST /ingest`, `/heartbeat`) — machine-to-machine, bearer token
-    (`WISP_CENTRAL_TOKEN`). This is how edges report; unchanged from Part A/B.
+  * **Ingest** (`POST /ingest`, `/heartbeat`, `/report`, `GET /edge/devices`) —
+    machine-to-machine, bearer token (`WISP_CENTRAL_TOKEN`). This is how edges report and
+    learn what to probe; unchanged auth model from Part A/B.
   * **Dashboard** (`/api/*` reads + writes, the SPA) — humans, per-org login accounts with
     identity-carrying signed-cookie sessions (`central/auth.py`). Every dashboard read is
     **scoped to the caller's tenant**; a superadmin sees all orgs and may pass `?tenant=`.
@@ -17,14 +19,20 @@ import hmac
 import json
 import logging
 import mimetypes
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import auth
+from wisp.central import auth, inventory
+from wisp.central import engine as central_engine
+from wisp.central.dispatch import CentralAlertDispatcher
+from wisp.central.engine import EngineRegistry
 from wisp.central.store import CentralStore
+from wisp.egress.notifiers import build_notifier
 from wisp.egress.shipper import WIRE_V
+from wisp.ingress.probers import PingResult
 from wisp.server.auth import LoginThrottle
 
 log = logging.getLogger("wisp.central")
@@ -34,8 +42,17 @@ _MAX_BODY = 16 * 1024 * 1024
 _STATIC = Path(__file__).resolve().parent / "static"
 
 
-def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
+                  engine_registry: EngineRegistry | None = None):
     token = cfg.central_token
+    notifier = notifier or build_notifier(cfg)
+    # ONE registry per server (not per-request): the FSM's flap-suppression counters must
+    # survive across an edge's successive POST /report calls (see central/engine.py).
+    registry = engine_registry or EngineRegistry(store, cfg)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "wisp-central"
@@ -147,7 +164,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                 self._reply(200, {"user": _public_user(user),
                                   "channels": {"central": cfg.central_ntfy_topic}})
                 return
-            if route in ("/api/fleet", "/api/orgs", "/api/devices",
+            # Ingest plane (bearer token): what should this edge probe? Phase B — the
+            # edge's device list now comes from the ISP-managed org_devices topology
+            # (Phase A), not a local dashboard.
+            if route == "/edge/devices":
+                if not self._bearer_ok():
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = (qs.get("tenant_id") or [None])[0]
+                if not tenant:
+                    self._reply(400, {"error": "tenant_id required"})
+                    return
+                self._reply(200, {"devices": store.org_device_topology(tenant),
+                                  "canary_ip": cfg.canary_ip})
+                return
+            if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users"):
                 user = self._reader()
                 if not user:
@@ -157,7 +188,14 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                 if route == "/api/fleet":
                     self._reply(200, store.fleet(tenant_id=tenant))
                 elif route == "/api/orgs":
-                    self._reply(200, {"orgs": store.orgs()})
+                    # store.orgs() is cross-tenant by nature (it's the org directory) — an
+                    # org user must only ever see their OWN org's row (name/topics included),
+                    # never another tenant's. `tenant` here is already pinned for org users
+                    # (_scope_tenant) and only None for a superadmin with no ?tenant=.
+                    orgs = store.orgs()
+                    if tenant:
+                        orgs = [o for o in orgs if o["tenant_id"] == tenant]
+                    self._reply(200, {"orgs": orgs})
                 elif route == "/api/devices":
                     self._reply(200, {"devices": store.devices(tenant_id=tenant)})
                 elif route == "/api/users":
@@ -170,6 +208,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                         self._reply(400, {"error": "tenant required"})
                         return
                     self._reply(200, {"team": store.list_workers(tenant)})
+                elif route == "/api/inventory":
+                    if not tenant:
+                        self._reply(400, {"error": "tenant required"})
+                        return
+                    self._reply(200, {"devices": store.list_org_devices(tenant)})
                 else:  # /api/attendance
                     if not tenant:
                         self._reply(400, {"error": "tenant required"})
@@ -184,7 +227,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
             parsed = urlparse(self.path)
             route = parsed.path
             # Ingest plane (bearer token).
-            if route in ("/ingest", "/heartbeat"):
+            if route in ("/ingest", "/heartbeat", "/report"):
                 if not self._bearer_ok():
                     self._read_body()
                     self._reply(401, {"error": "unauthorized"})
@@ -197,10 +240,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                     if route == "/ingest":
                         self._reply(200, {"accepted": store.ingest(tenant, node,
                                                                    env.get("records", []))})
-                    else:
+                    elif route == "/heartbeat":
                         body = env.get("body", {})
                         store.record_heartbeat(tenant, node, body)
                         self._reply(200, self._heartbeat_reply(tenant, node, body))
+                    else:
+                        self._reply(200, self._report(tenant, env))
                 except Exception:
                     log.exception("ingest failed for %s/%s", tenant, node)
                     self._reply(500, {"error": "internal error"})
@@ -219,7 +264,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                 return
             try:
                 self._dashboard_write(route, user, body)
-            except auth.AuthError as exc:
+            except (auth.AuthError, inventory.InventoryError) as exc:
                 self._reply(422, {"error": str(exc)})
             except Exception:
                 log.exception("dashboard write failed: %s", route)
@@ -238,6 +283,55 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                     reply["update"] = directive
             except Exception:
                 log.exception("rollout directive failed for %s/%s", tenant, node)
+            return reply
+
+        def _report(self, tenant: str, env: dict) -> dict:
+            """Phase B — one raw-ping report from an edge: run that tenant's
+            MonitorEngine one cycle, persist outages + live device_states, and page
+            through the org's role topics. `pings` is {ip: {loss_pct, latency_ms,
+            jitter_ms}} — the SAME ip-keyed shape `MonitorEngine.process_cycle` already
+            expects (a device's IP resolves to its org_devices row inside the engine), so
+            no device-id translation is needed on the wire going IN.
+
+            `mode` (default "full") is the fast-confirm round trip: a "full" report
+            advances every device and, if anything looks like a fresh DOWN/recovery in
+            progress, the reply carries a `recheck` hint (down_ips/up_ips/interval_s —
+            see central/engine.py:compute_recheck). A "recheck" report carries samples for
+            ONLY those suspect IPs; central resolves them back to device ids (via the
+            SAME cached engine — `eng.meta`, so FSM state stays consistent with the full
+            pass that flagged them) and advances just that subset, mirroring the edge's
+            own confirmation-pass mode. Either way the reply may carry ANOTHER `recheck`
+            hint — the edge just keeps following it until the reply omits one, which
+            happens automatically once every suspect has either confirmed or cleared (see
+            compute_recheck's docstring for why that's guaranteed to terminate)."""
+            ts = env.get("ts") or _now_iso()
+            pings = env.get("pings") or {}
+            results = {
+                ip: PingResult(ip, v.get("latency_ms"),
+                              float(v.get("loss_pct", 100.0)), v.get("jitter_ms"))
+                for ip, v in pings.items()
+            }
+            eng = registry.get(tenant)
+            mode = env.get("mode") or "full"
+            if mode == "recheck":
+                ip_to_id = {d.ip_address: d.id for d in eng.meta.values()}
+                subset = {ip_to_id[ip] for ip in results if ip in ip_to_id}
+                cycle = central_engine.run_cycle(store, tenant, eng, results, ts,
+                                                 subset=subset)
+            else:
+                cycle = central_engine.run_cycle(store, tenant, eng, results, ts)
+
+            disp = CentralAlertDispatcher(store, tenant, eng, notifier, cfg)
+            disp.dispatch(cycle.events, ts)
+            if mode != "recheck":
+                # Escalation sweeping is time-gated (due_at) and idempotent, but a recheck
+                # burst can fire several rounds a second — no need to re-check on every one.
+                disp.sweep(ts)
+
+            reply: dict = {"ok": True}
+            recheck = central_engine.compute_recheck(eng, cycle, results, cfg)
+            if recheck:
+                reply["recheck"] = recheck
             return reply
 
         # --- login ---
@@ -287,14 +381,87 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle):
                                      body.get("day"))
                 self._reply(200, {"ok": True})
                 return
-            # org rename / topic (owner of that org, or superadmin)
+            # org rename / topics (owner of that org, or superadmin)
             if route == "/api/org":
                 tenant = body.get("tenant_id") or user["tenant_id"]
                 if not self._can_write(user, tenant):
                     self._reply(403, {"error": "forbidden"})
                     return
-                store.set_org(tenant, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"))
+                store.set_org(tenant, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
+                              ntfy_topic_owner=body.get("ntfy_topic_owner"),
+                              ntfy_topic_operator=body.get("ntfy_topic_operator"),
+                              ntfy_topic_tech=body.get("ntfy_topic_tech"))
                 self._reply(200, {"ok": True})
+                return
+            # send a test push to one of an org's three role channels (Settings go-live check)
+            if route == "/api/test-alert":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                role = str(body.get("role") or "").strip().lower()
+                if role not in ("owner", "operator", "tech"):
+                    self._reply(422, {"error": "role must be one of: owner, operator, tech"})
+                    return
+                topic = store.org_role_topic(tenant, role)
+                if not topic:
+                    self._reply(422, {"error": f"no {role} channel configured — set it in "
+                                                 "Settings first"})
+                    return
+                res = notifier.send(topic, "✅ WISP Central test alert",
+                                    f"This is a test alert for {tenant}'s {role} channel.", 3)
+                self._reply(200, {"ok": res.ok, "detail": res.detail, "channel": notifier.channel,
+                                  "recipient": topic, "role": role})
+                return
+            # device inventory (the org's topology; owner of that org, or superadmin)
+            if route == "/api/inventory":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                clean = inventory.clean_device_payload(
+                    body, parents=store.org_device_parent_map(tenant), device_id=None)
+                did = store.create_org_device(tenant, clean)
+                self._reply(200, {"id": did})
+                return
+            if route == "/api/inventory/update":
+                did = int(body.get("id") or 0)
+                tenant = store.device_tenant(did)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                parents = store.org_device_parent_map(tenant)
+                clean = inventory.clean_device_payload(body, parents=parents, device_id=did)
+                ok = store.update_org_device(tenant, did, clean)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/delete":
+                did = int(body.get("id") or 0)
+                tenant = store.device_tenant(did)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                result = store.delete_org_device(tenant, did)
+                self._reply(200 if result["ok"] else 409, result)
+                return
+            if route == "/api/inventory/maintenance":
+                did = int(body.get("id") or 0)
+                tenant = store.device_tenant(did)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                ok = store.set_org_device_maintenance(tenant, did, bool(body.get("on")))
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/snmp":
+                did = int(body.get("id") or 0)
+                tenant = store.device_tenant(did)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                clean = inventory.clean_snmp_payload(body)
+                ok = store.set_org_device_snmp(tenant, did, clean)
+                self._reply(200 if ok else 404, {"ok": ok})
                 return
             # user provisioning: superadmin anywhere; an owner within their own org
             if route == "/api/users":
@@ -337,9 +504,11 @@ def _worker_tenant(store: CentralStore, worker_id) -> str | None:
     return row["tenant_id"] if row else None
 
 
-def make_server(cfg: Config = CONFIG, store: CentralStore | None = None) -> ThreadingHTTPServer:
+def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
+                notifier=None, engine_registry: EngineRegistry | None = None
+                ) -> ThreadingHTTPServer:
     store = store or CentralStore(cfg.central_db)
-    handler = _make_handler(cfg, store, LoginThrottle())
+    handler = _make_handler(cfg, store, LoginThrottle(), notifier, engine_registry)
     httpd = ThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler)
     httpd.store = store  # type: ignore[attr-defined]
     return httpd

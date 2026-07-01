@@ -130,6 +130,96 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(org["name"], "ISP A")
         self.assertEqual(org["node_count"], 1)
 
+    def test_set_org_role_topics(self):
+        self.store.set_org("ispA", ntfy_topic_owner="isp-a-owner",
+                           ntfy_topic_operator="isp-a-op", ntfy_topic_tech="isp-a-tech")
+        self.assertEqual(self.store.org_role_topic("ispA", "owner"), "isp-a-owner")
+        self.assertEqual(self.store.org_role_topic("ispA", "operator"), "isp-a-op")
+        self.assertEqual(self.store.org_role_topic("ispA", "tech"), "isp-a-tech")
+        self.assertIsNone(self.store.org_role_topic("ispA", "bogus"))
+        # COALESCE semantics: setting one topic doesn't clobber the others.
+        self.store.set_org("ispA", ntfy_topic_owner="isp-a-owner-2")
+        self.assertEqual(self.store.org_role_topic("ispA", "owner"), "isp-a-owner-2")
+        self.assertEqual(self.store.org_role_topic("ispA", "operator"), "isp-a-op")
+
+
+class OrgDevicesTest(unittest.TestCase):
+    """Phase A: the ISP-managed device topology — distinct from the edge-ingest `devices`
+    registry above (this table has no edge behind it yet; an ISP builds it by hand)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "central.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_create_list_update_delete_round_trip(self):
+        root = self.store.create_org_device("ispA", {
+            "name": "Core Router", "ip_address": "10.0.0.1", "device_type": "core",
+            "region": "north", "parent_device_id": None})
+        child = self.store.create_org_device("ispA", {
+            "name": "Tower 1", "ip_address": "10.0.0.2", "device_type": "backhaul",
+            "region": "north", "parent_device_id": root})
+        devs = self.store.list_org_devices("ispA")
+        self.assertEqual(len(devs), 2)
+        root_row = next(d for d in devs if d["id"] == root)
+        self.assertEqual(root_row["child_count"], 1)
+
+        ok = self.store.update_org_device("ispA", child, {
+            "name": "Tower 1 (renamed)", "ip_address": "10.0.0.2", "device_type": "backhaul",
+            "region": "north", "parent_device_id": root})
+        self.assertTrue(ok)
+        self.assertEqual(self.store.get_org_device("ispA", child)["name"], "Tower 1 (renamed)")
+
+        # blocked while it still has a child
+        result = self.store.delete_org_device("ispA", root)
+        self.assertFalse(result["ok"])
+        self.assertIn("child", result["reason"])
+        self.store.delete_org_device("ispA", child)
+        result = self.store.delete_org_device("ispA", root)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.store.list_org_devices("ispA"), [])
+
+    def test_tenant_isolation(self):
+        a = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.store.create_org_device("ispB", {
+            "name": "B", "ip_address": "10.0.1.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.assertEqual(len(self.store.list_org_devices("ispA")), 1)
+        self.assertEqual(len(self.store.list_org_devices("ispB")), 1)
+        # ispB can't reach into ispA's row by id
+        self.assertIsNone(self.store.get_org_device("ispB", a))
+        self.assertFalse(self.store.update_org_device("ispB", a, {
+            "name": "hijacked", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None}))
+        self.assertEqual(self.store.device_tenant(a), "ispA")
+
+    def test_parent_map_is_tenant_scoped(self):
+        a = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.store.create_org_device("ispB", {
+            "name": "B", "ip_address": "10.0.1.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        pmap = self.store.org_device_parent_map("ispA")
+        self.assertEqual(set(pmap.keys()), {a})
+
+    def test_maintenance_and_snmp_toggle(self):
+        d = self.store.create_org_device("ispA", {
+            "name": "Sw1", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.assertTrue(self.store.set_org_device_maintenance("ispA", d, True))
+        self.assertTrue(self.store.get_org_device("ispA", d)["maintenance"])
+        self.assertTrue(self.store.set_org_device_snmp("ispA", d, {
+            "snmp_enabled": 1, "snmp_version": "2c", "snmp_community": "public",
+            "snmp_port": 161}))
+        row = self.store.get_org_device("ispA", d)
+        self.assertTrue(row["snmp_enabled"])
+        self.assertEqual(row["snmp_community"], "public")
+
 
 class CentralServerTest(unittest.TestCase):
     def setUp(self):

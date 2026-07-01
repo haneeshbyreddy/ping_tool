@@ -280,6 +280,16 @@ class Config:
     # analytics, reconstructable) — never an unsent 'event' (an outage record is sacred).
     # 0 = no cap (let it grow; an event is never dropped regardless).
     outbox_max_rows: int = field(default_factory=lambda: _env_int("WISP_OUTBOX_MAX_ROWS", 100000))
+    # New-architecture Phase B: a SEPARATE opt-in from central_url/central_enabled(), on
+    # purpose. central_enabled()=True alone still means Phase 10 behaviour UNCHANGED — the
+    # edge keeps its own local FSM + AlertDispatcher and ships FINISHED events via the
+    # outbox/shipper. Only central_brain_mode=True (needs central_enabled() too — see
+    # central_brain_enabled()) switches the daemon to the new thin-probe loop
+    # (apps/daemon/main.py:run_forever_central_brain): pull the device list from
+    # `GET /edge/devices`, probe, POST raw pings to `/report`, run NO local FSM/alerting at
+    # all. Default off so every existing standalone AND Phase-10 deployment is unaffected.
+    central_brain_mode: bool = field(
+        default_factory=lambda: _env_bool("WISP_CENTRAL_BRAIN", False))
 
     # --- Central server (the aggregation plane — a separate process/deploy) ----
     # Used only by apps/central; the edge ignores these. The central store is its OWN
@@ -330,6 +340,12 @@ class Config:
         whole distributed layer is dormant (the Phase 10 back-compat anchor): no outbox
         writes, no shipper thread, behaviour identical to the standalone monitor."""
         return bool(self.central_url)
+
+    def central_brain_enabled(self) -> bool:
+        """New-architecture Phase B: run the thin-probe loop (no local FSM/alerting)
+        instead of Phase 10's local-detect + outbox-ship loop. Requires central_url too —
+        WISP_CENTRAL_BRAIN=1 with no central_url is a no-op, not an error."""
+        return self.central_enabled() and self.central_brain_mode
 
     def stale_threshold_s(self) -> int:
         """Seconds without a fresh poll before the monitor is 'down'. Honours an

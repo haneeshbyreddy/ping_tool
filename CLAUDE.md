@@ -13,7 +13,7 @@ Production build: Phases 1–6 (engine, FSM, alerting, BI, dashboard), **Phase 8
 backup lines + the on-backup signal) and Part B (SNMP port status) — and **Phase 10 Parts A–D**
 (edge→central shipper + outbox + heartbeat; multi-tenant central store + global device-id
 mapping + cross-edge fleet watchdog; per-org dashboard + accounts + org-wide team/attendance;
-version authority + staged rollout + supervisor self-update + Linux/CI packaging) — 265 tests. The
+version authority + staged rollout + supervisor self-update + Linux/CI packaging) — 321 tests. The
 daemon now also needs `pysnmp` (lazy-imported; in `requirements.txt`) for the SNMP
 ingress. Config is env-var only (no
 in-UI control plane); see "Config" below. The mock/simulated
@@ -23,6 +23,21 @@ the venv (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **n
 (system Python is PEP 668-locked) — and the kernel ping group enabled for unprivileged ICMP
 (`sysctl net.ipv4.ping_group_range="0 2147483647"`). There is no demo
 seeder anymore; populate real devices/team from the dashboard.
+
+**New architecture in progress (see `new-plan.md`):** the plan is to move central from
+"aggregates what edges report" to "IS the product" — ISPs manage everything from central,
+the FSM/alerting run there too, and the edge becomes a thin probe. **Phase A is done**:
+central has its own ISP-managed device topology, team, and per-org alert settings,
+independent of any connected edge (see "Central management plane" below). **Phase B v1 is
+done, opt-in, off by default**: central's own FSM + alerting (`central/engine.py`,
+`central/dispatch.py`, `POST /report`, `GET /edge/devices`) plus the edge-side thin-probe
+loop that calls them (`apps/daemon/main.py:run_forever_central_brain`,
+`runtime/central_client.py`) are built and tested end to end. It's a THIRD daemon mode
+behind `WISP_CENTRAL_BRAIN=1` — standalone and Phase 10's local-FSM + outbox/shipper mode
+are both completely unchanged and remain the default. See "Central runs the brain" below,
+especially "The three daemon modes", before assuming a given edge uses the new path.
+Still not done: Phase C (stripping the edge's local dashboard/DB once this mode is
+trusted) and the deferred v1 gaps (fast-confirm round-trip, perf/redundancy/SNMP tiers).
 
 ## Imports & paths (the main trap)
 
@@ -397,6 +412,167 @@ Src layout, zero-install (see README "Layout" for the tree). What bites:
   apply happy-path/verify-fail-no-swap/unhealthy-rollback/skip, consume_request file), plus the shipper's
   update-directive handoff (`test_shipper`: directive→supervisor, current-version ignored, no-directive
   no-op; heartbeat carries version+platform).
+
+## Central management plane — device inventory, team, settings (New Architecture Phase A)
+
+- **`org_devices` (central) and `devices` (central) are TWO DIFFERENT TABLES — don't
+  conflate them.** `devices` (Phase 10 Part B) is the edge-ingest global id map: it only has
+  rows for devices an edge has actually reported an event/rollup for, keyed by
+  `(tenant_id, node_id, edge_local_id)`. `org_devices` (Phase A) is the ISP-managed topology
+  an org builds by hand from the central dashboard — it exists **before and independent of**
+  any edge ever connecting, has its own autoincrement id space, and is what Phase B will
+  eventually reconcile live state onto (not yet — no FSM runs on central today). The API
+  reflects the split: `GET /api/devices` = the live edge-ingest registry (read-only, no
+  CRUD), `GET/POST /api/inventory*` = the org-managed topology (full CRUD). Adding a field
+  that belongs to one to the other is the classic mistake here.
+- **Phase A has no backup/redundancy links yet.** `central/inventory.py`'s cycle check walks
+  the PRIMARY parent chain only (unlike the edge's `_clean_device_payload`, which spans
+  primary+backup edges via `device_links`). Redundant uplinks only mean something once live
+  detection exists to fail over between them (Phase B) — don't add a `device_links`-equivalent
+  to central until then, it would have no signal to suppress on.
+- **`central/inventory.py` mirrors the edge's validation, not its storage.** Pure functions
+  (`clean_device_payload`, `clean_snmp_payload`) — no DB, unit-tested directly
+  (`tests/unit/test_central_inventory.py`), same split as the edge's SNMP-payload cleaner.
+  `clean_device_payload`'s `parents` map must already be scoped to one tenant by the caller
+  (`CentralStore.org_device_parent_map`) — a cross-tenant id is never in the map, so it just
+  looks like "parent node does not exist" rather than needing an explicit tenant check.
+- **Every `org_devices` write in `central/server.py` re-derives the tenant from the DB row,
+  not the request body**, via `store.device_tenant(id)` — mirrors `_worker_tenant`. A body's
+  `tenant_id` is only trusted for *create* (where there's no row yet to derive it from); for
+  update/delete/maintenance/snmp it would let an authenticated user from org A claim to own
+  org B's device id. `_can_write(user, tenant)` still gates on the *derived* tenant.
+- **`/api/orgs` must stay tenant-filtered.** It was NOT (a Phase 10 Part C gap fixed in Phase
+  A): any authenticated org user hitting it got every org's row back — including every other
+  org's `ntfy_topic*` alert channels, a real cross-tenant leak per the "multi-tenancy is
+  non-negotiable" rule. The fix is the same `tenant` value `_scope_tenant` already computes
+  for every other route (pinned for an org user, optional `?tenant=` for a superadmin) — don't
+  add a new endpoint here that skips that filter.
+- **The org's three role topics (`orgs.ntfy_topic_owner/operator/tech`) are separate from
+  `orgs.ntfy_topic`** (the Part B fleet-watchdog's `NODE_STALE`/`NODE_OK` page target). One is
+  "is this ISP's box alive" (platform-operational, routed by us), the other is "route this
+  ISP's own outage pages by role" (customer-configured, Phase B will read it). Both live on
+  `orgs` but serve different alarms — don't merge them.
+- **New `orgs` columns need the in-code column migration**, not just the `CREATE TABLE IF NOT
+  EXISTS` in `_SCHEMA` — that only helps a fresh DB. `CentralStore.__init__` runs
+  `_ensure_columns(conn, table, coldefs)` (checks `PRAGMA table_info`, `ALTER TABLE ADD
+  COLUMN` for anything missing) right after `executescript`. Add any new `orgs`/`org_devices`
+  column there too, or an existing `central.db` silently keeps the old schema.
+- **`central/server.py`'s dashboard writes now send real pushes (`/api/test-alert`), so
+  `make_server`/`_make_handler` take an injectable `notifier`** (defaults to
+  `build_notifier(cfg)`, same lazy-httpx-import `NtfyNotifier` the edge and the Part B fleet
+  watchdog use) — tests inject a recording double (`tests/integration/test_central_auth.py`),
+  no real network in the suite. Follow this constructor-injection pattern (not a module-level
+  singleton) for anything else central needs to send.
+- **Tests:** `unit/test_central_inventory` (pure payload/cycle validation),
+  `integration/test_central.OrgDevicesTest` (CRUD round-trip, tenant isolation, parent-map
+  scoping, children-block delete, maintenance/SNMP toggles), `integration/test_central_auth`
+  (`/api/inventory*` CRUD + 422/403 + cross-tenant-write-rejected over HTTP, `/api/orgs`
+  tenant-scoping fix + superadmin narrow, org role-topic round-trip, `/api/test-alert` via the
+  injected recording notifier + missing-topic 422 + write-gated).
+
+## Central runs the brain (New Architecture Phase B — v1, ICMP core only)
+
+- **Status: both sides are built and tested end to end — but this is a THIRD daemon mode,
+  opt-in, not a replacement.** `central/engine.py` + `central/dispatch.py` + `POST
+  /report` / `GET /edge/devices` are the central-side brain; `apps/daemon/main.py`'s
+  `run_forever_central_brain` (+ `runtime/central_client.py`) is the edge-side thin-probe
+  loop that calls them. Neither the standalone daemon nor Phase 10's local-FSM +
+  outbox/shipper mode changed AT ALL — `main()` only takes this new path when
+  `cfg.central_brain_enabled()` (`WISP_CENTRAL_BRAIN=1` **and** `WISP_CENTRAL_URL` set);
+  see "The three daemon modes" below.
+- **`core/state_machine.MonitorEngine` is reused UNCHANGED — only its DB glue is new.**
+  The FSM itself doesn't know or care whether it's fed by the edge's single-tenant SQLite
+  or central's multi-tenant one. `central/engine.py`'s `load_device_meta`/`build_engine`/
+  `apply_events` are the central-native equivalents of the same-named functions at the
+  bottom of `core/state_machine.py`, over `org_devices`/`device_states`/`outages` instead
+  of `devices`/`poll_results`/`outages`. Same for `central/dispatch.py`'s
+  `CentralAlertDispatcher` vs. the edge's `egress/notifiers.AlertDispatcher` — same
+  policy (dedupe-per-outage, owner+operator on open, all-three on the hourly escalation
+  and on resolve, ack-doesn't-stop-only-recovery-does), different DB layer. They are
+  deliberately NOT shared via inheritance/mixins — the two have different connection/lock
+  models (`wisp.database.client` + `write_with_retry` vs `CentralStore`'s own
+  `_write_lock`) and different topic sources (fixed `Config` fields vs per-org DB rows via
+  `store.org_role_topic`), so forcing a shared base would mean threading DB-shape
+  differences through every method for no real reuse.
+- **`EngineRegistry` exists because central's HTTP handling is stateless per-request but
+  the FSM's flap-suppression counters are NOT.** A device's `down_streak` must accumulate
+  across an edge's successive `POST /report` calls, or it could never reach
+  `down_consecutive` — one HTTP request only ever feeds the engine ONE sample.
+  `EngineRegistry` (in `central/engine.py`) holds one live `MonitorEngine` per tenant in
+  memory, the direct analogue of the daemon's own long-lived `engine` variable in
+  `run_forever`. It rebuilds a tenant's engine only when that tenant's topology actually
+  changed (a cheap `(id, parent_device_id)` fingerprint recomputed every `.get()` — same
+  device-set-reload check the daemon does at the top of every cycle), and a fresh/rebuilt
+  engine rehydrates FSM state from `device_states` (restart-safe, same as the edge's
+  `build_engine` reading back `poll_results`). One `EngineRegistry` lives per central
+  server process, threaded into `_make_handler` alongside the existing injectable
+  `notifier` — don't build a new one per request, it would defeat the whole point.
+- **The wire format is IP-keyed, not device-id-keyed — no translation needed.**
+  `MonitorEngine.process_cycle` already takes `{ip: PingResult}`; a device resolves to its
+  `org_devices` row internally via `dev.ip_address`. So `POST /report`'s body is just
+  `{"v":1,"tenant_id":…,"node_id":…,"ts":…,"pings":{"<ip>":{"loss_pct":…,"latency_ms":…,
+  "jitter_ms":…}}}` — the edge doesn't need to know or send central's device ids at all,
+  it only needs to know which IPs to probe (from `GET /edge/devices`, bearer-authed,
+  returns that tenant's active `org_devices` topology + `cfg.canary_ip`).
+- **Escalation sweeping rides the edge's own report cadence, not a background timer.**
+  `CentralAlertDispatcher.sweep(ts)` is called once per `/report`, scoped to just that
+  tenant's due `escalations` rows — there's no separate central-side clock thread for
+  this in v1. In practice this is fine (an edge reports every `poll_interval_s`, far more
+  often than the hourly ladder needs), but it does mean escalations for a tenant silently
+  stop advancing if that tenant's edge goes fully stale — accepted for v1 since the
+  Part B fleet watchdog (`central/watchdog.py`) already separately pages the org when a
+  node's heartbeat goes stale; that's a different alarm for a different failure.
+- **The three daemon modes — know which one is running before you touch `apps/daemon/main.py`.**
+  `main()` branches on config, not a CLI flag, so it's easy to misread which loop a box is
+  actually running:
+  1. **Standalone** (`WISP_CENTRAL_URL` empty) — today's monitor, unchanged, forever.
+  2. **Phase 10 / central-aggregation** (`central_enabled()=True`,
+     `central_brain_mode=False`, the default whenever `WISP_CENTRAL_URL` is set) — local
+     `MonitorEngine` + `AlertDispatcher` detect and page exactly as standalone; the outbox
+     + `egress/shipper.py` additionally ship FINISHED events to central for the fleet
+     view. Central runs no FSM in this mode.
+  3. **Phase B / central-brain** (`central_brain_enabled()=True`, i.e. `WISP_CENTRAL_BRAIN=1`
+     **and** `WISP_CENTRAL_URL` set) — `run_forever_central_brain`: no local `MonitorEngine`,
+     no `AlertDispatcher`, no `migrate()`/local DB writes at all. It fetches its topology
+     from `GET /edge/devices` (re-fetched every cycle, like the standalone daemon's own
+     device-set reload, skipped for finite `--cycles`), probes with the SAME
+     `_gather_pings`/`build_prober` machinery as every other mode (including the gentle-infra
+     cadence — `_gentle_probe_plan` recomputes `MonitorEngine.probe_plan()`'s "is a parent"
+     rule client-side from the central-supplied topology, since there's no local engine to
+     ask), and `POST /report`s the raw per-IP results. Central's `central/engine.py` +
+     `central/dispatch.py` do 100% of the detecting and paging. A `SingleInstance` lock still
+     guards this mode (a different lock file, `.central-brain.lock`, since there's no local DB
+     to key off) — two probes for the same tenant would just double-report, which is wasteful
+     even though central's per-outage dedupe makes it harmless.
+  4. Modes 2 and 3 are **mutually exclusive per box**, not layered — a box in central-brain
+     mode does not also run the old outbox/shipper (`start_shipper_thread` is Phase 10's own
+     code path, untouched, and simply isn't in `run_forever_central_brain`'s loop).
+- **Deliberately deferred, not forgotten — v1 is the ICMP core outage ladder only:**
+  the central round-trip fast-confirm hint ("recheck this device now") described in
+  `new-plan.md` isn't built — `run_cycle_central_brain` has no fast-confirm / between-cycle
+  watch at all, so detection latency in this mode is `poll_interval_s × down_consecutive`,
+  the pre-fast-confirm baseline, not the few-seconds figure standalone/Phase-10 modes get.
+  Also still missing: canary/uplink freeze (the engine handles it the moment `pings`
+  includes `cfg.canary_ip`, which `run_cycle_central_brain` already sends — so this one
+  actually works today, just untested end-to-end), the soft-signal tiers (`perf_sweep`,
+  `redundancy_sweep`, SNMP port folding — need trailing sample history central doesn't
+  store yet), and the hourly rollup/prune sweeps (nothing local to roll up or prune in this
+  mode). Don't be surprised these don't fire; they're the next slices, not bugs.
+- **Tests:** `integration/test_central_brain.py` — `CentralEngineTest` (topology mapping
+  excludes maintenance, restart rehydration doesn't re-page, `EngineRegistry` streak
+  persistence across calls + rebuild-on-topology-change + per-tenant isolation),
+  `CentralAlertDispatcherTest` (mirrors `test_notifiers.py`: owner+operator on open,
+  UNREACHABLE suppressed, per-outage dedupe, new-outage-after-recovery pages again,
+  resolve broadcasts to all three (silent if from UNREACHABLE), hourly escalation
+  fans out + reschedules, ack doesn't stop it but recovery does, a missing topic is a
+  soft no-op not a crash), `ReportEndpointTest` (`GET /edge/devices` + `POST /report`
+  end-to-end over a real socket, bearer-gated, tenant isolation).
+  `integration/test_daemon_central_brain.py` (loads `apps/daemon/main.py` by path like
+  `test_daemon.py`) — `_gentle_probe_plan` infra-vs-leaf cadence, `run_cycle_central_brain`
+  reports every probed IP incl. canary + survives a report failure without raising,
+  `run_forever_central_brain` re-fetches topology + reports per cycle and aborts loudly
+  (`SystemExit(2)`) if the very first topology fetch fails, `Config.central_brain_enabled()`
+  requires both flags.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
