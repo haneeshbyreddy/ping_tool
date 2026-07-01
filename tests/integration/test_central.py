@@ -83,6 +83,42 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(total, 2)
         self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
 
+    def test_triage_outages_status_derivation(self):
+        dev = self._device()
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispA", dev)
+        statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
+        self.assertEqual(statuses[oid], "unassigned")
+
+        self.store.acknowledge_outage("ispA", oid, "alice")
+        statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
+        self.assertEqual(statuses[oid], "in_progress")
+
+        self.store.resolve_outage("ispA", dev, "2026-06-23T08:05:00+00:00")
+        statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
+        self.assertEqual(statuses[oid], "pending_postmortem")
+
+        # a postmortem removes it from the triage queue entirely
+        self.assertTrue(self.store.set_outage_postmortem("ispA", oid, "fiber cut", "spliced"))
+        self.assertNotIn(oid, {o["id"] for o in self.store.triage_outages("ispA")})
+
+    def test_postmortem_refuses_still_open_outage(self):
+        dev = self._device()
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispA", dev)
+        self.assertFalse(self.store.set_outage_postmortem("ispA", oid, "guess", None))
+
+    def test_outage_tenant_is_none_for_unknown_id(self):
+        self.assertIsNone(self.store.outage_tenant(999))
+
+    def test_list_events_pagination(self):
+        self.store.ingest("ispA", "edge-1", [_evt(i) for i in range(1, 6)])
+        page1 = self.store.list_events("ispA", limit=2)
+        self.assertEqual(len(page1), 2)
+        page2 = self.store.list_events("ispA", limit=2, before_id=page1[-1]["id"])
+        self.assertEqual(len(page2), 2)
+        self.assertTrue(page2[0]["id"] < page1[-1]["id"])
+
     def test_heartbeat_upserts_node(self):
         self.store.record_heartbeat("ispA", "edge-1",
                                     {"version": "0.10.0", "fleet_size": 7, "open_outages": 1,

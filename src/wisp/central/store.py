@@ -26,7 +26,7 @@ import json
 import secrets
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SCHEMA = """
@@ -1181,6 +1181,76 @@ class CentralStore:
                 (_now_iso(), by, outage_id, tenant_id))
             conn.commit()
             return cur.rowcount > 0
+
+    def outage_tenant(self, outage_id: int) -> str | None:
+        """The owning tenant of an outages row — same re-derive-from-the-row discipline
+        as `device_tenant`/`switch_port_tenant`, so an ack/post-mortem write is
+        authorized against the right org before the request body is trusted."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT tenant_id FROM outages WHERE id=?",
+                               (outage_id,)).fetchone()
+        return row["tenant_id"] if row else None
+
+    def triage_outages(self, tenant_id: str, postmortem_days: int = 30) -> list[dict]:
+        """The dashboard's Outages triage queue: every still-open outage, plus any
+        resolved in the last `postmortem_days` still missing an operator post-mortem
+        `root_cause`. `status` is derived, never stored: 'unassigned' (open,
+        unacknowledged), 'in_progress' (open, acknowledged), or 'pending_postmortem'
+        (resolved, no root_cause yet). Recovery itself is never operator-driven — the
+        FSM resolves outages on its own (CLAUDE.md: cause is operator-confirmed, never
+        inferred) — this only surfaces outages that need acknowledgement or a cause."""
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                 - timedelta(days=postmortem_days)).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT o.*, d.name AS device_name, d.region FROM outages o"
+                " JOIN org_devices d ON d.id = o.device_id"
+                " WHERE o.tenant_id=? AND (o.resolved_at IS NULL"
+                " OR (o.root_cause IS NULL AND o.resolved_at >= ?))"
+                " ORDER BY o.started_at DESC", (tenant_id, cutoff)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d["resolved_at"] is None:
+                d["status"] = "in_progress" if d["acknowledged_at"] else "unassigned"
+            else:
+                d["status"] = "pending_postmortem"
+            out.append(d)
+        return out
+
+    def set_outage_postmortem(self, tenant_id: str, outage_id: int, root_cause: str,
+                              resolution_notes: str | None) -> bool:
+        """Operator-entered post-mortem on an already-RESOLVED outage (CLAUDE.md: cause
+        is operator-confirmed, never auto-inferred) — overwrites whatever
+        `stamp_outage_cause` may have COALESCEd in from an SNMP fold, since a human call
+        supersedes a leading indicator. Refuses a still-open outage: a cause is only
+        ever entered at resolution, not while the picture can still change."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE outages SET root_cause=?, resolution_notes=?"
+                " WHERE id=? AND tenant_id=? AND resolved_at IS NOT NULL",
+                (root_cause, resolution_notes, outage_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def list_events(self, tenant_id: str, limit: int = 100,
+                    before_id: int | None = None) -> list[dict]:
+        """Newest-first event log for the dashboard's Logs page, cursor-paginated on
+        `id` (before_id = strictly older than this id). Unlike `fleet()`'s
+        `recent_events` (capped at 50, meant for the overview card), this is the
+        tenant's full history, paged for a proper log view."""
+        scope, args = self._scope(tenant_id)
+        cursor = ""
+        if before_id is not None:
+            cursor = " AND id < ?"
+            args = (*args, before_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, tenant_id, node_id, type, device_id, device_name, device_ip,"
+                " device_region, state, occurred_at, received_at FROM events"
+                " WHERE 1=1" + scope + cursor + " ORDER BY id DESC LIMIT ?",
+                (*args, max(1, min(limit, 500)))).fetchall()
+        return [dict(r) for r in rows]
 
     # -- alert log + escalation ladder (mirrors egress/notifiers.AlertDispatcher) --
     def already_paged(self, outage_id: int) -> bool:

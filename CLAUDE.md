@@ -194,9 +194,17 @@ Src layout, zero-install:
   + `GET /api/summary` (tenant-scoped: uplink flag + fleet-wide bw-alarmed ports) and
   `store.data_version` + `GET /api/events` (SSE, tenant-scoped fingerprint) exist only to
   feed that look — the header's low-bandwidth/uplink chips and live refresh-on-change.
-  Not brought back: the old dashboard's outage triage/assign/acknowledge queue — central
-  has no open-outages-listing or acknowledge endpoint today, so that would be a new
-  backend feature, not a UI restore.
+  The Outages triage queue (`store.triage_outages` + `GET /api/outages`,
+  `POST /api/outages/acknowledge`/`postmortem`) and the Logs page
+  (`store.list_events` + `GET /api/logs`, cursor-paginated on `id`) were added as a
+  follow-up — status (`unassigned`/`in_progress`/`pending_postmortem`) is derived, never
+  stored, from `acknowledged_at`/`resolved_at`/`root_cause`; a resolved outage without a
+  `root_cause` stays in the queue for `postmortem_days` (default 30) so an operator can
+  still log one. Recovery itself is never operator-driven — the FSM resolves outages on
+  its own — so this page only ever offers acknowledge/postmortem, never a manual
+  resolve. Ack/postmortem writes re-derive tenant from the outage row
+  (`store.outage_tenant`), same discipline as `device_tenant`/`switch_port_tenant`, and
+  are gated the same as every other dashboard write (owner or superadmin only).
 
 ## Engine invariants (don't break)
 

@@ -459,6 +459,63 @@ class CentralAuthHttpTest(unittest.TestCase):
             {"id": pid, "direction": "sideways"}, cookie=own)
         self.assertEqual(status, 422)
 
+    # --- outage triage (Outages page) ---
+    def test_outage_acknowledge_and_postmortem_round_trip(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Tower", "ip_address": "10.0.5.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispA", dev)
+
+        _, op = self._login("oper", "operpassword")
+        status, body, _ = self._req("GET", "/api/outages", cookie=op)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["outages"][0]["status"], "unassigned")
+        # operator cannot acknowledge — outage writes are owner/superadmin only, same
+        # tier as team/inventory writes.
+        status, _, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=op)
+        self.assertEqual(status, 403)
+
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        status, body, _ = self._req("GET", "/api/outages", cookie=own)
+        self.assertEqual(body["outages"][0]["status"], "in_progress")
+
+        # a post-mortem is refused while the outage is still open
+        status, body, _ = self._req("POST", "/api/outages/postmortem",
+                                    {"outage_id": oid, "root_cause": "fiber cut"}, cookie=own)
+        self.assertEqual(status, 404)
+
+        self.store.resolve_outage("ispA", dev, "2026-06-23T08:10:00+00:00")
+        status, body, _ = self._req(
+            "POST", "/api/outages/postmortem",
+            {"outage_id": oid, "root_cause": "fiber cut", "resolution_notes": "spliced"},
+            cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        # a recorded post-mortem drops it out of the triage queue entirely
+        status, body, _ = self._req("GET", "/api/outages", cookie=own)
+        self.assertNotIn(oid, {o["id"] for o in body["outages"]})
+
+    def test_outage_write_cannot_cross_tenant(self):
+        dev = self.store.create_org_device("ispB", {
+            "name": "Relay", "ip_address": "10.0.5.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.store.open_outage_if_absent("ispB", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispB", dev)
+        _, own = self._login("owner", "ownerpassword")   # ispA owner
+        status, _, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=own)
+        self.assertEqual(status, 403)
+
+    def test_logs_endpoint_is_tenant_scoped(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("GET", "/api/logs", cookie=own)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["events"])
+        self.assertTrue(all(e["tenant_id"] == "ispA" for e in body["events"]))
+
     # --- static (unauthed) ---
     def test_static_index_served(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)

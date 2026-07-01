@@ -397,6 +397,37 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(200, {"since": since, "until": until,
                                   "buckets": store.device_rollup_series(tenant, did, since, until)})
                 return
+            if route == "/api/outages":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = self._scope_tenant(user, qs)
+                if not tenant:
+                    self._reply(400, {"error": "tenant required"})
+                    return
+                self._reply(200, {"outages": store.triage_outages(tenant)})
+                return
+            if route == "/api/logs":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = self._scope_tenant(user, qs)
+                if not tenant:
+                    self._reply(400, {"error": "tenant required"})
+                    return
+                try:
+                    limit = int((qs.get("limit") or [100])[0])
+                except (TypeError, ValueError):
+                    limit = 100
+                before_raw = (qs.get("before") or [None])[0]
+                try:
+                    before_id = int(before_raw) if before_raw is not None else None
+                except ValueError:
+                    before_id = None
+                self._reply(200, {"events": store.list_events(tenant, limit, before_id)})
+                return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users", "/api/nodes"):
                 user = self._reader()
@@ -686,6 +717,32 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 store.set_attendance(w, int(body["worker_id"]), bool(body.get("present")),
                                      body.get("day"))
                 self._reply(200, {"ok": True})
+                return
+            # outage triage: acknowledge (open only) / post-mortem (resolved only) —
+            # tenant is re-derived from the outage row, never trusted from the body
+            # (same discipline as device_tenant/switch_port_tenant/_worker_tenant).
+            if route == "/api/outages/acknowledge":
+                oid = int(body.get("outage_id") or 0)
+                tenant = store.outage_tenant(oid)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                ok = store.acknowledge_outage(tenant, oid, user["username"])
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/outages/postmortem":
+                oid = int(body.get("outage_id") or 0)
+                tenant = store.outage_tenant(oid)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                cause = str(body.get("root_cause") or "").strip()
+                if not cause:
+                    self._reply(422, {"error": "root_cause is required"})
+                    return
+                notes = str(body.get("resolution_notes") or "").strip() or None
+                ok = store.set_outage_postmortem(tenant, oid, cause, notes)
+                self._reply(200 if ok else 404, {"ok": ok})
                 return
             # org rename / topics (owner of that org, or superadmin)
             if route == "/api/org":

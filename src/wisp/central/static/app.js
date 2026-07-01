@@ -133,7 +133,7 @@ const STATE_TONE = { UP: "ok", DOWN: "down", UNREACHABLE: "down", DEGRADED: "war
 const TH = "text-left font-label-xs text-label-xs text-on-surface-variant uppercase tracking-wider py-2 px-3 border-b border-outline-variant";
 const TD = "py-2 px-3 border-b border-outline-variant/50 align-middle";
 const BTN = "px-3 py-1.5 rounded-md bg-primary text-surface font-label-md text-label-md hover:opacity-90 active:scale-95 transition-transform disabled:opacity-40";
-const GHOST = "px-3 py-1.5 rounded-md border border-outline-variant text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface font-label-md text-label-md active:scale-95 transition-transform";
+const GHOST = "px-3 py-1.5 rounded-md border border-outline-variant text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface font-label-md text-label-md active:scale-95 transition-transform disabled:opacity-40 disabled:pointer-events-none";
 const FIELD = "bg-surface border border-outline-variant rounded-md px-3 py-1.5 text-on-surface font-body-sm text-body-sm placeholder:text-outline focus:outline-none focus:border-primary";
 
 function loading(label) {
@@ -176,9 +176,11 @@ function renderLogin(err = "") {
 const PAGES = [
   ["overview", "Overview", "dashboard"],
   ["nodes", "Nodes", "router"],
+  ["outages", "Outages", "warning"],
   ["agents", "Edge Nodes", "cell_tower"],
   ["team", "Team", "group"],
   ["settings", "Settings", "settings"],
+  ["logs", "Logs", "terminal"],
 ];
 
 function updateUplinkChip(down) {
@@ -287,9 +289,11 @@ async function refresh() {
   try {
     await refreshSummary();
     if (PAGE === "nodes") await renderNodesPage(main);
+    else if (PAGE === "outages") await renderOutagesPage(main);
     else if (PAGE === "agents") await renderAgentsPage(main);
     else if (PAGE === "team") await renderTeamPage(main);
     else if (PAGE === "settings") await renderSettingsPage(main);
+    else if (PAGE === "logs") await renderLogsPage(main);
     else await renderOverviewPage(main);
   } catch (e) {
     main.replaceChildren(h(`<div class="border border-error/30 bg-error/5 rounded-md p-4 flex items-center gap-3 text-error">
@@ -523,6 +527,142 @@ function nodesPageCard(devices, tenant) {
     return wrap;
   }
   return card_;
+}
+
+// --- Outages page: the triage queue (acknowledge an open outage, log a post-mortem on
+// a resolved one) — status is derived server-side (store.triage_outages), never stored:
+// unassigned (open, unacknowledged) / in_progress (open, acknowledged) /
+// pending_postmortem (resolved, no root_cause yet). Recovery itself is automatic (the
+// FSM resolves outages on its own); this page never offers a manual "resolve" action.
+const OUTAGE_STATUS_META = {
+  unassigned: { label: "UNASSIGNED", cls: "text-amber-400 border-amber-400/30 bg-amber-400/10", border: "border-l-amber-500" },
+  in_progress: { label: "IN PROGRESS", cls: "text-sky-400 border-sky-400/30 bg-sky-400/10", border: "border-l-sky-500" },
+  pending_postmortem: { label: "PENDING POST-MORTEM", cls: "text-emerald-400 border-emerald-400/30 bg-emerald-400/10", border: "border-l-emerald-500" },
+};
+
+async function renderOutagesPage(main) {
+  const t = scope();
+  if (!t) { main.replaceChildren(needsOrgCard()); return; }
+  const { outages } = await api(`/api/outages${tq(t)}`);
+  main.replaceChildren(outagesPageCard(outages, t));
+}
+
+// A still-open outage's duration ticks live off its start (tickDurations' [data-since]
+// mechanism, same as the Low Bandwidth card); a resolved one is a fixed elapsed span.
+function outageDuration(o) {
+  if (!o.resolved_at) return `<span data-since="${esc(o.started_at)}">—</span>`;
+  return esc(fmtDur((toUtcDate(o.resolved_at) - toUtcDate(o.started_at)) / 1000));
+}
+
+function outageCard(o) {
+  const m = OUTAGE_STATUS_META[o.status] || OUTAGE_STATUS_META.unassigned;
+  const write = canWrite();
+  const head = `<div class="flex justify-between items-start flex-wrap gap-2">
+    <div>
+      <h3 class="font-body-lg text-body-lg text-primary font-medium">${esc(o.device_name)} <span class="text-on-surface-variant font-normal">· ${esc(o.region || "—")}</span></h3>
+      <div class="flex items-center gap-2 mt-1 flex-wrap">
+        <span class="font-label-xs text-label-xs ${m.cls} border px-2 py-0.5 rounded-md">${esc(m.label)}</span>
+        <span class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1">${icon("schedule", { size: 14 })} ${outageDuration(o)}</span>
+        <span class="font-mono-data text-mono-data text-on-surface-variant">${esc(o.final_state)}</span>
+      </div>
+    </div>
+  </div>`;
+
+  let action = "";
+  if (o.status === "unassigned") {
+    action = write ? `<div class="pt-3 border-t border-outline-variant">
+      <button data-ack="${o.id}" class="${BTN}">Acknowledge</button>
+    </div>` : "";
+  } else if (o.status === "in_progress") {
+    action = `<div class="font-mono-data text-mono-data text-on-surface-variant flex items-center gap-1 border-t border-outline-variant pt-3">${icon("assignment", { size: 14 })} Acknowledged by ${esc(o.acknowledged_by || "—")}</div>`;
+  } else if (o.status === "pending_postmortem") {
+    action = write ? `<form data-postmortem="${o.id}" class="flex flex-col gap-3 border-t border-outline-variant pt-3">
+      <div class="flex flex-col gap-1">
+        <label class="font-label-xs text-label-xs text-on-surface-variant">What was the issue?</label>
+        <input data-root class="${FIELD}" placeholder="e.g. fiber cut, power failure, hardware fault">
+      </div>
+      <div class="flex flex-col gap-1">
+        <label class="font-label-xs text-label-xs text-on-surface-variant">Resolution details</label>
+        <textarea data-notes rows="2" placeholder="Brief summary of the fix…" class="${FIELD} resize-none"></textarea>
+      </div>
+      <button type="submit" class="${BTN} self-start">Submit post-mortem</button>
+      <div class="font-label-xs text-label-xs text-error min-h-[14px]" data-err></div>
+    </form>` : `<div class="font-label-xs text-label-xs text-on-surface-variant border-t border-outline-variant pt-3">Awaiting an operator post-mortem.</div>`;
+  }
+
+  return `<div class="border border-outline-variant bg-surface rounded-md p-4 flex flex-col gap-3 border-l-4 ${m.border} animate-fade-in">${head}${action}</div>`;
+}
+
+function outagesPageCard(outages, tenant) {
+  const wrap = h(card(`${sectionHeader(`Outages — ${tenant}`, "warning",
+    pill(`${outages.length} ITEM${outages.length === 1 ? "" : "S"}`, outages.length ? "warn" : "muted"))}
+    <div class="flex flex-col gap-3">
+      ${outages.map(outageCard).join("") || `<div class="font-body-sm text-body-sm text-on-surface-variant py-6 text-center">Nothing needs attention right now.</div>`}
+    </div>`));
+  wrap.querySelectorAll("[data-ack]").forEach(b => b.onclick = async () => {
+    try { await api("/api/outages/acknowledge", "POST", { outage_id: +b.dataset.ack }); refresh(); }
+    catch (e) { alert(e.message); }
+  });
+  wrap.querySelectorAll("form[data-postmortem]").forEach(f => f.onsubmit = async (e) => {
+    e.preventDefault();
+    const err = f.querySelector("[data-err]");
+    const root = f.querySelector("[data-root]").value.trim();
+    if (!root) { err.textContent = "describe the cause first"; return; }
+    try {
+      await api("/api/outages/postmortem", "POST", {
+        outage_id: +f.dataset.postmortem, root_cause: root,
+        resolution_notes: f.querySelector("[data-notes]").value.trim() || null,
+      });
+      refresh();
+    } catch (ex) { err.textContent = ex.message; }
+  });
+  return wrap;
+}
+
+// --- Logs page: the tenant's full event history, cursor-paginated on id (unlike the
+// overview's "Recent events", which is capped at 50 for a quick glance) -----------------
+function logsRows(events) {
+  return events.map(e => `<tr>
+    <td class="${TD} text-on-surface-variant">${esc(e.node_id)}</td>
+    <td class="${TD}">${esc(e.type || "—")}</td>
+    <td class="${TD}">${esc(e.device_name || e.device_id || "—")}</td>
+    <td class="${TD}">${e.state ? pill(e.state, STATE_TONE[e.state] || "muted") : "—"}</td>
+    <td class="${TD} text-on-surface-variant">${esc(e.occurred_at || e.received_at)}</td>
+  </tr>`).join("") || `<tr><td colspan=5 class="${TD} text-on-surface-variant">No events yet.</td></tr>`;
+}
+
+function logsTableInner(events) {
+  return `<tr><th class="${TH}">Node</th><th class="${TH}">Type</th><th class="${TH}">Device</th><th class="${TH}">State</th><th class="${TH}">When</th></tr>
+    ${logsRows(events)}`;
+}
+
+async function renderLogsPage(main) {
+  const t = scope();
+  if (!t) { main.replaceChildren(needsOrgCard()); return; }
+  const { events } = await api(`/api/logs${tq(t)}`);
+  main.replaceChildren(logsPageCard(events, t));
+}
+
+function logsPageCard(events, tenant) {
+  let items = events.slice();
+  const wrap = h(card(`${sectionHeader(`Logs — ${tenant}`, "terminal")}
+    <table class="w-full border-collapse" id="logstbl">${logsTableInner(items)}</table>
+    <div class="mt-4 flex justify-center">
+      <button id="loadmore" class="${GHOST}" ${events.length < 100 ? "disabled" : ""}>Load older</button>
+    </div>`));
+  $("#loadmore", wrap).onclick = async () => {
+    const btn = $("#loadmore", wrap);
+    const before = items.length ? items[items.length - 1].id : null;
+    if (before == null) { btn.disabled = true; return; }
+    let more;
+    try { more = (await api(`/api/logs${tq(scope())}&before=${before}`)).events; }
+    catch { btn.disabled = true; return; }
+    if (!more.length) { btn.disabled = true; btn.textContent = "No more"; return; }
+    items = items.concat(more);
+    $("#logstbl", wrap).innerHTML = logsTableInner(items);
+    if (more.length < 100) { btn.disabled = true; btn.textContent = "No more"; }
+  };
+  return wrap;
 }
 
 // --- Edge Nodes page: self-service enrollment for physical probes -------------------
