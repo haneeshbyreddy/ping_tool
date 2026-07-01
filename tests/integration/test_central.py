@@ -439,6 +439,45 @@ class CentralServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispB"})
 
+    def test_summary_requires_tenant_and_reports_low_bandwidth(self):
+        status, _ = self._req("GET", "/api/summary")
+        self.assertEqual(status, 401)
+        status, body = self._req("GET", "/api/summary", token="s3cret")
+        self.assertEqual(status, 400)  # superadmin with no ?tenant= narrows to nothing
+        switch = self.store.create_org_device("ispA", {
+            "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.store.upsert_switch_port("ispA", switch, 3, "Gi0/3", None, "up", "up",
+                                      None, 0, False, None, "2026-01-01T00:00:00+00:00",
+                                      bw=("0", "0", "2026-01-01T00:00:00+00:00",
+                                          5_000_000.0, 5_000_000.0, 2, True,
+                                          "2026-01-01T00:00:20+00:00"))
+        port_id = self.store.list_switch_ports("ispA", switch)[0]["id"]
+        self.store.set_port_monitored("ispA", port_id, True)
+        self.store.set_port_bandwidth_config("ispA", port_id, 10, "either")
+        status, body = self._req("GET", "/api/summary?tenant=ispA", token="s3cret")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["uplink_down"])
+        self.assertEqual(len(body["low_bandwidth"]), 1)
+        self.assertEqual(body["low_bandwidth"][0]["switch_name"], "Core Switch")
+
+    def test_events_stream_emits_changed_on_new_data(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/events", headers={"Authorization": "Bearer s3cret"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
+        self.assertTrue(resp.readline().startswith(b"retry:"))
+        resp.readline()  # blank line after the retry directive
+        self.assertEqual(resp.readline(), b"event: changed\n")
+        version_before = resp.readline()
+        resp.readline()  # blank line closing the first event
+        self._req("POST", "/ingest", _batch([_evt(1, device_name="Tower")]), token="s3cret")
+        self.assertEqual(resp.readline(), b"event: changed\n")
+        version_after = resp.readline()
+        self.assertNotEqual(version_before, version_after)
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

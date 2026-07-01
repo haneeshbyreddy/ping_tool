@@ -32,6 +32,7 @@ import logging
 import mimetypes
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -202,6 +203,47 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return None
             return body
 
+        # --- live push (Server-Sent Events) ---
+        def _serve_events(self, tenant: str | None) -> None:
+            """SSE stream: emit a `changed` event whenever `store.data_version(tenant)`
+            moves, so the dashboard updates the instant an edge reports or an SNMP walk
+            lands — no client-side polling. Mirrors the old single-box dashboard's
+            `_serve_events` one-for-one; scoped to the caller's tenant (or every tenant,
+            for a superadmin viewing "all orgs"). No Content-Length — the connection
+            stays open and the browser's EventSource auto-reconnects."""
+            self.close_connection = True
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.wfile.write(b"retry: 3000\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            last: str | None = None
+            idle = 0
+            while True:
+                try:
+                    version = store.data_version(tenant)
+                except Exception:
+                    version = last  # a transient DB hiccup must not kill the stream
+                try:
+                    if version != last:
+                        last = version
+                        self.wfile.write(f"event: changed\ndata: {version}\n\n".encode())
+                        idle = 0
+                    else:
+                        idle += 1
+                        if idle % 15 == 0:
+                            self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(1.0)
+
         # --- static (unauthed; SPA shows its own login gate on 401) ---
         def _serve_static(self, route: str) -> bool:
             rel = "index.html" if route in ("/", "") else route.lstrip("/")
@@ -231,6 +273,26 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 self._reply(200, {"user": _public_user(user),
                                   "channels": {"central": cfg.central_ntfy_topic}})
+                return
+            if route == "/api/summary":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = self._scope_tenant(user, qs)
+                if not tenant:
+                    self._reply(400, {"error": "tenant required"})
+                    return
+                self._reply(200, {"uplink_down": store.uplink_active(tenant),
+                                  "low_bandwidth": store.low_bandwidth_alarms(tenant)})
+                return
+            if route == "/api/events":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                tenant = self._scope_tenant(user, qs)
+                self._serve_events(tenant)
                 return
             # Ingest plane (bearer token): what should this edge probe? Phase B — the
             # edge's device list now comes from the ISP-managed org_devices topology

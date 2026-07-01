@@ -186,6 +186,17 @@ Src layout, zero-install:
 - `config.PROJECT_ROOT` is the repo root (`parents[2]` of `config.py`); `central_db`
   defaults to `data/central.db`; `central/server.py` resolves the dashboard SPA from
   `central/static/`.
+- **The dashboard's visual language is ported from the old retired single-box edge
+  dashboard** (dark Material-ish Tailwind, `central/static/vendor/tailwind.js` +
+  `icons.js` copied verbatim from that dashboard's last commit before it was deleted) —
+  only the LOOK came back, rewired against central's tenant-scoped API; the old
+  dashboard's own code is still gone (see "Removed" above). `store.low_bandwidth_alarms`
+  + `GET /api/summary` (tenant-scoped: uplink flag + fleet-wide bw-alarmed ports) and
+  `store.data_version` + `GET /api/events` (SSE, tenant-scoped fingerprint) exist only to
+  feed that look — the header's low-bandwidth/uplink chips and live refresh-on-change.
+  Not brought back: the old dashboard's outage triage/assign/acknowledge queue — central
+  has no open-outages-listing or acknowledge endpoint today, so that would be a new
+  backend feature, not a UI restore.
 
 ## Engine invariants (don't break)
 

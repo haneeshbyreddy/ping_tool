@@ -1,56 +1,76 @@
 <!DOCTYPE html>
-<html lang="en">
+<html class="dark" lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8" />
+  <meta content="width=device-width, initial-scale=1.0" name="viewport" />
   <title>WISP Central</title>
+  <!-- Vendored locally: no CDN, works on a site with no internet. -->
+  <script src="vendor/tailwind.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            "error": "#ffb4ab",
+            "secondary": "#c6c6cf",
+            "surface-container-highest": "#353434",
+            "surface-dim": "#141313",
+            "surface-container": "#201f1f",
+            "primary": "#ffffff",
+            "surface-bright": "#3a3939",
+            "surface-container-lowest": "#0e0e0e",
+            "surface-container-low": "#1c1b1b",
+            "on-background": "#e5e2e1",
+            "on-surface-variant": "#c4c7c8",
+            "background": "#141313",
+            "tertiary": "#ffffff",
+            "surface-variant": "#353434",
+            "outline-variant": "#444748",
+            "on-surface": "#e5e2e1",
+            "inverse-primary": "#5d5f5f",
+            "surface": "#141313",
+            "outline": "#8e9192",
+            "primary-container": "#e2e2e2",
+            "surface-container-high": "#2a2a2a",
+            "tertiary-fixed": "#e2e2e2"
+          },
+          borderRadius: { "DEFAULT": "0.375rem", "md": "0.375rem", "lg": "0.5rem", "xl": "0.75rem", "full": "9999px" },
+          spacing: { "base": "4px", "section-gap": "32px", "component-padding-y": "8px", "component-padding-x": "12px", "gutter": "16px", "container-margin": "24px" },
+          fontFamily: {
+            "label-xs": ["Geist", "sans-serif"], "headline-lg": ["Geist", "sans-serif"], "headline-md": ["Geist", "sans-serif"],
+            "display": ["Geist", "sans-serif"], "body-sm": ["Geist", "sans-serif"], "mono-data": ["Geist", "monospace"],
+            "label-md": ["Geist", "sans-serif"], "body-lg": ["Geist", "sans-serif"]
+          },
+          fontSize: {
+            "label-xs": ["11px", { "lineHeight": "1", "letterSpacing": "0.03em", "fontWeight": "600" }],
+            "headline-lg": ["24px", { "lineHeight": "1.3", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+            "headline-md": ["18px", { "lineHeight": "1.4", "fontWeight": "500" }],
+            "display": ["32px", { "lineHeight": "1.2", "letterSpacing": "-0.02em", "fontWeight": "600" }],
+            "body-sm": ["14px", { "lineHeight": "1.5", "fontWeight": "400" }],
+            "mono-data": ["13px", { "lineHeight": "1", "letterSpacing": "0", "fontWeight": "400" }],
+            "label-md": ["13px", { "lineHeight": "1", "letterSpacing": "0.01em", "fontWeight": "500" }],
+            "body-lg": ["16px", { "lineHeight": "1.5", "fontWeight": "400" }]
+          },
+          animation: { 'fade-in': 'fadeIn 0.4s ease-out forwards' },
+          keyframes: { fadeIn: { '0%': { opacity: '0', transform: 'translateY(10px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } } }
+        }
+      }
+    }
+  </script>
   <style>
-    :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --fg:#e2e8f0; --mut:#94a3b8;
-            --up:#22c55e; --down:#ef4444; --deg:#f59e0b; --acc:#38bdf8; }
-    * { box-sizing: border-box; }
-    body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
-    header { display:flex; align-items:center; gap:16px; padding:12px 20px;
-             background:var(--panel); border-bottom:1px solid var(--line); }
-    header h1 { font-size:16px; margin:0; color:var(--acc); }
-    header .spacer { flex:1; }
-    .tabs { display:flex; gap:4px; padding:10px 20px 0; max-width:1100px; margin:0 auto; }
-    .tab { background:transparent; border:1px solid transparent; border-bottom:none;
-           border-radius:8px 8px 0 0; color:var(--mut); }
-    .tab.active { background:var(--panel); color:var(--fg); border-color:var(--line); }
-    select, input, button { font:inherit; color:var(--fg); background:#0b1220;
-             border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
-    button { cursor:pointer; background:#1d4ed8; border-color:#1d4ed8; }
-    button.ghost { background:transparent; border-color:var(--line); }
-    button:hover { filter:brightness(1.1); }
-    main { padding:20px; max-width:1100px; margin:0 auto; }
-    .grid { display:grid; gap:16px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
-    .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.04em;
-               color:var(--mut); }
-    table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
-    th { color:var(--mut); font-weight:600; font-size:12px; }
-    .pill { padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; margin-right:4px; }
-    .UP{background:#052e1a;color:var(--up)} .DOWN,.UNREACHABLE{background:#3f1212;color:var(--down)}
-    .DEGRADED{background:#3a2a08;color:var(--deg)} .stale{background:#3f1212;color:var(--down)}
-    .ok{background:#052e1a;color:var(--up)} .maint{background:#3a2a08;color:var(--deg)}
-    .muted-pill{background:#0b1220;color:var(--mut)}
-    .muted { color:var(--mut); }
-    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    label { font-size:13px; }
-    .login { max-width:340px; margin:12vh auto; }
-    .login .card { display:grid; gap:10px; }
-    .err { color:var(--down); min-height:18px; }
-    .chip { font-size:12px; padding:2px 8px; border:1px solid var(--line); border-radius:999px;
-            cursor:pointer; background:#0b1220; }
-    .chip.on { background:#052e1a; color:var(--up); border-color:#14532d; }
-    .num { font-variant-numeric: tabular-nums; }
-    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-    code { background:#0b1220; border:1px solid var(--line); border-radius:4px; padding:2px 6px; }
+    body { background-color: #141313; color: #ffffff; min-height: 100dvh; font-family: 'Geist', system-ui, sans-serif; }
+    ::-webkit-scrollbar { height: 6px; width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #444748; border-radius: 4px; }
+    .ic { display: inline-block; vertical-align: middle; flex-shrink: 0; }
+    [data-spin] { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
-<body>
-  <div id="app"></div>
+<body class="antialiased min-h-screen flex flex-col font-body-sm text-body-sm bg-background text-on-background">
+  <div id="app" class="flex flex-col min-h-screen w-full"></div>
+  <script src="icons.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

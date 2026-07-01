@@ -587,6 +587,57 @@ class CentralStore:
                 + " ORDER BY id DESC LIMIT ?", (*eargs, max(0, recent_events)))]
         return {"nodes": nodes, "recent_events": events}
 
+    def low_bandwidth_alarms(self, tenant_id: str) -> list[dict]:
+        """Monitored ports currently below their bandwidth threshold, across every
+        active device this tenant owns — feeds the dashboard's Low Bandwidth card and
+        header chip (mirrors the old single-box `system_summary`'s low_bandwidth list,
+        just tenant-scoped and read straight off `switch_ports` rather than a summary
+        helper, since central has no per-tenant summary function of its own)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT sp.id AS port_id, sp.device_id, d.name AS switch_name,"
+                " sp.if_index, sp.if_name, sp.if_alias, sp.in_bps, sp.out_bps,"
+                " sp.bw_threshold_mbps, sp.bw_direction, sp.bw_alarm_since"
+                " FROM switch_ports sp JOIN org_devices d ON d.id = sp.device_id"
+                " WHERE sp.tenant_id=? AND sp.monitored=1 AND sp.bw_alarm=1"
+                " AND d.is_active=1 ORDER BY sp.bw_alarm_since", (tenant_id,)).fetchall()
+        out = []
+        for r in rows:
+            base = r["if_name"] or f"if{r['if_index']}"
+            label = f"{base} ({r['if_alias']})" if r["if_alias"] else base
+            out.append({
+                "port_id": r["port_id"], "device_id": r["device_id"],
+                "switch_name": r["switch_name"], "label": label,
+                "in_mbps": round(r["in_bps"] / 1e6, 2) if r["in_bps"] is not None else None,
+                "out_mbps": round(r["out_bps"] / 1e6, 2) if r["out_bps"] is not None else None,
+                "threshold_mbps": r["bw_threshold_mbps"],
+                "direction": r["bw_direction"] or "either",
+                "since": r["bw_alarm_since"],
+            })
+        return out
+
+    def data_version(self, tenant_id: str | None = None) -> str:
+        """A cheap monotonic fingerprint of the data the dashboard's live views render,
+        for the `/api/events` SSE stream — bumps whenever a new event/outage row lands,
+        or a switch_ports write (SNMP walk: port status + live bandwidth, which UPSERT
+        in place with no new id) refreshes, so a client knows to re-fetch. Mirrors the
+        old single-box server's `_data_version` one-for-one, scoped to one tenant (or
+        every tenant when `tenant_id` is None, for a superadmin's all-orgs view)."""
+        escope, eargs = self._scope(tenant_id, prefix="e.")
+        oscope, oargs = self._scope(tenant_id, prefix="o.")
+        sscope, sargs = self._scope(tenant_id, prefix="sp.")
+        with self._connect() as conn:
+            e = conn.execute(
+                "SELECT COALESCE(MAX(e.id),0) FROM events e WHERE 1=1" + escope,
+                eargs).fetchone()[0]
+            o = conn.execute(
+                "SELECT COALESCE(MAX(o.id),0) FROM outages o WHERE 1=1" + oscope,
+                oargs).fetchone()[0]
+            s = conn.execute(
+                "SELECT COALESCE(MAX(sp.updated_at),'') FROM switch_ports sp"
+                " WHERE 1=1" + sscope, sargs).fetchone()[0]
+        return f"{e}.{o}.{s}"
+
     # --- self-service node enrollment (dashboard-issued ingest credentials) ---
     @staticmethod
     def _hash_node_token(token: str) -> str:
