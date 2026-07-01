@@ -215,10 +215,22 @@ class Config:
     # (e.g. https://central.example.net). All detection/alerting happens on central —
     # the edge only probes and ships raw per-IP samples.
     central_url: str = field(default_factory=lambda: _env("WISP_CENTRAL_URL", "").rstrip("/"))
-    # Stopgap auth until mTLS enrollment exists: a per-node shared secret sent as
-    # `Authorization: Bearer <token>`. The wire envelope is designed so mTLS slots in
-    # later without changing the record format. Keep it out of logs.
+    # The original stopgap auth (now that mTLS enrollment exists below, this is the
+    # fallback/coexistence path, not the only option): a per-node shared secret sent as
+    # `Authorization: Bearer <token>`. Keep it out of logs.
     central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
+    # --- mTLS enrollment (plan.md item 6) — the edge's half -------------------
+    # Client identity for the ingest TLS handshake, issued by `central.admin
+    # enroll-edge` (see central/pki.py). Empty ⇒ the edge presents no client cert and
+    # falls back to the bearer token above — both can be set at once during a
+    # migration (either satisfies central's ingest auth), so turning this on is not a
+    # hard cutover.
+    central_client_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_CLIENT_CERT", ""))
+    central_client_key: str = field(default_factory=lambda: _env("WISP_CENTRAL_CLIENT_KEY", ""))
+    # CA bundle to verify central's own TLS server cert against (needed only when
+    # central's cert isn't from a public CA the OS trust store already has — the
+    # common case for the internal CA `central.admin init-ca` creates).
+    central_ca_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_CA_CERT", ""))
     # Edge identity. (tenant_id, node_id) is the durable identity central keys every
     # record by. node_id defaults to the hostname so a fresh install still has a
     # stable id.
@@ -240,6 +252,25 @@ class Config:
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
+    # --- mTLS enrollment (plan.md item 6) — central's half --------------------
+    # Central's own TLS identity. Both empty (the default) ⇒ central serves plain
+    # HTTP exactly as before — fully backward compatible; every existing deploy and
+    # test keeps working unchanged. Set both to switch the listener to HTTPS (a cert
+    # from `central.admin init-ca`, or a real one — either works, they're just PEM
+    # files). `central/pki.py`'s `issue_cert`/`init-ca` writes both under
+    # `WISP_CENTRAL_PKI_DIR` by default.
+    central_tls_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_TLS_CERT", ""))
+    central_tls_key: str = field(default_factory=lambda: _env("WISP_CENTRAL_TLS_KEY", ""))
+    # The CA bundle to verify an edge's PRESENTED client cert against (mTLS). Empty ⇒
+    # ingest stays bearer-token-only even over HTTPS — client certs are simply never
+    # requested. Set once you've run `central.admin init-ca` and enrolled edges with
+    # `enroll-edge`; a verified cert then satisfies ingest auth as an alternative to
+    # the bearer token (self-activating, same pattern as the fleet installers'
+    # minisign/Authenticode checks — see CLAUDE.md's "Fleet update hardening").
+    central_client_ca: str = field(default_factory=lambda: _env("WISP_CENTRAL_CLIENT_CA", ""))
+    # Where `central.admin init-ca`/`enroll-edge` read/write the CA + issued certs.
+    central_pki_dir: Path = field(
+        default_factory=lambda: Path(_env("WISP_CENTRAL_PKI_DIR", str(DATA_DIR / "pki"))))
     # Cross-edge fleet watchdog (Part B): central pages (per-org) when a node's heartbeat
     # goes silent — box dead OR WAN cut. A node is "stale" after this many seconds without a
     # heartbeat; keep it a comfortable multiple of WISP_HEARTBEAT_INTERVAL_S so one missed

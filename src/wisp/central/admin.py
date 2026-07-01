@@ -12,15 +12,24 @@ rest (org users, team, attendance) from the console.
 
 A password may be passed with --password or, more safely, omitted to be prompted (no shell
 history). The central DB is WISP_CENTRAL_DB (env), same as the server.
+
+mTLS enrollment (plan.md item 6 — replaces the bearer-token stopgap; see central/pki.py):
+
+    PYTHONPATH=src python -m wisp.central.admin init-ca --host central.example.net
+    PYTHONPATH=src python -m wisp.central.admin enroll-edge --tenant ispA --node edge-a1
+
+`init-ca` creates the internal CA (once) plus central's own server cert; `enroll-edge` issues
+one client cert per edge, signed by that CA. Both need `openssl` on PATH (see central/pki.py).
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import sys
+from pathlib import Path
 
 from wisp.config import CONFIG
-from wisp.central import auth
+from wisp.central import auth, pki
 from wisp.central.store import CentralStore
 
 
@@ -67,6 +76,21 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("rollout-status", help="show an org's rollout + node versions")
     p.add_argument("--tenant", required=True)
+
+    p = sub.add_parser("init-ca", help="create (or reuse) the internal mTLS CA + "
+                       "central's own server cert, replacing the bearer-token stopgap")
+    p.add_argument("--pki-dir", default=str(CONFIG.central_pki_dir))
+    p.add_argument("--host", action="append", default=[],
+                   help="hostname/IP central is reachable at (repeatable — becomes the "
+                        "server cert's SAN so edges can verify it without disabling "
+                        "hostname checking); e.g. --host central.example.net --host 10.0.0.5")
+
+    p = sub.add_parser("enroll-edge", help="issue an mTLS client cert for one edge")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--node", required=True)
+    p.add_argument("--pki-dir", default=str(CONFIG.central_pki_dir))
+    p.add_argument("--out", default=None,
+                   help="directory to write <node>.key/<node>.crt to (default: --pki-dir)")
 
     args = ap.parse_args(argv)
     store = CentralStore(CONFIG.central_db)
@@ -116,7 +140,38 @@ def main(argv: list[str] | None = None) -> int:
             for n in store.node_versions(args.tenant):
                 print(f"  {n['node_id']:<16} version={n['version'] or '?':<10} "
                       f"last_seen={n['last_seen']}")
+        elif args.cmd == "init-ca":
+            pki_dir = Path(args.pki_dir)
+            ca_key, ca_cert = pki.ensure_ca(pki_dir)
+            server_key, server_cert = pki_dir / "central.key", pki_dir / "central.crt"
+            san = [f"IP:{h}" if h.replace(".", "").isdigit() else f"DNS:{h}" for h in args.host]
+            pki.issue_cert(pki_dir, "central", server_key, server_cert,
+                           san=san or None)
+            print(f"CA ready at {ca_cert} (keep {ca_key} secret — it can mint new edge certs)")
+            print(f"central server cert: {server_cert} / {server_key}")
+            print("point central at them:")
+            print(f"  WISP_CENTRAL_TLS_CERT={server_cert} WISP_CENTRAL_TLS_KEY={server_key} "
+                  f"WISP_CENTRAL_CLIENT_CA={ca_cert}")
+            if not args.host:
+                print("no --host given — the server cert has no SAN; edges will need "
+                      "WISP_CENTRAL_CA_CERT set without hostname verification, or re-run "
+                      "with --host once you know central's address", file=sys.stderr)
+        elif args.cmd == "enroll-edge":
+            pki_dir = Path(args.pki_dir)
+            out_dir = Path(args.out) if args.out else pki_dir
+            cn = pki.edge_common_name(args.tenant, args.node)
+            key_path = out_dir / f"{args.node}.key"
+            cert_path = out_dir / f"{args.node}.crt"
+            pki.issue_cert(pki_dir, cn, key_path, cert_path)
+            _, ca_cert = pki.ensure_ca(pki_dir)
+            print(f"issued edge cert for {args.tenant}/{args.node}: {cert_path} / {key_path}")
+            print(f"copy {cert_path}, {key_path}, and the CA cert ({ca_cert}) to the edge box, then set:")
+            print(f"  WISP_CENTRAL_CLIENT_CERT={cert_path} WISP_CENTRAL_CLIENT_KEY={key_path} "
+                  f"WISP_CENTRAL_CA_CERT={ca_cert}")
     except auth.AuthError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except pki.PkiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

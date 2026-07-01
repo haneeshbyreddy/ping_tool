@@ -34,7 +34,7 @@ run locally beyond the probe.
   end-to-end in tests. What's *not* exercised outside CI: the actual multi-arch
   PyInstaller build, code-signing, and the Windows installer on real hardware.
 
-264 tests, `python -m unittest discover -s tests`.
+283 tests, `python -m unittest discover -s tests`.
 
 ## The model: what changed from a single-box tool
 
@@ -131,7 +131,7 @@ them trustworthy at scale, across many ISPs, without any of them stepping on eac
 | **Alert channels** | **ntfy** only. Three fixed topics per org (owner/operator/tech); a fresh DOWN pages owner+operator, the hourly escalation broadcasts to all three until recovery. |
 | **Multi-tenancy** | Non-negotiable. An org user must never see another org's data; every central read is tenant-scoped. |
 | **Where the edge runs** | On-prem at the ISP, one probe process, no local DB/dashboard. Frozen-binary (fleet, PyInstaller + supervisor) or venv (single box, systemd) — both talk the same wire protocol to central. |
-| **Transport** | The edge dials central; central never connects in. Bearer-token auth for now (`WISP_CENTRAL_TOKEN`); the envelope is versioned so mTLS can slot in later without a wire change. |
+| **Transport** | The edge dials central; central never connects in. Bearer-token auth (`WISP_CENTRAL_TOKEN`) and/or mTLS (`central.admin init-ca`/`enroll-edge`, see item 6) — either satisfies ingest auth, so mTLS is opt-in, not a forced cutover. |
 | **Updates** | Pull-based over the existing heartbeat/report channel (no inbound holes). Central is the version authority; rollouts are staged + health-gated + auto-rollback. |
 | **Realism** | Probers & notifiers sit behind small interfaces (`build_prober`/`build_notifier`); the real ICMP prober + ntfy notifier are the only impls. Tests inject recording doubles instead of hitting the network. |
 
@@ -225,9 +225,28 @@ groundwork that hasn't been done yet. In rough priority order:
      fabricated here — commit only the minisign PUBLIC half to `deploy/minisign.pub` once
      it exists), an actual signed release cut on real CI runners, and running the signed
      Linux/Windows installers on real boxes to confirm the whole chain end to end.
-6. **mTLS enrollment**, replacing the static bearer-token stopgap for edge↔central auth —
-   deferred from the original design on purpose; revisit once there's more than a handful
-   of edges to make cert issuance/rotation worth building.
+6. ~~**mTLS enrollment**, replacing the static bearer-token stopgap for edge↔central
+   auth.~~ **Done.** `central/pki.py` is a minimal internal CA — shells out to `openssl`
+   (an admin-CLI-time operation, not a per-request one, so central's own request path
+   stays pure stdlib) rather than adding `cryptography` as a project dependency.
+   `central.admin init-ca` creates the CA + central's own server cert (optionally with
+   a `--host` SAN so edges can verify it with hostname checking ON); `enroll-edge
+   --tenant --node` issues one client cert per edge, CN-encoded as `tenant:node`.
+   `central/server.py`'s `make_server` terminates TLS itself (stdlib `ssl`, wrapped
+   inside each request's own worker thread via a `finish_request` override so one
+   slow/bad handshake can't stall other connections) when `WISP_CENTRAL_TLS_CERT`/`_KEY`
+   are set; if `WISP_CENTRAL_CLIENT_CA` is also set, a presented client cert is
+   verified and its CN checked against the claimed tenant (and node, on `/report`/
+   `/ingest`/`/heartbeat`) as an alternative to the bearer token — **either satisfies
+   ingest auth**, so turning mTLS on is not a hard cutover off the token, same
+   self-activating/coexistence pattern as fleet update hardening's minisign/
+   Authenticode checks. Both empty (the default) ⇒ central still serves plain HTTP,
+   exactly as before this item — every existing deploy/test keeps working unchanged.
+   The edge's `HttpCentralClient` picks up `WISP_CENTRAL_CLIENT_CERT`/`_KEY`/
+   `WISP_CENTRAL_CA_CERT` and presents them to httpx's `cert=`/`verify=`. No CRL/cert
+   rotation tooling yet (revoking means re-running `enroll-edge` with a fresh keypair
+   and rotating the CA if a cert is compromised) — fine at today's fleet size; revisit
+   if that becomes a real operational need.
 
 None of these block the platform from running today — `WISP_CENTRAL_BRAIN=1` +
 `WISP_CENTRAL_URL` is a complete, working loop. They're the gap between "works" and

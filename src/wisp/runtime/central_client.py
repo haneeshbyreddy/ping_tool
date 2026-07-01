@@ -39,12 +39,26 @@ class HttpCentralClient:
         self.tenant_id = cfg.tenant_id
         self.node_id = cfg.node_id
         self.timeout = cfg.ship_timeout_s
+        # mTLS enrollment (plan.md item 6): a cert issued by `central.admin enroll-edge`.
+        # Coexists with the bearer token above — central accepts either, so setting
+        # these isn't a hard cutover off the token (see central/server.py's `_ingest_ok`).
+        self.client_cert = cfg.central_client_cert
+        self.client_key = cfg.central_client_key
+        self.ca_cert = cfg.central_ca_cert
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
+
+    def _tls_kwargs(self) -> dict:
+        kwargs = {}
+        if self.ca_cert:
+            kwargs["verify"] = self.ca_cert
+        if self.client_cert and self.client_key:
+            kwargs["cert"] = (self.client_cert, self.client_key)
+        return kwargs
 
     def fetch_devices(self) -> dict:
         """{'devices': [{'id','name','ip_address','region','parent_device_id'}, …],
@@ -57,7 +71,8 @@ class HttpCentralClient:
         try:
             resp = httpx.get(f"{self.base}/edge/devices",
                              params={"tenant_id": self.tenant_id},
-                             headers=self._headers(), timeout=self.timeout)
+                             headers=self._headers(), timeout=self.timeout,
+                             **self._tls_kwargs())
             resp.raise_for_status()
             return resp.json()
         except CentralClientError:
@@ -88,7 +103,8 @@ class HttpCentralClient:
             env["ports"] = ports
         try:
             resp = httpx.post(f"{self.base}/report", json=env,
-                              headers=self._headers(), timeout=self.timeout)
+                              headers=self._headers(), timeout=self.timeout,
+                              **self._tls_kwargs())
             resp.raise_for_status()
             return resp.json() if resp.content else {}
         except CentralClientError:

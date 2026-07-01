@@ -3,15 +3,21 @@ multi-tenant dashboard, pure stdlib.
 
 Two auth planes, deliberately separate:
   * **Ingest** (`POST /ingest`, `/heartbeat`, `/report`, `GET /edge/devices`) —
-    machine-to-machine, bearer token (`WISP_CENTRAL_TOKEN`). This is how edges report and
-    learn what to probe; unchanged auth model from Part A/B.
+    machine-to-machine. Bearer token (`WISP_CENTRAL_TOKEN`) OR a verified mTLS client
+    cert (`WISP_CENTRAL_CLIENT_CA` + an edge cert from `central.admin enroll-edge`,
+    see `central/pki.py`) — either satisfies it, so enabling mTLS is not a hard cutover
+    off the token. If NEITHER is configured, ingest stays open (trusted-network
+    default, unchanged from before mTLS existed).
   * **Dashboard** (`/api/*` reads + writes, the SPA) — humans, per-org login accounts with
     identity-carrying signed-cookie sessions (`central/auth.py`). Every dashboard read is
     **scoped to the caller's tenant**; a superadmin sees all orgs and may pass `?tenant=`.
 
 Writes (team/attendance/users/org) require an owner or a superadmin. Static assets are unauthed
-(the SPA renders its own login gate on a 401), exactly like the edge dashboard. Run behind a TLS
-terminator in production; the server itself speaks plain HTTP to stay dependency-free.
+(the SPA renders its own login gate on a 401), exactly like the edge dashboard. The server
+speaks plain HTTP unless `WISP_CENTRAL_TLS_CERT`/`_KEY` are set, in which case it terminates
+TLS itself (stdlib `ssl` — no new dependency) so it can do the client-cert handshake mTLS
+needs; a terminator (nginx/Caddy) in front is still fine for the dashboard-only case, or if
+you'd rather not manage the internal CA at all.
 """
 from __future__ import annotations
 
@@ -19,13 +25,15 @@ import hmac
 import json
 import logging
 import mimetypes
+import ssl
+import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import auth, inventory
+from wisp.central import auth, inventory, pki
 from wisp.central import analytics as central_analytics
 from wisp.central import engine as central_engine
 from wisp.central import perf as central_perf
@@ -54,6 +62,7 @@ def _now_iso() -> str:
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
                   engine_registry: EngineRegistry | None = None):
     token = cfg.central_token
+    client_ca = cfg.central_client_ca
     notifier = notifier or build_notifier(cfg)
     # ONE registry per server (not per-request): the FSM's flap-suppression counters must
     # survive across an edge's successive POST /report calls (see central/engine.py).
@@ -88,13 +97,46 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             except Exception:
                 return None
 
-        # --- auth: ingest (bearer) vs dashboard (session) ---
-        def _bearer_ok(self) -> bool:
+        # --- auth: ingest (bearer and/or mTLS) vs dashboard (session) ---
+        def _token_ok(self) -> bool:
             if not token:
-                return True
+                return False
             got = self.headers.get("Authorization", "")
             presented = got[7:] if got.startswith("Bearer ") else ""
             return hmac.compare_digest(presented, token)
+
+        def _bearer_ok(self) -> bool:
+            if not token:
+                return True
+            return self._token_ok()
+
+        def _peer_identity(self) -> tuple[str, str] | None:
+            """The (tenant_id, node_id) a verified mTLS client cert claims, or None if
+            this connection is plain HTTP / presented no cert / the cert's CN isn't in
+            our `tenant:node` shape. `self.connection` is only an `ssl.SSLSocket` (with
+            `getpeercert`) when `make_server` wrapped the listener in TLS."""
+            getpeercert = getattr(self.connection, "getpeercert", None)
+            if getpeercert is None:
+                return None
+            return pki.peer_identity(getpeercert())
+
+        def _ingest_ok(self, tenant: str, node: str | None = None) -> bool:
+            """Ingest auth: the bearer token OR a verified client cert claiming this
+            tenant (and this node, when known — GET /edge/devices has no node in its
+            query, so that check is tenant-only there). If NEITHER a token nor a client
+            CA is configured, ingest stays open — today's trusted-network default,
+            unchanged from before mTLS existed."""
+            if not token and not client_ca:
+                return True
+            if self._token_ok():
+                return True
+            identity = self._peer_identity()
+            if identity is None:
+                return False
+            peer_tenant, peer_node = identity
+            if peer_tenant != tenant:
+                return False
+            return node is None or peer_node == node
 
         def _user(self) -> dict | None:
             tok = auth.cookie_token(self.headers.get("Cookie"))
@@ -125,19 +167,17 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return True
             return user["role"] == "owner" and user["tenant_id"] == tenant
 
-        def _envelope(self) -> dict | None:
-            env = self._read_body()
-            if env is None or not isinstance(env, dict):
-                self._reply(400, {"error": "bad or missing JSON body"})
-                return None
-            v = env.get("v")
+        def _envelope(self, body: dict) -> dict | None:
+            """Shape-validate an already-read ingest body (see do_POST — auth needs
+            `tenant_id`/`node_id` out of the body first, so reading happens before this)."""
+            v = body.get("v")
             if not isinstance(v, int) or v > MAX_WIRE_V:
                 self._reply(400, {"error": f"unsupported envelope version {v!r}"})
                 return None
-            if not env.get("tenant_id") or not env.get("node_id"):
+            if not body.get("tenant_id") or not body.get("node_id"):
                 self._reply(400, {"error": "missing tenant_id/node_id"})
                 return None
-            return env
+            return body
 
         # --- static (unauthed; SPA shows its own login gate on 401) ---
         def _serve_static(self, route: str) -> bool:
@@ -173,12 +213,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             # edge's device list now comes from the ISP-managed org_devices topology
             # (Phase A), not a local dashboard.
             if route == "/edge/devices":
-                if not self._bearer_ok():
-                    self._reply(401, {"error": "unauthorized"})
-                    return
                 tenant = (qs.get("tenant_id") or [None])[0]
                 if not tenant:
                     self._reply(400, {"error": "tenant_id required"})
+                    return
+                if not self._ingest_ok(tenant):
+                    self._reply(401, {"error": "unauthorized"})
                     return
                 self._reply(200, {"devices": store.org_device_topology(tenant),
                                   "canary_ip": cfg.canary_ip})
@@ -320,13 +360,19 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_POST(self):
             parsed = urlparse(self.path)
             route = parsed.path
-            # Ingest plane (bearer token).
+            # Ingest plane (bearer token and/or mTLS client cert).
             if route in ("/ingest", "/heartbeat", "/report"):
-                if not self._bearer_ok():
-                    self._read_body()
+                body = self._read_body()
+                if body is None or not isinstance(body, dict):
+                    self._reply(400, {"error": "bad or missing JSON body"})
+                    return
+                # Auth needs the CLAIMED tenant/node to check a presented cert against —
+                # read before full shape validation so a missing field still 401s (not
+                # 400s) when auth is what actually failed, same precedence as before mTLS.
+                if not self._ingest_ok(body.get("tenant_id"), body.get("node_id")):
                     self._reply(401, {"error": "unauthorized"})
                     return
-                env = self._envelope()
+                env = self._envelope(body)
                 if env is None:
                     return
                 tenant, node = env["tenant_id"], env["node_id"]
@@ -709,20 +755,69 @@ def _worker_tenant(store: CentralStore, worker_id) -> str | None:
     return row["tenant_id"] if row else None
 
 
+class _TLSThreadingHTTPServer(ThreadingHTTPServer):
+    """Wraps each accepted socket in TLS inside its own worker thread rather than the
+    shared accept loop — `ThreadingMixIn.process_request_thread` calls `finish_request`
+    (this override) already off-thread, so one client's slow/failed handshake can't
+    stall new connections. A handshake failure raises here and is caught by
+    `ThreadingMixIn`'s own per-request try/except (`handle_error` + `shutdown_request`),
+    same as any other request exception — it never takes the server down."""
+
+    def __init__(self, addr, handler, ssl_context: ssl.SSLContext) -> None:
+        super().__init__(addr, handler)
+        self._ssl_context = ssl_context
+
+    def finish_request(self, request, client_address) -> None:
+        request = self._ssl_context.wrap_socket(request, server_side=True)
+        self.RequestHandlerClass(request, client_address, self)
+
+    def handle_error(self, request, client_address) -> None:
+        # A bad/aborted TLS handshake (a port scanner, a stale client, a rejected cert)
+        # is routine noise on an ingest port exposed to the internet — log it quietly
+        # instead of dumping a traceback, but let any OTHER exception (a real bug) fall
+        # through to the base class's default (loud) handling so it's not hidden.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ssl.SSLError):
+            log.debug("TLS handshake with %s failed: %s", client_address, exc)
+            return
+        super().handle_error(request, client_address)
+
+
+def _build_tls_context(cfg: Config) -> ssl.SSLContext | None:
+    """None ⇒ plain HTTP (both cert/key unset — the default, fully backward compatible).
+    Otherwise central terminates TLS itself; if `central_client_ca` is also set, a
+    presented client cert is verified against it (CERT_OPTIONAL — a cert is requested
+    but not required, since dashboard browsers and not-yet-migrated edges have none)."""
+    if not (cfg.central_tls_cert and cfg.central_tls_key):
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cfg.central_tls_cert, cfg.central_tls_key)
+    if cfg.central_client_ca:
+        ctx.verify_mode = ssl.CERT_OPTIONAL
+        ctx.load_verify_locations(cafile=cfg.central_client_ca)
+    return ctx
+
+
 def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
                 notifier=None, engine_registry: EngineRegistry | None = None
                 ) -> ThreadingHTTPServer:
     store = store or CentralStore(cfg.central_db)
     handler = _make_handler(cfg, store, LoginThrottle(), notifier, engine_registry)
-    httpd = ThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler)
+    tls_context = _build_tls_context(cfg)
+    if tls_context is not None:
+        httpd = _TLSThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler, tls_context)
+    else:
+        httpd = ThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler)
     httpd.store = store  # type: ignore[attr-defined]
     return httpd
 
 
 def serve(cfg: Config = CONFIG) -> None:
-    if not cfg.central_token:
-        log.warning("WISP_CENTRAL_TOKEN is empty — ingest is UNAUTHENTICATED. Set a token "
-                    "before exposing central beyond a trusted network.")
+    if not cfg.central_token and not cfg.central_client_ca:
+        log.warning("neither WISP_CENTRAL_TOKEN nor WISP_CENTRAL_CLIENT_CA is set — ingest is "
+                    "UNAUTHENTICATED. Set a token and/or enroll edges with mTLS "
+                    "(central.admin init-ca / enroll-edge) before exposing central beyond a "
+                    "trusted network.")
     httpd = make_server(cfg)
     from wisp.central.watchdog import start_central_watchdog_thread
     start_central_watchdog_thread(cfg, httpd.store)  # type: ignore[attr-defined]
@@ -730,8 +825,9 @@ def serve(cfg: Config = CONFIG) -> None:
     if not httpd.store.list_users():  # type: ignore[attr-defined]
         log.warning("no central accounts yet — bootstrap one: "
                     "PYTHONPATH=src python -m wisp.central.admin create-superadmin --username ...")
-    log.info("central listening on %s:%d (db=%s)",
-             cfg.central_bind, cfg.central_port, cfg.central_db)
+    scheme = "https" if isinstance(httpd, _TLSThreadingHTTPServer) else "http"
+    log.info("central listening on %s://%s:%d (db=%s)",
+             scheme, cfg.central_bind, cfg.central_port, cfg.central_db)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

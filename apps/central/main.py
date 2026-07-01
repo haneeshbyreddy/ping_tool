@@ -7,9 +7,10 @@ never runs an FSM and never pages; it owns the picture, the edge owns the page.
 
     WISP_CENTRAL_TOKEN=s3cret WISP_CENTRAL_PORT=8443 python apps/central/main.py
 
-Run it behind a TLS terminator (nginx/Caddy) for HTTPS in production; the skeleton itself
-speaks plain HTTP so it stays dependency-free. Zero-install: this puts <repo>/src on
-sys.path. (Part D builds the frozen-binary fleet path; this is the server side.)
+Run it behind a TLS terminator (nginx/Caddy), or set WISP_CENTRAL_TLS_CERT/_KEY to have it
+terminate TLS itself (stdlib `ssl`, no new dependency — see central/pki.py's mTLS enrollment);
+plain HTTP only when neither is configured. Zero-install: this puts <repo>/src on sys.path.
+(Part D builds the frozen-binary fleet path; this is the server side.)
 """
 from __future__ import annotations
 
@@ -50,7 +51,8 @@ def main() -> None:
         overrides["central_port"] = args.port
     cfg = Config(**overrides) if overrides else CONFIG
 
-    print(f"WISP central -> http://{cfg.central_bind}:{cfg.central_port}  "
+    scheme = "https" if (cfg.central_tls_cert and cfg.central_tls_key) else "http"
+    print(f"WISP central -> {scheme}://{cfg.central_bind}:{cfg.central_port}  "
           f"(ingest + dashboard; db={cfg.central_db.name})")
     print("Bootstrap an account: PYTHONPATH=src python -m wisp.central.admin "
           "create-superadmin --username <you>")

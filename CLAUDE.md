@@ -14,7 +14,7 @@ no other path). An earlier single-box version of this tool (one daemon + one loc
 no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
 deleted wholesale, not just deprecated. See "Removed" below before assuming a described
 behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 264 tests.
+history, not this file. 283 tests.
 
 **Central's own management plane and FSM/alerting are done and tested end to end**, including
 the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
@@ -26,9 +26,12 @@ the code, not just this file (an earlier draft of this doc called the fast-confi
 performance baseline, and the on-backup redundancy signal are all now wired end to end,
 on central** — see "SNMP port folding", "Historical rollups", "Per-link performance
 baseline", and "On-backup redundancy" below. Every soft-signal tier the old single-box
-edge had now has a central-side equivalent — plan.md's remaining items are production
-groundwork (real hosting, fleet-update hardening, mTLS), not more detection tiers. See
-`plan.md` for the full list of what's next and in what order.
+edge had now has a central-side equivalent. **mTLS enrollment is also done** (see
+"mTLS enrollment" below) — edge↔central ingest auth is bearer token and/or mTLS now,
+either satisfies it. What's left in plan.md is real hosting (needs the operator's
+provider/region/domain) and the last mile of fleet-update hardening (a real signing
+keypair/cert + a genuine tagged release run on real hardware) — not more engineering
+that can be done sight-unseen in this repo. See `plan.md` for the full list.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
@@ -468,10 +471,78 @@ Src layout, zero-install. What bites:
 - **Device topology, team, and per-org alert routing are live in central's dashboard, not env
   vars.** Only process-level tunables (poll cadence, retry interval, thresholds, concurrency
   caps) are `WISP_*` — see `README.md`'s Configuration table for the current field list.
-- **The only secret is `WISP_CENTRAL_TOKEN`** (edge→central bearer auth) plus whatever central's
-  own dashboard session secret is (`central/auth.py`, a file under `data/`, 0600). There is no
-  PIN anymore — that was the edge dashboard's auth model, deleted in Phase C; central uses
+- **Edge→central ingest auth is `WISP_CENTRAL_TOKEN` (bearer) and/or mTLS** (see "mTLS
+  enrollment" below) — either satisfies it. Plus whatever central's own dashboard
+  session secret is (`central/auth.py`, a file under `data/`, 0600). There is no PIN
+  anymore — that was the edge dashboard's auth model, deleted in Phase C; central uses
   per-user accounts (see "Central runs the brain" / `central/auth.py`).
+
+## mTLS enrollment (plan.md item 6, done — replaces the bearer-token-only stopgap)
+
+- **`central/pki.py` shells out to `openssl` rather than adding `cryptography` as a
+  project dependency.** Cert issuance (`central.admin init-ca`/`enroll-edge`) is a
+  one-time admin-CLI operation, not something the server does per-request, so it
+  doesn't need to live inside central's pure-stdlib request path — `central/server.py`'s
+  actual verification at request time uses only the stdlib `ssl` module. `openssl` needs
+  to be on the PATH of whatever box runs the admin CLI (true of essentially every
+  Linux/macOS box); `pki.PkiError` gives a clear message if it's missing, rather than a
+  raw `FileNotFoundError` from subprocess.
+- **Identity is CN-encoded, not a new wire field.** An edge's client cert CommonName is
+  `tenant_id:node_id` (`pki.edge_common_name`/`pki.peer_identity`) — central decodes it
+  off the verified `ssl.SSLSocket.getpeercert()` at the TCP layer, so `POST /report`'s
+  JSON envelope is completely unchanged. This is the "envelope is versioned so mTLS
+  slots in later" promise from the original design actually cashed in.
+- **Either bearer token or a verified matching cert satisfies ingest auth — not both
+  required.** `central/server.py`'s `_ingest_ok(tenant, node)` checks `_token_ok()`
+  first, then falls back to `_peer_identity()` (cert CN must match the CLAIMED tenant,
+  and node where the route has one — `/edge/devices` has no node in its query, so
+  that check is tenant-only there; `/ingest`/`/heartbeat`/`/report` check both). If
+  NEITHER `WISP_CENTRAL_TOKEN` nor `WISP_CENTRAL_CLIENT_CA` is configured, ingest stays
+  fully open — the same trusted-network default from before mTLS existed, unchanged.
+  This is the same self-activating/coexistence pattern as the fleet installers'
+  minisign/Authenticode checks (see "Fleet update hardening" below): turning mTLS on
+  is opt-in, never a hard cutover that could lock out an unmigrated edge fleet.
+- **Central terminates TLS itself now, when configured — stdlib `ssl`, no new
+  dependency.** `make_server` wraps the listener in a `_TLSThreadingHTTPServer` only
+  when `WISP_CENTRAL_TLS_CERT`/`_KEY` are BOTH set; if neither is set (the default),
+  central serves plain HTTP exactly as it always has — every existing test and deploy
+  keeps working unchanged. `WISP_CENTRAL_CLIENT_CA` is independent of that: it turns on
+  `CERT_OPTIONAL` client-cert verification (requested, not required — dashboard
+  browsers and not-yet-enrolled edges have none and still connect fine) once TLS
+  itself is on. A terminator (nginx/Caddy) in front is still a valid choice too — this
+  doesn't retire that option, it adds a stdlib-only path that doesn't need one.
+- **The TLS handshake happens inside each request's own worker thread, not the shared
+  accept loop.** `_TLSThreadingHTTPServer` overrides `finish_request` (not
+  `get_request`) to call `ssl_context.wrap_socket` — `ThreadingMixIn` already calls
+  `finish_request` off-thread per connection, so one client's slow/failed handshake
+  can't stall new connections arriving on the same port. A handshake failure raises
+  there and is caught by `ThreadingMixIn`'s own per-request exception handling, same as
+  any other request exception — never takes the server down. `handle_error` is
+  overridden to log an `ssl.SSLError` quietly (routine noise on an ingest port exposed
+  to the internet — a scanner, a stale client, a rejected cert) but let any OTHER
+  exception fall through to the base class's loud default, so a real bug is never
+  silently swallowed.
+- **`central.admin init-ca --host <name-or-ip>`** creates the CA (idempotent — reruns
+  reuse the existing CA) plus central's OWN server cert, with `--host` (repeatable)
+  becoming the cert's SAN so edges can verify it with hostname checking ON rather than
+  disabling it. Skipping `--host` still works but edges then need to trust the CA
+  without SAN-based hostname verification. **`enroll-edge --tenant --node`** issues one
+  client cert per edge off that same CA. Both print the exact env vars to set on the
+  respective side (`WISP_CENTRAL_TLS_CERT`/`_KEY`/`_CLIENT_CA` for central,
+  `WISP_CENTRAL_CLIENT_CERT`/`_KEY`/`WISP_CENTRAL_CA_CERT` for the edge).
+- **No CRL or cert rotation tooling yet.** Revoking a compromised edge cert today means
+  rotating the CA (`enroll-edge` always reuses the same CA files under
+  `WISP_CENTRAL_PKI_DIR` unless you point it at a fresh directory) — acceptable at
+  today's fleet size; a real CRL/short-lived-cert-rotation story is future work if that
+  becomes an actual operational need, not something to pre-build speculatively.
+- **Tests:** `unit/test_central_pki` (CA/cert issuance against real `openssl`, skipped
+  if it's not on PATH; `peer_identity`'s CN decode is pure and always runs),
+  `integration/test_central_mtls` (a REAL TLS socket via `make_server` wrapped for real
+  — a plain-HTTP client can't complete the handshake, a valid cert authenticates
+  `/edge/devices` and `/report`, a valid-but-wrong-tenant cert is rejected, a cert
+  claiming the wrong node on `/report` is rejected even with the right tenant, no cert
+  + no token is 401, `/healthz` stays reachable over HTTPS with no client cert at all,
+  and the bearer token still works standalone even with mTLS also configured).
 
 ## Conventions & gotchas
 
@@ -511,7 +582,7 @@ Src layout, zero-install. What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (264 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (283 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
 `unit/test_baseline` (pure perf-deviation math — now wired by `central/perf.py`; see

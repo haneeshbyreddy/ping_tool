@@ -93,9 +93,10 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 │                          #   port status + bandwidth folding), redundancy.py (on-backup
 │                          #   signal), perf.py (per-link performance baseline),
 │                          #   analytics.py (outage-derived downtime/SLA), rollup.py
-│                          #   (hourly latency/loss trend, 30d retention), store
-│                          #   (multi-tenant SQLite), server.py (ingest + dashboard API),
-│                          #   watchdog, auth, admin CLI, rollout, inventory,
+│                          #   (hourly latency/loss trend, 30d retention), pki.py (internal
+│                          #   CA for mTLS enrollment), store (multi-tenant SQLite),
+│                          #   server.py (ingest + dashboard API, optional TLS/mTLS
+│                          #   termination), watchdog, auth, admin CLI, rollout, inventory,
 │                          #   static/ (the dashboard SPA)
 └── runtime/               # central_client.py (edge's central HTTP client), single_instance.py,
                            #   supervisor.py (agent self-update logic)
@@ -200,8 +201,23 @@ curl -H 'Authorization: Bearer s3cret' 'http://HOST:8443/api/devices?tenant=ispA
 WISP_CENTRAL_BRAIN=1 WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
 WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
 ```
-Put the central server behind a TLS terminator (nginx/Caddy) in production — it speaks
-plain HTTP itself to stay dependency-free.
+Put the central server behind a TLS terminator (nginx/Caddy) in production, or let central
+terminate TLS itself (see "mTLS enrollment" below) — either works; it speaks plain HTTP only
+when neither is configured, to stay dependency-free by default.
+
+**mTLS enrollment** (replaces the bearer-token-only stopgap; either still works standalone,
+and both can be set at once during a migration):
+```bash
+PYTHONPATH=src python -m wisp.central.admin init-ca --host central.example.net
+PYTHONPATH=src python -m wisp.central.admin enroll-edge --tenant ispA --node edge-a1
+```
+`init-ca` creates a small internal CA (via `openssl` — no new Python dependency) plus
+central's own server cert, and prints the `WISP_CENTRAL_TLS_CERT`/`_KEY`/`_CLIENT_CA` env
+vars to set on central. `enroll-edge` issues one client cert per edge and prints the
+`WISP_CENTRAL_CLIENT_CERT`/`_KEY`/`WISP_CENTRAL_CA_CERT` vars to set on that edge box. Once
+`WISP_CENTRAL_CLIENT_CA` is set, a verified client cert satisfies ingest auth as an
+alternative to the bearer token — set both during rollout, drop the token fleet-wide once
+every edge is enrolled.
 
 **Fleet deploy + self-update.** Edges can instead ship as a **frozen single binary**
 (PyInstaller — no Python/venv on the box); a small stable **supervisor** runs the agent
@@ -267,9 +283,13 @@ simpler systemd/Scheduled-Task-managed probe; the frozen binary + supervisor
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |
 | `WISP_CENTRAL_BRAIN` | `0` | `1` = run the edge as a thin probe (needs `WISP_CENTRAL_URL` too — this is the only mode) |
 | `WISP_CENTRAL_URL` | — | central base URL the edge probes report to |
-| `WISP_CENTRAL_TOKEN` | — | bearer token the edge presents / central requires for ingest |
+| `WISP_CENTRAL_TOKEN` | — | bearer token the edge presents / central requires for ingest (coexists with mTLS below — either satisfies auth) |
+| `WISP_CENTRAL_CLIENT_CERT` / `_KEY` / `WISP_CENTRAL_CA_CERT` | — | edge's mTLS client cert/key (from `enroll-edge`) + the CA to verify central's server cert against |
 | `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity central keys records by |
 | `WISP_CENTRAL_DB` / `WISP_CENTRAL_BIND` / `WISP_CENTRAL_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central server store + listen address |
+| `WISP_CENTRAL_TLS_CERT` / `_KEY` | — | central's own TLS server cert/key; both empty (default) = plain HTTP, unchanged from before mTLS existed |
+| `WISP_CENTRAL_CLIENT_CA` | — | CA to verify a presented edge client cert against (mTLS); empty = ingest stays bearer-token-only even over HTTPS |
+| `WISP_CENTRAL_PKI_DIR` | `data/pki` | where `central.admin init-ca`/`enroll-edge` read/write the CA + issued certs |
 | `WISP_CENTRAL_NODE_STALE_S` | `180` | central pages an org when a node's heartbeat is older than this (box dead / WAN cut) |
 | `WISP_CENTRAL_NTFY_TOPIC` | `wisp-central` | fallback fleet-watchdog topic when an org has set none |
 | `WISP_ROLLOUT_HEALTH_WINDOW_S` | `600` | how long a canary has to come back healthy on the target before the rollout auto-halts |
