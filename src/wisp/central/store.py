@@ -267,10 +267,84 @@ CREATE TABLE IF NOT EXISTS switch_ports (
     alarm           INTEGER NOT NULL DEFAULT 0,
     alarm_since     TEXT,
     updated_at      TEXT,
+    -- plan.md item 3: per-port throughput (bandwidth), orthogonal to oper/admin status.
+    -- Operator-set (never touched by a walk): bw_threshold_mbps/bw_direction. Walk-
+    -- refreshed: the raw octet counters (TEXT — Counter64 can exceed SQLite's signed-64
+    -- INTEGER range) + the last computed rates. Flap-suppressed like the port-down path,
+    -- its own streak because traffic is burstier than link state.
+    bw_threshold_mbps REAL,
+    bw_direction      TEXT,
+    in_octets         TEXT,
+    out_octets        TEXT,
+    counters_at       TEXT,
+    in_bps            REAL,
+    out_bps           REAL,
+    bw_low_streak     INTEGER NOT NULL DEFAULT 0,
+    bw_alarm          INTEGER NOT NULL DEFAULT 0,
+    bw_alarm_since    TEXT,
     UNIQUE(tenant_id, device_id, if_index)
 );
 CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(tenant_id, device_id);
 CREATE INDEX IF NOT EXISTS idx_switch_ports_feeds ON switch_ports(tenant_id, feeds_device_id);
+-- plan.md item 3: graph topology backup edges, central-side. Mirrors the old single-box
+-- `device_links` one-for-one, tenant-scoped: the PRIMARY parent stays the single source
+-- of truth on `org_devices.parent_device_id` (every existing tree/topo query keeps
+-- working unchanged); this table carries only the EXTRA redundancy edges
+-- (kind='backup'). `core/state_machine.py`'s `DeviceMeta.effective_parents()` combines
+-- the two — the engine itself needed ZERO changes to support this (see central/engine.py).
+CREATE TABLE IF NOT EXISTS org_device_links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id  TEXT NOT NULL,
+    child_id   INTEGER NOT NULL REFERENCES org_devices(id),
+    parent_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    kind       TEXT NOT NULL DEFAULT 'backup',
+    is_active  INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(tenant_id, child_id, parent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_device_links_child ON org_device_links(tenant_id, child_id);
+CREATE INDEX IF NOT EXISTS idx_org_device_links_parent ON org_device_links(tenant_id, parent_id);
+-- The on-backup badge (one row per redundancy-capable device) — central/redundancy.py
+-- writes it every full report cycle, restart-safe (a restart mid-failover reads `was`
+-- back from here rather than re-paging). Never part of the outage/escalation ladder.
+CREATE TABLE IF NOT EXISTS device_redundancy (
+    device_id          INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    tenant_id          TEXT NOT NULL,
+    on_backup          INTEGER NOT NULL DEFAULT 0,
+    primary_down_since TEXT,
+    updated_at         TEXT NOT NULL
+);
+-- plan.md item 3: per-link performance baseline, central-side (core/baseline.py's pure
+-- median+MAD deviation math, unchanged — central's job is just the trailing-sample
+-- window + badge). device_perf_samples is a BOUNDED per-device ring buffer (trimmed to
+-- the newest cfg.perf_window rows after every insert — central/perf.py), not a full
+-- history: this is deliberately much finer-grained than device_rollups' hourly buckets
+-- (the whole point is catching an intra-hour slowdown an hourly average would smear
+-- out), so it is NOT the same storage as the trend rollup — don't conflate the two.
+CREATE TABLE IF NOT EXISTS device_perf_samples (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT NOT NULL,
+    device_id    INTEGER NOT NULL REFERENCES org_devices(id),
+    ts           TEXT NOT NULL,
+    latency_ms   REAL,
+    packet_loss  REAL,
+    jitter_ms    REAL,
+    state        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_perf_samples_lookup
+    ON device_perf_samples(tenant_id, device_id, id);
+-- The slow-link badge (one row per device), restart-safe like device_redundancy — a
+-- central restart resumes from the last verdict even though the raw sample window
+-- itself resets (see device_perf_samples' docstring above).
+CREATE TABLE IF NOT EXISTS device_perf (
+    device_id   INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    tenant_id   TEXT NOT NULL,
+    degraded    INTEGER NOT NULL DEFAULT 0,
+    metric      TEXT,
+    baseline_ms REAL,
+    current_ms  REAL,
+    since       TEXT,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -299,6 +373,12 @@ class CentralStore:
             self._ensure_columns(conn, "orgs", (
                 ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_operator", "TEXT"),
                 ("ntfy_topic_tech", "TEXT")))
+            self._ensure_columns(conn, "switch_ports", (
+                ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
+                ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),
+                ("in_bps", "REAL"), ("out_bps", "REAL"),
+                ("bw_low_streak", "INTEGER NOT NULL DEFAULT 0"),
+                ("bw_alarm", "INTEGER NOT NULL DEFAULT 0"), ("bw_alarm_since", "TEXT")))
             conn.commit()
 
     @staticmethod
@@ -656,7 +736,9 @@ class CentralStore:
     # --- Phase A: ISP-managed device topology (org_devices) ---------------------
     def list_org_devices(self, tenant_id: str) -> list[dict]:
         """Every active device an org has configured, plus each node's child count (for
-        the Nodes-page tree + the parent-node dropdown)."""
+        the Nodes-page tree + the parent-node dropdown) and its BACKUP parent ids
+        (plan.md item 3's graph topology — the PRIMARY parent is still just
+        `parent_device_id` above; `backup_parents` is the extra redundancy edge set)."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT d.id, d.tenant_id, d.name, d.ip_address, d.device_type, d.region,"
@@ -666,7 +748,17 @@ class CentralStore:
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count"
                 " FROM org_devices d WHERE d.tenant_id=? AND d.is_active=1 ORDER BY d.id",
                 (tenant_id,)).fetchall()
-        return [dict(r) for r in rows]
+            links = conn.execute(
+                "SELECT child_id, parent_id FROM org_device_links"
+                " WHERE tenant_id=? AND is_active=1 AND kind='backup'",
+                (tenant_id,)).fetchall()
+        backups: dict[int, list[int]] = {}
+        for link in links:
+            backups.setdefault(link["child_id"], []).append(link["parent_id"])
+        out = [dict(r) for r in rows]
+        for d in out:
+            d["backup_parents"] = backups.get(d["id"], [])
+        return out
 
     def get_org_device(self, tenant_id: str, device_id: int) -> dict | None:
         with self._connect() as conn:
@@ -1019,23 +1111,44 @@ class CentralStore:
     def upsert_switch_port(self, tenant_id: str, device_id: int, if_index: int,
                            if_name: str | None, if_alias: str | None, admin_status: str,
                            oper_status: str, last_change: str | None, down_streak: int,
-                           alarm: bool, alarm_since: str | None, ts: str) -> None:
+                           alarm: bool, alarm_since: str | None, ts: str, *,
+                           bw: tuple | None = None) -> None:
         """Discover/refresh one port's live reading + flap-suppressed alarm state.
-        Operator-set fields (`monitored`, `feeds_device_id`) are NOT touched here —
-        only `central/ports.py`'s `set_port_monitored`/`set_port_feeds` writers do."""
+        Operator-set fields (`monitored`, `feeds_device_id`, `bw_threshold_mbps`,
+        `bw_direction`) are NOT touched here — only the dedicated setters do.
+
+        `bw`, when given, is `(in_octets, out_octets, counters_at, in_bps, out_bps,
+        bw_low_streak, bw_alarm, bw_alarm_since)` — the throughput half of the same
+        walk (plan.md item 3), written in the SAME upsert so a port's status and
+        bandwidth reading never disagree about which walk they came from."""
+        in_octets = out_octets = counters_at = in_bps = out_bps = None
+        bw_low_streak, bw_alarm, bw_alarm_since = 0, False, None
+        if bw is not None:
+            (in_octets, out_octets, counters_at, in_bps, out_bps,
+             bw_low_streak, bw_alarm, bw_alarm_since) = bw
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO switch_ports (tenant_id, device_id, if_index, if_name,"
                 " if_alias, admin_status, oper_status, last_change, down_streak, alarm,"
-                " alarm_since, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                " alarm_since, updated_at, in_octets, out_octets, counters_at, in_bps,"
+                " out_bps, bw_low_streak, bw_alarm, bw_alarm_since)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(tenant_id, device_id, if_index) DO UPDATE SET"
                 " if_name=excluded.if_name, if_alias=excluded.if_alias,"
                 " admin_status=excluded.admin_status, oper_status=excluded.oper_status,"
                 " last_change=excluded.last_change, down_streak=excluded.down_streak,"
                 " alarm=excluded.alarm, alarm_since=excluded.alarm_since,"
-                " updated_at=excluded.updated_at",
+                " updated_at=excluded.updated_at, in_octets=excluded.in_octets,"
+                " out_octets=excluded.out_octets, counters_at=excluded.counters_at,"
+                " in_bps=excluded.in_bps, out_bps=excluded.out_bps,"
+                " bw_low_streak=excluded.bw_low_streak, bw_alarm=excluded.bw_alarm,"
+                " bw_alarm_since=excluded.bw_alarm_since",
                 (tenant_id, device_id, if_index, if_name, if_alias, admin_status,
-                 oper_status, last_change, down_streak, 1 if alarm else 0, alarm_since, ts))
+                 oper_status, last_change, down_streak, 1 if alarm else 0, alarm_since, ts,
+                 str(in_octets) if in_octets is not None else None,
+                 str(out_octets) if out_octets is not None else None,
+                 counters_at, in_bps, out_bps, bw_low_streak, 1 if bw_alarm else 0,
+                 bw_alarm_since))
             conn.commit()
 
     def set_port_monitored(self, tenant_id: str, port_id: int, on: bool) -> bool:
@@ -1054,6 +1167,127 @@ class CentralStore:
                 (feeds_device_id, port_id, tenant_id))
             conn.commit()
             return cur.rowcount > 0
+
+    def set_port_bandwidth_config(self, tenant_id: str, port_id: int,
+                                  threshold_mbps: float | None, direction: str) -> bool:
+        """Operator config for the low-bandwidth alarm: `threshold_mbps=None` disables
+        it for that port (badge-only, never alarms — mirrors `snmp_enabled=0`'s "no
+        alarm without explicit opt-in" pattern)."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET bw_threshold_mbps=?, bw_direction=?"
+                " WHERE id=? AND tenant_id=?",
+                (threshold_mbps, direction, port_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    # --- graph topology: backup edges (plan.md item 3) --------------------------
+    def org_device_backup_map(self, tenant_id: str) -> dict[int, set[int]]:
+        """child_id -> set of active BACKUP parent ids, scoped to one tenant — the
+        cycle-check input for `central/inventory.py:clean_backup_link` (never crosses
+        tenants, same discipline as `org_device_parent_map`)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT child_id, parent_id FROM org_device_links"
+                " WHERE tenant_id=? AND is_active=1 AND kind='backup'",
+                (tenant_id,)).fetchall()
+        out: dict[int, set[int]] = {}
+        for r in rows:
+            out.setdefault(r["child_id"], set()).add(r["parent_id"])
+        return out
+
+    def org_device_backup_edges(self, tenant_id: str) -> list[dict]:
+        """Every active backup edge for one tenant — `central/engine.py:load_device_meta`
+        builds each device's `DeviceMeta.parents` from this."""
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT child_id, parent_id FROM org_device_links"
+                " WHERE tenant_id=? AND is_active=1 AND kind='backup'", (tenant_id,))]
+
+    def create_backup_link(self, tenant_id: str, child_id: int, parent_id: int) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO org_device_links (tenant_id, child_id, parent_id,"
+                " kind) VALUES (?,?,?,'backup')", (tenant_id, child_id, parent_id))
+            conn.commit()
+
+    def delete_backup_link(self, tenant_id: str, child_id: int, parent_id: int) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM org_device_links WHERE tenant_id=? AND child_id=?"
+                " AND parent_id=? AND kind='backup'", (tenant_id, child_id, parent_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    # --- on-backup redundancy badge (plan.md item 3) -----------------------------
+    def device_redundancy_state(self, tenant_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT on_backup, primary_down_since FROM device_redundancy"
+                " WHERE tenant_id=? AND device_id=?", (tenant_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def write_device_redundancy(self, tenant_id: str, device_id: int, on_backup: bool,
+                                since: str | None, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO device_redundancy (device_id, tenant_id, on_backup,"
+                " primary_down_since, updated_at) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET on_backup=excluded.on_backup,"
+                " primary_down_since=excluded.primary_down_since,"
+                " updated_at=excluded.updated_at",
+                (device_id, tenant_id, 1 if on_backup else 0, since, ts))
+            conn.commit()
+
+    # --- per-link performance baseline (plan.md item 3) --------------------------
+    def record_perf_sample(self, tenant_id: str, device_id: int, ts: str,
+                           latency_ms: float | None, packet_loss: float | None,
+                           jitter_ms: float | None, state: str, keep: int) -> None:
+        """Append one sample and trim to the newest `keep` rows for this device — a
+        bounded ring buffer in SQL rather than an ever-growing history table."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO device_perf_samples (tenant_id, device_id, ts, latency_ms,"
+                " packet_loss, jitter_ms, state) VALUES (?,?,?,?,?,?,?)",
+                (tenant_id, device_id, ts, latency_ms, packet_loss, jitter_ms, state))
+            conn.execute(
+                "DELETE FROM device_perf_samples WHERE tenant_id=? AND device_id=? AND id"
+                " NOT IN (SELECT id FROM device_perf_samples WHERE tenant_id=? AND"
+                " device_id=? ORDER BY id DESC LIMIT ?)",
+                (tenant_id, device_id, tenant_id, device_id, keep))
+            conn.commit()
+
+    def perf_sample_window(self, tenant_id: str, device_id: int) -> list[dict]:
+        """Oldest-first trailing samples for one device — `evaluate_perf`'s input."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT latency_ms, packet_loss, jitter_ms, state FROM"
+                " device_perf_samples WHERE tenant_id=? AND device_id=? ORDER BY id",
+                (tenant_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def device_perf_state(self, tenant_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT degraded, metric, baseline_ms, current_ms, since FROM"
+                " device_perf WHERE tenant_id=? AND device_id=?",
+                (tenant_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def write_device_perf(self, tenant_id: str, device_id: int, degraded: bool,
+                          metric: str | None, baseline_ms: float | None,
+                          current_ms: float | None, since: str | None, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO device_perf (device_id, tenant_id, degraded, metric,"
+                " baseline_ms, current_ms, since, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET degraded=excluded.degraded,"
+                " metric=excluded.metric, baseline_ms=excluded.baseline_ms,"
+                " current_ms=excluded.current_ms, since=excluded.since,"
+                " updated_at=excluded.updated_at",
+                (device_id, tenant_id, 1 if degraded else 0, metric, baseline_ms,
+                 current_ms, since, ts))
+            conn.commit()
 
     # --- releases / staged rollout (Part D version authority) ---
     def set_release(self, version: str, artifacts: dict, channel: str = "stable") -> None:

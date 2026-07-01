@@ -10,7 +10,13 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from wisp.central.inventory import InventoryError, clean_device_payload, clean_snmp_payload
+from wisp.central.inventory import (
+    InventoryError,
+    clean_backup_link,
+    clean_device_payload,
+    clean_port_bandwidth_payload,
+    clean_snmp_payload,
+)
 
 
 class CleanDevicePayloadTest(unittest.TestCase):
@@ -92,6 +98,67 @@ class CleanSnmpPayloadTest(unittest.TestCase):
     def test_bad_port_rejected(self):
         with self.assertRaises(InventoryError):
             clean_snmp_payload({"snmp_enabled": 1, "snmp_community": "x", "snmp_port": 70000})
+
+
+class CleanBackupLinkTest(unittest.TestCase):
+    def test_child_must_exist(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(99, 1, parents={1: None}, backups={})
+
+    def test_parent_must_exist(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(1, 99, parents={1: None}, backups={})
+
+    def test_self_backup_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(1, 1, parents={1: None}, backups={})
+
+    def test_already_primary_parent_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(2, 1, parents={1: None, 2: 1}, backups={})
+
+    def test_duplicate_backup_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(2, 3, parents={1: None, 2: 1, 3: None}, backups={2: {3}})
+
+    def test_cycle_over_full_edge_set_rejected(self):
+        # 1 -> None (root), 2 -> 1 (primary), 3 -> 2 (backup already). Backing 1 up to 3
+        # would close a loop through the combined primary+backup graph.
+        with self.assertRaises(InventoryError):
+            clean_backup_link(1, 3, parents={1: None, 2: 1, 3: None}, backups={3: {2}})
+
+    def test_valid_backup_accepted(self):
+        clean_backup_link(2, 3, parents={1: None, 2: 1, 3: None}, backups={})   # no raise
+
+    def test_cross_tenant_id_looks_like_missing_parent(self):
+        with self.assertRaises(InventoryError):
+            clean_backup_link(1, 42, parents={1: None}, backups={})
+
+
+class CleanPortBandwidthPayloadTest(unittest.TestCase):
+    def test_no_threshold_disables_the_alarm(self):
+        clean = clean_port_bandwidth_payload({})
+        self.assertIsNone(clean["threshold_mbps"])
+        self.assertEqual(clean["direction"], "either")
+
+    def test_valid_threshold_and_direction(self):
+        clean = clean_port_bandwidth_payload({"threshold_mbps": 10, "direction": "in"})
+        self.assertEqual(clean["threshold_mbps"], 10.0)
+        self.assertEqual(clean["direction"], "in")
+
+    def test_bad_direction_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_port_bandwidth_payload({"threshold_mbps": 10, "direction": "sideways"})
+
+    def test_non_positive_threshold_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_port_bandwidth_payload({"threshold_mbps": 0})
+        with self.assertRaises(InventoryError):
+            clean_port_bandwidth_payload({"threshold_mbps": -5})
+
+    def test_non_numeric_threshold_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_port_bandwidth_payload({"threshold_mbps": "fast"})
 
 
 if __name__ == "__main__":

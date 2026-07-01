@@ -21,6 +21,7 @@ import threading
 
 from wisp.config import CONFIG, Config
 from wisp.core.state_machine import (
+    BACKUP,
     CycleResult,
     DeviceMeta,
     DOWN_FAMILY,
@@ -29,17 +30,25 @@ from wisp.core.state_machine import (
     OutageOpened,
     OutageRecategorized,
     OutageResolved,
+    ParentEdge,
 )
 from wisp.ingress.probers import PingResult
 
 
 def load_device_meta(store, tenant_id: str) -> list[DeviceMeta]:
-    """DeviceMeta has no backup-parent edges here — Phase A's `org_devices` only carries
-    the primary parent chain (see central/inventory.py); `parents` stays the default ()."""
+    """DeviceMeta's BACKUP parent edges (plan.md item 3) come from `org_device_links` —
+    the PRIMARY parent stays `parent_device_id`, unchanged. The engine itself needed NO
+    changes to support this: `DeviceMeta.effective_parents()`/topology suppression/
+    redundancy math were all built generically in Phase 9 already; central's job is just
+    wiring the extra edges in."""
+    edges = store.org_device_backup_edges(tenant_id)
+    backups: dict[int, list[ParentEdge]] = {}
+    for e in edges:
+        backups.setdefault(e["child_id"], []).append(ParentEdge(e["parent_id"], BACKUP))
     return [
         DeviceMeta(id=r["id"], name=r["name"], ip_address=r["ip_address"],
                   region=r["region"], parent_device_id=r["parent_device_id"],
-                  technician_phone=None)
+                  technician_phone=None, parents=tuple(backups.get(r["id"], ())))
         for r in store.org_device_topology(tenant_id)
     ]
 
@@ -85,10 +94,12 @@ class EngineRegistry:
 
     @staticmethod
     def _fingerprint(devices: list[DeviceMeta]) -> tuple:
-        """A cheap topology signature (id + parent per device) — changes on any
-        add/remove/reparent/maintenance-toggle, exactly the edge daemon's own reload
-        trigger, so a stale in-memory engine never silently ignores a topology edit."""
-        return tuple(sorted((d.id, d.parent_device_id) for d in devices))
+        """A cheap topology signature (id + primary parent + backup edges per device) —
+        changes on any add/remove/reparent/maintenance-toggle/backup-link edit, exactly
+        the edge daemon's own reload trigger, so a stale in-memory engine never silently
+        ignores a topology edit. `d.parents` is a tuple of hashable `ParentEdge`s, so it
+        sorts/compares fine inside the outer tuple."""
+        return tuple(sorted((d.id, d.parent_device_id, d.parents) for d in devices))
 
     def get(self, tenant_id: str) -> MonitorEngine:
         devices = load_device_meta(self.store, tenant_id)

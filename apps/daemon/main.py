@@ -126,7 +126,8 @@ async def _gather_snmp_ports(
         ports_by_device[d["id"]] = [
             {"if_index": p.if_index, "if_name": p.if_name, "if_alias": p.if_alias,
              "admin_status": p.admin_status, "oper_status": p.oper_status,
-             "last_change": p.last_change}
+             "last_change": p.last_change, "in_octets": p.in_octets,
+             "out_octets": p.out_octets, "speed_bps": p.speed_bps}
             for p in ports
         ]
     return ports_by_device

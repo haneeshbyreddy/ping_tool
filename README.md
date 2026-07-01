@@ -90,10 +90,12 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── egress/               # notifiers.py — the ntfy channel (NtfyNotifier/send_with_retry),
 │                          #   shared by the edge probe's error paths and central's dispatcher
 ├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), ports.py (SNMP
-│                          #   port folding), analytics.py (outage-derived downtime/SLA),
-│                          #   rollup.py (hourly latency/loss trend, 30d retention),
-│                          #   store (multi-tenant SQLite), server.py (ingest + dashboard
-│                          #   API), watchdog, auth, admin CLI, rollout, inventory,
+│                          #   port status + bandwidth folding), redundancy.py (on-backup
+│                          #   signal), perf.py (per-link performance baseline),
+│                          #   analytics.py (outage-derived downtime/SLA), rollup.py
+│                          #   (hourly latency/loss trend, 30d retention), store
+│                          #   (multi-tenant SQLite), server.py (ingest + dashboard API),
+│                          #   watchdog, auth, admin CLI, rollout, inventory,
 │                          #   static/ (the dashboard SPA)
 └── runtime/               # central_client.py (edge's central HTTP client), single_instance.py,
                            #   supervisor.py (agent self-update logic)
@@ -139,16 +141,26 @@ run.sh                    # local dev: central + one edge probe together
 - **Uplink canary** — if an edge's own internet is down, central freezes that tenant's
   detection for the cycle and sends ONE `UPLINK_DOWN` instead of a storm of per-site alerts.
 - **Topology suppression** — a child is `UNREACHABLE` (one alert, not forty) only when
-  every monitored parent is down; a genuinely-down device with any live parent still
-  pages. (Backup/redundant uplinks are an edge-only soft-signal tier from before this
-  migration — not yet ported to central-brain mode; see `CLAUDE.md`.)
-- **SNMP port folding** — the edge walks its snmp-enabled switches on its own slow
-  cadence (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval) and reports
-  port readings alongside its pings; central folds a monitored port-down into the open
-  outage it feeds (stamping the physical cause) or, with no open outage yet, sends a
-  one-shot operator heads-up — never a second, competing alarm. Admin-down ports and
-  unmonitored (undiscovered) ports stay silent. See `CLAUDE.md`'s "Central runs the
-  brain" for the full rule set.
+  every monitored parent (primary AND any backup) is down; a genuinely-down device with
+  any live parent still pages.
+- **On-backup redundancy** — a device with a configured BACKUP parent (Nodes page) that
+  loses its primary uplink but is still reachable via the backup is "running on backup":
+  a one-shot operator heads-up (redundancy is gone, one more failure is an outage), never
+  an outage itself. Clears silently if the node itself goes hard DOWN — the outage owns
+  that story.
+- **Per-link performance baseline** — a link running well under the FSM's absolute
+  thresholds can still be sitting far above ITS OWN normal latency/jitter; central judges
+  each link against a rolling median+MAD baseline and pages the operator once on a
+  sustained (not single-sample) deviation, clearing once the link is back within baseline.
+- **SNMP port folding + bandwidth** — the edge walks its snmp-enabled switches on its own
+  slow cadence (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval) and reports
+  port + throughput readings alongside its pings; central folds a monitored port-down into
+  the open outage it feeds (stamping the physical cause) or, with no open outage yet,
+  sends a one-shot operator heads-up — never a second, competing alarm. A monitored port
+  whose throughput falls below its operator-assigned threshold alarms separately (its own
+  flap-suppressed streak). Admin-down ports, unmonitored ports, and bandwidth on a
+  down/admin-down port all stay silent. See `CLAUDE.md`'s "Central runs the brain" for the
+  full rule set.
 - **Outage-derived SLA reporting** — `GET /api/analytics?days=` answers "how reliable
   was Tower A over the last N days" straight off the outage history central already
   keeps: per-device downtime seconds, uptime %, and outage count (UNREACHABLE outages
@@ -225,7 +237,11 @@ simpler systemd-managed probe; the frozen binary + supervisor is the *fleet* pat
 | `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = off); independent of the ICMP poll cadence |
 | `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks a *monitored* port needs before central alarms it |
 | `WISP_SNMP_ALERTS` | `1` | `0` = mute the operator port-down page (the `switch_ports` state is still written) |
+| `WISP_SNMP_BW_CONSECUTIVE` | `3` | consecutive below-threshold walks before central alarms a monitored port's low bandwidth |
+| `WISP_SNMP_BW_ALERTS` | `1` | `0` = mute the operator low-bandwidth page (the rate is still recorded) |
 | `WISP_SNMP_TIMEOUT_S` | `2.0` | per-switch SNMP request timeout (a dead switch must never block the ICMP cycle) |
+| `WISP_PERF_ALERTS` | `1` | `0` = mute the operator slow-link page (the `device_perf` badge is still written); the baseline math's own tunables (`WISP_PERF_WINDOW`/`_MIN_SAMPLES`/`_CONSECUTIVE`/`_DEVIATION_FACTOR`/`_MAD_K`/`_MIN_BASELINE_MS`/`_MIN_JITTER_MS`) rarely need changing from `config.py`'s defaults |
+| `WISP_BACKUP_ALERTS` | `1` | `0` = mute the operator on-backup page (the `device_redundancy` badge is still written) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |

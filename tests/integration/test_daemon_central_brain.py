@@ -164,7 +164,8 @@ class RunCycleCentralBrainTest(unittest.TestCase):
         ports = client.reports[0]["ports"]
         self.assertEqual(ports[1], [{"if_index": 2, "if_name": "Gi0/2", "if_alias": None,
                                      "admin_status": "up", "oper_status": "down",
-                                     "last_change": None}])
+                                     "last_change": None, "in_octets": None,
+                                     "out_octets": None, "speed_bps": None}])
 
     def test_snmp_skips_devices_without_it_enabled(self):
         devices = [_dev(1, "10.0.0.1", snmp_enabled=False)]
@@ -207,7 +208,8 @@ class GatherSnmpPortsTest(unittest.TestCase):
         self.assertEqual(set(ports), {1})
         self.assertEqual(ports[1], [{"if_index": 3, "if_name": "Gi0/3", "if_alias": "-> X",
                                      "admin_status": "up", "oper_status": "down",
-                                     "last_change": None}])
+                                     "last_change": None, "in_octets": None,
+                                     "out_octets": None, "speed_bps": None}])
 
 
 class FollowRecheckTest(unittest.TestCase):

@@ -122,6 +122,17 @@ class Config:
         default_factory=lambda: _env_float("WISP_PERF_MIN_BASELINE_MS", 5.0))
     perf_min_jitter_ms: float = field(
         default_factory=lambda: _env_float("WISP_PERF_MIN_JITTER_MS", 3.0))
+    # A degraded/recovered edge always updates the device_perf badge; this gates
+    # whether central actually PAGES the operator about it.
+    perf_alerts: bool = field(default_factory=lambda: _env_bool("WISP_PERF_ALERTS", True))
+
+    # --- Redundancy / on-backup signal ----------------------------------------
+    # A device with a BACKUP parent edge (org_device_links, kind='backup') that loses
+    # its primary uplink but is still reachable via the backup is "on backup" — a
+    # heads-up (redundancy is gone, one more failure is an outage), not an outage
+    # itself. An enter/leave edge always updates the device_redundancy badge; this
+    # gates whether central actually PAGES the operator about it.
+    backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
 
     # --- SNMP ingress (graph topology Part B; IF-MIB oper/admin only) --------
     # `ingress/snmp.py`'s poller, wired into the central-brain daemon loop on its own
@@ -141,6 +152,16 @@ class Config:
     # A monitored port-down/restored always updates switch_ports; this gates whether
     # central actually PAGES the operator about it (state is written either way).
     snmp_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_ALERTS", True))
+    # --- Per-port bandwidth (throughput) low-threshold alarm (plan.md item 3) -----
+    # Orthogonal to oper/admin status: each walk reads the 64-bit byte counters and
+    # central diffs them into a rate (bits/sec). A monitored port whose rate falls
+    # below its operator-assigned threshold for this many consecutive walks alarms —
+    # its own streak, because traffic is burstier than link state (a port that's up
+    # but momentarily idle shouldn't page on a single quiet walk).
+    snmp_bw_consecutive: int = field(
+        default_factory=lambda: _env_int("WISP_SNMP_BW_CONSECUTIVE", 3))
+    # Gate the low-bandwidth page (the switch_ports bw state is always written).
+    snmp_bw_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_BW_ALERTS", True))
 
     # --- State-machine thresholds (see plan.md §"State machine") -------------
     latency_threshold_ms: float = field(

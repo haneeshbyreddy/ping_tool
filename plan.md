@@ -34,7 +34,7 @@ run locally beyond the probe.
   end-to-end in tests. What's *not* exercised outside CI: the actual multi-arch
   PyInstaller build, code-signing, and the Windows installer on real hardware.
 
-224 tests, `python -m unittest discover -s tests`.
+264 tests, `python -m unittest discover -s tests`.
 
 ## The model: what changed from a single-box tool
 
@@ -141,18 +141,14 @@ The platform is feature-complete for its core job (detect, suppress, page, multi
 dashboard) but has real gaps versus the single-box tool it replaced, plus production
 groundwork that hasn't been done yet. In rough priority order:
 
-1. ~~**SNMP port monitoring on central.**~~ **Done.** The single-box tool could watch switch
-   uplink ports (IF-MIB oper/admin status) and fold a port-down into the device outage it
-   feeds; that's now wired end to end on the current platform. `POST /report` carries an
-   optional `ports` key ({device_id: [port dict, ...]}) on the edge's own slow SNMP cadence
-   (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval — ports don't flap like
-   radio links), and `central/ports.py:CentralPortMonitor` is the central-side consumer,
-   mirroring the old edge design one-for-one: `monitored` ports only, admin-down silent
-   (reuses `ingress/snmp.py`'s `PortStatus.is_down()`), fold into an open outage
-   (`stamp_outage_cause`) rather than a competing alarm, and a leading-indicator heads-up
-   when there's no open outage yet. SNMP *bandwidth* (`ifHCIn/OutOctets`/`ifHighSpeed` —
-   `ingress/snmp.py` already parses these) is still not carried on the wire or stored
-   centrally; that remains a follow-up alongside item 3 below.
+1. ~~**SNMP port monitoring on central.**~~ **Done**, including bandwidth (see item 3).
+   `POST /report` carries an optional `ports` key ({device_id: [port dict, ...]}) on the
+   edge's own slow SNMP cadence (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll
+   interval — ports don't flap like radio links), and `central/ports.py:CentralPortMonitor`
+   is the central-side consumer, mirroring the old edge design one-for-one: `monitored`
+   ports only, admin-down silent (reuses `ingress/snmp.py`'s `PortStatus.is_down()`),
+   fold into an open outage (`stamp_outage_cause`) rather than a competing alarm, and a
+   leading-indicator heads-up when there's no open outage yet.
 2. ~~**Central-side historical rollups / trend analytics.**~~ **Done.** Two slices:
    outage-history downtime/uptime/SLA reporting (`central/analytics.py:device_reliability`,
    `GET /api/analytics?days=`) answers "how reliable was Tower A last month" straight off
@@ -165,12 +161,32 @@ groundwork that hasn't been done yet. In rough priority order:
    fast-confirm subset's rapid re-probes), with a daily prune sweep on its own background
    thread (`central/rollup.py:start_central_rollup_prune_thread`, started alongside the
    fleet watchdog thread in `central/server.py:serve()`).
-3. **Per-link performance baseline + on-backup redundancy signal, on central.** Both
-   existed on the old edge as soft-signal tiers (a link slow/jittery vs its own baseline;
-   a node running on a backup path with primary uplink down) and were genuinely useful
-   heads-up signals, not just outages. Central would need its own trailing-sample storage
-   to reintroduce either — don't bolt them onto `device_states` (a single current-state
-   row) without designing that storage properly.
+3. ~~**Per-link performance baseline + on-backup redundancy signal + SNMP bandwidth,
+   on central.**~~ **Done.** All three existed as soft-signal tiers on the old single-box
+   edge and needed central's own trailing-sample storage to reintroduce, which now
+   exists:
+   - **On-backup redundancy** (`central/redundancy.py`) needed ZERO engine changes —
+     `core/state_machine.MonitorEngine` already computed `CycleResult.redundancy`
+     generically off `DeviceMeta.parents`' BACKUP edges; central's job was purely
+     wiring in the extra edge (`org_device_links`, `central/inventory.py:clean_backup_link`
+     for the topology-loop-safe validation, `GET/POST /api/inventory/links*`) and
+     persisting the badge (`device_redundancy`, restart-safe, operator-only page on the
+     enter/leave edge, gated by `WISP_BACKUP_ALERTS`, never louder than an outage).
+   - **Per-link performance baseline** (`central/perf.py`) reuses `core/baseline.py`'s
+     pure median+MAD deviation math verbatim; central's job was the trailing-sample
+     window. Deliberately NOT the same storage as `central/rollup.py`'s hourly trend
+     buckets (too coarse to catch an intra-hour slowdown) — a new bounded per-device
+     ring buffer (`device_perf_samples`, trimmed to `WISP_PERF_WINDOW` rows after every
+     insert) plus a restart-safe badge (`device_perf`). Operator-only page on the
+     enter/leave edge, gated by `WISP_PERF_ALERTS`.
+   - **SNMP bandwidth** (`central/ports.py`, extending the port-status fold from item 1)
+     diffs the 64-bit IF-MIB octet counters `ingress/snmp.py` already parses into a live
+     in/out rate (`throughput_bps`) and alarms a MONITORED port whose rate falls below
+     an operator-assigned per-port threshold (`bw_threshold_mbps`/`bw_direction`,
+     `GET/POST /api/inventory/ports/bandwidth`) for `WISP_SNMP_BW_CONSECUTIVE`
+     consecutive walks — its own streak, separate from the port-down streak, gated by
+     `WISP_SNMP_BW_ALERTS`. Never judged on a down/admin-down port (that alarm already
+     owns the story).
 4. **Actually deploying central for production.** Everything to date has been local dev
    (`run.sh`) or a single test process. Central is meant to run somewhere always-available
    (a small always-on VM is enough to start) with a TLS terminator in front of it (it

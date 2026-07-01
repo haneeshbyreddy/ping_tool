@@ -14,7 +14,7 @@ no other path). An earlier single-box version of this tool (one daemon + one loc
 no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
 deleted wholesale, not just deprecated. See "Removed" below before assuming a described
 behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 224 tests.
+history, not this file. 264 tests.
 
 **Central's own management plane and FSM/alerting are done and tested end to end**, including
 the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
@@ -22,15 +22,13 @@ management plane" and "Central runs the brain" below. Verify claims about what's
 the code, not just this file (an earlier draft of this doc called the fast-confirm round-trip
 "deferred" after it had already shipped — that drift is exactly the kind of thing to watch for).
 
-**SNMP port status and historical rollups/trend analytics are now wired end to end, on
-central** — see "SNMP port folding" and "Historical rollups" below. Still genuinely
-missing on central: bandwidth/throughput (the `ifHCIn/OutOctets` + `ifHighSpeed` fields
-`ingress/snmp.py` already parses are captured on the wire but not yet stored/alerted on),
-the per-link performance baseline, and the on-backup redundancy signal. The latter two
-existed on the old single-box edge (deleted, see below) and were never ported to
-central — they'd reuse `central/rollup.py`'s trailing-sample storage pattern (now that it
-exists) but nobody's built the deviation-vs-baseline math or the backup-path detection on
-top of it yet. See `plan.md` for the full list of what's next and in what order.
+**SNMP port status (incl. bandwidth), historical rollups/trend analytics, the per-link
+performance baseline, and the on-backup redundancy signal are all now wired end to end,
+on central** — see "SNMP port folding", "Historical rollups", "Per-link performance
+baseline", and "On-backup redundancy" below. Every soft-signal tier the old single-box
+edge had now has a central-side equivalent — plan.md's remaining items are production
+groundwork (real hosting, fleet-update hardening, mTLS), not more detection tiers. See
+`plan.md` for the full list of what's next and in what order.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
@@ -163,9 +161,11 @@ Src layout, zero-install. What bites:
   for *create* (where there's no row yet to derive it from); for update/delete/maintenance/snmp
   it would let an authenticated user from org A claim to own org B's device id. `_can_write(user,
   tenant)` still gates on the *derived* tenant. `switch_ports` writes (`/api/inventory/ports/
-  monitored`, `/api/inventory/ports/feeds`) follow the same pattern via
-  `store.switch_port_tenant(id)`; `feeds` additionally checks the target device is in the SAME
-  tenant (`store.device_tenant(feeds) == tenant`) before accepting it.
+  monitored`, `/api/inventory/ports/feeds`, `/api/inventory/ports/bandwidth`) follow the
+  same pattern via `store.switch_port_tenant(id)`; `feeds` additionally checks the target
+  device is in the SAME tenant (`store.device_tenant(feeds) == tenant`) before accepting
+  it. `/api/inventory/links` (backup edges) derives tenant from `child_id` the same way and
+  additionally checks `parent_id` is in that SAME tenant before accepting the edge.
 - **`/api/orgs` must stay tenant-filtered.** Any authenticated org user must only ever get their
   own org's row back — including their own `ntfy_topic*` alert channels, never another
   tenant's. The scoping is the same `tenant` value `_scope_tenant` computes for every other
@@ -176,11 +176,16 @@ Src layout, zero-install. What bites:
   this ISP's box alive" (platform-operational, routed by us), the other is "route this ISP's
   own outage pages by role" (customer-configured, read by `central/dispatch.py`). Both live on
   `orgs` but serve different alarms — don't merge them.
-- **New `orgs`/`org_devices` columns need the in-code column migration**, not just the `CREATE
-  TABLE IF NOT EXISTS` in `_SCHEMA` — that only helps a fresh DB. `CentralStore.__init__` runs
-  `_ensure_columns(conn, table, coldefs)` (checks `PRAGMA table_info`, `ALTER TABLE ADD COLUMN`
-  for anything missing) right after `executescript`. Add any new column there too, or an
-  existing `central.db` silently keeps the old schema.
+- **New `orgs`/`org_devices`/`switch_ports` columns need the in-code column migration**, not
+  just the `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` — that only helps a fresh DB.
+  `CentralStore.__init__` runs `_ensure_columns(conn, table, coldefs)` (checks `PRAGMA
+  table_info`, `ALTER TABLE ADD COLUMN` for anything missing) right after `executescript`.
+  Add any new column there too, or an existing `central.db` silently keeps the old schema
+  (this is exactly how the item-3 bandwidth columns — `bw_threshold_mbps`, `in_octets`,
+  etc. — got added onto the item-1 `switch_ports` table without a real migration runner).
+  A brand-new TABLE (like `org_device_links`/`device_perf_samples`) needs no such
+  migration — `CREATE TABLE IF NOT EXISTS` alone is enough since there's no existing row
+  shape to reconcile.
 - **`central/server.py`'s dashboard writes send real pushes (`/api/test-alert`), so
   `make_server`/`_make_handler` take an injectable `notifier`** (defaults to
   `build_notifier(cfg)`, the lazy-httpx-import `NtfyNotifier`) — tests inject a recording
@@ -200,12 +205,14 @@ Src layout, zero-install. What bites:
   (`/api/inventory*` CRUD + 422/403 + cross-tenant-write-rejected over HTTP, `/api/orgs`
   tenant-scoping + superadmin narrow, org role-topic round-trip, `/api/test-alert` via the
   injected recording notifier + missing-topic 422 + write-gated, `/api/analytics` +
-  `/api/analytics/trend` tenant scoping + superadmin narrow), `integration/test_central_analytics`
-  (`DeviceReliabilityTest`: window-overlap math, DOWN-only excludes UNREACHABLE, a
-  zero-outage device reports 100% up, tenant isolation; `DeviceRollupTest`: hour-bucket
-  flooring, same-bucket averaging across cycles, a lost sample has no latency but still
-  counts loss/down, different hours land in different buckets, prune keeps only recent
-  buckets, tenant isolation).
+  `/api/analytics/trend` tenant scoping + superadmin narrow, `/api/inventory/links*`
+  round-trip + cross-tenant-parent-rejected + topology-loop-rejected + write-gated,
+  `/api/inventory/ports/bandwidth` round-trip + bad-direction-422), `integration/
+  test_central_analytics` (`DeviceReliabilityTest`: window-overlap math, DOWN-only
+  excludes UNREACHABLE, a zero-outage device reports 100% up, tenant isolation;
+  `DeviceRollupTest`: hour-bucket flooring, same-bucket averaging across cycles, a lost
+  sample has no latency but still counts loss/down, different hours land in different
+  buckets, prune keeps only recent buckets, tenant isolation).
 
 ## Central runs the brain (New Architecture Phase B — the ONLY edge mode, post-Phase-C)
 
@@ -280,8 +287,19 @@ Src layout, zero-install. What bites:
   ignored (`_report:_ingest_ports`) — the same re-derive-tenant-from-what-we-already-know
   discipline as `org_devices` writes, so tenant A can't attribute a port reading to tenant
   B's device. Operator-only page, gated by `cfg.snmp_alerts` (state is always written); no
-  escalation ladder of its own. Bandwidth (`in_octets`/`out_octets`/`speed_bps`) is parsed by
-  `ingress/snmp.py` but not yet carried on the wire or stored centrally — still a follow-up.
+  escalation ladder of its own. **Bandwidth is wired too (plan.md item 3).** The same walk's
+  64-bit octet counters (`in_octets`/`out_octets`/`speed_bps`, already parsed by
+  `ingress/snmp.py`, now carried on the wire alongside status) get diffed by
+  `central/ports.py`'s `throughput_bps` into a live in/out rate; a MONITORED port whose
+  rate falls below its operator-assigned per-port threshold
+  (`bw_threshold_mbps`/`bw_direction`, `GET/POST /api/inventory/ports/bandwidth`,
+  `clean_port_bandwidth_payload`) for `cfg.snmp_bw_consecutive` walks alarms — its OWN
+  streak (`bw_low_streak`/`bw_alarm`), separate from the port-down streak, since traffic is
+  burstier than link state. Never judged on a down/admin-down port (`bw_eligible` requires
+  `oper_status == "up" and not down`) — that alarm already owns the story, so a bw-alarmed
+  port going down clears its bw badge SILENTLY (no confusing "bandwidth recovered" chaser).
+  Gated by `cfg.snmp_bw_alerts`; the `switch_ports` row (`in_bps`/`out_bps`/`counters_at`)
+  is always written.
 - **Historical rollups/trend analytics are wired (plan.md item 2, both slices).**
   `central/analytics.py:device_reliability` (`GET /api/analytics?days=`) is pure
   outage-history math — no new storage, since central already retains full outage history
@@ -296,11 +314,41 @@ Src layout, zero-install. What bites:
   (`latency_sum`/`loss_sum`/`down_samples`) rather than storing raw samples — averages are
   computed at READ time. `start_central_rollup_prune_thread` runs a daily sweep, started
   in `central/server.py:serve()` right alongside the fleet watchdog thread.
-- **Deliberately deferred, not forgotten:** SNMP bandwidth/throughput, and the per-link
-  perf baseline + on-backup redundancy soft-signal tiers (these need trailing sample
-  history — `central/rollup.py`'s `device_rollups` table is exactly that storage now, but
-  nobody's built the deviation-vs-baseline math or backup-path detection on top of it
-  yet). Don't be surprised these don't fire; they're follow-up work, not bugs.
+- **Per-link performance baseline is wired (plan.md item 3).** `central/perf.py` reuses
+  `core/baseline.py`'s pure median+MAD deviation math (`evaluate_perf`) VERBATIM — none of
+  that math changed. Central's own contribution is the trailing-sample window:
+  `device_perf_samples` is a bounded per-(tenant, device) ring buffer (`store.
+  record_perf_sample` inserts then trims to the newest `cfg.perf_window` rows in the SAME
+  write), deliberately NOT `central/rollup.py`'s hourly buckets — an hourly average would
+  smear out exactly the intra-hour slowdown this tier exists to catch; don't conflate the
+  two storages. `record_and_evaluate` runs once per full-report cycle (never a recheck),
+  appends this cycle's sample, evaluates the window, and persists the badge
+  (`device_perf`, restart-safe — a hard-DOWN device's perf is moot and clears its badge
+  SILENTLY, the outage owns that story). Operator-only page on the enter/leave edge, gated
+  by `cfg.perf_alerts`.
+- **On-backup redundancy is wired (plan.md item 3) — and needed ZERO engine changes.**
+  `core/state_machine.MonitorEngine` already computed `CycleResult.redundancy` generically
+  in its full pass (`DeviceMeta.effective_parents()` combining the primary parent with any
+  BACKUP `ParentEdge`s) from an earlier, still-untouched phase of the old single-box tool —
+  central's entire job here was wiring the extra edge in: `org_device_links` (mirrors the
+  old `device_links` table, tenant-scoped, `kind='backup'`), `central/inventory.py:
+  clean_backup_link` (the topology-loop check over the FULL edge set — primary + existing
+  backups — mirroring the old `add_backup_link`), and `central/engine.py:load_device_meta`
+  populating `DeviceMeta.parents` from `store.org_device_backup_edges`. **`EngineRegistry`'s
+  topology fingerprint now includes `d.parents`, not just `d.parent_device_id`** — a
+  backup-link add/remove is a topology change like any other and must trigger a rebuild,
+  same as a reparent. `central/redundancy.py:sweep` is the direct port of the old edge's
+  `AlertDispatcher.redundancy_sweep`: persists the `device_redundancy` badge every full
+  cycle (restart-safe), pages the operator once on the enter/leave edge, and — same
+  invariant as every soft-signal tier — NEVER opens an outage or touches the escalation
+  ladder; a node that's itself gone hard DOWN clears its badge SILENTLY (the outage owns
+  that story, not this). Gated by `cfg.backup_alerts`. Dashboard CRUD:
+  `GET/POST /api/inventory/links*`, `GET /api/inventory/redundancy?device_id=`.
+- **Every soft-signal tier the old single-box edge had now exists on central.** SNMP port
+  status + bandwidth, outage-history SLA reporting, the latency/loss trend, the per-link
+  performance baseline, and on-backup redundancy are all wired. Nothing is deliberately
+  deferred at the detection-tier level anymore — see plan.md for what's left (production
+  deployment, fleet-update hardening, mTLS), which is groundwork, not new tiers.
 - **Tests:** `integration/test_central_brain.py` — `CentralEngineTest` (topology mapping
   excludes maintenance, restart rehydration doesn't re-page, `EngineRegistry` streak
   persistence across calls + rebuild-on-topology-change + per-tenant isolation),
@@ -313,12 +361,14 @@ Src layout, zero-install. What bites:
   including fast-confirm-within-two-rechecks and a blip clearing the hint without confirming,
   plus SNMP port folding over HTTP: a monitored port-down folds into an open outage's
   `root_cause` and a device id from another tenant's `ports` key is silently ignored;
-  plus the trend rollup: a full report folds one bucket, a recheck folds none).
-  `integration/test_daemon_central_brain.py` (loads `apps/daemon/main.py` by path) —
-  `_gentle_probe_plan` infra-vs-leaf cadence, `run_cycle_central_brain` reports every probed IP
-  incl. canary + survives a report failure without raising, `run_forever_central_brain`
-  re-fetches topology + reports per cycle and aborts loudly (`SystemExit(2)`) if the very first
-  topology fetch fails, `_follow_recheck` follows a hint and stops when it's disabled/empty,
+  plus the trend rollup: a full report folds one bucket, a recheck folds none; plus the
+  on-backup redundancy badge driven end to end by 3 down-cycles on the primary while the
+  backup + child stay reachable). `integration/test_daemon_central_brain.py` (loads
+  `apps/daemon/main.py` by path) — `_gentle_probe_plan` infra-vs-leaf cadence,
+  `run_cycle_central_brain` reports every probed IP incl. canary + survives a report
+  failure without raising, `run_forever_central_brain` re-fetches topology + reports per
+  cycle and aborts loudly (`SystemExit(2)`) if the very first topology fetch fails,
+  `_follow_recheck` follows a hint and stops when it's disabled/empty,
   `Config.central_brain_enabled()` requires both flags, `_gather_snmp_ports`/
   `run_cycle_central_brain(snmp_poller=...)` walk only snmp-enabled devices, attach the haul
   to the same full report, and isolate a dead switch's walk failure from the ICMP cycle.
@@ -326,7 +376,16 @@ Src layout, zero-install. What bites:
   `CentralPortMonitor`/`CentralStore`): discovery lands unmonitored, flap-suppressed
   monitored-down, a single blip never alarms, admin-down stays silent, fold-into-open-outage
   vs. leading-indicator-no-outage, recovery pages once, the `snmp_alerts` gate mutes the page
-  but still writes state, a missing operator topic is a soft no-op.
+  but still writes state, a missing operator topic is a soft no-op; `BandwidthTest`
+  (counter-delta rate math, flap-suppressed below-threshold alarm, direction selection,
+  recovery, the `snmp_bw_alerts` gate, a bw-alarmed port going down clears silently).
+  `integration/test_central_redundancy.py` (mirrors the old `test_redundancy.py`): a
+  single operator page on enter, one recovered notice on leave, a hard-DOWN node clears
+  the badge silently, the `backup_alerts` gate, restart doesn't re-page, tenant isolation.
+  `integration/test_central_perf.py` (mirrors the old `test_perf.py`): sustained
+  degradation pages once, recovery sends one notice, a hard-DOWN device clears the perf
+  badge silently, the `perf_alerts` gate, restart doesn't re-page (the window survives in
+  the DB), tenant isolation.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -410,20 +469,24 @@ Src layout, zero-install. What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (224 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (264 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
-`unit/test_baseline` (pure perf-deviation math — module kept, not currently wired into anything
-that calls it; see Status), `unit/test_snmp` (pure SNMP parser/throughput math, incl.
-`is_down()` — the same predicate `central/ports.py` reuses for the folding alarm condition),
-`unit/test_supervisor` (Part D, untouched by
-Phase C), `unit/test_central_inventory` (pure central payload/cycle validation),
+`unit/test_baseline` (pure perf-deviation math — now wired by `central/perf.py`; see
+"Per-link performance baseline" above), `unit/test_snmp` (pure SNMP parser/throughput math,
+incl. `is_down()` — the same predicate `central/ports.py` reuses for the folding alarm
+condition), `unit/test_supervisor` (Part D, untouched by
+Phase C), `unit/test_central_inventory` (pure central payload/cycle validation, incl.
+`clean_backup_link`'s full-edge-set cycle check and `clean_port_bandwidth_payload`),
 `integration/test_daemon` (the edge's shared `_gather_pings`: concurrency-bound semaphore,
 per-IP count map, the config-error-vs-per-host-error policy), `integration/test_daemon_central_brain`
 (the edge probe loop end to end against a recording central client double, incl. the SNMP
 task's `_gather_snmp_ports`/dead-switch isolation), `integration/test_central_ports`
 (`CentralPortMonitor` against `CentralStore` — monitored-only, admin-down-silent, fold vs.
-leading-indicator, recovery, the alerts gate), `integration/test_notifiers`
+leading-indicator, recovery, the alerts gate, plus the bandwidth tier's throughput/alarm
+math), `integration/test_central_redundancy` (the on-backup sweep against `CentralStore`),
+`integration/test_central_perf` (the perf-baseline sweep against `CentralStore`),
+`integration/test_notifiers`
 (the `send_with_retry` policy — pure, no DB/network), `integration/test_single_instance` (the OS
 lock + idempotent `OutageOpened`), `integration/test_analytics` (outage-window/downtime math,
 the edge-schema version `central/analytics.py` mirrors), `integration/test_central_analytics`

@@ -6,11 +6,13 @@ coercion, IP sanity, device-type pick-list, and parent-cycle check as the edge's
 pure function of a payload + the tenant's current parent map), so it lives here,
 unit-testable without a DB — exactly like the edge's SNMP-payload cleaner.
 
-Phase A has no backup/redundancy links yet (that's topology suppression, which only means
-something once Phase B is running live detection), so the cycle check here walks the
-PRIMARY parent chain only. `parents` must already be scoped to one tenant — the caller
-(`central/store.py:org_device_parent_map`) never leaks another org's ids into it, so a
-cross-tenant id simply looks like "parent node does not exist".
+`clean_device_payload`'s cycle check walks the PRIMARY parent chain only — a device's
+`parent_device_id`. `clean_backup_link` (plan.md item 3) is the sibling validator for the
+EXTRA redundancy edge (`org_device_links`, kind='backup'): its cycle check walks the FULL
+edge set (primary + existing backups), mirroring the old single-box `add_backup_link`.
+`parents`/`backups` must already be scoped to one tenant — the caller
+(`central/store.py:org_device_parent_map`/`org_device_backup_map`) never leaks another
+org's ids into them, so a cross-tenant id simply looks like "parent node does not exist".
 """
 from __future__ import annotations
 
@@ -72,6 +74,64 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
 
     return {"name": name, "ip_address": ip_address, "device_type": device_type,
             "region": region, "parent_device_id": parent_id}
+
+
+def clean_backup_link(child_id: int, parent_id: int, *,
+                      parents: dict[int, int | None],
+                      backups: dict[int, set[int]]) -> None:
+    """Validate a proposed BACKUP parent edge (`child_id` runs a redundant uplink to
+    `parent_id`) against the tenant's current topology. Raises `InventoryError` on the
+    first problem; returns nothing (an OK edge) otherwise. Pure — mirrors the old
+    single-box `add_backup_link`'s checks one-for-one, minus the DB, so it's
+    unit-testable like `clean_device_payload`."""
+    if child_id not in parents:
+        raise InventoryError("node not found")
+    if parent_id not in parents:
+        raise InventoryError("backup parent does not exist")
+    if parent_id == child_id:
+        raise InventoryError("a node can't be its own backup parent")
+    if parents.get(child_id) == parent_id:
+        raise InventoryError("that node is already the primary parent")
+    if parent_id in backups.get(child_id, set()):
+        raise InventoryError("that backup link already exists")
+    # Cycle check over the FULL edge set (primary + existing backups): walk UP from the
+    # proposed parent; reaching the child means the new edge would close a loop.
+    edges_of: dict[int, set[int]] = {}
+    for cid, pid in parents.items():
+        if pid is not None:
+            edges_of.setdefault(cid, set()).add(pid)
+    for cid, pids in backups.items():
+        edges_of.setdefault(cid, set()).update(pids)
+    stack, seen = [parent_id], set()
+    while stack:
+        cur = stack.pop()
+        if cur == child_id:
+            raise InventoryError("that backup link would create a topology loop")
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(edges_of.get(cur, ()))
+
+
+BW_DIRECTIONS = ("in", "out", "either", "total")
+
+
+def clean_port_bandwidth_payload(data: dict) -> dict:
+    """Validate a per-port low-bandwidth alarm config: `threshold_mbps=None`/absent
+    disables the alarm for that port (badge-only)."""
+    raw = data.get("threshold_mbps")
+    threshold: float | None = None
+    if raw not in (None, "", "null"):
+        try:
+            threshold = float(raw)
+        except (TypeError, ValueError):
+            raise InventoryError("threshold_mbps must be a number")
+        if threshold <= 0:
+            raise InventoryError("threshold_mbps must be positive")
+    direction = (str(data.get("direction") or "either")).strip().lower()
+    if direction not in BW_DIRECTIONS:
+        raise InventoryError(f"direction must be one of: {', '.join(BW_DIRECTIONS)}")
+    return {"threshold_mbps": threshold, "direction": direction}
 
 
 def clean_snmp_payload(data: dict) -> dict:

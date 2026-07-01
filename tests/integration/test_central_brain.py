@@ -550,6 +550,38 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(self.store.list_switch_ports("ispA", other_switch), [])
         self.assertEqual(self.store.list_switch_ports("ispB", other_switch), [])
 
+    # -- on-backup redundancy signal, over the real socket (plan.md item 3) --
+    def test_report_drives_on_backup_badge_end_to_end(self):
+        primary = self.store.create_org_device("ispA", {
+            "name": "Primary", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        backup = self.store.create_org_device("ispA", {
+            "name": "Backup", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        child = self.store.create_org_device("ispA", {
+            "name": "Relay", "ip_address": "10.0.0.3", "device_type": None,
+            "region": None, "parent_device_id": primary})
+        self.store.create_backup_link("ispA", child, backup)
+        self.store.set_org("ispA", ntfy_topic_operator="a-op")
+
+        def _report_all(primary_loss):
+            body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+                    "pings": {"10.0.0.1": {"loss_pct": primary_loss,
+                                          "latency_ms": None if primary_loss else 5.0},
+                             "10.0.0.2": {"loss_pct": 0.0, "latency_ms": 5.0},
+                             "10.0.0.3": {"loss_pct": 0.0, "latency_ms": 5.0}}}
+            return self._req("POST", "/report", body)
+
+        for _ in range(3):   # down_consecutive=3 (this test's cfg override)
+            _report_all(100.0)
+        self.assertEqual(self.store.device_states("ispA")[primary]["state"], DOWN)
+
+        status, body = self._req("GET", f"/api/inventory/redundancy?device_id={child}",
+                                 token="tok")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["redundancy"]["on_backup"], 1)
+        self.assertTrue(any("On backup" in s["title"] for s in self.notifier.sent))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,8 @@ from wisp.config import CONFIG, Config
 from wisp.central import auth, inventory
 from wisp.central import analytics as central_analytics
 from wisp.central import engine as central_engine
+from wisp.central import perf as central_perf
+from wisp.central import redundancy as central_redundancy
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
 from wisp.central.ports import CentralPortMonitor
@@ -196,6 +198,38 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 self._reply(200, {"ports": store.list_switch_ports(tenant, did)})
+                return
+            if route == "/api/inventory/redundancy":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                tenant = store.device_tenant(did)
+                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"redundancy": store.device_redundancy_state(tenant, did)})
+                return
+            if route == "/api/inventory/perf":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                tenant = store.device_tenant(did)
+                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"perf": store.device_perf_state(tenant, did)})
                 return
             if route == "/api/analytics":
                 user = self._reader()
@@ -397,6 +431,15 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # reports only, so a recheck's rapid re-probe of a suspect subset never
                 # skews an hour's average.
                 central_rollup.record_cycle(store, tenant, eng, cycle, results, ts)
+                # Per-link performance baseline (plan.md item 3) — same full-report-only
+                # gating; a recheck's suspect subset isn't a meaningful perf sample.
+                central_perf.record_and_evaluate(store, tenant, eng, cycle, results, ts,
+                                                 notifier, cfg)
+                # On-backup redundancy signal (plan.md item 3) — cycle.redundancy is
+                # only ever populated on a full pass (see MonitorEngine.process_cycle),
+                # so this is a no-op on a recheck even without the mode gate above.
+                central_redundancy.sweep(store, tenant, eng, cycle.redundancy,
+                                         cycle.states, notifier, ts, cfg)
 
             reply: dict = {"ok": True}
             recheck = central_engine.compute_recheck(eng, cycle, results, cfg)
@@ -584,6 +627,45 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         self._reply(422, {"error": "feeds device must belong to the same org"})
                         return
                 ok = store.set_port_feeds(tenant, pid, feeds)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/ports/bandwidth":
+                pid = int(body.get("id") or 0)
+                tenant = store.switch_port_tenant(pid)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                clean = inventory.clean_port_bandwidth_payload(body)
+                ok = store.set_port_bandwidth_config(
+                    tenant, pid, clean["threshold_mbps"], clean["direction"])
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            # graph topology: backup (redundancy) parent edges (plan.md item 3)
+            if route == "/api/inventory/links":
+                child_id = int(body.get("child_id") or 0)
+                parent_id = int(body.get("parent_id") or 0)
+                tenant = store.device_tenant(child_id)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                if store.device_tenant(parent_id) != tenant:
+                    self._reply(422, {"error": "backup parent must belong to the same org"})
+                    return
+                parents = store.org_device_parent_map(tenant)
+                backups = store.org_device_backup_map(tenant)
+                inventory.clean_backup_link(child_id, parent_id, parents=parents,
+                                            backups=backups)
+                store.create_backup_link(tenant, child_id, parent_id)
+                self._reply(200, {"ok": True})
+                return
+            if route == "/api/inventory/links/delete":
+                child_id = int(body.get("child_id") or 0)
+                parent_id = int(body.get("parent_id") or 0)
+                tenant = store.device_tenant(child_id)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                ok = store.delete_backup_link(tenant, child_id, parent_id)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             # user provisioning: superadmin anywhere; an owner within their own org

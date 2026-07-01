@@ -368,6 +368,97 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["name"], "Other")
 
+    # --- graph topology: backup links + port bandwidth config (plan.md item 3) ---
+    def test_backup_link_round_trip_and_cross_tenant_rejected(self):
+        _, own = self._login("owner", "ownerpassword")
+        primary = self.store.create_org_device("ispA", {
+            "name": "Primary", "ip_address": "10.0.1.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        backup = self.store.create_org_device("ispA", {
+            "name": "Backup", "ip_address": "10.0.1.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        child = self.store.create_org_device("ispA", {
+            "name": "Relay", "ip_address": "10.0.1.3", "device_type": None,
+            "region": None, "parent_device_id": primary})
+        status, body, _ = self._req(
+            "POST", "/api/inventory/links",
+            {"child_id": child, "parent_id": backup}, cookie=own)
+        self.assertEqual(status, 200)
+        devices = self._req("GET", "/api/inventory", cookie=own)[1]["devices"]
+        relay = next(d for d in devices if d["id"] == child)
+        self.assertEqual(relay["backup_parents"], [backup])
+
+        # a backup parent from a DIFFERENT tenant is rejected
+        other = self.store.create_org_device("ispB", {
+            "name": "Other", "ip_address": "10.0.9.9", "device_type": None,
+            "region": None, "parent_device_id": None})
+        status, body, _ = self._req(
+            "POST", "/api/inventory/links",
+            {"child_id": child, "parent_id": other}, cookie=own)
+        self.assertEqual(status, 422)
+
+        status, _, _ = self._req(
+            "POST", "/api/inventory/links/delete",
+            {"child_id": child, "parent_id": backup}, cookie=own)
+        self.assertEqual(status, 200)
+        devices = self._req("GET", "/api/inventory", cookie=own)[1]["devices"]
+        relay = next(d for d in devices if d["id"] == child)
+        self.assertEqual(relay["backup_parents"], [])
+
+    def test_backup_link_rejects_a_topology_loop(self):
+        _, own = self._login("owner", "ownerpassword")
+        a = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.2.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        b = self.store.create_org_device("ispA", {
+            "name": "B", "ip_address": "10.0.2.2", "device_type": None,
+            "region": None, "parent_device_id": a})
+        status, body, _ = self._req(
+            "POST", "/api/inventory/links", {"child_id": a, "parent_id": b}, cookie=own)
+        self.assertEqual(status, 422)
+
+    def test_operator_cannot_write_backup_links(self):
+        _, own = self._login("owner", "ownerpassword")
+        a = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.3.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        b = self.store.create_org_device("ispA", {
+            "name": "B", "ip_address": "10.0.3.2", "device_type": None,
+            "region": None, "parent_device_id": None})
+        _, op = self._login("oper", "operpassword")
+        status, _, _ = self._req(
+            "POST", "/api/inventory/links", {"child_id": a, "parent_id": b}, cookie=op)
+        self.assertEqual(status, 403)
+
+    def test_port_bandwidth_config_round_trip(self):
+        _, own = self._login("owner", "ownerpassword")
+        switch = self.store.create_org_device("ispA", {
+            "name": "Switch", "ip_address": "10.0.4.1", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.store.upsert_switch_port("ispA", switch, 1, "Gi0/1", None, "up", "up",
+                                      None, 0, False, None, "2026-01-01T00:00:00+00:00")
+        pid = self.store.list_switch_ports("ispA", switch)[0]["id"]
+        status, body, _ = self._req(
+            "POST", "/api/inventory/ports/bandwidth",
+            {"id": pid, "threshold_mbps": 25, "direction": "out"}, cookie=own)
+        self.assertEqual(status, 200)
+        row = self.store.list_switch_ports("ispA", switch)[0]
+        self.assertEqual(row["bw_threshold_mbps"], 25.0)
+        self.assertEqual(row["bw_direction"], "out")
+
+    def test_port_bandwidth_rejects_bad_direction(self):
+        _, own = self._login("owner", "ownerpassword")
+        switch = self.store.create_org_device("ispA", {
+            "name": "Switch", "ip_address": "10.0.4.2", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.store.upsert_switch_port("ispA", switch, 1, "Gi0/1", None, "up", "up",
+                                      None, 0, False, None, "2026-01-01T00:00:00+00:00")
+        pid = self.store.list_switch_ports("ispA", switch)[0]["id"]
+        status, _, _ = self._req(
+            "POST", "/api/inventory/ports/bandwidth",
+            {"id": pid, "direction": "sideways"}, cookie=own)
+        self.assertEqual(status, 422)
+
     # --- static (unauthed) ---
     def test_static_index_served(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)

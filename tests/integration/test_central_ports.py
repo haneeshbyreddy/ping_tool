@@ -41,6 +41,19 @@ def _port(idx, oper, admin="up", name=None, alias=None):
            "admin_status": admin, "oper_status": oper}
 
 
+# Timestamps 10s apart so a counter delta yields a real rate (TS above gives dt=0).
+TS_SEQ = [f"2026-01-01T00:00:{s:02d}+00:00" for s in (0, 10, 20, 30, 40, 50)]
+# octets gained over a 10s walk for a given rate: bytes = mbps*1e6 * 10s / 8.
+_OCT_PER_MBPS_10S = 1_250_000
+
+
+def _pbw(idx, in_oct, out_oct, oper="up", admin="up"):
+    """A port carrying byte counters (for the bandwidth tier)."""
+    return {"if_index": idx, "if_name": f"Gi0/{idx}", "if_alias": None,
+           "admin_status": admin, "oper_status": oper,
+           "in_octets": in_oct, "out_octets": out_oct, "speed_bps": 1_000_000_000}
+
+
 class CentralPortMonitorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -164,6 +177,144 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.pm.sync_device(self.switch, [_port(2, "down")], TS)   # must not raise
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._rows()[2]["alarm"], 1)
+
+
+class BandwidthTest(unittest.TestCase):
+    """Per-port throughput (plan.md item 3): counter-delta rate math, flap-suppressed
+    below-threshold alarm, direction selection, recovery, the alerts gate, and the
+    silent clear when a bw-alarmed port goes down. Mirrors the old single-box
+    test_ports.py's BandwidthTest one-for-one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          snmp_down_consecutive=2, snmp_bw_consecutive=2)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.set_org(TENANT, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.switch = self.store.create_org_device(TENANT, {
+            "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
+            "region": "Rampur", "parent_device_id": None})
+        self.notifier = RecordingNotifier()
+        self.pm = CentralPortMonitor(self.store, TENANT, self.notifier, self.cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _row(self, idx=3):
+        return {r["if_index"]: r for r in
+               self.store.list_switch_ports(TENANT, self.switch)}[idx]
+
+    def _watch_bw(self, idx, threshold, direction="either"):
+        """Discover the port (baseline counters at TS_SEQ[0]), then watch it + set a
+        bw floor."""
+        self.pm.sync_device(self.switch, [_pbw(idx, 0, 0)], TS_SEQ[0])
+        pid = self._row(idx)["id"]
+        self.store.set_port_monitored(TENANT, pid, True)
+        self.store.set_port_bandwidth_config(TENANT, pid, threshold, direction)
+        return pid
+
+    def test_throughput_is_computed_from_counter_delta(self):
+        self._watch_bw(3, threshold=1)            # 1 Mbps floor (won't trip at 50)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 50 * _OCT_PER_MBPS_10S, 50 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        r = self._row(3)
+        self.assertAlmostEqual(r["in_bps"], 50_000_000.0, delta=1.0)
+        self.assertAlmostEqual(r["out_bps"], 50_000_000.0, delta=1.0)
+        self.assertEqual(r["bw_alarm"], 0)
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_low_bandwidth_is_flap_suppressed_then_pages(self):
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertEqual(self.notifier.sent, [])
+        evs = self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual([e.kind for e in evs], ["bw_low"])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.notifier.sent[0]["recipient"], "op")
+        self.assertIn("bandwidth", self.notifier.sent[0]["title"].lower())
+
+    def test_single_dip_does_not_alarm(self):
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 55 * _OCT_PER_MBPS_10S, 55 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_recovery_edge_pages_once(self):
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.notifier.sent.clear()
+        evs = self.pm.sync_device(self.switch, [_pbw(
+            3, 60 * _OCT_PER_MBPS_10S, 60 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
+        self.assertEqual([e.kind for e in evs], ["bw_ok"])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertIn("recovered", self.notifier.sent[0]["title"].lower())
+
+    def test_direction_out_ignores_low_inbound(self):
+        self._watch_bw(3, threshold=10, direction="out")
+        for i in (1, 2, 3):
+            self.pm.sync_device(self.switch, [_pbw(
+                3, i * 5 * _OCT_PER_MBPS_10S, i * 50 * _OCT_PER_MBPS_10S)], TS_SEQ[i])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_direction_in_catches_low_inbound(self):
+        self._watch_bw(3, threshold=10, direction="in")
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 50 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        self.assertTrue(self.notifier.sent)
+
+    def test_unmonitored_port_never_bw_alarms(self):
+        self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])
+        pid = self._row(3)["id"]
+        self.store.set_port_bandwidth_config(TENANT, pid, 10, "either")  # no monitored
+        for i in (1, 2, 3):
+            self.pm.sync_device(self.switch, [_pbw(
+                3, i * 5 * _OCT_PER_MBPS_10S, i * 5 * _OCT_PER_MBPS_10S)], TS_SEQ[i])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertIsNotNone(self._row(3)["in_bps"])   # stats still captured
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_alerts_gate_keeps_state_mutes_page(self):
+        self.pm.cfg = replace(self.cfg, snmp_bw_alerts=False, snmp_bw_consecutive=2)
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        with self.store._connect() as conn:
+            st = conn.execute(
+                "SELECT status FROM alert_log ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(st["status"], "suppressed")
+
+    def test_port_going_down_clears_bw_alarm_silently(self):
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        self.notifier.sent.clear()
+        evs = self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S, oper="down")], TS_SEQ[3])
+        self.assertEqual(evs, [])
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        self.assertEqual(self.notifier.sent, [])
 
 
 if __name__ == "__main__":
