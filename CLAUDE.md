@@ -91,6 +91,15 @@ feature are **untouched** — orthogonal to the FSM/dashboard removal.
   hard `err`/`Die`. This is deliberate so today's unsigned releases keep installing while
   the operator hasn't set up keys, and installers start enforcing automatically the moment
   they do, with no installer-script change needed.
+- **`deploy/wisp-edge.spec`'s `Analysis` paths are built off `os.path.dirname(SPECPATH)`, not
+  bare relative strings — don't revert that.** PyInstaller resolves a *loaded* `.spec` file's
+  relative paths against the spec's own directory (`deploy/`), not the cwd `pyinstaller` was
+  run from; a first real CI run (pushing this very item's branch) failed with `script
+  '.../deploy/apps/daemon/main.py' not found` because the old spec used bare
+  `["apps/daemon/main.py"]` / `pathex=["src"]`. The inline supervisor build in
+  `release.yml` (`pyinstaller --onefile --name wisp-supervisor ... apps/supervisor/main.py`,
+  no `.spec` file) doesn't have this problem — CLI-invoked PyInstaller without a spec
+  resolves relative to cwd, which IS the repo root in that step.
 - **None of this has run against a real signing key or real Windows/Linux hardware** — that
   needs the platform operator's actual minisign keypair + code-signing cert (not something
   to fabricate in a coding session) and a genuine `v*` tag release. The multi-arch

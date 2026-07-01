@@ -209,13 +209,22 @@ groundwork that hasn't been done yet. In rough priority order:
      signed win-amd64 binaries, verifies sha256 + Authenticode (same self-activating
      policy), installs under Program Files, and runs the **supervisor** (not the agent
      directly) via a Scheduled Task as SYSTEM — the Windows analogue of `wisp-edge.service`.
+   - **Pushing this branch to real CI immediately paid off:** the `linux-amd64` and
+     `linux-arm64` build jobs both failed with `script '.../deploy/apps/daemon/main.py' not
+     found` — `deploy/wisp-edge.spec` had never actually been run through `pyinstaller` for
+     real before. PyInstaller resolves relative paths in a *loaded* `.spec` file against the
+     spec's OWN directory (`SPECPATH`, i.e. `deploy/`), not the cwd `pyinstaller` was
+     invoked from — so `Analysis(["apps/daemon/main.py"], pathex=["src"], ...)` was looking
+     in `deploy/apps/...` / `deploy/src` instead of the repo root. Fixed by resolving both
+     paths off `os.path.dirname(SPECPATH)` inside the spec. Confirmed fixed both against a
+     real local PyInstaller build (produces a working `wisp-edge --version` binary) and
+     re-pushed to CI. This is exactly why item 5 called out needing "real CI runners to
+     validate" — a dev sandbox with no PyInstaller installed would never have caught it.
    - **Still needed, and still can't be done from this sandbox:** a real minisign keypair +
      `WINDOWS_CODESIGN_PFX` cert generated and held by whoever operates this platform (not
      fabricated here — commit only the minisign PUBLIC half to `deploy/minisign.pub` once
      it exists), an actual signed release cut on real CI runners, and running the signed
-     Linux/Windows installers on real boxes to confirm the whole chain end to end. The
-     multi-arch PyInstaller build itself (unsigned) validates on every push via the existing
-     `build` job — that part doesn't need secrets to exercise for real.
+     Linux/Windows installers on real boxes to confirm the whole chain end to end.
 6. **mTLS enrollment**, replacing the static bearer-token stopgap for edge↔central auth —
    deferred from the original design on purpose; revisit once there's more than a handful
    of edges to make cert issuance/rotation worth building.
