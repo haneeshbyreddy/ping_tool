@@ -194,8 +194,28 @@ groundwork that hasn't been done yet. In rough priority order:
    provisioning exists in this repo yet.
 5. **Fleet update system hardening.** The rollout/supervisor *logic* is tested; the
    PyInstaller multi-arch build, code-signing (Authenticode/minisign), and the Windows
-   installer have never run outside this dev sandbox. Needs real CI runners + real signing
-   keys to validate.
+   installer have never run outside this dev sandbox — **in progress**:
+   - `.github/workflows/release.yml` now does REAL signing, not a placeholder: Authenticode
+     (Windows `.exe`s, in `build`) and minisign over the assembled `SHA256SUMS` (`release`,
+     one signature covers every artifact transitively since each is already sha256-checked
+     against that manifest). Both are gated on their secrets (`WINDOWS_CODESIGN_PFX`/
+     `_PASSWORD`, `MINISIGN_KEY` — a password-less key, since CI can't answer a passphrase
+     prompt) and no-op when unset, same policy the placeholder always had.
+   - `deploy/install-edge.sh` (Linux fleet installer) now verifies the minisign signature
+     over `SHA256SUMS` when a public key + signature are published (self-activating —
+     sha256-only until then, hard-fails if a signature IS present but invalid).
+   - `deploy/install-edge.ps1` — **new**, the Windows fleet installer that didn't exist
+     before (only the single-box venv installer, `install.ps1`, existed). Downloads the
+     signed win-amd64 binaries, verifies sha256 + Authenticode (same self-activating
+     policy), installs under Program Files, and runs the **supervisor** (not the agent
+     directly) via a Scheduled Task as SYSTEM — the Windows analogue of `wisp-edge.service`.
+   - **Still needed, and still can't be done from this sandbox:** a real minisign keypair +
+     `WINDOWS_CODESIGN_PFX` cert generated and held by whoever operates this platform (not
+     fabricated here — commit only the minisign PUBLIC half to `deploy/minisign.pub` once
+     it exists), an actual signed release cut on real CI runners, and running the signed
+     Linux/Windows installers on real boxes to confirm the whole chain end to end. The
+     multi-arch PyInstaller build itself (unsigned) validates on every push via the existing
+     `build` job — that part doesn't need secrets to exercise for real.
 6. **mTLS enrollment**, replacing the static bearer-token stopgap for edge↔central auth —
    deferred from the original design on purpose; revisit once there's more than a handful
    of edges to make cert issuance/rotation worth building.

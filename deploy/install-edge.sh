@@ -8,9 +8,13 @@
 # It detects the arch, downloads the matching signed binary, VERIFIES its sha256 (a published
 # checksum — refuses to install on a mismatch), installs the agent + supervisor under /opt/wisp,
 # writes config/identity to /etc/wisp (which an update never touches), enables unprivileged ICMP,
-# and starts the systemd service. Supply-chain note: serve this over HTTPS and verify the sha256
-# (and, in production, a minisign/GPG signature with the public key pinned here) — never ship an
-# unverified pipe-to-shell.
+# and starts the systemd service. Supply-chain note: serve this over HTTPS and verify the sha256.
+# If a minisign public key is available (deploy/minisign.pub, shipped alongside this script, or
+# fetched from $BASE_URL) AND a release actually published a SHA256SUMS.minisig
+# (.github/workflows/release.yml's "Sign checksums (minisign)" step — no-op until the operator
+# sets the MINISIGN_KEY secret), the checksums manifest's signature is verified too, hard-failing
+# on a mismatch. Until then this degrades to sha256-only, same as before — never ship an
+# unverified pipe-to-shell once signing IS configured.
 set -euo pipefail
 
 CENTRAL="" TOKEN="" TENANT="default" NODE="$(hostname)"
@@ -55,6 +59,30 @@ fetch "SHA256SUMS"
 log "verifying sha256…"
 ( cd "$tmp" && grep -E " wisp-(edge|supervisor)-$PLAT\$" SHA256SUMS | sha256sum -c - ) \
   || err "checksum verification FAILED — refusing to install"
+
+# --- minisign (optional, self-activating once the operator publishes a signed release) -----
+# Best-effort fetch of the public key + the checksums signature — neither exists until the
+# operator generates a keypair (deploy/minisign.pub, committed to the repo) and sets the
+# MINISIGN_KEY Actions secret, so a 404 here is normal on an unsigned release, not an error.
+PUBKEY=""
+if curl -fsSL "$BASE_URL/minisign.pub" -o "$tmp/minisign.pub" 2>/dev/null; then
+  PUBKEY="$tmp/minisign.pub"
+elif [ -f "$(dirname "$0")/minisign.pub" ]; then
+  PUBKEY="$(dirname "$0")/minisign.pub"
+fi
+
+if [ -n "$PUBKEY" ] && curl -fsSL "$BASE_URL/SHA256SUMS.minisig" -o "$tmp/SHA256SUMS.minisig" 2>/dev/null; then
+  command -v minisign >/dev/null 2>&1 || {
+    log "minisign not installed — installing (apt)…"
+    apt-get update -qq && apt-get install -y -qq minisign >/dev/null
+  }
+  log "verifying minisign signature over SHA256SUMS…"
+  minisign -V -p "$PUBKEY" -m "$tmp/SHA256SUMS" -x "$tmp/SHA256SUMS.minisig" -q \
+    || err "minisign signature verification FAILED — refusing to install (checksums manifest may be tampered)"
+  log "minisign signature OK."
+else
+  log "no minisign public key / signature published yet — sha256-only verification (see deploy/minisign.pub)."
+fi
 
 # --- install (binary under /opt; config/identity under /etc, preserved on update) ----
 install -d "$PREFIX/bin" "$CONFIG_DIR"

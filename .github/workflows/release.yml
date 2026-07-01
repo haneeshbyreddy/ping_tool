@@ -69,15 +69,33 @@ jobs:
           cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
           cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
 
-      # Signing happens IN CI so artifacts are signed the instant they're built and the edge
-      # verifies before any swap. Keys live in Actions secrets; steps no-op if a secret is unset
-      # (so forks/PRs still build). Authenticode (Windows) + minisign (Linux) are the real path.
-      - name: Sign (Linux, minisign)
-        if: runner.os == 'Linux' && env.MINISIGN_KEY != ''
-        env: { MINISIGN_KEY: "${{ secrets.MINISIGN_KEY }}" }
-        shell: bash
+      # Signing happens IN CI so artifacts are signed the instant they're built and the edge/
+      # installer verifies before any swap/install. Keys live in Actions secrets; steps no-op if
+      # a secret is unset (so forks/PRs still build unsigned). Two real signing mechanisms:
+      #   * Authenticode (Windows exes) — embedded in the PE itself, checked by SmartScreen/AV
+      #     and `deploy/install-edge.ps1` (`Get-AuthenticodeSignature`). Per-binary, done here.
+      #   * minisign (everything) — one signature over the assembled SHA256SUMS manifest, done
+      #     once in the `release` job below (see there for why signing the manifest instead of
+      #     every artifact is enough).
+      - name: Sign (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
         run: |
-          echo "(minisign signing would run here; key from secrets.MINISIGN_KEY)"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}" `
+            "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+          & $signtool.FullName verify /pa "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on wisp-edge" }
 
       - name: Checksums
         shell: bash
@@ -114,6 +132,28 @@ jobs:
                             "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
           json.dump({"version": ver, "artifacts": arts}, sys.stdout, indent=2)
           PY
+
+      # One minisign signature over the checksums manifest covers every artifact transitively
+      # (each artifact is already sha256-verified against SHA256SUMS by the installers/supervisor
+      # — signing the manifest once, here, means we don't need a signature per platform/binary).
+      # No-ops if the secret isn't set, same policy as the Authenticode step above. The PUBLIC
+      # key is not a secret — commit it to `deploy/minisign.pub` (see README) so the installers
+      # can verify without contacting anything beyond what they already download.
+      - name: Sign checksums (minisign)
+        # MINISIGN_KEY must be a PASSWORD-LESS secret key (`minisign -G -W`), base64-encoded —
+        # CI has no terminal to answer minisign's password prompt. Generate once, keep the
+        # unencrypted key ONLY in Actions secrets (never in the repo), commit the public half
+        # to `deploy/minisign.pub`.
+        if: env.MINISIGN_KEY != ''
+        env: { MINISIGN_KEY: "${{ secrets.MINISIGN_KEY }}" }
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          keyfile="$(mktemp)"
+          trap 'shred -u "$keyfile"' EXIT
+          printf '%s' "$MINISIGN_KEY" | base64 -d > "$keyfile"
+          minisign -S -s "$keyfile" -m release/SHA256SUMS -x release/SHA256SUMS.minisig \
+            -t "wisp-edge ${GITHUB_REF_NAME#v}" </dev/null
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:

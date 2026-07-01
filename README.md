@@ -216,11 +216,31 @@ PYTHONPATH=src python -m wisp.central.admin start-rollout --tenant ispA --versio
 PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
 ```
 Linux install is `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
-(`deploy/install-edge.sh`: arch-detect → download → **verify sha256** → systemd unit →
-ICMP sysctl). CI (`.github/workflows/release.yml`) builds + tests on every push/PR and,
-**only on a `v*` tag**, signs/packages/publishes a Release with a version manifest
-central ingests. The single-box venv path (`deploy/install.sh`) still exists for a
-simpler systemd-managed probe; the frozen binary + supervisor is the *fleet* path.
+(`deploy/install-edge.sh`: arch-detect → download → **verify sha256** (+ minisign over
+`SHA256SUMS` if published) → systemd unit → ICMP sysctl). The Windows fleet path is
+`deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`: download → **verify
+sha256** (+ Authenticode if the binaries are signed) → install under Program Files →
+Scheduled Task running the **supervisor** (not the agent directly) as SYSTEM — the
+frozen-binary sibling of `install.ps1`, which is the *single-box venv* path instead (no
+supervisor, no self-update). CI (`.github/workflows/release.yml`) builds + tests on every
+push/PR and, **only on a `v*` tag**, signs/packages/publishes a Release with a version
+manifest central ingests:
+- **Authenticode** (Windows `.exe`s, in the `build` job, gated on the
+  `WINDOWS_CODESIGN_PFX`/`WINDOWS_CODESIGN_PASSWORD` secrets) — embedded per-binary so
+  SmartScreen/AV and `install-edge.ps1`'s `Get-AuthenticodeSignature` check see a real chain.
+- **minisign** (all platforms, in the `release` job, gated on the `MINISIGN_KEY` secret — a
+  **password-less** secret key, `minisign -G -W`, since CI has no terminal for a passphrase
+  prompt) signs the assembled `SHA256SUMS` **once**; every artifact is already sha256-checked
+  against that file, so one signature covers all of them transitively. Commit the public half
+  to `deploy/minisign.pub` once you've generated a real keypair — neither installer treats a
+  missing key/signature as fatal (an unsigned release still verifies by sha256 alone, same as
+  before this existed), but both hard-fail if a signature IS published and doesn't verify.
+Both signing steps are **no-ops until their secrets are set** (so forks/PRs still build
+unsigned) — see `plan.md` item 5 for what's still needed to actually turn them on (real keys,
+validating the signed artifacts on real hardware).
+The single-box venv path (`deploy/install.sh` / `deploy/install.ps1`) still exists for a
+simpler systemd/Scheduled-Task-managed probe; the frozen binary + supervisor
+(`install-edge.sh` / `install-edge.ps1`) is the *fleet* path.
 
 ## Configuration (env vars, all optional)
 

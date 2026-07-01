@@ -64,6 +64,39 @@ before removing anything reused this widely.
 `runtime/supervisor.py`, `apps/supervisor/main.py`, and the whole staged-rollout / self-update
 feature are **untouched** — orthogonal to the FSM/dashboard removal.
 
+## Fleet update hardening (plan.md item 5, in progress)
+
+- **There are now FOUR install scripts, two per OS — know which is which before touching
+  any of them.** `deploy/install.sh` / `deploy/install.ps1` = single-box, source checkout +
+  venv, no self-update. `deploy/install-edge.sh` / `deploy/install-edge.ps1` = the fleet
+  path: frozen binary + the supervisor (`runtime/supervisor.py`) owns self-update, staged
+  rollout applies. `install-edge.ps1` didn't exist before this item — don't assume the
+  Windows fleet path is still a gap; only the actual signing keys/hardware validation are.
+- **CI signing (`.github/workflows/release.yml`) is real, not a placeholder, but still
+  needs real secrets to produce a signed artifact.** Authenticode signs the Windows `.exe`s
+  directly (per-binary, in `build`, needs `WINDOWS_CODESIGN_PFX`/`_PASSWORD`); minisign
+  signs the assembled `SHA256SUMS` **once** in `release` (needs `MINISIGN_KEY` — generate
+  with `minisign -G -W`, i.e. **no password**, since CI can't answer a passphrase prompt).
+  One minisign signature over the checksums manifest covers every platform's artifact
+  transitively (each is already sha256-checked against that same file) — don't add a
+  per-artifact `.minisig`, that's redundant. Both steps are `if: env.<SECRET> != ''`
+  no-ops when unset, so forks/PRs still build unsigned — same policy the old placeholder had.
+- **The minisign PUBLIC key is not a secret — commit it to `deploy/minisign.pub`** once a
+  real keypair exists; don't fabricate a placeholder file there (an invalid pubkey would
+  make both installers hard-fail signature verification even on a legitimately-unsigned
+  release, since the file's mere presence is what triggers the check).
+- **Both fleet installers are self-activating on signing, not hard-required yet.** No
+  pubkey/signature published (Linux) or an Authenticode status of `NotSigned` (Windows) is a
+  warning + sha256-only fallback — but a signature that IS present and doesn't verify is a
+  hard `err`/`Die`. This is deliberate so today's unsigned releases keep installing while
+  the operator hasn't set up keys, and installers start enforcing automatically the moment
+  they do, with no installer-script change needed.
+- **None of this has run against a real signing key or real Windows/Linux hardware** — that
+  needs the platform operator's actual minisign keypair + code-signing cert (not something
+  to fabricate in a coding session) and a genuine `v*` tag release. The multi-arch
+  PyInstaller build itself (unsigned) DOES validate for real on every push via the existing
+  `build` job — that part doesn't need secrets to exercise.
+
 ## Imports & paths (the main trap)
 
 Src layout, zero-install. What bites:
