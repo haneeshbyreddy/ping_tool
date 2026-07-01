@@ -124,11 +124,23 @@ class Config:
         default_factory=lambda: _env_float("WISP_PERF_MIN_JITTER_MS", 3.0))
 
     # --- SNMP ingress (graph topology Part B; IF-MIB oper/admin only) --------
-    # `ingress/snmp.py`'s poller — kept per plan.md's "what's next", but not yet wired into
-    # the central-brain daemon loop (central's /report doesn't accept port data yet;
-    # that's a separate follow-up). SNMP request timeout per walk, kept short since a
-    # dead switch must never block anything else.
+    # `ingress/snmp.py`'s poller, wired into the central-brain daemon loop on its own
+    # slow cadence (ports don't flap like radio links) — see apps/daemon/main.py's
+    # `_gather_snmp_ports` + `POST /report`'s `ports` key, folded/alerted centrally by
+    # `central/ports.py:CentralPortMonitor`. SNMP request timeout per walk, kept short
+    # since a dead switch must never block anything else (ICMP or SNMP).
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
+    # How often the edge walks its snmp-enabled switches (independent of poll_interval_s
+    # — a port flapping every 30s is a switch bug, not a signal to chase that fast). 0
+    # disables the SNMP task entirely.
+    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 90))
+    # Consecutive down walks a MONITORED port needs before central alarms it (flap
+    # suppression, same discipline as the ICMP FSM's down_consecutive).
+    snmp_down_consecutive: int = field(
+        default_factory=lambda: _env_int("WISP_SNMP_DOWN_CONSECUTIVE", 2))
+    # A monitored port-down/restored always updates switch_ports; this gates whether
+    # central actually PAGES the operator about it (state is written either way).
+    snmp_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_ALERTS", True))
 
     # --- State-machine thresholds (see plan.md §"State machine") -------------
     latency_threshold_ms: float = field(

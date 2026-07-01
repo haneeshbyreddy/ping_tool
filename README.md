@@ -85,13 +85,14 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 ├── version.py            # the running build version (reported in the heartbeat)
 ├── core/                 # state_machine.py (FSM, reused by central), analytics.py, baseline.py
 ├── database/             # client.py (WAL conn + migration runner; used by state_machine's DB glue)
-├── ingress/               # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk, kept
-│                          #   for a future central-brain SNMP wire extension — not yet wired in)
+├── ingress/               # probers.py (real ICMP via icmplib), snmp.py (IF-MIB port walk;
+│                          #   walked by the edge daemon, folded/alerted by central/ports.py)
 ├── egress/               # notifiers.py — the ntfy channel (NtfyNotifier/send_with_retry),
 │                          #   shared by the edge probe's error paths and central's dispatcher
-├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), store (multi-tenant
-│                          #   SQLite), server.py (ingest + dashboard API), watchdog, auth, admin
-│                          #   CLI, rollout, inventory, static/ (the dashboard SPA)
+├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), ports.py (SNMP
+│                          #   port folding), store (multi-tenant SQLite), server.py (ingest +
+│                          #   dashboard API), watchdog, auth, admin CLI, rollout, inventory,
+│                          #   static/ (the dashboard SPA)
 └── runtime/               # central_client.py (edge's central HTTP client), single_instance.py,
                            #   supervisor.py (agent self-update logic)
 apps/
@@ -137,8 +138,15 @@ run.sh                    # local dev: central + one edge probe together
   detection for the cycle and sends ONE `UPLINK_DOWN` instead of a storm of per-site alerts.
 - **Topology suppression** — a child is `UNREACHABLE` (one alert, not forty) only when
   every monitored parent is down; a genuinely-down device with any live parent still
-  pages. (Backup/redundant uplinks and SNMP port folding are edge-only soft-signal tiers
-  from before this migration — not yet ported to central-brain mode; see `CLAUDE.md`.)
+  pages. (Backup/redundant uplinks are an edge-only soft-signal tier from before this
+  migration — not yet ported to central-brain mode; see `CLAUDE.md`.)
+- **SNMP port folding** — the edge walks its snmp-enabled switches on its own slow
+  cadence (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval) and reports
+  port readings alongside its pings; central folds a monitored port-down into the open
+  outage it feeds (stamping the physical cause) or, with no open outage yet, sends a
+  one-shot operator heads-up — never a second, competing alarm. Admin-down ports and
+  unmonitored (undiscovered) ports stay silent. See `CLAUDE.md`'s "Central runs the
+  brain" for the full rule set.
 - **Escalation is restart-safe** — timers live in central's DB, not memory; a crash
   can't drop them. A fresh DOWN pages owner+operator immediately; while it stays open,
   an all-hands page (owner+operator+tech) fires every `WISP_ESCALATE_EVERY_MIN` with the
@@ -201,6 +209,10 @@ simpler systemd-managed probe; the frozen binary + supervisor is the *fleet* pat
 | `WISP_PINGS_PER_POLL` | `5` | echoes per poll for leaf devices (CPEs) |
 | `WISP_PINGS_PER_POLL_INFRA` | `2` | echoes per poll for aggregation gear (any device that is a parent) |
 | `WISP_MAX_INFLIGHT` | `256` | max concurrent probes in flight (0 = unbounded); caps FD use at scale |
+| `WISP_SNMP_INTERVAL_S` | `90` | seconds between SNMP port walks (0 = off); independent of the ICMP poll cadence |
+| `WISP_SNMP_DOWN_CONSECUTIVE` | `2` | consecutive down walks a *monitored* port needs before central alarms it |
+| `WISP_SNMP_ALERTS` | `1` | `0` = mute the operator port-down page (the `switch_ports` state is still written) |
+| `WISP_SNMP_TIMEOUT_S` | `2.0` | per-switch SNMP request timeout (a dead switch must never block the ICMP cycle) |
 | `WISP_CANARY_IP` | `1.1.1.1` | uplink check target |
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages while an outage stays open |
 | `WISP_NTFY_URL` | `https://ntfy.sh` | ntfy base URL |

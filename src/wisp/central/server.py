@@ -29,6 +29,7 @@ from wisp.central import auth, inventory
 from wisp.central import engine as central_engine
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
+from wisp.central.ports import CentralPortMonitor
 from wisp.central.store import CentralStore
 from wisp.egress.notifiers import build_notifier
 from wisp.ingress.probers import PingResult
@@ -177,6 +178,22 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 self._reply(200, {"devices": store.org_device_topology(tenant),
                                   "canary_ip": cfg.canary_ip})
+                return
+            if route == "/api/inventory/ports":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                tenant = store.device_tenant(did)
+                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"ports": store.list_switch_ports(tenant, did)})
                 return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users"):
@@ -327,12 +344,40 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # Escalation sweeping is time-gated (due_at) and idempotent, but a recheck
                 # burst can fire several rounds a second — no need to re-check on every one.
                 disp.sweep(ts)
+                # SNMP port folding (plan.md item 1): only a "full" report carries a
+                # `ports` key (the edge's own slow SNMP cadence, independent of ICMP's
+                # poll_interval_s — see apps/daemon/main.py's _gather_snmp_ports), run
+                # AFTER the ICMP cycle commits so open_outage_id reflects this cycle's
+                # outages, not last cycle's.
+                self._ingest_ports(tenant, eng, env.get("ports"), ts)
 
             reply: dict = {"ok": True}
             recheck = central_engine.compute_recheck(eng, cycle, results, cfg)
             if recheck:
                 reply["recheck"] = recheck
             return reply
+
+        def _ingest_ports(self, tenant: str, eng, ports_by_device, ts: str) -> None:
+            """Fold each reported switch's port readings. `ports_by_device` is
+            {"<device_id>": [port dict, ...]} (JSON object keys are always strings on
+            the wire). A device id not in THIS tenant's engine meta is ignored rather
+            than trusted from the body — the same re-derive-tenant-from-what-we-already-
+            know discipline `org_devices` writes use, so tenant A can't attribute a port
+            reading to tenant B's device id."""
+            if not ports_by_device:
+                return
+            monitor = CentralPortMonitor(store, tenant, notifier, cfg)
+            for raw_id, ports in ports_by_device.items():
+                try:
+                    device_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if device_id not in eng.meta or not isinstance(ports, list):
+                    continue
+                try:
+                    monitor.sync_device(device_id, ports, ts)
+                except Exception:
+                    log.exception("SNMP port fold failed for %s/device=%d", tenant, device_id)
 
         # --- login ---
         def _login(self):
@@ -461,6 +506,37 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 clean = inventory.clean_snmp_payload(body)
                 ok = store.set_org_device_snmp(tenant, did, clean)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            # SNMP port folding config (central/ports.py): which discovered ports
+            # actually alarm, and which downstream device a monitored port feeds.
+            if route == "/api/inventory/ports/monitored":
+                pid = int(body.get("id") or 0)
+                tenant = store.switch_port_tenant(pid)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                ok = store.set_port_monitored(tenant, pid, bool(body.get("on")))
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/ports/feeds":
+                pid = int(body.get("id") or 0)
+                tenant = store.switch_port_tenant(pid)
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                feeds_raw = body.get("feeds_device_id")
+                feeds = None
+                if feeds_raw not in (None, "", "null"):
+                    try:
+                        feeds = int(feeds_raw)
+                    except (TypeError, ValueError):
+                        self._reply(422, {"error": "feeds_device_id must be a number"})
+                        return
+                    if store.device_tenant(feeds) != tenant:
+                        self._reply(422, {"error": "feeds device must belong to the same org"})
+                        return
+                ok = store.set_port_feeds(tenant, pid, feeds)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             # user provisioning: superadmin anywhere; an owner within their own org

@@ -34,7 +34,7 @@ run locally beyond the probe.
   end-to-end in tests. What's *not* exercised outside CI: the actual multi-arch
   PyInstaller build, code-signing, and the Windows installer on real hardware.
 
-191 tests, `python -m unittest discover -s tests`.
+206 tests, `python -m unittest discover -s tests`.
 
 ## The model: what changed from a single-box tool
 
@@ -141,15 +141,18 @@ The platform is feature-complete for its core job (detect, suppress, page, multi
 dashboard) but has real gaps versus the single-box tool it replaced, plus production
 groundwork that hasn't been done yet. In rough priority order:
 
-1. **SNMP port monitoring on central.** The single-box tool could watch switch uplink
-   ports (IF-MIB oper/admin status + bandwidth) and fold a port-down into the device
-   outage it feeds. That capability doesn't exist on the current platform — `ingress/snmp.py`'s
-   poller is still in the tree (real ICMP-independent value: it tells you a switch's *port*
-   died, not just that a downstream device stopped answering), but nothing wires it to
-   central. Needs: a wire-format extension to `POST /report` (or a sibling endpoint) for
-   port data, and a central-side consumer to fold/alert it — mirroring the old edge design
-   (`monitored` ports only, admin-down silent, fold into an open outage rather than a
-   competing alarm).
+1. ~~**SNMP port monitoring on central.**~~ **Done.** The single-box tool could watch switch
+   uplink ports (IF-MIB oper/admin status) and fold a port-down into the device outage it
+   feeds; that's now wired end to end on the current platform. `POST /report` carries an
+   optional `ports` key ({device_id: [port dict, ...]}) on the edge's own slow SNMP cadence
+   (`WISP_SNMP_INTERVAL_S`, independent of the ICMP poll interval — ports don't flap like
+   radio links), and `central/ports.py:CentralPortMonitor` is the central-side consumer,
+   mirroring the old edge design one-for-one: `monitored` ports only, admin-down silent
+   (reuses `ingress/snmp.py`'s `PortStatus.is_down()`), fold into an open outage
+   (`stamp_outage_cause`) rather than a competing alarm, and a leading-indicator heads-up
+   when there's no open outage yet. SNMP *bandwidth* (`ifHCIn/OutOctets`/`ifHighSpeed` —
+   `ingress/snmp.py` already parses these) is still not carried on the wire or stored
+   centrally; that remains a follow-up alongside item 3 below.
 2. **Central-side historical rollups / trend analytics.** Central has live `device_states`
    but nothing like the old `poll_rollups` table — no uptime chart, no latency trend, no
    SLA reporting. An ISP asking "how reliable was Tower A last month" has no answer today.
@@ -178,9 +181,10 @@ None of these block the platform from running today — `WISP_CENTRAL_BRAIN=1` +
 
 ## Open questions (answer as you build each item above, don't block on them)
 
-- **SNMP wire format:** extend the existing report envelope with a `ports` key, or add a
-  sibling `POST /report/snmp`? Depends on whether you want port data on the same cadence
-  as ICMP (probably not — ports don't flap like radio links) or its own slower one.
+- ~~**SNMP wire format**~~ — decided: extended the existing `POST /report` envelope with a
+  `ports` key rather than a sibling endpoint, since it rides the same auth/tenant/idempotency
+  machinery for free; it runs on its own slower cadence (`WISP_SNMP_INTERVAL_S`) within that
+  same envelope rather than every cycle, since ports don't flap like radio links.
 - **Rollup ownership:** does central fold `device_states` history itself (a new sweep,
   central's own cron-equivalent), or does the edge ship periodic snapshots for central to
   fold? Given central already owns all detection, folding locally seems right — but check

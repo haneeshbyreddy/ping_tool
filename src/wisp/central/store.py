@@ -223,6 +223,35 @@ CREATE TABLE IF NOT EXISTS rollouts (
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(tenant_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(tenant_id, node_id, device_id, id);
 CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(tenant_id, node_id, id);
+-- Phase C follow-up — SNMP port status, central-side (plan.md item 1). One row per
+-- discovered switch port, mirrors the old single-box `switch_ports` table one-for-one
+-- but tenant-scoped: `device_id`/`feeds_device_id` are `org_devices` ids. Discovery
+-- (every walked port) lands `monitored=0`; the operator ticks which ports to watch —
+-- you do NOT want to alarm on every access port a laptop comes and goes on. A
+-- monitored port that drops folds into the outage of the device it `feeds_device_id`
+-- (central/ports.py), it never raises a competing alarm. `down_streak`/`alarm`/
+-- `alarm_since` carry the flap-suppressed detection state in-row so it survives a
+-- central restart (no in-memory port FSM to lose, same discipline as `device_states`).
+CREATE TABLE IF NOT EXISTS switch_ports (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id       TEXT NOT NULL,
+    device_id       INTEGER NOT NULL REFERENCES org_devices(id),
+    if_index        INTEGER NOT NULL,
+    if_name         TEXT,
+    if_alias        TEXT,
+    admin_status    TEXT,
+    oper_status     TEXT,
+    last_change     TEXT,
+    monitored       INTEGER NOT NULL DEFAULT 0,
+    feeds_device_id INTEGER REFERENCES org_devices(id),
+    down_streak     INTEGER NOT NULL DEFAULT 0,
+    alarm           INTEGER NOT NULL DEFAULT 0,
+    alarm_since     TEXT,
+    updated_at      TEXT,
+    UNIQUE(tenant_id, device_id, if_index)
+);
+CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(tenant_id, device_id);
+CREATE INDEX IF NOT EXISTS idx_switch_ports_feeds ON switch_ports(tenant_id, feeds_device_id);
 """
 
 
@@ -710,10 +739,14 @@ class CentralStore:
         NOT in maintenance (mirrors the edge's `load_device_meta` filter exactly — a
         paused node drops out of detection). Unlike `list_org_devices` (the Nodes-page
         listing, which must still SHOW a maintenance device with its badge), this feeds
-        the FSM, so maintenance rows are excluded here, not just flagged."""
+        the FSM, so maintenance rows are excluded here, not just flagged. Also carries
+        each device's SNMP config (`GET /edge/devices`'s payload) — the edge has no
+        local DB, so central hands over the community/port/version it needs to walk a
+        switch's IF-MIB itself, the same way it hands over `canary_ip`."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, ip_address, region, parent_device_id FROM org_devices"
+                "SELECT id, name, ip_address, region, parent_device_id, snmp_enabled,"
+                " snmp_version, snmp_community, snmp_port FROM org_devices"
                 " WHERE tenant_id=? AND is_active=1 AND maintenance=0 ORDER BY id",
                 (tenant_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -780,6 +813,17 @@ class CentralStore:
             conn.execute(
                 "UPDATE outages SET final_state=? WHERE tenant_id=? AND device_id=?"
                 " AND resolved_at IS NULL", (state, tenant_id, device_id))
+            conn.commit()
+
+    def stamp_outage_cause(self, tenant_id: str, outage_id: int, cause: str) -> None:
+        """Enrich a still-open outage with a physical cause (e.g. a folded-in SNMP
+        port-down) — COALESCE so this never clobbers an operator's own post-mortem
+        `root_cause`, and only applies while the outage is still open."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE outages SET root_cause = COALESCE(root_cause, ?)"
+                " WHERE id=? AND tenant_id=? AND resolved_at IS NULL",
+                (cause, outage_id, tenant_id))
             conn.commit()
 
     def resolve_outage(self, tenant_id: str, device_id: int, ts: str) -> None:
@@ -864,6 +908,65 @@ class CentralStore:
         with self._write_lock, self._connect() as conn:
             conn.execute("UPDATE escalations SET due_at=? WHERE id=?", (due_at, esc_id))
             conn.commit()
+
+    # --- SNMP port status (central-side, plan.md item 1) ------------------------
+    def list_switch_ports(self, tenant_id: str, device_id: int) -> list[dict]:
+        """Every discovered port on one switch — `central/ports.py`'s per-cycle read
+        of prior state (streak/alarm/monitored/feeds) before folding this walk's
+        readings, and the Nodes-page port panel's data source."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM switch_ports WHERE tenant_id=? AND device_id=?"
+                " ORDER BY if_index", (tenant_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def switch_port_tenant(self, port_id: int) -> str | None:
+        """The owning tenant of a switch_ports row — same re-derive-from-the-row
+        discipline as `device_tenant`, so a monitored/feeds write is authorized
+        against the right org before the request body is trusted."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT tenant_id FROM switch_ports WHERE id=?",
+                               (port_id,)).fetchone()
+        return row["tenant_id"] if row else None
+
+    def upsert_switch_port(self, tenant_id: str, device_id: int, if_index: int,
+                           if_name: str | None, if_alias: str | None, admin_status: str,
+                           oper_status: str, last_change: str | None, down_streak: int,
+                           alarm: bool, alarm_since: str | None, ts: str) -> None:
+        """Discover/refresh one port's live reading + flap-suppressed alarm state.
+        Operator-set fields (`monitored`, `feeds_device_id`) are NOT touched here —
+        only `central/ports.py`'s `set_port_monitored`/`set_port_feeds` writers do."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO switch_ports (tenant_id, device_id, if_index, if_name,"
+                " if_alias, admin_status, oper_status, last_change, down_streak, alarm,"
+                " alarm_since, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(tenant_id, device_id, if_index) DO UPDATE SET"
+                " if_name=excluded.if_name, if_alias=excluded.if_alias,"
+                " admin_status=excluded.admin_status, oper_status=excluded.oper_status,"
+                " last_change=excluded.last_change, down_streak=excluded.down_streak,"
+                " alarm=excluded.alarm, alarm_since=excluded.alarm_since,"
+                " updated_at=excluded.updated_at",
+                (tenant_id, device_id, if_index, if_name, if_alias, admin_status,
+                 oper_status, last_change, down_streak, 1 if alarm else 0, alarm_since, ts))
+            conn.commit()
+
+    def set_port_monitored(self, tenant_id: str, port_id: int, on: bool) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET monitored=? WHERE id=? AND tenant_id=?",
+                (1 if on else 0, port_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_port_feeds(self, tenant_id: str, port_id: int,
+                       feeds_device_id: int | None) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET feeds_device_id=? WHERE id=? AND tenant_id=?",
+                (feeds_device_id, port_id, tenant_id))
+            conn.commit()
+            return cur.rowcount > 0
 
     # --- releases / staged rollout (Part D version authority) ---
     def set_release(self, version: str, artifacts: dict, channel: str = "stable") -> None:

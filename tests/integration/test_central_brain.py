@@ -476,6 +476,57 @@ class ReportEndpointTest(unittest.TestCase):
         status, resp = self._req("POST", "/report", body)
         self.assertTrue(any("restored" in s["title"].lower() for s in self.notifier.sent))
 
+    # -- SNMP port folding, over the real socket (plan.md item 1) --
+    def _report_with_ports(self, tenant, device_id, ports, ip="10.0.0.9"):
+        body = {"v": 1, "tenant_id": tenant, "node_id": "edge-1",
+                "pings": {ip: {"loss_pct": 0.0, "latency_ms": 5.0}},
+                "ports": {str(device_id): ports}}
+        return self._req("POST", "/report", body)
+
+    def test_report_folds_monitored_port_down_into_open_outage(self):
+        switch = self.store.create_org_device("ispA", {
+            "name": "Core Switch", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        tower = self.store.create_org_device("ispA", {
+            "name": "Rampur Tower", "ip_address": "10.0.0.1", "device_type": "backhaul",
+            "region": None, "parent_device_id": None})
+        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_operator="a-op")
+        for _ in range(3):   # ICMP confirms the tower DOWN first (default down_consecutive=3)
+            self._report(100.0)
+        self.assertEqual(self.store.device_states("ispA")[tower]["state"], DOWN)
+
+        port = {"if_index": 2, "if_name": "Gi0/2", "if_alias": "-> Rampur",
+               "admin_status": "up", "oper_status": "down"}
+        self._report_with_ports("ispA", switch, [port])
+        pid = self.store.list_switch_ports("ispA", switch)[0]["id"]
+        self.store.set_port_monitored("ispA", pid, True)
+        self.store.set_port_feeds("ispA", pid, tower)
+        self._report_with_ports("ispA", switch, [port])   # streak 1
+        status, _ = self._report_with_ports("ispA", switch, [port])   # streak 2 -> alarm
+        self.assertEqual(status, 200)
+
+        oid = self.store.open_outage_id("ispA", tower)
+        with self.store._connect() as conn:
+            o = conn.execute("SELECT root_cause FROM outages WHERE id=?", (oid,)).fetchone()
+        self.assertIn("Port", o["root_cause"])
+
+    def test_report_ports_ignores_a_device_id_from_another_tenant(self):
+        self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        other_switch = self.store.create_org_device("ispB", {
+            "name": "B Switch", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        port = {"if_index": 1, "if_name": "Gi0/1", "admin_status": "up", "oper_status": "up"}
+        # ispA's report claims a device id that actually belongs to ispB — must be a no-op.
+        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+                "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}},
+                "ports": {str(other_switch): [port]}}
+        status, _ = self._req("POST", "/report", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.store.list_switch_ports("ispA", other_switch), [])
+        self.assertEqual(self.store.list_switch_ports("ispB", other_switch), [])
+
 
 if __name__ == "__main__":
     unittest.main()

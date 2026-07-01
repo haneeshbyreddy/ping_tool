@@ -19,12 +19,14 @@ _spec.loader.exec_module(daemon)
 
 from wisp.config import Config
 from wisp.ingress.probers import PingResult
+from wisp.ingress.snmp import PortStatus
 from wisp.runtime.central_client import CentralClientError
 
 
-def _dev(id, ip, parent=None):
+def _dev(id, ip, parent=None, snmp_enabled=False, snmp_community=None):
     return {"id": id, "name": f"d{id}", "ip_address": ip, "region": "R",
-            "parent_device_id": parent}
+            "parent_device_id": parent, "snmp_enabled": snmp_enabled,
+            "snmp_community": snmp_community, "snmp_port": 161, "snmp_version": "2c"}
 
 
 class _FakeProber:
@@ -57,13 +59,24 @@ class RecordingCentralClient:
             raise CentralClientError("fetch boom")
         return {"devices": self.devices, "canary_ip": self.canary_ip}
 
-    def report(self, pings: dict, ts: str, *, mode: str = "full") -> dict:
+    def report(self, pings: dict, ts: str, *, mode: str = "full", ports=None) -> dict:
         if self.fail_report:
             raise CentralClientError("report boom")
-        self.reports.append({"pings": pings, "ts": ts, "mode": mode})
+        self.reports.append({"pings": pings, "ts": ts, "mode": mode, "ports": ports})
         if self._replies:
             return self._replies.pop(0)
         return {"ok": True}
+
+
+class _FakeSnmpPoller:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour   # ip -> list[PortStatus] or an Exception instance
+
+    async def walk(self, target):
+        result = self._behaviour[target.ip]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class GentleProbePlanTest(unittest.TestCase):
@@ -133,6 +146,68 @@ class RunCycleCentralBrainTest(unittest.TestCase):
         cfg = Config(retry_interval_s=0)   # fast-confirm off entirely
         asyncio.run(daemon.run_cycle_central_brain(prober, client, devices, "1.1.1.1", cfg))
         self.assertEqual(len(client.reports), 1)   # never followed the hint
+
+    def test_snmp_ports_attached_to_the_full_report_when_poller_given(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        prober = _FakeProber({
+            "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+        })
+        client = RecordingCentralClient(devices)
+        snmp = _FakeSnmpPoller({"10.0.0.1": [
+            PortStatus(if_index=2, if_name="Gi0/2", if_alias=None,
+                      admin_status="up", oper_status="down")]})
+        cfg = Config()
+        asyncio.run(daemon.run_cycle_central_brain(
+            prober, client, devices, "1.1.1.1", cfg, snmp_poller=snmp))
+        self.assertEqual(len(client.reports), 1)
+        ports = client.reports[0]["ports"]
+        self.assertEqual(ports[1], [{"if_index": 2, "if_name": "Gi0/2", "if_alias": None,
+                                     "admin_status": "up", "oper_status": "down",
+                                     "last_change": None}])
+
+    def test_snmp_skips_devices_without_it_enabled(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=False)]
+        prober = _FakeProber({
+            "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+        })
+        client = RecordingCentralClient(devices)
+        snmp = _FakeSnmpPoller({})   # would KeyError if ever walked
+        cfg = Config()
+        asyncio.run(daemon.run_cycle_central_brain(
+            prober, client, devices, "1.1.1.1", cfg, snmp_poller=snmp))
+        self.assertIsNone(client.reports[0]["ports"])   # nothing to attach -> no kwarg used
+
+    def test_a_dead_switch_does_not_sink_the_icmp_cycle(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
+                  _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
+        prober = _FakeProber({
+            "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),
+            "10.0.0.2": lambda: PingResult("10.0.0.2", 5.0, 0.0),
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+        })
+        client = RecordingCentralClient(devices)
+        snmp = _FakeSnmpPoller({"10.0.0.1": RuntimeError("SNMP walk boom"),
+                               "10.0.0.2": [PortStatus(1, "Gi0/1", None, "up", "up")]})
+        cfg = Config()
+        asyncio.run(daemon.run_cycle_central_brain(
+            prober, client, devices, "1.1.1.1", cfg, snmp_poller=snmp))
+        self.assertEqual(len(client.reports), 1)
+        self.assertEqual(set(client.reports[0]["ports"]), {2})   # device 1's walk failed
+
+
+class GatherSnmpPortsTest(unittest.TestCase):
+    def test_walks_only_snmp_enabled_devices(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
+                  _dev(2, "10.0.0.2", snmp_enabled=False)]
+        snmp = _FakeSnmpPoller({"10.0.0.1": [PortStatus(3, "Gi0/3", "-> X", "up", "down")]})
+        cfg = Config()
+        ports = asyncio.run(daemon._gather_snmp_ports(snmp, devices, cfg))
+        self.assertEqual(set(ports), {1})
+        self.assertEqual(ports[1], [{"if_index": 3, "if_name": "Gi0/3", "if_alias": "-> X",
+                                     "admin_status": "up", "oper_status": "down",
+                                     "last_change": None}])
 
 
 class FollowRecheckTest(unittest.TestCase):

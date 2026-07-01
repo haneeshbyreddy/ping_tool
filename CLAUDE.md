@@ -14,7 +14,7 @@ no other path). An earlier single-box version of this tool (one daemon + one loc
 no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
 deleted wholesale, not just deprecated. See "Removed" below before assuming a described
 behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 191 tests.
+history, not this file. 206 tests.
 
 **Central's own management plane and FSM/alerting are done and tested end to end**, including
 the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
@@ -22,14 +22,14 @@ management plane" and "Central runs the brain" below. Verify claims about what's
 the code, not just this file (an earlier draft of this doc called the fast-confirm round-trip
 "deferred" after it had already shipped — that drift is exactly the kind of thing to watch for).
 
-Still genuinely missing on central (not yet built anywhere, edge or central): SNMP port
-status/bandwidth, the per-link performance baseline, and the on-backup redundancy signal.
-These existed on the old single-box edge (deleted, see below) and were never ported to
-central — central would need its own trailing-sample storage to reintroduce them, which
-doesn't exist yet. `ingress/snmp.py`'s poller is kept in the tree (see `plan.md`'s "what's
-next") but is **not wired into the daemon loop** — central's `/report` doesn't accept port
-data yet, so this is dormant code waiting on a follow-up. See `plan.md` for the full list of
-what's next and in what order.
+**SNMP port status is now wired end to end, on central** — see "SNMP port folding" below.
+Still genuinely missing on central: bandwidth/throughput (the `ifHCIn/OutOctets` +
+`ifHighSpeed` fields `ingress/snmp.py` already parses are captured on the wire but not yet
+stored/alerted on), the per-link performance baseline, and the on-backup redundancy signal.
+The latter two existed on the old single-box edge (deleted, see below) and were never
+ported to central — central would need its own trailing-sample storage to reintroduce
+them, which doesn't exist yet. See `plan.md` for the full list of what's next and in what
+order.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
@@ -161,7 +161,10 @@ Src layout, zero-install. What bites:
   not the request body**, via `store.device_tenant(id)`. A body's `tenant_id` is only trusted
   for *create* (where there's no row yet to derive it from); for update/delete/maintenance/snmp
   it would let an authenticated user from org A claim to own org B's device id. `_can_write(user,
-  tenant)` still gates on the *derived* tenant.
+  tenant)` still gates on the *derived* tenant. `switch_ports` writes (`/api/inventory/ports/
+  monitored`, `/api/inventory/ports/feeds`) follow the same pattern via
+  `store.switch_port_tenant(id)`; `feeds` additionally checks the target device is in the SAME
+  tenant (`store.device_tenant(feeds) == tenant`) before accepting it.
 - **`/api/orgs` must stay tenant-filtered.** Any authenticated org user must only ever get their
   own org's row back — including their own `ntfy_topic*` alert channels, never another
   tenant's. The scoping is the same `tenant` value `_scope_tenant` computes for every other
@@ -239,12 +242,36 @@ Src layout, zero-install. What bites:
   cadence via `_gentle_probe_plan`), and `POST /report`s the raw per-IP results, following any
   `recheck` hint via `_follow_recheck`. Central's `central/engine.py` + `central/dispatch.py`
   do 100% of the detecting and paging.
-- **Deliberately deferred, not forgotten:** SNMP (no wire format for port data yet, and
-  `ingress/snmp.py`'s poller sits unwired in the daemon), the per-link perf baseline and
-  on-backup redundancy soft-signal tiers (need trailing sample history central doesn't store),
-  and the hourly rollup/prune sweeps (nothing local to roll up or prune in this mode — central
-  doesn't fold `device_states` into trend rollups yet either). Don't be surprised these don't
-  fire; they're follow-up work, not bugs.
+- **SNMP port folding is wired end to end (plan.md item 1, no longer deferred).** The edge
+  walks its snmp-enabled `org_devices` (config now travels on `GET /edge/devices`'s topology
+  reply — `snmp_enabled`/`snmp_community`/`snmp_port`/`snmp_version` — since the edge has no
+  local DB of its own to read credentials from) on its OWN slow cadence
+  (`cfg.snmp_interval_s`, default 90s, independent of `poll_interval_s` — ports don't flap
+  like radio links), via `apps/daemon/main.py:_gather_snmp_ports`, and attaches the haul to
+  the SAME "full" `POST /report` under a `ports` key ({device_id: [port dict, ...]}; never a
+  recheck report — fast-confirm is ICMP-only). A dead/blocked switch is isolated per-device
+  (`try/except` inside `_gather_snmp_ports`) and never sinks the ICMP cycle, same discipline
+  as `_gather_pings`. Central's `central/ports.py:CentralPortMonitor` (run from
+  `central/server.py:_report`, AFTER the ICMP cycle commits so `open_outage_id` reflects
+  this cycle's outages) is the direct port of the old single-box `egress/ports.py` onto
+  `CentralStore`'s tenant-scoped `switch_ports` table: monitored-only (discovery alone never
+  alarms), admin-down stays silent (reuses `PortStatus.is_down()` verbatim — never re-derive
+  that predicate on the central side of the wire), and one alarm not two (a monitored
+  port-down folds into the `feeds_device_id` device's open outage via
+  `store.stamp_outage_cause` — COALESCE, never clobbers an operator's post-mortem — instead
+  of raising a competing alarm; no open outage yet = a leading-indicator operator heads-up;
+  SNMP never opens an outage itself, ICMP/the FSM still owns that exclusively). A device id
+  in the wire's `ports` key that isn't in the reporting tenant's own `eng.meta` is silently
+  ignored (`_report:_ingest_ports`) — the same re-derive-tenant-from-what-we-already-know
+  discipline as `org_devices` writes, so tenant A can't attribute a port reading to tenant
+  B's device. Operator-only page, gated by `cfg.snmp_alerts` (state is always written); no
+  escalation ladder of its own. Bandwidth (`in_octets`/`out_octets`/`speed_bps`) is parsed by
+  `ingress/snmp.py` but not yet carried on the wire or stored centrally — still a follow-up.
+- **Deliberately deferred, not forgotten:** SNMP bandwidth/throughput, the per-link perf
+  baseline and on-backup redundancy soft-signal tiers (need trailing sample history central
+  doesn't store), and the hourly rollup/prune sweeps (nothing local to roll up or prune in
+  this mode — central doesn't fold `device_states` into trend rollups yet either). Don't be
+  surprised these don't fire; they're follow-up work, not bugs.
 - **Tests:** `integration/test_central_brain.py` — `CentralEngineTest` (topology mapping
   excludes maintenance, restart rehydration doesn't re-page, `EngineRegistry` streak
   persistence across calls + rebuild-on-topology-change + per-tenant isolation),
@@ -254,13 +281,22 @@ Src layout, zero-install. What bites:
   reschedules, ack doesn't stop it but recovery does, a missing topic is a soft no-op not a
   crash), `ReportEndpointTest` (`GET /edge/devices` + `POST /report` end-to-end over a real
   socket, bearer-gated, tenant isolation, canary freeze over HTTP, the recheck round trip
-  including fast-confirm-within-two-rechecks and a blip clearing the hint without confirming).
+  including fast-confirm-within-two-rechecks and a blip clearing the hint without confirming,
+  plus SNMP port folding over HTTP: a monitored port-down folds into an open outage's
+  `root_cause` and a device id from another tenant's `ports` key is silently ignored).
   `integration/test_daemon_central_brain.py` (loads `apps/daemon/main.py` by path) —
   `_gentle_probe_plan` infra-vs-leaf cadence, `run_cycle_central_brain` reports every probed IP
   incl. canary + survives a report failure without raising, `run_forever_central_brain`
   re-fetches topology + reports per cycle and aborts loudly (`SystemExit(2)`) if the very first
   topology fetch fails, `_follow_recheck` follows a hint and stops when it's disabled/empty,
-  `Config.central_brain_enabled()` requires both flags.
+  `Config.central_brain_enabled()` requires both flags, `_gather_snmp_ports`/
+  `run_cycle_central_brain(snmp_poller=...)` walk only snmp-enabled devices, attach the haul
+  to the same full report, and isolate a dead switch's walk failure from the ICMP cycle.
+  `integration/test_central_ports.py` (mirrors the old single-box `test_ports.py` against
+  `CentralPortMonitor`/`CentralStore`): discovery lands unmonitored, flap-suppressed
+  monitored-down, a single blip never alarms, admin-down stays silent, fold-into-open-outage
+  vs. leading-indicator-no-outage, recovery pages once, the `snmp_alerts` gate mutes the page
+  but still writes state, a missing operator topic is a soft no-op.
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
@@ -344,16 +380,20 @@ Src layout, zero-install. What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (191 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (206 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
 `unit/test_baseline` (pure perf-deviation math — module kept, not currently wired into anything
-that calls it; see Status), `unit/test_snmp` (pure SNMP parser/throughput math — module kept,
-not wired into the daemon loop; see Status), `unit/test_supervisor` (Part D, untouched by
+that calls it; see Status), `unit/test_snmp` (pure SNMP parser/throughput math, incl.
+`is_down()` — the same predicate `central/ports.py` reuses for the folding alarm condition),
+`unit/test_supervisor` (Part D, untouched by
 Phase C), `unit/test_central_inventory` (pure central payload/cycle validation),
 `integration/test_daemon` (the edge's shared `_gather_pings`: concurrency-bound semaphore,
 per-IP count map, the config-error-vs-per-host-error policy), `integration/test_daemon_central_brain`
-(the edge probe loop end to end against a recording central client double), `integration/test_notifiers`
+(the edge probe loop end to end against a recording central client double, incl. the SNMP
+task's `_gather_snmp_ports`/dead-switch isolation), `integration/test_central_ports`
+(`CentralPortMonitor` against `CentralStore` — monitored-only, admin-down-silent, fold vs.
+leading-indicator, recovery, the alerts gate), `integration/test_notifiers`
 (the `send_with_retry` policy — pure, no DB/network), `integration/test_single_instance` (the OS
 lock + idempotent `OutageOpened`), `integration/test_analytics` (outage-window/downtime math,
 shared by central), `integration/test_central*` (store, auth, brain, rollout, watchdog — see

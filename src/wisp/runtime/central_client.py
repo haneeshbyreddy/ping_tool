@@ -28,7 +28,8 @@ class CentralClientError(RuntimeError):
 
 class CentralBrainClient(Protocol):
     def fetch_devices(self) -> dict: ...
-    def report(self, pings: dict, ts: str, *, mode: str = "full") -> dict: ...
+    def report(self, pings: dict, ts: str, *, mode: str = "full",
+              ports: dict | None = None) -> dict: ...
 
 
 class HttpCentralClient:
@@ -64,19 +65,27 @@ class HttpCentralClient:
         except Exception as exc:
             raise CentralClientError(str(exc)) from exc
 
-    def report(self, pings: dict, ts: str, *, mode: str = "full") -> dict:
+    def report(self, pings: dict, ts: str, *, mode: str = "full",
+              ports: dict | None = None) -> dict:
         """Ship one cycle's raw per-IP results ({ip: {loss_pct, latency_ms, jitter_ms}}).
         `mode="full"` (default) is a normal poll; `mode="recheck"` carries samples for
         ONLY the fast-confirm suspect IPs central named in a prior reply's `recheck` hint.
         Either way central may reply with ANOTHER `recheck` hint
         ({'recheck': {'down_ips','up_ips','interval_s'}}) — the caller
-        (apps/daemon/main.py's central-brain loop) follows it until a reply omits one."""
+        (apps/daemon/main.py's central-brain loop) follows it until a reply omits one.
+
+        `ports` (optional) is this cycle's SNMP haul — {device_id: [port dict, ...]} —
+        the edge's own slow SNMP cadence, independent of the ICMP poll interval (see
+        `apps/daemon/main.py:_gather_snmp_ports`). Only ever attached to a "full"
+        report; a recheck round is ICMP-only, so its caller never passes this."""
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover
             raise CentralClientError(f"httpx missing: {exc}") from exc
         env = {"v": WIRE_V, "tenant_id": self.tenant_id, "node_id": self.node_id,
               "ts": ts, "mode": mode, "pings": pings}
+        if ports:
+            env["ports"] = ports
         try:
             resp = httpx.post(f"{self.base}/report", json=env,
                               headers=self._headers(), timeout=self.timeout)

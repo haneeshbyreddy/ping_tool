@@ -33,6 +33,7 @@ from wisp.runtime.central_client import (
 )
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.ingress.probers import PingResult, Prober, build_prober
+from wisp.ingress.snmp import SnmpPoller, SnmpTarget, build_snmp_poller
 
 log = logging.getLogger("wisp.daemon")
 
@@ -100,6 +101,37 @@ def _pings_payload(results: dict[str, PingResult]) -> dict:
     }
 
 
+async def _gather_snmp_ports(
+    snmp_poller: SnmpPoller, devices: list[dict], cfg: Config = CONFIG,
+) -> dict[int, list[dict]]:
+    """Walk every snmp-enabled device's IF-MIB (mirrors the old single-box daemon's
+    `snmp_cycle`), returning {device_id: [port dict, ...]} ready to attach to
+    `POST /report`'s `ports` key. Each switch is isolated in its own try/except — a
+    dead/blocked switch (or a broken pysnmp) must never sink the ICMP cycle, same
+    discipline as `_gather_pings`' per-host guard. `devices` is central's topology
+    (`GET /edge/devices`), which now carries each device's SNMP config alongside its
+    IP/parent — the edge has no local DB of its own to read credentials from."""
+    ports_by_device: dict[int, list[dict]] = {}
+    for d in devices:
+        if not d.get("snmp_enabled"):
+            continue
+        target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
+                            port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
+        try:
+            ports = await snmp_poller.walk(target)
+        except Exception:
+            log.exception("SNMP walk failed for device %s (%s); continuing",
+                          d.get("id"), d["ip_address"])
+            continue
+        ports_by_device[d["id"]] = [
+            {"if_index": p.if_index, "if_name": p.if_name, "if_alias": p.if_alias,
+             "admin_status": p.admin_status, "oper_status": p.oper_status,
+             "last_change": p.last_change}
+            for p in ports
+        ]
+    return ports_by_device
+
+
 async def _follow_recheck(
     prober: Prober, client: CentralBrainClient, reply: dict, cfg: Config,
 ) -> None:
@@ -134,20 +166,27 @@ async def _follow_recheck(
 
 async def run_cycle_central_brain(
     prober: Prober, client: CentralBrainClient, devices: list[dict], canary_ip: str,
-    cfg: Config = CONFIG,
+    cfg: Config = CONFIG, *, snmp_poller: SnmpPoller | None = None,
 ) -> None:
     """One central-brain cycle: probe this tenant's topology (+ canary), report the raw
     results, then follow any fast-confirm hint central sends back. All detection/alerting
     happens on central — this function has no opinion on UP/DOWN, it just samples,
-    ships, and (if asked) re-samples the suspects a few seconds later."""
+    ships, and (if asked) re-samples the suspects a few seconds later.
+
+    `snmp_poller`, when passed (only on cycles due for the SNMP task's own slow
+    cadence — see `run_forever_central_brain`), also walks every snmp-enabled
+    device's IF-MIB and attaches the haul to this SAME "full" report under `ports`,
+    so central's port-folding (`central/ports.py`) runs off the same cycle's outages."""
     prober.on_cycle_start()
     ts = _utc_now_iso()
     plan = _gentle_probe_plan(devices, canary_ip, cfg)
     results = await _gather_pings(
         prober, sorted(plan), plan, max_inflight=cfg.probe_max_inflight
     )
+    ports = await _gather_snmp_ports(snmp_poller, devices, cfg) if snmp_poller else {}
     try:
-        reply = client.report(_pings_payload(results), ts)
+        reply = (client.report(_pings_payload(results), ts, ports=ports) if ports
+                else client.report(_pings_payload(results), ts))
     except CentralClientError as exc:
         # A WAN cut or a dead central must never crash the probe loop — just skip this
         # report and try again next cycle (mirrors the old shipper's own isolation).
@@ -186,6 +225,15 @@ async def run_forever_central_brain(
         f"[prober={cfg.prober}] (Ctrl-C to stop)"
     )
 
+    # SNMP port status runs on its own slow cadence (ports don't flap like radio
+    # links) — built once (lazy pysnmp import happens inside .walk(), so this is safe
+    # even without pysnmp installed as long as no cycle actually needs it), tracked
+    # against the loop clock like the standalone daemon's own `next_snmp`. Skipped
+    # entirely for finite `--cycles` runs, same determinism rule as the topology
+    # refresh above.
+    snmp_poller = build_snmp_poller(cfg) if cfg.snmp_interval_s > 0 else None
+    next_snmp = 0.0   # due on the very first eligible cycle
+
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
         # Topology hot-reload: re-fetch each cycle (like the standalone daemon's own
@@ -199,10 +247,15 @@ async def run_forever_central_brain(
             except CentralClientError as exc:
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
+        due_snmp = (snmp_poller is not None and max_cycles is None and started >= next_snmp)
         try:
-            await run_cycle_central_brain(prober, client, devices, canary_ip, cfg)
+            await run_cycle_central_brain(
+                prober, client, devices, canary_ip, cfg,
+                snmp_poller=snmp_poller if due_snmp else None)
         except Exception:
             log.exception("central-brain cycle %d failed; continuing", cycle + 1)
+        if due_snmp:
+            next_snmp = started + cfg.snmp_interval_s
         cycle += 1
         print(f"cycle {cycle:>3} | reported {len(devices)} device(s) to central")
         if max_cycles is not None and cycle >= max_cycles:
