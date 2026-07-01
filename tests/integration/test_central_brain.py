@@ -510,6 +510,29 @@ class ReportEndpointTest(unittest.TestCase):
             o = conn.execute("SELECT root_cause FROM outages WHERE id=?", (oid,)).fetchone()
         self.assertIn("Port", o["root_cause"])
 
+    # -- hourly latency/loss trend rollup (plan.md item 2, second slice) --
+    def test_full_report_folds_a_trend_bucket_recheck_does_not(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        status, _ = self._report(0.0)   # a "full" report
+        self.assertEqual(status, 200)
+        status, body = self._req("GET", f"/api/analytics/trend?device_id={dev}", token="tok")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["buckets"]), 1)
+        self.assertEqual(body["buckets"][0]["samples"], 1)
+
+        self._recheck("10.0.0.1", 0.0)   # a recheck must NOT add another sample
+        status, body = self._req("GET", f"/api/analytics/trend?device_id={dev}", token="tok")
+        self.assertEqual(body["buckets"][0]["samples"], 1)
+
+    def test_trend_requires_bearer_or_session(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None})
+        status, _ = self._req("GET", f"/api/analytics/trend?device_id={dev}", token=None)
+        self.assertEqual(status, 401)
+
     def test_report_ports_ignores_a_device_id_from_another_tenant(self):
         self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,

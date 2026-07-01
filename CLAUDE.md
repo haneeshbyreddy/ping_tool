@@ -14,7 +14,7 @@ no other path). An earlier single-box version of this tool (one daemon + one loc
 no multi-tenancy) existed and was fully retired — its local dashboard/server/FSM/outbox were
 deleted wholesale, not just deprecated. See "Removed" below before assuming a described
 behavior still lives on the edge; if you're looking for that old design's detail, it's in git
-history, not this file. 215 tests.
+history, not this file. 224 tests.
 
 **Central's own management plane and FSM/alerting are done and tested end to end**, including
 the fast-confirm round-trip and canary/uplink freeze over a real socket — see "Central
@@ -22,14 +22,15 @@ management plane" and "Central runs the brain" below. Verify claims about what's
 the code, not just this file (an earlier draft of this doc called the fast-confirm round-trip
 "deferred" after it had already shipped — that drift is exactly the kind of thing to watch for).
 
-**SNMP port status is now wired end to end, on central** — see "SNMP port folding" below.
-Still genuinely missing on central: bandwidth/throughput (the `ifHCIn/OutOctets` +
-`ifHighSpeed` fields `ingress/snmp.py` already parses are captured on the wire but not yet
-stored/alerted on), the per-link performance baseline, and the on-backup redundancy signal.
-The latter two existed on the old single-box edge (deleted, see below) and were never
-ported to central — central would need its own trailing-sample storage to reintroduce
-them, which doesn't exist yet. See `plan.md` for the full list of what's next and in what
-order.
+**SNMP port status and historical rollups/trend analytics are now wired end to end, on
+central** — see "SNMP port folding" and "Historical rollups" below. Still genuinely
+missing on central: bandwidth/throughput (the `ifHCIn/OutOctets` + `ifHighSpeed` fields
+`ingress/snmp.py` already parses are captured on the wire but not yet stored/alerted on),
+the per-link performance baseline, and the on-backup redundancy signal. The latter two
+existed on the old single-box edge (deleted, see below) and were never ported to
+central — they'd reuse `central/rollup.py`'s trailing-sample storage pattern (now that it
+exists) but nobody's built the deviation-vs-baseline math or the backup-path detection on
+top of it yet. See `plan.md` for the full list of what's next and in what order.
 
 The central server + dashboard are pure stdlib; the edge probe needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into a `.venv`, **never globally** (system
@@ -198,9 +199,13 @@ Src layout, zero-install. What bites:
   scoping, children-block delete, maintenance/SNMP toggles), `integration/test_central_auth`
   (`/api/inventory*` CRUD + 422/403 + cross-tenant-write-rejected over HTTP, `/api/orgs`
   tenant-scoping + superadmin narrow, org role-topic round-trip, `/api/test-alert` via the
-  injected recording notifier + missing-topic 422 + write-gated, `/api/analytics` tenant
-  scoping + superadmin narrow), `integration/test_central_analytics` (window-overlap math,
-  DOWN-only excludes UNREACHABLE, a zero-outage device reports 100% up, tenant isolation).
+  injected recording notifier + missing-topic 422 + write-gated, `/api/analytics` +
+  `/api/analytics/trend` tenant scoping + superadmin narrow), `integration/test_central_analytics`
+  (`DeviceReliabilityTest`: window-overlap math, DOWN-only excludes UNREACHABLE, a
+  zero-outage device reports 100% up, tenant isolation; `DeviceRollupTest`: hour-bucket
+  flooring, same-bucket averaging across cycles, a lost sample has no latency but still
+  counts loss/down, different hours land in different buckets, prune keeps only recent
+  buckets, tenant isolation).
 
 ## Central runs the brain (New Architecture Phase B — the ONLY edge mode, post-Phase-C)
 
@@ -277,11 +282,25 @@ Src layout, zero-install. What bites:
   B's device. Operator-only page, gated by `cfg.snmp_alerts` (state is always written); no
   escalation ladder of its own. Bandwidth (`in_octets`/`out_octets`/`speed_bps`) is parsed by
   `ingress/snmp.py` but not yet carried on the wire or stored centrally — still a follow-up.
-- **Deliberately deferred, not forgotten:** SNMP bandwidth/throughput, the per-link perf
-  baseline and on-backup redundancy soft-signal tiers (need trailing sample history central
-  doesn't store), and the hourly rollup/prune sweeps (nothing local to roll up or prune in
-  this mode — central doesn't fold `device_states` into trend rollups yet either). Don't be
-  surprised these don't fire; they're follow-up work, not bugs.
+- **Historical rollups/trend analytics are wired (plan.md item 2, both slices).**
+  `central/analytics.py:device_reliability` (`GET /api/analytics?days=`) is pure
+  outage-history math — no new storage, since central already retains full outage history
+  in central-brain mode; it reports every ACTIVE configured device (not just ones with an
+  outage) and excludes UNREACHABLE outages from the downtime sum (a topology-suppressed
+  artifact of a dead parent, not that device's own fault). `central/rollup.py` is the
+  latency/loss TREND chart (`GET /api/analytics/trend?device_id=&days=`): hourly buckets,
+  30-day retention (both decided, not configurable via env — this is a platform-wide
+  policy, not per-org). `record_cycle` folds straight off `_report`'s already-computed
+  per-device samples on every "full" report (never a recheck — that would badly skew an
+  hour's average with the fast-confirm subset's rapid re-probes), as running sums
+  (`latency_sum`/`loss_sum`/`down_samples`) rather than storing raw samples — averages are
+  computed at READ time. `start_central_rollup_prune_thread` runs a daily sweep, started
+  in `central/server.py:serve()` right alongside the fleet watchdog thread.
+- **Deliberately deferred, not forgotten:** SNMP bandwidth/throughput, and the per-link
+  perf baseline + on-backup redundancy soft-signal tiers (these need trailing sample
+  history — `central/rollup.py`'s `device_rollups` table is exactly that storage now, but
+  nobody's built the deviation-vs-baseline math or backup-path detection on top of it
+  yet). Don't be surprised these don't fire; they're follow-up work, not bugs.
 - **Tests:** `integration/test_central_brain.py` — `CentralEngineTest` (topology mapping
   excludes maintenance, restart rehydration doesn't re-page, `EngineRegistry` streak
   persistence across calls + rebuild-on-topology-change + per-tenant isolation),
@@ -293,7 +312,8 @@ Src layout, zero-install. What bites:
   socket, bearer-gated, tenant isolation, canary freeze over HTTP, the recheck round trip
   including fast-confirm-within-two-rechecks and a blip clearing the hint without confirming,
   plus SNMP port folding over HTTP: a monitored port-down folds into an open outage's
-  `root_cause` and a device id from another tenant's `ports` key is silently ignored).
+  `root_cause` and a device id from another tenant's `ports` key is silently ignored;
+  plus the trend rollup: a full report folds one bucket, a recheck folds none).
   `integration/test_daemon_central_brain.py` (loads `apps/daemon/main.py` by path) —
   `_gentle_probe_plan` infra-vs-leaf cadence, `run_cycle_central_brain` reports every probed IP
   incl. canary + survives a report failure without raising, `run_forever_central_brain`
@@ -390,7 +410,7 @@ Src layout, zero-install. What bites:
 
 ## Tests
 
-Run `python -m unittest discover -s tests` after any logic change (215 tests). Layout:
+Run `python -m unittest discover -s tests` after any logic change (224 tests). Layout:
 `unit/test_state_machine` (FSM + overrides + `probe_plan` gentle-infra + the subset
 confirmation pass + adaptive cadence — the shared engine both the tests and central build on),
 `unit/test_baseline` (pure perf-deviation math — module kept, not currently wired into anything
@@ -407,8 +427,9 @@ leading-indicator, recovery, the alerts gate), `integration/test_notifiers`
 (the `send_with_retry` policy — pure, no DB/network), `integration/test_single_instance` (the OS
 lock + idempotent `OutageOpened`), `integration/test_analytics` (outage-window/downtime math,
 the edge-schema version `central/analytics.py` mirrors), `integration/test_central_analytics`
-(the same math over `CentralStore`'s tenant-scoped `outages`, feeding `GET /api/analytics`),
-`integration/test_central*` (store, auth, brain, rollout, watchdog — see
+(the same math over `CentralStore`'s tenant-scoped `outages`, feeding `GET /api/analytics`,
+plus `central/rollup.py`'s hourly trend-bucket folding/pruning feeding `GET
+/api/analytics/trend`), `integration/test_central*` (store, auth, brain, rollout, watchdog — see
 "Central runs the brain" / "Central management plane" for what each covers). Tests inject a
 recording notifier/client double where a real network call would otherwise be needed — no real
 ntfy/central network in the suite.

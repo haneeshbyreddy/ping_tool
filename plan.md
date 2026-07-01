@@ -34,7 +34,7 @@ run locally beyond the probe.
   end-to-end in tests. What's *not* exercised outside CI: the actual multi-arch
   PyInstaller build, code-signing, and the Windows installer on real hardware.
 
-215 tests, `python -m unittest discover -s tests`.
+224 tests, `python -m unittest discover -s tests`.
 
 ## The model: what changed from a single-box tool
 
@@ -153,15 +153,18 @@ groundwork that hasn't been done yet. In rough priority order:
    when there's no open outage yet. SNMP *bandwidth* (`ifHCIn/OutOctets`/`ifHighSpeed` —
    `ingress/snmp.py` already parses these) is still not carried on the wire or stored
    centrally; that remains a follow-up alongside item 3 below.
-2. **Central-side historical rollups / trend analytics.** Partially done: outage-history
-   downtime/uptime/SLA reporting (`central/analytics.py:device_reliability`, `GET
-   /api/analytics?days=`) now answers "how reliable was Tower A last month" straight off
+2. ~~**Central-side historical rollups / trend analytics.**~~ **Done.** Two slices:
+   outage-history downtime/uptime/SLA reporting (`central/analytics.py:device_reliability`,
+   `GET /api/analytics?days=`) answers "how reliable was Tower A last month" straight off
    the existing `outages` table — no new storage needed, since central already retains
-   full outage history in central-brain mode. Still missing: a latency/packet-loss TREND
-   chart. `device_states` only holds each device's latest sample (overwritten every
-   cycle, not a history), so that needs its own time-series storage — unlike the SLA
-   slice above, this one genuinely needs the retention/granularity call made first (see
-   Open questions below); don't bolt it onto `device_states` speculatively. An ISP asking "how reliable was Tower A last month" has no answer today.
+   full outage history in central-brain mode. And a latency/packet-loss TREND chart
+   (`central/rollup.py`, `GET /api/analytics/trend?device_id=&days=`): hourly buckets,
+   30-day retention (both decided — see the old "Open questions" below), folded
+   incrementally straight off each "full" report cycle's already-computed per-device
+   samples (never a recheck — that would badly skew an hour's average with the
+   fast-confirm subset's rapid re-probes), with a daily prune sweep on its own background
+   thread (`central/rollup.py:start_central_rollup_prune_thread`, started alongside the
+   fleet watchdog thread in `central/server.py:serve()`).
 3. **Per-link performance baseline + on-backup redundancy signal, on central.** Both
    existed on the old edge as soft-signal tiers (a link slow/jittery vs its own baseline;
    a node running on a backup path with primary uplink down) and were genuinely useful
@@ -191,13 +194,11 @@ None of these block the platform from running today — `WISP_CENTRAL_BRAIN=1` +
   `ports` key rather than a sibling endpoint, since it rides the same auth/tenant/idempotency
   machinery for free; it runs on its own slower cadence (`WISP_SNMP_INTERVAL_S`) within that
   same envelope rather than every cycle, since ports don't flap like radio links.
-- **Rollup ownership (for the still-missing latency/loss TREND chart, not the SLA slice
-  already shipped):** does central fold `device_states` history itself (a new sweep,
-  central's own cron-equivalent), or does the edge ship periodic snapshots for central to
-  fold? Given central already owns all detection, folding locally seems right — but check
-  the DB-lock discipline (`CentralStore`'s single writer lock) before assuming it's free.
-  Also unresolved: rollup granularity (hourly? per-poll-interval?) and retention length —
-  make that call before adding the storage, not after.
+- ~~**Rollup ownership/granularity/retention**~~ — decided: central folds incrementally at
+  report time (no edge involvement, no separate ingest sweep — `central/rollup.py:
+  record_cycle` runs inside `central/server.py:_report`, under `CentralStore`'s existing
+  write lock), hourly buckets, 30-day retention, pruned by its own daily background
+  thread. Not per-org — retention is a platform-wide policy for this slice.
 - **Central hosting:** which provider/region, and does one box serve every tenant or does
   scale eventually demand sharding? Not urgent until tenant count says otherwise.
 - **Rollout policy:** fully automatic per org, or operator-approved? Canary size? These

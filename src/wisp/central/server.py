@@ -31,6 +31,7 @@ from wisp.central import engine as central_engine
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
 from wisp.central.ports import CentralPortMonitor
+from wisp.central import rollup as central_rollup
 from wisp.central.store import CentralStore
 from wisp.egress.notifiers import build_notifier
 from wisp.ingress.probers import PingResult
@@ -214,6 +215,29 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                                   "devices": central_analytics.device_reliability(
                                       store, tenant, since, until)})
                 return
+            if route == "/api/analytics/trend":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                tenant = store.device_tenant(did)
+                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                try:
+                    days = int((qs.get("days") or [7])[0])
+                except (TypeError, ValueError):
+                    days = 7
+                days = min(days, central_rollup.RETENTION_DAYS)   # nothing older survives
+                since, until = central_analytics.window(days)
+                self._reply(200, {"since": since, "until": until,
+                                  "buckets": store.device_rollup_series(tenant, did, since, until)})
+                return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users"):
                 user = self._reader()
@@ -369,6 +393,10 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # AFTER the ICMP cycle commits so open_outage_id reflects this cycle's
                 # outages, not last cycle's.
                 self._ingest_ports(tenant, eng, env.get("ports"), ts)
+                # Hourly latency/loss trend rollup (plan.md item 2, second slice) — full
+                # reports only, so a recheck's rapid re-probe of a suspect subset never
+                # skews an hour's average.
+                central_rollup.record_cycle(store, tenant, eng, cycle, results, ts)
 
             reply: dict = {"ok": True}
             recheck = central_engine.compute_recheck(eng, cycle, results, cfg)
@@ -616,6 +644,7 @@ def serve(cfg: Config = CONFIG) -> None:
     httpd = make_server(cfg)
     from wisp.central.watchdog import start_central_watchdog_thread
     start_central_watchdog_thread(cfg, httpd.store)  # type: ignore[attr-defined]
+    central_rollup.start_central_rollup_prune_thread(cfg, httpd.store)  # type: ignore[attr-defined]
     if not httpd.store.list_users():  # type: ignore[attr-defined]
         log.warning("no central accounts yet — bootstrap one: "
                     "PYTHONPATH=src python -m wisp.central.admin create-superadmin --username ...")

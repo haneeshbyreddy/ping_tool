@@ -91,6 +91,7 @@ src/wisp/                 # the engine package (import as `wisp.*`)
 │                          #   shared by the edge probe's error paths and central's dispatcher
 ├── central/              # THE BRAIN: engine.py + dispatch.py (FSM/alerting), ports.py (SNMP
 │                          #   port folding), analytics.py (outage-derived downtime/SLA),
+│                          #   rollup.py (hourly latency/loss trend, 30d retention),
 │                          #   store (multi-tenant SQLite), server.py (ingest + dashboard
 │                          #   API), watchdog, auth, admin CLI, rollout, inventory,
 │                          #   static/ (the dashboard SPA)
@@ -154,6 +155,11 @@ run.sh                    # local dev: central + one edge probe together
   don't count against a device's own uptime — that's a topology-suppressed artifact of
   a dead parent, not this device's fault). No new storage; a device with zero outages
   in the window still reports 100% up.
+- **Latency/loss trend** — `GET /api/analytics/trend?device_id=&days=` returns hourly
+  average-latency/loss/down-percentage buckets (30-day retention, pruned by a daily
+  background sweep), folded incrementally from each "full" report cycle's samples —
+  never a recheck, which would skew an hour's average with its rapid re-probe of just
+  the suspect subset.
 - **Escalation is restart-safe** — timers live in central's DB, not memory; a crash
   can't drop them. A fresh DOWN pages owner+operator immediately; while it stays open,
   an all-hands page (owner+operator+tech) fires every `WISP_ESCALATE_EVERY_MIN` with the

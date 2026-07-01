@@ -180,6 +180,25 @@ CREATE TABLE IF NOT EXISTS outages (
     resolution_notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outages_open ON outages(tenant_id, device_id, resolved_at);
+-- plan.md item 2, second slice: hourly latency/packet-loss trend (30-day retention,
+-- hourly buckets — both decided; see plan.md). Folded incrementally at each "full"
+-- report cycle (never a recheck — see central/rollup.py), so no raw per-poll history
+-- needs to live here, just running sums per (tenant, device, hour). Averages are
+-- computed at READ time (`CentralStore.device_rollup_series`), not stored, so the
+-- write path stays a single upsert regardless of how many samples land in an hour.
+CREATE TABLE IF NOT EXISTS device_rollups (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id     TEXT NOT NULL,
+    device_id     INTEGER NOT NULL REFERENCES org_devices(id),
+    bucket        TEXT NOT NULL,           -- hour-bucket start, ISO8601 naive UTC
+    samples       INTEGER NOT NULL DEFAULT 0,
+    latency_sum   REAL NOT NULL DEFAULT 0,
+    latency_count INTEGER NOT NULL DEFAULT 0,  -- latency can be NULL (100% loss) -> tracked apart from samples
+    loss_sum      REAL NOT NULL DEFAULT 0,
+    down_samples  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, device_id, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_device_rollups_lookup ON device_rollups(tenant_id, device_id, bucket);
 CREATE TABLE IF NOT EXISTS alert_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id  TEXT NOT NULL,
@@ -845,6 +864,61 @@ class CentralStore:
                 " AND o.started_at <= ? ORDER BY o.started_at",
                 (tenant_id, since, until)).fetchall()
         return [dict(r) for r in rows]
+
+    # -- hourly latency/loss rollups (plan.md item 2, second slice) --
+    def fold_device_rollups(self, entries: list[tuple]) -> None:
+        """`entries`: (tenant_id, device_id, bucket, latency_ms, loss_pct, down) tuples,
+        one per device sampled this cycle — accumulated into that hour's running row
+        (`col = col + excluded.col` on conflict), so folding N cycles into one bucket is
+        just N upserts, never a read-modify-write of a growing list."""
+        if not entries:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO device_rollups (tenant_id, device_id, bucket, samples,"
+                " latency_sum, latency_count, loss_sum, down_samples)"
+                " VALUES (?,?,?,1,?,?,?,?)"
+                " ON CONFLICT(tenant_id, device_id, bucket) DO UPDATE SET"
+                " samples = samples + 1,"
+                " latency_sum = latency_sum + excluded.latency_sum,"
+                " latency_count = latency_count + excluded.latency_count,"
+                " loss_sum = loss_sum + excluded.loss_sum,"
+                " down_samples = down_samples + excluded.down_samples",
+                [(tenant_id, device_id, bucket, latency_ms or 0.0,
+                  1 if latency_ms is not None else 0, loss_pct if loss_pct is not None else 0.0,
+                  down)
+                 for tenant_id, device_id, bucket, latency_ms, loss_pct, down in entries])
+            conn.commit()
+
+    def device_rollup_series(self, tenant_id: str, device_id: int, since: str,
+                             until: str) -> list[dict]:
+        """Hourly buckets in [since, until] for one device, with averages computed at
+        read time from the stored running sums. `avg_latency_ms` is None for a bucket
+        where every sample was 100% loss (no latency reading ever landed)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT bucket, samples, latency_sum, latency_count, loss_sum,"
+                " down_samples FROM device_rollups WHERE tenant_id=? AND device_id=?"
+                " AND bucket >= ? AND bucket <= ? ORDER BY bucket",
+                (tenant_id, device_id, since, until)).fetchall()
+        out = []
+        for r in rows:
+            avg_latency = (r["latency_sum"] / r["latency_count"]) if r["latency_count"] else None
+            avg_loss = (r["loss_sum"] / r["samples"]) if r["samples"] else None
+            down_pct = (100.0 * r["down_samples"] / r["samples"]) if r["samples"] else None
+            out.append({
+                "bucket": r["bucket"], "samples": r["samples"],
+                "avg_latency_ms": round(avg_latency, 2) if avg_latency is not None else None,
+                "avg_loss_pct": round(avg_loss, 2) if avg_loss is not None else None,
+                "down_pct": round(down_pct, 2) if down_pct is not None else None,
+            })
+        return out
+
+    def prune_rollups_older_than(self, cutoff: str) -> int:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM device_rollups WHERE bucket < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount
 
     def last_resolved_state(self, tenant_id: str, device_id: int) -> str | None:
         """The `final_state` of the most recently resolved outage — used to tell a
