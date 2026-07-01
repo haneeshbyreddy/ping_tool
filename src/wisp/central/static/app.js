@@ -12,8 +12,9 @@ const DEVICE_TYPES = ["core", "router", "switch", "gateway", "OLT", "AP", "CPE",
 
 let ME = null;             // current user
 let TENANT = "";           // superadmin's selected org ("" = all); org users ignore this
-let PAGE = "overview";     // overview | nodes | team | settings
+let PAGE = "overview";     // overview | nodes | agents | team | settings
 let NODE_EDIT = null;      // the org_devices row currently being edited on the Nodes page, or null
+let AGENT_REVEAL = null;   // {node_id, token} shown once right after register/rotate, or null
 
 async function api(path, method = "GET", body) {
   const opt = { method, headers: {} };
@@ -55,7 +56,8 @@ function renderLogin(err = "") {
   $("#p").onkeydown = (e) => { if (e.key === "Enter") submit(); };
 }
 
-const PAGES = [["overview", "Overview"], ["nodes", "Nodes"], ["team", "Team"], ["settings", "Settings"]];
+const PAGES = [["overview", "Overview"], ["nodes", "Nodes"], ["agents", "Edge Nodes"],
+              ["team", "Team"], ["settings", "Settings"]];
 
 function renderApp() {
   const orgLabel = ME.is_superadmin ? "Superadmin" : `${esc(ME.tenant_id)} · ${esc(ME.role)}`;
@@ -75,7 +77,7 @@ function renderApp() {
     </div>`));
   $("#logout").onclick = async () => { await api("/api/logout", "POST", {}); ME = null; renderLogin(); };
   $("#tabs").querySelectorAll("[data-page]").forEach(b => b.onclick = () => {
-    PAGE = b.dataset.page; NODE_EDIT = null; renderApp();
+    PAGE = b.dataset.page; NODE_EDIT = null; AGENT_REVEAL = null; renderApp();
   });
   if (ME.is_superadmin) renderOrgPicker();
   refresh();
@@ -87,7 +89,7 @@ async function renderOrgPicker() {
     orgs.map(o => `<option value="${esc(o.tenant_id)}">${esc(o.tenant_id)} (${o.node_count} nodes)</option>`).join("")
   }</select>`);
   sel.value = TENANT;
-  sel.onchange = () => { TENANT = sel.value; NODE_EDIT = null; refresh(); };
+  sel.onchange = () => { TENANT = sel.value; NODE_EDIT = null; AGENT_REVEAL = null; refresh(); };
   $("#orgpick").replaceChildren(sel);
 }
 
@@ -96,6 +98,7 @@ async function refresh() {
   main.replaceChildren(h(`<div class="card muted">Loading…</div>`));
   try {
     if (PAGE === "nodes") await renderNodesPage(main);
+    else if (PAGE === "agents") await renderAgentsPage(main);
     else if (PAGE === "team") await renderTeamPage(main);
     else if (PAGE === "settings") await renderSettingsPage(main);
     else await renderOverviewPage(main);
@@ -278,6 +281,100 @@ function nodesPageCard(devices, tenant) {
       catch (e) { alert(e.message); }
     });
   }
+  return card;
+}
+
+// --- Edge Nodes page: self-service enrollment for physical probes (distinct from the
+// "Nodes" tab above, which is device TOPOLOGY — this page is just ingest credentials) --
+async function renderAgentsPage(main) {
+  const t = scope();
+  if (!t) { main.replaceChildren(needsOrgCard()); return; }
+  const { nodes } = await api(`/api/nodes${tq(t)}`);
+  main.replaceChildren(agentsPageCard(nodes, t));
+}
+
+function installCmd(tenant, nodeId, tok) {
+  return `curl -fsSL https://YOUR-CENTRAL/install-edge.sh | sudo sh -s -- \\\n`
+       + `    --central https://YOUR-CENTRAL --token ${tok} --tenant ${tenant} --node ${nodeId}`;
+}
+
+function agentsPageCard(nodes, tenant) {
+  const write = canWrite();
+  const stale = (n) => n.last_seen && (Date.now() - Date.parse(n.last_seen)) / 1000 > 180;
+  const status = (n) => n.revoked_at ? `<span class="pill DOWN">revoked</span>`
+    : n.last_seen ? `<span class="pill ${stale(n) ? "stale" : "ok"}">${ago(n.last_seen)}</span>`
+    : `<span class="pill muted-pill">never connected</span>`;
+  const card = h(`<div class="card">
+    <h2>Edge nodes — ${esc(tenant)} (${nodes.length})</h2>
+    <div class="muted" style="margin-bottom:8px">The physical probes this org has registered,
+      and their enrollment credentials. What each one MONITORS is configured on the
+      <b>Nodes</b> tab — this page is only about a probe's identity/credential.</div>
+    <table><tr><th>Node id</th><th>Status</th><th>Version</th><th>Registered</th>${write ? "<th></th>" : ""}</tr>
+    ${nodes.map(n => `<tr>
+      <td>${esc(n.node_id)}</td>
+      <td>${status(n)}</td>
+      <td class="muted">${esc(n.version || "—")}</td>
+      <td class="muted">${ago(n.created_at)}</td>
+      ${write ? `<td class="row">
+          <button class="ghost" data-rotate="${esc(n.node_id)}">rotate</button>
+          ${n.revoked_at ? "" : `<button class="ghost" data-revoke="${esc(n.node_id)}">revoke</button>`}
+        </td>` : ""}
+    </tr>`).join("") || `<tr><td colspan=${write ? 5 : 4} class="muted">No nodes registered yet — add one below.</td></tr>`}
+    </table>
+  </div>`);
+
+  if (!write) return card;
+
+  if (AGENT_REVEAL) {
+    const reveal = h(`<div class="card" style="margin-top:12px">
+      <h2>Save this now — it won't be shown again</h2>
+      <div class="muted">Token for <b>${esc(AGENT_REVEAL.node_id)}</b>:</div>
+      <div class="row" style="margin:6px 0"><code style="word-break:break-all">${esc(AGENT_REVEAL.token)}</code></div>
+      <div class="muted" style="margin-top:8px">Run this on the edge box (or its Windows
+        equivalent, <code>install-edge.ps1</code>):</div>
+      <pre style="white-space:pre-wrap;background:#0b1220;border:1px solid var(--line);
+                  border-radius:6px;padding:10px;font-size:12px;margin:6px 0">${esc(
+                    installCmd(tenant, AGENT_REVEAL.node_id, AGENT_REVEAL.token))}</pre>
+      <button class="ghost" id="agentdismiss">I've saved it</button>
+    </div>`);
+    $("#agentdismiss", reveal).onclick = () => { AGENT_REVEAL = null; refresh(); };
+    card.append(reveal);
+  }
+
+  const form = h(`<div class="card" style="margin-top:12px">
+    <h2>Register a new node</h2>
+    <div class="row">
+      <input id="anid" placeholder="node id, e.g. edge-a1" style="width:200px">
+      <button id="anadd">Register</button>
+    </div>
+    <div class="err" id="anerr"></div>
+  </div>`);
+  $("#anadd", form).onclick = async () => {
+    const anerr = $("#anerr", form);
+    anerr.textContent = "";
+    const nodeId = $("#anid", form).value.trim();
+    if (!nodeId) { anerr.textContent = "node id is required"; return; }
+    try {
+      const r = await api("/api/nodes", "POST", { tenant_id: tenant, node_id: nodeId });
+      AGENT_REVEAL = { node_id: r.node_id, token: r.token };
+      refresh();
+    } catch (e) { anerr.textContent = e.message; }
+  };
+  card.append(form);
+
+  card.querySelectorAll("[data-rotate]").forEach(b => b.onclick = async () => {
+    if (!confirm(`Rotate ${b.dataset.rotate}'s token? The old one stops working immediately.`)) return;
+    try {
+      const r = await api("/api/nodes/rotate", "POST", { tenant_id: tenant, node_id: b.dataset.rotate });
+      AGENT_REVEAL = { node_id: r.node_id, token: r.token };
+      refresh();
+    } catch (e) { alert(e.message); }
+  });
+  card.querySelectorAll("[data-revoke]").forEach(b => b.onclick = async () => {
+    if (!confirm(`Revoke ${b.dataset.revoke}'s token? It will stop reporting until re-enrolled.`)) return;
+    await api("/api/nodes/revoke", "POST", { tenant_id: tenant, node_id: b.dataset.revoke });
+    refresh();
+  });
   return card;
 }
 

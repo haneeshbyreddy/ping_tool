@@ -14,6 +14,7 @@ from wisp.central.inventory import (
     InventoryError,
     clean_backup_link,
     clean_device_payload,
+    clean_node_id,
     clean_port_bandwidth_payload,
     clean_snmp_payload,
 )
@@ -159,6 +160,37 @@ class CleanPortBandwidthPayloadTest(unittest.TestCase):
     def test_non_numeric_threshold_rejected(self):
         with self.assertRaises(InventoryError):
             clean_port_bandwidth_payload({"threshold_mbps": "fast"})
+
+
+class CleanNodeIdTest(unittest.TestCase):
+    def test_valid_ids_pass_through(self):
+        self.assertEqual(clean_node_id("edge-a1"), "edge-a1")
+        self.assertEqual(clean_node_id("Tower_2.local"), "Tower_2.local")
+        self.assertEqual(clean_node_id("  edge-a1  "), "edge-a1")   # trimmed
+
+    def test_empty_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_node_id("")
+        with self.assertRaises(InventoryError):
+            clean_node_id("   ")
+        with self.assertRaises(InventoryError):
+            clean_node_id(None)
+
+    def test_must_start_with_alnum(self):
+        with self.assertRaises(InventoryError):
+            clean_node_id("-edge-a1")
+        with self.assertRaises(InventoryError):
+            clean_node_id("_edge")
+
+    def test_bad_characters_rejected(self):
+        for bad in ("edge a1", "edge/a1", "edge;drop table", "edge$a1"):
+            with self.assertRaises(InventoryError):
+                clean_node_id(bad)
+
+    def test_too_long_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_node_id("a" * 65)
+        clean_node_id("a" * 64)   # exactly the limit is fine
 
 
 if __name__ == "__main__":

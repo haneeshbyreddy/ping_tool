@@ -174,6 +174,84 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(self.store.org_role_topic("ispA", "operator"), "isp-a-op")
 
 
+class NodeTokenTest(unittest.TestCase):
+    """Self-service node enrollment: an ISP owner/operator issues one of these per node
+    from the dashboard instead of a platform superadmin running a CLI command
+    (central/pki.py's enroll-edge/mTLS is still there for whoever wants it)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "central.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_never_registered_has_no_status(self):
+        self.assertIsNone(self.store.get_node_token_status("ispA", "edge-1"))
+        self.assertFalse(self.store.node_token_registered("ispA", "edge-1"))
+
+    def test_issue_then_resolve(self):
+        token = self.store.issue_node_token("ispA", "edge-1")
+        self.assertEqual(self.store.resolve_node_token(token), ("ispA", "edge-1"))
+        self.assertTrue(self.store.node_token_registered("ispA", "edge-1"))
+        status = self.store.get_node_token_status("ispA", "edge-1")
+        self.assertIsNotNone(status["created_at"])
+        self.assertIsNone(status["revoked_at"])
+
+    def test_wrong_token_does_not_resolve(self):
+        self.store.issue_node_token("ispA", "edge-1")
+        self.assertIsNone(self.store.resolve_node_token("not-the-token"))
+        self.assertIsNone(self.store.resolve_node_token(""))
+
+    def test_reissue_invalidates_the_old_token(self):
+        old = self.store.issue_node_token("ispA", "edge-1")
+        new = self.store.issue_node_token("ispA", "edge-1")
+        self.assertNotEqual(old, new)
+        self.assertIsNone(self.store.resolve_node_token(old))
+        self.assertEqual(self.store.resolve_node_token(new), ("ispA", "edge-1"))
+
+    def test_revoke_stops_resolving_but_keeps_the_row(self):
+        token = self.store.issue_node_token("ispA", "edge-1")
+        self.assertTrue(self.store.revoke_node_token("ispA", "edge-1"))
+        self.assertIsNone(self.store.resolve_node_token(token))
+        self.assertFalse(self.store.node_token_registered("ispA", "edge-1"))
+        status = self.store.get_node_token_status("ispA", "edge-1")
+        self.assertIsNotNone(status)          # history kept, just deactivated
+        self.assertIsNotNone(status["revoked_at"])
+
+    def test_revoke_twice_is_a_no_op(self):
+        self.store.issue_node_token("ispA", "edge-1")
+        self.assertTrue(self.store.revoke_node_token("ispA", "edge-1"))
+        self.assertFalse(self.store.revoke_node_token("ispA", "edge-1"))
+
+    def test_revoke_of_never_registered_node_is_false(self):
+        self.assertFalse(self.store.revoke_node_token("ispA", "ghost"))
+
+    def test_reissue_after_revoke_reactivates(self):
+        token1 = self.store.issue_node_token("ispA", "edge-1")
+        self.store.revoke_node_token("ispA", "edge-1")
+        token2 = self.store.issue_node_token("ispA", "edge-1")
+        self.assertIsNone(self.store.resolve_node_token(token1))
+        self.assertEqual(self.store.resolve_node_token(token2), ("ispA", "edge-1"))
+        self.assertIsNone(self.store.get_node_token_status("ispA", "edge-1")["revoked_at"])
+
+    def test_tenant_isolation(self):
+        a = self.store.issue_node_token("ispA", "edge-1")
+        self.store.issue_node_token("ispB", "edge-1")   # same node_id, different tenant
+        self.assertEqual(self.store.resolve_node_token(a), ("ispA", "edge-1"))
+        self.assertEqual(len(self.store.list_node_tokens("ispA")), 1)
+        self.assertEqual(len(self.store.list_node_tokens("ispB")), 1)
+
+    def test_list_joins_heartbeat_info(self):
+        self.store.issue_node_token("ispA", "edge-1")
+        self.store.issue_node_token("ispA", "edge-2")
+        self.store.record_heartbeat("ispA", "edge-1", {"version": "0.11.0"})
+        rows = {r["node_id"]: r for r in self.store.list_node_tokens("ispA")}
+        self.assertEqual(rows["edge-1"]["version"], "0.11.0")
+        self.assertIsNotNone(rows["edge-1"]["last_seen"])
+        self.assertIsNone(rows["edge-2"]["version"])   # registered, never connected
+
+
 class OrgDevicesTest(unittest.TestCase):
     """Phase A: the ISP-managed device topology — distinct from the edge-ingest `devices`
     registry above (this table has no edge behind it yet; an ISP builds it by hand)."""

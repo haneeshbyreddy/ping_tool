@@ -3,11 +3,16 @@ multi-tenant dashboard, pure stdlib.
 
 Two auth planes, deliberately separate:
   * **Ingest** (`POST /ingest`, `/heartbeat`, `/report`, `GET /edge/devices`) —
-    machine-to-machine. Bearer token (`WISP_CENTRAL_TOKEN`) OR a verified mTLS client
-    cert (`WISP_CENTRAL_CLIENT_CA` + an edge cert from `central.admin enroll-edge`,
-    see `central/pki.py`) — either satisfies it, so enabling mTLS is not a hard cutover
-    off the token. If NEITHER is configured, ingest stays open (trusted-network
-    default, unchanged from before mTLS existed).
+    machine-to-machine, any ONE of three satisfies it: the global bearer token
+    (`WISP_CENTRAL_TOKEN`), a self-service per-node token an ISP owner/operator issues
+    from the dashboard itself (`POST /api/nodes`, presented the same way — as
+    `Authorization: Bearer <token>` — so no edge-side config shape changes; see
+    `node_tokens` in `central/store.py`), or a verified mTLS client cert
+    (`WISP_CENTRAL_CLIENT_CA` + an edge cert from `central.admin enroll-edge`, see
+    `central/pki.py`). If NONE of the three is configured/registered for a given node,
+    ingest stays open (trusted-network default, unchanged from before any of this
+    existed) — but a node that HAS a self-service credential of its own is gated on it
+    regardless of the other two, so registering one actually means something.
   * **Dashboard** (`/api/*` reads + writes, the SPA) — humans, per-org login accounts with
     identity-carrying signed-cookie sessions (`central/auth.py`). Every dashboard read is
     **scoped to the caller's tenant**; a superadmin sees all orgs and may pass `?tenant=`.
@@ -97,13 +102,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             except Exception:
                 return None
 
-        # --- auth: ingest (bearer and/or mTLS) vs dashboard (session) ---
+        # --- auth: ingest (global bearer, and/or a self-service per-node token, and/or
+        # mTLS) vs dashboard (session) ---
+        def _presented_bearer(self) -> str:
+            got = self.headers.get("Authorization", "")
+            return got[7:] if got.startswith("Bearer ") else ""
+
         def _token_ok(self) -> bool:
             if not token:
                 return False
-            got = self.headers.get("Authorization", "")
-            presented = got[7:] if got.startswith("Bearer ") else ""
-            return hmac.compare_digest(presented, token)
+            return hmac.compare_digest(self._presented_bearer(), token)
 
         def _bearer_ok(self) -> bool:
             if not token:
@@ -120,23 +128,38 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return None
             return pki.peer_identity(getpeercert())
 
+        def _node_token_identity(self) -> tuple[str, str] | None:
+            """The (tenant_id, node_id) a presented bearer authenticates as via a
+            dashboard-issued self-service credential (`POST /api/nodes`, `central/
+            store.py`'s `node_tokens`) — same derive-identity-from-the-credential
+            discipline as `_peer_identity()`, never trust the envelope's claimed
+            tenant/node alone."""
+            presented = self._presented_bearer()
+            return store.resolve_node_token(presented) if presented else None
+
         def _ingest_ok(self, tenant: str, node: str | None = None) -> bool:
-            """Ingest auth: the bearer token OR a verified client cert claiming this
-            tenant (and this node, when known — GET /edge/devices has no node in its
-            query, so that check is tenant-only there). If NEITHER a token nor a client
-            CA is configured, ingest stays open — today's trusted-network default,
-            unchanged from before mTLS existed."""
-            if not token and not client_ca:
-                return True
+            """Ingest auth: the global bearer token, OR a self-service per-node token
+            claiming this tenant (and node, when known), OR a verified mTLS client cert
+            claiming the same (GET /edge/devices has no node in its query, so that check
+            is tenant-only there) — any one of the three satisfies it. If NONE of the
+            three is configured/registered at all, ingest stays open (today's trusted-
+            network default). But a node that HAS its own registered self-service
+            credential is gated on presenting it regardless of whether the global token
+            or mTLS are configured — otherwise self-service registration would be
+            security theatre on a deployment that never set either of those up."""
             if self._token_ok():
                 return True
-            identity = self._peer_identity()
-            if identity is None:
+            node_identity = self._node_token_identity()
+            if (node_identity is not None and node_identity[0] == tenant
+                    and (node is None or node_identity[1] == node)):
+                return True
+            cert_identity = self._peer_identity()
+            if (cert_identity is not None and cert_identity[0] == tenant
+                    and (node is None or cert_identity[1] == node)):
+                return True
+            if node is not None and store.node_token_registered(tenant, node):
                 return False
-            peer_tenant, peer_node = identity
-            if peer_tenant != tenant:
-                return False
-            return node is None or peer_node == node
+            return not token and not client_ca
 
         def _user(self) -> dict | None:
             tok = auth.cookie_token(self.headers.get("Cookie"))
@@ -313,7 +336,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                                   "buckets": store.device_rollup_series(tenant, did, since, until)})
                 return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
-                         "/api/team", "/api/attendance", "/api/users"):
+                         "/api/team", "/api/attendance", "/api/users", "/api/nodes"):
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
@@ -347,6 +370,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         self._reply(400, {"error": "tenant required"})
                         return
                     self._reply(200, {"devices": store.list_org_devices(tenant)})
+                elif route == "/api/nodes":
+                    if not tenant:
+                        self._reply(400, {"error": "tenant required"})
+                        return
+                    self._reply(200, {"nodes": store.list_node_tokens(tenant)})
                 else:  # /api/attendance
                     if not tenant:
                         self._reply(400, {"error": "tenant required"})
@@ -535,6 +563,41 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
 
         # --- dashboard writes (owner / superadmin) ---
         def _dashboard_write(self, route: str, user: dict, body: dict):
+            # self-service node (edge) enrollment
+            if route == "/api/nodes":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                node_id = inventory.clean_node_id(body.get("node_id"))
+                if store.get_node_token_status(tenant, node_id):
+                    raise inventory.InventoryError(
+                        f"node {node_id!r} is already registered for {tenant!r} — "
+                        "use rotate instead of registering it again")
+                node_token = store.issue_node_token(tenant, node_id, created_by=user["id"])
+                self._reply(200, {"node_id": node_id, "token": node_token})
+                return
+            if route == "/api/nodes/rotate":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                node_id = inventory.clean_node_id(body.get("node_id"))
+                if not store.get_node_token_status(tenant, node_id):
+                    raise inventory.InventoryError(
+                        f"node {node_id!r} isn't registered for {tenant!r} yet")
+                node_token = store.issue_node_token(tenant, node_id, created_by=user["id"])
+                self._reply(200, {"node_id": node_id, "token": node_token})
+                return
+            if route == "/api/nodes/revoke":
+                tenant = body.get("tenant_id") or user["tenant_id"]
+                if not self._can_write(user, tenant):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                node_id = inventory.clean_node_id(body.get("node_id"))
+                ok = store.revoke_node_token(tenant, node_id)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
             # team
             if route == "/api/team":
                 tenant = body.get("tenant_id") or user["tenant_id"]

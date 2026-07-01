@@ -21,7 +21,9 @@ delivery + idempotent storage = effectively-once.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -48,6 +50,21 @@ CREATE TABLE IF NOT EXISTS nodes (
     first_seen   TEXT NOT NULL,
     last_seen    TEXT NOT NULL,
     PRIMARY KEY (tenant_id, node_id)
+);
+-- Self-service edge enrollment: an ISP owner/operator issues one of these per node from
+-- the dashboard, then presents it as the ingest bearer token. Independent of `nodes`
+-- above (a row here can exist before that node has ever connected) and of the global
+-- WISP_CENTRAL_TOKEN/mTLS (either of those still also works) — see central/server.py's
+-- `_ingest_ok`. Only the hash is ever stored; the plaintext is shown once, at issue time.
+CREATE TABLE IF NOT EXISTS node_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id   TEXT NOT NULL,
+    node_id     TEXT NOT NULL,
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    created_by  INTEGER,                    -- users.id of whoever issued it
+    revoked_at  TEXT,
+    UNIQUE (tenant_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS devices (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,   -- the central GLOBAL device id
@@ -569,6 +586,89 @@ class CentralStore:
                 " state, occurred_at, received_at FROM events WHERE 1=1" + escope
                 + " ORDER BY id DESC LIMIT ?", (*eargs, max(0, recent_events)))]
         return {"nodes": nodes, "recent_events": events}
+
+    # --- self-service node enrollment (dashboard-issued ingest credentials) ---
+    @staticmethod
+    def _hash_node_token(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def get_node_token_status(self, tenant_id: str, node_id: str) -> dict | None:
+        """None if this identity has never been registered. Else {'created_at',
+        'revoked_at'} — never the token or its hash."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT created_at, revoked_at FROM node_tokens"
+                " WHERE tenant_id=? AND node_id=?", (tenant_id, node_id)).fetchone()
+        return dict(row) if row else None
+
+    def issue_node_token(self, tenant_id: str, node_id: str, *,
+                         created_by: int | None = None) -> str:
+        """(Re)issues this node's credential: a fresh plaintext token (returned once,
+        never stored) and its hash written in place of any prior one, un-revoking it if
+        it was revoked. Used for both first-time registration and rotation — the API
+        layer (central/server.py) decides which one a request means by checking
+        `get_node_token_status` first, so this method itself stays a plain upsert."""
+        token = secrets.token_urlsafe(32)
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO node_tokens (tenant_id, node_id, token_hash, created_at, created_by)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(tenant_id, node_id) DO UPDATE SET"
+                " token_hash=excluded.token_hash, created_at=excluded.created_at,"
+                " created_by=excluded.created_by, revoked_at=NULL",
+                (tenant_id, node_id, self._hash_node_token(token), now, created_by))
+            conn.commit()
+        return token
+
+    def revoke_node_token(self, tenant_id: str, node_id: str) -> bool:
+        """True if a live credential was revoked; False if there was none to revoke
+        (never registered, or already revoked) — the caller's cue for a 404 vs 200."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE node_tokens SET revoked_at=? WHERE tenant_id=? AND node_id=?"
+                " AND revoked_at IS NULL", (_now_iso(), tenant_id, node_id))
+            conn.commit()
+        return cur.rowcount > 0
+
+    def list_node_tokens(self, tenant_id: str) -> list[dict]:
+        """This tenant's registered node identities, left-joined with the `nodes`
+        heartbeat table so the dashboard can show "never connected" vs. live/version/
+        last-seen in one list without a second round trip. Never includes the token
+        or its hash."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT nt.node_id, nt.created_at, nt.revoked_at, n.version,"
+                " n.last_seen, n.fleet_size, n.open_outages FROM node_tokens nt"
+                " LEFT JOIN nodes n ON n.tenant_id=nt.tenant_id AND n.node_id=nt.node_id"
+                " WHERE nt.tenant_id=? ORDER BY nt.node_id", (tenant_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_node_token(self, presented_token: str) -> tuple[str, str] | None:
+        """The `(tenant_id, node_id)` a presented bearer token authenticates as, or None
+        if it's blank or doesn't match any live (non-revoked) registered credential.
+        `central/server.py`'s ingest auth calls this the same way it derives identity
+        from a verified mTLS cert — never trust the envelope's claimed tenant/node
+        alone, derive it from the credential and compare."""
+        if not presented_token:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tenant_id, node_id FROM node_tokens"
+                " WHERE token_hash=? AND revoked_at IS NULL",
+                (self._hash_node_token(presented_token),)).fetchone()
+        return (row["tenant_id"], row["node_id"]) if row else None
+
+    def node_token_registered(self, tenant_id: str, node_id: str) -> bool:
+        """True if this specific node has its own live registered credential — if so,
+        ingest for it is gated on a matching credential even when the deployment has
+        neither a global token nor mTLS configured (self-service registration has to
+        mean something on its own, not just "if nothing else is set up either")."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM node_tokens WHERE tenant_id=? AND node_id=?"
+                " AND revoked_at IS NULL", (tenant_id, node_id)).fetchone()
+        return row is not None
 
     def devices(self, tenant_id: str | None = None) -> list[dict]:
         """The global device registry + each device's latest reported state (the unified

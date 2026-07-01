@@ -17,14 +17,19 @@ org's ids into them, so a cross-tenant id simply looks like "parent node does no
 from __future__ import annotations
 
 import ipaddress
+import re
 
 # Kept in lockstep with the central dashboard SPA's device-type form.
 DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
 SNMP_VERSIONS = ("2c",)  # room for '3' later; v3 auth/priv is out of scope for now
 
+# node_id becomes a systemd unit's identity, a filesystem path component (/etc/wisp on
+# the edge), and a URL query/JSON value on the wire — keep it boring on purpose.
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
 
 class InventoryError(ValueError):
-    """A bad device/SNMP payload (validation), surfaced to the UI as a 422."""
+    """A bad device/SNMP/node-enrollment payload (validation), surfaced to the UI as a 422."""
 
 
 def _str(data: dict, key: str, *, required: bool = False, default=None):
@@ -151,3 +156,18 @@ def clean_snmp_payload(data: dict) -> dict:
         raise InventoryError("SNMP port must be 1–65535")
     return {"snmp_enabled": enabled, "snmp_version": version,
             "snmp_community": community, "snmp_port": port}
+
+
+def clean_node_id(raw) -> str:
+    """Validate a node_id an ISP user types in when self-service-registering a new edge
+    (`POST /api/nodes`, `central/server.py`) — deliberately boring charset since it ends
+    up as a systemd identity, a path segment under /etc/wisp on the edge box, and a bare
+    JSON/query value on the wire."""
+    node_id = str(raw or "").strip()
+    if not node_id:
+        raise InventoryError("node id is required")
+    if not _NODE_ID_RE.match(node_id):
+        raise InventoryError(
+            "node id must be 1-64 characters, starting with a letter or digit, and "
+            "contain only letters, digits, '.', '_', or '-'")
+    return node_id
