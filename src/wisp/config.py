@@ -101,21 +101,6 @@ class Config:
     probe_max_inflight: int = field(
         default_factory=lambda: _env_int("WISP_MAX_INFLIGHT", 256)
     )
-    # Raw poll samples older than this are pruned by the daemon (once/day) so a
-    # 24/7 deployment reaches a steady-state DB size instead of growing forever.
-    # Raw polls are *scratch*: the hourly `poll_rollups` are the long-term trend
-    # record (latency min/avg/max, mean loss, per-state counts) and `outages` is
-    # the permanent incident log — neither is pruned. Nothing reads raw rows older
-    # than the current un-folded hour (charts read rollups, history reads outages,
-    # FSM restart reads only the newest row), so a short window is plenty; it just
-    # has to clear the hourly rollup cadence so a prune never races a fold. 7 days
-    # leaves huge margin plus an ad-hoc forensic window. At ~1k devices the old
-    # 90-day default held ~130M rows (10s of GB) that answered no query. Raise it
-    # only if you add a sub-hour drill-down view. 0 = keep everything (pruning off).
-    poll_retention_days: int = field(
-        default_factory=lambda: _env_int("WISP_POLL_RETENTION_DAYS", 7)
-    )
-
     # --- Per-link performance baseline (soft "slow link" signal) -------------
     # The FSM only knows UP/DEGRADED/DOWN against ABSOLUTE thresholds; this tier
     # flags a link that is slow/jittery vs ITS OWN rolling baseline (median + MAD)
@@ -137,50 +122,13 @@ class Config:
         default_factory=lambda: _env_float("WISP_PERF_MIN_BASELINE_MS", 5.0))
     perf_min_jitter_ms: float = field(
         default_factory=lambda: _env_float("WISP_PERF_MIN_JITTER_MS", 3.0))
-    # Gate the operator push (the dashboard badge is always written). 0 = badge only.
-    perf_alerts: bool = field(default_factory=lambda: _env_bool("WISP_PERF_ALERTS", True))
 
-    # --- Redundancy / on-backup signal (graph topology, Phase 9 Part A) -------
-    # When a node's PRIMARY uplink dies but a BACKUP path carries it, the node still
-    # pings "up" — no outage — but redundancy is gone ("one more failure is an outage").
-    # Like the perf tier this is a soft heads-up: the dashboard badge is always written;
-    # this gates the single operator page on the enter/leave edge. 0 = badge only.
-    backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
-
-    # --- SNMP port status (graph topology Part B; IF-MIB oper/admin only) ----
-    # A second ingress: walk each snmp_enabled switch's ifTable for port status AND live
-    # bandwidth (byte-counter deltas). One bulk-walk per switch is cheap, so it runs on
-    # its own cadence. 30s gives near-real-time throughput on the dashboard (and ~3×30s to
-    # a bandwidth alarm); raise it to ease load on switches with many monitored ports, or
-    # lower it for fresher rates. 0 disables the SNMP task entirely.
-    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 30))
-    # Flap suppression for ports: a monitored port must read down this many consecutive
-    # walks before it alarms (mirrors the ICMP down_consecutive idea, gentler cadence).
-    snmp_down_consecutive: int = field(
-        default_factory=lambda: _env_int("WISP_SNMP_DOWN_CONSECUTIVE", 2))
-    # Gate the port page (the switch_ports badge/state is always written). 0 = badge only.
-    snmp_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_ALERTS", True))
-    # --- Per-port bandwidth (throughput) low-threshold alarm ------------------
-    # Orthogonal to oper/admin status: each walk reads the 64-bit byte counters and the
-    # daemon diffs them into a rate (bits/sec). A monitored port whose rate falls below its
-    # operator-assigned threshold for this many consecutive walks alarms — flap suppression
-    # like the port-down path, but its own count because traffic is burstier than link
-    # state (a port that's up but momentarily idle shouldn't page on a single quiet walk).
-    snmp_bw_consecutive: int = field(
-        default_factory=lambda: _env_int("WISP_SNMP_BW_CONSECUTIVE", 3))
-    # Gate the low-bandwidth page (the switch_ports bw state is always written). 0 = badge only.
-    snmp_bw_alerts: bool = field(default_factory=lambda: _env_bool("WISP_SNMP_BW_ALERTS", True))
-    # SNMP request timeout / retries per walk (seconds). Kept short — it runs in the
-    # daemon loop inside its own try/except, so a dead switch never sinks the ICMP cycle.
+    # --- SNMP ingress (graph topology Part B; IF-MIB oper/admin only) --------
+    # `ingress/snmp.py`'s poller — kept per new-plan.md Phase C, but not yet wired into
+    # the central-brain daemon loop (central's /report doesn't accept port data yet;
+    # that's a separate follow-up). SNMP request timeout per walk, kept short since a
+    # dead switch must never block anything else.
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
-
-    # --- Monitor watchdog (dead-monitor alarm) -------------------------------
-    # If the newest poll is older than this, the monitor itself is considered
-    # down and the watchdog pages the owner. 0 = auto (max(180s, 3 poll cycles)),
-    # so a slow box that misses one cycle doesn't false-alarm.
-    monitor_stale_after_s: int = field(
-        default_factory=lambda: _env_int("WISP_MONITOR_STALE_S", 0)
-    )
 
     # --- State-machine thresholds (see plan.md §"State machine") -------------
     latency_threshold_ms: float = field(
@@ -214,13 +162,9 @@ class Config:
     escalate_every_min: int = field(
         default_factory=lambda: _env_int("WISP_ESCALATE_EVERY_MIN", 60)
     )
-    # A recipient won't get the same device's initial alert more than once per this
-    # window (the recurring all-hands escalation bypasses this).
-    alert_dedupe_min: int = field(default_factory=lambda: _env_int("WISP_ALERT_DEDUPE_MIN", 10))
 
     # --- Providers (real adapters: ICMP ping + ntfy push) --------------------
     prober: str = field(default_factory=lambda: _env("WISP_PROBER", "icmp").lower())
-    notifier: str = field(default_factory=lambda: _env("WISP_NOTIFIER", "ntfy").lower())
 
     # --- Channel credentials (only needed once real notifiers are selected) --
     ntfy_base_url: str = field(default_factory=lambda: _env("WISP_NTFY_URL", "https://ntfy.sh"))
@@ -232,62 +176,26 @@ class Config:
         default_factory=lambda: _env_float("WISP_NTFY_RETRY_BACKOFF_S", 0.5)
     )
 
-    # --- Role channels -------------------------------------------------------
-    # Three fixed ntfy topics, one per role. Each person subscribes to the topic
-    # that matches their role (owner / operator / tech) — there is no per-person
-    # routing key. On public ntfy.sh pick unguessable names (anyone who knows a
-    # topic can read it); override these env vars or self-host with auth.
-    ntfy_topic_owner: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_OWNER", "hansa-owner"))
-    ntfy_topic_operator: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_OPERATOR", "hansa-operator"))
-    ntfy_topic_tech: str = field(default_factory=lambda: _env("WISP_NTFY_TOPIC_TECH", "hansa-tech"))
-
-    # --- Organization / locale (display) -------------------------------------
-    org_name: str = field(default_factory=lambda: _env("WISP_ORG_NAME", "HANSA Communications"))
-    timezone: str = field(default_factory=lambda: _env("WISP_TIMEZONE", "Asia/Kolkata"))
-
-    # --- Central reporting (Phase 10 Part A — edge shipper + outbox) ----------
-    # THE back-compat anchor: WISP_CENTRAL_URL empty ⇒ this whole distributed layer
-    # is dormant and the edge is byte-for-byte today's standalone monitor (nothing is
-    # written to the outbox, no thread starts). Set it to the central ingest base URL
-    # (e.g. https://central.example.net) to turn the edge into a reporting node. The
-    # edge ALWAYS keeps detecting + paging locally; central only aggregates.
+    # --- Central reporting (Phase B — the edge is a thin probe) ---------------
+    # THE back-compat anchor: WISP_CENTRAL_URL empty ⇒ the edge has nowhere to report
+    # to and refuses to start (see main()). Set it to the central ingest base URL
+    # (e.g. https://central.example.net). All detection/alerting happens on central —
+    # the edge only probes and ships raw per-IP samples.
     central_url: str = field(default_factory=lambda: _env("WISP_CENTRAL_URL", "").rstrip("/"))
-    # Stopgap auth until Part C's mTLS enrollment exists: a per-node shared secret sent
-    # as `Authorization: Bearer <token>`. The wire envelope is designed so mTLS slots in
+    # Stopgap auth until mTLS enrollment exists: a per-node shared secret sent as
+    # `Authorization: Bearer <token>`. The wire envelope is designed so mTLS slots in
     # later without changing the record format. Keep it out of logs.
     central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
     # Edge identity. (tenant_id, node_id) is the durable identity central keys every
-    # record by; edge-local devices.id are per-SQLite and meaningless across nodes, so
-    # they ride along only as a per-node correlation id (central maps them in Part B).
-    # node_id defaults to the hostname so a fresh install still has a stable id.
+    # record by. node_id defaults to the hostname so a fresh install still has a
+    # stable id.
     tenant_id: str = field(default_factory=lambda: _env("WISP_TENANT_ID", "default"))
     node_id: str = field(default_factory=lambda: _env("WISP_NODE_ID", "") or _hostname())
-    # Shipper cadence + batch size. The drain loop wakes this often; the heartbeat is
-    # sent on its own (usually slower) sub-timer. A batch caps how many outbox rows go in
-    # one POST so a large backlog drains in bounded chunks.
-    ship_interval_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_INTERVAL_S", 5.0))
-    ship_batch: int = field(default_factory=lambda: _env_int("WISP_SHIP_BATCH", 200))
-    heartbeat_interval_s: int = field(
-        default_factory=lambda: _env_int("WISP_HEARTBEAT_INTERVAL_S", 60))
-    # Exponential backoff bounds for a failing central (WAN cut, central down). Capped so
-    # a long outage doesn't stretch the retry to hours — when central returns, the backlog
-    # ships promptly. Isolated from the poll loop, so this never affects local detection.
-    ship_backoff_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_BACKOFF_S", 2.0))
-    ship_backoff_max_s: float = field(
-        default_factory=lambda: _env_float("WISP_SHIP_BACKOFF_MAX_S", 300.0))
+    # HTTP timeout for GET /edge/devices and POST /report.
     ship_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_TIMEOUT_S", 10.0))
-    # Outbox high-water mark. Past this the shipper evicts the OLDEST 'rollup' rows (trend
-    # analytics, reconstructable) — never an unsent 'event' (an outage record is sacred).
-    # 0 = no cap (let it grow; an event is never dropped regardless).
-    outbox_max_rows: int = field(default_factory=lambda: _env_int("WISP_OUTBOX_MAX_ROWS", 100000))
-    # New-architecture Phase B: a SEPARATE opt-in from central_url/central_enabled(), on
-    # purpose. central_enabled()=True alone still means Phase 10 behaviour UNCHANGED — the
-    # edge keeps its own local FSM + AlertDispatcher and ships FINISHED events via the
-    # outbox/shipper. Only central_brain_mode=True (needs central_enabled() too — see
-    # central_brain_enabled()) switches the daemon to the new thin-probe loop
-    # (apps/daemon/main.py:run_forever_central_brain): pull the device list from
-    # `GET /edge/devices`, probe, POST raw pings to `/report`, run NO local FSM/alerting at
-    # all. Default off so every existing standalone AND Phase-10 deployment is unaffected.
+    # Historical opt-in flag from when central-brain mode was one of three daemon
+    # modes; the daemon now has only this mode, but `central_brain_enabled()` (still
+    # exercised directly by tests) keeps the "needs central_url too" contract explicit.
     central_brain_mode: bool = field(
         default_factory=lambda: _env_bool("WISP_CENTRAL_BRAIN", False))
 
@@ -323,7 +231,7 @@ class Config:
     agent_health_deadline_s: int = field(
         default_factory=lambda: _env_int("WISP_AGENT_HEALTH_DEADLINE_S", 300))
 
-    # --- Dashboard session (the shared-PIN auth lives in server/auth.py) ------
+    # --- Central dashboard session (the login/session crypto lives in central/auth.py) --
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
 
     def effective_interval(self, device_count: int) -> int:
@@ -336,27 +244,19 @@ class Config:
         return self.poll_interval_s
 
     def central_enabled(self) -> bool:
-        """Is this edge reporting to a central server? Empty WISP_CENTRAL_URL ⇒ the
-        whole distributed layer is dormant (the Phase 10 back-compat anchor): no outbox
-        writes, no shipper thread, behaviour identical to the standalone monitor."""
+        """Is a central URL configured at all? A helper for `central_brain_enabled()` —
+        the edge has no other mode, so this is really just "is central_url set"."""
         return bool(self.central_url)
 
     def central_brain_enabled(self) -> bool:
-        """New-architecture Phase B: run the thin-probe loop (no local FSM/alerting)
-        instead of Phase 10's local-detect + outbox-ship loop. Requires central_url too —
-        WISP_CENTRAL_BRAIN=1 with no central_url is a no-op, not an error."""
+        """Central-brain mode needs central_url too — WISP_CENTRAL_BRAIN=1 with no
+        central_url is a no-op, not an error."""
         return self.central_enabled() and self.central_brain_mode
-
-    def stale_threshold_s(self) -> int:
-        """Seconds without a fresh poll before the monitor is 'down'. Honours an
-        explicit override, else auto-derives a forgiving floor from the cadence so
-        one slow cycle never trips the alarm."""
-        return self.monitor_stale_after_s or max(180, 3 * self.poll_interval_s)
 
     def __str__(self) -> str:  # friendly one-liner for startup logs
         return (
             f"Config(db={self.db_path.name}, poll={self.poll_interval_s}s, "
-            f"prober={self.prober}, notifier={self.notifier})"
+            f"prober={self.prober})"
         )
 
 

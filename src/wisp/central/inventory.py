@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import ipaddress
 
-# Kept in lockstep with the edge's list (server/services.py DEVICE_TYPES) and the SPA form.
+# Kept in lockstep with the central dashboard SPA's device-type form.
 DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
 SNMP_VERSIONS = ("2c",)  # room for '3' later; v3 auth/priv is out of scope for now
 

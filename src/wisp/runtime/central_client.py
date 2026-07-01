@@ -13,7 +13,11 @@ from __future__ import annotations
 from typing import Protocol
 
 from wisp.config import CONFIG, Config
-from wisp.egress.shipper import WIRE_V
+
+# Wire envelope version for POST /report (and central's /ingest). Bump on a
+# breaking change to the envelope shape; central accepts v <= MAX_WIRE_V so a
+# staged fleet rollout with mixed edge versions never breaks ingest.
+WIRE_V = 1
 
 
 class CentralClientError(RuntimeError):

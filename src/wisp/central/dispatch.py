@@ -1,13 +1,14 @@
-"""Phase B — central alerting: the same policy as `egress/notifiers.AlertDispatcher`,
-ported to run against `CentralStore`'s tenant-scoped tables and an org's three role
-topics instead of the edge's single-tenant `Config.ntfy_topic_*`.
+"""Phase B — central alerting: the same policy the edge's now-deleted `AlertDispatcher`
+used to run (Phase C removed it from `egress/notifiers.py` along with the edge's local
+FSM), ported to run against `CentralStore`'s tenant-scoped tables and an org's three role
+topics instead of a fixed per-process config.
 
-Deliberately NOT a subclass or a shared base with the edge's `AlertDispatcher` — the two
-have different DB layers (`wisp.database.client.connect`+`write_with_retry` vs
-`CentralStore`'s own connection/lock) and different topic sources (fixed `Config` fields
-vs per-org DB rows), so sharing code would mean threading DB-shape differences through
-every method. Same escalation ladder, same dedupe rule, same wording — copy once, keep
-both readable, per the engine's own "keep the byte-identical path simple" preference over
+Deliberately NOT a subclass or a shared base with that old edge dispatcher — the two had
+different DB layers (`wisp.database.client.connect`+`write_with_retry` vs `CentralStore`'s
+own connection/lock) and different topic sources (fixed `Config` fields vs per-org DB
+rows), so sharing code would have meant threading DB-shape differences through every
+method. Same escalation ladder, same dedupe rule, same wording — copy once, keep both
+readable, per the engine's own "keep the byte-identical path simple" preference over
 a forced abstraction.
 
 Scope (Phase B v1): the core outage ladder (open/resolve/recategorize, hourly all-hands

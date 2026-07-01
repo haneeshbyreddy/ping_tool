@@ -31,9 +31,9 @@ from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
 from wisp.central.store import CentralStore
 from wisp.egress.notifiers import build_notifier
-from wisp.egress.shipper import WIRE_V
 from wisp.ingress.probers import PingResult
-from wisp.server.auth import LoginThrottle
+from wisp.runtime.central_client import WIRE_V
+from wisp.central.auth import LoginThrottle
 
 log = logging.getLogger("wisp.central")
 

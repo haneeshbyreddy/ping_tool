@@ -179,3 +179,37 @@ def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict |
     user.pop("pw_salt", None)
     user["is_superadmin"] = user["tenant_id"] is None
     return user
+
+
+# --- brute-force throttle (login rate limiting) ------------------------------
+class LoginThrottle:
+    """In-memory per-IP failed-login limiter with exponential backoff. A single-
+    process ThreadingHTTPServer shares one instance, so a dict + lock suffices."""
+
+    def __init__(self, lock_after: int = 5, base_delay: float = 2.0,
+                 cap: float = 300.0) -> None:
+        self.lock_after = lock_after
+        self.base_delay = base_delay
+        self.cap = cap
+        self._fails: dict[str, tuple[int, float]] = {}
+        self._lock = threading.Lock()
+
+    def retry_after(self, ip: str, *, now: float | None = None) -> float:
+        """Seconds the client must wait before another attempt (0.0 if allowed)."""
+        t = time.time() if now is None else now
+        with self._lock:
+            n, last = self._fails.get(ip, (0, 0.0))
+        if n < self.lock_after:
+            return 0.0
+        delay = min(self.cap, self.base_delay * (2 ** (n - self.lock_after)))
+        return max(0.0, (last + delay) - t)
+
+    def fail(self, ip: str, *, now: float | None = None) -> None:
+        t = time.time() if now is None else now
+        with self._lock:
+            n, _ = self._fails.get(ip, (0, 0.0))
+            self._fails[ip] = (n + 1, t)
+
+    def reset(self, ip: str) -> None:
+        with self._lock:
+            self._fails.pop(ip, None)
