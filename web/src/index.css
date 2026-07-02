@@ -62,23 +62,25 @@
 
 /* Palette ported from the WISP Central Mobile mockup's themeTokens() — dark is the
    default (matches the mockup), light is the alternate the mockup also defined.
-   Both are exact hex ports, not re-derived, so the app looks like what was designed. */
+   Neutral surface tokens (background/card/secondary/muted/accent/border/input/ring/
+   sidebar) were since swapped to plain grays for a more minimal look; primary/
+   destructive/success/warning/chart accents are unchanged from the mockup. */
 :root {
-    --background: #faf7f2;
-    --foreground: #2b2620;
+    --background: #f6f6f7;
+    --foreground: #1c1c1f;
     --card: #ffffff;
-    --card-foreground: #2b2620;
+    --card-foreground: #1c1c1f;
     --popover: #ffffff;
-    --popover-foreground: #2b2620;
+    --popover-foreground: #1c1c1f;
     --primary: #c96442;
     --primary-foreground: #ffffff;
     --primary-soft: rgba(201,100,66,0.12);
-    --secondary: #f2ede4;
-    --secondary-foreground: #2b2620;
-    --muted: #f2ede4;
-    --muted-foreground: #6f6759;
-    --accent: #f2ede4;
-    --accent-foreground: #2b2620;
+    --secondary: #eeeeef;
+    --secondary-foreground: #1c1c1f;
+    --muted: #eeeeef;
+    --muted-foreground: #6b6b70;
+    --accent: #eeeeef;
+    --accent-foreground: #1c1c1f;
     --destructive: #b8503d;
     --destructive-foreground: #ffffff;
     --destructive-soft: rgba(184,80,61,0.12);
@@ -88,9 +90,9 @@
     --warning: #b5811f;
     --warning-foreground: #ffffff;
     --warning-soft: rgba(181,129,31,0.12);
-    --border: #e8e1d6;
-    --input: #e8e1d6;
-    --ring: #d8cfc0;
+    --border: #e2e2e4;
+    --input: #e2e2e4;
+    --ring: #c9c9cc;
     --chart-1: #c96442;
     --chart-2: #3f8a5c;
     --chart-3: #b5811f;
@@ -98,31 +100,31 @@
     --chart-5: #8a8578;
     --radius: 0.625rem;
     --sidebar: #ffffff;
-    --sidebar-foreground: #2b2620;
+    --sidebar-foreground: #1c1c1f;
     --sidebar-primary: #c96442;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #f2ede4;
-    --sidebar-accent-foreground: #2b2620;
-    --sidebar-border: #e8e1d6;
-    --sidebar-ring: #d8cfc0;
+    --sidebar-accent: #eeeeef;
+    --sidebar-accent-foreground: #1c1c1f;
+    --sidebar-border: #e2e2e4;
+    --sidebar-ring: #c9c9cc;
 }
 
 .dark {
-    --background: #181614;
-    --foreground: #f2ede4;
-    --card: #211e1b;
-    --card-foreground: #f2ede4;
-    --popover: #211e1b;
-    --popover-foreground: #f2ede4;
+    --background: #18181b;
+    --foreground: #f4f4f5;
+    --card: #202023;
+    --card-foreground: #f4f4f5;
+    --popover: #202023;
+    --popover-foreground: #f4f4f5;
     --primary: #da7756;
     --primary-foreground: #ffffff;
     --primary-soft: rgba(218,119,86,0.15);
-    --secondary: #2a2622;
-    --secondary-foreground: #f2ede4;
-    --muted: #2a2622;
-    --muted-foreground: #b0a897;
-    --accent: #2a2622;
-    --accent-foreground: #f2ede4;
+    --secondary: #27272a;
+    --secondary-foreground: #f4f4f5;
+    --muted: #27272a;
+    --muted-foreground: #a1a1aa;
+    --accent: #27272a;
+    --accent-foreground: #f4f4f5;
     --destructive: #d3705a;
     --destructive-foreground: #ffffff;
     --destructive-soft: rgba(211,112,90,0.16);
@@ -132,22 +134,22 @@
     --warning: #e0b04a;
     --warning-foreground: #1f1608;
     --warning-soft: rgba(224,176,74,0.14);
-    --border: #332f29;
-    --input: #332f29;
-    --ring: #433d34;
+    --border: #303034;
+    --input: #303034;
+    --ring: #3f3f46;
     --chart-1: #da7756;
     --chart-2: #5aab7c;
     --chart-3: #e0b04a;
     --chart-4: #d3705a;
     --chart-5: #8a8578;
-    --sidebar: #211e1b;
-    --sidebar-foreground: #f2ede4;
+    --sidebar: #202023;
+    --sidebar-foreground: #f4f4f5;
     --sidebar-primary: #da7756;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #2a2622;
-    --sidebar-accent-foreground: #f2ede4;
-    --sidebar-border: #332f29;
-    --sidebar-ring: #433d34;
+    --sidebar-accent: #27272a;
+    --sidebar-accent-foreground: #f4f4f5;
+    --sidebar-border: #303034;
+    --sidebar-ring: #3f3f46;
 }
 
 @layer base {

@@ -14,6 +14,7 @@ import { EdgeNodesPage } from "@/routes/edge-nodes-page"
 import { TeamPage } from "@/routes/team-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { LogsPage } from "@/routes/logs-page"
+import { OrganizationsPage } from "@/routes/organizations-page"
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -39,6 +40,7 @@ function App() {
                     <Route path="team" element={<TeamPage />} />
                     <Route path="settings" element={<SettingsPage />} />
                     <Route path="logs" element={<LogsPage />} />
+                    <Route path="orgs" element={<OrganizationsPage />} />
                   </Route>
                 </Route>
               </Routes>

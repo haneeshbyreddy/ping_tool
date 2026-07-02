@@ -186,3 +186,18 @@ def clean_node_id(raw) -> str:
             "node id must be 1-64 characters, starting with a letter or digit, and "
             "contain only letters, digits, '.', '_', or '-'")
     return node_id
+
+
+def clean_tenant_id(raw) -> str:
+    """Validate a tenant_id a superadmin types in when creating a new org
+    (`POST /api/orgs`, `central/server.py`) — same boring charset as `clean_node_id`
+    since it becomes the mTLS CN's `tenant_id:node_id` prefix (`pki.edge_common_name`),
+    the primary key of every tenant-scoped table, and a bare JSON/query value."""
+    tenant_id = str(raw or "").strip()
+    if not tenant_id:
+        raise InventoryError("org id is required")
+    if not _NODE_ID_RE.match(tenant_id):
+        raise InventoryError(
+            "org id must be 1-64 characters, starting with a letter or digit, and "
+            "contain only letters, digits, '.', '_', or '-'")
+    return tenant_id

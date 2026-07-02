@@ -778,6 +778,19 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 ok = store.set_outage_postmortem(tenant, oid, cause, notes)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
+            # org creation — superadmin only, since a brand-new tenant_id isn't yet
+            # anyone's own org for `_can_write`'s owner branch to match against.
+            if route == "/api/orgs":
+                if not user["is_superadmin"]:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                tenant = inventory.clean_tenant_id(body.get("tenant_id"))
+                if store.org_exists(tenant):
+                    self._reply(409, {"error": f"org {tenant!r} already exists"})
+                    return
+                store.set_org(tenant, name=body.get("name"))
+                self._reply(200, {"tenant_id": tenant})
+                return
             # org rename / topics (owner of that org, or superadmin)
             if route == "/api/org":
                 tenant = body.get("tenant_id") or user["tenant_id"]
@@ -950,6 +963,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 target = store.get_user(int(body["id"]))
                 if target and (user["is_superadmin"] or target["tenant_id"] == user["tenant_id"]):
                     store.set_user_active(int(body["id"]), bool(body.get("active", False)))
+                    self._reply(200, {"ok": True})
+                else:
+                    self._reply(403, {"error": "forbidden"})
+                return
+            if route == "/api/users/delete":
+                if not (user["is_superadmin"] or user["role"] == "owner"):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                target_id = int(body.get("id") or 0)
+                if target_id == user["id"]:
+                    self._reply(422, {"error": "cannot delete your own account"})
+                    return
+                target = store.get_user(target_id)
+                if target and (user["is_superadmin"] or target["tenant_id"] == user["tenant_id"]):
+                    store.delete_user(target_id)
                     self._reply(200, {"ok": True})
                 else:
                     self._reply(403, {"error": "forbidden"})

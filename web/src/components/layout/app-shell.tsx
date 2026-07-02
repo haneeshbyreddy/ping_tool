@@ -2,6 +2,7 @@ import { useState } from "react"
 import { NavLink, Outlet } from "react-router-dom"
 import { Search } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { useAuth } from "@/hooks/use-auth"
 import { NAV_ITEMS, MORE_ITEMS } from "./nav-items"
 import { AlarmChips } from "./alarm-chips"
 import { OrgSwitcher } from "./org-switcher"
@@ -29,6 +30,9 @@ function Brand() {
 
 export function AppShell() {
   const [searchOpen, setSearchOpen] = useState(false)
+  const { user } = useAuth()
+  const navItems = NAV_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
+  const moreItems = MORE_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
 
   return (
     <SidebarProvider>
@@ -40,7 +44,7 @@ export function AppShell() {
           <SidebarGroup>
             <SidebarGroupContent>
               <SidebarMenu>
-                {NAV_ITEMS.map((item) => (
+                {navItems.map((item) => (
                   <SidebarMenuItem key={item.to}>
                     <SidebarMenuButton asChild tooltip={item.label}>
                       <NavLink
@@ -85,7 +89,7 @@ export function AppShell() {
         {/* Mobile bottom tab bar — mirrors the mockup's 5-icon nav (More folds Team/
             Settings/Logs, which get their own sidebar entries on desktop). */}
         <nav className="fixed inset-x-0 bottom-0 z-30 flex items-stretch justify-around border-t bg-sidebar px-1 pb-[env(safe-area-inset-bottom)] md:hidden">
-          {NAV_ITEMS.filter((i) => i.mobile).map((item) => (
+          {navItems.filter((i) => i.mobile).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -109,7 +113,7 @@ export function AppShell() {
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" side="top" className="mb-2">
-              {MORE_ITEMS.map((item) => (
+              {moreItems.map((item) => (
                 <DropdownMenuItem key={item.to} asChild>
                   <NavLink to={item.to}>
                     <item.icon />

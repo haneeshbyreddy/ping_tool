@@ -584,6 +584,11 @@ class CentralStore:
                 " (SELECT COUNT(*) FROM nodes n WHERE n.tenant_id=o.tenant_id) AS node_count"
                 " FROM orgs o ORDER BY o.tenant_id")]
 
+    def org_exists(self, tenant_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM orgs WHERE tenant_id=?", (tenant_id,)).fetchone()
+        return row is not None
+
     # --- read views (every one is tenant-scopeable) ---
     def _scope(self, tenant_id, prefix="") -> tuple[str, tuple]:
         """('' , ()) or (' AND <p>tenant_id=?', (tenant_id,)) — the multi-tenant filter."""

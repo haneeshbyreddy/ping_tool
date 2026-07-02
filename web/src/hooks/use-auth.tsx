@@ -47,8 +47,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = async () => {
     await authApi.logout()
-    queryClient.setQueryData(["me"], undefined)
+    // Order matters: clear() removes every cached query (including "me"), and an
+    // active observer whose query was just removed refetches it — since that refetch
+    // would still see the pre-clear() cookie state for a moment, it raced with the
+    // sign-out and left the shell rendering the last page until a manual reload.
+    // Writing "me" last makes it the query's final settled state instead of a
+    // refetch target, so RequireAuth sees user=null on the very next render.
     queryClient.clear()
+    queryClient.setQueryData(["me"], undefined)
     setSuperadminScope(null)
     localStorage.removeItem(SCOPE_STORAGE_KEY)
   }

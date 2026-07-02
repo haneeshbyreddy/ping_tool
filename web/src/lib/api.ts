@@ -47,6 +47,8 @@ export const summaryApi = {
 
 export const orgsApi = {
   list: (tenant?: string | null) => request<{ orgs: Org[] }>(`/api/orgs${tq(tenant)}`),
+  create: (body: { tenant_id: string; name?: string | null }) =>
+    request<{ tenant_id: string }>("/api/orgs", { method: "POST", body }),
   save: (body: {
     tenant_id: string; name?: string | null
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
@@ -144,4 +146,5 @@ export const usersApi = {
     request<{ id: number }>("/api/users", { method: "POST", body }),
   setActive: (id: number, active: boolean) =>
     request<{ ok: true }>("/api/users/deactivate", { method: "POST", body: { id, active } }),
+  remove: (id: number) => request<{ ok: true }>("/api/users/delete", { method: "POST", body: { id } }),
 }

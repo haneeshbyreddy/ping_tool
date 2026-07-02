@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Plus } from "lucide-react"
+import { Plus, Trash2 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, usersApi, ApiError } from "@/lib/api"
 import type { Role } from "@/lib/types"
@@ -125,6 +125,11 @@ function UsersCard({ tenant }: { tenant: string }) {
     onSuccess: invalidate,
     onError: () => toast.error("failed to update"),
   })
+  const remove = useMutation({
+    mutationFn: (id: number) => usersApi.remove(id),
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to delete"),
+  })
 
   const users = data?.users ?? []
 
@@ -144,11 +149,19 @@ function UsersCard({ tenant }: { tenant: string }) {
               <p className="truncate text-sm font-semibold">{u.username}</p>
               <p className="text-xs text-muted-foreground capitalize">{u.role}</p>
             </div>
-            <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-              {u.is_active ? "active" : "deactivated"}
-              <Switch checked={!!u.is_active}
-                onCheckedChange={(v) => setActive.mutate({ id: u.id, active: v })} />
-            </label>
+            <div className="flex shrink-0 items-center gap-2">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                {u.is_active ? "active" : "deactivated"}
+                <Switch checked={!!u.is_active}
+                  onCheckedChange={(v) => setActive.mutate({ id: u.id, active: v })} />
+              </label>
+              {u.id !== user?.id && (
+                <Button variant="ghost" size="icon" className="size-7"
+                  onClick={() => { if (confirm(`Delete login account "${u.username}"? This cannot be undone.`)) remove.mutate(u.id) }}>
+                  <Trash2 className="size-3.5" />
+                </Button>
+              )}
+            </div>
           </div>
         ))}
         {addOpen && (
