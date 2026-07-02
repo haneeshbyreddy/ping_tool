@@ -926,15 +926,24 @@ class CentralStore:
         """Every active device an org has configured, plus each node's child count (for
         the Nodes-page tree + the parent-node dropdown) and its BACKUP parent ids
         (CLAUDE.md item 3's graph topology — the PRIMARY parent is still just
-        `parent_device_id` above; `backup_parents` is the extra redundancy edge set)."""
+        `parent_device_id` above; `backup_parents` is the extra redundancy edge set).
+
+        Also LEFT JOINs `device_states` (state/latency_ms/packet_loss/jitter_ms/
+        state_updated_at) so the dashboard's topology view can color a device without a
+        second round trip per device — null until that device's first report lands.
+        This is a read-only convenience join; `device_states` itself is still owned by
+        `central/engine.py`'s commit path, not written here."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT d.id, d.tenant_id, d.name, d.ip_address, d.device_type, d.region,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port,"
                 " (SELECT COUNT(*) FROM org_devices c"
-                "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count"
-                " FROM org_devices d WHERE d.tenant_id=? AND d.is_active=1 ORDER BY d.id",
+                "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
+                " s.state AS state, s.latency_ms AS latency_ms, s.packet_loss AS packet_loss,"
+                " s.jitter_ms AS jitter_ms, s.updated_at AS state_updated_at"
+                " FROM org_devices d LEFT JOIN device_states s ON s.device_id = d.id"
+                " WHERE d.tenant_id=? AND d.is_active=1 ORDER BY d.id",
                 (tenant_id,)).fetchall()
             links = conn.execute(
                 "SELECT child_id, parent_id FROM org_device_links"

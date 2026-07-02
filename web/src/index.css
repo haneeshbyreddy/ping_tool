@@ -1,0 +1,163 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-destructive-foreground: var(--destructive-foreground);
+    --color-destructive-soft: var(--destructive-soft);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-primary-soft: var(--primary-soft);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    /* WISP-specific status colors, on top of shadcn's default set — the mockup's
+       healthy/warning/danger/neutral tokens (danger reuses shadcn's destructive). */
+    --color-success: var(--success);
+    --color-success-foreground: var(--success-foreground);
+    --color-success-soft: var(--success-soft);
+    --color-warning: var(--warning);
+    --color-warning-foreground: var(--warning-foreground);
+    --color-warning-soft: var(--warning-soft);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Palette ported from the WISP Central Mobile mockup's themeTokens() — dark is the
+   default (matches the mockup), light is the alternate the mockup also defined.
+   Both are exact hex ports, not re-derived, so the app looks like what was designed. */
+:root {
+    --background: #faf7f2;
+    --foreground: #2b2620;
+    --card: #ffffff;
+    --card-foreground: #2b2620;
+    --popover: #ffffff;
+    --popover-foreground: #2b2620;
+    --primary: #c96442;
+    --primary-foreground: #ffffff;
+    --primary-soft: rgba(201,100,66,0.12);
+    --secondary: #f2ede4;
+    --secondary-foreground: #2b2620;
+    --muted: #f2ede4;
+    --muted-foreground: #6f6759;
+    --accent: #f2ede4;
+    --accent-foreground: #2b2620;
+    --destructive: #b8503d;
+    --destructive-foreground: #ffffff;
+    --destructive-soft: rgba(184,80,61,0.12);
+    --success: #3f8a5c;
+    --success-foreground: #ffffff;
+    --success-soft: rgba(63,138,92,0.12);
+    --warning: #b5811f;
+    --warning-foreground: #ffffff;
+    --warning-soft: rgba(181,129,31,0.12);
+    --border: #e8e1d6;
+    --input: #e8e1d6;
+    --ring: #d8cfc0;
+    --chart-1: #c96442;
+    --chart-2: #3f8a5c;
+    --chart-3: #b5811f;
+    --chart-4: #b8503d;
+    --chart-5: #8a8578;
+    --radius: 0.625rem;
+    --sidebar: #ffffff;
+    --sidebar-foreground: #2b2620;
+    --sidebar-primary: #c96442;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #f2ede4;
+    --sidebar-accent-foreground: #2b2620;
+    --sidebar-border: #e8e1d6;
+    --sidebar-ring: #d8cfc0;
+}
+
+.dark {
+    --background: #181614;
+    --foreground: #f2ede4;
+    --card: #211e1b;
+    --card-foreground: #f2ede4;
+    --popover: #211e1b;
+    --popover-foreground: #f2ede4;
+    --primary: #da7756;
+    --primary-foreground: #ffffff;
+    --primary-soft: rgba(218,119,86,0.15);
+    --secondary: #2a2622;
+    --secondary-foreground: #f2ede4;
+    --muted: #2a2622;
+    --muted-foreground: #b0a897;
+    --accent: #2a2622;
+    --accent-foreground: #f2ede4;
+    --destructive: #d3705a;
+    --destructive-foreground: #ffffff;
+    --destructive-soft: rgba(211,112,90,0.16);
+    --success: #5aab7c;
+    --success-foreground: #0d1a12;
+    --success-soft: rgba(90,171,124,0.14);
+    --warning: #e0b04a;
+    --warning-foreground: #1f1608;
+    --warning-soft: rgba(224,176,74,0.14);
+    --border: #332f29;
+    --input: #332f29;
+    --ring: #433d34;
+    --chart-1: #da7756;
+    --chart-2: #5aab7c;
+    --chart-3: #e0b04a;
+    --chart-4: #d3705a;
+    --chart-5: #8a8578;
+    --sidebar: #211e1b;
+    --sidebar-foreground: #f2ede4;
+    --sidebar-primary: #da7756;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #2a2622;
+    --sidebar-accent-foreground: #f2ede4;
+    --sidebar-border: #332f29;
+    --sidebar-ring: #433d34;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}

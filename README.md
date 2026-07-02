@@ -16,21 +16,34 @@ sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"   # unprivileged ICMP
 PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you --password ...
 # log in, add your first device from the dashboard's Nodes page
 
-python -m unittest discover -s tests   # 310 tests, pure stdlib
+python -m unittest discover -s tests   # 335 tests, pure stdlib
 ```
 
 `src/wisp` is a *src layout*, not installed — `apps/daemon` and `apps/central` add
 `src/` to `sys.path` themselves; the admin CLI needs `PYTHONPATH=src`.
 
+The dashboard itself (`central/static/`) is a built React SPA — `./run.sh` serves the
+already-committed build, so the quick start above needs no Node. Only touch the frontend
+source if you're changing the dashboard: `cd web && npm install && npm run build`
+regenerates `central/static/` (Node 20+; build-time only, never a runtime dependency).
+
 ## Central dashboard
 
-- **Nodes** — device topology (name, IP, type, region, parent/backup). Changes apply
-  within one poll cycle, no edge restart.
-- **Edge Nodes** — physical probe enrollment (distinct from **Nodes**). Owner/operator
-  self-registers a node, gets a one-time token; rotate/revoke from the same page.
+React + Tailwind + shadcn/ui (source in `web/`, see `CLAUDE.md`'s "Central dashboard"
+section for the architecture). Pages:
+
+- **Home** — fleet-wide stat tiles, uplink status, low-bandwidth alert, recent events.
+- **Triage** — the outage queue: acknowledge an open outage, log a post-mortem once
+  it's auto-resolved. Recovery itself is never operator-driven.
+- **Topology** — device tree (name, IP, type, region, parent/backup, live state),
+  SNMP port watch/bandwidth. Changes apply within one poll cycle, no edge restart.
+- **Probes** — physical probe enrollment (distinct from **Topology**). Owner/operator
+  self-registers a node, gets a one-time token; rotate/revoke/delete from the same page.
 - **Team** — workers as identity + role (owner/operator/tech); alerts route to one ntfy
   topic per role, set in **Settings**. Also carries daily operator attendance.
-- **Settings** — the three role ntfy topics + a test-alert button.
+- **Settings** — org name, the three role ntfy topics + a test-alert button, and login
+  account provisioning (owner/superadmin only).
+- **Logs** — the full tenant event history, cursor-paginated.
 - **Accounts** — central-provisioned only: a superadmin onboards each ISP
   (`central.admin create-superadmin`/`create-user`); org users see only their tenant.
 
@@ -44,12 +57,14 @@ src/wisp/
 ├── egress/      # notifiers.py (ntfy channel)
 ├── central/     # the brain: engine, dispatch, ports, redundancy, perf, analytics,
 │                #   rollup, pki, store, server, watchdog, auth, admin CLI, rollout,
-│                #   inventory, static/ (dashboard SPA)
+│                #   inventory, static/ (built dashboard SPA — generated, see web/)
 └── runtime/     # central_client.py, single_instance.py, supervisor.py
 apps/
 ├── daemon/main.py      # edge: probe loop only
 ├── central/main.py     # central: ingest + dashboard + watchdog
 └── supervisor/main.py  # edge supervisor (self-update)
+web/         # dashboard SPA source (React/TS/Tailwind/shadcn) — `npm run build`
+             #   compiles into src/wisp/central/static/; Node is build-time only
 data/        # central.db + session_secret + pki/ — git-ignored
 deploy/      # wisp-edge.service, install-edge.sh/.ps1, PyInstaller spec
 tests/{unit,integration}/

@@ -17,10 +17,15 @@ central's dashboard with a per-org account, manage topology/team/alert routing t
 and self-service-register the nodes they run — one ISP can run one or many nodes, each
 with its own enrollment credential.
 
-310 tests, `python -m unittest discover -s tests`. Verify claims about what's done
+335 tests, `python -m unittest discover -s tests`. Verify claims about what's done
 against the code, not just this file — stale docs drift.
 
-Central + dashboard are pure stdlib; the edge needs a small venv
+Central's own server process (`central/server.py`/`store.py`/`auth.py`/…) is pure
+stdlib. Its dashboard is a separate build-time SPA — React + TypeScript + Tailwind +
+shadcn/ui, source in `web/`, compiled straight into `central/static/` (see "Central
+dashboard" below) — Node is a dev/build dependency only, never a runtime one; the
+deployed artifact is static assets a stdlib server hands out unchanged, same as before.
+The edge needs a small venv
 (`requirements.txt`: `icmplib`/`httpx`) — install into `.venv`, never globally
 (system Python is PEP 668-locked) — and the kernel ping group for unprivileged ICMP
 (`sysctl net.ipv4.ping_group_range="0 2147483647"`). Not yet done: real production
@@ -138,6 +143,11 @@ here. Gone:
 - The single-box install path: `deploy/install.sh`, `install.ps1`,
   `wisp-monitor.service`. Every edge node now installs through the frozen-binary fleet
   path (`install-edge.sh`/`.ps1` + `wisp-edge.service`). No separate "simple" mode.
+- The old hand-rolled vanilla-JS dashboard: `central/static/app.js`, `icons.js`,
+  `vendor/tailwind.js`, and `index.html`'s gray Material color config — replaced
+  wholesale by the React/Tailwind/shadcn SPA in `web/` (see "Central dashboard" below),
+  not deprecated alongside it. Git history has the old one if you need to compare
+  behavior; don't resurrect its files.
 
 `runtime/supervisor.py`, `apps/supervisor/main.py`, and staged-rollout/self-update are
 untouched by any of the above.
@@ -186,11 +196,8 @@ Src layout, zero-install:
 - `config.PROJECT_ROOT` is the repo root (`parents[2]` of `config.py`); `central_db`
   defaults to `data/central.db`; `central/server.py` resolves the dashboard SPA from
   `central/static/`.
-- **The dashboard's visual language is ported from the old retired single-box edge
-  dashboard** (dark Material-ish Tailwind, `central/static/vendor/tailwind.js` +
-  `icons.js` copied verbatim from that dashboard's last commit before it was deleted) —
-  only the LOOK came back, rewired against central's tenant-scoped API; the old
-  dashboard's own code is still gone (see "Removed" above). `store.low_bandwidth_alarms`
+- **The dashboard is a React/Tailwind/shadcn SPA (`web/`), not hand-rolled vanilla JS
+  anymore** — see "Central dashboard" below for the full picture. `store.low_bandwidth_alarms`
   + `GET /api/summary` (tenant-scoped: uplink flag + fleet-wide bw-alarmed ports) and
   `store.data_version` + `GET /api/events` (SSE, tenant-scoped fingerprint) exist only to
   feed that look — the header's low-bandwidth/uplink chips and live refresh-on-change.
@@ -255,6 +262,63 @@ Src layout, zero-install:
   `poll_interval_s` (60). Off by default; `run_forever_central_brain` computes it once
   at startup and doesn't retune mid-run. Detection latency floor is `interval ×
   down_consecutive`, though fast-confirm usually beats that.
+
+## Central dashboard (React + Tailwind + shadcn/ui)
+
+- **Source lives in `web/` (Vite + React 18 + TypeScript + Tailwind v4 + shadcn/ui,
+  react-router, @tanstack/react-query), builds straight into `central/static/`.**
+  `web/vite.config.ts`'s `build.outDir` points at `../src/wisp/central/static` with
+  `emptyOutDir: true` — `cd web && npm install && npm run build` regenerates it after any
+  frontend change. The built output is committed to git like any other static asset (not
+  gitignored) so `./run.sh` keeps working with zero Node dependency for anyone not
+  touching the frontend; only `web/node_modules` is ignored. `server.py`'s
+  `_STATIC`/`_serve_static` are completely unchanged — they just hand out whatever's in
+  `central/static/`, same as when it was hand-rolled vanilla JS.
+- **Routing is `HashRouter` (`/#/outages`, `/#/topology`, …), not `BrowserRouter`.**
+  `server.py`'s static handler 404s on any path that isn't a literal file — there's no
+  SPA-fallback route, deliberately, to keep the stdlib server dumb. `BrowserRouter` needs
+  the server to serve `index.html` for unknown paths (deep-link/refresh would 404);
+  `HashRouter` needs no server cooperation at all since the fragment never reaches the
+  server. Don't switch back without adding that fallback to `server.py` first.
+- **Theme (`web/src/index.css`) is a hex-for-hex port of the "WISP Central Mobile"
+  design mockup's `themeTokens()`** (dark default — `bg #181614`/`accent #da7756` — plus
+  a light variant), not the old dashboard's gray Material palette. CSS variables follow
+  shadcn's convention (`--background`/`--card`/`--primary`/`--border`/…) with
+  `--success`/`--warning`/their `-soft` variants layered on top for status coloring;
+  toggled via a `dark` class on `<html>`, persisted to `localStorage`
+  (`web/src/lib/theme.ts`), applied before first paint in `main.tsx` to avoid a flash.
+- **Auth rides the exact same session-cookie plane as before** — `central/auth.py` is
+  untouched. `web/src/hooks/use-auth.tsx`'s `AuthProvider` wraps `GET /api/me`/
+  `POST /api/login`/`POST /api/logout` over same-origin `fetch` (cookie sent
+  automatically); a 401 anywhere dispatches a `wisp:unauthorized` window event the
+  provider listens for. Tenant scoping (`scopeTenant`) mirrors the old dashboard exactly:
+  a superadmin picks an org via the header switcher (persisted to `localStorage`, GET
+  `/api/orgs`); an org user is always pinned to their own tenant and never shown a
+  picker, matching `server.py`'s `_scope_tenant`.
+- **Live updates reuse the same `GET /api/events` SSE stream** —
+  `web/src/hooks/use-event-stream.ts` opens one `EventSource` per tenant scope and
+  invalidates react-query cache keys (`summary`/`outages`/`inventory`/`logs`/`team`/
+  `attendance`) on each `changed` event, instead of the old dashboard's manual
+  `refresh()`.
+- **One backend change this needed:** `store.list_org_devices()` now LEFT JOINs
+  `device_states` so the topology tree and home page can color a device without a
+  second round trip per device — nullable `state`/`latency_ms`/`packet_loss`/
+  `jitter_ms`/`state_updated_at` on each row, null until that device's first report
+  lands. Read-only convenience join, not a new stored column — no `_ensure_columns`
+  migration needed.
+- **The mockup this was built from was a fully mocked design-doc, not a spec** — some of
+  its fake features have no backend equivalent and don't exist in the real app: "Clients
+  online" (platform only monitors infra, not end-user devices), a manual "Resolve"
+  action (recovery is FSM-automatic, never operator-driven — only acknowledge +
+  post-resolve postmortem are real), a Docker install option (only Linux/Windows
+  installers exist), a Topology "Map" view (no device coordinates in the schema), and
+  "Notification history" (`alert_log` is internal-only, no dashboard route reads it).
+  Don't go looking for them or try to "finish" them without a real backend underneath.
+- **No frontend test suite yet.** Verified during development via `tsc --noEmit`, a
+  production `npm run build`, and manual Playwright screenshots/interaction against a
+  live central instance (not committed — was throwaway verification tooling). The
+  Python suite (`tests/`) only needed a one-line extension for the `list_org_devices`
+  change above and is otherwise unaffected by any of this.
 
 ## Central management plane — device inventory, team, settings
 
