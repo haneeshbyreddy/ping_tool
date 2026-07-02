@@ -12,23 +12,23 @@ import {
 // search endpoint. Opens on Cmd/Ctrl+K from anywhere in the app.
 export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const navigate = useNavigate()
-  const { scopeTenant } = useAuth()
+  const { scopeOrg } = useAuth()
   const [query, setQuery] = useState("")
 
   const devices = useQuery({
-    queryKey: ["inventory", scopeTenant],
-    queryFn: () => inventoryApi.list(scopeTenant),
-    enabled: open && !!scopeTenant,
+    queryKey: ["inventory", scopeOrg],
+    queryFn: () => inventoryApi.list(scopeOrg),
+    enabled: open && !!scopeOrg,
   })
   const outages = useQuery({
-    queryKey: ["outages", scopeTenant],
-    queryFn: () => outagesApi.list(scopeTenant),
-    enabled: open && !!scopeTenant,
+    queryKey: ["outages", scopeOrg],
+    queryFn: () => outagesApi.list(scopeOrg),
+    enabled: open && !!scopeOrg,
   })
   const nodes = useQuery({
-    queryKey: ["nodes", scopeTenant],
-    queryFn: () => nodesApi.list(scopeTenant),
-    enabled: open && !!scopeTenant,
+    queryKey: ["nodes", scopeOrg],
+    queryFn: () => nodesApi.list(scopeOrg),
+    enabled: open && !!scopeOrg,
   })
 
   useEffect(() => {
@@ -64,7 +64,7 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
           </CommandGroup>
           <CommandGroup heading="Outages">
             {outages.data?.outages.filter((o) => !o.resolved_at).map((o) => (
-              <CommandItem key={o.id} value={o.device_name} onSelect={() => go("/outages")}>
+              <CommandItem key={o.id} value={o.device_name} onSelect={() => go("/")}>
                 <span className="flex-1 truncate">{o.device_name}</span>
                 <span className="text-xs text-muted-foreground">{o.status.replace("_", " ")}</span>
               </CommandItem>

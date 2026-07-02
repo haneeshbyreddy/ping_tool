@@ -8,7 +8,6 @@ import { RequireAuth } from "@/components/layout/require-auth"
 import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
-import { OutagesPage } from "@/routes/outages-page"
 import { TopologyPage } from "@/routes/topology-page"
 import { EdgeNodesPage } from "@/routes/edge-nodes-page"
 import { TeamPage } from "@/routes/team-page"
@@ -34,7 +33,6 @@ function App() {
                 <Route element={<RequireAuth />}>
                   <Route element={<AppShell />}>
                     <Route index element={<HomePage />} />
-                    <Route path="outages" element={<OutagesPage />} />
                     <Route path="topology" element={<TopologyPage />} />
                     <Route path="nodes" element={<EdgeNodesPage />} />
                     <Route path="team" element={<TeamPage />} />

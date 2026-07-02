@@ -39,12 +39,12 @@ def _on_target_alive(node: dict, target: str, now: datetime, fresh_s: int) -> bo
     return (now - _parse(node["last_seen"])).total_seconds() <= fresh_s
 
 
-def directive_for(store, tenant_id: str, node_id: str, reported_version: str | None,
+def directive_for(store, org_id: str, node_id: str, reported_version: str | None,
                   platform: str | None, *, now=None) -> dict | None:
     """The update this node should pull now, or None. None when: no rollout / it's terminal /
     the node already runs the target / the node isn't eligible in the current wave / there is
     no artifact for the node's platform (we can't update what we can't build for)."""
-    rollout = store.get_rollout(tenant_id)
+    rollout = store.get_rollout(org_id)
     if not rollout or rollout["state"] in _TERMINAL:
         return None
     target = rollout["target_version"]
@@ -62,15 +62,15 @@ def directive_for(store, tenant_id: str, node_id: str, reported_version: str | N
     return {"target_version": target, "url": art["url"], "sha256": art["sha256"]}
 
 
-def evaluate(store, tenant_id: str, *, cfg: Config = CONFIG, now=None) -> str:
+def evaluate(store, org_id: str, *, cfg: Config = CONFIG, now=None) -> str:
     """Advance the rollout state machine for one org; persists + returns the new state."""
-    rollout = store.get_rollout(tenant_id)
+    rollout = store.get_rollout(org_id)
     if not rollout or rollout["state"] in _TERMINAL:
         return rollout["state"] if rollout else "none"
     now = _now(now)
     target = rollout["target_version"]
     fresh_s = cfg.central_node_stale_s
-    nodes = store.node_versions(tenant_id)
+    nodes = store.node_versions(org_id)
     state = rollout["state"]
 
     if state == "canary":
@@ -79,22 +79,22 @@ def evaluate(store, tenant_id: str, *, cfg: Config = CONFIG, now=None) -> str:
         all_ok = all(_on_target_alive(n, target, now, fresh_s) for n in canary_nodes) \
             and len(canary_nodes) == len(rollout["canary"])
         if all_ok:
-            store.update_rollout_state(tenant_id, "promoted")
+            store.update_rollout_state(org_id, "promoted")
             log.info("rollout %s -> %s: canaries healthy, PROMOTED fleet-wide",
-                     tenant_id, target)
+                     org_id, target)
             return "promoted"
         # Past the health window with canaries still not healthy on target -> auto-halt.
         elapsed = (now - _parse(rollout["started_at"])).total_seconds()
         if elapsed > cfg.rollout_health_window_s:
-            store.update_rollout_state(tenant_id, "halted")
+            store.update_rollout_state(org_id, "halted")
             log.warning("rollout %s -> %s: canaries unhealthy after %ds — HALTED",
-                        tenant_id, target, int(elapsed))
+                        org_id, target, int(elapsed))
             return "halted"
         return "canary"
 
     # promoted: finish when every node is on the target and alive.
     if nodes and all(_on_target_alive(n, target, now, fresh_s) for n in nodes):
-        store.update_rollout_state(tenant_id, "done")
-        log.info("rollout %s -> %s: all nodes updated, DONE", tenant_id, target)
+        store.update_rollout_state(org_id, "done")
+        log.info("rollout %s -> %s: all nodes updated, DONE", org_id, target)
         return "done"
     return "promoted"

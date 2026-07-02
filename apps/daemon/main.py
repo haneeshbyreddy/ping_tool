@@ -172,7 +172,7 @@ async def run_cycle_central_brain(
     prober: Prober, client: CentralBrainClient, devices: list[dict], canary_ip: str,
     cfg: Config = CONFIG, *, snmp_poller: SnmpPoller | None = None,
 ) -> None:
-    """One central-brain cycle: probe this tenant's topology (+ canary), report the raw
+    """One central-brain cycle: probe this org's topology (+ canary), report the raw
     results, then follow any fast-confirm hint central sends back. All detection/alerting
     happens on central — this function has no opinion on UP/DOWN, it just samples,
     ships, and (if asked) re-samples the suspects a few seconds later.
@@ -225,7 +225,7 @@ async def run_forever_central_brain(
     interval = cli_interval if cli_interval is not None else cfg.effective_interval(len(devices))
     print(
         f"central-brain mode: probing {len(devices)} device(s) for "
-        f"{cfg.tenant_id}/{cfg.node_id} every {interval}s -> {cfg.central_url} "
+        f"{cfg.org_id}/{cfg.node_id} every {interval}s -> {cfg.central_url} "
         f"[prober={cfg.prober}] (Ctrl-C to stop)"
     )
 
@@ -297,7 +297,7 @@ def main() -> None:
             pass
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every central POST
 
-    # One logical poller per tenant/node: two pollers racing the same target
+    # One logical poller per org/node: two pollers racing the same target
     # double-*report*, which is wasteful and confusing even though central's ingest is
     # idempotent per outage. An OS advisory lock refuses the second start (auto-released
     # by the kernel on exit/crash — no stale pidfile to reap). Central-brain mode makes

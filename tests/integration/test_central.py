@@ -19,7 +19,7 @@ from wisp.central.server import make_server
 
 
 def _batch(records):
-    return {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+    return {"v": 1, "org_id": "ispA", "node_id": "edge-1",
             "kind": "batch", "records": records}
 
 
@@ -67,7 +67,7 @@ class CentralStoreTest(unittest.TestCase):
         self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
         with self.store._connect() as conn:
             n = conn.execute(
-                "SELECT COUNT(*) FROM outages WHERE tenant_id='ispA' AND device_id=?"
+                "SELECT COUNT(*) FROM outages WHERE org_id='ispA' AND device_id=?"
                 " AND resolved_at IS NULL", (dev,)).fetchone()[0]
         self.assertEqual(n, 1)
 
@@ -78,7 +78,7 @@ class CentralStoreTest(unittest.TestCase):
         self.store.open_outage_if_absent("ispA", dev, "2026-06-23T09:00:00+00:00", "DOWN")
         with self.store._connect() as conn:
             total = conn.execute(
-                "SELECT COUNT(*) FROM outages WHERE tenant_id='ispA' AND device_id=?",
+                "SELECT COUNT(*) FROM outages WHERE org_id='ispA' AND device_id=?",
                 (dev,)).fetchone()[0]
         self.assertEqual(total, 2)
         self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
@@ -108,8 +108,8 @@ class CentralStoreTest(unittest.TestCase):
         oid = self.store.open_outage_id("ispA", dev)
         self.assertFalse(self.store.set_outage_postmortem("ispA", oid, "guess", None))
 
-    def test_outage_tenant_is_none_for_unknown_id(self):
-        self.assertIsNone(self.store.outage_tenant(999))
+    def test_outage_org_is_none_for_unknown_id(self):
+        self.assertIsNone(self.store.outage_org(999))
 
     def test_list_events_pagination(self):
         self.store.ingest("ispA", "edge-1", [_evt(i) for i in range(1, 6)])
@@ -143,15 +143,15 @@ class CentralStoreTest(unittest.TestCase):
         names = [e["device_name"] for e in self.store.fleet()["recent_events"]]
         self.assertEqual(names, ["B", "A"])
 
-    # --- Part B: orgs, the global id mapping, tenant scoping ---
+    # --- Part B: orgs, the global id mapping, org scoping ---
     def test_org_auto_provisioned_on_first_contact(self):
         self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5)])
         self.store.record_heartbeat("ispB", "edge-9", {"fleet_size": 1})
-        tenants = {o["tenant_id"] for o in self.store.orgs()}
-        self.assertEqual(tenants, {"ispA", "ispB"})
+        orgs = {o["org_id"] for o in self.store.orgs()}
+        self.assertEqual(orgs, {"ispA", "ispB"})
 
     def test_device_registry_assigns_one_global_id_per_edge_device(self):
-        # same (tenant,node,edge_local_id) across two events -> ONE global id, metadata kept.
+        # same (org,node,edge_local_id) across two events -> ONE global id, metadata kept.
         self.store.ingest("ispA", "edge-1",
                           [_evt(1, device_id=5, device_name="Tower", device_ip="10.0.0.5")])
         self.store.ingest("ispA", "edge-1", [_evt(2, device_id=5, state="UP")])
@@ -178,12 +178,12 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(d["last_state"], "UP")
         self.assertEqual(d["last_event"], "OutageResolved")
 
-    def test_tenant_scoping_filters_reads(self):
+    def test_org_scoping_filters_reads(self):
         self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5, device_name="A")])
         self.store.ingest("ispB", "edge-1", [_evt(1, device_id=7, device_name="B")])
         self.assertEqual(len(self.store.devices("ispA")), 1)
-        self.assertEqual(len(self.store.devices()), 2)               # unscoped = all tenants
-        self.assertEqual([n["tenant_id"] for n in self.store.fleet("ispB")["nodes"]], ["ispB"])
+        self.assertEqual(len(self.store.devices()), 2)               # unscoped = all orgs
+        self.assertEqual([n["org_id"] for n in self.store.fleet("ispB")["nodes"]], ["ispB"])
 
     def test_uplink_event_has_no_device_row(self):
         self.store.ingest("ispA", "edge-1", [_evt(1, type="UplinkDown")])  # no device_id
@@ -193,7 +193,7 @@ class CentralStoreTest(unittest.TestCase):
         self.store.ingest("ispA", "edge-1", [_evt(1, device_id=5)])
         self.store.set_org("ispA", name="ISP A", ntfy_topic="ispA-ops")
         self.assertEqual(self.store.org_topic("ispA"), "ispA-ops")
-        org = next(o for o in self.store.orgs() if o["tenant_id"] == "ispA")
+        org = next(o for o in self.store.orgs() if o["org_id"] == "ispA")
         self.assertEqual(org["name"], "ISP A")
         self.assertEqual(org["node_count"], 1)
 
@@ -271,9 +271,9 @@ class NodeTokenTest(unittest.TestCase):
         self.assertEqual(self.store.resolve_node_token(token2), ("ispA", "edge-1"))
         self.assertIsNone(self.store.get_node_token_status("ispA", "edge-1")["revoked_at"])
 
-    def test_tenant_isolation(self):
+    def test_org_isolation(self):
         a = self.store.issue_node_token("ispA", "edge-1")
-        self.store.issue_node_token("ispB", "edge-1")   # same node_id, different tenant
+        self.store.issue_node_token("ispB", "edge-1")   # same node_id, different org
         self.assertEqual(self.store.resolve_node_token(a), ("ispA", "edge-1"))
         self.assertEqual(len(self.store.list_node_tokens("ispA")), 1)
         self.assertEqual(len(self.store.list_node_tokens("ispB")), 1)
@@ -296,7 +296,7 @@ class NodeTokenTest(unittest.TestCase):
         dev = next(d for d in self.store.list_org_devices("ispA") if d["id"] == did)
         self.assertIsNone(dev["assigned_node_id"])  # falls back to "every client covers it"
 
-    def test_delete_does_not_touch_other_tenants_or_nodes(self):
+    def test_delete_does_not_touch_other_orgs_or_nodes(self):
         self.store.issue_node_token("ispA", "edge-1")
         self.store.issue_node_token("ispA", "edge-2")
         self.store.issue_node_token("ispB", "edge-1")
@@ -352,7 +352,7 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(self.store.list_org_devices("ispA"), [])
 
-    def test_tenant_isolation(self):
+    def test_org_isolation(self):
         a = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -366,9 +366,9 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertFalse(self.store.update_org_device("ispB", a, {
             "name": "hijacked", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None}))
-        self.assertEqual(self.store.device_tenant(a), "ispA")
+        self.assertEqual(self.store.device_org(a), "ispA")
 
-    def test_parent_map_is_tenant_scoped(self):
+    def test_parent_map_is_org_scoped(self):
         a = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -482,7 +482,7 @@ class CentralServerTest(unittest.TestCase):
         self.assertEqual(self.store.counts()["events"], 2)
 
     def test_heartbeat_persists(self):
-        env = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1", "kind": "heartbeat",
+        env = {"v": 1, "org_id": "ispA", "node_id": "edge-1", "kind": "heartbeat",
                "body": {"version": "0.10.0", "fleet_size": 3}}
         status, body = self._req("POST", "/heartbeat", env, token="s3cret")
         self.assertEqual(status, 200)
@@ -494,7 +494,7 @@ class CentralServerTest(unittest.TestCase):
         status, body = self._req("POST", "/ingest", env, token="s3cret")
         self.assertEqual(status, 400)
 
-    def test_missing_tenant_rejected(self):
+    def test_missing_org_rejected(self):
         env = {"v": 1, "node_id": "edge-1", "kind": "batch", "records": []}
         status, _ = self._req("POST", "/ingest", env, token="s3cret")
         self.assertEqual(status, 400)
@@ -522,7 +522,7 @@ class CentralServerTest(unittest.TestCase):
                   _batch([_evt(1, device_id=5, device_name="Tower")]), token="s3cret")
         status, body = self._req("GET", "/api/orgs", token="s3cret")
         self.assertEqual(status, 200)
-        self.assertEqual(body["orgs"][0]["tenant_id"], "ispA")
+        self.assertEqual(body["orgs"][0]["org_id"], "ispA")
         status, body = self._req("GET", "/api/devices", token="s3cret")
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["name"], "Tower")
@@ -530,20 +530,20 @@ class CentralServerTest(unittest.TestCase):
         # both require the token
         self.assertEqual(self._req("GET", "/api/devices")[0], 401)
 
-    def test_fleet_tenant_query_param_scopes(self):
+    def test_fleet_org_query_param_scopes(self):
         self._req("POST", "/ingest", _batch([_evt(1, device_name="A")]), token="s3cret")
-        env = {"v": 1, "tenant_id": "ispB", "node_id": "edge-1", "kind": "batch",
+        env = {"v": 1, "org_id": "ispB", "node_id": "edge-1", "kind": "batch",
                "records": [_evt(1, device_name="B")]}
         self._req("POST", "/ingest", env, token="s3cret")
-        status, body = self._req("GET", "/api/fleet?tenant=ispB", token="s3cret")
+        status, body = self._req("GET", "/api/fleet?org=ispB", token="s3cret")
         self.assertEqual(status, 200)
-        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispB"})
+        self.assertEqual({n["org_id"] for n in body["nodes"]}, {"ispB"})
 
-    def test_summary_requires_tenant_and_reports_low_bandwidth(self):
+    def test_summary_requires_org_and_reports_low_bandwidth(self):
         status, _ = self._req("GET", "/api/summary")
         self.assertEqual(status, 401)
         status, body = self._req("GET", "/api/summary", token="s3cret")
-        self.assertEqual(status, 400)  # superadmin with no ?tenant= narrows to nothing
+        self.assertEqual(status, 400)  # superadmin with no ?org= narrows to nothing
         switch = self.store.create_org_device("ispA", {
             "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
             "region": None, "parent_device_id": None})
@@ -555,7 +555,7 @@ class CentralServerTest(unittest.TestCase):
         port_id = self.store.list_switch_ports("ispA", switch)[0]["id"]
         self.store.set_port_monitored("ispA", port_id, True)
         self.store.set_port_bandwidth_config("ispA", port_id, 10, "either")
-        status, body = self._req("GET", "/api/summary?tenant=ispA", token="s3cret")
+        status, body = self._req("GET", "/api/summary?org=ispA", token="s3cret")
         self.assertEqual(status, 200)
         self.assertFalse(body["uplink_down"])
         self.assertEqual(len(body["low_bandwidth"]), 1)

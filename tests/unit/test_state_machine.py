@@ -123,7 +123,7 @@ class ConfirmationPass(unittest.TestCase):
 
 
 class DeviceAssignment(unittest.TestCase):
-    """`expected_ips` (central's multi-edge-per-tenant device assignment) narrows a full
+    """`expected_ips` (central's multi-edge-per-org device assignment) narrows a full
     pass to only the devices THIS report is authoritative for — a device outside that
     set must be skipped entirely (state untouched, no event), not scored 100% loss just
     because this particular report didn't mention it."""

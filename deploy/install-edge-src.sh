@@ -10,11 +10,11 @@
 # integrity comes only from git's own HTTPS transport, not a checksum manifest.
 #
 #   curl -fsSL https://central.example.net/install-edge-src.sh | sudo sh -s -- \
-#        --central https://central.example.net --token <TOKEN> --tenant ispA --node edge-a1
+#        --central https://central.example.net --token <TOKEN> --org ispA --node edge-a1
 #
 set -euo pipefail
 
-CENTRAL="" TOKEN="" TENANT="default" NODE="$(hostname)"
+CENTRAL="" TOKEN="" ORG="default" NODE="$(hostname)"
 REPO_URL="https://github.com/haneeshbyreddy/ping_tool.git"
 BRANCH="main"
 PREFIX=/opt/wisp
@@ -27,7 +27,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --central) CENTRAL="$2"; shift 2;;
     --token)   TOKEN="$2"; shift 2;;
-    --tenant)  TENANT="$2"; shift 2;;
+    --org)  ORG="$2"; shift 2;;
     --node)    NODE="$2"; shift 2;;
     --repo-url) REPO_URL="$2"; shift 2;;
     --branch)  BRANCH="$2"; shift 2;;
@@ -73,7 +73,7 @@ cat > "$ENV_FILE" <<EOF
 WISP_CENTRAL_BRAIN=1
 WISP_CENTRAL_URL=$CENTRAL
 WISP_CENTRAL_TOKEN=$TOKEN
-WISP_TENANT_ID=$TENANT
+WISP_ORG_ID=$ORG
 WISP_NODE_ID=$NODE
 EOF
 chmod 600 "$ENV_FILE"
@@ -103,7 +103,7 @@ systemctl daemon-reload
 systemctl enable --now wisp-edge-src
 
 echo ""
-log "WISP edge (source path) installed and started. Node $TENANT/$NODE -> $CENTRAL."
+log "WISP edge (source path) installed and started. Node $ORG/$NODE -> $CENTRAL."
 echo "  status: systemctl status wisp-edge-src"
 echo "  logs:   journalctl -u wisp-edge-src -f"
 echo "  stop:   systemctl stop wisp-edge-src"

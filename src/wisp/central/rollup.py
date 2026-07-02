@@ -36,7 +36,7 @@ def bucket_of(ts: str) -> str:
     return dt.replace(minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
 
 
-def record_cycle(store, tenant_id: str, eng, cycle, results: dict, ts: str) -> None:
+def record_cycle(store, org_id: str, eng, cycle, results: dict, ts: str) -> None:
     """Fold one full-report cycle's per-device samples into the current hour's running
     rollup. `eng`/`cycle`/`results` are the SAME objects `central/server.py:_report`
     already has right after `central_engine.run_cycle` — reused rather than re-derived,
@@ -50,12 +50,12 @@ def record_cycle(store, tenant_id: str, eng, cycle, results: dict, ts: str) -> N
         latency = res.latency_ms if res else None
         loss = res.packet_loss if res else None
         down = 1 if state in DOWN_FAMILY else 0
-        entries.append((tenant_id, dev_id, bucket, latency, loss, down))
+        entries.append((org_id, dev_id, bucket, latency, loss, down))
     store.fold_device_rollups(entries)
 
 
 def prune_old_rollups(store, now: str | None = None) -> int:
-    """Delete every bucket older than RETENTION_DAYS, across all tenants — retention is
+    """Delete every bucket older than RETENTION_DAYS, across all orgs — retention is
     a platform-wide policy for this slice, not per-org (see CLAUDE.md)."""
     end = _parse(now) if now else datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = (end - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")

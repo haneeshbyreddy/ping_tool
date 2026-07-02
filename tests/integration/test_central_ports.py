@@ -1,6 +1,6 @@
 """Central-side SNMP port folding (central/ports.py:CentralPortMonitor) — mirrors the
 old single-box tests/integration/test_ports.py one-for-one, but against CentralStore's
-tenant-scoped `switch_ports` table: discovery, flap-suppressed monitored-port-down,
+org-scoped `switch_ports` table: discovery, flap-suppressed monitored-port-down,
 admin-down silence, folding into the fed device's open outage vs a leading-indicator
 heads-up, recovery, and the WISP_SNMP_ALERTS gate. Temp DB + a recording notifier — no
 real SNMP/network.
@@ -12,28 +12,17 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "src"))
+_TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
+sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
 from wisp.central.ports import CentralPortMonitor
 from wisp.central.store import CentralStore
-from wisp.egress.notifiers import NotifyResult
+from support import RecordingNotifier
 
 TS = "2026-01-01T00:00:00+00:00"
-TENANT = "ispA"
-
-
-class RecordingNotifier:
-    channel = "ntfy"
-
-    def __init__(self):
-        self.sent = []
-
-    def send(self, recipient, title, body, priority):
-        self.sent.append({"recipient": recipient, "title": title,
-                          "body": body, "priority": priority})
-        return NotifyResult(True)
+ORG = "ispA"
 
 
 def _port(idx, oper, admin="up", name=None, alias=None):
@@ -60,22 +49,22 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           snmp_down_consecutive=2)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(TENANT, ntfy_topic_owner="own", ntfy_topic_operator="op")
-        self.switch = self.store.create_org_device(TENANT, {
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.switch = self.store.create_org_device(ORG, {
             "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
             "region": "Rampur", "parent_device_id": None})
-        self.tower = self.store.create_org_device(TENANT, {
+        self.tower = self.store.create_org_device(ORG, {
             "name": "Rampur Tower", "ip_address": "10.0.0.2", "device_type": "backhaul",
             "region": "Rampur", "parent_device_id": None})
         self.notifier = RecordingNotifier()
-        self.pm = CentralPortMonitor(self.store, TENANT, self.notifier, self.cfg)
+        self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _rows(self):
         return {r["if_index"]: r for r in
-               self.store.list_switch_ports(TENANT, self.switch)}
+               self.store.list_switch_ports(ORG, self.switch)}
 
     def _port_id(self, if_index):
         return self._rows()[if_index]["id"]
@@ -83,9 +72,9 @@ class CentralPortMonitorTest(unittest.TestCase):
     def _discover_and_watch(self, if_index, feeds=None):
         self.pm.sync_device(self.switch, [_port(if_index, "up")], TS)
         pid = self._port_id(if_index)
-        self.store.set_port_monitored(TENANT, pid, True)
+        self.store.set_port_monitored(ORG, pid, True)
         if feeds is not None:
-            self.store.set_port_feeds(TENANT, pid, feeds)
+            self.store.set_port_feeds(ORG, pid, feeds)
         return pid
 
     def test_discovery_inserts_unmonitored(self):
@@ -124,11 +113,11 @@ class CentralPortMonitorTest(unittest.TestCase):
 
     def test_folds_into_open_outage(self):
         self._discover_and_watch(2, feeds=self.tower)
-        self.store.open_outage_if_absent(TENANT, self.tower, TS, "DOWN")
+        self.store.open_outage_if_absent(ORG, self.tower, TS, "DOWN")
         self.pm.sync_device(self.switch, [_port(2, "down", alias="-> Rampur Tower")], TS)
         evs = self.pm.sync_device(self.switch, [_port(2, "down", alias="-> Rampur Tower")], TS)
         self.assertEqual([e.folded_into for e in evs], [self.tower])
-        oid = self.store.open_outage_id(TENANT, self.tower)
+        oid = self.store.open_outage_id(ORG, self.tower)
         with self.store._connect() as conn:
             o = conn.execute("SELECT root_cause FROM outages WHERE id=?", (oid,)).fetchone()
         self.assertIn("Port", o["root_cause"])
@@ -167,10 +156,10 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.assertEqual(st["status"], "suppressed")
 
     def test_missing_operator_topic_is_soft_noop(self):
-        self.store.set_org(TENANT, ntfy_topic_operator=None)
+        self.store.set_org(ORG, ntfy_topic_operator=None)
         # set_org COALESCEs, so blank it out directly for this test
         with self.store._connect() as conn:
-            conn.execute("UPDATE orgs SET ntfy_topic_operator=NULL WHERE tenant_id=?", (TENANT,))
+            conn.execute("UPDATE orgs SET ntfy_topic_operator=NULL WHERE org_id=?", (ORG,))
             conn.commit()
         self._discover_and_watch(2)
         self.pm.sync_device(self.switch, [_port(2, "down")], TS)
@@ -190,27 +179,27 @@ class BandwidthTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           snmp_down_consecutive=2, snmp_bw_consecutive=2)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(TENANT, ntfy_topic_owner="own", ntfy_topic_operator="op")
-        self.switch = self.store.create_org_device(TENANT, {
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.switch = self.store.create_org_device(ORG, {
             "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
             "region": "Rampur", "parent_device_id": None})
         self.notifier = RecordingNotifier()
-        self.pm = CentralPortMonitor(self.store, TENANT, self.notifier, self.cfg)
+        self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _row(self, idx=3):
         return {r["if_index"]: r for r in
-               self.store.list_switch_ports(TENANT, self.switch)}[idx]
+               self.store.list_switch_ports(ORG, self.switch)}[idx]
 
     def _watch_bw(self, idx, threshold, direction="either"):
         """Discover the port (baseline counters at TS_SEQ[0]), then watch it + set a
         bw floor."""
         self.pm.sync_device(self.switch, [_pbw(idx, 0, 0)], TS_SEQ[0])
         pid = self._row(idx)["id"]
-        self.store.set_port_monitored(TENANT, pid, True)
-        self.store.set_port_bandwidth_config(TENANT, pid, threshold, direction)
+        self.store.set_port_monitored(ORG, pid, True)
+        self.store.set_port_bandwidth_config(ORG, pid, threshold, direction)
         return pid
 
     def test_throughput_is_computed_from_counter_delta(self):
@@ -280,7 +269,7 @@ class BandwidthTest(unittest.TestCase):
     def test_unmonitored_port_never_bw_alarms(self):
         self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])
         pid = self._row(3)["id"]
-        self.store.set_port_bandwidth_config(TENANT, pid, 10, "either")  # no monitored
+        self.store.set_port_bandwidth_config(ORG, pid, 10, "either")  # no monitored
         for i in (1, 2, 3):
             self.pm.sync_device(self.switch, [_pbw(
                 3, i * 5 * _OCT_PER_MBPS_10S, i * 5 * _OCT_PER_MBPS_10S)], TS_SEQ[i])

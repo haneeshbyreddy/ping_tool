@@ -26,10 +26,10 @@ async function request<T>(path: string, opts: { method?: string; body?: unknown 
   return data as T
 }
 
-// The tenant query param a superadmin uses to scope a read/write to one org; org users
+// The org query param a superadmin uses to scope a read/write to one org; org users
 // are pinned server-side and ignore it, so it's safe to always include when present.
-export function tq(tenant?: string | null): string {
-  return tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""
+export function tq(org?: string | null): string {
+  return org ? `?org=${encodeURIComponent(org)}` : ""
 }
 
 // --- auth -------------------------------------------------------------------------
@@ -42,25 +42,25 @@ export const authApi = {
 
 // --- summary / orgs -----------------------------------------------------------------
 export const summaryApi = {
-  get: (tenant?: string | null) => request<Summary>(`/api/summary${tq(tenant)}`),
+  get: (org?: string | null) => request<Summary>(`/api/summary${tq(org)}`),
 }
 
 export const orgsApi = {
-  list: (tenant?: string | null) => request<{ orgs: Org[] }>(`/api/orgs${tq(tenant)}`),
-  create: (body: { tenant_id: string; name?: string | null }) =>
-    request<{ tenant_id: string }>("/api/orgs", { method: "POST", body }),
+  list: (org?: string | null) => request<{ orgs: Org[] }>(`/api/orgs${tq(org)}`),
+  create: (body: { org_id: string; name?: string | null }) =>
+    request<{ org_id: string }>("/api/orgs", { method: "POST", body }),
   save: (body: {
-    tenant_id: string; name?: string | null
+    org_id: string; name?: string | null
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
-  testAlert: (tenant_id: string, role: Role) =>
+  testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
-      "/api/test-alert", { method: "POST", body: { tenant_id, role } }),
+      "/api/test-alert", { method: "POST", body: { org_id, role } }),
 }
 
 // --- device inventory / topology -----------------------------------------------------
 export interface DevicePayload {
-  tenant_id?: string
+  org_id?: string
   name: string
   ip_address: string
   device_type?: string | null
@@ -70,7 +70,7 @@ export interface DevicePayload {
 }
 
 export const inventoryApi = {
-  list: (tenant?: string | null) => request<{ devices: OrgDevice[] }>(`/api/inventory${tq(tenant)}`),
+  list: (org?: string | null) => request<{ devices: OrgDevice[] }>(`/api/inventory${tq(org)}`),
   create: (body: DevicePayload) => request<{ id: number }>("/api/inventory", { method: "POST", body }),
   update: (id: number, body: DevicePayload) =>
     request<{ ok: boolean }>("/api/inventory/update", { method: "POST", body: { id, ...body } }),
@@ -96,7 +96,7 @@ export const inventoryApi = {
 
 // --- outages / triage ----------------------------------------------------------------
 export const outagesApi = {
-  list: (tenant?: string | null) => request<{ outages: Outage[] }>(`/api/outages${tq(tenant)}`),
+  list: (org?: string | null) => request<{ outages: Outage[] }>(`/api/outages${tq(org)}`),
   acknowledge: (outage_id: number) =>
     request<{ ok: boolean }>("/api/outages/acknowledge", { method: "POST", body: { outage_id } }),
   postmortem: (outage_id: number, root_cause: string, resolution_notes?: string) =>
@@ -106,33 +106,35 @@ export const outagesApi = {
 
 // --- edge node enrollment -------------------------------------------------------------
 export const nodesApi = {
-  list: (tenant?: string | null) => request<{ nodes: NodeToken[] }>(`/api/nodes${tq(tenant)}`),
-  register: (tenant_id: string, node_id: string) =>
-    request<{ node_id: string; token: string }>("/api/nodes", { method: "POST", body: { tenant_id, node_id } }),
-  rotate: (tenant_id: string, node_id: string) =>
-    request<{ node_id: string; token: string }>("/api/nodes/rotate", { method: "POST", body: { tenant_id, node_id } }),
-  revoke: (tenant_id: string, node_id: string) =>
-    request<{ ok: boolean }>("/api/nodes/revoke", { method: "POST", body: { tenant_id, node_id } }),
-  remove: (tenant_id: string, node_id: string) =>
-    request<{ ok: boolean; error?: string }>("/api/nodes/delete", { method: "POST", body: { tenant_id, node_id } }),
+  list: (org?: string | null) => request<{ nodes: NodeToken[] }>(`/api/nodes${tq(org)}`),
+  register: (org_id: string, node_id: string) =>
+    request<{ node_id: string; token: string }>("/api/nodes", { method: "POST", body: { org_id, node_id } }),
+  rotate: (org_id: string, node_id: string) =>
+    request<{ node_id: string; token: string }>("/api/nodes/rotate", { method: "POST", body: { org_id, node_id } }),
+  revoke: (org_id: string, node_id: string) =>
+    request<{ ok: boolean }>("/api/nodes/revoke", { method: "POST", body: { org_id, node_id } }),
+  remove: (org_id: string, node_id: string) =>
+    request<{ ok: boolean; error?: string }>("/api/nodes/delete", { method: "POST", body: { org_id, node_id } }),
 }
 
 // --- team + attendance -----------------------------------------------------------------
 export const teamApi = {
-  list: (tenant?: string | null) => request<{ team: Worker[] }>(`/api/team${tq(tenant)}`),
-  add: (body: { tenant_id: string; name: string; role: Role; region?: string; notes?: string }) =>
+  list: (org?: string | null) => request<{ team: Worker[] }>(`/api/team${tq(org)}`),
+  add: (body: { org_id: string; name: string; role: Role; region?: string; notes?: string }) =>
     request<{ id: number }>("/api/team", { method: "POST", body }),
+  update: (id: number, body: { name?: string; role?: Role; region?: string; notes?: string }) =>
+    request<{ ok: true }>("/api/team/update", { method: "POST", body: { id, ...body } }),
   remove: (id: number) => request<{ ok: true }>("/api/team/delete", { method: "POST", body: { id } }),
-  attendance: (tenant?: string | null) => request<AttendanceOverview>(`/api/attendance${tq(tenant)}`),
+  attendance: (org?: string | null) => request<AttendanceOverview>(`/api/attendance${tq(org)}`),
   setPresent: (worker_id: number, present: boolean, day?: string) =>
     request<{ ok: true }>("/api/attendance", { method: "POST", body: { worker_id, present, day } }),
 }
 
 // --- logs ------------------------------------------------------------------------------
 export const logsApi = {
-  list: (tenant: string | null | undefined, limit = 100, before?: number) => {
+  list: (org: string | null | undefined, limit = 100, before?: number) => {
     const params = new URLSearchParams()
-    if (tenant) params.set("tenant", tenant)
+    if (org) params.set("org", org)
     params.set("limit", String(limit))
     if (before != null) params.set("before", String(before))
     return request<{ events: LogEvent[] }>(`/api/logs?${params.toString()}`)
@@ -141,10 +143,14 @@ export const logsApi = {
 
 // --- user provisioning -------------------------------------------------------------------
 export const usersApi = {
-  list: (tenant?: string | null) => request<{ users: AccountUser[] }>(`/api/users${tq(tenant)}`),
-  create: (body: { tenant_id?: string; username: string; password: string; role: Role }) =>
+  list: (org?: string | null) => request<{ users: AccountUser[] }>(`/api/users${tq(org)}`),
+  create: (body: { org_id?: string; username: string; password: string; role: Role }) =>
     request<{ id: number }>("/api/users", { method: "POST", body }),
   setActive: (id: number, active: boolean) =>
     request<{ ok: true }>("/api/users/deactivate", { method: "POST", body: { id, active } }),
   remove: (id: number) => request<{ ok: true }>("/api/users/delete", { method: "POST", body: { id } }),
+  // Self-service (own account — needs current_password) or an owner/superadmin
+  // resetting a teammate's (pass id, no current_password required).
+  changePassword: (body: { id?: number; current_password?: string; new_password: string }) =>
+    request<{ ok: true }>("/api/users/password", { method: "POST", body }),
 }

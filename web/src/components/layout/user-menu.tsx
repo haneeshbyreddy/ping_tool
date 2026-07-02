@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { useNavigate } from "react-router-dom"
 import { LogOut, Moon, Sun } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { applyTheme, getStoredTheme, type ThemeMode } from "@/lib/theme"
@@ -14,6 +15,7 @@ function initials(name: string): string {
 
 export function UserMenu() {
   const { user, logout } = useAuth()
+  const navigate = useNavigate()
   const [mode, setMode] = useState<ThemeMode>(getStoredTheme())
   if (!user) return null
 
@@ -21,6 +23,11 @@ export function UserMenu() {
     const next = mode === "dark" ? "light" : "dark"
     applyTheme(next)
     setMode(next)
+  }
+
+  const onLogout = async () => {
+    await logout()
+    navigate("/login", { replace: true })
   }
 
   return (
@@ -38,7 +45,7 @@ export function UserMenu() {
         <DropdownMenuLabel>
           <div className="truncate">{user.username}</div>
           <div className="text-xs font-normal text-muted-foreground">
-            {user.is_superadmin ? "Superadmin" : `${user.tenant_id} · ${user.role}`}
+            {user.is_superadmin ? "Superadmin" : `${user.org_name || user.org_id} · ${user.role}`}
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
@@ -46,7 +53,7 @@ export function UserMenu() {
           {mode === "dark" ? <Sun /> : <Moon />}
           {mode === "dark" ? "Light mode" : "Dark mode"}
         </DropdownMenuItem>
-        <DropdownMenuItem variant="destructive" onClick={() => logout()}>
+        <DropdownMenuItem variant="destructive" onClick={() => onLogout()}>
           <LogOut />
           Sign out
         </DropdownMenuItem>

@@ -1,7 +1,7 @@
 """Phase B tests: central runs the brain. Mirrors tests/integration/test_notifiers.py
 (dispatcher policy: dedupe, escalation ladder, ack-vs-recovery, UNREACHABLE suppression)
 and tests/unit/test_state_machine.py (engine correctness), but against CentralStore's
-tenant-scoped tables, plus HTTP-level coverage of the new raw-report ingest endpoints.
+org-scoped tables, plus HTTP-level coverage of the new raw-report ingest endpoints.
 No real ntfy network — a recording notifier double throughout.
 """
 import http.client
@@ -13,8 +13,9 @@ import threading
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "src"))
+_TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
+sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
 from wisp.central import engine as central_engine
@@ -30,24 +31,11 @@ from wisp.core.state_machine import (
     UplinkDown,
     UplinkRestored,
 )
-from wisp.egress.notifiers import NotifyResult
 from wisp.ingress.probers import PingResult
+from support import RecordingNotifier
 
 T0 = "2026-01-01T00:00:00+00:00"
 T_LATER = "2026-01-01T01:30:00+00:00"   # past the first hourly escalation (+60)
-
-
-class RecordingNotifier:
-    channel = "ntfy"
-
-    def __init__(self, ok: bool = True) -> None:
-        self.ok = ok
-        self.sent: list[dict] = []
-
-    def send(self, recipient, title, body, priority) -> NotifyResult:
-        self.sent.append({"recipient": recipient, "title": title,
-                          "body": body, "priority": priority})
-        return NotifyResult(self.ok)
 
 
 def _up(loss=0.0, latency=10.0, jitter=1.0):
@@ -123,7 +111,7 @@ class CentralEngineTest(unittest.TestCase):
         eng = registry.get("ispA")
         self.assertIn(new_dev, eng.meta)
 
-    def test_tenants_have_independent_engines(self):
+    def test_orgs_have_independent_engines(self):
         a = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -134,7 +122,7 @@ class CentralEngineTest(unittest.TestCase):
         for _ in range(3):
             central_engine.run_cycle(self.store, "ispA", registry.get("ispA"),
                                      {"10.0.0.1": _down()}, T0)
-        # ispB never reported anything down — same IP, different tenant, must stay UP
+        # ispB never reported anything down — same IP, different org, must stay UP
         self.assertNotIn(a, self.store.device_states("ispB"))
         self.assertEqual(self.store.device_states("ispA")[a]["state"], DOWN)
 
@@ -358,20 +346,20 @@ class ReportEndpointTest(unittest.TestCase):
         return resp.status, (json.loads(raw) if raw else {})
 
     def _report(self, loss):
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
                 "pings": {"10.0.0.1": {"loss_pct": loss,
                           "latency_ms": None if loss else 5.0}}}
         return self._req("POST", "/report", body)
 
     def test_edge_devices_requires_bearer(self):
-        status, _ = self._req("GET", "/edge/devices?tenant_id=ispA", token=None)
+        status, _ = self._req("GET", "/edge/devices?org_id=ispA", token=None)
         self.assertEqual(status, 401)
 
     def test_edge_devices_returns_topology_and_canary(self):
         self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": "core",
             "region": None, "parent_device_id": None})
-        status, body = self._req("GET", "/edge/devices?tenant_id=ispA")
+        status, body = self._req("GET", "/edge/devices?org_id=ispA")
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["ip_address"], "10.0.0.1")
         self.assertIn("canary_ip", body)
@@ -387,14 +375,14 @@ class ReportEndpointTest(unittest.TestCase):
             "name": "C-unassigned", "ip_address": "10.0.0.3", "device_type": None,
             "region": None, "parent_device_id": None})
 
-        status, body = self._req("GET", "/edge/devices?tenant_id=ispA&node_id=edge-1")
+        status, body = self._req("GET", "/edge/devices?org_id=ispA&node_id=edge-1")
         self.assertEqual(status, 200)
         ips = {d["ip_address"] for d in body["devices"]}
         # edge-1 gets its own assigned device plus the unassigned one, NOT edge-2's.
         self.assertEqual(ips, {"10.0.0.1", "10.0.0.3"})
 
         # Omitting node_id keeps today's unfiltered behavior (older/misconfigured client).
-        status, body = self._req("GET", "/edge/devices?tenant_id=ispA")
+        status, body = self._req("GET", "/edge/devices?org_id=ispA")
         self.assertEqual({d["ip_address"] for d in body["devices"]},
                         {"10.0.0.1", "10.0.0.2", "10.0.0.3"})
 
@@ -412,7 +400,7 @@ class ReportEndpointTest(unittest.TestCase):
         # "missing IP = 100% loss" full pass would have committed B as DOWN by now.
         for _ in range(5):
             status, _ = self._req("POST", "/report", {
-                "v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+                "v": 1, "org_id": "ispA", "node_id": "edge-1",
                 "pings": {"10.0.0.1": {"loss_pct": 0, "latency_ms": 5.0}}})
             self.assertEqual(status, 200)
 
@@ -423,7 +411,7 @@ class ReportEndpointTest(unittest.TestCase):
 
         # edge-2's own report for B works normally.
         status, _ = self._req("POST", "/report", {
-            "v": 1, "tenant_id": "ispA", "node_id": "edge-2",
+            "v": 1, "org_id": "ispA", "node_id": "edge-2",
             "pings": {"10.0.0.2": {"loss_pct": 0, "latency_ms": 5.0}}})
         self.assertEqual(status, 200)
         states = self.store.device_states("ispA")
@@ -450,7 +438,7 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(self.store.device_states("ispA")[1]["state"], "UP")
         self.assertTrue(any("Restored" in s["title"] for s in self.notifier.sent))
 
-    def test_report_tenant_isolation(self):
+    def test_report_org_isolation(self):
         self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -458,7 +446,7 @@ class ReportEndpointTest(unittest.TestCase):
             "name": "B", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
         for _ in range(3):
-            body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+            body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
                     "pings": {"10.0.0.1": {"loss_pct": 100.0}}}
             self._req("POST", "/report", body)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], DOWN)
@@ -466,7 +454,7 @@ class ReportEndpointTest(unittest.TestCase):
 
     # -- fast-confirm round trip, over the real socket --
     def _recheck(self, ip, loss):
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1", "mode": "recheck",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1", "mode": "recheck",
                 "pings": {ip: {"loss_pct": loss, "latency_ms": None if loss else 5.0}}}
         return self._req("POST", "/report", body)
 
@@ -512,7 +500,7 @@ class ReportEndpointTest(unittest.TestCase):
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
         self.store.set_org("ispA", ntfy_topic_owner="a-owner")
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
                 "pings": {"10.0.0.1": {"loss_pct": 100.0},
                          self.cfg.canary_ip: {"loss_pct": 100.0}}}
         status, resp = self._req("POST", "/report", body)
@@ -530,8 +518,8 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertTrue(any("restored" in s["title"].lower() for s in self.notifier.sent))
 
     # -- SNMP port folding, over the real socket (CLAUDE.md item 1) --
-    def _report_with_ports(self, tenant, device_id, ports, ip="10.0.0.9"):
-        body = {"v": 1, "tenant_id": tenant, "node_id": "edge-1",
+    def _report_with_ports(self, org, device_id, ports, ip="10.0.0.9"):
+        body = {"v": 1, "org_id": org, "node_id": "edge-1",
                 "pings": {ip: {"loss_pct": 0.0, "latency_ms": 5.0}},
                 "ports": {str(device_id): ports}}
         return self._req("POST", "/report", body)
@@ -586,7 +574,7 @@ class ReportEndpointTest(unittest.TestCase):
         status, _ = self._req("GET", f"/api/analytics/trend?device_id={dev}", token=None)
         self.assertEqual(status, 401)
 
-    def test_report_ports_ignores_a_device_id_from_another_tenant(self):
+    def test_report_ports_ignores_a_device_id_from_another_org(self):
         self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -595,7 +583,7 @@ class ReportEndpointTest(unittest.TestCase):
             "region": None, "parent_device_id": None})
         port = {"if_index": 1, "if_name": "Gi0/1", "admin_status": "up", "oper_status": "up"}
         # ispA's report claims a device id that actually belongs to ispB — must be a no-op.
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
                 "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}},
                 "ports": {str(other_switch): [port]}}
         status, _ = self._req("POST", "/report", body)
@@ -618,7 +606,7 @@ class ReportEndpointTest(unittest.TestCase):
         self.store.set_org("ispA", ntfy_topic_operator="a-op")
 
         def _report_all(primary_loss):
-            body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-1",
+            body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
                     "pings": {"10.0.0.1": {"loss_pct": primary_loss,
                                           "latency_ms": None if primary_loss else 5.0},
                              "10.0.0.2": {"loss_pct": 0.0, "latency_ms": 5.0},

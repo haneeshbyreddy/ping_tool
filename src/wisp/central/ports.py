@@ -2,7 +2,7 @@
 item 3's SNMP-bandwidth follow-up).
 
 Mirrors the old single-box `egress/ports.py` (`PortMonitor`) one-for-one, ported onto
-`CentralStore`'s tenant-scoped `switch_ports` table + an org's operator ntfy topic
+`CentralStore`'s org-scoped `switch_ports` table + an org's operator ntfy topic
 instead of a fixed per-process `Config`. Three product rules carried over verbatim for
 port STATUS:
 
@@ -139,19 +139,19 @@ class CentralPortMonitor:
     ports that cycle (`central/server.py:_report`, after the ICMP cycle has already
     committed — so `store.open_outage_id` reflects THIS cycle's outages, not last
     cycle's). `device_id`/`feeds_device_id` are `org_devices` ids; the caller is
-    responsible for checking `device_id` belongs to `tenant_id` (via the tenant's own
+    responsible for checking `device_id` belongs to `org_id` (via the org's own
     `EngineRegistry` meta) before this ever runs — this class trusts its input."""
 
-    def __init__(self, store, tenant_id: str, notifier, cfg: Config = CONFIG) -> None:
+    def __init__(self, store, org_id: str, notifier, cfg: Config = CONFIG) -> None:
         self.store = store
-        self.tenant_id = tenant_id
+        self.org_id = org_id
         self.notifier = notifier
         self.cfg = cfg
 
     def sync_device(self, device_id: int, raw_ports: list[dict], ts: str) -> list[PortEvent]:
         cfg = self.cfg
         existing = {r["if_index"]: r for r in
-                   self.store.list_switch_ports(self.tenant_id, device_id)}
+                   self.store.list_switch_ports(self.org_id, device_id)}
         events: list[PortEvent] = []
         for raw in raw_ports:
             p = _to_port_status(raw)
@@ -211,7 +211,7 @@ class CentralPortMonitor:
                        else (prior["bw_alarm_since"] if (prior and bw_alarm) else None))
 
             self.store.upsert_switch_port(
-                self.tenant_id, device_id, p.if_index, p.if_name, p.if_alias,
+                self.org_id, device_id, p.if_index, p.if_name, p.if_alias,
                 p.admin_status, p.oper_status, p.last_change, streak, alarm, since, ts,
                 bw=(p.in_octets, p.out_octets, ts, in_bps, out_bps, bw_streak, bw_alarm,
                    bw_since))
@@ -236,12 +236,12 @@ class CentralPortMonitor:
         folded_into = None
         if feeds is not None:
             fed_name = self._name(feeds)
-            oid = self.store.open_outage_id(self.tenant_id, feeds)
+            oid = self.store.open_outage_id(self.org_id, feeds)
             if oid is not None:
                 # FOLD: enrich the existing outage with the physical cause instead of
                 # raising a separate alarm. ICMP/the FSM still owns the outage record.
                 self.store.stamp_outage_cause(
-                    self.tenant_id, oid, f"Port {label} down (SNMP) -> {fed_name}")
+                    self.org_id, oid, f"Port {label} down (SNMP) -> {fed_name}")
                 folded_into = feeds
                 self._page(f"\U0001f50c Port down — {fed_name}",
                           f"{switch}: monitored port {label} is down (SNMP). This is the "
@@ -296,7 +296,7 @@ class CentralPortMonitor:
 
     # -- glue --
     def _name(self, device_id: int) -> str:
-        dev = self.store.get_org_device(self.tenant_id, device_id)
+        dev = self.store.get_org_device(self.org_id, device_id)
         return dev["name"] if dev else f"#{device_id}"
 
     def _page(self, title: str, body: str, device_id: int, outage_id: int | None,
@@ -308,11 +308,11 @@ class CentralPortMonitor:
         outage that ladder already covers, or stands alone as a one-shot heads-up with
         no ladder of its own; same for a bandwidth edge."""
         gate = self.cfg.snmp_alerts if enabled is None else enabled
-        topic = self.store.org_role_topic(self.tenant_id, "operator")
+        topic = self.store.org_role_topic(self.org_id, "operator")
         if gate and topic:
             res = self.notifier.send(topic, title, body, 3)
             status = "sent" if res.ok else "failed"
         else:
             status = "suppressed"
-        self.store.log_alert(self.tenant_id, outage_id, device_id, self.notifier.channel,
+        self.store.log_alert(self.org_id, outage_id, device_id, self.notifier.channel,
                              topic, status, payload, ts)

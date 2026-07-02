@@ -40,7 +40,7 @@ class CentralWatchdog:
         self.store = store
         self.cfg = cfg
         self.notifier = notifier or build_notifier(cfg)
-        # (tenant, node) -> currently-alarmed?  Seeded lazily from the DB (restart safety).
+        # (org, node) -> currently-alarmed?  Seeded lazily from the DB (restart safety).
         self._alarm: dict[tuple[str, str], bool] = {}
 
     def _alarmed(self, key: tuple[str, str]) -> bool:
@@ -49,47 +49,47 @@ class CentralWatchdog:
         return self._alarm[key]
 
     def check(self, now: datetime | None = None) -> list[tuple[str, str, str]]:
-        """One evaluation across every node. Returns the (tenant, node, 'alarm'|'recover')
+        """One evaluation across every node. Returns the (org, node, 'alarm'|'recover')
         transitions it acted on — so it's safe to call on a fixed timer."""
         now = now or datetime.now(timezone.utc).replace(tzinfo=None)
         threshold = self.cfg.central_node_stale_s
         transitions: list[tuple[str, str, str]] = []
         for row in self.store.node_liveness():
-            tenant, node = row["tenant_id"], row["node_id"]
-            key = (tenant, node)
+            org, node = row["org_id"], row["node_id"]
+            key = (org, node)
             age = max(0.0, (now - _parse(row["last_seen"])).total_seconds())
             stale = age > threshold
             if stale and not self._alarmed(key):
                 if self._page(key, STALE_MARK, age, now):
                     self._alarm[key] = True
-                    transitions.append((tenant, node, "alarm"))
+                    transitions.append((org, node, "alarm"))
                 # send failed -> leave un-alarmed so the next tick retries
             elif not stale and self._alarmed(key):
                 self._page(key, OK_MARK, age, now)
                 self._alarm[key] = False  # clear regardless; OK is informational
-                transitions.append((tenant, node, "recover"))
+                transitions.append((org, node, "recover"))
         return transitions
 
     def _page(self, key: tuple[str, str], mark: str, age: float, now: datetime) -> bool:
-        tenant, node = key
-        topic = self.store.org_topic(tenant) or self.cfg.central_ntfy_topic
+        org, node = key
+        topic = self.store.org_topic(org) or self.cfg.central_ntfy_topic
         mins = int(age // 60)
         if mark == STALE_MARK:
             title = "🚨 EDGE NODE DOWN"
-            body = (f"{tenant}/{node}: no heartbeat in ~{mins}m — the edge box may be down "
+            body = (f"{org}/{node}: no heartbeat in ~{mins}m — the edge box may be down "
                     f"or its WAN cut. Central is blind to this site until it returns.")
             priority = 5
         else:
             title = "✅ Edge node back"
-            body = f"{tenant}/{node}: heartbeats resumed — central is in sync again."
+            body = f"{org}/{node}: heartbeats resumed — central is in sync again."
             priority = 3
         ok = False
         if topic:
             try:
                 ok = self.notifier.send(topic, title, body, priority).ok
             except Exception:
-                log.exception("central watchdog page failed for %s/%s", tenant, node)
-        self.store.record_node_alert(tenant, node, mark, "sent" if ok else "failed",
+                log.exception("central watchdog page failed for %s/%s", org, node)
+        self.store.record_node_alert(org, node, mark, "sent" if ok else "failed",
                                      f"age={int(age)}s",
                                      now.replace(tzinfo=timezone.utc).isoformat(timespec="seconds"))
         return ok
@@ -108,11 +108,11 @@ def start_central_watchdog_thread(cfg: Config = CONFIG, store=None,
                  cfg.central_node_stale_s, interval)
         while True:
             try:
-                for tenant, node, action in wd.check():
+                for org, node, action in wd.check():
                     if action == "alarm":
-                        log.warning("edge node %s/%s appears DOWN — paged the org", tenant, node)
+                        log.warning("edge node %s/%s appears DOWN — paged the org", org, node)
                     else:
-                        log.info("edge node %s/%s resumed — notified the org", tenant, node)
+                        log.info("edge node %s/%s resumed — notified the org", org, node)
             except Exception:
                 log.exception("central watchdog check failed; will retry next tick")
             _time.sleep(interval)

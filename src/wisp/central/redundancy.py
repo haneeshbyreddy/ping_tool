@@ -8,7 +8,7 @@ itself. `core/state_machine.MonitorEngine` already computes this in its full pas
 (`CycleResult.redundancy`) — it was built generically enough in the old single-box tool
 that NOTHING in the engine needed to change to support it here. This module is the
 direct port of the old edge's `AlertDispatcher.redundancy_sweep` onto `CentralStore`'s
-tenant-scoped `device_redundancy` table.
+org-scoped `device_redundancy` table.
 
 Not part of the outage/escalation ladder — on-backup is NOT louder (decision carried
 over verbatim): it never opens an outage, and a node that has itself gone DOWN clears
@@ -21,7 +21,7 @@ from wisp.config import CONFIG, Config
 from wisp.core.state_machine import DOWN_FAMILY
 
 
-def sweep(store, tenant_id: str, eng, redundancy: dict[int, bool],
+def sweep(store, org_id: str, eng, redundancy: dict[int, bool],
          states: dict[int, str], notifier, ts: str, cfg: Config = CONFIG) -> None:
     """`redundancy`/`states` are `CycleResult.redundancy`/`.states` from THIS cycle's
     full pass (`redundancy` is always empty on a recheck — the engine only computes it
@@ -34,17 +34,17 @@ def sweep(store, tenant_id: str, eng, redundancy: dict[int, bool],
         node_down = states.get(dev_id) in DOWN_FAMILY
         eff = bool(on_backup) and not node_down
 
-        prior = store.device_redundancy_state(tenant_id, dev_id)
+        prior = store.device_redundancy_state(org_id, dev_id)
         was = bool(prior["on_backup"]) if prior else False
         # `since` marks when the current on-backup episode began (held across holds).
         since = (ts if (eff and not was)
                 else (prior["primary_down_since"] if (prior and eff) else None))
-        store.write_device_redundancy(tenant_id, dev_id, eff, since, ts)
+        store.write_device_redundancy(org_id, dev_id, eff, since, ts)
 
         if eff == was:
             continue   # no edge — badge refreshed, nobody paged
         if eff:
-            _page(store, tenant_id, notifier, cfg, dev_id,
+            _page(store, org_id, notifier, cfg, dev_id,
                  f"\U0001f501 On backup — {dev.name} ({dev.region})",
                  f"{dev.name} ({dev.ip_address}) lost its primary uplink and is running "
                  f"on a backup path. It's still up, but redundancy is gone — one more "
@@ -52,19 +52,19 @@ def sweep(store, tenant_id: str, eng, redundancy: dict[int, bool],
         elif not node_down:
             # left on-backup because the primary path came back (not because the node
             # itself died) — a clean "redundancy restored" heads-up.
-            _page(store, tenant_id, notifier, cfg, dev_id,
+            _page(store, org_id, notifier, cfg, dev_id,
                  f"✅ Primary restored — {dev.name} ({dev.region})",
                  "Primary uplink is back; running on the primary path again.",
                  "BACKUP_CLEARED", ts)
         # else: node_down -> clear silently; the outage owns the alarm.
 
 
-def _page(store, tenant_id: str, notifier, cfg: Config, device_id: int,
+def _page(store, org_id: str, notifier, cfg: Config, device_id: int,
          title: str, body: str, payload: str, ts: str) -> None:
-    topic = store.org_role_topic(tenant_id, "operator")
+    topic = store.org_role_topic(org_id, "operator")
     if cfg.backup_alerts and topic:
         res = notifier.send(topic, title, body, 3)
         status = "sent" if res.ok else "failed"
     else:
         status = "suppressed"
-    store.log_alert(tenant_id, None, device_id, notifier.channel, topic, status, payload, ts)
+    store.log_alert(org_id, None, device_id, notifier.channel, topic, status, payload, ts)

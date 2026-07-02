@@ -1,5 +1,5 @@
 """Central server (Phase 10 Parts A–C; Phase B raw-report ingest) — ingest + a
-multi-tenant dashboard, pure stdlib.
+multi-org dashboard, pure stdlib.
 
 Two auth planes, deliberately separate:
   * **Ingest** (`POST /ingest`, `/heartbeat`, `/report`, `GET /edge/devices`) —
@@ -15,7 +15,7 @@ Two auth planes, deliberately separate:
     regardless of the other two, so registering one actually means something.
   * **Dashboard** (`/api/*` reads + writes, the SPA) — humans, per-org login accounts with
     identity-carrying signed-cookie sessions (`central/auth.py`). Every dashboard read is
-    **scoped to the caller's tenant**; a superadmin sees all orgs and may pass `?tenant=`.
+    **scoped to the caller's org**; a superadmin sees all orgs and may pass `?org=`.
 
 Writes (team/attendance/users/org) require an owner or a superadmin. Static assets are unauthed
 (the SPA renders its own login gate on a 401), exactly like the edge dashboard. The server
@@ -120,9 +120,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             return self._token_ok()
 
         def _peer_identity(self) -> tuple[str, str] | None:
-            """The (tenant_id, node_id) a verified mTLS client cert claims, or None if
+            """The (org_id, node_id) a verified mTLS client cert claims, or None if
             this connection is plain HTTP / presented no cert / the cert's CN isn't in
-            our `tenant:node` shape. `self.connection` is only an `ssl.SSLSocket` (with
+            our `org:node` shape. `self.connection` is only an `ssl.SSLSocket` (with
             `getpeercert`) when `make_server` wrapped the listener in TLS."""
             getpeercert = getattr(self.connection, "getpeercert", None)
             if getpeercert is None:
@@ -130,19 +130,19 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             return pki.peer_identity(getpeercert())
 
         def _node_token_identity(self) -> tuple[str, str] | None:
-            """The (tenant_id, node_id) a presented bearer authenticates as via a
+            """The (org_id, node_id) a presented bearer authenticates as via a
             dashboard-issued self-service credential (`POST /api/nodes`, `central/
             store.py`'s `node_tokens`) — same derive-identity-from-the-credential
             discipline as `_peer_identity()`, never trust the envelope's claimed
-            tenant/node alone."""
+            org/node alone."""
             presented = self._presented_bearer()
             return store.resolve_node_token(presented) if presented else None
 
-        def _ingest_ok(self, tenant: str, node: str | None = None) -> bool:
+        def _ingest_ok(self, org: str, node: str | None = None) -> bool:
             """Ingest auth: the global bearer token, OR a self-service per-node token
-            claiming this tenant (and node, when known), OR a verified mTLS client cert
+            claiming this org (and node, when known), OR a verified mTLS client cert
             claiming the same (GET /edge/devices has no node in its query, so that check
-            is tenant-only there) — any one of the three satisfies it. If NONE of the
+            is org-only there) — any one of the three satisfies it. If NONE of the
             three is configured/registered at all, ingest stays open (today's trusted-
             network default). But a node that HAS its own registered self-service
             credential is gated on presenting it regardless of whether the global token
@@ -151,14 +151,14 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             if self._token_ok():
                 return True
             node_identity = self._node_token_identity()
-            if (node_identity is not None and node_identity[0] == tenant
+            if (node_identity is not None and node_identity[0] == org
                     and (node is None or node_identity[1] == node)):
                 return True
             cert_identity = self._peer_identity()
-            if (cert_identity is not None and cert_identity[0] == tenant
+            if (cert_identity is not None and cert_identity[0] == org
                     and (node is None or cert_identity[1] == node)):
                 return True
-            if node is not None and store.node_token_registered(tenant, node):
+            if node is not None and store.node_token_registered(org, node):
                 return False
             return not token and not client_ca
 
@@ -168,47 +168,47 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
 
         def _reader(self) -> dict | None:
             """The principal allowed to READ: a logged-in human, OR — for curl/automation —
-            the configured bearer token, treated as a cross-tenant machine superadmin. Writes
+            the configured bearer token, treated as a cross-org machine superadmin. Writes
             never accept the token (they go through real accounts); the token reads only."""
             user = self._user()
             if user:
                 return user
             if token and self._bearer_ok():
-                return {"id": 0, "username": "token", "tenant_id": None,
+                return {"id": 0, "username": "token", "org_id": None,
                         "role": "superadmin", "is_superadmin": True}
             return None
 
-        def _scope_tenant(self, user: dict, qs: dict) -> str | None:
-            """The tenant a request is allowed to read: an org user is pinned to their own
-            tenant; a superadmin sees all (None) or narrows with ?tenant=."""
+        def _scope_org(self, user: dict, qs: dict) -> str | None:
+            """The org a request is allowed to read: an org user is pinned to their own
+            org; a superadmin sees all (None) or narrows with ?org=."""
             if not user["is_superadmin"]:
-                return user["tenant_id"]
-            return (qs.get("tenant") or [None])[0]
+                return user["org_id"]
+            return (qs.get("org") or [None])[0]
 
         @staticmethod
-        def _can_write(user: dict, tenant: str | None) -> bool:
+        def _can_write(user: dict, org: str | None) -> bool:
             if user["is_superadmin"]:
                 return True
-            return user["role"] == "owner" and user["tenant_id"] == tenant
+            return user["role"] == "owner" and user["org_id"] == org
 
         def _envelope(self, body: dict) -> dict | None:
             """Shape-validate an already-read ingest body (see do_POST — auth needs
-            `tenant_id`/`node_id` out of the body first, so reading happens before this)."""
+            `org_id`/`node_id` out of the body first, so reading happens before this)."""
             v = body.get("v")
             if not isinstance(v, int) or v > MAX_WIRE_V:
                 self._reply(400, {"error": f"unsupported envelope version {v!r}"})
                 return None
-            if not body.get("tenant_id") or not body.get("node_id"):
-                self._reply(400, {"error": "missing tenant_id/node_id"})
+            if not body.get("org_id") or not body.get("node_id"):
+                self._reply(400, {"error": "missing org_id/node_id"})
                 return None
             return body
 
         # --- live push (Server-Sent Events) ---
-        def _serve_events(self, tenant: str | None) -> None:
-            """SSE stream: emit a `changed` event whenever `store.data_version(tenant)`
+        def _serve_events(self, org: str | None) -> None:
+            """SSE stream: emit a `changed` event whenever `store.data_version(org)`
             moves, so the dashboard updates the instant an edge reports or an SNMP walk
             lands — no client-side polling. Mirrors the old single-box dashboard's
-            `_serve_events` one-for-one; scoped to the caller's tenant (or every tenant,
+            `_serve_events` one-for-one; scoped to the caller's org (or every org,
             for a superadmin viewing "all orgs"). No Content-Length — the connection
             stays open and the browser's EventSource auto-reconnects."""
             self.close_connection = True
@@ -227,7 +227,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             idle = 0
             while True:
                 try:
-                    version = store.data_version(tenant)
+                    version = store.data_version(org)
                 except Exception:
                     version = last  # a transient DB hiccup must not kill the stream
                 try:
@@ -274,7 +274,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                self._reply(200, {"user": _public_user(user),
+                self._reply(200, {"user": _public_user(user, store),
                                   "channels": {"central": cfg.central_ntfy_topic}})
                 return
             if route == "/api/summary":
@@ -282,34 +282,34 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
-                if not tenant:
-                    self._reply(400, {"error": "tenant required"})
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
                     return
-                self._reply(200, {"uplink_down": store.uplink_active(tenant),
-                                  "low_bandwidth": store.low_bandwidth_alarms(tenant)})
+                self._reply(200, {"uplink_down": store.uplink_active(org),
+                                  "low_bandwidth": store.low_bandwidth_alarms(org)})
                 return
             if route == "/api/events":
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
-                self._serve_events(tenant)
+                org = self._scope_org(user, qs)
+                self._serve_events(org)
                 return
             # Ingest plane (bearer token): what should this edge probe? Phase B — the
             # edge's device list now comes from the ISP-managed org_devices topology
             # (Phase A), not a local dashboard.
             if route == "/edge/devices":
-                tenant = (qs.get("tenant_id") or [None])[0]
-                if not tenant:
-                    self._reply(400, {"error": "tenant_id required"})
+                org = (qs.get("org_id") or [None])[0]
+                if not org:
+                    self._reply(400, {"error": "org_id required"})
                     return
-                if not self._ingest_ok(tenant):
+                if not self._ingest_ok(org):
                     self._reply(401, {"error": "unauthorized"})
                     return
-                devices = store.org_device_topology(tenant)
-                # Device assignment (CLAUDE.md's multi-edge-per-tenant feature): a node
+                devices = store.org_device_topology(org)
+                # Device assignment (CLAUDE.md's multi-edge-per-org feature): a node
                 # only needs to know what IT should probe — unassigned devices (every
                 # node's concern, the default) plus whatever's explicitly assigned to
                 # it. Omitting node_id (older/misconfigured client) keeps today's
@@ -330,11 +330,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 except (TypeError, ValueError):
                     self._reply(400, {"error": "device_id required"})
                     return
-                tenant = store.device_tenant(did)
-                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                self._reply(200, {"ports": store.list_switch_ports(tenant, did)})
+                self._reply(200, {"ports": store.list_switch_ports(org, did)})
                 return
             if route == "/api/inventory/redundancy":
                 user = self._reader()
@@ -346,11 +346,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 except (TypeError, ValueError):
                     self._reply(400, {"error": "device_id required"})
                     return
-                tenant = store.device_tenant(did)
-                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                self._reply(200, {"redundancy": store.device_redundancy_state(tenant, did)})
+                self._reply(200, {"redundancy": store.device_redundancy_state(org, did)})
                 return
             if route == "/api/inventory/perf":
                 user = self._reader()
@@ -362,20 +362,20 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 except (TypeError, ValueError):
                     self._reply(400, {"error": "device_id required"})
                     return
-                tenant = store.device_tenant(did)
-                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                self._reply(200, {"perf": store.device_perf_state(tenant, did)})
+                self._reply(200, {"perf": store.device_perf_state(org, did)})
                 return
             if route == "/api/analytics":
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
-                if not tenant:
-                    self._reply(400, {"error": "tenant required"})
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
                     return
                 try:
                     days = int((qs.get("days") or [30])[0])
@@ -384,7 +384,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 since, until = central_analytics.window(days)
                 self._reply(200, {"since": since, "until": until,
                                   "devices": central_analytics.device_reliability(
-                                      store, tenant, since, until)})
+                                      store, org, since, until)})
                 return
             if route == "/api/analytics/trend":
                 user = self._reader()
@@ -396,8 +396,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 except (TypeError, ValueError):
                     self._reply(400, {"error": "device_id required"})
                     return
-                tenant = store.device_tenant(did)
-                if tenant is None or not (user["is_superadmin"] or user["tenant_id"] == tenant):
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 try:
@@ -407,27 +407,27 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 days = min(days, central_rollup.RETENTION_DAYS)   # nothing older survives
                 since, until = central_analytics.window(days)
                 self._reply(200, {"since": since, "until": until,
-                                  "buckets": store.device_rollup_series(tenant, did, since, until)})
+                                  "buckets": store.device_rollup_series(org, did, since, until)})
                 return
             if route == "/api/outages":
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
-                if not tenant:
-                    self._reply(400, {"error": "tenant required"})
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
                     return
-                self._reply(200, {"outages": store.triage_outages(tenant)})
+                self._reply(200, {"outages": store.triage_outages(org)})
                 return
             if route == "/api/logs":
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
-                if not tenant:
-                    self._reply(400, {"error": "tenant required"})
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
                     return
                 try:
                     limit = int((qs.get("limit") or [100])[0])
@@ -438,7 +438,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     before_id = int(before_raw) if before_raw is not None else None
                 except ValueError:
                     before_id = None
-                self._reply(200, {"events": store.list_events(tenant, limit, before_id)})
+                self._reply(200, {"events": store.list_events(org, limit, before_id)})
                 return
             if route in ("/api/fleet", "/api/orgs", "/api/devices", "/api/inventory",
                          "/api/team", "/api/attendance", "/api/users", "/api/nodes"):
@@ -446,45 +446,45 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
                     return
-                tenant = self._scope_tenant(user, qs)
+                org = self._scope_org(user, qs)
                 if route == "/api/fleet":
-                    self._reply(200, store.fleet(tenant_id=tenant))
+                    self._reply(200, store.fleet(org_id=org))
                 elif route == "/api/orgs":
-                    # store.orgs() is cross-tenant by nature (it's the org directory) — an
+                    # store.orgs() is cross-org by nature (it's the org directory) — an
                     # org user must only ever see their OWN org's row (name/topics included),
-                    # never another tenant's. `tenant` here is already pinned for org users
-                    # (_scope_tenant) and only None for a superadmin with no ?tenant=.
+                    # never another org's. `org` here is already pinned for org users
+                    # (_scope_org) and only None for a superadmin with no ?org=.
                     orgs = store.orgs()
-                    if tenant:
-                        orgs = [o for o in orgs if o["tenant_id"] == tenant]
+                    if org:
+                        orgs = [o for o in orgs if o["org_id"] == org]
                     self._reply(200, {"orgs": orgs})
                 elif route == "/api/devices":
-                    self._reply(200, {"devices": store.devices(tenant_id=tenant)})
+                    self._reply(200, {"devices": store.devices(org_id=org)})
                 elif route == "/api/users":
                     if not user["is_superadmin"] and user["role"] != "owner":
                         self._reply(403, {"error": "forbidden"})
                         return
-                    self._reply(200, {"users": store.list_users(tenant_id=tenant)})
+                    self._reply(200, {"users": store.list_users(org_id=org)})
                 elif route == "/api/team":
-                    if not tenant:
-                        self._reply(400, {"error": "tenant required"})
+                    if not org:
+                        self._reply(400, {"error": "org required"})
                         return
-                    self._reply(200, {"team": store.list_workers(tenant)})
+                    self._reply(200, {"team": store.list_workers(org)})
                 elif route == "/api/inventory":
-                    if not tenant:
-                        self._reply(400, {"error": "tenant required"})
+                    if not org:
+                        self._reply(400, {"error": "org required"})
                         return
-                    self._reply(200, {"devices": store.list_org_devices(tenant)})
+                    self._reply(200, {"devices": store.list_org_devices(org)})
                 elif route == "/api/nodes":
-                    if not tenant:
-                        self._reply(400, {"error": "tenant required"})
+                    if not org:
+                        self._reply(400, {"error": "org required"})
                         return
-                    self._reply(200, {"nodes": store.list_node_tokens(tenant)})
+                    self._reply(200, {"nodes": store.list_node_tokens(org)})
                 else:  # /api/attendance
-                    if not tenant:
-                        self._reply(400, {"error": "tenant required"})
+                    if not org:
+                        self._reply(400, {"error": "org required"})
                         return
-                    self._reply(200, store.attendance_overview(tenant))
+                    self._reply(200, store.attendance_overview(org))
                 return
             if self._serve_static(route):
                 return
@@ -499,28 +499,28 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if body is None or not isinstance(body, dict):
                     self._reply(400, {"error": "bad or missing JSON body"})
                     return
-                # Auth needs the CLAIMED tenant/node to check a presented cert against —
+                # Auth needs the CLAIMED org/node to check a presented cert against —
                 # read before full shape validation so a missing field still 401s (not
                 # 400s) when auth is what actually failed, same precedence as before mTLS.
-                if not self._ingest_ok(body.get("tenant_id"), body.get("node_id")):
+                if not self._ingest_ok(body.get("org_id"), body.get("node_id")):
                     self._reply(401, {"error": "unauthorized"})
                     return
                 env = self._envelope(body)
                 if env is None:
                     return
-                tenant, node = env["tenant_id"], env["node_id"]
+                org, node = env["org_id"], env["node_id"]
                 try:
                     if route == "/ingest":
-                        self._reply(200, {"accepted": store.ingest(tenant, node,
+                        self._reply(200, {"accepted": store.ingest(org, node,
                                                                    env.get("records", []))})
                     elif route == "/heartbeat":
                         body = env.get("body", {})
-                        store.record_heartbeat(tenant, node, body)
-                        self._reply(200, self._heartbeat_reply(tenant, node, body))
+                        store.record_heartbeat(org, node, body)
+                        self._reply(200, self._heartbeat_reply(org, node, body))
                     else:
-                        self._reply(200, self._report(tenant, env))
+                        self._reply(200, self._report(org, env))
                 except Exception:
-                    log.exception("ingest failed for %s/%s", tenant, node)
+                    log.exception("ingest failed for %s/%s", org, node)
                     self._reply(500, {"error": "internal error"})
                 return
             # Dashboard plane (session).
@@ -543,23 +543,23 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 log.exception("dashboard write failed: %s", route)
                 self._reply(500, {"error": "internal error"})
 
-        def _heartbeat_reply(self, tenant: str, node: str, body: dict) -> dict:
+        def _heartbeat_reply(self, org: str, node: str, body: dict) -> dict:
             """The heartbeat reply doubles as the update channel (Part D): advance the org's
             rollout and, if this node is due a newer version, hand it the signed directive."""
             reply: dict = {"ok": True}
             try:
                 from wisp.central import rollout
-                rollout.evaluate(store, tenant, cfg=cfg)
-                directive = rollout.directive_for(store, tenant, node, body.get("version"),
+                rollout.evaluate(store, org, cfg=cfg)
+                directive = rollout.directive_for(store, org, node, body.get("version"),
                                                   body.get("platform"))
                 if directive:
                     reply["update"] = directive
             except Exception:
-                log.exception("rollout directive failed for %s/%s", tenant, node)
+                log.exception("rollout directive failed for %s/%s", org, node)
             return reply
 
-        def _report(self, tenant: str, env: dict) -> dict:
-            """Phase B — one raw-ping report from an edge: run that tenant's
+        def _report(self, org: str, env: dict) -> dict:
+            """Phase B — one raw-ping report from an edge: run that org's
             MonitorEngine one cycle, persist outages + live device_states, and page
             through the org's role topics. `pings` is {ip: {loss_pct, latency_ms,
             jitter_ms}} — the SAME ip-keyed shape `MonitorEngine.process_cycle` already
@@ -586,13 +586,13 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             }
             # Central's own clock, not the edge-reported `ts` — keeps last_seen immune
             # to edge clock drift, same as record_heartbeat/ingest's `now`.
-            store.touch_node(tenant, env.get("node_id", ""))
-            eng = registry.get(tenant)
+            store.touch_node(org, env.get("node_id", ""))
+            eng = registry.get(org)
             mode = env.get("mode") or "full"
             if mode == "recheck":
                 ip_to_id = {d.ip_address: d.id for d in eng.meta.values()}
                 subset = {ip_to_id[ip] for ip in results if ip in ip_to_id}
-                cycle = central_engine.run_cycle(store, tenant, eng, results, ts,
+                cycle = central_engine.run_cycle(store, org, eng, results, ts,
                                                  subset=subset)
             else:
                 # Device assignment: this report only speaks for the reporting node's
@@ -600,11 +600,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # MonitorEngine.process_cycle's expected_ips docstring for why a device
                 # assigned elsewhere must be skipped, not scored 100% loss, when it's
                 # absent from THIS report.
-                expected = store.node_expected_ips(tenant, env.get("node_id", ""))
-                cycle = central_engine.run_cycle(store, tenant, eng, results, ts,
+                expected = store.node_expected_ips(org, env.get("node_id", ""))
+                cycle = central_engine.run_cycle(store, org, eng, results, ts,
                                                  expected_ips=expected)
 
-            disp = CentralAlertDispatcher(store, tenant, eng, notifier, cfg)
+            disp = CentralAlertDispatcher(store, org, eng, notifier, cfg)
             disp.dispatch(cycle.events, ts)
             if mode != "recheck":
                 # Escalation sweeping is time-gated (due_at) and idempotent, but a recheck
@@ -615,19 +615,19 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 # poll_interval_s — see apps/daemon/main.py's _gather_snmp_ports), run
                 # AFTER the ICMP cycle commits so open_outage_id reflects this cycle's
                 # outages, not last cycle's.
-                self._ingest_ports(tenant, eng, env.get("ports"), ts)
+                self._ingest_ports(org, eng, env.get("ports"), ts)
                 # Hourly latency/loss trend rollup (CLAUDE.md item 2, second slice) — full
                 # reports only, so a recheck's rapid re-probe of a suspect subset never
                 # skews an hour's average.
-                central_rollup.record_cycle(store, tenant, eng, cycle, results, ts)
+                central_rollup.record_cycle(store, org, eng, cycle, results, ts)
                 # Per-link performance baseline (CLAUDE.md item 3) — same full-report-only
                 # gating; a recheck's suspect subset isn't a meaningful perf sample.
-                central_perf.record_and_evaluate(store, tenant, eng, cycle, results, ts,
+                central_perf.record_and_evaluate(store, org, eng, cycle, results, ts,
                                                  notifier, cfg)
                 # On-backup redundancy signal (CLAUDE.md item 3) — cycle.redundancy is
                 # only ever populated on a full pass (see MonitorEngine.process_cycle),
                 # so this is a no-op on a recheck even without the mode gate above.
-                central_redundancy.sweep(store, tenant, eng, cycle.redundancy,
+                central_redundancy.sweep(store, org, eng, cycle.redundancy,
                                          cycle.states, notifier, ts, cfg)
 
             reply: dict = {"ok": True}
@@ -636,16 +636,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 reply["recheck"] = recheck
             return reply
 
-        def _ingest_ports(self, tenant: str, eng, ports_by_device, ts: str) -> None:
+        def _ingest_ports(self, org: str, eng, ports_by_device, ts: str) -> None:
             """Fold each reported switch's port readings. `ports_by_device` is
             {"<device_id>": [port dict, ...]} (JSON object keys are always strings on
-            the wire). A device id not in THIS tenant's engine meta is ignored rather
-            than trusted from the body — the same re-derive-tenant-from-what-we-already-
-            know discipline `org_devices` writes use, so tenant A can't attribute a port
-            reading to tenant B's device id."""
+            the wire). A device id not in THIS org's engine meta is ignored rather
+            than trusted from the body — the same re-derive-org-from-what-we-already-
+            know discipline `org_devices` writes use, so org A can't attribute a port
+            reading to org B's device id."""
             if not ports_by_device:
                 return
-            monitor = CentralPortMonitor(store, tenant, notifier, cfg)
+            monitor = CentralPortMonitor(store, org, notifier, cfg)
             for raw_id, ports in ports_by_device.items():
                 try:
                     device_id = int(raw_id)
@@ -656,7 +656,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 try:
                     monitor.sync_device(device_id, ports, ts)
                 except Exception:
-                    log.exception("SNMP port fold failed for %s/device=%d", tenant, device_id)
+                    log.exception("SNMP port fold failed for %s/device=%d", org, device_id)
 
         # --- login ---
         def _login(self):
@@ -674,52 +674,52 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             throttle.reset(ip)
             tok = auth.issue_session(user["id"], cfg)
             cookie = auth.session_cookie(tok, max_age=cfg.session_timeout_h * 3600)
-            self._reply(200, {"user": _public_user(user)}, cookie=cookie)
+            self._reply(200, {"user": _public_user(user, store)}, cookie=cookie)
 
         # --- dashboard writes (owner / superadmin) ---
         def _dashboard_write(self, route: str, user: dict, body: dict):
             # self-service node (edge) enrollment
             if route == "/api/nodes":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 node_id = inventory.clean_node_id(body.get("node_id"))
-                if store.get_node_token_status(tenant, node_id):
+                if store.get_node_token_status(org, node_id):
                     raise inventory.InventoryError(
-                        f"node {node_id!r} is already registered for {tenant!r} — "
+                        f"node {node_id!r} is already registered for {org!r} — "
                         "use rotate instead of registering it again")
-                node_token = store.issue_node_token(tenant, node_id, created_by=user["id"])
+                node_token = store.issue_node_token(org, node_id, created_by=user["id"])
                 self._reply(200, {"node_id": node_id, "token": node_token})
                 return
             if route == "/api/nodes/rotate":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 node_id = inventory.clean_node_id(body.get("node_id"))
-                if not store.get_node_token_status(tenant, node_id):
+                if not store.get_node_token_status(org, node_id):
                     raise inventory.InventoryError(
-                        f"node {node_id!r} isn't registered for {tenant!r} yet")
-                node_token = store.issue_node_token(tenant, node_id, created_by=user["id"])
+                        f"node {node_id!r} isn't registered for {org!r} yet")
+                node_token = store.issue_node_token(org, node_id, created_by=user["id"])
                 self._reply(200, {"node_id": node_id, "token": node_token})
                 return
             if route == "/api/nodes/revoke":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 node_id = inventory.clean_node_id(body.get("node_id"))
-                ok = store.revoke_node_token(tenant, node_id)
+                ok = store.revoke_node_token(org, node_id)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/nodes/delete":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 node_id = inventory.clean_node_id(body.get("node_id"))
-                ok = store.delete_node_token(tenant, node_id)
+                ok = store.delete_node_token(org, node_id)
                 if ok:
                     self._reply(200, {"ok": True})
                 else:
@@ -727,16 +727,25 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             # team
             if route == "/api/team":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                wid = store.add_worker(tenant, body["name"], body.get("role", "operator"),
+                wid = store.add_worker(org, body["name"], body.get("role", "operator"),
                                        body.get("region"), body.get("notes"))
                 self._reply(200, {"id": wid})
                 return
+            if route == "/api/team/update":
+                w = _worker_org(store, body.get("id"))
+                if not self._can_write(user, w):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                fields = {k: body[k] for k in ("name", "role", "region", "notes") if k in body}
+                store.update_worker(int(body["id"]), **fields)
+                self._reply(200, {"ok": True})
+                return
             if route == "/api/team/delete":
-                w = _worker_tenant(store, body.get("id"))
+                w = _worker_org(store, body.get("id"))
                 if not self._can_write(user, w):
                     self._reply(403, {"error": "forbidden"})
                     return
@@ -744,7 +753,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(200, {"ok": True})
                 return
             if route == "/api/attendance":
-                w = _worker_tenant(store, body.get("worker_id"))
+                w = _worker_org(store, body.get("worker_id"))
                 if not self._can_write(user, w):
                     self._reply(403, {"error": "forbidden"})
                     return
@@ -753,21 +762,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(200, {"ok": True})
                 return
             # outage triage: acknowledge (open only) / post-mortem (resolved only) —
-            # tenant is re-derived from the outage row, never trusted from the body
-            # (same discipline as device_tenant/switch_port_tenant/_worker_tenant).
+            # org is re-derived from the outage row, never trusted from the body
+            # (same discipline as device_org/switch_port_org/_worker_org).
             if route == "/api/outages/acknowledge":
                 oid = int(body.get("outage_id") or 0)
-                tenant = store.outage_tenant(oid)
-                if not self._can_write(user, tenant):
+                org = store.outage_org(oid)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                ok = store.acknowledge_outage(tenant, oid, user["username"])
+                ok = store.acknowledge_outage(org, oid, user["username"])
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/outages/postmortem":
                 oid = int(body.get("outage_id") or 0)
-                tenant = store.outage_tenant(oid)
-                if not self._can_write(user, tenant):
+                org = store.outage_org(oid)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 cause = str(body.get("root_cause") or "").strip()
@@ -775,29 +784,29 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(422, {"error": "root_cause is required"})
                     return
                 notes = str(body.get("resolution_notes") or "").strip() or None
-                ok = store.set_outage_postmortem(tenant, oid, cause, notes)
+                ok = store.set_outage_postmortem(org, oid, cause, notes)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
-            # org creation — superadmin only, since a brand-new tenant_id isn't yet
+            # org creation — superadmin only, since a brand-new org_id isn't yet
             # anyone's own org for `_can_write`'s owner branch to match against.
             if route == "/api/orgs":
                 if not user["is_superadmin"]:
                     self._reply(403, {"error": "forbidden"})
                     return
-                tenant = inventory.clean_tenant_id(body.get("tenant_id"))
-                if store.org_exists(tenant):
-                    self._reply(409, {"error": f"org {tenant!r} already exists"})
+                org = inventory.clean_org_id(body.get("org_id"))
+                if store.org_exists(org):
+                    self._reply(409, {"error": f"org {org!r} already exists"})
                     return
-                store.set_org(tenant, name=body.get("name"))
-                self._reply(200, {"tenant_id": tenant})
+                store.set_org(org, name=body.get("name"))
+                self._reply(200, {"org_id": org})
                 return
             # org rename / topics (owner of that org, or superadmin)
             if route == "/api/org":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                store.set_org(tenant, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
+                store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                               ntfy_topic_owner=body.get("ntfy_topic_owner"),
                               ntfy_topic_operator=body.get("ntfy_topic_operator"),
                               ntfy_topic_tech=body.get("ntfy_topic_tech"))
@@ -805,92 +814,92 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             # send a test push to one of an org's three role channels (Settings go-live check)
             if route == "/api/test-alert":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 role = str(body.get("role") or "").strip().lower()
                 if role not in ("owner", "operator", "tech"):
                     self._reply(422, {"error": "role must be one of: owner, operator, tech"})
                     return
-                topic = store.org_role_topic(tenant, role)
+                topic = store.org_role_topic(org, role)
                 if not topic:
                     self._reply(422, {"error": f"no {role} channel configured — set it in "
                                                  "Settings first"})
                     return
                 res = notifier.send(topic, "✅ WISP Central test alert",
-                                    f"This is a test alert for {tenant}'s {role} channel.", 3)
+                                    f"This is a test alert for {org}'s {role} channel.", 3)
                 self._reply(200, {"ok": res.ok, "detail": res.detail, "channel": notifier.channel,
                                   "recipient": topic, "role": role})
                 return
             # device inventory (the org's topology; owner of that org, or superadmin)
             if route == "/api/inventory":
-                tenant = body.get("tenant_id") or user["tenant_id"]
-                if not self._can_write(user, tenant):
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 clean = inventory.clean_device_payload(
-                    body, parents=store.org_device_parent_map(tenant), device_id=None,
-                    registered_nodes=store.registered_node_ids(tenant))
-                did = store.create_org_device(tenant, clean)
+                    body, parents=store.org_device_parent_map(org), device_id=None,
+                    registered_nodes=store.registered_node_ids(org))
+                did = store.create_org_device(org, clean)
                 self._reply(200, {"id": did})
                 return
             if route == "/api/inventory/update":
                 did = int(body.get("id") or 0)
-                tenant = store.device_tenant(did)
-                if not self._can_write(user, tenant):
+                org = store.device_org(did)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                parents = store.org_device_parent_map(tenant)
+                parents = store.org_device_parent_map(org)
                 clean = inventory.clean_device_payload(
                     body, parents=parents, device_id=did,
-                    registered_nodes=store.registered_node_ids(tenant))
-                ok = store.update_org_device(tenant, did, clean)
+                    registered_nodes=store.registered_node_ids(org))
+                ok = store.update_org_device(org, did, clean)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/delete":
                 did = int(body.get("id") or 0)
-                tenant = store.device_tenant(did)
-                if not self._can_write(user, tenant):
+                org = store.device_org(did)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                result = store.delete_org_device(tenant, did)
+                result = store.delete_org_device(org, did)
                 self._reply(200 if result["ok"] else 409, result)
                 return
             if route == "/api/inventory/maintenance":
                 did = int(body.get("id") or 0)
-                tenant = store.device_tenant(did)
-                if not self._can_write(user, tenant):
+                org = store.device_org(did)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                ok = store.set_org_device_maintenance(tenant, did, bool(body.get("on")))
+                ok = store.set_org_device_maintenance(org, did, bool(body.get("on")))
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/snmp":
                 did = int(body.get("id") or 0)
-                tenant = store.device_tenant(did)
-                if not self._can_write(user, tenant):
+                org = store.device_org(did)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 clean = inventory.clean_snmp_payload(body)
-                ok = store.set_org_device_snmp(tenant, did, clean)
+                ok = store.set_org_device_snmp(org, did, clean)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             # SNMP port folding config (central/ports.py): which discovered ports
             # actually alarm, and which downstream device a monitored port feeds.
             if route == "/api/inventory/ports/monitored":
                 pid = int(body.get("id") or 0)
-                tenant = store.switch_port_tenant(pid)
-                if not self._can_write(user, tenant):
+                org = store.switch_port_org(pid)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                ok = store.set_port_monitored(tenant, pid, bool(body.get("on")))
+                ok = store.set_port_monitored(org, pid, bool(body.get("on")))
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/ports/feeds":
                 pid = int(body.get("id") or 0)
-                tenant = store.switch_port_tenant(pid)
-                if not self._can_write(user, tenant):
+                org = store.switch_port_org(pid)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 feeds_raw = body.get("feeds_device_id")
@@ -901,58 +910,58 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     except (TypeError, ValueError):
                         self._reply(422, {"error": "feeds_device_id must be a number"})
                         return
-                    if store.device_tenant(feeds) != tenant:
+                    if store.device_org(feeds) != org:
                         self._reply(422, {"error": "feeds device must belong to the same org"})
                         return
-                ok = store.set_port_feeds(tenant, pid, feeds)
+                ok = store.set_port_feeds(org, pid, feeds)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/ports/bandwidth":
                 pid = int(body.get("id") or 0)
-                tenant = store.switch_port_tenant(pid)
-                if not self._can_write(user, tenant):
+                org = store.switch_port_org(pid)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
                 clean = inventory.clean_port_bandwidth_payload(body)
                 ok = store.set_port_bandwidth_config(
-                    tenant, pid, clean["threshold_mbps"], clean["direction"])
+                    org, pid, clean["threshold_mbps"], clean["direction"])
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             # graph topology: backup (redundancy) parent edges (CLAUDE.md item 3)
             if route == "/api/inventory/links":
                 child_id = int(body.get("child_id") or 0)
                 parent_id = int(body.get("parent_id") or 0)
-                tenant = store.device_tenant(child_id)
-                if not self._can_write(user, tenant):
+                org = store.device_org(child_id)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                if store.device_tenant(parent_id) != tenant:
+                if store.device_org(parent_id) != org:
                     self._reply(422, {"error": "backup parent must belong to the same org"})
                     return
-                parents = store.org_device_parent_map(tenant)
-                backups = store.org_device_backup_map(tenant)
+                parents = store.org_device_parent_map(org)
+                backups = store.org_device_backup_map(org)
                 inventory.clean_backup_link(child_id, parent_id, parents=parents,
                                             backups=backups)
-                store.create_backup_link(tenant, child_id, parent_id)
+                store.create_backup_link(org, child_id, parent_id)
                 self._reply(200, {"ok": True})
                 return
             if route == "/api/inventory/links/delete":
                 child_id = int(body.get("child_id") or 0)
                 parent_id = int(body.get("parent_id") or 0)
-                tenant = store.device_tenant(child_id)
-                if not self._can_write(user, tenant):
+                org = store.device_org(child_id)
+                if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
-                ok = store.delete_backup_link(tenant, child_id, parent_id)
+                ok = store.delete_backup_link(org, child_id, parent_id)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             # user provisioning: superadmin anywhere; an owner within their own org
             if route == "/api/users":
-                tenant = body.get("tenant_id") if user["is_superadmin"] else user["tenant_id"]
+                org = body.get("org_id") if user["is_superadmin"] else user["org_id"]
                 if not (user["is_superadmin"] or user["role"] == "owner"):
                     self._reply(403, {"error": "forbidden"})
                     return
-                uid = auth.create_user(store, tenant, body.get("username", ""),
+                uid = auth.create_user(store, org, body.get("username", ""),
                                        body.get("password", ""), body.get("role", "operator"))
                 self._reply(200, {"id": uid})
                 return
@@ -961,7 +970,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 target = store.get_user(int(body["id"]))
-                if target and (user["is_superadmin"] or target["tenant_id"] == user["tenant_id"]):
+                if target and (user["is_superadmin"] or target["org_id"] == user["org_id"]):
                     store.set_user_active(int(body["id"]), bool(body.get("active", False)))
                     self._reply(200, {"ok": True})
                 else:
@@ -976,30 +985,51 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(422, {"error": "cannot delete your own account"})
                     return
                 target = store.get_user(target_id)
-                if target and (user["is_superadmin"] or target["tenant_id"] == user["tenant_id"]):
+                if target and (user["is_superadmin"] or target["org_id"] == user["org_id"]):
                     store.delete_user(target_id)
                     self._reply(200, {"ok": True})
                 else:
                     self._reply(403, {"error": "forbidden"})
+                return
+            # Self-service (own account, current password required) or an owner/superadmin
+            # resetting someone else's (no current password needed — same trust level as
+            # deactivate/delete above).
+            if route == "/api/users/password":
+                target_id = int(body.get("id") or user["id"])
+                if target_id == user["id"]:
+                    if not auth.verify_login(store, user["username"], body.get("current_password", "")):
+                        self._reply(422, {"error": "current password is incorrect"})
+                        return
+                else:
+                    if not (user["is_superadmin"] or user["role"] == "owner"):
+                        self._reply(403, {"error": "forbidden"})
+                        return
+                    target = store.get_user(target_id)
+                    if not target or not (user["is_superadmin"] or target["org_id"] == user["org_id"]):
+                        self._reply(403, {"error": "forbidden"})
+                        return
+                auth.set_password(store, target_id, body.get("new_password", ""))
+                self._reply(200, {"ok": True})
                 return
             self._reply(404, {"error": "not found"})
 
     return Handler
 
 
-def _public_user(user: dict) -> dict:
-    return {"id": user["id"], "username": user["username"], "tenant_id": user["tenant_id"],
-            "role": user["role"], "is_superadmin": user["tenant_id"] is None}
+def _public_user(user: dict, store: CentralStore) -> dict:
+    org_name = store.org_name(user["org_id"]) if user["org_id"] else None
+    return {"id": user["id"], "username": user["username"], "org_id": user["org_id"],
+            "org_name": org_name, "role": user["role"], "is_superadmin": user["org_id"] is None}
 
 
-def _worker_tenant(store: CentralStore, worker_id) -> str | None:
-    """The tenant a worker belongs to (so a write is authorized against the right org)."""
+def _worker_org(store: CentralStore, worker_id) -> str | None:
+    """The org a worker belongs to (so a write is authorized against the right org)."""
     if worker_id is None:
         return None
     with store._connect() as conn:  # read-only; the write that follows takes the lock
-        row = conn.execute("SELECT tenant_id FROM org_workers WHERE id=?",
+        row = conn.execute("SELECT org_id FROM org_workers WHERE id=?",
                            (int(worker_id),)).fetchone()
-    return row["tenant_id"] if row else None
+    return row["org_id"] if row else None
 
 
 class _TLSThreadingHTTPServer(ThreadingHTTPServer):

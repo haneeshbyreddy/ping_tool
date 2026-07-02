@@ -9,7 +9,7 @@ whatever box an operator runs the admin CLI from (true of essentially every Linu
 box); central/server.py's request-time verification uses only the stdlib `ssl` module,
 so the *server* itself stays dependency-free exactly as before.
 
-Identity encoding: an edge's client cert's CommonName is `<tenant_id>:<node_id>` —
+Identity encoding: an edge's client cert's CommonName is `<org_id>:<node_id>` —
 `peer_identity()` is the decode side central/server.py calls against a verified
 `ssl.SSLSocket.getpeercert()`.
 """
@@ -63,7 +63,7 @@ def issue_cert(pki_dir: Path, common_name: str, out_key: Path, out_cert: Path, *
     """Issue a cert for `common_name` signed by the CA under `pki_dir` (created via
     `ensure_ca` if missing), written to `out_key`/`out_cert`.
 
-    Used for both an edge's client cert (CN=`tenant:node`, no SAN needed — a client
+    Used for both an edge's client cert (CN=`org:node`, no SAN needed — a client
     cert is never hostname-checked) and central's own server cert (`san` should cover
     whatever host/IP `WISP_CENTRAL_URL` resolves to, so edges can verify it without
     disabling hostname checking)."""
@@ -90,14 +90,14 @@ def issue_cert(pki_dir: Path, common_name: str, out_key: Path, out_cert: Path, *
     out_key.chmod(0o600)
 
 
-def edge_common_name(tenant_id: str, node_id: str) -> str:
-    return f"{tenant_id}:{node_id}"
+def edge_common_name(org_id: str, node_id: str) -> str:
+    return f"{org_id}:{node_id}"
 
 
 def peer_identity(peer_cert: dict | None) -> tuple[str, str] | None:
     """Decode a verified client cert's CommonName (from `ssl.SSLSocket.getpeercert()`)
-    back into `(tenant_id, node_id)`. None if there's no cert, or its CN isn't in our
-    `tenant:node` shape (e.g. a cert issued for something else entirely)."""
+    back into `(org_id, node_id)`. None if there's no cert, or its CN isn't in our
+    `org:node` shape (e.g. a cert issued for something else entirely)."""
     if not peer_cert:
         return None
     cn = None
@@ -107,5 +107,5 @@ def peer_identity(peer_cert: dict | None) -> tuple[str, str] | None:
                 cn = value
     if not cn or ":" not in cn:
         return None
-    tenant, _, node = cn.partition(":")
-    return (tenant, node) if tenant and node else None
+    org, _, node = cn.partition(":")
+    return (org, node) if org and node else None

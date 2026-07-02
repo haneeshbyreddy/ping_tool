@@ -9,32 +9,20 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "src"))
+_TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
+sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
 from wisp.central.store import CentralStore
 from wisp.central.watchdog import CentralWatchdog, STALE_MARK
-from wisp.egress.notifiers import NotifyResult
+from support import RecordingNotifier
 
 NOW = datetime(2026, 1, 1, 12, 0, 0)  # naive UTC
 
 
 def _iso(dt: datetime) -> str:
     return dt.replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
-
-
-class RecordingNotifier:
-    channel = "ntfy"
-
-    def __init__(self, ok: bool = True) -> None:
-        self.ok = ok
-        self.sent: list[dict] = []
-
-    def send(self, recipient, title, body, priority) -> NotifyResult:
-        self.sent.append({"recipient": recipient, "title": title,
-                          "body": body, "priority": priority})
-        return NotifyResult(self.ok)
 
 
 class CentralWatchdogTest(unittest.TestCase):
@@ -47,12 +35,12 @@ class CentralWatchdogTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _seen(self, tenant, node, age_s, **org):
+    def _seen(self, org_id, node, age_s, **org_kwargs):
         """Register a node whose last heartbeat was age_s ago."""
-        self.store.record_heartbeat(tenant, node, {"fleet_size": 1},
+        self.store.record_heartbeat(org_id, node, {"fleet_size": 1},
                                     now=_iso(NOW - timedelta(seconds=age_s)))
-        if org:
-            self.store.set_org(tenant, **org)
+        if org_kwargs:
+            self.store.set_org(org_id, **org_kwargs)
 
     def _wd(self, notifier):
         return CentralWatchdog(self.store, self.cfg, notifier)

@@ -1,16 +1,16 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
-import { TriangleAlert, ArrowDown } from "lucide-react"
+import { ArrowDown } from "lucide-react"
 import { summaryApi } from "@/lib/api"
 import { useAuth } from "@/hooks/use-auth"
 import { cn } from "@/lib/utils"
 
 export function AlarmChips() {
-  const { scopeTenant } = useAuth()
+  const { scopeOrg } = useAuth()
   const { data } = useQuery({
-    queryKey: ["summary", scopeTenant],
-    queryFn: () => summaryApi.get(scopeTenant),
-    enabled: !!scopeTenant,
+    queryKey: ["summary", scopeOrg],
+    queryFn: () => summaryApi.get(scopeOrg),
+    enabled: !!scopeOrg,
     refetchInterval: 30_000,
   })
 
@@ -19,22 +19,6 @@ export function AlarmChips() {
 
   return (
     <div className="flex items-center gap-2">
-      {data.uplink_down && (
-        <Link
-          to="/outages"
-          className={cn(
-            "flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-semibold",
-            "border-destructive/30 bg-destructive-soft text-destructive",
-          )}
-        >
-          <span className="relative flex size-1.5">
-            <span className="absolute inline-flex size-full animate-ping rounded-full bg-destructive opacity-75" />
-            <span className="relative inline-flex size-1.5 rounded-full bg-destructive" />
-          </span>
-          <TriangleAlert className="size-3.5" />
-          <span className="hidden sm:inline">Uplink down</span>
-        </Link>
-      )}
       {lowBw > 0 && (
         <Link
           to="/topology"

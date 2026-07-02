@@ -1,16 +1,13 @@
 import { useState } from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { useAuth } from "@/hooks/use-auth"
 import { outagesApi, ApiError } from "@/lib/api"
 import type { Outage, OutageStatus } from "@/lib/types"
 import { ROOT_CAUSES } from "@/lib/types"
-import { NeedsOrg } from "@/components/needs-org"
 import { durationSince, fmtDur, toUtcDate } from "@/lib/format"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Skeleton } from "@/components/ui/skeleton"
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
@@ -29,7 +26,7 @@ function OutageDuration({ outage }: { outage: Outage }) {
   return <span className="font-mono text-xs font-semibold text-destructive">{durationSince(outage.started_at)}</span>
 }
 
-function OutageCard({ outage }: { outage: Outage }) {
+export function OutageCard({ outage }: { outage: Outage }) {
   const queryClient = useQueryClient()
   const [closing, setClosing] = useState(false)
   const [rootCause, setRootCause] = useState("")
@@ -117,36 +114,5 @@ function OutageCard({ outage }: { outage: Outage }) {
         )}
       </CardContent>
     </Card>
-  )
-}
-
-export function OutagesPage() {
-  const { scopeTenant } = useAuth()
-  const { data, isLoading } = useQuery({
-    queryKey: ["outages", scopeTenant],
-    queryFn: () => outagesApi.list(scopeTenant),
-    enabled: !!scopeTenant,
-  })
-
-  if (!scopeTenant) return <NeedsOrg />
-
-  const outages = data?.outages ?? []
-  const openCount = outages.filter((o) => !o.resolved_at).length
-
-  return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-3 p-4 md:p-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">Triage queue</h1>
-        <span className="rounded-full border bg-card px-2.5 py-1 text-[11.5px] font-bold text-muted-foreground">
-          {openCount} open
-        </span>
-      </div>
-
-      {isLoading && <Skeleton className="h-24 w-full" />}
-      {!isLoading && outages.length === 0 && (
-        <p className="py-16 text-center text-sm text-muted-foreground">Nothing needs triage right now.</p>
-      )}
-      {outages.map((o) => <OutageCard key={o.id} outage={o} />)}
-    </div>
   )
 }

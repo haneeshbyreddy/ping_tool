@@ -101,7 +101,7 @@ class PeerIdentityTest(unittest.TestCase):
         self.assertIsNone(pki.peer_identity(None))
         self.assertIsNone(pki.peer_identity({}))
 
-    def test_decodes_tenant_node_cn(self):
+    def test_decodes_org_node_cn(self):
         cert = {"subject": ((("commonName", "ispA:edge-1"),),)}
         self.assertEqual(pki.peer_identity(cert), ("ispA", "edge-1"))
 

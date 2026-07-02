@@ -1,8 +1,8 @@
 # Village WISP Monitor
 
-Multi-tenant network monitoring + alerting for rural WiFi ISPs. **Central runs the
+Multi-org network monitoring + alerting for rural WiFi ISPs. **Central runs the
 brain** — FSM, topology-aware suppression, fast-confirm detection, the ntfy alerting
-ladder, multi-tenant dashboard — for every tenant it serves. Each ISP's **edge box is a
+ladder, multi-org dashboard — for every org it serves. Each ISP's **edge box is a
 thin probe**: real ICMP, reports raw results to central, no local DB/dashboard/FSM of
 its own. See `CLAUDE.md` for design rationale, status, and invariants.
 
@@ -43,9 +43,9 @@ section for the architecture). Pages:
   topic per role, set in **Settings**. Also carries daily operator attendance.
 - **Settings** — org name, the three role ntfy topics + a test-alert button, and login
   account provisioning (owner/superadmin only).
-- **Logs** — the full tenant event history, cursor-paginated.
+- **Logs** — the full org event history, cursor-paginated.
 - **Accounts** — central-provisioned only: a superadmin onboards each ISP
-  (`central.admin create-superadmin`/`create-user`); org users see only their tenant.
+  (`central.admin create-superadmin`/`create-user`); org users see only their org.
 
 ## Layout
 
@@ -79,7 +79,7 @@ run.sh
 - **Fast-confirm** — central names a suspect IP in its `/report` reply; the edge
   re-probes just that IP every `WISP_RETRY_INTERVAL_S` until confirmed/cleared —
   detection in seconds, not `poll_interval × down_consecutive`.
-- **Uplink canary** — edge's own internet down → central freezes that tenant's cycle,
+- **Uplink canary** — edge's own internet down → central freezes that org's cycle,
   sends one `UPLINK_DOWN` instead of a storm.
 - **Topology suppression** — a child is `UNREACHABLE` (silent) only when every parent
   (primary + backup) is down; any live parent means a real fault, still pages.
@@ -100,18 +100,18 @@ run.sh
 - **Scales without lying** — bounded probe fan-out (`WISP_MAX_INFLIGHT`) and gentle
   infra probing (`WISP_PINGS_PER_POLL_INFRA`) keep a large fleet from faking a mass
   outage or reading rate-limiting as loss.
-- **Multi-tenant, always** — every read/write is tenant-scoped; a superadmin can narrow
-  with `?tenant=`.
+- **Multi-org, always** — every read/write is org-scoped; a superadmin can narrow
+  with `?org=`.
 
 ## Central + edge setup
 
 ```bash
 WISP_CENTRAL_TOKEN=s3cret python apps/central/main.py --host 0.0.0.0 --port 8443
 PYTHONPATH=src python -m wisp.central.admin create-superadmin --username you
-PYTHONPATH=src python -m wisp.central.admin create-user --tenant ispA --username asha --role owner
+PYTHONPATH=src python -m wisp.central.admin create-user --org ispA --username asha --role owner
 
 WISP_CENTRAL_BRAIN=1 WISP_CENTRAL_URL=https://central.example.net WISP_CENTRAL_TOKEN=s3cret \
-WISP_TENANT_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
+WISP_ORG_ID=ispA WISP_NODE_ID=edge-a1 python apps/daemon/main.py
 ```
 
 Put a TLS terminator (nginx/Caddy) in front of central, or let it terminate TLS itself
@@ -121,7 +121,7 @@ default to stay dependency-free.
 **mTLS enrollment** (alternative to the bearer token; either or both can be active):
 ```bash
 PYTHONPATH=src python -m wisp.central.admin init-ca --host central.example.net
-PYTHONPATH=src python -m wisp.central.admin enroll-edge --tenant ispA --node edge-a1
+PYTHONPATH=src python -m wisp.central.admin enroll-edge --org ispA --node edge-a1
 ```
 Each command prints the env vars to set on its respective side.
 
@@ -132,10 +132,10 @@ health-gated rollout:
 ```bash
 PYTHONPATH=src python -m wisp.central.admin publish-release --version 0.11.0 \
     --artifact linux-amd64 https://.../wisp-edge-linux-amd64 <sha256>
-PYTHONPATH=src python -m wisp.central.admin start-rollout --tenant ispA --version 0.11.0 --canary edge-a1
-PYTHONPATH=src python -m wisp.central.admin rollout-status --tenant ispA
+PYTHONPATH=src python -m wisp.central.admin start-rollout --org ispA --version 0.11.0 --canary edge-a1
+PYTHONPATH=src python -m wisp.central.admin rollout-status --org ispA
 ```
-Install: `curl … | sudo sh -s -- --central … --token … --tenant … --node …`
+Install: `curl … | sudo sh -s -- --central … --token … --org … --node …`
 (`deploy/install-edge.sh`) or `deploy/install-edge.ps1` on Windows — see "Going live"
 below. Both are the only supported install path (no separate single-box mode). CI
 (`.github/workflows/release.yml`) builds+tests every push/PR; on a `v*` tag it also
@@ -157,7 +157,7 @@ Full list + defaults: `src/wisp/config.py`. The ones worth knowing up front:
 | `WISP_ESCALATE_EVERY_MIN` | `60` | minutes between all-hands re-pages |
 | `WISP_CENTRAL_BRAIN` / `_URL` / `_TOKEN` | `0` / — / — | edge mode switch + central address + ingest auth |
 | `WISP_CENTRAL_CLIENT_CERT`/`_KEY`/`_CA_CERT` | — | edge's mTLS identity (from `enroll-edge`) |
-| `WISP_TENANT_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity |
+| `WISP_ORG_ID` / `WISP_NODE_ID` | `default` / hostname | edge identity |
 | `WISP_CENTRAL_DB` / `_BIND` / `_PORT` | `data/central.db` / `0.0.0.0` / `8443` | central store + listen address |
 | `WISP_CENTRAL_TLS_CERT`/`_KEY`/`_CLIENT_CA` | — | central-terminated TLS + mTLS verification |
 | `WISP_CENTRAL_NODE_STALE_S` | `180` | fleet-watchdog staleness threshold |
@@ -175,9 +175,9 @@ just to ping correctly, buying no real isolation for an extra moving part.
 1. On the edge box, run the fleet installer with your enrollment token:
    ```bash
    curl -fsSL https://YOUR-CENTRAL/install-edge.sh | sudo sh -s -- \
-       --central https://central.example.net --token <ENROLL> --tenant ispA --node edge-a1
+       --central https://central.example.net --token <ENROLL> --org ispA --node edge-a1
    ```
-   (Windows: `deploy/install-edge.ps1 -Central … -Token … -Tenant … -Node …`, run
+   (Windows: `deploy/install-edge.ps1 -Central … -Token … -Org … -Node …`, run
    elevated.) This detects arch, verifies sha256 (+ minisign/Authenticode if published),
    installs the agent + supervisor under `/opt/wisp` (`Program Files` on Windows),
    writes identity/config to `/etc/wisp` (untouched by future updates), enables

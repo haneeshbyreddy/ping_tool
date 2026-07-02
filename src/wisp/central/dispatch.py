@@ -1,6 +1,6 @@
 """Phase B — central alerting: the same policy the edge's now-deleted `AlertDispatcher`
 used to run (Phase C removed it from `egress/notifiers.py` along with the edge's local
-FSM), ported to run against `CentralStore`'s tenant-scoped tables and an org's three role
+FSM), ported to run against `CentralStore`'s org-scoped tables and an org's three role
 topics instead of a fixed per-process config.
 
 Deliberately NOT a subclass or a shared base with that old edge dispatcher — the two had
@@ -51,16 +51,16 @@ def _plus_minutes(ts: str, minutes: int) -> str:
 
 
 class CentralAlertDispatcher:
-    def __init__(self, store, tenant_id: str, engine: MonitorEngine, notifier,
+    def __init__(self, store, org_id: str, engine: MonitorEngine, notifier,
                 cfg: Config = CONFIG) -> None:
         self.store = store
-        self.tenant_id = tenant_id
+        self.org_id = org_id
         self.engine = engine
         self.notifier = notifier
         self.cfg = cfg
 
     def _topic(self, role: str) -> str | None:
-        return self.store.org_role_topic(self.tenant_id, role)
+        return self.store.org_role_topic(self.org_id, role)
 
     def _publish(self, role: str, title: str, body: str, priority: int) -> NotifyResult:
         """Send to a role's channel, with a copy to the operator channel (operators get
@@ -89,11 +89,11 @@ class CentralAlertDispatcher:
         return primary
 
     def _log(self, outage_id, device_id, recipient, status, payload, ts) -> None:
-        self.store.log_alert(self.tenant_id, outage_id, device_id, self.notifier.channel,
+        self.store.log_alert(self.org_id, outage_id, device_id, self.notifier.channel,
                              recipient, status, payload, ts)
 
     def _record(self, device_id, recipient, status, payload, ts) -> None:
-        oid = self.store.open_outage_id(self.tenant_id, device_id)
+        oid = self.store.open_outage_id(self.org_id, device_id)
         self._log(oid, device_id, recipient, status, payload, ts)
 
     # -- public API: called once per report, after engine.py's process_report --
@@ -120,7 +120,7 @@ class CentralAlertDispatcher:
                          "UNREACHABLE (parent down)", ts)
             return
 
-        oid = self.store.open_outage_id(self.tenant_id, ev.device_id)
+        oid = self.store.open_outage_id(self.org_id, ev.device_id)
         if oid is None:
             return   # apply_events already ran; shouldn't happen, but don't page a ghost
         recipient = self._topic("owner")
@@ -133,20 +133,20 @@ class CentralAlertDispatcher:
         body = f"No ping response from {dev.ip_address}"
         res = self._publish("owner", title, body, _DOWN_PRIORITY)
         self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body, ts)
-        self.store.schedule_escalation(self.tenant_id, oid, "hourly",
+        self.store.schedule_escalation(self.org_id, oid, "hourly",
                                        _plus_minutes(ts, self.cfg.escalate_every_min))
 
     def _on_resolved(self, ev: OutageResolved, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
         recipient = self._topic("operator")
         was_suppressed = self.store.last_resolved_state(
-            self.tenant_id, ev.device_id) == UNREACHABLE
+            self.org_id, ev.device_id) == UNREACHABLE
 
         if not was_suppressed:
             self._broadcast(f"✅ Restored — {dev.name} ({dev.region})",
                             "Service back up", 3)
 
-        self.store.cancel_pending_escalations(self.tenant_id, ev.device_id, ts)
+        self.store.cancel_pending_escalations(self.org_id, ev.device_id, ts)
         self._log(None, ev.device_id, recipient,
                   "suppressed" if was_suppressed else "sent", "restored", ts)
 
@@ -157,9 +157,9 @@ class CentralAlertDispatcher:
         self._log(None, None, self._topic("owner"), "sent" if res.ok else "failed",
                   logged, ts)
 
-    # -- escalation sweeper: called once per report, for THIS tenant's due rows --
+    # -- escalation sweeper: called once per report, for THIS org's due rows --
     def sweep(self, now_ts: str) -> None:
-        for row in self.store.due_escalations(self.tenant_id, now_ts):
+        for row in self.store.due_escalations(self.org_id, now_ts):
             if row["resolved_at"] is not None or row["kind"] != "hourly":
                 self.store.mark_escalation_executed(row["id"], now_ts)
                 continue
@@ -193,4 +193,4 @@ class CentralAlertDispatcher:
 
     # -- acknowledge (stops the escalation ladder; recovery is what cancels it) --
     def acknowledge(self, outage_id: int, by: str) -> bool:
-        return self.store.acknowledge_outage(self.tenant_id, outage_id, by)
+        return self.store.acknowledge_outage(self.org_id, outage_id, by)

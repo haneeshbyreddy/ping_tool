@@ -11,17 +11,17 @@ import { Skeleton } from "@/components/ui/skeleton"
 const PAGE_SIZE = 50
 
 export function LogsPage() {
-  const { scopeTenant } = useAuth()
+  const { scopeOrg } = useAuth()
   const { data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ["logs", scopeTenant, "full"],
-    queryFn: ({ pageParam }) => logsApi.list(scopeTenant, PAGE_SIZE, pageParam),
+    queryKey: ["logs", scopeOrg, "full"],
+    queryFn: ({ pageParam }) => logsApi.list(scopeOrg, PAGE_SIZE, pageParam),
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.events.length < PAGE_SIZE ? undefined : lastPage.events.at(-1)?.id,
-    enabled: !!scopeTenant,
+    enabled: !!scopeOrg,
   })
 
-  if (!scopeTenant) return <NeedsOrg />
+  if (!scopeOrg) return <NeedsOrg />
 
   const events = data?.pages.flatMap((p) => p.events) ?? []
 

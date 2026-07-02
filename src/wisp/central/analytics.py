@@ -3,7 +3,7 @@ derived downtime/uptime/SLA reporting.
 
 Deliberately scoped to what the EXISTING `outages` table can already answer — "how
 reliable was Tower A last month" is downtime-window math (the old edge's
-`core/analytics.py` already had this), ported onto `CentralStore`'s tenant-scoped
+`core/analytics.py` already had this), ported onto `CentralStore`'s org-scoped
 schema. No new storage, no retention-policy decision needed: central already keeps the
 full outage history (nothing prunes it in central-brain mode).
 
@@ -30,20 +30,20 @@ def window(days: int, *, until: str | None = None) -> tuple[str, str]:
     return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
 
 
-def device_reliability(store, tenant_id: str, since: str, until: str) -> list[dict]:
+def device_reliability(store, org_id: str, since: str, until: str) -> list[dict]:
     """Per-device downtime seconds + uptime % over [since, until], for EVERY active
-    device the tenant has configured — not just ones with an outage, since a device
+    device the org has configured — not just ones with an outage, since a device
     with zero outages in the window is 100% up and should still appear in an SLA
     report. Only DOWN-final-state outages count against uptime (mirrors the edge's
     `only_down=True` default): an UNREACHABLE outage is a topology-suppressed artifact
     of a dead parent, not this device's own fault, so it doesn't count against IT."""
     win_start, win_end = _parse(since), _parse(until)
     span = (win_end - win_start).total_seconds()
-    devices = {d["id"]: d for d in store.list_org_devices(tenant_id)}
+    devices = {d["id"]: d for d in store.list_org_devices(org_id)}
 
     downtime: dict[int, float] = defaultdict(float)
     outage_counts: dict[int, int] = defaultdict(int)
-    for o in store.outages_in_window(tenant_id, since, until):
+    for o in store.outages_in_window(org_id, since, until):
         if o["final_state"] != DOWN:
             continue
         s = max(_parse(o["started_at"]), win_start)

@@ -6,7 +6,8 @@ export type Role = "owner" | "operator" | "tech"
 export interface User {
   id: number
   username: string
-  tenant_id: string | null
+  org_id: string | null
+  org_name: string | null
   role: Role
   is_superadmin: boolean
 }
@@ -17,7 +18,7 @@ export interface MeResponse {
 }
 
 export interface Org {
-  tenant_id: string
+  org_id: string
   name: string | null
   ntfy_topic: string | null
   ntfy_topic_owner: string | null
@@ -35,7 +36,7 @@ export type DeviceState = "UP" | "DOWN" | "DEGRADED" | "UNREACHABLE"
 
 export interface OrgDevice {
   id: number
-  tenant_id: string
+  org_id: string
   name: string
   ip_address: string
   device_type: DeviceType | null
@@ -60,7 +61,7 @@ export interface OrgDevice {
 
 export interface SwitchPort {
   id: number
-  tenant_id: string
+  org_id: string
   device_id: number
   if_index: number
   if_name: string | null
@@ -87,7 +88,7 @@ export type OutageStatus = "unassigned" | "in_progress" | "pending_postmortem"
 
 export interface Outage {
   id: number
-  tenant_id: string
+  org_id: string
   device_id: number
   device_name: string
   region: string | null
@@ -117,7 +118,7 @@ export interface NodeToken {
 
 export interface Worker {
   id: number
-  tenant_id: string
+  org_id: string
   name: string
   role: Role
   region: string | null
@@ -142,7 +143,7 @@ export interface AttendanceOverview {
 
 export interface LogEvent {
   id: number
-  tenant_id: string
+  org_id: string
   node_id: string
   type: string
   device_id: number | null
@@ -171,7 +172,7 @@ export interface Summary {
 
 export interface AccountUser {
   id: number
-  tenant_id: string | null
+  org_id: string | null
   username: string
   role: Role
   is_active: 0 | 1

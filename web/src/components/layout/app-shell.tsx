@@ -1,8 +1,10 @@
 import { useState } from "react"
 import { NavLink, Outlet } from "react-router-dom"
+import { useQuery } from "@tanstack/react-query"
 import { Search } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
+import { orgsApi } from "@/lib/api"
 import { NAV_ITEMS, MORE_ITEMS } from "./nav-items"
 import { AlarmChips } from "./alarm-chips"
 import { OrgSwitcher } from "./org-switcher"
@@ -19,10 +21,24 @@ import { Button } from "@/components/ui/button"
 import { MoreHorizontal } from "lucide-react"
 
 function Brand() {
+  const { user } = useAuth()
+  // Superadmins operate across every org (the OrgSwitcher next to this is their org
+  // picker), so they keep the platform brand. An org user is always pinned to one
+  // org, so their own org's name is more useful here than the generic platform name.
+  const { data } = useQuery({
+    queryKey: ["orgs", "brand", user?.org_id],
+    queryFn: () => orgsApi.list(),
+    enabled: !!user && !user.is_superadmin,
+    staleTime: 5 * 60 * 1000,
+  })
+  const orgName = !user?.is_superadmin
+    ? data?.orgs[0]?.name || user?.org_id
+    : null
+
   return (
-    <NavLink to="/" className="flex shrink-0 items-center gap-2 px-1">
-      <span className="whitespace-nowrap font-serif text-lg italic font-semibold tracking-tight text-foreground">
-        WISP Central
+    <NavLink to="/" className="flex min-w-0 shrink-0 items-center gap-2 px-1">
+      <span className="truncate whitespace-nowrap font-serif text-lg italic font-semibold tracking-tight text-foreground">
+        {orgName || "WISP Central"}
       </span>
     </NavLink>
   )

@@ -22,8 +22,8 @@
 .PARAMETER Token
     The self-service node token from central's dashboard (Edge Nodes tab).
 
-.PARAMETER Tenant
-    Tenant/org id this edge belongs to, e.g. byreddy
+.PARAMETER Org
+    Org/org id this edge belongs to, e.g. byreddy
 
 .PARAMETER Node
     This edge's node id (defaults to hostname)
@@ -38,13 +38,13 @@
     One-liner (fetch + run with args in one shot), from an admin PowerShell:
 
     & ([scriptblock]::Create((irm https://hansanet.in/install-edge-src.ps1))) `
-        -Central https://hansanet.in -Token <TOKEN> -Tenant byreddy -Node byreddy-edge-1
+        -Central https://hansanet.in -Token <TOKEN> -Org byreddy -Node byreddy-edge-1
 #>
 #Requires -RunAsAdministrator
 param(
     [Parameter(Mandatory)][string]$Central,
     [Parameter(Mandatory)][string]$Token,
-    [string]$Tenant = "default",
+    [string]$Org = "default",
     [string]$Node = $env:COMPUTERNAME,
     [string]$RepoUrl = "https://github.com/haneeshbyreddy/ping_tool.git",
     [string]$Branch = "main"
@@ -108,7 +108,7 @@ Log "writing $envFile (identity + central config)..."
 `$env:WISP_CENTRAL_BRAIN = '1'
 `$env:WISP_CENTRAL_URL = '$Central'
 `$env:WISP_CENTRAL_TOKEN = '$Token'
-`$env:WISP_TENANT_ID = '$Tenant'
+`$env:WISP_ORG_ID = '$Org'
 `$env:WISP_NODE_ID = '$Node'
 "@ | Set-Content -Path $envFile -Encoding ASCII
 Ok "wrote identity/config"
@@ -141,7 +141,7 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ''
-Ok "WISP edge (source path) installed and started. Node $Tenant/$Node -> $Central."
+Ok "WISP edge (source path) installed and started. Node $Org/$Node -> $Central."
 Write-Host "  status: Get-ScheduledTask $TaskName | Get-ScheduledTaskInfo"
 Write-Host "  logs:   run '$launcher' by hand in a console to see live output"
 Write-Host "  stop:   Stop-ScheduledTask -TaskName $TaskName"

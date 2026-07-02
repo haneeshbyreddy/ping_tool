@@ -69,8 +69,8 @@ class CleanDevicePayloadTest(unittest.TestCase):
             parents={1: None}, device_id=None)
         self.assertEqual(clean["parent_device_id"], 1)
 
-    def test_cross_tenant_id_looks_like_missing_parent(self):
-        # `parents` is always scoped to one tenant by the caller — an id from another org
+    def test_cross_org_id_looks_like_missing_parent(self):
+        # `parents` is always scoped to one org by the caller — an id from another org
         # simply isn't in the map, so it's rejected the same as any nonexistent id.
         with self.assertRaises(InventoryError):
             clean_device_payload(
@@ -157,7 +157,7 @@ class CleanBackupLinkTest(unittest.TestCase):
     def test_valid_backup_accepted(self):
         clean_backup_link(2, 3, parents={1: None, 2: 1, 3: None}, backups={})   # no raise
 
-    def test_cross_tenant_id_looks_like_missing_parent(self):
+    def test_cross_org_id_looks_like_missing_parent(self):
         with self.assertRaises(InventoryError):
             clean_backup_link(1, 42, parents={1: None}, backups={})
 

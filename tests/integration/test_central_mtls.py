@@ -65,8 +65,8 @@ class MtlsIngestTest(unittest.TestCase):
         self.server.server_close()
         self.tmp.cleanup()
 
-    def _issue(self, tenant, node):
-        cn = pki.edge_common_name(tenant, node)
+    def _issue(self, org, node):
+        cn = pki.edge_common_name(org, node)
         key, cert = self.pki_dir / f"{node}.key", self.pki_dir / f"{node}.crt"
         pki.issue_cert(self.pki_dir, cn, key, cert)
         return key, cert
@@ -115,33 +115,33 @@ class MtlsIngestTest(unittest.TestCase):
 
     def test_valid_client_cert_authenticates_ingest(self):
         ctx = self._client_ctx(self.a_cert, self.a_key)
-        status, body = self._get("/edge/devices?tenant_id=ispA", ctx)
+        status, body = self._get("/edge/devices?org_id=ispA", ctx)
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["ip_address"], "10.0.0.1")
 
     def test_no_cert_and_no_token_is_unauthorized(self):
         ctx = self._client_ctx()  # no client cert presented
-        status, _ = self._get("/edge/devices?tenant_id=ispA", ctx)
+        status, _ = self._get("/edge/devices?org_id=ispA", ctx)
         self.assertEqual(status, 401)
 
-    def test_cert_for_wrong_tenant_is_rejected(self):
+    def test_cert_for_wrong_org_is_rejected(self):
         # b_cert is valid (signed by the real CA) but claims ispB, not ispA.
         ctx = self._client_ctx(self.b_cert, self.b_key)
-        status, _ = self._get("/edge/devices?tenant_id=ispA", ctx)
+        status, _ = self._get("/edge/devices?org_id=ispA", ctx)
         self.assertEqual(status, 401)
 
     def test_report_over_mtls_end_to_end(self):
         ctx = self._client_ctx(self.a_cert, self.a_key)
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-a1",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-a1",
                 "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}}}
         status, resp = self._post("/report", body, ctx)
         self.assertEqual(status, 200)
 
     def test_report_cert_node_mismatch_rejected(self):
-        # a_cert is CN ispA:edge-a1 — claiming a DIFFERENT node in the same tenant
-        # must not be accepted just because the tenant half matches.
+        # a_cert is CN ispA:edge-a1 — claiming a DIFFERENT node in the same org
+        # must not be accepted just because the org half matches.
         ctx = self._client_ctx(self.a_cert, self.a_key)
-        body = {"v": 1, "tenant_id": "ispA", "node_id": "edge-a2",
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-a2",
                 "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}}}
         status, _ = self._post("/report", body, ctx)
         self.assertEqual(status, 401)
@@ -194,7 +194,7 @@ class TokenAndMtlsCoexistTest(unittest.TestCase):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(cafile=str(self.ca_cert))
         conn = http.client.HTTPSConnection("127.0.0.1", self.port, context=ctx, timeout=5)
-        conn.request("GET", "/edge/devices?tenant_id=ispA",
+        conn.request("GET", "/edge/devices?org_id=ispA",
                      headers={"Authorization": "Bearer tok"})
         resp = conn.getresponse()
         self.assertEqual(resp.status, 200)

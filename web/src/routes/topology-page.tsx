@@ -62,9 +62,9 @@ const EMPTY_FORM: DeviceFormState = {
 }
 
 function DeviceForm({
-  tenant, editing, devices, nodeIds, onDone,
+  org, editing, devices, nodeIds, onDone,
 }: {
-  tenant: string
+  org: string
   editing: OrgDevice | null
   devices: OrgDevice[]
   nodeIds: string[]
@@ -85,7 +85,7 @@ function DeviceForm({
   const save = useMutation({
     mutationFn: async () => {
       const payload = {
-        tenant_id: tenant,
+        org_id: org,
         name: form.name.trim(),
         ip_address: form.ip_address.trim(),
         device_type: form.device_type || null,
@@ -330,22 +330,22 @@ function DeviceRow({
 }
 
 export function TopologyPage() {
-  const { scopeTenant, canWrite } = useAuth()
+  const { scopeOrg, canWrite } = useAuth()
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<OrgDevice | null>(null)
 
   const { data, isLoading } = useQuery({
-    queryKey: ["inventory", scopeTenant],
-    queryFn: () => inventoryApi.list(scopeTenant),
-    enabled: !!scopeTenant,
+    queryKey: ["inventory", scopeOrg],
+    queryFn: () => inventoryApi.list(scopeOrg),
+    enabled: !!scopeOrg,
   })
   const nodes = useQuery({
-    queryKey: ["nodes", scopeTenant],
-    queryFn: () => nodesApi.list(scopeTenant),
-    enabled: !!scopeTenant,
+    queryKey: ["nodes", scopeOrg],
+    queryFn: () => nodesApi.list(scopeOrg),
+    enabled: !!scopeOrg,
   })
 
-  if (!scopeTenant) return <NeedsOrg />
+  if (!scopeOrg) return <NeedsOrg />
 
   const devices = data?.devices ?? []
   const ordered = treeOrder(devices)
@@ -366,7 +366,7 @@ export function TopologyPage() {
       </div>
 
       {formOpen && (
-        <DeviceForm tenant={scopeTenant} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
+        <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
       )}
 
       {isLoading && <Skeleton className="h-40 w-full" />}

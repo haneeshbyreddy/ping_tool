@@ -4,12 +4,12 @@ The edge's single shared PIN does not survive multi-tenancy: central serves many
 each operator logs in with their OWN account, scoped to their org. This is the real authn
 change the plan flags. It reuses the edge's proven, pure-stdlib crypto (salted SHA-256
 passwords + HMAC-signed cookies, `server/auth.py`) — but the session now carries the user's
-**identity** (so the server resolves their tenant scope + role per request, and a deactivated
+**identity** (so the server resolves their org scope + role per request, and a deactivated
 account loses access immediately), and there are real user records instead of one PIN.
 
 Account model (decision: central-provisioned). A SUPERADMIN (the platform operator, a `users`
-row with `tenant_id IS NULL`) onboards each ISP and provisions its accounts; org users are
-scoped to one `tenant_id` with a role (owner/operator/tech). No public signup. Provision the
+row with `org_id IS NULL`) onboards each ISP and provisions its accounts; org users are
+scoped to one `org_id` with a role (owner/operator/tech). No public signup. Provision the
 first superadmin with the `central/admin.py` CLI; everything else can be done from the console.
 
 Same documented posture as the edge: plain HTTP behind a TLS terminator, secrets protected by
@@ -82,20 +82,20 @@ def _validate_password(password: str) -> str:
     return password
 
 
-def create_user(store, tenant_id: str | None, username: str, password: str,
+def create_user(store, org_id: str | None, username: str, password: str,
                 role: str = "operator") -> int:
-    """Provision an account. tenant_id None = superadmin. Raises AuthError on a weak
+    """Provision an account. org_id None = superadmin. Raises AuthError on a weak
     password, a bad role, or a duplicate username."""
     username = (username or "").strip()
     if not username:
         raise AuthError("username required")
-    if tenant_id is not None and role not in ROLES:
+    if org_id is not None and role not in ROLES:
         raise AuthError(f"role must be one of {ROLES}")
     _validate_password(password)
     if store.get_user_by_username(username):
         raise AuthError(f"username {username!r} already exists")
     salt = secrets.token_hex(16)
-    return store.add_user(tenant_id, username, hash_pw(password, salt), salt, role)
+    return store.add_user(org_id, username, hash_pw(password, salt), salt, role)
 
 
 def set_password(store, user_id: int, password: str) -> None:
@@ -167,7 +167,7 @@ def cookie_token(cookie_header: str | None) -> str | None:
 
 def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict | None:
     """token -> the active user dict (with a derived `is_superadmin`), or None. The single
-    seam the server calls to authorize a dashboard request + learn its tenant scope."""
+    seam the server calls to authorize a dashboard request + learn its org scope."""
     user_id = verify_session(token, cfg=cfg, timeout_h=cfg.session_timeout_h)
     if user_id is None:
         return None
@@ -177,7 +177,7 @@ def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict |
     user = dict(user)
     user.pop("pw_hash", None)
     user.pop("pw_salt", None)
-    user["is_superadmin"] = user["tenant_id"] is None
+    user["is_superadmin"] = user["org_id"] is None
     return user
 
 

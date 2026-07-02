@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Plus, Trash2 } from "lucide-react"
+import { KeyRound, Plus, Trash2 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, usersApi, ApiError } from "@/lib/api"
-import type { Role } from "@/lib/types"
+import type { AccountUser, Role } from "@/lib/types"
 import { NeedsOrg } from "@/components/needs-org"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -15,35 +15,38 @@ import { Switch } from "@/components/ui/switch"
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
+} from "@/components/ui/dialog"
 
 const ROLE_TOPICS: Array<{ key: "owner" | "operator" | "tech"; label: string }> = [
   { key: "owner", label: "Owner" }, { key: "operator", label: "Operator" }, { key: "tech", label: "Tech" },
 ]
 
-function OrgSettingsCard({ tenant, canWrite }: { tenant: string; canWrite: boolean }) {
+function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
-    queryKey: ["orgs", tenant],
-    queryFn: () => orgsApi.list(tenant),
-    enabled: !!tenant,
+    queryKey: ["orgs", org],
+    queryFn: () => orgsApi.list(org),
+    enabled: !!org,
   })
-  const org = data?.orgs.find((o) => o.tenant_id === tenant)
+  const current = data?.orgs.find((o) => o.org_id === org)
 
   const [name, setName] = useState("")
   const [topics, setTopics] = useState({ owner: "", operator: "", tech: "" })
   const [testResults, setTestResults] = useState<Record<string, string>>({})
 
   useEffect(() => {
-    if (!org) return
-    setName(org.name || "")
+    if (!current) return
+    setName(current.name || "")
     setTopics({
-      owner: org.ntfy_topic_owner || "", operator: org.ntfy_topic_operator || "", tech: org.ntfy_topic_tech || "",
+      owner: current.ntfy_topic_owner || "", operator: current.ntfy_topic_operator || "", tech: current.ntfy_topic_tech || "",
     })
-  }, [org])
+  }, [current])
 
   const save = useMutation({
     mutationFn: () => orgsApi.save({
-      tenant_id: tenant, name: name.trim() || null,
+      org_id: org, name: name.trim() || null,
       ntfy_topic_owner: topics.owner.trim() || null,
       ntfy_topic_operator: topics.operator.trim() || null,
       ntfy_topic_tech: topics.tech.trim() || null,
@@ -53,7 +56,7 @@ function OrgSettingsCard({ tenant, canWrite }: { tenant: string; canWrite: boole
   })
 
   const test = useMutation({
-    mutationFn: (role: "owner" | "operator" | "tech") => orgsApi.testAlert(tenant, role),
+    mutationFn: (role: "owner" | "operator" | "tech") => orgsApi.testAlert(org, role),
     onSuccess: (r, role) => setTestResults((t) => ({ ...t, [role]: r.ok ? "✓ sent" : `failed: ${r.detail || ""}` })),
     onError: (e, role) => setTestResults((t) => ({ ...t, [role]: e instanceof ApiError ? e.message : "failed" })),
   })
@@ -62,7 +65,7 @@ function OrgSettingsCard({ tenant, canWrite }: { tenant: string; canWrite: boole
 
   return (
     <Card>
-      <CardHeader><CardTitle className="text-sm">Settings — {tenant}</CardTitle></CardHeader>
+      <CardHeader><CardTitle className="text-sm">Settings — {org}</CardTitle></CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="flex flex-col gap-1.5">
           <Label>Org name</Label>
@@ -98,7 +101,100 @@ function OrgSettingsCard({ tenant, canWrite }: { tenant: string; canWrite: boole
   )
 }
 
-function UsersCard({ tenant }: { tenant: string }) {
+function ChangePasswordCard() {
+  const [current, setCurrent] = useState("")
+  const [next, setNext] = useState("")
+  const [confirm, setConfirm] = useState("")
+  const [error, setError] = useState("")
+
+  const change = useMutation({
+    mutationFn: () => usersApi.changePassword({ current_password: current, new_password: next }),
+    onSuccess: () => {
+      toast.success("Password changed")
+      setCurrent(""); setNext(""); setConfirm(""); setError("")
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to change password"),
+  })
+
+  const mismatch = confirm.length > 0 && next !== confirm
+  const canSubmit = current.length > 0 && next.length >= 8 && next === confirm && !change.isPending
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <KeyRound className="size-4 text-muted-foreground" /> Your password
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2.5">
+        <div className="flex flex-col gap-1.5">
+          <Label>Current password</Label>
+          <Input type="password" autoComplete="current-password" className="max-w-sm"
+            value={current} onChange={(e) => setCurrent(e.target.value)} />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>New password</Label>
+          <Input type="password" autoComplete="new-password" placeholder="min 8 characters" className="max-w-sm"
+            value={next} onChange={(e) => setNext(e.target.value)} />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Confirm new password</Label>
+          <Input type="password" autoComplete="new-password" className="max-w-sm"
+            value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </div>
+        {mismatch && <p className="text-xs text-destructive">Passwords don't match.</p>}
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <Button size="sm" className="w-fit" disabled={!canSubmit} onClick={() => change.mutate()}>
+          {change.isPending ? "Changing…" : "Change password"}
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ResetPasswordDialog({ target }: { target: AccountUser }) {
+  const [open, setOpen] = useState(false)
+  const [next, setNext] = useState("")
+  const [error, setError] = useState("")
+
+  const reset = useMutation({
+    mutationFn: () => usersApi.changePassword({ id: target.id, new_password: next }),
+    onSuccess: () => {
+      toast.success(`Password reset for ${target.username}`)
+      setOpen(false); setNext(""); setError("")
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to reset password"),
+  })
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) { setNext(""); setError("") } }}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="icon" className="size-7" title="Reset password">
+          <KeyRound className="size-3.5" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Reset password — {target.username}</DialogTitle>
+        </DialogHeader>
+        <div className="flex flex-col gap-1.5">
+          <Label>New password</Label>
+          <Input type="password" autoComplete="new-password" placeholder="min 8 characters"
+            value={next} onChange={(e) => setNext(e.target.value)} autoFocus />
+        </div>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>Cancel</Button>
+          <Button size="sm" disabled={next.length < 8 || reset.isPending} onClick={() => reset.mutate()}>
+            Reset
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function UsersCard({ org }: { org: string }) {
   const { user } = useAuth()
   const queryClient = useQueryClient()
   const [addOpen, setAddOpen] = useState(false)
@@ -108,14 +204,14 @@ function UsersCard({ tenant }: { tenant: string }) {
   const [error, setError] = useState("")
 
   const { data, isLoading } = useQuery({
-    queryKey: ["users", tenant],
-    queryFn: () => usersApi.list(tenant),
+    queryKey: ["users", org],
+    queryFn: () => usersApi.list(org),
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["users"] })
 
   const create = useMutation({
     mutationFn: () => usersApi.create({
-      tenant_id: user?.is_superadmin ? tenant : undefined, username: username.trim(), password, role,
+      org_id: user?.is_superadmin ? org : undefined, username: username.trim(), password, role,
     }),
     onSuccess: () => { invalidate(); setAddOpen(false); setUsername(""); setPassword(""); setError("") },
     onError: (e) => setError(e instanceof ApiError ? e.message : "failed to create"),
@@ -155,6 +251,7 @@ function UsersCard({ tenant }: { tenant: string }) {
                 <Switch checked={!!u.is_active}
                   onCheckedChange={(v) => setActive.mutate({ id: u.id, active: v })} />
               </label>
+              {u.id !== user?.id && <ResetPasswordDialog target={u} />}
               {u.id !== user?.id && (
                 <Button variant="ghost" size="icon" className="size-7"
                   onClick={() => { if (confirm(`Delete login account "${u.username}"? This cannot be undone.`)) remove.mutate(u.id) }}>
@@ -193,14 +290,18 @@ function UsersCard({ tenant }: { tenant: string }) {
 }
 
 export function SettingsPage() {
-  const { scopeTenant, canWrite } = useAuth()
-  if (!scopeTenant) return <NeedsOrg />
+  const { scopeOrg, canWrite } = useAuth()
 
+  // A superadmin's own account isn't scoped to any org, so their password change
+  // shouldn't be gated behind picking one from the header switcher — the rest of this
+  // page (ntfy routing, login accounts) still needs an org picked first.
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-4 p-4 md:p-6">
       <h1 className="text-xl font-bold">Settings</h1>
-      <OrgSettingsCard tenant={scopeTenant} canWrite={canWrite} />
-      {canWrite && <UsersCard tenant={scopeTenant} />}
+      {scopeOrg && <OrgSettingsCard org={scopeOrg} canWrite={canWrite} />}
+      <ChangePasswordCard />
+      {scopeOrg && canWrite && <UsersCard org={scopeOrg} />}
+      {!scopeOrg && <NeedsOrg />}
     </div>
   )
 }

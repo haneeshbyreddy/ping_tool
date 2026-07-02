@@ -12,7 +12,7 @@
 #   ./run.sh --no-daemon     # central only (don't start the probe)
 #
 # First run: create a superadmin, log into the dashboard, and add at least one
-# device under tenant "default" (Nodes ▸ Add) before the probe has anything to
+# device under org "default" (Nodes ▸ Add) before the probe has anything to
 # report — see the printed instructions below.
 #
 # Real ICMP polling needs raw sockets — install deps in a venv (see README
@@ -56,7 +56,7 @@ export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 # ingest open); set one yourself before exposing this beyond localhost.
 export WISP_CENTRAL_BRAIN=1
 export WISP_CENTRAL_URL="${WISP_CENTRAL_URL:-http://127.0.0.1:${PORT}}"
-export WISP_TENANT_ID="${WISP_TENANT_ID:-default}"
+export WISP_ORG_ID="${WISP_ORG_ID:-default}"
 export WISP_POLL_INTERVAL_S="${WISP_POLL_INTERVAL_S:-20}"
 export WISP_RETRY_INTERVAL_S="${WISP_RETRY_INTERVAL_S:-1}"
 
@@ -70,17 +70,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$NO_DAEMON" -eq 0 ]; then
-  echo "▸ starting edge probe in the background (central-brain mode, tenant=$WISP_TENANT_ID)…"
+  echo "▸ starting edge probe in the background (central-brain mode, org=$WISP_ORG_ID)…"
   "$PY" apps/daemon/main.py >/tmp/hansa_daemon.log 2>&1 &
   DAEMON_PID=$!
   echo "  probe pid=$DAEMON_PID  (log: /tmp/hansa_daemon.log — it'll idle/error until"
-  echo "  central has at least one device for tenant \"$WISP_TENANT_ID\", see below)"
+  echo "  central has at least one device for org \"$WISP_ORG_ID\", see below)"
 fi
 
 echo "▸ starting central → http://${HOST}:${PORT}"
 echo
 echo "  First run: create a superadmin, then log in and add devices/team from"
-echo "  the dashboard (tenant \"$WISP_TENANT_ID\" if you kept the default):"
+echo "  the dashboard (org \"$WISP_ORG_ID\" if you kept the default):"
 echo "    PYTHONPATH=src $PY -m wisp.central.admin create-superadmin --username you --password ..."
 echo
 echo "  (Ctrl-C to stop everything)"

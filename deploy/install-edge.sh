@@ -3,7 +3,7 @@
 # WISP Edge — fleet installer (frozen binary). The "curl | sh" fleet path:
 #
 #   curl -fsSL https://central.example.net/install-edge.sh | sudo sh -s -- \
-#        --central https://central.example.net --token <ENROLL> --tenant ispA --node edge-a1
+#        --central https://central.example.net --token <ENROLL> --org ispA --node edge-a1
 #
 # It detects the arch, downloads the matching signed binary, VERIFIES its sha256 (a published
 # checksum — refuses to install on a mismatch), installs the agent + supervisor under /opt/wisp,
@@ -17,7 +17,7 @@
 # unverified pipe-to-shell once signing IS configured.
 set -euo pipefail
 
-CENTRAL="" TOKEN="" TENANT="default" NODE="$(hostname)"
+CENTRAL="" TOKEN="" ORG="default" NODE="$(hostname)"
 BASE_URL=""            # where the binaries + SHA256SUMS live (defaults to $CENTRAL/dl)
 PREFIX=/opt/wisp
 CONFIG_DIR=/etc/wisp
@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --central) CENTRAL="$2"; shift 2;;
     --token)   TOKEN="$2"; shift 2;;
-    --tenant)  TENANT="$2"; shift 2;;
+    --org)  ORG="$2"; shift 2;;
     --node)    NODE="$2"; shift 2;;
     --base-url) BASE_URL="$2"; shift 2;;
     *) err "unknown arg: $1";;
@@ -95,7 +95,7 @@ if [ ! -f "$CONFIG_DIR/edge.env" ]; then
   cat > "$CONFIG_DIR/edge.env" <<EOF
 WISP_CENTRAL_URL=$CENTRAL
 WISP_CENTRAL_TOKEN=$TOKEN
-WISP_TENANT_ID=$TENANT
+WISP_ORG_ID=$ORG
 WISP_NODE_ID=$NODE
 WISP_DB=$CONFIG_DIR/wisp.db
 EOF
@@ -115,6 +115,6 @@ curl -fsSL "$BASE_URL/wisp-edge.service" -o /etc/systemd/system/wisp-edge.servic
 systemctl daemon-reload
 systemctl enable --now wisp-edge
 
-log "done. Node $TENANT/$NODE reporting to $CENTRAL."
+log "done. Node $ORG/$NODE reporting to $CENTRAL."
 log "  logs:   journalctl -u wisp-edge -f"
 log "  status: systemctl status wisp-edge"

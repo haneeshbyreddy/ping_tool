@@ -36,7 +36,7 @@ class HttpCentralClient:
     def __init__(self, cfg: Config = CONFIG) -> None:
         self.base = cfg.central_url.rstrip("/")
         self.token = cfg.central_token
-        self.tenant_id = cfg.tenant_id
+        self.org_id = cfg.org_id
         self.node_id = cfg.node_id
         self.timeout = cfg.ship_timeout_s
         # mTLS enrollment (CLAUDE.md item 6): a cert issued by `central.admin enroll-edge`.
@@ -62,11 +62,11 @@ class HttpCentralClient:
 
     def fetch_devices(self) -> dict:
         """{'devices': [{'id','name','ip_address','region','parent_device_id'}, …],
-        'canary_ip': …} — this tenant's ISP-managed topology (org_devices), the thing the
+        'canary_ip': …} — this org's ISP-managed topology (org_devices), the thing the
         edge now probes instead of a locally-configured device list. Sending our own
         node_id lets central filter to just what THIS node is assigned to (device
-        assignment, CLAUDE.md's multi-edge-per-tenant feature) — unassigned devices
-        still come back to everyone, so a tenant that's never used assignment sees no
+        assignment, CLAUDE.md's multi-edge-per-org feature) — unassigned devices
+        still come back to everyone, so an org that's never used assignment sees no
         change at all."""
         try:
             import httpx
@@ -74,7 +74,7 @@ class HttpCentralClient:
             raise CentralClientError(f"httpx missing: {exc}") from exc
         try:
             resp = httpx.get(f"{self.base}/edge/devices",
-                             params={"tenant_id": self.tenant_id, "node_id": self.node_id},
+                             params={"org_id": self.org_id, "node_id": self.node_id},
                              headers=self._headers(), timeout=self.timeout,
                              **self._tls_kwargs())
             resp.raise_for_status()
@@ -101,7 +101,7 @@ class HttpCentralClient:
             import httpx
         except ImportError as exc:  # pragma: no cover
             raise CentralClientError(f"httpx missing: {exc}") from exc
-        env = {"v": WIRE_V, "tenant_id": self.tenant_id, "node_id": self.node_id,
+        env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
               "ts": ts, "mode": mode, "pings": pings}
         if ports:
             env["ports"] = ports

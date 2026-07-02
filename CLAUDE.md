@@ -1,18 +1,20 @@
 # CLAUDE.md
 
 Working notes for Claude Code in this repo — conventions, invariants, and gotchas that
-aren't obvious from the code, plus the design rationale and roadmap. For what/how/
-layout/config, read `README.md` instead of duplicating it here.
+aren't obvious from the code. For what/how/layout/config, read `README.md` instead of
+duplicating it here. For the design rationale behind these invariants, the roadmap, and
+a list of deliberately-deleted code, read `docs/ARCHITECTURE.md` — split out to keep
+this file's per-session load small; only open it when you need the backstory.
 
 ## Architecture at a glance
 
-Central runs the brain, for every tenant. The edge is a thin probe, full stop — one
+Central runs the brain, for every org. The edge is a thin probe, full stop — one
 daemon mode (`WISP_CENTRAL_BRAIN=1` + `WISP_CENTRAL_URL`, effectively mandatory). It
 fetches topology from central, probes with real ICMP under bounded-concurrency fan-out,
 reports raw per-IP samples back. No local database, dashboard, PIN, or FSM on the edge.
 
 Central owns the FSM, topology-aware suppression, fast-confirm detection, the alerting
-ladder, the multi-tenant dashboard, and fleet version/rollout state. ISPs log into
+ladder, the multi-org dashboard, and fleet version/rollout state. ISPs log into
 central's dashboard with a per-org account, manage topology/team/alert routing there,
 and self-service-register the nodes they run — one ISP can run one or many nodes, each
 with its own enrollment credential.
@@ -33,124 +35,11 @@ hosting (needs the operator's provider/region/domain) and the last mile of fleet
 signing (real minisign keypair + Windows code-signing cert as CI secrets, plus a genuine
 tagged release tested on real hardware) — see "Roadmap" below.
 
-## Design rationale & roadmap
-
-The platform grew out of a single-box appliance (one daemon + one local dashboard, one
-ISP, one SQLite file) — visible in git history, not how the system runs today. The edge
-kept its detection-speed characteristics (bounded fan-out, gentle infra probing,
-fast-confirm) but lost everything that made it a standalone product; that now all lives
-on central, multiplied across tenants.
-
-```
-  ISP "A"                                        Central (multi-tenant)
-  ┌──────────────────────────┐                  ┌───────────────────────────┐
-  │ edge-a1 (thin probe)      │  POST /report    │ POST /report, GET         │
-  │  ICMP + SNMP only ────────┼─── raw samples ─►│  /edge/devices (topology) │
-  │  no local FSM/DB/alerting │◄── recheck hint ─┤      │                    │
-  │  + supervisor (updates) ◄─┼── version/url ───┤      ▼                    │
-  └──────────────────────────┘   in heartbeat    │ MonitorEngine (per tenant,│
-  ISP "B": edge-b1, edge-b2 ────────────────────►│  in-memory, restart-safe) │
-                                                  │      │                    │
-                                                  │      ▼                    │
-                                                  │ CentralAlertDispatcher ──┼──► ntfy
-                                                  │ + dashboard + watchdog   │
-                                                  │ + version authority      │
-                                                  └───────────────────────────┘
-```
-
-**Why the invariants above are shaped this way:**
-- Flap suppression exists because a wireless link blips constantly; paging on one bad
-  poll trains people to ignore alerts. Fast-confirm collapses the *wall clock* for those
-  samples to seconds without touching the count.
-- The uplink canary exists because if an ISP's own internet is down, every device
-  behind it looks down — one `UPLINK_DOWN` beats a storm.
-- Topology suppression exists because one "Tower A down" is actionable, forty child
-  alerts are noise — a child stays silent unless it has a live backup path too.
-- Cause is operator-confirmed, never inferred, because an earlier auto-inference
-  attempt (power-vs-link heuristics from device co-location) was never wired to any UI
-  and was removed rather than finished.
-- Durable DB-backed memory (not in-memory timers) plus `EngineRegistry`'s
-  one-engine-per-tenant exists because a central restart must never drop an escalation
-  or re-page everyone, and flap-suppression streaks must survive across an edge's
-  stateless HTTP reports.
-
-**Locked decisions (don't relitigate without a real reason):**
-
-| Topic | Decision |
-|---|---|
-| Where the brain runs | Central, for every tenant. The edge never runs an FSM or alerts on its own. |
-| What we monitor | Shared infrastructure (towers, backhaul, switches), not end-user routers (yet). |
-| Alert channels | ntfy only; 3 topics per org (owner/operator/tech); fresh DOWN pages owner+operator, hourly escalation broadcasts to all three until recovery. |
-| Multi-tenancy | Non-negotiable — every central read/write is tenant-scoped. |
-| Where the edge runs | On-prem, one process per node, no local DB/dashboard. Every node deploys the same way (frozen binary + supervisor); no separate "simple" mode. |
-| Transport | Edge dials central, never the reverse. Ingest auth: global token, self-service node token, or mTLS — any one satisfies it. |
-| Updates | Pull-based over the existing report channel. Central is the version authority; rollouts are staged + health-gated + auto-rollback. |
-| Realism | Probers/notifiers sit behind small interfaces; tests inject recording doubles, never hit the real network. |
-
-**Roadmap (item numbers are referenced by comments across the codebase — keep them
-stable):**
-
-1. ~~SNMP port monitoring on central~~ — **done**, including bandwidth (item 3).
-2. ~~Central-side historical rollups / trend analytics~~ — **done** (outage-derived SLA
-   + hourly latency/loss trend).
-3. ~~Per-link performance baseline + on-backup redundancy + SNMP bandwidth~~ — **done**.
-4. **Deploy central for production** — everything to date is local dev (`run.sh`) or
-   test processes; needs an always-on host + TLS terminator, and the operator's actual
-   provider/region/domain choice. Not started.
-5. **Fleet update signing, last mile** — CI signing logic is real and exercised
-   (unsigned) on every push. Still needed: a real minisign keypair +
-   `WINDOWS_CODESIGN_PFX` cert held by the platform operator, a genuine signed `v*`
-   release, and running the signed installers on real Linux/Windows hardware — not
-   fabricable in a coding session.
-6. ~~mTLS enrollment~~ — **done**, replacing the bearer-token-only stopgap.
-7. ~~Self-service node registration from the dashboard~~ — **done**.
-
-Nothing is deferred at the detection-tier level (every soft-signal tier the old
-single-box edge had now exists on central) — items 4–5 are production/ops groundwork,
-not missing features.
-
-**Open questions (answer as you build, don't block on them):** central hosting
-provider/region and whether one box serves every tenant or scale eventually demands
-sharding; rollout policy (fully automatic per org vs. operator-approved, canary size) —
-product calls for the platform operator, not code-shape questions; data residency/
-retention policy — one shared policy across tenants, or per-org.
-
-## Removed — don't go looking for these
-
-An earlier single-tenant version (one daemon + one local dashboard, no central server)
-was fully retired; code deleted wholesale, not deprecated. Detail is in git history, not
-here. Gone:
-
-- `apps/dashboard/` (edge's local web UI), `src/wisp/server/` (routes/services/auth/
-  watchdog — `LoginThrottle` now lives in `central/auth.py`).
-- `egress/shipper.py` + `database/outbox.py` (store-and-forward, moot once the edge
-  ships raw samples), `egress/ports.py` + `egress/ack.py`, `core/rollup.py`.
-- `AlertDispatcher` + `role_topic`/`acknowledge_outage` out of `egress/notifiers.py` —
-  that file now holds only the ntfy channel (`NtfyNotifier`, `send_with_retry`,
-  `build_notifier`). The DB-coupled alerting policy is `central/dispatch.py`'s
-  `CentralAlertDispatcher`.
-- `apps/daemon/main.py`'s old local-`MonitorEngine` drivers: `run_forever`, `run_cycle`,
-  `_confirm_down`/`_confirm_up`, `_between_cycle_watch`, `_persist`, `prune_old_polls`,
-  `snmp_cycle`. What's left is the probe loop: `_gather_pings`, `_gentle_probe_plan`,
-  `run_cycle_central_brain`, `run_forever_central_brain`, `_follow_recheck`.
-- The legacy per-edge SQLite layer: `src/wisp/database/` and `migrations/*.sql`, plus
-  `core/state_machine.py`'s old DB-glue (`load_device_meta`/`build_engine`/
-  `apply_events` — distinct from central's own same-named functions in
-  `central/engine.py`, which are what's actually called) and `ingress/snmp.py`'s
-  `load_snmp_targets` (zero callers). `core/state_machine.py`, `core/analytics.py`
-  (now just `_parse`/`_now`), and `core/baseline.py` are still alive — central imports
-  them directly. Grep before deleting anything in `core/`.
-- The single-box install path: `deploy/install.sh`, `install.ps1`,
-  `wisp-monitor.service`. Every edge node now installs through the frozen-binary fleet
-  path (`install-edge.sh`/`.ps1` + `wisp-edge.service`). No separate "simple" mode.
-- The old hand-rolled vanilla-JS dashboard: `central/static/app.js`, `icons.js`,
-  `vendor/tailwind.js`, and `index.html`'s gray Material color config — replaced
-  wholesale by the React/Tailwind/shadcn SPA in `web/` (see "Central dashboard" below),
-  not deprecated alongside it. Git history has the old one if you need to compare
-  behavior; don't resurrect its files.
-
-`runtime/supervisor.py`, `apps/supervisor/main.py`, and staged-rollout/self-update are
-untouched by any of the above.
+See `docs/ARCHITECTURE.md` for: the design rationale behind the invariants below, the
+locked-decisions table, the numbered roadmap (item numbers are referenced by comments
+across the codebase — keep them stable), open questions, and the full list of
+deliberately-removed single-box-era code (don't go looking for `apps/dashboard/`,
+`src/wisp/server/`, the old vanilla-JS dashboard, etc. — it's all gone, not deprecated).
 
 ## Fleet update signing
 
@@ -198,9 +87,14 @@ Src layout, zero-install:
   `central/static/`.
 - **The dashboard is a React/Tailwind/shadcn SPA (`web/`), not hand-rolled vanilla JS
   anymore** — see "Central dashboard" below for the full picture. `store.low_bandwidth_alarms`
-  + `GET /api/summary` (tenant-scoped: uplink flag + fleet-wide bw-alarmed ports) and
-  `store.data_version` + `GET /api/events` (SSE, tenant-scoped fingerprint) exist only to
-  feed that look — the header's low-bandwidth/uplink chips and live refresh-on-change.
+  + `GET /api/summary` (org-scoped: uplink flag + fleet-wide bw-alarmed ports) and
+  `store.data_version` + `GET /api/events` (SSE, org-scoped fingerprint) exist only to
+  feed that look — the header's low-bandwidth chip and live refresh-on-change.
+  `uplink_down` is still in `GET /api/summary`'s response (other tooling may read it) but
+  the SPA no longer surfaces it anywhere — an operator viewing the dashboard at all is
+  already evidence their own uplink isn't fully down, so a dedicated "uplink status"
+  indicator was judged low-value clutter and dropped (`central/dispatch.py` still pages
+  `UPLINK_DOWN` via ntfy the moment it happens, independent of anything in the SPA).
   The Outages triage queue (`store.triage_outages` + `GET /api/outages`,
   `POST /api/outages/acknowledge`/`postmortem`) and the Logs page
   (`store.list_events` + `GET /api/logs`, cursor-paginated on `id`) were added as a
@@ -208,10 +102,14 @@ Src layout, zero-install:
   stored, from `acknowledged_at`/`resolved_at`/`root_cause`; a resolved outage without a
   `root_cause` stays in the queue for `postmortem_days` (default 30) so an operator can
   still log one. Recovery itself is never operator-driven — the FSM resolves outages on
-  its own — so this page only ever offers acknowledge/postmortem, never a manual
-  resolve. Ack/postmortem writes re-derive tenant from the outage row
-  (`store.outage_tenant`), same discipline as `device_tenant`/`switch_port_tenant`, and
-  are gated the same as every other dashboard write (owner or superadmin only).
+  its own — so triage only ever offers acknowledge/postmortem, never a manual resolve.
+  Ack/postmortem writes re-derive org from the outage row (`store.outage_org`),
+  same discipline as `device_org`/`switch_port_org`, and are gated the same as
+  every other dashboard write (owner or superadmin only). **The triage queue itself was
+  later folded into the Home page** (`routes/home-page.tsx`, using the shared
+  `components/outage-card.tsx`) rather than kept as its own `/outages` route — it's a
+  small, bounded, action-oriented list (not a full history), so a dedicated page was one
+  click of indirection with no payoff; there's no standalone Triage nav entry anymore.
 
 ## Engine invariants (don't break)
 
@@ -274,7 +172,7 @@ Src layout, zero-install:
   touching the frontend; only `web/node_modules` is ignored. `server.py`'s
   `_STATIC`/`_serve_static` are completely unchanged — they just hand out whatever's in
   `central/static/`, same as when it was hand-rolled vanilla JS.
-- **Routing is `HashRouter` (`/#/outages`, `/#/topology`, …), not `BrowserRouter`.**
+- **Routing is `HashRouter` (`/#/topology`, `/#/nodes`, …), not `BrowserRouter`.**
   `server.py`'s static handler 404s on any path that isn't a literal file — there's no
   SPA-fallback route, deliberately, to keep the stdlib server dumb. `BrowserRouter` needs
   the server to serve `index.html` for unknown paths (deep-link/refresh would 404);
@@ -291,12 +189,12 @@ Src layout, zero-install:
   untouched. `web/src/hooks/use-auth.tsx`'s `AuthProvider` wraps `GET /api/me`/
   `POST /api/login`/`POST /api/logout` over same-origin `fetch` (cookie sent
   automatically); a 401 anywhere dispatches a `wisp:unauthorized` window event the
-  provider listens for. Tenant scoping (`scopeTenant`) mirrors the old dashboard exactly:
+  provider listens for. Org scoping (`scopeOrg`) mirrors the old dashboard exactly:
   a superadmin picks an org via the header switcher (persisted to `localStorage`, GET
-  `/api/orgs`); an org user is always pinned to their own tenant and never shown a
-  picker, matching `server.py`'s `_scope_tenant`.
+  `/api/orgs`); an org user is always pinned to their own org and never shown a
+  picker, matching `server.py`'s `_scope_org`.
 - **Live updates reuse the same `GET /api/events` SSE stream** —
-  `web/src/hooks/use-event-stream.ts` opens one `EventSource` per tenant scope and
+  `web/src/hooks/use-event-stream.ts` opens one `EventSource` per org scope and
   invalidates react-query cache keys (`summary`/`outages`/`inventory`/`logs`/`team`/
   `attendance`) on each `changed` event, instead of the old dashboard's manual
   `refresh()`.
@@ -324,7 +222,7 @@ Src layout, zero-install:
 
 - **`org_devices` and `devices` are TWO DIFFERENT TABLES.** `devices` (legacy naming) is
   the edge-ingest global id map: rows exist only when an edge has reported an event for
-  them, keyed `(tenant_id, node_id, edge_local_id)`. `org_devices` is the ISP-managed
+  them, keyed `(org_id, node_id, edge_local_id)`. `org_devices` is the ISP-managed
   topology an org builds by hand — exists before/independent of any edge, own id space,
   what central-brain's engine runs against. `GET /api/devices` = legacy registry
   (read-only, no CRUD, stays empty in practice since central-brain is the only mode).
@@ -332,18 +230,18 @@ Src layout, zero-install:
   page uses (a DIFFERENT "Nodes" than **Edge Nodes** — device topology vs. physical
   probe enrollment). Adding a field to the wrong one is the classic mistake.
 - **`central/inventory.py` is pure validation, no storage.** `clean_device_payload`'s
-  `parents` map must already be scoped to one tenant by the caller
-  (`CentralStore.org_device_parent_map`), so a cross-tenant id just looks like "parent
+  `parents` map must already be scoped to one org by the caller
+  (`CentralStore.org_device_parent_map`), so a cross-org id just looks like "parent
   does not exist" rather than needing an explicit check. `clean_backup_link`'s cycle
   check walks the FULL edge set (primary + existing backups).
-- **Every `org_devices` write re-derives the tenant from the DB row, not the request
-  body**, via `store.device_tenant(id)` — a body's `tenant_id` is only trusted for
-  *create*. `_can_write(user, tenant)` gates on the derived tenant.
-  `switch_ports` writes follow the same pattern via `store.switch_port_tenant(id)`;
-  `feeds` also checks the target device is in the SAME tenant. `/api/inventory/links`
-  derives tenant from `child_id` and checks `parent_id` is in that same tenant.
-- **`/api/orgs` must stay tenant-filtered** — same `_scope_tenant` every other route
-  uses (pinned for org users, optional `?tenant=` for superadmin).
+- **Every `org_devices` write re-derives the org from the DB row, not the request
+  body**, via `store.device_org(id)` — a body's `org_id` is only trusted for
+  *create*. `_can_write(user, org)` gates on the derived org.
+  `switch_ports` writes follow the same pattern via `store.switch_port_org(id)`;
+  `feeds` also checks the target device is in the SAME org. `/api/inventory/links`
+  derives org from `child_id` and checks `parent_id` is in that same org.
+- **`/api/orgs` must stay org-filtered** — same `_scope_org` every other route
+  uses (pinned for org users, optional `?org=` for superadmin).
 - **`orgs.ntfy_topic_owner/operator/tech`** (per-role outage routing, customer-set) are
   separate from **`orgs.ntfy_topic`** (fleet-watchdog's `NODE_STALE`/`NODE_OK`,
   platform-operational) — don't merge them.
@@ -358,7 +256,7 @@ Src layout, zero-install:
   pattern for anything else central sends.
 - **`GET /api/analytics?days=`** is outage-history math, no new storage —
   `central/analytics.py:device_reliability` reads `store.outages_in_window`,
-  tenant-scoped. Reports every ACTIVE configured device, not just ones with an outage
+  org-scoped. Reports every ACTIVE configured device, not just ones with an outage
   (a clean device shows 100% uptime). UNREACHABLE outages excluded from downtime — a
   topology-suppressed child isn't "unreliable" on its own account.
 - **Tests:** `unit/test_central_inventory`, `integration/test_central.OrgDevicesTest`,
@@ -375,13 +273,13 @@ Src layout, zero-install:
 - **`EngineRegistry` exists because central's HTTP handling is stateless per-request but
   flap-suppression counters are NOT.** One HTTP request feeds the engine ONE sample; a
   `down_streak` must accumulate across an edge's successive `/report` calls.
-  `EngineRegistry` holds one live `MonitorEngine` per tenant in memory, rebuilding a
-  tenant's engine only when its topology fingerprint changes (`(id,
+  `EngineRegistry` holds one live `MonitorEngine` per org in memory, rebuilding a
+  org's engine only when its topology fingerprint changes (`(id,
   parent_device_id, d.parents)` — `d.parents` covers backup-link add/remove too). A
   fresh/rebuilt engine rehydrates from `device_states` (restart-safe). One registry per
   server process, threaded into `_make_handler` alongside `notifier`.
 - **The wire format is IP-keyed, not device-id-keyed.** `POST /report` body:
-  `{"v":1,"tenant_id":…,"node_id":…,"ts":…,"mode":"full"|"recheck","pings":{"<ip>":
+  `{"v":1,"org_id":…,"node_id":…,"ts":…,"mode":"full"|"recheck","pings":{"<ip>":
   {"loss_pct":…,"latency_ms":…,"jitter_ms":…}}}` — the edge never needs central's device
   ids, only which IPs to probe (from `GET /edge/devices`). A `"recheck"` report carries
   only the suspect IPs named in a prior reply; `_follow_recheck` keeps following until
@@ -389,7 +287,7 @@ Src layout, zero-install:
 - **Escalation sweeping rides the edge's report cadence, not a background timer.**
   `CentralAlertDispatcher.sweep(ts)` runs once per full `/report` (not recheck — timing
   is due-at-gated and idempotent, no need to re-check that often), scoped to that
-  tenant's due `escalations`. Accepted tradeoff: escalations for a tenant stop advancing
+  org's due `escalations`. Accepted tradeoff: escalations for an org stop advancing
   if its edge goes fully stale — the fleet watchdog (`central/watchdog.py`) separately
   pages for that, a different alarm.
 - **The daemon has exactly one mode.** `main()` unconditionally runs
@@ -409,7 +307,7 @@ Src layout, zero-install:
   verbatim), one alarm not two (a monitored port-down folds into the open outage via
   `stamp_outage_cause` — COALESCE, never clobbers a post-mortem — instead of a
   competing alarm; no open outage = leading-indicator heads-up; SNMP never opens an
-  outage itself). A device id in `ports` not in the reporting tenant's `eng.meta` is
+  outage itself). A device id in `ports` not in the reporting org's `eng.meta` is
   silently ignored. Operator-only page, gated by `cfg.snmp_alerts`; state always
   written. **Bandwidth is wired too:** 64-bit octet counters diffed by
   `throughput_bps` into a live rate; a MONITORED port below its per-port threshold
@@ -425,7 +323,7 @@ Src layout, zero-install:
   hour's average) as running sums, averaged at read time.
   `start_central_rollup_prune_thread` runs a daily sweep alongside the fleet watchdog.
 - **Per-link performance baseline.** `central/perf.py` reuses `core/baseline.py`'s pure
-  median+MAD math verbatim. `device_perf_samples` is a bounded per-(tenant,device) ring
+  median+MAD math verbatim. `device_perf_samples` is a bounded per-(org,device) ring
   buffer (insert then trim to `cfg.perf_window`), deliberately NOT the hourly rollup
   storage — an hourly average would smear the intra-hour slowdown this tier exists to
   catch. `record_and_evaluate` runs once per full-report cycle, persists the badge
@@ -433,7 +331,7 @@ Src layout, zero-install:
   enter/leave edge, gated by `cfg.perf_alerts`.
 - **On-backup redundancy needed ZERO engine changes.** `MonitorEngine` already computed
   `CycleResult.redundancy` generically (`DeviceMeta.effective_parents()`). The work was
-  wiring the extra edge: `org_device_links` (tenant-scoped, `kind='backup'`),
+  wiring the extra edge: `org_device_links` (org-scoped, `kind='backup'`),
   `clean_backup_link` (full-edge-set loop check), `load_device_meta` populating
   `DeviceMeta.parents` from backup edges. **`EngineRegistry`'s fingerprint includes
   `d.parents`, not just `parent_device_id`** — a backup add/remove is a topology change
@@ -442,7 +340,8 @@ Src layout, zero-install:
   its badge silently. Gated by `cfg.backup_alerts`.
 - **Every soft-signal tier this platform's edge ever had now exists on central** — SNMP
   status+bandwidth, SLA reporting, latency/loss trend, perf baseline, redundancy.
-  Nothing deferred at the detection-tier level; see "Roadmap" above for remaining groundwork.
+  Nothing deferred at the detection-tier level; see `docs/ARCHITECTURE.md`'s "Roadmap"
+  for remaining groundwork.
 - **Tests:** `integration/test_central_brain.py` (`CentralEngineTest`,
   `CentralAlertDispatcherTest`, `ReportEndpointTest` — full `/report`+`/edge/devices`
   over a real socket, recheck round trip, SNMP folding, trend rollup, redundancy),
@@ -452,7 +351,7 @@ Src layout, zero-install:
 
 ## Reliability invariants (the "trust the alarm" set — don't regress)
 
-- **One logical probe per tenant/node.** Each daemon holds its own OS advisory lock
+- **One logical probe per org/node.** Each daemon holds its own OS advisory lock
   (`runtime/single_instance.py`) and exits (code 3) if another holds it. Two probes
   would double-report, wasteful but harmless since central's per-outage dedupe
   (`store.open_outage_if_absent`, `WHERE NOT EXISTS`) is idempotent.
@@ -495,12 +394,12 @@ Src layout, zero-install:
   shown once at issue time, never retrievable, only rotatable. A fast hash is fine since
   the token is already ~256 bits of generated entropy (`secrets.token_urlsafe(32)`).
 - **The token rides the EXACT SAME `Authorization: Bearer` header** the edge already
-  sends — zero client changes. `central/server.py`'s `_ingest_ok(tenant, node)` tries
+  sends — zero client changes. `central/server.py`'s `_ingest_ok(org, node)` tries
   the global token, then a self-service token (`_node_token_identity` →
   `store.resolve_node_token`, deriving identity FROM the credential, never trusting the
   envelope's claim alone), then a verified mTLS cert. Any one satisfies it.
 - **A node that HAS registered its own credential is gated on presenting it**, even with
-  neither the global token nor mTLS configured — `store.node_token_registered(tenant,
+  neither the global token nor mTLS configured — `store.node_token_registered(org,
   node)` is a hard "credential required" gate before falling back to the open
   trusted-network default. An UNREGISTERED node still gets that open default.
 - **`clean_node_id`** validates the id (1–64 chars, starts letter/digit, then
@@ -517,11 +416,11 @@ Src layout, zero-install:
   time uses only stdlib `ssl`). `openssl` needs to be on the admin CLI box's PATH;
   `PkiError` gives a clear message if missing.
 - **Identity is CN-encoded, not a new wire field.** An edge's client cert CommonName is
-  `tenant_id:node_id` (`pki.edge_common_name`/`pki.peer_identity`) — central decodes it
+  `org_id:node_id` (`pki.edge_common_name`/`pki.peer_identity`) — central decodes it
   off the verified socket, so `/report`'s JSON is unchanged.
 - **The bearer token, a self-service token, or a verified matching cert — any one
   satisfies ingest auth**, none required. `_peer_identity()`'s cert CN must match the
-  CLAIMED tenant (and node, on routes that have one — `/edge/devices` is tenant-only).
+  CLAIMED org (and node, on routes that have one — `/edge/devices` is org-only).
   If none of the three is configured, ingest stays fully open (unchanged default).
 - **Central terminates TLS itself when configured — stdlib `ssl`, no new dependency.**
   `make_server` wraps the listener only when `WISP_CENTRAL_TLS_CERT`/`_KEY` are BOTH
@@ -535,7 +434,7 @@ Src layout, zero-install:
   `handle_error` logs `ssl.SSLError` quietly (routine scanner/stale-client noise on an
   internet-facing ingest port) but lets any other exception fall through loudly.
 - **`central.admin init-ca --host <name-or-ip>`** creates the CA (idempotent) + central's
-  own server cert, `--host` (repeatable) becomes the SAN. **`enroll-edge --tenant
+  own server cert, `--host` (repeatable) becomes the SAN. **`enroll-edge --org
   --node`** issues one client cert per edge off that CA. Both print the exact env vars
   to set on each side.
 - **No CRL or cert rotation tooling yet.** Revoking a compromised edge cert means

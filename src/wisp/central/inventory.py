@@ -1,18 +1,18 @@
-"""ISP device-inventory validation (Phase A) — pure, no DB, no tenant crossing.
+"""ISP device-inventory validation (Phase A) — pure, no DB, no org crossing.
 
 The org-managed topology (`org_devices` in `central/store.py`) needs the same field
 coercion, IP sanity, device-type pick-list, and parent-cycle check as the edge's
 `server/services.py:_clean_device_payload`. That logic is separable from storage (it's a
-pure function of a payload + the tenant's current parent map), so it lives here,
+pure function of a payload + the org's current parent map), so it lives here,
 unit-testable without a DB — exactly like the edge's SNMP-payload cleaner.
 
 `clean_device_payload`'s cycle check walks the PRIMARY parent chain only — a device's
 `parent_device_id`. `clean_backup_link` (CLAUDE.md item 3) is the sibling validator for the
 EXTRA redundancy edge (`org_device_links`, kind='backup'): its cycle check walks the FULL
 edge set (primary + existing backups), mirroring the old single-box `add_backup_link`.
-`parents`/`backups` must already be scoped to one tenant — the caller
+`parents`/`backups` must already be scoped to one org — the caller
 (`central/store.py:org_device_parent_map`/`org_device_backup_map`) never leaks another
-org's ids into them, so a cross-tenant id simply looks like "parent node does not exist".
+org's ids into them, so a cross-org id simply looks like "parent node does not exist".
 """
 from __future__ import annotations
 
@@ -43,12 +43,12 @@ def _str(data: dict, key: str, *, required: bool = False, default=None):
 def clean_device_payload(data: dict, *, parents: dict[int, int | None],
                          device_id: int | None,
                          registered_nodes: set[str] | None = None) -> dict:
-    """Validate + normalise a create/update payload against one tenant's current parent
+    """Validate + normalise a create/update payload against one org's current parent
     map. Raises InventoryError on the first problem. `device_id` is None on create.
 
-    `registered_nodes` (the tenant's own edge-node/wisp-client ids, from
+    `registered_nodes` (the org's own edge-node/wisp-client ids, from
     `store.registered_node_ids`) validates an optional `assigned_node_id` — which
-    specific edge node probes this device (CLAUDE.md's multi-edge-per-tenant device
+    specific edge node probes this device (CLAUDE.md's multi-edge-per-org device
     assignment). Blank/absent means unassigned (every node covers it, the default).
     Callers that don't pass `registered_nodes` (None) skip this check entirely — only
     `central/server.py`'s real inventory routes need it, tests exercising unrelated
@@ -100,7 +100,7 @@ def clean_backup_link(child_id: int, parent_id: int, *,
                       parents: dict[int, int | None],
                       backups: dict[int, set[int]]) -> None:
     """Validate a proposed BACKUP parent edge (`child_id` runs a redundant uplink to
-    `parent_id`) against the tenant's current topology. Raises `InventoryError` on the
+    `parent_id`) against the org's current topology. Raises `InventoryError` on the
     first problem; returns nothing (an OK edge) otherwise. Pure — mirrors the old
     single-box `add_backup_link`'s checks one-for-one, minus the DB, so it's
     unit-testable like `clean_device_payload`."""
@@ -188,16 +188,16 @@ def clean_node_id(raw) -> str:
     return node_id
 
 
-def clean_tenant_id(raw) -> str:
-    """Validate a tenant_id a superadmin types in when creating a new org
+def clean_org_id(raw) -> str:
+    """Validate a org_id a superadmin types in when creating a new org
     (`POST /api/orgs`, `central/server.py`) — same boring charset as `clean_node_id`
-    since it becomes the mTLS CN's `tenant_id:node_id` prefix (`pki.edge_common_name`),
-    the primary key of every tenant-scoped table, and a bare JSON/query value."""
-    tenant_id = str(raw or "").strip()
-    if not tenant_id:
+    since it becomes the mTLS CN's `org_id:node_id` prefix (`pki.edge_common_name`),
+    the primary key of every org-scoped table, and a bare JSON/query value."""
+    org_id = str(raw or "").strip()
+    if not org_id:
         raise InventoryError("org id is required")
-    if not _NODE_ID_RE.match(tenant_id):
+    if not _NODE_ID_RE.match(org_id):
         raise InventoryError(
             "org id must be 1-64 characters, starting with a letter or digit, and "
             "contain only letters, digits, '.', '_', or '-'")
-    return tenant_id
+    return org_id

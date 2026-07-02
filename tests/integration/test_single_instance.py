@@ -1,5 +1,5 @@
 """Duplicate-daemon prevention: the OS-level single-instance lock that stops two
-probe processes for the same tenant/node from running at once (the idempotent
+probe processes for the same org/node from running at once (the idempotent
 OutageOpened guard on the DB side of this is `central/engine.py`'s equivalent,
 covered by `test_central_brain.py`). Temp lock file.
 """

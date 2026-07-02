@@ -1,9 +1,9 @@
-"""Phase B — central runs the brain: per-tenant MonitorEngine over org_devices.
+"""Phase B — central runs the brain: per-org MonitorEngine over org_devices.
 
 `core/state_machine.MonitorEngine` is pure and DB-agnostic; the edge's own
 `load_device_meta`/`build_engine`/`apply_events` (bottom of that file) are just its DB
-glue over the edge's single-tenant schema. This module is the same glue over
-`CentralStore`'s multi-tenant schema — `org_devices` (Phase A's ISP-managed topology)
+glue over the edge's single-org schema. This module is the same glue over
+`CentralStore`'s multi-org schema — `org_devices` (Phase A's ISP-managed topology)
 supplies `DeviceMeta`, `device_states` is the rehydration source (mirrors the edge reading
 back the last `poll_results` row).
 
@@ -11,8 +11,8 @@ Central's HTTP handling is stateless per request, but the FSM's flap-suppression
 (`down_streak`/`nondown_streak`/…) must survive across an edge's successive `POST /report`
 calls, or a device could never accumulate `down_consecutive` samples — one HTTP request
 would only ever feed it one sample. `EngineRegistry` keeps one live `MonitorEngine` per
-tenant in memory (the direct analogue of the daemon's own long-lived `engine` variable in
-`run_forever`), rebuilding only when that tenant's topology actually changed — same
+org in memory (the direct analogue of the daemon's own long-lived `engine` variable in
+`run_forever`), rebuilding only when that org's topology actually changed — same
 device-set-reload check the daemon does at the top of every cycle.
 """
 from __future__ import annotations
@@ -35,13 +35,13 @@ from wisp.core.state_machine import (
 from wisp.ingress.probers import PingResult
 
 
-def load_device_meta(store, tenant_id: str) -> list[DeviceMeta]:
+def load_device_meta(store, org_id: str) -> list[DeviceMeta]:
     """DeviceMeta's BACKUP parent edges (CLAUDE.md item 3) come from `org_device_links` —
     the PRIMARY parent stays `parent_device_id`, unchanged. The engine itself needed NO
     changes to support this: `DeviceMeta.effective_parents()`/topology suppression/
     redundancy math were all built generically in Phase 9 already; central's job is just
     wiring the extra edges in."""
-    edges = store.org_device_backup_edges(tenant_id)
+    edges = store.org_device_backup_edges(org_id)
     backups: dict[int, list[ParentEdge]] = {}
     for e in edges:
         backups.setdefault(e["child_id"], []).append(ParentEdge(e["parent_id"], BACKUP))
@@ -49,40 +49,40 @@ def load_device_meta(store, tenant_id: str) -> list[DeviceMeta]:
         DeviceMeta(id=r["id"], name=r["name"], ip_address=r["ip_address"],
                   region=r["region"], parent_device_id=r["parent_device_id"],
                   technician_phone=None, parents=tuple(backups.get(r["id"], ())))
-        for r in store.org_device_topology(tenant_id)
+        for r in store.org_device_topology(org_id)
     ]
 
 
-def build_engine(store, tenant_id: str, cfg: Config = CONFIG) -> MonitorEngine:
+def build_engine(store, org_id: str, cfg: Config = CONFIG) -> MonitorEngine:
     """Construct the engine and rehydrate each FSM from `device_states` so a central
     restart continues instead of re-paging every open outage (mirrors the edge's
     `build_engine`)."""
-    engine = MonitorEngine(load_device_meta(store, tenant_id), cfg)
-    states = store.device_states(tenant_id)
+    engine = MonitorEngine(load_device_meta(store, org_id), cfg)
+    states = store.device_states(org_id)
     for dev_id, fsm in engine.fsm.items():
         row = states.get(dev_id)
         if row:
             fsm.prime(row["state"])
-    if store.uplink_active(tenant_id):
+    if store.uplink_active(org_id):
         engine._uplink_active = True
     return engine
 
 
-def apply_events(store, tenant_id: str, events: list[Event], ts: str) -> None:
+def apply_events(store, org_id: str, events: list[Event], ts: str) -> None:
     """Persist outage open/recategorize/resolve (mirrors
-    `core/state_machine.apply_events`, tenant-scoped)."""
+    `core/state_machine.apply_events`, org-scoped)."""
     for ev in events:
         if isinstance(ev, OutageOpened):
-            store.open_outage_if_absent(tenant_id, ev.device_id, ts, ev.state)
+            store.open_outage_if_absent(org_id, ev.device_id, ts, ev.state)
         elif isinstance(ev, OutageRecategorized):
-            store.recategorize_outage(tenant_id, ev.device_id, ev.state)
+            store.recategorize_outage(org_id, ev.device_id, ev.state)
         elif isinstance(ev, OutageResolved):
-            store.resolve_outage(tenant_id, ev.device_id, ts)
+            store.resolve_outage(org_id, ev.device_id, ts)
 
 
 class EngineRegistry:
-    """One live `MonitorEngine` per tenant, rebuilt only on a topology change. Thread-safe
-    (central's `ThreadingHTTPServer` can process reports for different tenants — or
+    """One live `MonitorEngine` per org, rebuilt only on a topology change. Thread-safe
+    (central's `ThreadingHTTPServer` can process reports for different orgs — or
     concurrent retries for the same one — on different threads)."""
 
     def __init__(self, store, cfg: Config = CONFIG) -> None:
@@ -101,29 +101,29 @@ class EngineRegistry:
         sorts/compares fine inside the outer tuple."""
         return tuple(sorted((d.id, d.parent_device_id, d.parents) for d in devices))
 
-    def get(self, tenant_id: str) -> MonitorEngine:
-        devices = load_device_meta(self.store, tenant_id)
+    def get(self, org_id: str) -> MonitorEngine:
+        devices = load_device_meta(self.store, org_id)
         fp = self._fingerprint(devices)
         with self._lock:
-            if self._fingerprints.get(tenant_id) != fp:
+            if self._fingerprints.get(org_id) != fp:
                 engine = MonitorEngine(devices, self.cfg)
-                states = self.store.device_states(tenant_id)
+                states = self.store.device_states(org_id)
                 for dev_id, fsm in engine.fsm.items():
                     row = states.get(dev_id)
                     if row:
                         fsm.prime(row["state"])
-                if self.store.uplink_active(tenant_id):
+                if self.store.uplink_active(org_id):
                     engine._uplink_active = True
-                self._engines[tenant_id] = engine
-                self._fingerprints[tenant_id] = fp
-            return self._engines[tenant_id]
+                self._engines[org_id] = engine
+                self._fingerprints[org_id] = fp
+            return self._engines[org_id]
 
 
-def run_cycle(store, tenant_id: str, engine: MonitorEngine,
+def run_cycle(store, org_id: str, engine: MonitorEngine,
              results: dict[str, PingResult], ts: str,
              subset: set[int] | None = None,
              expected_ips: set[str] | None = None) -> CycleResult:
-    """One tenant's report -> one engine cycle -> persisted outages + live state. Takes
+    """One org's report -> one engine cycle -> persisted outages + live state. Takes
     an already-fetched engine (from `EngineRegistry.get`) rather than the registry
     itself, so the caller (central/server.py) can reuse the SAME engine instance for the
     alert dispatcher afterwards (it needs `engine.meta` for device names/regions) without
@@ -137,12 +137,12 @@ def run_cycle(store, tenant_id: str, engine: MonitorEngine,
     fleet. `cycle.states` (and so the `device_states` write below) is naturally already
     scoped to just the fed devices in that case — nothing else needs to change.
 
-    `expected_ips` (full pass only — device assignment, CLAUDE.md's multi-edge-per-tenant
+    `expected_ips` (full pass only — device assignment, CLAUDE.md's multi-edge-per-org
     feature) narrows which devices THIS report can commit; see
     `MonitorEngine.process_cycle`'s own docstring for why that's the right place to skip
     an out-of-scope device instead of scoring it 100% loss."""
     cycle = engine.process_cycle(results, ts, subset=subset, expected_ips=expected_ips)
-    apply_events(store, tenant_id, cycle.events, ts)
+    apply_events(store, org_id, cycle.events, ts)
     rows = []
     for dev_id, state in cycle.states.items():
         dev = engine.meta[dev_id]
@@ -151,7 +151,7 @@ def run_cycle(store, tenant_id: str, engine: MonitorEngine,
                     res.latency_ms if res else None,
                     res.packet_loss if res else None,
                     res.jitter_ms if res else None))
-    store.write_device_states(tenant_id, rows, ts)
+    store.write_device_states(org_id, rows, ts)
     return cycle
 
 

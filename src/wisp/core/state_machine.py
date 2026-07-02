@@ -11,7 +11,7 @@ flap suppression, recovery hysteresis, and two network-aware overrides:
 `MonitorEngine` is deliberately pure: it takes a dict of {ip: PingResult} plus a
 timestamp and returns committed states + a list of events, with no I/O of its own —
 `central/engine.py` owns building/rehydrating it and persisting its events against
-central's multi-tenant store, so the decision logic here can be unit-tested with no
+central's multi-org store, so the decision logic here can be unit-tested with no
 database at all.
 """
 from __future__ import annotations
@@ -266,7 +266,7 @@ class MonitorEngine:
         full pass already handled this cycle.
 
         `expected_ips`, on a full pass only, narrows which devices this particular
-        report is authoritative for (central's multi-edge-per-tenant device assignment —
+        report is authoritative for (central's multi-edge-per-org device assignment —
         see `central/store.py:node_expected_ips`). A device whose ip ISN'T in
         `expected_ips` is skipped entirely — no feed(), no committed entry, no event —
         rather than defaulting to the missing-sample 100%-loss fallback below, so a

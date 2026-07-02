@@ -1,5 +1,5 @@
-"""Central dashboard auth + multi-tenant API tests (Phase 10 Part C): password/account
-crypto, identity-carrying sessions, the login flow, tenant scoping (org user pinned,
+"""Central dashboard auth + multi-org API tests (Phase 10 Part C): password/account
+crypto, identity-carrying sessions, the login flow, org scoping (org user pinned,
 superadmin sees all), write authorization (owner/superadmin only), and the org-wide team /
 attendance — all over a real socket with http.client. No network beyond loopback."""
 import http.client
@@ -12,28 +12,15 @@ import time
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))), "src"))
+_TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
+sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
 from wisp.central import auth
 from wisp.central.store import CentralStore
 from wisp.central.server import make_server
-from wisp.egress.notifiers import NotifyResult
-
-
-class RecordingNotifier:
-    """No real network — mirrors the recording double used in test_central_watchdog."""
-    channel = "ntfy"
-
-    def __init__(self, ok: bool = True) -> None:
-        self.ok = ok
-        self.sent: list[dict] = []
-
-    def send(self, recipient, title, body, priority) -> NotifyResult:
-        self.sent.append({"recipient": recipient, "title": title,
-                          "body": body, "priority": priority})
-        return NotifyResult(self.ok)
+from support import RecordingNotifier
 
 
 class CentralAuthUnitTest(unittest.TestCase):
@@ -135,7 +122,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertTrue(cookie.startswith("wisp_central_session="))
         status, body, _ = self._req("GET", "/api/me", cookie=cookie)
         self.assertEqual(status, 200)
-        self.assertEqual(body["user"]["tenant_id"], "ispA")
+        self.assertEqual(body["user"]["org_id"], "ispA")
         self.assertEqual(body["user"]["role"], "owner")
 
     def test_bad_login_401_and_me_requires_session(self):
@@ -147,45 +134,45 @@ class CentralAuthHttpTest(unittest.TestCase):
             self._login("owner", "wrong")
         self.assertEqual(self._login("owner", "wrong")[0], 429)  # locked out after 5 fails
 
-    # --- tenant scoping ---
-    def test_org_user_is_pinned_to_their_tenant(self):
+    # --- org scoping ---
+    def test_org_user_is_pinned_to_their_org(self):
         _, cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/fleet", cookie=cookie)
-        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispA"})
-        # even if they try to peek at another org, the server ignores ?tenant for org users
-        _, body, _ = self._req("GET", "/api/fleet?tenant=ispB", cookie=cookie)
-        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispA"})
+        self.assertEqual({n["org_id"] for n in body["nodes"]}, {"ispA"})
+        # even if they try to peek at another org, the server ignores ?org for org users
+        _, body, _ = self._req("GET", "/api/fleet?org=ispB", cookie=cookie)
+        self.assertEqual({n["org_id"] for n in body["nodes"]}, {"ispA"})
 
     def test_superadmin_sees_all_and_can_narrow(self):
         _, cookie = self._login("root", "rootpassword")
         _, body, _ = self._req("GET", "/api/fleet", cookie=cookie)
-        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispA", "ispB"})
-        _, body, _ = self._req("GET", "/api/fleet?tenant=ispB", cookie=cookie)
-        self.assertEqual({n["tenant_id"] for n in body["nodes"]}, {"ispB"})
+        self.assertEqual({n["org_id"] for n in body["nodes"]}, {"ispA", "ispB"})
+        _, body, _ = self._req("GET", "/api/fleet?org=ispB", cookie=cookie)
+        self.assertEqual({n["org_id"] for n in body["nodes"]}, {"ispB"})
 
     def test_bearer_token_reads_as_machine_superadmin(self):
         status, body, _ = self._req("GET", "/api/devices", token="tok")
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["devices"]), 2)        # cross-tenant
+        self.assertEqual(len(body["devices"]), 2)        # cross-org
 
     # --- write authorization ---
     def test_operator_cannot_write_team_owner_can(self):
         _, op = self._login("oper", "operpassword")
         status, _, _ = self._req("POST", "/api/team",
-                                 {"tenant_id": "ispA", "name": "Bob"}, cookie=op)
+                                 {"org_id": "ispA", "name": "Bob"}, cookie=op)
         self.assertEqual(status, 403)
         _, own = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/team",
-                                    {"tenant_id": "ispA", "name": "Bob", "role": "operator"}, cookie=own)
+                                    {"org_id": "ispA", "name": "Bob", "role": "operator"}, cookie=own)
         self.assertEqual(status, 200)
         # owner cannot write into a DIFFERENT org
         status, _, _ = self._req("POST", "/api/team",
-                                 {"tenant_id": "ispB", "name": "X"}, cookie=own)
+                                 {"org_id": "ispB", "name": "X"}, cookie=own)
         self.assertEqual(status, 403)
 
     def test_team_and_attendance_round_trip(self):
         _, own = self._login("owner", "ownerpassword")
-        self._req("POST", "/api/team", {"tenant_id": "ispA", "name": "Asha", "role": "operator"}, cookie=own)
+        self._req("POST", "/api/team", {"org_id": "ispA", "name": "Asha", "role": "operator"}, cookie=own)
         _, team, _ = self._req("GET", "/api/team", cookie=own)
         self.assertEqual(team["team"][0]["name"], "Asha")
         wid = team["team"][0]["id"]
@@ -197,39 +184,73 @@ class CentralAuthHttpTest(unittest.TestCase):
     def test_superadmin_provisions_org_user(self):
         _, root = self._login("root", "rootpassword")
         status, body, _ = self._req("POST", "/api/users",
-            {"tenant_id": "ispB", "username": "bowner", "password": "bpassword12", "role": "owner"},
+            {"org_id": "ispB", "username": "bowner", "password": "bpassword12", "role": "owner"},
             cookie=root)
         self.assertEqual(status, 200)
         self.assertEqual(self._login("bowner", "bpassword12")[0], 200)
 
+    # --- password changes ---
+    def test_self_service_password_change_requires_current_password(self):
+        _, own = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"current_password": "wrongpassword", "new_password": "newpassword1"}, cookie=own)
+        self.assertEqual(status, 422)
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"current_password": "ownerpassword", "new_password": "newpassword1"}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._login("owner", "ownerpassword")[0], 401)  # old password dead
+        self.assertEqual(self._login("owner", "newpassword1")[0], 200)
+
+    def test_owner_can_reset_teammate_password_without_current(self):
+        _, own = self._login("owner", "ownerpassword")
+        oper_id = self.store.get_user_by_username("oper")["id"]
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"id": oper_id, "new_password": "resetpassword1"}, cookie=own)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._login("oper", "resetpassword1")[0], 200)
+
+    def test_operator_cannot_reset_teammate_password(self):
+        _, op = self._login("oper", "operpassword")
+        owner_id = self.store.get_user_by_username("owner")["id"]
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"id": owner_id, "new_password": "hijacked12"}, cookie=op)
+        self.assertEqual(status, 403)
+
+    def test_owner_cannot_reset_password_of_another_org(self):
+        _, own = self._login("owner", "ownerpassword")
+        root_id = self.store.get_user_by_username("root")["id"]
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"id": root_id, "new_password": "hijackroot1"}, cookie=own)
+        self.assertEqual(status, 403)
+
     def test_ingest_uses_bearer_not_session(self):
         _, op = self._login("oper", "operpassword")
         # a session cookie does NOT authorize ingest (that plane is bearer-only)
-        env = {"v": 1, "tenant_id": "ispA", "node_id": "edge-2", "kind": "heartbeat",
+        env = {"v": 1, "org_id": "ispA", "node_id": "edge-2", "kind": "heartbeat",
                "body": {"fleet_size": 1}}
         self.assertEqual(self._req("POST", "/heartbeat", env, cookie=op)[0], 401)
         self.assertEqual(self._req("POST", "/heartbeat", env, token="tok")[0], 200)
 
-    # --- /api/orgs must never leak another tenant's row to an org user ---
-    def test_orgs_endpoint_is_tenant_scoped_for_org_users(self):
+    # --- /api/orgs must never leak another org's row to an org user ---
+    def test_orgs_endpoint_is_org_scoped_for_org_users(self):
         self.store.set_org("ispA", ntfy_topic_owner="secret-a-topic")
         self.store.set_org("ispB", ntfy_topic_owner="secret-b-topic")
         _, own = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/orgs", cookie=own)
         self.assertEqual(status, 200)
-        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispA"])
+        self.assertEqual([o["org_id"] for o in body["orgs"]], ["ispA"])
         self.assertEqual(body["orgs"][0]["ntfy_topic_owner"], "secret-a-topic")
         # even asking for another org explicitly doesn't leak it (org users are pinned)
-        status, body, _ = self._req("GET", "/api/orgs?tenant=ispB", cookie=own)
-        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispA"])
+        status, body, _ = self._req("GET", "/api/orgs?org=ispB", cookie=own)
+        self.assertEqual([o["org_id"] for o in body["orgs"]], ["ispA"])
 
     def test_superadmin_orgs_sees_all_or_narrows(self):
         self.store.set_org("ispA", name="A"); self.store.set_org("ispB", name="B")
         _, root = self._login("root", "rootpassword")
         _, body, _ = self._req("GET", "/api/orgs", cookie=root)
-        self.assertEqual({o["tenant_id"] for o in body["orgs"]}, {"ispA", "ispB"})
-        _, body, _ = self._req("GET", "/api/orgs?tenant=ispB", cookie=root)
-        self.assertEqual([o["tenant_id"] for o in body["orgs"]], ["ispB"])
+        self.assertEqual({o["org_id"] for o in body["orgs"]}, {"ispA", "ispB"})
+        _, body, _ = self._req("GET", "/api/orgs?org=ispB", cookie=root)
+        self.assertEqual([o["org_id"] for o in body["orgs"]], ["ispB"])
 
     # --- Phase A: device inventory (management plane) ---
     def test_inventory_create_update_delete_round_trip(self):
@@ -274,17 +295,17 @@ class CentralAuthHttpTest(unittest.TestCase):
             {"name": "X", "ip_address": "10.0.0.5"}, cookie=op)
         self.assertEqual(status, 403)
 
-    def test_inventory_write_cannot_cross_tenant(self):
+    def test_inventory_write_cannot_cross_org(self):
         _, own = self._login("owner", "ownerpassword")
         _, body, _ = self._req("POST", "/api/inventory",
             {"name": "A", "ip_address": "10.0.0.1"}, cookie=own)
         dev_id = body["id"]
         # ispB has no owner logged in here, but even ispA's owner can't touch it via
-        # tenant_id override — a device's tenant is derived from the row, not the body.
+        # org_id override — a device's org is derived from the row, not the body.
         status, _, _ = self._req("POST", "/api/inventory",
-            {"tenant_id": "ispB", "name": "B", "ip_address": "10.0.1.1"}, cookie=own)
+            {"org_id": "ispB", "name": "B", "ip_address": "10.0.1.1"}, cookie=own)
         self.assertEqual(status, 403)
-        status, _, _ = self._req("GET", "/api/inventory?tenant=ispB", cookie=own)
+        status, _, _ = self._req("GET", "/api/inventory?org=ispB", cookie=own)
         # org user pinned: ispB's inventory (empty) is what they'd see, not a leak of ispA's
         self.assertEqual(status, 200)
 
@@ -342,7 +363,7 @@ class CentralAuthHttpTest(unittest.TestCase):
     def test_analytics_requires_auth(self):
         self.assertEqual(self._req("GET", "/api/analytics")[0], 401)
 
-    def test_analytics_is_tenant_scoped_for_org_users(self):
+    def test_analytics_is_org_scoped_for_org_users(self):
         dev = self.store.create_org_device("ispA", {
             "name": "Tower", "ip_address": "10.0.0.1", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -355,8 +376,8 @@ class CentralAuthHttpTest(unittest.TestCase):
         ids = {d["device_id"] for d in body["devices"]}
         self.assertIn(dev, ids)
         self.assertNotIn(other, ids)
-        # an org user can't peek at another tenant via ?tenant=
-        status, body, _ = self._req("GET", "/api/analytics?tenant=ispB", cookie=own)
+        # an org user can't peek at another org via ?org=
+        status, body, _ = self._req("GET", "/api/analytics?org=ispB", cookie=own)
         self.assertNotIn(other, {d["device_id"] for d in body["devices"]})
 
     def test_analytics_superadmin_can_narrow(self):
@@ -364,12 +385,12 @@ class CentralAuthHttpTest(unittest.TestCase):
             "name": "Other", "ip_address": "10.0.0.2", "device_type": None,
             "region": None, "parent_device_id": None})
         _, root = self._login("root", "rootpassword")
-        status, body, _ = self._req("GET", "/api/analytics?tenant=ispB&days=7", cookie=root)
+        status, body, _ = self._req("GET", "/api/analytics?org=ispB&days=7", cookie=root)
         self.assertEqual(status, 200)
         self.assertEqual(body["devices"][0]["name"], "Other")
 
     # --- graph topology: backup links + port bandwidth config (CLAUDE.md item 3) ---
-    def test_backup_link_round_trip_and_cross_tenant_rejected(self):
+    def test_backup_link_round_trip_and_cross_org_rejected(self):
         _, own = self._login("owner", "ownerpassword")
         primary = self.store.create_org_device("ispA", {
             "name": "Primary", "ip_address": "10.0.1.1", "device_type": None,
@@ -388,7 +409,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         relay = next(d for d in devices if d["id"] == child)
         self.assertEqual(relay["backup_parents"], [backup])
 
-        # a backup parent from a DIFFERENT tenant is rejected
+        # a backup parent from a DIFFERENT org is rejected
         other = self.store.create_org_device("ispB", {
             "name": "Other", "ip_address": "10.0.9.9", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -499,7 +520,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         status, body, _ = self._req("GET", "/api/outages", cookie=own)
         self.assertNotIn(oid, {o["id"] for o in body["outages"]})
 
-    def test_outage_write_cannot_cross_tenant(self):
+    def test_outage_write_cannot_cross_org(self):
         dev = self.store.create_org_device("ispB", {
             "name": "Relay", "ip_address": "10.0.5.2", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -509,12 +530,12 @@ class CentralAuthHttpTest(unittest.TestCase):
         status, _, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=own)
         self.assertEqual(status, 403)
 
-    def test_logs_endpoint_is_tenant_scoped(self):
+    def test_logs_endpoint_is_org_scoped(self):
         _, own = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/logs", cookie=own)
         self.assertEqual(status, 200)
         self.assertTrue(body["events"])
-        self.assertTrue(all(e["tenant_id"] == "ispA" for e in body["events"]))
+        self.assertTrue(all(e["org_id"] == "ispA" for e in body["events"]))
 
     # --- static (unauthed) ---
     def test_static_index_served(self):

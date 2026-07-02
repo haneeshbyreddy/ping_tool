@@ -231,10 +231,10 @@ class Config:
     # central's cert isn't from a public CA the OS trust store already has — the
     # common case for the internal CA `central.admin init-ca` creates).
     central_ca_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_CA_CERT", ""))
-    # Edge identity. (tenant_id, node_id) is the durable identity central keys every
+    # Edge identity. (org_id, node_id) is the durable identity central keys every
     # record by. node_id defaults to the hostname so a fresh install still has a
     # stable id.
-    tenant_id: str = field(default_factory=lambda: _env("WISP_TENANT_ID", "default"))
+    org_id: str = field(default_factory=lambda: _env("WISP_ORG_ID", "default"))
     node_id: str = field(default_factory=lambda: _env("WISP_NODE_ID", "") or _hostname())
     # HTTP timeout for GET /edge/devices and POST /report.
     ship_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_TIMEOUT_S", 10.0))
