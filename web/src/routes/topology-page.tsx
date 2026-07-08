@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode 
 import { useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, MoreVertical, Pencil, Plus, Radio, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ChevronRight, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { analyticsApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
@@ -13,6 +13,7 @@ import { NeedsOrg } from "@/components/needs-org"
 import { OpticalPanel } from "@/components/optical-panel"
 import { RegionSelect } from "@/components/region-select"
 import { ProbesPanel } from "@/components/probes-panel"
+import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
 import { ago, deviceTone, durationSince, fmtBytes, fmtDur, isStale } from "@/lib/format"
@@ -636,6 +637,7 @@ function DeviceRow({
 }) {
   const queryClient = useQueryClient()
   const [detailOpen, setDetailOpen] = useState(false)
+  const [walkOpen, setWalkOpen] = useState(false)
   const confirmDelete = useConfirm()
   const rowRef = useRef<HTMLDivElement>(null)
 
@@ -789,6 +791,11 @@ function DeviceRow({
                 <DropdownMenuItem onClick={() => onEdit(device)}>
                   <Pencil /> Edit
                 </DropdownMenuItem>
+                {device.snmp_enabled === 1 && (
+                  <DropdownMenuItem onClick={() => setWalkOpen(true)}>
+                    <ScanSearch /> SNMP walk
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
                   <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
                 </DropdownMenuItem>
@@ -802,10 +809,13 @@ function DeviceRow({
             title={`Delete ${device.name}?`}
             description="The device, its state, and its outage history are removed. This cannot be undone."
             onConfirm={() => remove.mutate()} />
+          {walkOpen && (
+            <SnmpWalkDialog device={device} open={walkOpen} onOpenChange={setWalkOpen} />
+          )}
         </div>
       </div>
       {detailOpen && (
-        <div className="px-3 pt-1 pb-3" style={{ paddingLeft: device.depth * 16 + 28 }}>
+        <div className="px-3 pt-1 pb-3">
           <DeviceDetail device={device} tab={detailTab} onTab={setDetailTab} />
         </div>
       )}

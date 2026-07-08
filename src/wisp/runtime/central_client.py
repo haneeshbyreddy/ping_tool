@@ -12,8 +12,11 @@ class CentralClientError(RuntimeError):
 class CentralBrainClient(Protocol):
     def fetch_devices(self) -> dict: ...
     def report(self, pings: dict, ts: str, *, mode: str = "full",
-              ports: dict | None = None, optics: dict | None = None) -> dict: ...
+              ports: dict | None = None, optics: dict | None = None,
+              health: dict | None = None) -> dict: ...
     def heartbeat(self, body: dict) -> dict: ...
+    def walk_result(self, walk_id: int, *, varbinds: list | None = None,
+                    error: str | None = None) -> dict: ...
     def close(self) -> None: ...
 
 class HttpCentralClient:
@@ -81,18 +84,31 @@ class HttpCentralClient:
             raise CentralClientError(str(exc)) from exc
 
     def report(self, pings: dict, ts: str, *, mode: str = "full",
-              ports: dict | None = None, optics: dict | None = None) -> dict:
+              ports: dict | None = None, optics: dict | None = None,
+              health: dict | None = None) -> dict:
         env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
               "ts": ts, "mode": mode, "pings": pings}
         if ports:
             env["ports"] = ports
         if optics:
             env["optics"] = optics
+        if health:
+            env["health"] = health
         return self._post("/report", env)
 
     def heartbeat(self, body: dict) -> dict:
         env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id, "body": body}
         return self._post("/heartbeat", env)
+
+    def walk_result(self, walk_id: int, *, varbinds: list | None = None,
+                    error: str | None = None) -> dict:
+        env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
+              "walk_id": walk_id}
+        if error:
+            env["error"] = error
+        else:
+            env["varbinds"] = varbinds or []
+        return self._post("/edge/snmp-walk", env)
 
 def build_central_client(cfg: Config = CONFIG) -> CentralBrainClient:
     return HttpCentralClient(cfg)

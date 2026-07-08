@@ -106,6 +106,7 @@ async def _gather_snmp_ports(
 
 async def _gather_snmp_health(
     health_poller: HealthPoller, devices: list[dict], cfg: Config = CONFIG,
+    profiles: list[dict] | None = None,
 ) -> dict[int, dict]:
     sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
 
@@ -115,7 +116,8 @@ async def _gather_snmp_health(
         async with sem:
             try:
                 health = await asyncio.wait_for(
-                    health_poller.walk(target), timeout=cfg.snmp_walk_timeout_s or None)
+                    health_poller.walk(target, profiles),
+                    timeout=cfg.snmp_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("SNMP health walk of device %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
@@ -158,6 +160,77 @@ async def _gather_onu_optics(
                 if d.get("snmp_enabled") and (d.get("device_type") or "").upper() == "OLT"]
     pairs = await asyncio.gather(*(one(d) for d in eligible))
     return {dev_id: onus for dev_id, onus in (p for p in pairs if p)}
+
+class _DiagWalkRunner:
+    """Runs central-queued diagnostic SNMP walks (reply key "snmp_walks").
+
+    Deliberately boring: sequential (one walk at a time — a diagnostic must never
+    compete with the monitoring sweeps for SNMP airtime), dedupes directive ids
+    (central re-delivers a pending walk every report until its result lands, so a
+    restart mid-walk just re-runs it), and refuses any target that isn't in the
+    device list this node currently probes — central names devices, never raw IPs.
+    A failed result upload un-marks the id so the next re-delivery retries it.
+    """
+
+    def __init__(self, client: CentralBrainClient, cfg: Config = CONFIG,
+                 walker=None) -> None:
+        self._client = client
+        self._cfg = cfg
+        self._walker = walker
+        self._queue: list[tuple[dict, bool]] = []
+        self._seen: set[int] = set()
+        self._task: asyncio.Task | None = None
+
+    def accept(self, walks: list | None, devices: list[dict]) -> None:
+        if not walks:
+            return
+        allowed = {d["ip_address"] for d in devices}
+        for w in walks:
+            try:
+                wid = int(w.get("id"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if wid in self._seen:
+                continue
+            self._seen.add(wid)
+            self._queue.append((w, w.get("ip_address") in allowed))
+        if self._queue and (self._task is None or self._task.done()):
+            self._task = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        while self._queue:
+            w, allowed = self._queue.pop(0)
+            wid = int(w["id"])
+            try:
+                if not allowed:
+                    self._client.walk_result(
+                        wid, error="target is not a device this node probes")
+                    continue
+                if self._walker is None:
+                    from wisp.ingress.walker import build_diag_walker
+                    self._walker = build_diag_walker(self._cfg)
+                target = SnmpTarget(
+                    ip=w["ip_address"], community=w.get("snmp_community") or "",
+                    port=w.get("snmp_port") or 161,
+                    version=w.get("snmp_version") or "2c")
+                res = await self._walker.walk(
+                    target, w.get("root_oid") or "1.3.6.1",
+                    int(w.get("max_varbinds") or 2000))
+                self._client.walk_result(
+                    wid, varbinds=[[o, v] for o, v in res.varbinds])
+                log.info("diagnostic walk %d of %s done: %d varbinds%s", wid,
+                         w["ip_address"], len(res.varbinds),
+                         " (truncated)" if res.truncated else "")
+            except CentralClientError as exc:
+                log.warning("walk %d result upload failed, will retry on"
+                            " re-delivery: %s", wid, exc)
+                self._seen.discard(wid)
+            except Exception as exc:
+                log.exception("diagnostic walk %d failed", wid)
+                try:
+                    self._client.walk_result(wid, error=str(exc)[:500])
+                except CentralClientError:
+                    self._seen.discard(wid)
 
 async def _follow_recheck(
     prober: Prober, client: CentralBrainClient, reply: dict, cfg: Config,
@@ -212,6 +285,7 @@ async def run_cycle_central_brain(
     gpon_pool: GponPollerPool | None = None,
     optics: dict[int, list[dict]] | None = None,
     health: dict[int, dict] | None = None,
+    walk_runner: _DiagWalkRunner | None = None,
 ) -> bool:
     prober.on_cycle_start()
     ts = _utc_now_iso()
@@ -235,6 +309,8 @@ async def run_cycle_central_brain(
     except CentralClientError as exc:
         log.warning("central report failed: %s", exc)
         return False
+    if walk_runner is not None:
+        walk_runner.accept(reply.get("snmp_walks"), devices)
     if cfg.retry_interval_s > 0:
         await _follow_recheck(prober, client, reply, cfg)
     return True
@@ -299,6 +375,7 @@ async def _run_central_brain(
         raise SystemExit(2)
     devices = topo.get("devices") or []
     canary_ip = topo.get("canary_ip") or cfg.canary_ip
+    snmp_profiles = topo.get("snmp_profiles") or []
 
     cli_interval = interval
     interval = cli_interval if cli_interval is not None else cfg.effective_interval(len(devices))
@@ -316,6 +393,7 @@ async def _run_central_brain(
     gpon_task: asyncio.Task | None = None
     health_poller = build_health_poller(cfg) if cfg.snmp_interval_s > 0 else None
     health_task: asyncio.Task | None = None
+    walk_runner = _DiagWalkRunner(client, cfg) if cfg.snmp_interval_s > 0 else None
 
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
@@ -324,6 +402,7 @@ async def _run_central_brain(
                 topo = client.fetch_devices()
                 devices = topo.get("devices") or devices
                 canary_ip = topo.get("canary_ip") or canary_ip
+                snmp_profiles = topo.get("snmp_profiles") or snmp_profiles
             except CentralClientError as exc:
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
@@ -337,7 +416,8 @@ async def _run_central_brain(
                     _gather_onu_optics(gpon_pool, list(devices), cfg))
             if health_poller is not None:
                 health_task = asyncio.create_task(
-                    _gather_snmp_health(health_poller, list(devices), cfg))
+                    _gather_snmp_health(health_poller, list(devices), cfg,
+                                        list(snmp_profiles)))
             next_snmp = started + cfg.snmp_interval_s
         ports: dict[int, list[dict]] | None = None
         if snmp_task is not None and snmp_task.done():
@@ -363,7 +443,7 @@ async def _run_central_brain(
         try:
             reported = await run_cycle_central_brain(
                 prober, client, devices, canary_ip, cfg, ports=ports, optics=optics,
-                health=health)
+                health=health, walk_runner=walk_runner)
             status.write(PHASE_RUNNING, ok=reported, devices=len(devices),
                          error=None if reported else "last report to central failed")
         except Exception as exc:

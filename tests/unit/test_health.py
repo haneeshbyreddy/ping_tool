@@ -10,9 +10,9 @@ sys.path.insert(0, os.path.dirname(_TESTS_DIR))
 from wisp.config import Config
 from wisp.ingress.health import (
     DeviceHealth, OID_ENT_SENSOR_PRECISION, OID_ENT_SENSOR_SCALE, OID_ENT_SENSOR_TYPE,
-    OID_ENT_SENSOR_VALUE, OID_HR_CPU_LOAD, OID_HR_STORAGE_SIZE, OID_HR_STORAGE_TYPE,
-    OID_HR_STORAGE_UNITS, OID_HR_STORAGE_USED, OID_MTXR_HEALTH, PysnmpHealthPoller,
-    build_health_poller, parse_health,
+    OID_ENT_SENSOR_VALUE, OID_FH_HEALTH, OID_FH_MEM, OID_HR_CPU_LOAD, OID_HR_STORAGE_SIZE,
+    OID_HR_STORAGE_TYPE, OID_HR_STORAGE_UNITS, OID_HR_STORAGE_USED, OID_MTXR_HEALTH,
+    PysnmpHealthPoller, build_health_poller, parse_health,
 )
 from apps.daemon.main import _gather_snmp_health
 
@@ -86,6 +86,29 @@ class ParseTest(unittest.TestCase):
                (f"{OID_MTXR_HEALTH}.10.0", "990")]
         self.assertEqual(parse_health(vbs).temp_c, 50.0)
 
+    def test_fiberhome_private_tree_fills_all_three(self):
+        # An S3330-class switch exposes none of the standard MIBs; its 5651 tree does.
+        vbs = [(f"{OID_FH_HEALTH}.1.0", "69"),   # mem %
+               (f"{OID_FH_HEALTH}.2.0", "10"),   # cpu %
+               (f"{OID_FH_HEALTH}.3.0", "21"),   # temp C
+               (f"{OID_FH_MEM}.8.0", "485363712"),
+               (f"{OID_FH_MEM}.5.0", "334450688")]
+        h = parse_health(vbs)
+        self.assertEqual(h.cpu_pct, 10.0)
+        self.assertEqual(h.temp_c, 21.0)
+        self.assertEqual(h.mem_total_bytes, 485363712)
+        self.assertEqual(h.mem_used_bytes, 334450688)
+        self.assertAlmostEqual(h.mem_pct, 68.9, places=1)
+
+    def test_standard_mibs_win_over_fiberhome(self):
+        # A box that answers both keeps the standard reading, not the vendor fallback.
+        vbs = _ram_rows() + [(f"{OID_HR_CPU_LOAD}.1", "12"),
+                             (f"{OID_FH_HEALTH}.2.0", "99"),
+                             (f"{OID_FH_MEM}.8.0", "1"), (f"{OID_FH_MEM}.5.0", "1")]
+        h = parse_health(vbs)
+        self.assertEqual(h.cpu_pct, 12.0)
+        self.assertEqual(h.mem_total_bytes, 262144 * 1024)
+
     def test_empty_walk_is_empty_health(self):
         h = parse_health([])
         self.assertTrue(h.is_empty())
@@ -98,12 +121,96 @@ class ParseTest(unittest.TestCase):
         self.assertAlmostEqual(wire["mem_pct"], 36.2, places=1)
         self.assertIsNone(wire["temp_c"])
 
+def _profile(metrics, match="1.3.6.1.4.1.9999"):
+    return {"name": "test-vendor", "match_sysobjectid": match, "metrics": metrics}
+
+
+class ProfileTest(unittest.TestCase):
+    def test_profile_fills_gaps_the_standard_mibs_left(self):
+        vbs = [("1.3.6.1.4.1.9999.1.2.0", "37"),      # vendor cpu
+               ("1.3.6.1.4.1.9999.1.3.0", "425")]     # vendor temp, tenths
+        p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"},
+                      "temp_c": {"oid": "1.3.6.1.4.1.9999.1.3.0", "decode": "div10"}})
+        h = parse_health(vbs, p)
+        self.assertEqual(h.cpu_pct, 37.0)
+        self.assertEqual(h.temp_c, 42.5)
+
+    def test_standard_mibs_win_over_the_profile(self):
+        vbs = [(f"{OID_HR_CPU_LOAD}.1", "10"),
+               ("1.3.6.1.4.1.9999.1.2.0", "99")]
+        p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"}})
+        self.assertEqual(parse_health(vbs, p).cpu_pct, 10.0)
+
+    def test_signed_div100_decodes_negative_readings(self):
+        # 65036 -> (65036 - 65536) / 100 = -5.0 (the classic signed-16-bit-in-
+        # hundredths encoding; same decode covers optical dBm columns).
+        vbs = [("1.3.6.1.4.1.9999.7.1", "65036")]
+        p = _profile({"temp_c": {"oid": "1.3.6.1.4.1.9999.7",
+                                 "decode": "signed_div100", "select": "first"}})
+        self.assertEqual(parse_health(vbs, p).temp_c, -5.0)
+
+    def test_select_folds_column_rows(self):
+        vbs = [("1.3.6.1.4.1.9999.5.1", "10"),
+               ("1.3.6.1.4.1.9999.5.2", "30")]
+        for how, want in (("avg", 20.0), ("max", 30.0), ("first", 10.0)):
+            p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.5",
+                                      "decode": "as_is", "select": how}})
+            self.assertEqual(parse_health(vbs, p).cpu_pct, want, how)
+
+    def test_direct_mem_pct_when_no_byte_counters(self):
+        vbs = [("1.3.6.1.4.1.9999.6.0", "61")]
+        p = _profile({"mem_pct": {"oid": "1.3.6.1.4.1.9999.6.0", "decode": "as_is"}})
+        h = parse_health(vbs, p)
+        self.assertEqual(h.mem_pct, 61.0)
+        self.assertFalse(h.is_empty())
+        self.assertEqual(h.to_wire()["mem_pct"], 61.0)
+
+    def test_implausible_profile_values_are_dropped(self):
+        vbs = [("1.3.6.1.4.1.9999.1.2.0", "900"),   # cpu > 100
+               ("1.3.6.1.4.1.9999.1.3.0", "900")]   # temp > ceiling
+        p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"},
+                      "temp_c": {"oid": "1.3.6.1.4.1.9999.1.3.0", "decode": "as_is"}})
+        h = parse_health(vbs, p)
+        self.assertIsNone(h.cpu_pct)
+        self.assertIsNone(h.temp_c)
+
+
+class ProfileMatchTest(unittest.TestCase):
+    def test_longest_sysobjectid_prefix_wins(self):
+        from wisp.ingress.health import OID_SYS_OBJECT_ID, match_profile, sys_object_id
+        vbs = [(f"{OID_SYS_OBJECT_ID}.0", "1.3.6.1.4.1.5651.3.2")]
+        soid = sys_object_id(vbs)
+        self.assertEqual(soid, "1.3.6.1.4.1.5651.3.2")
+        vendor_wide = _profile({}, match="1.3.6.1.4.1.5651")
+        model_specific = _profile({}, match="1.3.6.1.4.1.5651.3")
+        other = _profile({}, match="1.3.6.1.4.1.14988")
+        picked = match_profile([vendor_wide, other, model_specific], soid)
+        self.assertIs(picked, model_specific)
+        self.assertIsNone(match_profile([other], soid))
+
+    def test_sysobjectid_normalises_the_mib_rendered_form(self):
+        from wisp.ingress.health import OID_SYS_OBJECT_ID, sys_object_id
+        vbs = [(f"{OID_SYS_OBJECT_ID}.0", "SNMPv2-SMI::enterprises.5651.3.2")]
+        self.assertEqual(sys_object_id(vbs), "1.3.6.1.4.1.5651.3.2")
+
+    def test_scalar_metric_oids_walk_their_parent(self):
+        from wisp.ingress.health import profile_walk_roots
+        p = _profile({
+            "cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"},
+            "temp_c": {"oid": "1.3.6.1.4.1.9999.1.3.0", "decode": "as_is"},
+            "mem_pct": {"oid": "1.3.6.1.4.1.9999.6", "decode": "as_is"}})
+        roots = profile_walk_roots(p)
+        self.assertIn("1.3.6.1.4.1.9999.1.2", roots)
+        self.assertIn("1.3.6.1.4.1.9999.6", roots)
+        self.assertNotIn("1.3.6.1.4.1.9999.1.2.0", roots)
+
+
 class _FakeHealthPoller:
     def __init__(self, by_ip):
         self.by_ip = by_ip
         self.walked = []
 
-    async def walk(self, target):
+    async def walk(self, target, profiles=None):
         self.walked.append(target.ip)
         result = self.by_ip[target.ip]
         if isinstance(result, Exception):

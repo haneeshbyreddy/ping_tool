@@ -161,8 +161,41 @@ Src layout, zero-install:
   populating `DeviceMeta.parents`. `central/redundancy.py:sweep` persists the badge per
   cycle, pages on enter/leave, never opens an outage, clears on hard-DOWN. Gated by
   `cfg.backup_alerts`.
+- **Remote diagnostic SNMP walks — the edge is central's HANDS, poll-only.** The dashboard
+  queues a walk against a device (`POST /api/inventory/snmp-walk`, owner-gated, needs SNMP
+  enabled + an assigned node); central delivers it in the next FULL `/report` reply under
+  `snmp_walks` (never recheck — same channel discipline as recheck hints / update
+  directives, the edge NEVER accepts inbound); the edge runs it in a background sequential
+  runner (`apps/daemon/main.py:_DiagWalkRunner`, one walk at a time so a diag never
+  competes with the monitoring sweeps) via `ingress/walker.py:PysnmpDiagWalker` (shared
+  `SnmpEngine`, bounded varbinds+time budget) and POSTs the dump to `/edge/snmp-walk`
+  (same ingest-auth plane as `/report`). `snmp_walks` table: status `pending`→`done|error`,
+  a pending walk is RE-DELIVERED every report until a result lands (restart-safe; the
+  runner dedupes ids, un-marks on a failed upload so re-delivery retries), one pending per
+  device (a re-queue supersedes), newest `SNMP_WALKS_KEEP` (10) retained. The runner
+  REFUSES any target IP not in the node's current device list — central names devices,
+  never raw IPs (no lateral-movement primitive). Server double-bounds the upload
+  (`WALK_CAP_MAX_VARBINDS`, per-value length). Read via `/api/inventory/snmp-walks` (list,
+  metadata-only) + `/api/inventory/snmp-walk/result` (full dump); folded into
+  `data_version` so the walk dialog live-updates.
+- **Declarative vendor SNMP health profiles — vendor knowledge as DATA, not edge code.**
+  `snmp_profiles` (org_id NULL = global/superadmin-managed, else org-local) maps health
+  metrics (`cpu_pct`/`mem_pct`/`mem_used_bytes`/`mem_total_bytes`/`temp_c`) to vendor OIDs
+  + a decode rule from a CLOSED vocabulary (`as_is`/`div10`/`div100`/`signed_div100`,
+  select `first`/`avg`/`max`/`sum` — `central/inventory.py:clean_profile_payload`). Served
+  to edges in the `GET /edge/devices` reply (`snmp_profiles`, enabled only). The EDGE
+  interpreter (`ingress/health.py`) walks `sysObjectID` first, matches a profile by LONGEST
+  prefix (model-specific beats vendor-wide), walks its metric OIDs BEFORE the standard MIBs
+  (on profile-needing boxes the standard subtrees are the dead ones that burn budget), and
+  fills only fields the standard MIBs left None — the hardcoded MikroTik/Fiberhome
+  fallbacks stay in code for fleets on an older central. Onboarding a vendor = a profile
+  row (dashboard: Settings → SNMP health profiles), NEVER an edge code change or rollout.
+  Deliberately tiny vocabulary — a vendor encoding this can't express is the rare case that
+  still warrants code, not a reason to grow a DSL.
 - **Tests:** `integration/test_central_brain.py`, `test_daemon_central_brain.py`,
-  `test_central_ports.py`, `test_central_redundancy.py`, `test_central_perf.py`.
+  `test_central_ports.py`, `test_central_redundancy.py`, `test_central_perf.py`,
+  `test_central_snmp_walk.py` (walk channel + profiles), `unit/test_health.py`
+  (profile decode/select/sysObjectID match).
 
 ## Central management plane — inventory, team, settings
 

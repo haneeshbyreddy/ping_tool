@@ -325,7 +325,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     devices = [d for d in devices if d.get("assigned_node_id") == node]
                 else:
                     devices = [d for d in devices if d.get("assigned_node_id")]
-                self._reply(200, {"devices": devices, "canary_ip": cfg.canary_ip})
+                self._reply(200, {"devices": devices, "canary_ip": cfg.canary_ip,
+                                  "snmp_profiles": store.snmp_profiles_for_edge(org)})
                 return
             if route == "/api/inventory/ports":
                 user = self._reader()
@@ -364,6 +365,49 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     "warn_dbm": dev.get("optical_warn_dbm") if dev.get("optical_warn_dbm") is not None else cfg.optical_warn_dbm,
                     "crit_dbm": dev.get("optical_crit_dbm") if dev.get("optical_crit_dbm") is not None else cfg.optical_crit_dbm,
                 })
+                return
+            if route == "/api/inventory/snmp-walks":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"walks": store.list_snmp_walks(org, did)})
+                return
+            if route == "/api/inventory/snmp-walk/result":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    wid = int((qs.get("id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "id required"})
+                    return
+                org = store.snmp_walk_org(wid)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"walk": store.get_snmp_walk(org, wid)})
+                return
+            if route == "/api/snmp-profiles":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                org = self._scope_org(user, qs)
+                self._reply(200, {"profiles": store.list_snmp_profiles(org),
+                                  "metrics": list(inventory.PROFILE_METRICS),
+                                  "decodes": list(inventory.PROFILE_DECODES),
+                                  "selects": list(inventory.PROFILE_SELECTS)})
                 return
             if route == "/api/inventory/redundancy":
                 user = self._reader()
@@ -540,7 +584,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_POST(self):
             parsed = urlparse(self.path)
             route = parsed.path
-            if route in ("/heartbeat", "/report"):
+            if route in ("/heartbeat", "/report", "/edge/snmp-walk"):
                 body = self._read_body()
                 if body is None or not isinstance(body, dict):
                     self._reply(400, {"error": "bad or missing JSON body"})
@@ -557,6 +601,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         body = env.get("body", {})
                         store.record_heartbeat(org, node, body)
                         self._reply(200, self._heartbeat_reply(org, node, body))
+                    elif route == "/edge/snmp-walk":
+                        self._walk_result(org, node, env)
                     else:
                         self._reply(200, self._report(org, env))
                 except Exception:
@@ -581,6 +627,31 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             except Exception:
                 log.exception("dashboard write failed: %s", route)
                 self._reply(500, {"error": "internal error"})
+
+        def _walk_result(self, org: str, node: str, env: dict) -> None:
+            try:
+                walk_id = int(env.get("walk_id"))
+            except (TypeError, ValueError):
+                self._reply(400, {"error": "walk_id required"})
+                return
+            error = env.get("error")
+            error = str(error)[:500] if error else None
+            varbinds = None
+            if error is None:
+                raw = env.get("varbinds")
+                if not isinstance(raw, list):
+                    self._reply(400, {"error": "varbinds must be a list"})
+                    return
+                # Server-side bound regardless of what the edge claims: cap the row
+                # count and each value's length so one walk can't bloat the DB.
+                varbinds = []
+                for pair in raw[:inventory.WALK_CAP_MAX_VARBINDS]:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    varbinds.append([str(pair[0])[:256], str(pair[1])[:1024]])
+            ok = store.complete_snmp_walk(org, node, walk_id,
+                                          varbinds=varbinds, error=error)
+            self._reply(200 if ok else 404, {"ok": ok})
 
         def _heartbeat_reply(self, org: str, node: str, body: dict) -> dict:
             reply: dict = {"ok": True}
@@ -633,6 +704,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             recheck = central_engine.compute_recheck(eng, cycle, results, cfg)
             if recheck:
                 reply["recheck"] = recheck
+            if mode != "recheck":
+                # Queued diagnostic walks ride the full-report reply, like update
+                # directives ride the heartbeat — the edge never accepts inbound.
+                walks = store.pending_snmp_walks(org, env.get("node_id", ""))
+                if walks:
+                    reply["snmp_walks"] = walks
             return reply
 
         def _ingest_ports(self, org: str, eng, ports_by_device, ts: str) -> None:
@@ -959,6 +1036,62 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 clean = inventory.clean_snmp_payload(body)
                 ok = store.set_org_device_snmp(org, did, clean)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/snmp-walk":
+                did = int(body.get("device_id") or 0)
+                org = store.device_org(did)
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                device = store.get_org_device(org, did)
+                if not device:
+                    self._reply(404, {"error": "device not found"})
+                    return
+                if not device.get("snmp_enabled") or not device.get("snmp_community"):
+                    raise inventory.InventoryError(
+                        "enable SNMP (with a community) on this device first")
+                node = device.get("assigned_node_id")
+                if not node:
+                    raise inventory.InventoryError(
+                        "assign this device to a probe first — the walk runs from "
+                        "its assigned node")
+                clean = inventory.clean_walk_payload(body)
+                wid = store.create_snmp_walk(org, did, node, clean["root_oid"],
+                                             clean["max_varbinds"],
+                                             requested_by=user["username"])
+                self._reply(200, {"id": wid})
+                return
+            if route == "/api/snmp-profiles":
+                clean = inventory.clean_profile_payload(body)
+                # org_id NULL = a GLOBAL profile every org's edges receive —
+                # superadmin only. An org owner creates org-local ones.
+                if user["is_superadmin"]:
+                    org = body.get("org_id") or None
+                else:
+                    org = user["org_id"]
+                if org is not None and not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                pid = store.create_snmp_profile(org, clean)
+                self._reply(200, {"id": pid})
+                return
+            if route in ("/api/snmp-profiles/update", "/api/snmp-profiles/delete"):
+                profile = store.get_snmp_profile(int(body.get("id") or 0))
+                if not profile:
+                    self._reply(404, {"error": "profile not found"})
+                    return
+                org = profile["org_id"]
+                allowed = (user["is_superadmin"] if org is None
+                           else self._can_write(user, org))
+                if not allowed:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                if route.endswith("/delete"):
+                    ok = store.delete_snmp_profile(profile["id"])
+                else:
+                    clean = inventory.clean_profile_payload(body)
+                    ok = store.update_snmp_profile(profile["id"], clean)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/ports/monitored":

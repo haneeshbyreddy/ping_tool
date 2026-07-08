@@ -190,6 +190,74 @@ def clean_snmp_payload(data: dict) -> dict:
     return {"snmp_enabled": enabled, "snmp_version": version,
             "snmp_community": community, "snmp_port": port}
 
+_OID_RE = re.compile(r"^\d+(\.\d+){0,127}$")
+
+# Diagnostic walk bounds: a full enterprise-tree walk of a loaded OLT can run to
+# hundreds of thousands of varbinds — the cap keeps one click from turning into a
+# multi-megabyte upload and a minutes-long UDP storm inside the customer's network.
+WALK_DEFAULT_MAX_VARBINDS = 2000
+WALK_CAP_MAX_VARBINDS = 20000
+
+def clean_oid(raw, *, default: str | None = None, field: str = "oid") -> str:
+    oid = str(raw or "").strip().strip(".")
+    if not oid and default:
+        return default
+    if not _OID_RE.match(oid):
+        raise InventoryError(
+            f"{field} must be a dotted numeric OID, e.g. 1.3.6.1.4.1")
+    return oid
+
+def clean_walk_payload(data: dict) -> dict:
+    root_oid = clean_oid(data.get("root_oid"), default="1.3.6.1", field="root_oid")
+    raw_max = data.get("max_varbinds")
+    if raw_max in (None, "", "null"):
+        max_varbinds = WALK_DEFAULT_MAX_VARBINDS
+    else:
+        try:
+            max_varbinds = int(raw_max)
+        except (TypeError, ValueError):
+            raise InventoryError("max_varbinds must be a number")
+        if max_varbinds <= 0:
+            raise InventoryError("max_varbinds must be positive")
+    return {"root_oid": root_oid,
+            "max_varbinds": min(max_varbinds, WALK_CAP_MAX_VARBINDS)}
+
+# The closed decode/select vocabulary the edge's profile interpreter understands
+# (ingress/health.py). Deliberately tiny — a vendor encoding this can't express is
+# the rare case that still warrants edge code, not a reason to grow this into a DSL.
+PROFILE_METRICS = ("cpu_pct", "mem_pct", "mem_used_bytes", "mem_total_bytes", "temp_c")
+PROFILE_DECODES = ("as_is", "div10", "div100", "signed_div100")
+PROFILE_SELECTS = ("first", "avg", "max", "sum")
+
+def clean_profile_payload(data: dict) -> dict:
+    name = _str(data, "name", required=True)
+    if len(name) > 64:
+        raise InventoryError("profile name must be 64 characters or fewer")
+    match = clean_oid(data.get("match_sysobjectid"), field="match_sysobjectid")
+    raw_metrics = data.get("metrics")
+    if not isinstance(raw_metrics, dict) or not raw_metrics:
+        raise InventoryError("metrics must map at least one metric to an OID")
+    metrics: dict = {}
+    for key, spec in raw_metrics.items():
+        if key not in PROFILE_METRICS:
+            raise InventoryError(
+                f"unknown metric {key!r} — must be one of: {', '.join(PROFILE_METRICS)}")
+        if not isinstance(spec, dict):
+            raise InventoryError(f"metric {key!r} must be an object with an oid")
+        oid = clean_oid(spec.get("oid"), field=f"{key}.oid")
+        decode = (str(spec.get("decode") or "as_is")).strip().lower()
+        if decode not in PROFILE_DECODES:
+            raise InventoryError(
+                f"{key}.decode must be one of: {', '.join(PROFILE_DECODES)}")
+        select = (str(spec.get("select") or "first")).strip().lower()
+        if select not in PROFILE_SELECTS:
+            raise InventoryError(
+                f"{key}.select must be one of: {', '.join(PROFILE_SELECTS)}")
+        metrics[key] = {"oid": oid, "decode": decode, "select": select}
+    enabled = str(data.get("enabled", 1)) not in ("0", "false", "False", "", "None")
+    return {"name": name, "match_sysobjectid": match, "metrics": metrics,
+            "enabled": enabled}
+
 def clean_node_id(raw) -> str:
     node_id = str(raw or "").strip()
     if not node_id:

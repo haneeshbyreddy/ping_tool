@@ -407,7 +407,51 @@ CREATE TABLE IF NOT EXISTS device_health (
     temp_c          REAL,
     updated_at      TEXT NOT NULL
 );
+-- Remote diagnostic SNMP walks — the dashboard queues one against a device, central
+-- delivers it to that device's assigned node inside the next full /report reply
+-- (like recheck hints and update directives, the edge only ever POLLS — no inbound
+-- connection to a probe), and the edge posts the varbind dump to /edge/snmp-walk.
+-- status: pending -> done | error. A walk stays 'pending' (re-delivered every report)
+-- until a result lands, so an edge restart mid-walk just re-runs it — idempotent.
+-- Results are bounded (max_varbinds, server-capped) and retained newest-N per device.
+CREATE TABLE IF NOT EXISTS snmp_walks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id        TEXT NOT NULL,
+    device_id     INTEGER NOT NULL REFERENCES org_devices(id),
+    node_id       TEXT NOT NULL,
+    root_oid      TEXT NOT NULL,
+    max_varbinds  INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    requested_by  TEXT,
+    error         TEXT,
+    result        TEXT,               -- JSON [[oid, value], ...]
+    varbind_count INTEGER,
+    created_at    TEXT NOT NULL,
+    completed_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snmp_walks_pending ON snmp_walks(org_id, node_id, status);
+CREATE INDEX IF NOT EXISTS idx_snmp_walks_device ON snmp_walks(org_id, device_id, id);
+-- Declarative vendor SNMP health profiles — vendor knowledge as DATA, not edge code.
+-- Each row maps health metrics (cpu_pct/mem_pct/mem bytes/temp_c) to vendor OIDs plus
+-- a decode rule; the EDGE matches a profile to a device by sysObjectID prefix during
+-- its health sweep (ingress/health.py). org_id NULL = global (superadmin-managed,
+-- served to every org); else org-local. Delivered in the GET /edge/devices reply, so
+-- onboarding a new vendor is a profile row, never an edge code change or rollout.
+CREATE TABLE IF NOT EXISTS snmp_profiles (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id            TEXT,              -- NULL => global
+    name              TEXT NOT NULL,
+    match_sysobjectid TEXT NOT NULL,     -- OID prefix, e.g. 1.3.6.1.4.1.5651
+    metrics           TEXT NOT NULL,     -- JSON {metric: {oid, decode, select}}
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
 """
+
+# Diagnostic walk results kept per device (newest first) — older ones are pruned at
+# create time so a chatty operator can't grow the DB unbounded.
+SNMP_WALKS_KEEP = 10
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -653,7 +697,13 @@ class CentralStore:
             g = conn.execute(
                 "SELECT COALESCE(MAX(g.updated_at),'') FROM onu_optics g"
                 " WHERE 1=1" + gscope, gargs).fetchone()[0]
-        return f"{e}.{o}.{s}.{n}.{g}"
+            wscope, wargs = self._scope(org_id, prefix="w.")
+            # MAX(id) moves on queue, MAX(completed_at) on a result landing — both
+            # must bump the fingerprint or the walk dialog needs a hard refresh.
+            w = conn.execute(
+                "SELECT COALESCE(MAX(w.id),0) || ':' || COALESCE(MAX(w.completed_at),'')"
+                " FROM snmp_walks w WHERE 1=1" + wscope, wargs).fetchone()[0]
+        return f"{e}.{o}.{s}.{n}.{g}.{w}"
 
     @staticmethod
     def _hash_node_token(token: str) -> str:
@@ -1700,6 +1750,155 @@ class CentralStore:
                 (device_id, org_id, _f("cpu_pct"), _i("mem_used_bytes"),
                  _i("mem_total_bytes"), _f("mem_pct"), _f("temp_c"), ts))
             conn.commit()
+
+    def create_snmp_walk(self, org_id: str, device_id: int, node_id: str,
+                         root_oid: str, max_varbinds: int,
+                         requested_by: str | None = None) -> int:
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            # One pending walk per device — a re-request supersedes the stale one
+            # instead of queueing behind it.
+            conn.execute(
+                "UPDATE snmp_walks SET status='error', error='superseded',"
+                " completed_at=? WHERE org_id=? AND device_id=? AND status='pending'",
+                (now, org_id, device_id))
+            cur = conn.execute(
+                "INSERT INTO snmp_walks (org_id, device_id, node_id, root_oid,"
+                " max_varbinds, requested_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                (org_id, device_id, node_id, root_oid, max_varbinds, requested_by, now))
+            conn.execute(
+                "DELETE FROM snmp_walks WHERE org_id=? AND device_id=? AND id NOT IN"
+                " (SELECT id FROM snmp_walks WHERE org_id=? AND device_id=?"
+                "  ORDER BY id DESC LIMIT ?)",
+                (org_id, device_id, org_id, device_id, SNMP_WALKS_KEEP))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def pending_snmp_walks(self, org_id: str, node_id: str) -> list[dict]:
+        # Target coordinates come from org_devices at DELIVERY time (not queue time)
+        # so a community/port edit between queue and pickup is honored.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT w.id, w.root_oid, w.max_varbinds, d.ip_address,"
+                " d.snmp_community, d.snmp_port, d.snmp_version"
+                " FROM snmp_walks w JOIN org_devices d"
+                "  ON d.id=w.device_id AND d.org_id=w.org_id"
+                " WHERE w.org_id=? AND w.node_id=? AND w.status='pending'"
+                " AND d.is_active=1 AND d.snmp_enabled=1 ORDER BY w.id",
+                (org_id, node_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def complete_snmp_walk(self, org_id: str, node_id: str, walk_id: int, *,
+                           varbinds: list | None = None,
+                           error: str | None = None) -> bool:
+        status = "error" if error else "done"
+        result = (json.dumps(varbinds, separators=(",", ":"))
+                  if varbinds is not None and not error else None)
+        count = len(varbinds) if varbinds is not None and not error else None
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE snmp_walks SET status=?, error=?, result=?, varbind_count=?,"
+                " completed_at=? WHERE id=? AND org_id=? AND node_id=?"
+                " AND status='pending'",
+                (status, error, result, count, _now_iso(), walk_id, org_id, node_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def list_snmp_walks(self, org_id: str, device_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, node_id, root_oid, max_varbinds, status, requested_by,"
+                " error, varbind_count, created_at, completed_at FROM snmp_walks"
+                " WHERE org_id=? AND device_id=? ORDER BY id DESC",
+                (org_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_snmp_walk(self, org_id: str, walk_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM snmp_walks WHERE id=? AND org_id=?",
+                (walk_id, org_id)).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["result"] = json.loads(out["result"]) if out["result"] else None
+        except (TypeError, ValueError):
+            out["result"] = None
+        return out
+
+    def snmp_walk_org(self, walk_id: int) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT org_id FROM snmp_walks WHERE id=?",
+                               (walk_id,)).fetchone()
+        return row["org_id"] if row else None
+
+    def list_snmp_profiles(self, org_id: str | None) -> list[dict]:
+        # An org sees global profiles + its own; superadmin scope (None) sees all.
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM snmp_profiles ORDER BY org_id IS NOT NULL, name")
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM snmp_profiles WHERE org_id IS NULL OR org_id=?"
+                    " ORDER BY org_id IS NOT NULL, name", (org_id,))
+            out = [dict(r) for r in rows.fetchall()]
+        for p in out:
+            try:
+                p["metrics"] = json.loads(p["metrics"])
+            except (TypeError, ValueError):
+                p["metrics"] = {}
+            p["enabled"] = bool(p["enabled"])
+        return out
+
+    def snmp_profiles_for_edge(self, org_id: str) -> list[dict]:
+        return [{"name": p["name"], "match_sysobjectid": p["match_sysobjectid"],
+                 "metrics": p["metrics"]}
+                for p in self.list_snmp_profiles(org_id) if p["enabled"]]
+
+    def create_snmp_profile(self, org_id: str | None, clean: dict) -> int:
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO snmp_profiles (org_id, name, match_sysobjectid, metrics,"
+                " enabled, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (org_id, clean["name"], clean["match_sysobjectid"],
+                 json.dumps(clean["metrics"], separators=(",", ":")),
+                 1 if clean.get("enabled", True) else 0, now, now))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def update_snmp_profile(self, profile_id: int, clean: dict) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE snmp_profiles SET name=?, match_sysobjectid=?, metrics=?,"
+                " enabled=?, updated_at=? WHERE id=?",
+                (clean["name"], clean["match_sysobjectid"],
+                 json.dumps(clean["metrics"], separators=(",", ":")),
+                 1 if clean.get("enabled", True) else 0, _now_iso(), profile_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def delete_snmp_profile(self, profile_id: int) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM snmp_profiles WHERE id=?", (profile_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_snmp_profile(self, profile_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM snmp_profiles WHERE id=?",
+                               (profile_id,)).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["metrics"] = json.loads(out["metrics"])
+        except (TypeError, ValueError):
+            out["metrics"] = {}
+        out["enabled"] = bool(out["enabled"])
+        return out
 
     def record_perf_sample(self, org_id: str, device_id: int, ts: str,
                            latency_ms: float | None, packet_loss: float | None,

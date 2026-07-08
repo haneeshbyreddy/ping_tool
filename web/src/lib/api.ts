@@ -1,7 +1,8 @@
 import type {
   AccountUser, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role, Summary,
-  SwitchPort, SystemStats, TrendBucket, Worker,
+  OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
+  SnmpProfilesResponse, SnmpWalk, SnmpWalkResult, Summary, SwitchPort, SystemStats,
+  TrendBucket, Worker,
 } from "./types"
 
 export class ApiError extends Error {}
@@ -105,6 +106,29 @@ export const inventoryApi = {
   setOpticalThresholds: (device_id: number, warn_dbm: number | null, crit_dbm: number | null) =>
     request<{ ok: boolean }>("/api/inventory/optics/thresholds",
       { method: "POST", body: { device_id, warn_dbm, crit_dbm } }),
+}
+
+export const snmpApi = {
+  walks: (deviceId: number) =>
+    request<{ walks: SnmpWalk[] }>(`/api/inventory/snmp-walks?device_id=${deviceId}`),
+  walkResult: (id: number) =>
+    request<{ walk: SnmpWalkResult | null }>(`/api/inventory/snmp-walk/result?id=${id}`),
+  startWalk: (device_id: number, root_oid: string, max_varbinds?: number) =>
+    request<{ id: number }>("/api/inventory/snmp-walk",
+      { method: "POST", body: { device_id, root_oid, max_varbinds } }),
+  profiles: (org?: string | null) => request<SnmpProfilesResponse>(`/api/snmp-profiles${tq(org)}`),
+  createProfile: (body: {
+    org_id?: string; name: string; match_sysobjectid: string
+    metrics: Record<string, { oid: string; decode: string; select: string }>
+    enabled: boolean
+  }) => request<{ id: number }>("/api/snmp-profiles", { method: "POST", body }),
+  updateProfile: (id: number, body: {
+    name: string; match_sysobjectid: string
+    metrics: Record<string, { oid: string; decode: string; select: string }>
+    enabled: boolean
+  }) => request<{ ok: boolean }>("/api/snmp-profiles/update", { method: "POST", body: { id, ...body } }),
+  removeProfile: (id: number) =>
+    request<{ ok: boolean }>("/api/snmp-profiles/delete", { method: "POST", body: { id } }),
 }
 
 export const analyticsApi = {

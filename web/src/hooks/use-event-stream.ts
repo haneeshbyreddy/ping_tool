@@ -2,7 +2,10 @@ import { useEffect } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import { tq } from "@/lib/api"
 
-const LIVE_QUERY_KEYS = ["summary", "outages", "inventory", "logs", "team", "attendance", "nodes"]
+const LIVE_QUERY_KEYS = [
+  "summary", "outages", "inventory", "logs", "team", "attendance", "nodes",
+  "snmp-walks", // a queued walk's result lands on the edge's report cadence
+]
 
 export function useEventStream(org: string | null) {
   const queryClient = useQueryClient()

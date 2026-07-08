@@ -45,6 +45,8 @@ class RecordingCentralClient:
         self.heartbeat_reply = heartbeat_reply if heartbeat_reply is not None else {"ok": True}
         self.reports: list[dict] = []
         self.heartbeats: list[dict] = []
+        self.walk_results: list[dict] = []
+        self.fail_walk_result = False
         self.fetch_calls = 0
         self._replies = list(replies) if replies is not None else None
 
@@ -54,12 +56,21 @@ class RecordingCentralClient:
             raise CentralClientError("fetch boom")
         return {"devices": self.devices, "canary_ip": self.canary_ip}
 
-    def report(self, pings: dict, ts: str, *, mode: str = "full", ports=None) -> dict:
+    def report(self, pings: dict, ts: str, *, mode: str = "full", ports=None,
+               optics=None, health=None) -> dict:
         if self.fail_report:
             raise CentralClientError("report boom")
-        self.reports.append({"pings": pings, "ts": ts, "mode": mode, "ports": ports})
+        self.reports.append({"pings": pings, "ts": ts, "mode": mode, "ports": ports,
+                             "optics": optics, "health": health})
         if self._replies:
             return self._replies.pop(0)
+        return {"ok": True}
+
+    def walk_result(self, walk_id: int, *, varbinds=None, error=None) -> dict:
+        if self.fail_walk_result:
+            raise CentralClientError("walk upload boom")
+        self.walk_results.append({"walk_id": walk_id, "varbinds": varbinds,
+                                  "error": error})
         return {"ok": True}
 
     def heartbeat(self, body: dict) -> dict:
@@ -254,6 +265,133 @@ class GatherSnmpPortsTest(unittest.TestCase):
         cfg = Config(snmp_max_inflight=2)
         asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
         self.assertLessEqual(inflight["peak"], 2)
+
+class _FakeDiagWalker:
+    def __init__(self, result=None, exc=None):
+        self.calls = []
+        self._result = result
+        self._exc = exc
+
+    async def walk(self, target, root_oid, max_varbinds):
+        self.calls.append((target.ip, root_oid, max_varbinds))
+        if self._exc:
+            raise self._exc
+        return self._result
+
+
+def _walk_directive(wid=7, ip="10.0.0.9", root="1.3.6.1", max_varbinds=100):
+    return {"id": wid, "ip_address": ip, "snmp_community": "public",
+            "snmp_port": 161, "snmp_version": "2c", "root_oid": root,
+            "max_varbinds": max_varbinds}
+
+
+class DiagWalkRunnerTest(unittest.TestCase):
+    def setUp(self):
+        from wisp.ingress.walker import WalkResult
+        self.WalkResult = WalkResult
+        self.devices = [_dev(1, "10.0.0.9", snmp_enabled=True,
+                             snmp_community="public")]
+
+    def _run(self, runner, directives):
+        async def scenario():
+            runner.accept(directives, self.devices)
+            if runner._task is not None:
+                await runner._task
+        asyncio.run(scenario())
+
+    def test_runs_the_walk_and_posts_varbinds(self):
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(result=self.WalkResult(
+            varbinds=[("1.3.6.1.2.1.1.5.0", "sw1")]))
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        self._run(runner, [_walk_directive()])
+        self.assertEqual(walker.calls, [("10.0.0.9", "1.3.6.1", 100)])
+        self.assertEqual(client.walk_results, [{
+            "walk_id": 7, "varbinds": [["1.3.6.1.2.1.1.5.0", "sw1"]],
+            "error": None}])
+
+    def test_redelivered_directive_is_deduped(self):
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(result=self.WalkResult())
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        self._run(runner, [_walk_directive()])
+        self._run(runner, [_walk_directive()])  # central re-delivers until done
+        self.assertEqual(len(walker.calls), 1)
+        self.assertEqual(len(client.walk_results), 1)
+
+    def test_target_outside_the_device_list_is_refused(self):
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(result=self.WalkResult())
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        self._run(runner, [_walk_directive(ip="192.168.99.99")])
+        self.assertEqual(walker.calls, [])
+        self.assertEqual(len(client.walk_results), 1)
+        self.assertIn("not a device", client.walk_results[0]["error"])
+
+    def test_walk_failure_reports_an_error_result(self):
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(exc=RuntimeError("No SNMP response"))
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        self._run(runner, [_walk_directive()])
+        self.assertEqual(len(client.walk_results), 1)
+        self.assertIn("No SNMP response", client.walk_results[0]["error"])
+
+    def test_failed_upload_retries_on_redelivery(self):
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(result=self.WalkResult())
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        client.fail_walk_result = True
+        self._run(runner, [_walk_directive()])
+        self.assertEqual(client.walk_results, [])
+        client.fail_walk_result = False
+        self._run(runner, [_walk_directive()])  # re-delivery retries
+        self.assertEqual(len(walker.calls), 2)
+        self.assertEqual(len(client.walk_results), 1)
+
+    def test_run_cycle_hands_reply_walks_to_the_runner(self):
+        devices = [_dev(1, "10.0.0.9", snmp_enabled=True, snmp_community="public")]
+        prober = _FakeProber({
+            "10.0.0.9": lambda: PingResult("10.0.0.9", 5.0, 0.0),
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+        })
+        client = RecordingCentralClient(devices, replies=[
+            {"ok": True, "snmp_walks": [_walk_directive()]}])
+        walker = _FakeDiagWalker(result=self.WalkResult(
+            varbinds=[("1.3.6.1.2.1.1.5.0", "sw1")]))
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+
+        async def scenario():
+            await daemon.run_cycle_central_brain(
+                prober, client, devices, "1.1.1.1", Config(retry_interval_s=0),
+                walk_runner=runner)
+            if runner._task is not None:
+                await runner._task
+        asyncio.run(scenario())
+        self.assertEqual(len(client.walk_results), 1)
+        self.assertEqual(client.walk_results[0]["walk_id"], 7)
+
+
+class HealthPassthroughTest(unittest.TestCase):
+    def test_health_readings_attach_to_the_full_report(self):
+        # Regression: HttpCentralClient.report once lacked the health kwarg, so
+        # every cycle with a health sweep result died on a TypeError.
+        devices = [_dev(1, "10.0.0.1")]
+        prober = _FakeProber({
+            "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),
+            "1.1.1.1": lambda: PingResult("1.1.1.1", 5.0, 0.0),
+        })
+        client = RecordingCentralClient(devices)
+        readings = {1: {"cpu_pct": 40.0, "temp_c": 51.0}}
+        asyncio.run(daemon.run_cycle_central_brain(
+            prober, client, devices, "1.1.1.1", Config(retry_interval_s=0),
+            health=readings))
+        self.assertEqual(client.reports[0]["health"], readings)
+
+    def test_http_client_report_accepts_health(self):
+        import inspect
+        from wisp.runtime.central_client import HttpCentralClient
+        self.assertIn("health", inspect.signature(HttpCentralClient.report).parameters)
+
 
 class FollowRecheckTest(unittest.TestCase):
 

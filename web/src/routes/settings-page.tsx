@@ -7,6 +7,7 @@ import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import type { AccountUser, Role } from "@/lib/types"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
+import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -435,16 +436,22 @@ function UsersCard({ org }: { org: string }) {
 }
 
 export function SettingsPage() {
-  const { scopeOrg, canWrite } = useAuth()
+  const { user, scopeOrg, canWrite } = useAuth()
+  const isSuperadmin = !!user?.is_superadmin
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 md:p-6">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
       {scopeOrg && <OrgSettingsCard org={scopeOrg} canWrite={canWrite} />}
       {scopeOrg && <RegionsCard org={scopeOrg} canWrite={canWrite} />}
+      {/* SNMP profiles: superadmin manages the global set; an org owner can add
+          org-local ones. A superadmin with no org scoped still manages globals. */}
+      {canWrite && (scopeOrg || isSuperadmin) && (
+        <SnmpProfilesCard org={scopeOrg} isSuperadmin={isSuperadmin} />
+      )}
       <ChangePasswordCard />
       {scopeOrg && canWrite && <UsersCard org={scopeOrg} />}
-      {!scopeOrg && <NeedsOrg />}
+      {!scopeOrg && !isSuperadmin && <NeedsOrg />}
     </div>
   )
 }

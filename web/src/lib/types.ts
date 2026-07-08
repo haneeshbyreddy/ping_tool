@@ -308,6 +308,49 @@ export interface AccountUser {
   created_at: string
 }
 
+export type SnmpWalkStatus = "pending" | "done" | "error"
+
+export interface SnmpWalk {
+  id: number
+  node_id: string
+  root_oid: string
+  max_varbinds: number
+  status: SnmpWalkStatus
+  requested_by: string | null
+  error: string | null
+  varbind_count: number | null
+  created_at: string
+  completed_at: string | null
+}
+
+export interface SnmpWalkResult extends SnmpWalk {
+  result: Array<[string, string]> | null
+}
+
+export interface ProfileMetricSpec {
+  oid: string
+  decode: string
+  select: string
+}
+
+export interface SnmpProfile {
+  id: number
+  org_id: string | null // null = global (every org's edges receive it)
+  name: string
+  match_sysobjectid: string
+  metrics: Record<string, ProfileMetricSpec>
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SnmpProfilesResponse {
+  profiles: SnmpProfile[]
+  metrics: string[]
+  decodes: string[]
+  selects: string[]
+}
+
 export interface SystemStats {
   hostname: string
   uptime_s: number | null

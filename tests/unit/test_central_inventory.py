@@ -264,5 +264,69 @@ class CleanNodeIdTest(unittest.TestCase):
             clean_node_id("a" * 65)
         clean_node_id("a" * 64)
 
+class CleanOidAndWalkPayloadTest(unittest.TestCase):
+    def test_valid_oids_pass_and_normalise(self):
+        from wisp.central.inventory import clean_oid
+        self.assertEqual(clean_oid("1.3.6.1.4.1"), "1.3.6.1.4.1")
+        self.assertEqual(clean_oid(".1.3.6.1."), "1.3.6.1")
+        self.assertEqual(clean_oid("1"), "1")
+
+    def test_bad_oids_rejected(self):
+        from wisp.central.inventory import clean_oid
+        for bad in ("not.an.oid", "1.3.6.1.4.x", "1..3", "", None, "1.3;drop"):
+            with self.assertRaises(InventoryError):
+                clean_oid(bad)
+
+    def test_walk_payload_defaults_and_caps(self):
+        from wisp.central.inventory import (
+            WALK_CAP_MAX_VARBINDS, WALK_DEFAULT_MAX_VARBINDS, clean_walk_payload)
+        clean = clean_walk_payload({})
+        self.assertEqual(clean["root_oid"], "1.3.6.1")
+        self.assertEqual(clean["max_varbinds"], WALK_DEFAULT_MAX_VARBINDS)
+        clean = clean_walk_payload({"root_oid": "1.3.6.1.4.1.5651",
+                                    "max_varbinds": 10**9})
+        self.assertEqual(clean["max_varbinds"], WALK_CAP_MAX_VARBINDS)
+        with self.assertRaises(InventoryError):
+            clean_walk_payload({"max_varbinds": -5})
+
+
+class CleanProfilePayloadTest(unittest.TestCase):
+    @staticmethod
+    def _payload(**overrides):
+        base = {"name": "fiberhome", "match_sysobjectid": "1.3.6.1.4.1.5651",
+                "metrics": {"cpu_pct": {"oid": "1.3.6.1.4.1.5651.3.901.2.0"}}}
+        base.update(overrides)
+        return base
+
+    def test_defaults_fill_decode_and_select(self):
+        from wisp.central.inventory import clean_profile_payload
+        clean = clean_profile_payload(self._payload())
+        spec = clean["metrics"]["cpu_pct"]
+        self.assertEqual(spec["decode"], "as_is")
+        self.assertEqual(spec["select"], "first")
+        self.assertTrue(clean["enabled"])
+
+    def test_unknown_metric_decode_select_rejected(self):
+        from wisp.central.inventory import clean_profile_payload
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(metrics={
+                "fan_rpm": {"oid": "1.3.6.1.4.1.5651.1"}}))
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(metrics={
+                "cpu_pct": {"oid": "1.3.6.1.4.1.5651.1", "decode": "times9000"}}))
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(metrics={
+                "cpu_pct": {"oid": "1.3.6.1.4.1.5651.1", "select": "median"}}))
+
+    def test_requires_name_match_and_a_metric(self):
+        from wisp.central.inventory import clean_profile_payload
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(name=""))
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(match_sysobjectid="vendor"))
+        with self.assertRaises(InventoryError):
+            clean_profile_payload(self._payload(metrics={}))
+
+
 if __name__ == "__main__":
     unittest.main()
