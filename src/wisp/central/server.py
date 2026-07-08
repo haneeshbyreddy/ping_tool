@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import auth, inventory, pki
+from wisp.central import auth, inventory, pki, sysinfo
 from wisp.central import analytics as central_analytics
 from wisp.central import engine as central_engine
 from wisp.central import perf as central_perf
@@ -293,6 +293,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                                   "low_bandwidth": store.low_bandwidth_alarms(org),
                                   "high_bandwidth": store.high_bandwidth_alarms(org)})
                 return
+            if route == "/api/system":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                if not user["is_superadmin"]:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, sysinfo.snapshot(cfg.central_db))
+                return
             if route == "/api/events":
                 user = self._reader()
                 if not user:
@@ -476,7 +486,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(200, {"events": store.list_events(org, limit, before_id)})
                 return
             if route in ("/api/orgs", "/api/inventory", "/api/team", "/api/attendance",
-                         "/api/users", "/api/nodes"):
+                         "/api/users", "/api/nodes", "/api/regions"):
                 user = self._reader()
                 if not user:
                     self._reply(401, {"error": "unauthorized"})
@@ -502,6 +512,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         self._reply(400, {"error": "org required"})
                         return
                     self._reply(200, {"devices": store.list_org_devices(org)})
+                elif route == "/api/regions":
+                    if not org:
+                        self._reply(400, {"error": "org required"})
+                        return
+                    self._reply(200, {"regions": store.list_regions(org)})
                 elif route == "/api/nodes":
                     if not org:
                         self._reply(400, {"error": "org required"})
@@ -607,6 +622,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 disp.sweep(ts)
                 self._ingest_ports(org, eng, env.get("ports"), ts)
                 self._ingest_optics(org, eng, env.get("optics"), ts)
+                self._ingest_health(org, eng, env.get("health"), ts)
                 central_rollup.record_cycle(store, org, eng, cycle, results, ts)
                 central_perf.record_and_evaluate(store, org, eng, cycle, results, ts,
                                                  notifier, cfg)
@@ -650,6 +666,21 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     monitor.sync_device(device_id, onus, ts)
                 except Exception:
                     log.exception("GPON optics fold failed for %s/device=%d", org, device_id)
+
+        def _ingest_health(self, org: str, eng, health_by_device, ts: str) -> None:
+            if not health_by_device:
+                return
+            for raw_id, health in health_by_device.items():
+                try:
+                    device_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if device_id not in eng.meta or not isinstance(health, dict):
+                    continue
+                try:
+                    store.upsert_device_health(org, device_id, health, ts)
+                except Exception:
+                    log.exception("SNMP health fold failed for %s/device=%d", org, device_id)
 
         def _login(self):
             ip = self.client_address[0]
@@ -773,6 +804,33 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 store.set_attendance(w, int(body["worker_id"]), bool(body.get("present")),
                                      body.get("day"))
                 self._reply(200, {"ok": True})
+                return
+            if route == "/api/regions":
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                store.add_region(org, inventory.clean_region_name(body.get("name")))
+                self._reply(200, {"ok": True})
+                return
+            if route == "/api/regions/rename":
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                old = inventory.clean_region_name(body.get("old"))
+                new = inventory.clean_region_name(body.get("new"))
+                store.rename_region(org, old, new)
+                self._reply(200, {"ok": True})
+                return
+            if route == "/api/regions/delete":
+                org = body.get("org_id") or user["org_id"]
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                result = store.delete_region(
+                    org, inventory.clean_region_name(body.get("name")))
+                self._reply(200 if result["ok"] else 409, result)
                 return
             if route == "/api/outages/acknowledge":
                 oid = int(body.get("outage_id") or 0)

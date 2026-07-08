@@ -142,6 +142,18 @@ class CentralAuthHttpTest(unittest.TestCase):
         _, body, _ = self._req("GET", "/api/orgs?org=ispB", cookie=cookie)
         self.assertEqual({o["org_id"] for o in body["orgs"]}, {"ispB"})
 
+    def test_system_stats_superadmin_only(self):
+        _, cookie = self._login("root", "rootpassword")
+        status, body, _ = self._req("GET", "/api/system", cookie=cookie)
+        self.assertEqual(status, 200)
+        for key in ("hostname", "cpu", "memory", "disk", "process", "uptime_s"):
+            self.assertIn(key, body)
+        _, cookie = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("GET", "/api/system", cookie=cookie)
+        self.assertEqual(status, 403)
+        status, _, _ = self._req("GET", "/api/system")
+        self.assertEqual(status, 401)
+
     def test_bearer_token_reads_as_machine_superadmin(self):
         status, body, _ = self._req("GET", "/api/orgs", token="tok")
         self.assertEqual(status, 200)

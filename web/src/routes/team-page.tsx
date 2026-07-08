@@ -5,7 +5,9 @@ import { Plus, Trash2, Pencil, Check, X, MoreVertical } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { teamApi, ApiError } from "@/lib/api"
 import type { AttendanceOperator, Role, Worker } from "@/lib/types"
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
+import { RegionSelect } from "@/components/region-select"
 import { cn } from "@/lib/utils"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -21,7 +23,8 @@ import {
 
 const ROLES: Role[] = ["operator", "owner", "tech"]
 
-function EditWorkerRow({ worker, onSave, onCancel, saving }: {
+function EditWorkerRow({ org, worker, onSave, onCancel, saving }: {
+  org: string
   worker: Worker
   onSave: (fields: { name: string; role: Role; region?: string }) => void
   onCancel: () => void
@@ -40,7 +43,8 @@ function EditWorkerRow({ worker, onSave, onCancel, saving }: {
           {ROLES.map((r) => <SelectItem key={r} value={r} className="capitalize">{r}</SelectItem>)}
         </SelectContent>
       </Select>
-      <Input className="h-8 w-28" placeholder="region" value={region} onChange={(e) => setRegion(e.target.value)} />
+      <RegionSelect org={org} value={region} onChange={setRegion}
+        className="h-8 w-32" inputClassName="h-8 w-28" />
       <div className="ml-auto flex gap-1">
         <Button
           variant="ghost" size="icon" className="size-7 shrink-0"
@@ -97,6 +101,7 @@ export function TeamPage() {
   const [role, setRole] = useState<Role>("operator")
   const [region, setRegion] = useState("")
   const [editingId, setEditingId] = useState<number | null>(null)
+  const [removing, setRemoving] = useState<Worker | null>(null)
 
   const team = useQuery({
     queryKey: ["team", scopeOrg],
@@ -112,29 +117,30 @@ export function TeamPage() {
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["team"] })
     queryClient.invalidateQueries({ queryKey: ["attendance"] })
+    queryClient.invalidateQueries({ queryKey: ["regions"] })
   }
 
   const add = useMutation({
     mutationFn: () => teamApi.add({ org_id: scopeOrg!, name: name.trim(), role, region: region.trim() || undefined }),
     onSuccess: () => { invalidate(); setName(""); setRegion(""); setAddOpen(false) },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to add"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to add"),
   })
   const update = useMutation({
     mutationFn: ({ id, fields }: { id: number; fields: { name: string; role: Role; region?: string } }) =>
       teamApi.update(id, fields),
     onSuccess: () => { invalidate(); setEditingId(null) },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to save"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save"),
   })
   const remove = useMutation({
     mutationFn: (id: number) => teamApi.remove(id),
     onSuccess: invalidate,
-    onError: () => toast.error("failed to remove"),
+    onError: () => toast.error("Failed to remove"),
   })
   const setPresent = useMutation({
     mutationFn: ({ workerId, day, present }: { workerId: number; day?: string; present: boolean }) =>
       teamApi.setPresent(workerId, present, day),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["attendance"] }),
-    onError: () => toast.error("failed to update attendance"),
+    onError: () => toast.error("Failed to update attendance"),
   })
 
   if (!scopeOrg) return <NeedsOrg />
@@ -174,7 +180,8 @@ export function TeamPage() {
               {ROLES.map((r) => <SelectItem key={r} value={r} className="capitalize">{r}</SelectItem>)}
             </SelectContent>
           </Select>
-          <Input placeholder="region" className="h-8 w-28" value={region} onChange={(e) => setRegion(e.target.value)} />
+          <RegionSelect org={scopeOrg} value={region} onChange={setRegion}
+            className="h-8 w-32" inputClassName="h-8 w-28" />
           <div className="ml-auto flex gap-2">
             <Button variant="ghost" size="sm" onClick={() => setAddOpen(false)}>Cancel</Button>
             <Button size="sm" disabled={!name.trim() || add.isPending} onClick={() => add.mutate()}>Add</Button>
@@ -195,6 +202,7 @@ export function TeamPage() {
               return (
                 <EditWorkerRow
                   key={w.id}
+                  org={scopeOrg}
                   worker={w}
                   saving={update.isPending}
                   onCancel={() => setEditingId(null)}
@@ -244,7 +252,7 @@ export function TeamPage() {
                       <DropdownMenuItem onClick={() => setEditingId(w.id)}>
                         <Pencil /> Edit
                       </DropdownMenuItem>
-                      <DropdownMenuItem variant="destructive" onClick={() => remove.mutate(w.id)}>
+                      <DropdownMenuItem variant="destructive" onClick={() => setRemoving(w)}>
                         <Trash2 /> Remove
                       </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -255,6 +263,14 @@ export function TeamPage() {
           })}
         </Card>
       )}
+      <ConfirmDialog
+        open={!!removing}
+        onOpenChange={(o) => { if (!o) setRemoving(null) }}
+        title={`Remove ${removing?.name ?? ""}?`}
+        description="Their attendance history goes with them. This cannot be undone."
+        confirmLabel="Remove"
+        onConfirm={() => { if (removing) remove.mutate(removing.id) }}
+      />
       {/* the strip itself is sm+-only, so the hint hides with it */}
       {att && att.days.length > 1 && workers.some((w) => attByWorker.has(w.id)) && (
         <p className="hidden text-xs text-muted-foreground/70 sm:block">

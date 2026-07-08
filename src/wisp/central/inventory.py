@@ -74,6 +74,14 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             "region": region, "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor}
 
+def clean_region_name(raw) -> str:
+    name = str(raw).strip() if raw is not None else ""
+    if not name:
+        raise InventoryError("region name is required")
+    if len(name) > 64:
+        raise InventoryError("region name must be 64 characters or fewer")
+    return name
+
 def clean_backup_link(child_id: int, parent_id: int, *,
                       parents: dict[int, int | None],
                       backups: dict[int, set[int]]) -> None:

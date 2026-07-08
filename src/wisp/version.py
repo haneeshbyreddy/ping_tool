@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 
-_FALLBACK = "0.12.1"
+_FALLBACK = "0.13.0"
 
 def _resolve() -> str:
     env = os.environ.get("WISP_VERSION")

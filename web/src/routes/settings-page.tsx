@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Copy, Dices, KeyRound, Plus, Trash2 } from "lucide-react"
+import { Check, Copy, Dices, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
-import { orgsApi, usersApi, ApiError } from "@/lib/api"
+import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import type { AccountUser, Role } from "@/lib/types"
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -64,13 +65,13 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
       ntfy_topic_tech: topics.tech.trim() || null,
     }),
     onSuccess: () => { toast.success("Settings saved"); queryClient.invalidateQueries({ queryKey: ["orgs"] }) },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "save failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
   })
 
   const test = useMutation({
     mutationFn: (role: "owner" | "operator" | "tech") => orgsApi.testAlert(org, role),
-    onSuccess: (r, role) => setTestResults((t) => ({ ...t, [role]: r.ok ? "✓ sent" : `failed: ${r.detail || ""}` })),
-    onError: (e, role) => setTestResults((t) => ({ ...t, [role]: e instanceof ApiError ? e.message : "failed" })),
+    onSuccess: (r, role) => setTestResults((t) => ({ ...t, [role]: r.ok ? "✓ sent" : `Failed: ${r.detail || ""}` })),
+    onError: (e, role) => setTestResults((t) => ({ ...t, [role]: e instanceof ApiError ? e.message : "Failed" })),
   })
 
   if (isLoading) return <Skeleton className="h-48 w-full" />
@@ -127,6 +128,116 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   )
 }
 
+function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
+  const queryClient = useQueryClient()
+  const [newName, setNewName] = useState("")
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [renameTo, setRenameTo] = useState("")
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["regions", org],
+    queryFn: () => regionsApi.list(org),
+  })
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["regions"] })
+    // a rename cascades onto device and team rows
+    queryClient.invalidateQueries({ queryKey: ["inventory"] })
+    queryClient.invalidateQueries({ queryKey: ["team"] })
+  }
+  const add = useMutation({
+    mutationFn: () => regionsApi.create(org, newName.trim()),
+    onSuccess: () => { setNewName(""); invalidate() },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to add region"),
+  })
+  const rename = useMutation({
+    mutationFn: () => regionsApi.rename(org, renaming!, renameTo.trim()),
+    onSuccess: () => {
+      toast.success("Region renamed — devices and members follow")
+      setRenaming(null); invalidate()
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to rename region"),
+  })
+  const remove = useMutation({
+    mutationFn: (name: string) => regionsApi.remove(org, name),
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to delete region"),
+  })
+
+  const regions = data?.regions ?? []
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <MapPin className="size-4 text-muted-foreground" /> Regions
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-0 p-0">
+        {isLoading && <div className="px-4 pb-4"><Skeleton className="h-10 w-full" /></div>}
+        {!isLoading && regions.length === 0 && (
+          <p className="px-4 pb-3 text-xs text-muted-foreground">
+            No regions yet — add one here, or pick "New region…" while editing a device.
+          </p>
+        )}
+        {regions.map((r) => {
+          const inUse = r.device_count + r.worker_count
+          const usage = [
+            r.device_count > 0 && `${r.device_count} device${r.device_count === 1 ? "" : "s"}`,
+            r.worker_count > 0 && `${r.worker_count} member${r.worker_count === 1 ? "" : "s"}`,
+          ].filter(Boolean).join(" · ")
+          if (canWrite && renaming === r.name) {
+            return (
+              <div key={r.name} className="flex items-center gap-2 border-t px-4 py-2 first:border-t-0">
+                <Input autoFocus className="h-8 max-w-48" value={renameTo}
+                  onChange={(e) => setRenameTo(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && renameTo.trim()) rename.mutate() }} />
+                <Button variant="ghost" size="icon" className="size-7"
+                  disabled={!renameTo.trim() || rename.isPending} onClick={() => rename.mutate()}>
+                  <Check className="size-3.5" />
+                </Button>
+                <Button variant="ghost" size="icon" className="size-7" onClick={() => setRenaming(null)}>
+                  <X className="size-3.5" />
+                </Button>
+              </div>
+            )
+          }
+          return (
+            <div key={r.name} className="group flex h-10 items-center gap-3 border-t px-4 first:border-t-0">
+              <span className="min-w-0 truncate text-sm font-medium">{r.name}</span>
+              <span className="text-xs text-muted-foreground">{usage || "unused"}</span>
+              {canWrite && (
+                <div className="ml-auto flex shrink-0 items-center gap-1 opacity-60 group-hover:opacity-100">
+                  <Button variant="ghost" size="icon" className="size-7" title="Rename (devices and members follow)"
+                    onClick={() => { setRenaming(r.name); setRenameTo(r.name) }}>
+                    <Pencil className="size-3.5" />
+                  </Button>
+                  <Button variant="ghost" size="icon" className="size-7" disabled={inUse > 0 || remove.isPending}
+                    title={inUse > 0 ? "In use — reassign its devices/members first" : "Delete region"}
+                    onClick={() => remove.mutate(r.name)}>
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              )}
+            </div>
+          )
+        })}
+        {canWrite && (
+          <div className="flex items-center gap-2 border-t p-4">
+            <Input placeholder="new region, e.g. north-dc" className="h-8 max-w-56" value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && newName.trim()) add.mutate() }} />
+            <Button size="sm" variant="outline" disabled={!newName.trim() || add.isPending}
+              onClick={() => add.mutate()}>
+              <Plus className="size-3.5" /> Add
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 function ChangePasswordCard() {
   const [current, setCurrent] = useState("")
   const [next, setNext] = useState("")
@@ -139,7 +250,7 @@ function ChangePasswordCard() {
       toast.success("Password changed")
       setCurrent(""); setNext(""); setConfirm(""); setError("")
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to change password"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Failed to change password"),
   })
 
   const mismatch = confirm.length > 0 && next !== confirm
@@ -189,7 +300,7 @@ function ResetPasswordDialog({ target }: { target: AccountUser }) {
       toast.success(`Password reset for ${target.username}`)
       setOpen(false); setNext(""); setError("")
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to reset password"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Failed to reset password"),
   })
 
   return (
@@ -228,6 +339,7 @@ function UsersCard({ org }: { org: string }) {
   const [password, setPassword] = useState("")
   const [role, setRole] = useState<Role>("operator")
   const [error, setError] = useState("")
+  const [deleting, setDeleting] = useState<AccountUser | null>(null)
 
   const { data, isLoading } = useQuery({
     queryKey: ["users", org],
@@ -240,17 +352,17 @@ function UsersCard({ org }: { org: string }) {
       org_id: user?.is_superadmin ? org : undefined, username: username.trim(), password, role,
     }),
     onSuccess: () => { invalidate(); setAddOpen(false); setUsername(""); setPassword(""); setError("") },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to create"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Failed to create"),
   })
   const setActive = useMutation({
     mutationFn: ({ id, active }: { id: number; active: boolean }) => usersApi.setActive(id, active),
     onSuccess: invalidate,
-    onError: () => toast.error("failed to update"),
+    onError: () => toast.error("Failed to update"),
   })
   const remove = useMutation({
     mutationFn: (id: number) => usersApi.remove(id),
     onSuccess: invalidate,
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to delete"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to delete"),
   })
 
   const users = data?.users ?? []
@@ -279,8 +391,8 @@ function UsersCard({ org }: { org: string }) {
               </label>
               {u.id !== user?.id && <ResetPasswordDialog target={u} />}
               {u.id !== user?.id && (
-                <Button variant="ghost" size="icon" className="size-7"
-                  onClick={() => { if (confirm(`Delete login account "${u.username}"? This cannot be undone.`)) remove.mutate(u.id) }}>
+                <Button variant="ghost" size="icon" className="size-7" title="Delete account"
+                  onClick={() => setDeleting(u)}>
                   <Trash2 className="size-3.5" />
                 </Button>
               )}
@@ -310,6 +422,13 @@ function UsersCard({ org }: { org: string }) {
             </div>
           </div>
         )}
+        <ConfirmDialog
+          open={!!deleting}
+          onOpenChange={(o) => { if (!o) setDeleting(null) }}
+          title={`Delete login account ${deleting?.username ?? ""}?`}
+          description="They are signed out and can no longer log in. This cannot be undone."
+          onConfirm={() => { if (deleting) remove.mutate(deleting.id) }}
+        />
       </CardContent>
     </Card>
   )
@@ -322,6 +441,7 @@ export function SettingsPage() {
     <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 md:p-6">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
       {scopeOrg && <OrgSettingsCard org={scopeOrg} canWrite={canWrite} />}
+      {scopeOrg && <RegionsCard org={scopeOrg} canWrite={canWrite} />}
       <ChangePasswordCard />
       {scopeOrg && canWrite && <UsersCard org={scopeOrg} />}
       {!scopeOrg && <NeedsOrg />}

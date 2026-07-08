@@ -27,6 +27,7 @@ from wisp.runtime.edge_status import (
 )
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.ingress.probers import PingResult, Prober, build_prober
+from wisp.ingress.health import HealthPoller, build_health_poller
 from wisp.ingress.snmp import SnmpPoller, SnmpTarget, build_snmp_poller
 from wisp.ingress.gpon import GponPollerPool
 
@@ -102,6 +103,33 @@ async def _gather_snmp_ports(
 
     pairs = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
     return {dev_id: ports for dev_id, ports in (p for p in pairs if p)}
+
+async def _gather_snmp_health(
+    health_poller: HealthPoller, devices: list[dict], cfg: Config = CONFIG,
+) -> dict[int, dict]:
+    sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
+
+    async def one(d: dict) -> tuple[int, dict] | None:
+        target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
+                            port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
+        async with sem:
+            try:
+                health = await asyncio.wait_for(
+                    health_poller.walk(target), timeout=cfg.snmp_walk_timeout_s or None)
+            except asyncio.TimeoutError:
+                log.warning("SNMP health walk of device %s (%s) exceeded %.0fs cap; skipping",
+                            d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
+                return None
+            except Exception:
+                log.exception("SNMP health walk failed for device %s (%s); continuing",
+                              d.get("id"), d["ip_address"])
+                return None
+        if health.is_empty():
+            return None
+        return d["id"], health.to_wire()
+
+    pairs = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
+    return {dev_id: h for dev_id, h in (p for p in pairs if p)}
 
 async def _gather_onu_optics(
     pool: GponPollerPool, devices: list[dict], cfg: Config = CONFIG,
@@ -183,6 +211,7 @@ async def run_cycle_central_brain(
     ports: dict[int, list[dict]] | None = None,
     gpon_pool: GponPollerPool | None = None,
     optics: dict[int, list[dict]] | None = None,
+    health: dict[int, dict] | None = None,
 ) -> bool:
     prober.on_cycle_start()
     ts = _utc_now_iso()
@@ -199,6 +228,8 @@ async def run_cycle_central_brain(
         extra["ports"] = ports
     if optics:
         extra["optics"] = optics
+    if health:
+        extra["health"] = health
     try:
         reply = client.report(_pings_payload(results), ts, **extra)
     except CentralClientError as exc:
@@ -283,6 +314,8 @@ async def _run_central_brain(
     snmp_task: asyncio.Task | None = None
     gpon_pool = GponPollerPool(cfg) if cfg.snmp_interval_s > 0 else None
     gpon_task: asyncio.Task | None = None
+    health_poller = build_health_poller(cfg) if cfg.snmp_interval_s > 0 else None
+    health_task: asyncio.Task | None = None
 
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
@@ -295,13 +328,16 @@ async def _run_central_brain(
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
         if (max_cycles is None and started >= next_snmp
-                and snmp_task is None and gpon_task is None):
+                and snmp_task is None and gpon_task is None and health_task is None):
             if snmp_poller is not None:
                 snmp_task = asyncio.create_task(
                     _gather_snmp_ports(snmp_poller, list(devices), cfg))
             if gpon_pool is not None:
                 gpon_task = asyncio.create_task(
                     _gather_onu_optics(gpon_pool, list(devices), cfg))
+            if health_poller is not None:
+                health_task = asyncio.create_task(
+                    _gather_snmp_health(health_poller, list(devices), cfg))
             next_snmp = started + cfg.snmp_interval_s
         ports: dict[int, list[dict]] | None = None
         if snmp_task is not None and snmp_task.done():
@@ -317,9 +353,17 @@ async def _run_central_brain(
             except Exception:
                 log.exception("GPON optics sweep failed; continuing")
             gpon_task = None
+        health: dict[int, dict] | None = None
+        if health_task is not None and health_task.done():
+            try:
+                health = health_task.result()
+            except Exception:
+                log.exception("SNMP health sweep failed; continuing")
+            health_task = None
         try:
             reported = await run_cycle_central_brain(
-                prober, client, devices, canary_ip, cfg, ports=ports, optics=optics)
+                prober, client, devices, canary_ip, cfg, ports=ports, optics=optics,
+                health=health)
             status.write(PHASE_RUNNING, ok=reported, devices=len(devices),
                          error=None if reported else "last report to central failed")
         except Exception as exc:

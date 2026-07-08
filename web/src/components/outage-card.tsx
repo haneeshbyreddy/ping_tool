@@ -40,12 +40,12 @@ export function OutageCard({ outage }: { outage: Outage }) {
   const ack = useMutation({
     mutationFn: () => outagesApi.acknowledge(outage.id),
     onSuccess: invalidate,
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to acknowledge"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to acknowledge"),
   })
   const postmortem = useMutation({
     mutationFn: () => outagesApi.postmortem(outage.id, rootCause, notes || undefined),
     onSuccess: () => { invalidate(); setClosing(false); toast.success("Post-mortem saved") },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to save"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save"),
   })
 
   const discard = () => {
@@ -71,8 +71,8 @@ export function OutageCard({ outage }: { outage: Outage }) {
 
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Clock className="size-3 shrink-0" />
-          Down since {fmtDateTime(outage.started_at)}
-          {outage.resolved_at && <> — recovered {fmtDateTime(outage.resolved_at)}</>}
+          Down {fmtDateTime(outage.started_at)}
+          {outage.resolved_at && <> – {fmtDateTime(outage.resolved_at)}</>}
         </p>
 
         <div className="flex items-center justify-between">

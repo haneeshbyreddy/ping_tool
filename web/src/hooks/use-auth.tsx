@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { authApi } from "@/lib/api"
-import type { User } from "@/lib/types"
+import { SESSION_EXPIRED_KEY } from "@/lib/session"
+import type { MeResponse, User } from "@/lib/types"
 
 const SCOPE_STORAGE_KEY = "wisp-central-org-scope"
 
@@ -31,7 +32,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   useEffect(() => {
-    const handler = () => queryClient.setQueryData(["me"], undefined)
+    const handler = () => {
+      // Only a 401 that kills a live session is an "expiry" — a cold visit
+      // hitting /api/me unauthenticated is just the normal login flow.
+      if (queryClient.getQueryData<MeResponse>(["me"])?.user) {
+        sessionStorage.setItem(SESSION_EXPIRED_KEY, "1")
+      }
+      queryClient.setQueryData(["me"], undefined)
+    }
     window.addEventListener("wisp:unauthorized", handler)
     return () => window.removeEventListener("wisp:unauthorized", handler)
   }, [queryClient])

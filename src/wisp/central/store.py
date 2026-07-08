@@ -133,6 +133,17 @@ CREATE TABLE IF NOT EXISTS org_devices (
     created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_org_devices_org ON org_devices(org_id, is_active);
+-- Declared region names per org — feeds the dashboard's region dropdowns.
+-- `org_devices.region`/`org_workers.region` stay plain text; list_regions returns
+-- the UNION of declared + in-use names, so pre-table free-text regions surface
+-- without any backfill.
+CREATE TABLE IF NOT EXISTS org_regions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (org_id, name)
+);
 -- Phase B — central runs the brain. One MonitorEngine per org (central/engine.py)
 -- feeds off org_devices topology and commits here every report; this is the FSM output
 -- store the edge's `poll_results`/`devices.state` played on the standalone box.
@@ -380,6 +391,21 @@ CREATE TABLE IF NOT EXISTS olt_optics (
     alarm       INTEGER NOT NULL DEFAULT 0,
     alarm_since TEXT,
     updated_at  TEXT NOT NULL
+);
+-- Device health over SNMP (CPU %, RAM, temperature) — one row per device, written
+-- off the full /report's `health` key on the edge's SNMP cadence (ingress/health.py).
+-- DISPLAY-ONLY: never opens an outage, never pages — the ICMP FSM owns alarms; this
+-- just explains them (a router at 98% CPU is why latency looks bad). Latest reading
+-- only, no history — the hourly rollup / perf ring stay ICMP-focused.
+CREATE TABLE IF NOT EXISTS device_health (
+    device_id       INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    org_id          TEXT NOT NULL,
+    cpu_pct         REAL,
+    mem_used_bytes  INTEGER,
+    mem_total_bytes INTEGER,
+    mem_pct         REAL,
+    temp_c          REAL,
+    updated_at      TEXT NOT NULL
 );
 """
 
@@ -867,6 +893,67 @@ class CentralStore:
             op["days"] = {d: ((op["id"], d) in present) for d in day_list}
         return {"today": today, "days": day_list, "operators": ops}
 
+    # ----- regions -----------------------------------------------------------
+
+    def list_regions(self, org_id: str) -> list[dict]:
+        with self._connect() as conn:
+            declared = {r["name"] for r in conn.execute(
+                "SELECT name FROM org_regions WHERE org_id=?", (org_id,))}
+            dev_counts = {r["region"]: r["n"] for r in conn.execute(
+                "SELECT region, COUNT(*) AS n FROM org_devices"
+                " WHERE org_id=? AND is_active=1 AND region IS NOT NULL AND region!=''"
+                " GROUP BY region", (org_id,))}
+            worker_counts = {r["region"]: r["n"] for r in conn.execute(
+                "SELECT region, COUNT(*) AS n FROM org_workers"
+                " WHERE org_id=? AND is_active=1 AND region IS NOT NULL AND region!=''"
+                " GROUP BY region", (org_id,))}
+        names = sorted(declared | set(dev_counts) | set(worker_counts), key=str.lower)
+        return [{
+            "name": n,
+            "declared": n in declared,
+            "device_count": dev_counts.get(n, 0),
+            "worker_count": worker_counts.get(n, 0),
+        } for n in names]
+
+    def add_region(self, org_id: str, name: str) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO org_regions (org_id, name, created_at)"
+                " VALUES (?,?,?)", (org_id, name, _now_iso()))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def rename_region(self, org_id: str, old: str, new: str) -> None:
+        # Cascades to devices and workers so a rename can't fragment the org's
+        # region set; the new name lands declared even if `old` never was.
+        with self._write_lock, self._connect() as conn:
+            conn.execute("DELETE FROM org_regions WHERE org_id=? AND name=?",
+                         (org_id, old))
+            conn.execute(
+                "INSERT OR IGNORE INTO org_regions (org_id, name, created_at)"
+                " VALUES (?,?,?)", (org_id, new, _now_iso()))
+            conn.execute("UPDATE org_devices SET region=? WHERE org_id=? AND region=?",
+                         (new, org_id, old))
+            conn.execute("UPDATE org_workers SET region=? WHERE org_id=? AND region=?",
+                         (new, org_id, old))
+            conn.commit()
+
+    def delete_region(self, org_id: str, name: str) -> dict:
+        with self._write_lock, self._connect() as conn:
+            in_use = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM org_devices"
+                "        WHERE org_id=? AND region=? AND is_active=1)"
+                "     + (SELECT COUNT(*) FROM org_workers"
+                "        WHERE org_id=? AND region=? AND is_active=1)",
+                (org_id, name, org_id, name)).fetchone()[0]
+            if in_use:
+                return {"ok": False,
+                        "reason": f"region is used by {in_use} device(s)/member(s)"}
+            conn.execute("DELETE FROM org_regions WHERE org_id=? AND name=?",
+                         (org_id, name))
+            conn.commit()
+            return {"ok": True}
+
     def list_org_devices(self, org_id: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -884,9 +971,14 @@ class CentralStore:
                 " g.onus_total AS onus_total, g.onus_online AS onus_online,"
                 " g.warn_count AS onus_warn, g.crit_count AS onus_crit,"
                 " s.state AS state, s.latency_ms AS latency_ms, s.packet_loss AS packet_loss,"
-                " s.jitter_ms AS jitter_ms, s.updated_at AS state_updated_at"
+                " s.jitter_ms AS jitter_ms, s.updated_at AS state_updated_at,"
+                " h.cpu_pct AS health_cpu_pct, h.mem_pct AS health_mem_pct,"
+                " h.mem_used_bytes AS health_mem_used_bytes,"
+                " h.mem_total_bytes AS health_mem_total_bytes,"
+                " h.temp_c AS health_temp_c, h.updated_at AS health_updated_at"
                 " FROM org_devices d LEFT JOIN device_states s ON s.device_id = d.id"
                 " LEFT JOIN olt_optics g ON g.device_id = d.id"
+                " LEFT JOIN device_health h ON h.device_id = d.id"
                 " WHERE d.org_id=? AND d.is_active=1 ORDER BY d.id",
                 (org_id,)).fetchall()
             links = conn.execute(
@@ -1582,6 +1674,31 @@ class CentralStore:
                 " primary_down_since=excluded.primary_down_since,"
                 " updated_at=excluded.updated_at",
                 (device_id, org_id, 1 if on_backup else 0, since, ts))
+            conn.commit()
+
+    def upsert_device_health(self, org_id: str, device_id: int, health: dict,
+                             ts: str) -> None:
+        def _f(key):
+            v = health.get(key)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _i(key):
+            v = _f(key)
+            return int(v) if v is not None else None
+
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO device_health (device_id, org_id, cpu_pct, mem_used_bytes,"
+                " mem_total_bytes, mem_pct, temp_c, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET cpu_pct=excluded.cpu_pct,"
+                " mem_used_bytes=excluded.mem_used_bytes,"
+                " mem_total_bytes=excluded.mem_total_bytes, mem_pct=excluded.mem_pct,"
+                " temp_c=excluded.temp_c, updated_at=excluded.updated_at",
+                (device_id, org_id, _f("cpu_pct"), _i("mem_used_bytes"),
+                 _i("mem_total_bytes"), _f("mem_pct"), _f("temp_c"), ts))
             conn.commit()
 
     def record_perf_sample(self, org_id: str, device_id: int, ts: str,

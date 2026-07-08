@@ -31,6 +31,13 @@ export type DeviceType = (typeof DEVICE_TYPES)[number]
 
 export type DeviceState = "UP" | "DOWN" | "DEGRADED" | "UNREACHABLE"
 
+export interface OrgRegion {
+  name: string
+  declared: boolean
+  device_count: number
+  worker_count: number
+}
+
 export interface OrgDevice {
   id: number
   org_id: string
@@ -64,6 +71,13 @@ export interface OrgDevice {
   packet_loss: number | null
   jitter_ms: number | null
   state_updated_at: string | null
+
+  health_cpu_pct: number | null
+  health_mem_pct: number | null
+  health_mem_used_bytes: number | null
+  health_mem_total_bytes: number | null
+  health_temp_c: number | null
+  health_updated_at: string | null
 }
 
 export interface SwitchPort {
@@ -292,4 +306,17 @@ export interface AccountUser {
   role: Role
   is_active: 0 | 1
   created_at: string
+}
+
+export interface SystemStats {
+  hostname: string
+  uptime_s: number | null
+  cpu: { percent: number | null; cores: number | null; load: number[] | null }
+  memory: {
+    total_bytes: number; used_bytes: number; available_bytes: number; percent: number
+  } | null
+  disk: {
+    total_bytes: number; used_bytes: number; free_bytes: number; percent: number
+  } | null
+  process: { rss_bytes: number | null; db_bytes: number | null }
 }

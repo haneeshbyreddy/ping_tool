@@ -548,6 +548,45 @@ class ReportEndpointTest(unittest.TestCase):
             o = conn.execute("SELECT root_cause FROM outages WHERE id=?", (oid,)).fetchone()
         self.assertIn("Port", o["root_cause"])
 
+    def test_report_health_upserts_and_rides_the_inventory_join(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core Router", "ip_address": "10.0.0.1", "device_type": "router",
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",
+                "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}},
+                "health": {str(dev): {"cpu_pct": 37.5, "mem_used_bytes": 96_000_000,
+                                      "mem_total_bytes": 256_000_000, "mem_pct": 37.5,
+                                      "temp_c": 54.0},
+                           "9999": {"cpu_pct": 1.0},          # unknown device: ignored
+                           "junk": {"cpu_pct": 1.0}}}         # bad id: ignored
+        status, _ = self._req("POST", "/report", body)
+        self.assertEqual(status, 200)
+        row = {d["id"]: d for d in self.store.list_org_devices("ispA")}[dev]
+        self.assertEqual(row["health_cpu_pct"], 37.5)
+        self.assertEqual(row["health_mem_pct"], 37.5)
+        self.assertEqual(row["health_mem_total_bytes"], 256_000_000)
+        self.assertEqual(row["health_temp_c"], 54.0)
+        self.assertIsNotNone(row["health_updated_at"])
+
+        # a later sweep with fewer facts overwrites in place (latest reading only)
+        body["health"] = {str(dev): {"cpu_pct": 90.0, "temp_c": "not-a-number"}}
+        self._req("POST", "/report", body)
+        row = {d["id"]: d for d in self.store.list_org_devices("ispA")}[dev]
+        self.assertEqual(row["health_cpu_pct"], 90.0)
+        self.assertIsNone(row["health_temp_c"])
+
+    def test_recheck_report_never_writes_health(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        body = {"v": 1, "org_id": "ispA", "node_id": "edge-1", "mode": "recheck",
+                "pings": {"10.0.0.1": {"loss_pct": 0.0, "latency_ms": 5.0}},
+                "health": {str(dev): {"cpu_pct": 37.5}}}
+        status, _ = self._req("POST", "/report", body)
+        self.assertEqual(status, 200)
+        row = {d["id"]: d for d in self.store.list_org_devices("ispA")}[dev]
+        self.assertIsNone(row["health_cpu_pct"])
+
     def test_full_report_folds_a_trend_bucket_recheck_does_not(self):
         dev = self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,

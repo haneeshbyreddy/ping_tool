@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { ServerHealthCard } from "@/components/server-health-card"
 
 function orgInitials(o: { name: string | null; org_id: string }): string {
   return (o.name || o.org_id).slice(0, 2).toUpperCase()
@@ -35,7 +36,7 @@ export function OrganizationsPage() {
   const create = useMutation({
     mutationFn: () => orgsApi.create({ org_id: orgId.trim(), name: name.trim() || undefined }),
     onSuccess: () => { invalidate(); setOrgId(""); setName(""); setError(""); toast.success("Org created") },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "failed to create"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Failed to create"),
   })
 
   const [edits, setEdits] = useState<Record<string, string>>({})
@@ -45,7 +46,7 @@ export function OrganizationsPage() {
       invalidate()
       setEdits((e) => { const next = { ...e }; delete next[id]; return next })
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to rename"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to rename"),
   })
 
   const manage = (id: string) => { setScopeOrg(id); navigate("/settings") }
@@ -59,6 +60,8 @@ export function OrganizationsPage() {
         <h1 className="text-lg font-semibold tracking-tight">Organizations</h1>
         <p className="text-sm text-muted-foreground">Every org on this platform — create new ISPs and manage their topology, team, and alert routing.</p>
       </div>
+
+      <ServerHealthCard />
 
       <Card>
         <CardHeader>

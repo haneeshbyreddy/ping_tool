@@ -8,6 +8,7 @@ import {
   WINDOWS_SETUP_EXE, linuxInstallCmd, probeIdentity, releaseAsset, windowsSilentCmd,
 } from "@/lib/install"
 import type { NodeToken, OrgRollout } from "@/lib/types"
+import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import { StatusDot } from "@/components/status-badge"
 import { ago, fmtBytes, isStale } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -168,6 +169,7 @@ function CredentialReveal({
 
 function ProbeRow({
   node, org, canWrite, onReveal, latestVersion, rollout,
+  deviceCount, filtered, onFilter,
 }: {
   node: NodeToken
   org: string
@@ -175,15 +177,19 @@ function ProbeRow({
   onReveal: (r: { node_id: string; token: string }) => void
   latestVersion: string | null
   rollout: OrgRollout | null
+  deviceCount?: number
+  filtered?: boolean
+  onFilter?: () => void
 }) {
   const queryClient = useQueryClient()
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["nodes"] })
+  const confirmDelete = useConfirm()
   useNow()
 
   const rotate = useMutation({
     mutationFn: () => nodesApi.rotate(org, node.node_id),
     onSuccess: (r) => { onReveal(r); invalidate() },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "rotate failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Rotate failed"),
   })
   const update = useMutation({
     mutationFn: () => nodesApi.update(org, node.node_id),
@@ -191,17 +197,17 @@ function ProbeRow({
       toast.success(`Update to ${r.target_version} queued — the probe pulls it on its next heartbeat`)
       invalidate()
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "update failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Update failed"),
   })
   const revoke = useMutation({
     mutationFn: () => nodesApi.revoke(org, node.node_id),
     onSuccess: invalidate,
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "revoke failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Revoke failed"),
   })
   const remove = useMutation({
     mutationFn: () => nodesApi.remove(org, node.node_id),
     onSuccess: invalidate,
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "delete failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Delete failed"),
   })
 
   const stale = !!node.last_seen && isStale(node.last_seen)
@@ -237,6 +243,19 @@ function ProbeRow({
         "min-w-0 truncate font-mono text-xs font-medium",
         !node.registered && "text-muted-foreground",
       )}>{node.node_id}</span>
+      {onFilter != null && (deviceCount ?? 0) > 0 && (
+        <button
+          className={cn(
+            "shrink-0 rounded-full border px-2 py-0.5 text-[0.6875rem] font-medium transition-colors",
+            filtered ? "border-primary/40 bg-primary-soft text-primary"
+              : "text-muted-foreground hover:bg-accent hover:text-foreground",
+          )}
+          title={filtered ? "Showing only this probe's devices — click to clear"
+            : "Show only this probe's devices"}
+          onClick={onFilter}>
+          {deviceCount} device{deviceCount === 1 ? "" : "s"}
+        </button>
+      )}
       {!node.registered && (
         <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-muted-foreground"
           title="Reporting to central without a dashboard-issued credential — a leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
@@ -306,23 +325,35 @@ function ProbeRow({
                   <Power /> Revoke
                 </DropdownMenuItem>
               )}
-              <DropdownMenuItem variant="destructive" onClick={() => {
-                const msg = node.registered
-                  ? `Delete probe ${node.node_id} permanently?`
-                  : `Forget unregistered probe ${node.node_id}? It will reappear if it keeps reporting.`
-                if (confirm(msg)) remove.mutate()
-              }}>
+              <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
                 <Trash2 /> Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         )}
+        <ConfirmDialog {...confirmDelete.props}
+          title={node.registered
+            ? `Delete probe ${node.node_id}?`
+            : `Forget unregistered probe ${node.node_id}?`}
+          description={node.registered
+            ? "Its credential stops working and its devices go unmonitored until reassigned. This cannot be undone."
+            : "It will reappear here if it keeps reporting."}
+          confirmLabel={node.registered ? "Delete" : "Forget"}
+          onConfirm={() => remove.mutate()} />
       </div>
     </div>
   )
 }
 
-export function ProbesPanel({ org, canWrite }: { org: string; canWrite: boolean }) {
+export function ProbesPanel({
+  org, canWrite, deviceCounts, probeFilter, onProbeFilter,
+}: {
+  org: string
+  canWrite: boolean
+  deviceCounts?: Map<string, number>
+  probeFilter?: string | null
+  onProbeFilter?: (nodeId: string | null) => void
+}) {
   const queryClient = useQueryClient()
   const [addOpen, setAddOpen] = useState(false)
   const [newId, setNewId] = useState("")
@@ -343,7 +374,7 @@ export function ProbesPanel({ org, canWrite }: { org: string; canWrite: boolean 
       setReveal(r); setAddOpen(false); setNewId(""); setError("")
       queryClient.invalidateQueries({ queryKey: ["nodes"] })
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "register failed"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Registration failed"),
   })
 
   const nodes = data?.nodes ?? []
@@ -390,7 +421,12 @@ export function ProbesPanel({ org, canWrite }: { org: string; canWrite: boolean 
         <Card className="gap-0 overflow-hidden py-0">
           {nodes.map((n) => (
             <ProbeRow key={n.node_id} node={n} org={org} canWrite={canWrite} onReveal={setReveal}
-              latestVersion={data?.latest_version ?? null} rollout={data?.rollout ?? null} />
+              latestVersion={data?.latest_version ?? null} rollout={data?.rollout ?? null}
+              deviceCount={deviceCounts?.get(n.node_id)}
+              filtered={probeFilter === n.node_id}
+              onFilter={onProbeFilter
+                ? () => onProbeFilter(probeFilter === n.node_id ? null : n.node_id)
+                : undefined} />
           ))}
         </Card>
       )}

@@ -21,7 +21,7 @@ export function ClearPostmortems({ org, count }: { org: string | null; count: nu
       setOpen(false)
       toast.success(`Cleared ${cleared} post-mortem${cleared === 1 ? "" : "s"}`)
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "failed to clear"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to clear"),
   })
 
   if (count === 0) return null

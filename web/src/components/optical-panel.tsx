@@ -114,7 +114,7 @@ function OnuRow({ o, deviceId }: { o: OnuOptic; deviceId: number }) {
       qc.invalidateQueries({ queryKey: ["optics", deviceId] })
       qc.invalidateQueries({ queryKey: ["inventory"] })
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "ack failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Acknowledge failed"),
   })
   return (
     <div className="flex items-center gap-3 py-1.5 text-xs">

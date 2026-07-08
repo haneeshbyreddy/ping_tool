@@ -1,17 +1,21 @@
 import { Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react"
+import { useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, MoreVertical, Pencil, Plus, Radio, Trash2, Waypoints, Wrench } from "lucide-react"
+import { ChevronRight, MoreVertical, Pencil, Plus, Radio, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { analyticsApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
 import { DEVICE_TYPES, type OrgDevice, type SwitchPort } from "@/lib/types"
+import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
+import { Meter } from "@/components/meter"
 import { NeedsOrg } from "@/components/needs-org"
 import { OpticalPanel } from "@/components/optical-panel"
+import { RegionSelect } from "@/components/region-select"
 import { ProbesPanel } from "@/components/probes-panel"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
-import { ago, deviceTone, durationSince, fmtDur, isStale } from "@/lib/format"
+import { ago, deviceTone, durationSince, fmtBytes, fmtDur, isStale } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -100,7 +104,11 @@ function DeviceForm({
     cardRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
   }, [editing])
 
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["inventory"] })
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["inventory"] })
+    // a "New region…" typed here reaches the dropdown via the in-use union
+    queryClient.invalidateQueries({ queryKey: ["regions"] })
+  }
 
   const save = useMutation({
     mutationFn: async () => {
@@ -126,13 +134,13 @@ function DeviceForm({
       }
     },
     onSuccess: () => { invalidate(); onDone() },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "save failed"),
+    onError: (e) => setError(e instanceof ApiError ? e.message : "Save failed"),
   })
 
   return (
     <Card ref={cardRef} className="border-primary/30">
       <CardContent className="flex flex-col gap-3 px-4">
-        <p className="text-sm font-semibold">{editing ? `Edit — ${editing.name}` : "Add node"}</p>
+        <p className="text-sm font-semibold">{editing ? `Edit — ${editing.name}` : "Add device"}</p>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="flex flex-col gap-1.5">
             <Label>Name</Label>
@@ -155,8 +163,8 @@ function DeviceForm({
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Region</Label>
-            <Input placeholder="north-dc" value={form.region}
-              onChange={(e) => setForm({ ...form, region: e.target.value })} />
+            <RegionSelect org={org} value={form.region} className="w-full"
+              onChange={(v) => setForm({ ...form, region: v })} />
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Parent</Label>
@@ -244,8 +252,8 @@ function PortBandwidthForm({ port, onSaved }: { port: SwitchPort; onSaved: () =>
       }
       return inventoryApi.setPortBandwidth(port.id, minVal, direction, maxVal)
     },
-    onSuccess: () => { toast.success("bandwidth limits saved"); onSaved() },
-    onError: (e) => toast.error(e instanceof Error ? e.message : "failed to save limits"),
+    onSuccess: () => { toast.success("Bandwidth limits saved"); onSaved() },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to save limits"),
   })
 
   return (
@@ -310,7 +318,7 @@ function PortsPanel({ device }: { device: OrgDevice }) {
   const toggleMonitored = useMutation({
     mutationFn: (p: SwitchPort) => inventoryApi.setPortMonitored(p.id, !p.monitored),
     onSuccess: invalidate,
-    onError: () => toast.error("failed to update port"),
+    onError: () => toast.error("Failed to update port"),
   })
 
   if (isLoading) return <Skeleton className="h-16 w-full" />
@@ -406,6 +414,45 @@ function DeviceMetrics({ device }: { device: OrgDevice }) {
 const median = (xs: number[]): number | null =>
   xs.length ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] : null
 
+// SNMP device vitals (CPU / RAM / temperature) — display-only, never alarms.
+// Warn/crit tints only; the thresholds are conventional NOC eyeball values.
+const VITAL_CPU_WARN = 80, VITAL_CPU_CRIT = 95
+const VITAL_MEM_WARN = 80, VITAL_MEM_CRIT = 95
+const VITAL_TEMP_WARN = 70, VITAL_TEMP_CRIT = 85
+
+function hasVitals(device: OrgDevice): boolean {
+  return device.health_cpu_pct != null || device.health_mem_pct != null
+    || device.health_temp_c != null
+}
+
+function DeviceVitals({ device }: { device: OrgDevice }) {
+  const { health_cpu_pct: cpu, health_mem_pct: mem, health_temp_c: temp } = device
+  if (!hasVitals(device)) return null
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-baseline justify-between text-[0.75rem] text-muted-foreground">
+        <span className="font-medium">Device health</span>
+        {device.health_updated_at && isStale(device.health_updated_at) && (
+          <span className="text-muted-foreground/70">as of {ago(device.health_updated_at)}</span>
+        )}
+      </div>
+      {cpu != null && (
+        <Meter label="CPU" pct={cpu} warn={VITAL_CPU_WARN} crit={VITAL_CPU_CRIT} />
+      )}
+      {mem != null && (
+        <Meter label="RAM" pct={mem} warn={VITAL_MEM_WARN} crit={VITAL_MEM_CRIT}
+          detail={device.health_mem_used_bytes != null && device.health_mem_total_bytes != null
+            ? `${fmtBytes(device.health_mem_used_bytes)} / ${fmtBytes(device.health_mem_total_bytes)}`
+            : undefined} />
+      )}
+      {temp != null && (
+        <Meter label="Temp" pct={Math.min(100, Math.max(0, temp))} value={`${Math.round(temp)}°C`}
+          warn={VITAL_TEMP_WARN} crit={VITAL_TEMP_CRIT} />
+      )}
+    </div>
+  )
+}
+
 function DevicePerfPanel({ device }: { device: OrgDevice }) {
   const { scopeOrg } = useAuth()
   const live = useQuery({
@@ -485,6 +532,9 @@ function DevicePerfPanel({ device }: { device: OrgDevice }) {
           ) : null}
         </span>
       </div>
+
+      {/* device internals, same freshness rules as the port/optics sweeps -------- */}
+      <DeviceVitals device={device} />
 
       {/* when was it bad, last 24 clock hours ----------------------------------- */}
       <div>
@@ -575,16 +625,27 @@ function DeviceDetail({ device, tab, onTab }: {
 }
 
 function DeviceRow({
-  device, canWrite, onEdit, collapsed, onToggleCollapse,
+  device, canWrite, onEdit, collapsed, onToggleCollapse, focus,
 }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
   onEdit: (d: OrgDevice) => void
   collapsed: boolean
   onToggleCollapse: () => void
+  focus?: boolean
 }) {
   const queryClient = useQueryClient()
   const [detailOpen, setDetailOpen] = useState(false)
+  const confirmDelete = useConfirm()
+  const rowRef = useRef<HTMLDivElement>(null)
+
+  // Deep-link landing (Home row / command palette): open the panel and scroll here.
+  useEffect(() => {
+    if (focus) {
+      setDetailOpen(true)
+      rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+    }
+  }, [focus])
 
   const hasOptics = isOpticalOlt(device)
   const hasPorts = device.snmp_enabled === 1
@@ -597,20 +658,20 @@ function DeviceRow({
     mutationFn: () => inventoryApi.remove(device.id),
     onSuccess: (res) => {
       if (res.ok) invalidate()
-      else toast.error(res.reason || "device has children — remove them first")
+      else toast.error(res.reason || "Device has children — remove them first")
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "delete failed"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Delete failed"),
   })
   const toggleMaintenance = useMutation({
     mutationFn: () => inventoryApi.setMaintenance(device.id, !device.maintenance),
     onSuccess: invalidate,
-    onError: () => toast.error("failed to update"),
+    onError: () => toast.error("Failed to update"),
   })
 
   const unassigned = !device.assigned_node_id
 
   return (
-    <div className="border-b last:border-b-0">
+    <div ref={rowRef} className="border-b last:border-b-0">
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-accent/40",
           detailOpen && "bg-accent/40")}
@@ -677,6 +738,20 @@ function DeviceRow({
             {device.onus_warn} ONU{device.onus_warn === 1 ? "" : "s"} weak
           </RowTag>
         )}
+        {/* Device vitals only chip when CRITICAL — a hot or pegged box is a fire to
+            walk toward; warn-level tints stay inside the expanded Health panel. */}
+        {(device.health_temp_c ?? 0) >= VITAL_TEMP_CRIT && (
+          <RowTag tone="destructive" title="Device temperature critical — click for health"
+            onClick={(e) => { e.stopPropagation(); openTab("health") }}>
+            {Math.round(device.health_temp_c!)}°C
+          </RowTag>
+        )}
+        {(device.health_cpu_pct ?? 0) >= VITAL_CPU_CRIT && (
+          <RowTag tone="destructive" title="Device CPU pegged — click for health"
+            onClick={(e) => { e.stopPropagation(); openTab("health") }}>
+            cpu {Math.round(device.health_cpu_pct!)}%
+          </RowTag>
+        )}
         {collapsed && device.descendantCount > 0 && <RowTag tone="muted">+{device.descendantCount}</RowTag>}
         <div className="ml-auto flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
           <DeviceMetrics device={device} />
@@ -717,12 +792,16 @@ function DeviceRow({
                 <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
                   <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
                 </DropdownMenuItem>
-                <DropdownMenuItem variant="destructive" onClick={() => remove.mutate()}>
+                <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
                   <Trash2 /> Delete
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           )}
+          <ConfirmDialog {...confirmDelete.props}
+            title={`Delete ${device.name}?`}
+            description="The device, its state, and its outage history are removed. This cannot be undone."
+            onConfirm={() => remove.mutate()} />
         </div>
       </div>
       {detailOpen && (
@@ -758,11 +837,17 @@ function saveCollapsed(org: string | null, set: Set<number>): void {
 
 export function TopologyPage() {
   const { scopeOrg, canWrite } = useAuth()
+  const location = useLocation()
+  const navState = location.state as { deviceId?: number; probeId?: string } | null
+  const focusId = navState?.deviceId
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<OrgDevice | null>(null)
   const [collapsed, setCollapsed] = useState<Set<number>>(() => loadCollapsed(scopeOrg))
+  const [probeFilter, setProbeFilter] = useState<string | null>(navState?.probeId ?? null)
 
   useEffect(() => { setCollapsed(loadCollapsed(scopeOrg)) }, [scopeOrg])
+  // arriving from a stale-probe card while already mounted
+  useEffect(() => { if (navState?.probeId) setProbeFilter(navState.probeId) }, [navState?.probeId])
   const toggleCollapse = (id: number) => setCollapsed((prev) => {
     const next = new Set(prev)
     if (next.has(id)) next.delete(id)
@@ -782,11 +867,42 @@ export function TopologyPage() {
     enabled: !!scopeOrg,
   })
 
+  // A deep-linked device may sit under collapsed ancestors — open the path to it
+  // (in memory only; a landing shouldn't rewrite the user's saved collapse prefs).
+  const devicesData = data?.devices
+  useEffect(() => {
+    if (focusId == null || !devicesData) return
+    const byId = new Map(devicesData.map((d) => [d.id, d]))
+    const ancestors: number[] = []
+    let cur = byId.get(focusId)?.parent_device_id
+    while (cur != null && byId.has(cur) && !ancestors.includes(cur)) {
+      ancestors.push(cur)
+      cur = byId.get(cur)?.parent_device_id
+    }
+    if (ancestors.length) {
+      setCollapsed((prev) => {
+        const next = new Set(prev)
+        for (const id of ancestors) next.delete(id)
+        return next
+      })
+    }
+  }, [focusId, devicesData])
+
   if (!scopeOrg) return <NeedsOrg />
 
-  const devices = data?.devices ?? []
+  const allDevices = data?.devices ?? []
+  const devices = probeFilter
+    ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
+    : allDevices
   const ordered = treeOrder(devices, collapsed)
-  const nodeIds = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at).map((n) => n.node_id)
+  const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
+  const nodeIds = activeNodes.map((n) => n.node_id)
+  const deviceCounts = new Map<string, number>()
+  for (const d of allDevices) {
+    if (d.assigned_node_id) {
+      deviceCounts.set(d.assigned_node_id, (deviceCounts.get(d.assigned_node_id) ?? 0) + 1)
+    }
+  }
 
   const fresh = devices.filter((d) => d.assigned_node_id && d.state && !isStale(d.state_updated_at))
   const down = fresh.filter((d) => d.state === "DOWN" || d.state === "UNREACHABLE").length
@@ -797,7 +913,8 @@ export function TopologyPage() {
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
-      <ProbesPanel org={scopeOrg} canWrite={canWrite} />
+      <ProbesPanel org={scopeOrg} canWrite={canWrite} deviceCounts={deviceCounts}
+        probeFilter={probeFilter} onProbeFilter={setProbeFilter} />
 
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
@@ -806,6 +923,15 @@ export function TopologyPage() {
               Devices
               {devices.length > 0 && <span className="ml-2 font-normal text-muted-foreground">{devices.length}</span>}
             </h2>
+            {probeFilter && (
+              <button
+                className="flex items-center gap-1.5 self-center rounded-full border bg-card px-2.5 py-0.5 text-[0.75rem] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                title="Showing only this probe's devices — click to clear"
+                onClick={() => setProbeFilter(null)}>
+                {probeFilter}
+                <X className="size-3" />
+              </button>
+            )}
             {(down > 0 || degraded > 0) && (
               <p className="text-xs">
                 {down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
@@ -817,7 +943,7 @@ export function TopologyPage() {
           {canWrite && !formOpen && (
             <Button variant="ghost" size="sm" className="text-muted-foreground"
               onClick={() => { setEditing(null); setFormOpen(true) }}>
-              <Plus className="size-3.5" /> Add node
+              <Plus className="size-3.5" /> Add device
             </Button>
           )}
         </div>
@@ -830,7 +956,7 @@ export function TopologyPage() {
         {isLoading && <Skeleton className="h-40 w-full" />}
         {!isLoading && devices.length === 0 && (
           <p className="rounded-lg border border-dashed py-10 text-center text-sm text-muted-foreground">
-            No devices yet — add one above.
+            {probeFilter ? `No devices assigned to ${probeFilter}.` : "No devices yet — add one above."}
           </p>
         )}
         {devices.length > 0 && (
@@ -838,7 +964,8 @@ export function TopologyPage() {
             {ordered.map((d) => (
               <Fragment key={d.id}>
                 <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
-                  collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)} />
+                  collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)}
+                  focus={d.id === focusId} />
                 {formOpen && editing?.id === d.id && (
                   <div className="border-t bg-muted/30 p-3">
                     <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />

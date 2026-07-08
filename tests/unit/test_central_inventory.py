@@ -11,6 +11,7 @@ from wisp.central.inventory import (
     clean_device_payload,
     clean_node_id,
     clean_port_bandwidth_payload,
+    clean_region_name,
     clean_snmp_payload,
 )
 
@@ -218,6 +219,20 @@ class CleanPortBandwidthPayloadTest(unittest.TestCase):
         clean = clean_port_bandwidth_payload({"threshold_mbps": 10, "max_mbps": 500})
         self.assertEqual(clean["threshold_mbps"], 10.0)
         self.assertEqual(clean["max_mbps"], 500.0)
+
+class CleanRegionNameTest(unittest.TestCase):
+    def test_trims_and_returns(self):
+        self.assertEqual(clean_region_name("  north-dc "), "north-dc")
+
+    def test_rejects_empty_and_none(self):
+        for raw in (None, "", "   "):
+            with self.assertRaises(InventoryError):
+                clean_region_name(raw)
+
+    def test_rejects_overlong(self):
+        with self.assertRaises(InventoryError):
+            clean_region_name("x" * 65)
+        self.assertEqual(len(clean_region_name("x" * 64)), 64)
 
 class CleanNodeIdTest(unittest.TestCase):
     def test_valid_ids_pass_through(self):

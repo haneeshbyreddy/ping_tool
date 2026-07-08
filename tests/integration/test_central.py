@@ -464,6 +464,74 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertTrue(row["snmp_enabled"])
         self.assertEqual(row["snmp_community"], "public")
 
+class RegionsTest(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "central.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_is_union_of_declared_and_in_use(self):
+        self.store.add_region("ispA", "north")
+        self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": "south", "parent_device_id": None})
+        self.store.add_worker("ispA", "Ravi", region="east")
+
+        regions = {r["name"]: r for r in self.store.list_regions("ispA")}
+        self.assertEqual(set(regions), {"north", "south", "east"})
+        self.assertTrue(regions["north"]["declared"])
+        self.assertFalse(regions["south"]["declared"])
+        self.assertEqual(regions["south"]["device_count"], 1)
+        self.assertEqual(regions["east"]["worker_count"], 1)
+        self.assertEqual(regions["north"]["device_count"], 0)
+
+    def test_add_is_idempotent(self):
+        self.assertTrue(self.store.add_region("ispA", "north"))
+        self.assertFalse(self.store.add_region("ispA", "north"))
+        self.assertEqual(len(self.store.list_regions("ispA")), 1)
+
+    def test_rename_cascades_devices_and_workers(self):
+        d = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": "north-dc", "parent_device_id": None})
+        w = self.store.add_worker("ispA", "Ravi", region="north-dc")
+        # a same-name region in another org must not be touched
+        other = self.store.create_org_device("ispB", {
+            "name": "B", "ip_address": "10.0.1.1", "device_type": None,
+            "region": "north-dc", "parent_device_id": None})
+
+        self.store.rename_region("ispA", "north-dc", "north")
+        self.assertEqual(self.store.get_org_device("ispA", d)["region"], "north")
+        worker = next(x for x in self.store.list_workers("ispA") if x["id"] == w)
+        self.assertEqual(worker["region"], "north")
+        self.assertEqual(self.store.get_org_device("ispB", other)["region"], "north-dc")
+        regions = {r["name"]: r for r in self.store.list_regions("ispA")}
+        self.assertIn("north", regions)
+        self.assertTrue(regions["north"]["declared"])
+        self.assertNotIn("north-dc", regions)
+
+    def test_delete_blocked_while_in_use(self):
+        self.store.add_region("ispA", "north")
+        d = self.store.create_org_device("ispA", {
+            "name": "A", "ip_address": "10.0.0.1", "device_type": None,
+            "region": "north", "parent_device_id": None})
+        result = self.store.delete_region("ispA", "north")
+        self.assertFalse(result["ok"])
+        self.assertIn("used by", result["reason"])
+
+        self.store.delete_org_device("ispA", d)
+        self.assertTrue(self.store.delete_region("ispA", "north")["ok"])
+        self.assertEqual(self.store.list_regions("ispA"), [])
+
+    def test_org_isolation(self):
+        self.store.add_region("ispA", "north")
+        self.assertEqual(self.store.list_regions("ispB"), [])
+        self.assertTrue(self.store.delete_region("ispB", "north")["ok"])
+        self.assertEqual(len(self.store.list_regions("ispA")), 1)
+
 class CentralServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -93,7 +93,17 @@ export function AppShell() {
           <OrgSwitcher />
           <div className="flex-1" />
           <AlarmChips />
-          <Button variant="outline" size="icon" className="size-8" aria-label="Search"
+          {/* input-shaped so the palette is discoverable; icon-only on mobile */}
+          <button
+            className="hidden h-8 w-52 items-center gap-2 rounded-lg border bg-muted/30 px-2.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground md:flex"
+            onClick={() => setSearchOpen(true)}>
+            <Search className="size-3.5 shrink-0" />
+            <span className="flex-1 text-left">Search…</span>
+            <kbd className="pointer-events-none rounded border bg-muted px-1.5 py-px font-mono text-[0.6875rem]">
+              {navigator.platform.includes("Mac") ? "⌘K" : "Ctrl K"}
+            </kbd>
+          </button>
+          <Button variant="outline" size="icon" className="size-8 md:hidden" aria-label="Search"
             onClick={() => setSearchOpen(true)}>
             <Search className="size-4" />
           </Button>

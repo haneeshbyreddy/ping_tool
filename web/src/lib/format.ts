@@ -24,6 +24,11 @@ export function fmtDateTime(ts: string | null | undefined): string {
 
 export function fmtDur(seconds: number): string {
   seconds = Math.max(0, Math.floor(seconds))
+  const dd = Math.floor(seconds / 86400)
+  if (dd) {
+    const hhRem = Math.floor((seconds % 86400) / 3600)
+    return hhRem ? `${dd}d ${hhRem}h` : `${dd}d`
+  }
   const hh = Math.floor(seconds / 3600)
   const mm = Math.floor((seconds % 3600) / 60)
   const ss = seconds % 60

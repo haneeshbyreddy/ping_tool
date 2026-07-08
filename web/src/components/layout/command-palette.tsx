@@ -39,10 +39,10 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
     return () => document.removeEventListener("keydown", onKey)
   }, [open, onOpenChange])
 
-  const go = (path: string) => {
+  const go = (path: string, state?: { deviceId: number }) => {
     onOpenChange(false)
     setQuery("")
-    navigate(path)
+    navigate(path, { state })
   }
 
   return (
@@ -53,7 +53,7 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
           <CommandEmpty>No results.</CommandEmpty>
           <CommandGroup heading="Devices">
             {devices.data?.devices.map((d) => (
-              <CommandItem key={d.id} value={`${d.name} ${d.ip_address}`} onSelect={() => go("/topology")}>
+              <CommandItem key={d.id} value={`${d.name} ${d.ip_address}`} onSelect={() => go("/topology", { deviceId: d.id })}>
                 <span className="flex-1 truncate">{d.name}</span>
                 <span className="font-mono text-xs text-muted-foreground">{d.ip_address}</span>
               </CommandItem>

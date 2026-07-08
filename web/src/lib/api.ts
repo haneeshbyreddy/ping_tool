@@ -1,7 +1,7 @@
 import type {
   AccountUser, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role, Summary, SwitchPort,
-  TrendBucket, Worker,
+  OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role, Summary,
+  SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
 
 export class ApiError extends Error {}
@@ -36,6 +36,10 @@ export const authApi = {
 
 export const summaryApi = {
   get: (org?: string | null) => request<Summary>(`/api/summary${tq(org)}`),
+}
+
+export const systemApi = {
+  get: () => request<SystemStats>("/api/system"),
 }
 
 export const orgsApi = {
@@ -136,6 +140,16 @@ export const nodesApi = {
     request<{ ok: boolean }>("/api/nodes/revoke", { method: "POST", body: { org_id, node_id } }),
   remove: (org_id: string, node_id: string) =>
     request<{ ok: boolean; error?: string }>("/api/nodes/delete", { method: "POST", body: { org_id, node_id } }),
+}
+
+export const regionsApi = {
+  list: (org?: string | null) => request<{ regions: OrgRegion[] }>(`/api/regions${tq(org)}`),
+  create: (org_id: string, name: string) =>
+    request<{ ok: true }>("/api/regions", { method: "POST", body: { org_id, name } }),
+  rename: (org_id: string, from: string, to: string) =>
+    request<{ ok: true }>("/api/regions/rename", { method: "POST", body: { org_id, old: from, new: to } }),
+  remove: (org_id: string, name: string) =>
+    request<{ ok: boolean; reason?: string }>("/api/regions/delete", { method: "POST", body: { org_id, name } }),
 }
 
 export const teamApi = {

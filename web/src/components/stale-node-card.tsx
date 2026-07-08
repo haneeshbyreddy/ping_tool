@@ -30,7 +30,8 @@ export function StaleNodeCard({ node }: { node: NodeToken }) {
             dark for {durationSince(node.last_seen)}
           </span>
           <Button asChild size="sm" variant="outline">
-            <Link to="/topology">Check probe</Link>
+            {/* probeId state pre-filters the device tree to what this probe covers */}
+            <Link to="/topology" state={{ probeId: node.node_id }}>Check probe</Link>
           </Button>
         </div>
       </CardContent>

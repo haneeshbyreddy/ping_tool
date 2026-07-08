@@ -1,6 +1,7 @@
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
-import { TriangleAlert } from "lucide-react"
+import { ChevronDown, ChevronUp, TriangleAlert } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { summaryApi, inventoryApi, outagesApi, nodesApi, logsApi, analyticsApi } from "@/lib/api"
@@ -12,6 +13,7 @@ import { StaleNodeCard } from "@/components/stale-node-card"
 import { StatusDot } from "@/components/status-badge"
 import { describeEvent, eventTone } from "@/lib/events"
 import { ago, deviceTone, isStale } from "@/lib/format"
+import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
 
@@ -58,6 +60,7 @@ function PanelEmpty({ children }: { children: React.ReactNode }) {
 
 export function HomePage() {
   const { scopeOrg } = useAuth()
+  const [showPostmortems, setShowPostmortems] = useState(false)
   useNow()
 
   const summary = useQuery({
@@ -109,8 +112,12 @@ export function HomePage() {
     (d) => d.state === "UP" && !isStale(d.state_updated_at),
   ).length
   const outageList = outages.data?.outages ?? []
-  const openOutages = outageList.filter((o) => !o.resolved_at).length
-  const pendingPostmortems = outageList.filter((o) => o.status === "pending_postmortem").length
+  // urgent cards (open outages) always render; resolved-awaiting-post-mortem is
+  // paperwork and folds behind a toggle so a backlog can't bury the emergencies
+  const activeOutages = outageList.filter((o) => o.status !== "pending_postmortem")
+  const postmortemList = outageList.filter((o) => o.status === "pending_postmortem")
+  const pendingPostmortems = postmortemList.length
+  const portsDown = deviceList.reduce((sum, d) => sum + (d.ports_down ?? 0), 0)
   const lowBw = summary.data?.low_bandwidth.length ?? 0
   const highBw = summary.data?.high_bandwidth.length ?? 0
   const bwAlarms = lowBw + highBw
@@ -120,11 +127,25 @@ export function HomePage() {
   const triageCount = outageList.length + staleNodes.length
   const triageLoading = outages.isLoading || nodes.isLoading
 
+  // when nothing is on fire, preview a couple of post-mortems instead of an
+  // empty queue with a bare button; the rest stay behind the toggle
+  const urgentCount = staleNodes.length + activeOutages.length
+  const postmortemPreview = urgentCount === 0 ? Math.min(2, pendingPostmortems) : 0
+  const visiblePostmortems = showPostmortems
+    ? postmortemList
+    : postmortemList.slice(0, postmortemPreview)
+  const hiddenPostmortems = pendingPostmortems - postmortemPreview
+
   const uptimeByDevice = new Map(
     (reliability.data?.devices ?? []).map((r) => [r.device_id, r.uptime_pct]),
   )
+  // Within a severity band (e.g. all UP), surface the least-reliable device first
+  // so the weakest link gets attention; fall back to name for a stable order.
   const rankedDevices = [...deviceList].sort(
-    (a, b) => severityRank(a) - severityRank(b) || a.name.localeCompare(b.name),
+    (a, b) =>
+      severityRank(a) - severityRank(b) ||
+      (uptimeByDevice.get(a.id) ?? 100) - (uptimeByDevice.get(b.id) ?? 100) ||
+      a.name.localeCompare(b.name),
   )
   const visibleDevices = rankedDevices.slice(0, DEVICE_ROW_CAP)
 
@@ -151,12 +172,13 @@ export function HomePage() {
       to: "/topology",
     },
     {
-      key: "outages",
-      label: "Open outages",
-      loading: outages.isLoading,
-      value: openOutages,
-      detail: openOutages > 0 ? "needs triage" : "all clear",
-      tone: openOutages > 0 ? "destructive" : undefined,
+      key: "ports",
+      label: "Ports down",
+      loading: devices.isLoading,
+      value: portsDown,
+      detail: portsDown > 0 ? "check switches" : "all up",
+      tone: portsDown > 0 ? "destructive" : undefined,
+      to: "/topology",
     },
     {
       key: "probes",
@@ -228,8 +250,17 @@ export function HomePage() {
           </div>
           <div className="grid gap-3 md:grid-cols-2 md:items-start xl:grid-cols-3">
             {staleNodes.map((n) => <StaleNodeCard key={n.node_id} node={n} />)}
-            {outageList.map((o) => <OutageCard key={o.id} outage={o} />)}
+            {activeOutages.map((o) => <OutageCard key={o.id} outage={o} />)}
+            {visiblePostmortems.map((o) => <OutageCard key={o.id} outage={o} />)}
           </div>
+          {hiddenPostmortems > 0 && (
+            <Button variant="outline" size="sm" className="gap-1.5 self-start"
+              onClick={() => setShowPostmortems((v) => !v)}>
+              {showPostmortems
+                ? <><ChevronUp className="size-3.5" /> Hide post-mortems</>
+                : <><ChevronDown className="size-3.5" /> Show {hiddenPostmortems}{postmortemPreview > 0 ? " more" : ""} pending post-mortem{hiddenPostmortems === 1 ? "" : "s"}</>}
+            </Button>
+          )}
         </div>
       )}
 
@@ -245,7 +276,7 @@ export function HomePage() {
               const unassigned = !d.assigned_node_id
               const stale = !unassigned && !!d.state && isStale(d.state_updated_at)
               return (
-                <Link key={d.id} to="/topology"
+                <Link key={d.id} to="/topology" state={{ deviceId: d.id }}
                   className="flex items-center gap-3 border-t px-5 py-2.5 transition-colors first:border-t-0 hover:bg-accent/30">
                   <StatusDot tone={unassigned ? "muted" : deviceTone(d.state, d.state_updated_at)} />
                   <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
