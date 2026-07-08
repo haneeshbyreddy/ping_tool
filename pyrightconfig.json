@@ -1,0 +1,8 @@
+{
+  "include": ["src", "apps", "tests"],
+  "extraPaths": ["src"],
+  "executionEnvironments": [
+    { "root": ".", "extraPaths": ["src"] }
+  ],
+  "reportMissingModuleSource": "none"
+}

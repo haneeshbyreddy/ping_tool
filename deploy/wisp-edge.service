@@ -1,0 +1,17 @@
+[Unit]
+Description=WISP Edge supervisor (manages + self-updates the polling agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/wisp/bin/wisp-supervisor
+Environment=WISP_AGENT_BIN=/opt/wisp/bin/wisp-edge
+Environment=WISP_DB=/etc/wisp/wisp.db
+EnvironmentFile=-/etc/wisp/edge.env
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

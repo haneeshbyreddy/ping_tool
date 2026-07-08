@@ -1,0 +1,12 @@
+[Unit]
+Description=WISP central — sync published releases from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=haneeshbyreddy
+WorkingDirectory=/home/haneeshbyreddy/ping_tool
+Environment=PYTHONPATH=/home/haneeshbyreddy/ping_tool/src
+EnvironmentFile=/home/haneeshbyreddy/ping_tool/deploy/central.env
+ExecStart=/home/haneeshbyreddy/ping_tool/.venv/bin/python3 -m wisp.central.admin sync-releases

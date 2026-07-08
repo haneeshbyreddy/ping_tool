@@ -1,0 +1,295 @@
+export type Role = "owner" | "operator" | "tech"
+
+export interface User {
+  id: number
+  username: string
+  org_id: string | null
+  org_name: string | null
+  role: Role
+  is_superadmin: boolean
+}
+
+export interface MeResponse {
+  user: User
+  channels: { central: string | null }
+}
+
+export interface Org {
+  org_id: string
+  name: string | null
+  ntfy_topic: string | null
+  ntfy_topic_owner: string | null
+  ntfy_topic_operator: string | null
+  ntfy_topic_tech: string | null
+  node_count: number
+}
+
+export const DEVICE_TYPES = [
+  "core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul",
+] as const
+export type DeviceType = (typeof DEVICE_TYPES)[number]
+
+export type DeviceState = "UP" | "DOWN" | "DEGRADED" | "UNREACHABLE"
+
+export interface OrgDevice {
+  id: number
+  org_id: string
+  name: string
+  ip_address: string
+  device_type: DeviceType | null
+  region: string | null
+  parent_device_id: number | null
+  assigned_node_id: string | null
+  maintenance: 0 | 1
+  snmp_enabled: 0 | 1
+  snmp_version: string
+  snmp_community: string | null
+  snmp_port: number
+
+  gpon_vendor: string | null
+  child_count: number
+  backup_parents: number[]
+
+  ports_down: number
+  ports_bw_low: number
+  ports_bw_high: number
+
+  onus_total: number | null
+  onus_online: number | null
+  onus_warn: number | null
+  onus_crit: number | null
+
+  state: DeviceState | null
+  latency_ms: number | null
+  packet_loss: number | null
+  jitter_ms: number | null
+  state_updated_at: string | null
+}
+
+export interface SwitchPort {
+  id: number
+  org_id: string
+  device_id: number
+  if_index: number
+  if_name: string | null
+  if_alias: string | null
+  admin_status: string | null
+  oper_status: string | null
+  last_change: string | null
+  monitored: 0 | 1
+  feeds_device_id: number | null
+  down_streak: number
+  alarm: 0 | 1
+  alarm_since: string | null
+  updated_at: string | null
+  bw_threshold_mbps: number | null
+  bw_max_mbps: number | null
+  bw_direction: "in" | "out" | "either" | "total" | null
+  in_bps: number | null
+  out_bps: number | null
+  bw_low_streak: number
+  bw_alarm: 0 | 1
+  bw_alarm_since: string | null
+  bw_high_streak: number
+  bw_high_alarm: 0 | 1
+  bw_high_alarm_since: string | null
+}
+
+export interface PerfSample {
+  ts: string
+  latency_ms: number | null
+  packet_loss: number | null
+  jitter_ms: number | null
+  state: string
+}
+
+export interface TrendBucket {
+  bucket: string
+  samples: number
+  avg_latency_ms: number | null
+  avg_loss_pct: number | null
+  down_pct: number | null
+}
+
+export interface PerfState {
+  degraded: 0 | 1
+  metric: "latency" | "jitter" | null
+  baseline_ms: number | null
+  current_ms: number | null
+  since: string | null
+}
+
+export interface OnuOptic {
+  id: number
+  device_id: number
+  onu_key: string
+  pon_port: string | null
+  onu_id: number | null
+  name: string | null
+  serial: string | null
+  state: "online" | "offline" | "dying_gasp" | "los" | "unknown" | null
+  rx_dbm: number | null
+  tx_dbm: number | null
+  olt_rx_dbm: number | null
+  distance_m: number | null
+  rx_ref_dbm: number | null
+  rx_ref_at: string | null
+  severity: "ok" | "warn" | "crit" | null
+  ack_until: string | null
+  updated_at: string
+}
+
+export interface OltOptics {
+  device_id: number
+  onus_total: number
+  onus_online: number
+  warn_count: number
+  crit_count: number
+  alarm: 0 | 1
+  alarm_since: string | null
+  updated_at: string
+}
+export interface OpticsResponse {
+  onus: OnuOptic[]
+  olt: OltOptics | null
+  warn_dbm: number
+  crit_dbm: number
+}
+
+export interface ReliabilityRow {
+  device_id: number
+  name: string
+  region: string | null
+  downtime_seconds: number
+  uptime_pct: number
+  outage_count: number
+}
+
+export type OutageStatus = "unassigned" | "in_progress" | "pending_postmortem"
+
+export interface Outage {
+  id: number
+  org_id: string
+  device_id: number
+  device_name: string
+  region: string | null
+  started_at: string
+  resolved_at: string | null
+  final_state: DeviceState
+  acknowledged_by: string | null
+  acknowledged_at: string | null
+  root_cause: string | null
+  resolution_notes: string | null
+  status: OutageStatus
+}
+
+export const ROOT_CAUSES = [
+  "Power Loss", "Fiber Cut", "Hardware Failure", "Config Error", "Weather", "Other",
+] as const
+
+export interface NodeToken {
+  node_id: string
+
+  registered: boolean
+  created_at: string | null
+  revoked_at: string | null
+  version: string | null
+  last_seen: string | null
+  fleet_size: number | null
+  open_outages: number | null
+
+  rss_bytes: number | null
+  mem_total_bytes: number | null
+  mem_available_bytes: number | null
+}
+
+export interface OrgRollout {
+  org_id: string
+  target_version: string
+  canary: string[]
+  state: "canary" | "promoted" | "done" | "halted"
+  started_at: string
+  updated_at: string
+  note: string | null
+}
+
+export interface NodesResponse {
+  nodes: NodeToken[]
+  latest_version: string | null
+  rollout: OrgRollout | null
+}
+
+export interface Worker {
+  id: number
+  org_id: string
+  name: string
+  role: Role
+  region: string | null
+  is_active: 0 | 1
+  notes: string | null
+}
+
+export interface AttendanceOperator {
+  id: number
+  name: string
+  role: Role
+  region: string | null
+  present_today: boolean
+  days: Record<string, boolean>
+}
+
+export interface AttendanceOverview {
+  today: string
+  days: string[]
+  operators: AttendanceOperator[]
+}
+
+export interface LogEvent {
+  id: number
+  org_id: string
+  node_id: string
+  type: string
+  device_id: number | null
+  device_name: string | null
+  device_ip: string | null
+  device_region: string | null
+  state: string | null
+  occurred_at: string | null
+  received_at: string
+  payload: Record<string, unknown> | null
+}
+
+export interface Summary {
+  uplink_down: boolean
+  low_bandwidth: Array<{
+    port_id: number
+    device_id: number
+    switch_name: string
+    label: string
+    in_mbps: number | null
+    out_mbps: number | null
+    threshold_mbps: number | null
+    direction: string
+    since: string | null
+  }>
+  high_bandwidth: Array<{
+    port_id: number
+    device_id: number
+    switch_name: string
+    label: string
+    in_mbps: number | null
+    out_mbps: number | null
+    max_mbps: number | null
+    direction: string
+    since: string | null
+  }>
+}
+
+export interface AccountUser {
+  id: number
+  org_id: string | null
+  username: string
+  role: Role
+  is_active: 0 | 1
+  created_at: string
+}

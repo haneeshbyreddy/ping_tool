@@ -1,0 +1,279 @@
+import os
+import sys
+import unittest
+from dataclasses import replace
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
+
+from wisp.config import Config
+from wisp.ingress.probers import PingResult
+from wisp.core.state_machine import (
+    BACKUP,
+    DEGRADED,
+    DOWN,
+    UNREACHABLE,
+    UP,
+    DeviceMeta,
+    MonitorEngine,
+    OutageOpened,
+    OutageResolved,
+    ParentEdge,
+    UplinkDown,
+    UplinkRestored,
+)
+
+CFG = Config(
+    down_consecutive=3,
+    degraded_consecutive=2,
+    recover_consecutive=2,
+    latency_threshold_ms=150.0,
+    loss_degraded_pct=5.0,
+    canary_ip="1.1.1.1",
+)
+
+UP_S = lambda ip="d": PingResult(ip, 20.0, 0.0)
+SLOW_S = lambda ip="d": PingResult(ip, 400.0, 0.0)
+LOSS_S = lambda ip="d": PingResult(ip, 50.0, 30.0)
+DEAD_S = lambda ip="d": PingResult(ip, None, 100.0)
+
+def solo_device(**over) -> DeviceMeta:
+    base = dict(
+        id=1, name="D1", ip_address="d", region="R",
+        parent_device_id=None, technician_phone="+910000000000",
+    )
+    base.update(over)
+    return DeviceMeta(**base)
+
+def feed(engine: MonitorEngine, samples_by_ip, canary_up=True):
+    results = dict(samples_by_ip)
+    results[CFG.canary_ip] = UP_S("1.1.1.1") if canary_up else DEAD_S("1.1.1.1")
+    return engine.process_cycle(results, ts="2026-01-01T00:00:00+00:00")
+
+class FlapSuppression(unittest.TestCase):
+    def test_down_needs_three_consecutive(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        self.assertEqual(feed(eng, {"d": DEAD_S()}).states[1], UP)
+        self.assertEqual(feed(eng, {"d": DEAD_S()}).states[1], UP)
+        r = feed(eng, {"d": DEAD_S()})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in r.events))
+
+    def test_single_blip_never_pages(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        feed(eng, {"d": DEAD_S()})
+        r = feed(eng, {"d": UP_S()})
+        self.assertEqual(r.states[1], UP)
+        self.assertFalse(r.events)
+
+class ProbePlan(unittest.TestCase):
+
+    CFG = Config(pings_per_poll=5, pings_per_poll_infra=2, canary_ip="1.1.1.1")
+
+    def test_parent_is_gentle_leaf_is_full(self):
+        tower = solo_device(id=1, ip_address="tower", parent_device_id=None)
+        cpe = solo_device(id=2, ip_address="cpe", parent_device_id=1)
+        eng = MonitorEngine([tower, cpe], self.CFG)
+        plan = eng.probe_plan()
+        self.assertEqual(plan["tower"], 2)
+        self.assertEqual(plan["cpe"], 5)
+        self.assertEqual(plan["1.1.1.1"], 5)
+        self.assertEqual(set(plan), eng.required_ips())
+
+    def test_childless_node_is_full(self):
+        eng = MonitorEngine([solo_device(id=1, ip_address="d")], self.CFG)
+        self.assertEqual(eng.probe_plan()["d"], 5)
+
+class ConfirmationPass(unittest.TestCase):
+
+    def test_subset_advances_only_listed_devices(self):
+        a = solo_device(id=1, ip_address="a")
+        b = solo_device(id=2, ip_address="b")
+        eng = MonitorEngine([a, b], CFG)
+        r = feed(eng, {"a": DEAD_S("a"), "b": DEAD_S("b")})
+        self.assertEqual((r.states[1], r.states[2]), (UP, UP))
+
+        eng.process_cycle({"a": DEAD_S("a")}, "t", subset={1})
+        r2 = eng.process_cycle({"a": DEAD_S("a")}, "t", subset={1})
+        self.assertEqual(r2.states, {1: DOWN})
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in r2.events))
+        self.assertEqual(eng.fsm[2].state, UP)
+        self.assertEqual(eng.fsm[2].down_streak, 1)
+
+class DeviceAssignment(unittest.TestCase):
+
+    def test_out_of_scope_device_untouched_not_scored_down(self):
+        a = solo_device(id=1, ip_address="a")
+        b = solo_device(id=2, ip_address="b")
+        eng = MonitorEngine([a, b], CFG)
+        for _ in range(3):
+            r = feed_scoped(eng, {"a": DEAD_S("a")}, expected_ips={"a"})
+        self.assertEqual(r.states, {1: DOWN})
+        self.assertEqual(eng.fsm[2].state, UP)
+        self.assertEqual(eng.fsm[2].down_streak, 0)
+
+    def test_none_still_defaults_missing_ip_to_lost(self):
+        a = solo_device(id=1, ip_address="a")
+        b = solo_device(id=2, ip_address="b")
+        eng = MonitorEngine([a, b], CFG)
+        r = feed(eng, {"a": DEAD_S("a")})
+        self.assertEqual(r.states, {1: UP, 2: UP})
+        self.assertEqual(eng.fsm[2].down_streak, 1)
+
+def feed_scoped(engine: MonitorEngine, samples_by_ip, expected_ips, canary_up=True):
+    results = dict(samples_by_ip)
+    results[CFG.canary_ip] = UP_S("1.1.1.1") if canary_up else DEAD_S("1.1.1.1")
+    return engine.process_cycle(results, ts="2026-01-01T00:00:00+00:00",
+                                expected_ips=expected_ips)
+
+class AdaptiveInterval(unittest.TestCase):
+
+    def test_off_by_default(self):
+        cfg = Config(poll_interval_s=60, poll_interval_small_s=30, small_fleet_max=1000)
+        self.assertEqual(cfg.effective_interval(10), 60)
+        self.assertEqual(cfg.effective_interval(5000), 60)
+
+    def test_small_fleet_polls_faster_when_on(self):
+        cfg = Config(poll_interval_adaptive=True, poll_interval_s=60,
+                     poll_interval_small_s=30, small_fleet_max=1000)
+        self.assertEqual(cfg.effective_interval(1000), 30)
+        self.assertEqual(cfg.effective_interval(1001), 60)
+
+class Degraded(unittest.TestCase):
+    def test_degraded_needs_two_consecutive(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        self.assertEqual(feed(eng, {"d": SLOW_S()}).states[1], UP)
+        self.assertEqual(feed(eng, {"d": SLOW_S()}).states[1], DEGRADED)
+
+    def test_loss_band_is_degraded(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        feed(eng, {"d": LOSS_S()})
+        self.assertEqual(feed(eng, {"d": LOSS_S()}).states[1], DEGRADED)
+
+class RecoveryHysteresis(unittest.TestCase):
+    def test_down_recovers_after_two_healthy(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        for _ in range(3):
+            feed(eng, {"d": DEAD_S()})
+        self.assertEqual(eng.fsm[1].state, DOWN)
+        self.assertEqual(feed(eng, {"d": UP_S()}).states[1], DOWN)
+        r = feed(eng, {"d": UP_S()})
+        self.assertEqual(r.states[1], UP)
+        self.assertTrue(any(isinstance(e, OutageResolved) for e in r.events))
+
+class Topology(unittest.TestCase):
+    def setUp(self):
+        self.parent = solo_device(id=1, ip_address="p")
+        self.child = solo_device(id=2, ip_address="c", parent_device_id=1)
+        self.eng = MonitorEngine([self.parent, self.child], CFG)
+
+    def test_child_of_down_parent_is_unreachable(self):
+        for _ in range(3):
+            r = feed(self.eng, {"p": DEAD_S("p"), "c": DEAD_S("c")})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[2], UNREACHABLE)
+        opened = [e for e in r.events if isinstance(e, OutageOpened)]
+        kinds = {e.device_id: e.state for e in opened}
+        self.assertEqual(kinds.get(2), UNREACHABLE)
+
+class GraphTopology(unittest.TestCase):
+
+    @staticmethod
+    def _backup(parent_id):
+        return (ParentEdge(parent_id, BACKUP),)
+
+    def test_multi_parent_topological_order(self):
+        a = solo_device(id=1, ip_address="a", parent_device_id=None)
+        b = solo_device(id=2, ip_address="b", parent_device_id=1)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1)
+        d = solo_device(id=4, ip_address="d4", parent_device_id=2, parents=self._backup(3))
+        order = MonitorEngine._topological_order([a, b, c, d])
+        self.assertLess(order.index(1), order.index(2))
+        self.assertLess(order.index(2), order.index(4))
+        self.assertLess(order.index(3), order.index(4))
+
+    def test_cycle_is_handled_best_effort(self):
+        a = solo_device(id=1, ip_address="a", parent_device_id=2)
+        b = solo_device(id=2, ip_address="b", parent_device_id=None, parents=self._backup(1))
+        order = MonitorEngine._topological_order([a, b])
+        self.assertEqual(set(order), {1, 2})
+
+    def _down(self, eng, ips, n=3):
+        r = None
+        for _ in range(n):
+            r = feed(eng, {ip: DEAD_S(ip) for ip in ips})
+        return r
+
+    def test_one_parent_alive_keeps_child_down_not_unreachable(self):
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = None
+        for _ in range(3):
+            r = feed(eng, {"p": DEAD_S("p"), "q": UP_S("q"), "c": DEAD_S("c")})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], DOWN)
+        self.assertNotEqual(r.states[3], UNREACHABLE)
+
+    def test_all_parents_down_suppresses_child(self):
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = self._down(eng, ["p", "q", "c"])
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], UNREACHABLE)
+
+    def test_on_backup_enter_and_leave(self):
+        p = solo_device(id=1, ip_address="p", parent_device_id=None)
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=1, parents=self._backup(2))
+        eng = MonitorEngine([p, q, c], CFG)
+        r = None
+        for _ in range(3):
+            r = feed(eng, {"p": DEAD_S("p"), "q": UP_S("q"), "c": UP_S("c")})
+        self.assertEqual(r.states[1], DOWN)
+        self.assertEqual(r.states[3], UP)
+        self.assertTrue(r.redundancy[3])
+        self.assertNotIn(1, r.redundancy)
+        self.assertNotIn(2, r.redundancy)
+        for _ in range(2):
+            r = feed(eng, {"p": UP_S("p"), "q": UP_S("q"), "c": UP_S("c")})
+        self.assertEqual(r.states[1], UP)
+        self.assertFalse(r.redundancy[3])
+
+    def test_backup_parent_is_probed_gently(self):
+        cfg = Config(pings_per_poll=5, pings_per_poll_infra=2, canary_ip="1.1.1.1")
+        q = solo_device(id=2, ip_address="q", parent_device_id=None)
+        c = solo_device(id=3, ip_address="c", parent_device_id=None, parents=(ParentEdge(2, BACKUP),))
+        plan = MonitorEngine([q, c], cfg).probe_plan()
+        self.assertEqual(plan["q"], 2)
+        self.assertEqual(plan["c"], 5)
+
+class CanaryFreeze(unittest.TestCase):
+    def test_uplink_down_freezes_and_alerts_once(self):
+        eng = MonitorEngine([solo_device()], CFG)
+        r1 = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertTrue(r1.canary_down)
+        self.assertEqual(r1.states[1], UP)
+        self.assertEqual(sum(isinstance(e, UplinkDown) for e in r1.events), 1)
+        r2 = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertFalse(any(isinstance(e, UplinkDown) for e in r2.events))
+        r3 = feed(eng, {"d": UP_S()}, canary_up=True)
+        self.assertTrue(any(isinstance(e, UplinkRestored) for e in r3.events))
+
+    def test_freeze_disabled_still_pages_local_devices(self):
+        cfg = replace(CFG, canary_freeze=False)
+        eng = MonitorEngine([solo_device()], cfg)
+        first = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertFalse(first.canary_down)
+        self.assertEqual(sum(isinstance(e, UplinkDown) for e in first.events), 1)
+        last = first
+        for _ in range(cfg.down_consecutive - 1):
+            last = feed(eng, {"d": DEAD_S()}, canary_up=False)
+        self.assertEqual(last.states[1], DOWN)
+        self.assertTrue(any(isinstance(e, OutageOpened) for e in last.events))
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

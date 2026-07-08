@@ -1,0 +1,219 @@
+name: release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    plat: linux-amd64, ext: "" }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64, ext: "" }
+          - { runner: windows-latest,   plat: win-amd64,   ext: ".exe" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Stamp version from git
+        shell: bash
+        run: |
+          VER="$(git describe --tags --always --dirty | sed 's/^v//')"
+          echo "VERSION = \"$VER\"" > src/wisp/_buildinfo.py
+          echo "built version: $VER"
+
+      - name: Install build deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build agent + supervisor
+        shell: bash
+        run: |
+          pyinstaller --clean -y deploy/wisp-edge.spec
+          pyinstaller --clean -y --onefile --name wisp-supervisor \
+            --paths src --hidden-import httpx apps/supervisor/main.py
+          mkdir -p out
+          cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
+
+      - name: Build tray app (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pyinstaller --clean -y --onefile --noconsole --name wisp-tray \
+            --paths src apps/tray/main.py
+          cp dist/wisp-tray.exe out/wisp-tray-${{ matrix.plat }}.exe
+
+      - name: Sign (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}" `
+            "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}" `
+            "out/wisp-tray-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+          & $signtool.FullName verify /pa "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on wisp-edge" }
+
+      - name: Build .deb package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VER="$(git describe --tags --always --dirty | sed 's/^v//')"
+          deploy/build-deb.sh "$VER" "${{ matrix.plat }}" \
+            "out/wisp-edge-${{ matrix.plat }}" "out/wisp-supervisor-${{ matrix.plat }}" out
+
+      - name: Build Windows setup exe (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = (git describe --tags --always --dirty) -replace '^v',''
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $outDir = Join-Path (Get-Location).Path 'out'
+          & $iscc deploy\wisp-edge-setup.iss /DAppVersion=$ver "/DBinDir=$outDir" "/DOutDir=$outDir"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Sign setup exe (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "out/wisp-edge-setup-win-amd64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+
+      - name: Checksums
+        shell: bash
+        run: (cd out && sha256sum * > "SHA256SUMS-${{ matrix.plat }}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wisp-${{ matrix.plat }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Assemble checksums + version manifest
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -type f -exec cp {} release/ \;
+          (cd release && cat SHA256SUMS-* > SHA256SUMS && rm -f SHA256SUMS-*)
+          VER="${GITHUB_REF_NAME#v}"
+          python - "$VER" > release/manifest.json <<'PY'
+          import hashlib, json, sys, pathlib
+          ver = sys.argv[1]; rel = pathlib.Path("release"); arts = {}
+          base = f"https://github.com/${{ github.repository }}/releases/download/v{ver}"
+          for p in sorted(rel.glob("wisp-edge-*")):
+              # skip the first-install artifacts (Windows installer, .debs) — only
+              # the bare agent binaries belong in the self-update manifest
+              if p.name.startswith("wisp-edge-setup") or p.name.endswith(".deb"):
+                  continue
+              plat = p.name.replace("wisp-edge-", "").replace(".exe", "")
+              arts[plat] = {"url": f"{base}/{p.name}",
+                            "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+          json.dump({"version": ver, "artifacts": arts}, sys.stdout, indent=2)
+          PY
+
+      # GitHub can't hide individual release assets, so the asset list will always show
+      # the self-update binaries too — the notes BODY is what steers humans: a short
+      # install table up top, and an explicit "you don't need the rest" line. Written
+      # OUTSIDE release/ so it doesn't get uploaded as an asset itself.
+      - name: Write install-first release notes
+        shell: bash
+        run: |
+          BASE="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
+          {
+            echo "## Install"
+            echo
+            echo "| Platform | Download this one file |"
+            echo "|---|---|"
+            echo "| Windows | [wisp-edge-setup-win-amd64.exe]($BASE/wisp-edge-setup-win-amd64.exe) |"
+            for deb in release/wisp-edge-*.deb; do
+              name="$(basename "$deb")"
+              case "$name" in
+                *-amd64.deb) plat="Debian/Ubuntu (amd64)" ;;
+                *-arm64.deb) plat="Debian/Ubuntu (arm64)" ;;
+                *)           plat="Debian/Ubuntu" ;;
+              esac
+              echo "| $plat | [$name]($BASE/$name) |"
+            done
+            echo
+            echo "**Those are the only files you need.** Everything else in the asset"
+            echo "list (\`wisp-edge-*\` / \`wisp-supervisor-*\` bare binaries,"
+            echo "\`manifest.json\`) is the self-update channel — installed probes fetch"
+            echo "those automatically through central's staged rollout. \`SHA256SUMS\`"
+            echo "(+ \`.minisig\`) is for verifying downloads by hand."
+          } > RELEASE_NOTES.md
+
+      # One minisign signature over the checksums manifest covers every artifact transitively
+      # (each artifact is already sha256-verified against SHA256SUMS by the installers/supervisor
+      # — signing the manifest once, here, means we don't need a signature per platform/binary).
+      # No-ops if the secret isn't set, same policy as the Authenticode step above. The PUBLIC
+      # key is not a secret — commit it to `deploy/minisign.pub` (see README) so the installers
+      # can verify without contacting anything beyond what they already download.
+      - name: Sign checksums (minisign)
+        # MINISIGN_KEY must be a PASSWORD-LESS secret key (`minisign -G -W`), base64-encoded —
+        # CI has no terminal to answer minisign's password prompt. Generate once, keep the
+        # unencrypted key ONLY in Actions secrets (never in the repo), commit the public half
+        # to `deploy/minisign.pub`.
+        if: env.MINISIGN_KEY != ''
+        env: { MINISIGN_KEY: "${{ secrets.MINISIGN_KEY }}" }
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          keyfile="$(mktemp)"
+          trap 'shred -u "$keyfile"' EXIT
+          printf '%s' "$MINISIGN_KEY" | base64 -d > "$keyfile"
+          minisign -S -s "$keyfile" -m release/SHA256SUMS -x release/SHA256SUMS.minisig \
+            -t "wisp-edge ${GITHUB_REF_NAME#v}" </dev/null
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true

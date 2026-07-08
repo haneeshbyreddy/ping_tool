@@ -1,0 +1,16 @@
+[Unit]
+Description=WISP central ingest + dashboard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=haneeshbyreddy
+WorkingDirectory=/home/haneeshbyreddy/ping_tool
+ExecStart=/home/haneeshbyreddy/ping_tool/.venv/bin/python3 apps/central/main.py
+EnvironmentFile=/home/haneeshbyreddy/ping_tool/deploy/central.env
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=WISP central — periodic GitHub release sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
