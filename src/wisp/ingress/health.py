@@ -9,10 +9,14 @@ doesn't expose just stays None, so a switch with no sensors still reports CPU.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from wisp.config import CONFIG, Config
+
+log = logging.getLogger("wisp.health")
 
 OID_HR_CPU_LOAD = "1.3.6.1.2.1.25.3.3.1.2"       # hrProcessorLoad, 0-100 per core
 OID_HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"   # hrStorageType
@@ -172,10 +176,17 @@ def parse_health(varbinds: list[tuple[str, str]]) -> DeviceHealth:
 
 class PysnmpHealthPoller:
     """One SnmpEngine per poller instance, NEVER one per walk (see CLAUDE.md —
-    a per-walk engine leaks its UDP transport registration forever)."""
+    a per-walk engine leaks its UDP transport registration forever).
+
+    Columns are walked BEST-EFFORT under one shared deadline: real fleets mix
+    agents that answer HOST-RESOURCES but ignore ENTITY-SENSOR (each ignored
+    subtree burns timeout x retries), so a dead subtree must cost only its own
+    slice — never the device's whole reading. Whatever answered still parses."""
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self._timeout = cfg.snmp_timeout_s
+        # Stay inside the edge sweep's per-device cap with headroom to parse.
+        self._budget_s = max(5.0, cfg.snmp_walk_timeout_s - 2.0)
         self._engine = None
 
     async def walk(self, target) -> DeviceHealth:
@@ -193,25 +204,39 @@ class PysnmpHealthPoller:
             self._engine = SnmpEngine()
         engine = self._engine
         community = CommunityData(target.community, mpModel=1)
-        transport = await UdpTransportTarget.create(
-            (target.ip, target.port), timeout=self._timeout, retries=1)
-        varbinds: list[tuple[str, str]] = []
         try:
-            for column in WALK_COLUMNS:
-                async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
-                    engine, community, transport, ContextData(),
-                    0, 25, ObjectType(ObjectIdentity(column)),
-                    lexicographicMode=False,
-                ):
-                    if errInd or errStat:
-                        raise RuntimeError(
-                            f"SNMP health walk of {target.ip} failed: {errInd or errStat}")
-                    for name, val in binds:
-                        varbinds.append((str(name), val.prettyPrint()))
-        except RuntimeError:
-            raise
+            transport = await UdpTransportTarget.create(
+                (target.ip, target.port), timeout=self._timeout, retries=1)
         except Exception as exc:
             raise RuntimeError(f"SNMP health walk of {target.ip} failed: {exc}") from exc
+
+        async def one_column(column: str, out: list[tuple[str, str]]) -> None:
+            async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
+                engine, community, transport, ContextData(),
+                0, 25, ObjectType(ObjectIdentity(column)),
+                lexicographicMode=False,
+            ):
+                if errInd or errStat:
+                    raise RuntimeError(str(errInd or errStat))
+                for name, val in binds:
+                    out.append((str(name), val.prettyPrint()))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._budget_s
+        varbinds: list[tuple[str, str]] = []
+        for column in WALK_COLUMNS:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                log.debug("health walk of %s ran out of budget at column %s",
+                          target.ip, column)
+                break
+            column_binds: list[tuple[str, str]] = []
+            try:
+                await asyncio.wait_for(one_column(column, column_binds), remaining)
+            except Exception as exc:
+                log.debug("health column %s on %s skipped: %s", column, target.ip, exc)
+                continue
+            varbinds.extend(column_binds)
         return parse_health(varbinds)
 
 

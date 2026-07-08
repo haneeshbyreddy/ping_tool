@@ -11,6 +11,7 @@ import type { NodeToken, OrgRollout } from "@/lib/types"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import { StatusDot } from "@/components/status-badge"
 import { ago, fmtBytes, isStale } from "@/lib/format"
+import { isNewerVersion } from "@/lib/version"
 import { cn } from "@/lib/utils"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -212,7 +213,10 @@ function ProbeRow({
 
   const stale = !!node.last_seen && isStale(node.last_seen)
 
-  const updateAvailable = !!(node.version && latestVersion && node.version !== latestVersion)
+  // Semver, not inequality — a node AHEAD of central's newest known release (manual
+  // update before the release sync ran) must read as current, never as a downgrade offer.
+  const updateAvailable = !!(node.version && latestVersion
+    && isNewerVersion(latestVersion, node.version))
   const rolloutCoversNode = !!(rollout && updateAvailable
     && rollout.target_version === latestVersion
     && (rollout.state === "promoted" || rollout.canary.includes(node.node_id)))
