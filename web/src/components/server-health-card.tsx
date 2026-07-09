@@ -57,7 +57,7 @@ export function ServerHealthCard() {
                 </span>
               ) : (
                 <span className="text-destructive">
-                  Release mirror failing (last try {ago(data.release_sync.at)}) — {data.release_sync.detail}
+                  Release mirror failing (last try {ago(data.release_sync.at)}). {data.release_sync.detail}
                 </span>
               )}
             </p>

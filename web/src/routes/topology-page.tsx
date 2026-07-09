@@ -141,7 +141,7 @@ function DeviceForm({
   return (
     <Card ref={cardRef} className="border-primary/30">
       <CardContent className="flex flex-col gap-3 px-4">
-        <p className="text-sm font-semibold">{editing ? `Edit — ${editing.name}` : "Add device"}</p>
+        <p className="text-sm font-semibold">{editing ? `Edit: ${editing.name}` : "Add device"}</p>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="flex flex-col gap-1.5">
             <Label>Name</Label>
@@ -173,7 +173,7 @@ function DeviceForm({
               onValueChange={(v) => setForm({ ...form, parent_device_id: v === "none" ? "" : v })}>
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="none">— none (root) —</SelectItem>
+                <SelectItem value="none">None (root)</SelectItem>
                 {devices.filter((d) => d.id !== editing?.id).map((d) => (
                   <SelectItem key={d.id} value={String(d.id)}>{d.name}</SelectItem>
                 ))}
@@ -186,7 +186,7 @@ function DeviceForm({
               onValueChange={(v) => setForm({ ...form, assigned_node_id: v === "any" ? "" : v })}>
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="any">— unassigned (not monitored) —</SelectItem>
+                <SelectItem value="any">Unassigned (not monitored)</SelectItem>
                 {nodeIds.map((id) => <SelectItem key={id} value={id}>{id}</SelectItem>)}
               </SelectContent>
             </Select>
@@ -329,7 +329,10 @@ function PortsPanel({ device }: { device: OrgDevice }) {
     return <p className="px-1 py-2 text-xs text-muted-foreground">No SNMP ports discovered yet.</p>
   }
 
-  const rank = (p: SwitchPort) => (portAlarmed(p) ? 0 : p.monitored ? 1 : 2)
+  // alarmed first (a down port that's alarming is the urgent one), then open/up
+  // ports, then quiet monitored ports, then everything else; if_index as tie-break.
+  const rank = (p: SwitchPort) =>
+    portAlarmed(p) ? 0 : p.oper_status === "up" ? 1 : p.monitored ? 2 : 3
   const sorted = [...ports].sort((a, b) => rank(a) - rank(b) || a.if_index - b.if_index)
   const watched = ports.filter((p) => p.monitored).length
   const down = ports.filter((p) => p.monitored && p.alarm === 1).length
@@ -661,7 +664,7 @@ function DeviceRow({
     mutationFn: () => inventoryApi.remove(device.id),
     onSuccess: (res) => {
       if (res.ok) invalidate()
-      else toast.error(res.reason || "Device has children — remove them first")
+      else toast.error(res.reason || "Device has children. Remove them first")
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Delete failed"),
   })
@@ -692,9 +695,9 @@ function DeviceRow({
         ) : (
           <span className="size-5 shrink-0" />
         )}
-        <span className="inline-flex shrink-0" title={unassigned ? "no probe assigned — not monitored"
+        <span className="inline-flex shrink-0" title={unassigned ? "no probe assigned, not monitored"
           : device.state && isStale(device.state_updated_at)
-          ? `stale — no report since ${ago(device.state_updated_at)}` : undefined}>
+          ? `stale, no report since ${ago(device.state_updated_at)}` : undefined}>
           <StatusDot tone={unassigned ? "muted" : deviceTone(device.state, device.state_updated_at)} />
         </span>
         <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
@@ -709,19 +712,19 @@ function DeviceRow({
             opens the ports panel straight to the story instead of making the operator
             hunt for it behind the radio icon. */}
         {device.ports_down > 0 && (
-          <RowTag tone="destructive" title="A watched port is down — click for ports"
+          <RowTag tone="destructive" title="A watched port is down. Click for ports"
             onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
             {device.ports_down === 1 ? "port down" : `${device.ports_down} ports down`}
           </RowTag>
         )}
         {device.ports_bw_low > 0 && (
-          <RowTag tone="warning" title="A watched port is below its bandwidth floor — click for ports"
+          <RowTag tone="warning" title="A watched port is below its bandwidth floor. Click for ports"
             onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
             low bw
           </RowTag>
         )}
         {device.ports_bw_high > 0 && (
-          <RowTag tone="warning" title="A watched port is above its bandwidth ceiling — click for ports"
+          <RowTag tone="warning" title="A watched port is above its bandwidth ceiling. Click for ports"
             onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
             high bw
           </RowTag>
@@ -730,13 +733,13 @@ function DeviceRow({
             Optical tab, same pattern as the port chips. Gated on hasOptics so a stale
             badge from before SNMP was turned off can't show a chip that links nowhere. */}
         {hasOptics && !!device.onus_crit && device.onus_crit > 0 && (
-          <RowTag tone="destructive" title="ONUs below the critical Rx-power floor — click for optics"
+          <RowTag tone="destructive" title="ONUs below the critical Rx-power floor. Click for optics"
             onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
             {device.onus_crit} ONU{device.onus_crit === 1 ? "" : "s"} crit
           </RowTag>
         )}
         {hasOptics && !device.onus_crit && !!device.onus_warn && device.onus_warn > 0 && (
-          <RowTag tone="warning" title="ONUs with a weak Rx-power warning — click for optics"
+          <RowTag tone="warning" title="ONUs with a weak Rx-power warning. Click for optics"
             onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
             {device.onus_warn} ONU{device.onus_warn === 1 ? "" : "s"} weak
           </RowTag>
@@ -744,13 +747,13 @@ function DeviceRow({
         {/* Device vitals only chip when CRITICAL — a hot or pegged box is a fire to
             walk toward; warn-level tints stay inside the expanded Health panel. */}
         {(device.health_temp_c ?? 0) >= VITAL_TEMP_CRIT && (
-          <RowTag tone="destructive" title="Device temperature critical — click for health"
+          <RowTag tone="destructive" title="Device temperature critical. Click for health"
             onClick={(e) => { e.stopPropagation(); openTab("health") }}>
             {Math.round(device.health_temp_c!)}°C
           </RowTag>
         )}
         {(device.health_cpu_pct ?? 0) >= VITAL_CPU_CRIT && (
-          <RowTag tone="destructive" title="Device CPU pegged — click for health"
+          <RowTag tone="destructive" title="Device CPU pegged. Click for health"
             onClick={(e) => { e.stopPropagation(); openTab("health") }}>
             cpu {Math.round(device.health_cpu_pct!)}%
           </RowTag>
@@ -765,14 +768,14 @@ function DeviceRow({
           {(hasOptics || hasPorts) && (
             <div className="flex items-center gap-1.5 text-muted-foreground/60">
               {hasOptics && (
-                <span title={device.onus_crit ? `Optical — ${device.onus_crit} ONU(s) critical`
-                  : device.onus_warn ? `Optical — ${device.onus_warn} ONU(s) weak` : "Optical (GPON) monitored"}>
+                <span title={device.onus_crit ? `Optical: ${device.onus_crit} ONU(s) critical`
+                  : device.onus_warn ? `Optical: ${device.onus_warn} ONU(s) weak` : "Optical (GPON) monitored"}>
                   <Waypoints className={cn("size-3.5",
                     device.onus_crit ? "text-destructive" : device.onus_warn ? "text-warning" : "")} />
                 </span>
               )}
               {hasPorts && (
-                <span title={device.ports_down ? `SNMP — ${device.ports_down} port(s) down` : "SNMP ports monitored"}>
+                <span title={device.ports_down ? `SNMP: ${device.ports_down} port(s) down` : "SNMP ports monitored"}>
                   <Radio className={cn("size-3.5",
                     device.ports_down ? "text-destructive"
                       : (device.ports_bw_low || device.ports_bw_high) ? "text-warning" : "")} />
@@ -871,11 +874,19 @@ export function TopologyPage() {
     queryKey: ["inventory", scopeOrg],
     queryFn: () => inventoryApi.list(scopeOrg),
     enabled: !!scopeOrg,
+    // Polling fallback: SSE + focus/visibility events are the primary refresh path,
+    // but none of them fire when the tab stays foreground while the machine sleeps
+    // or the SSE stream dies silently — the list then freezes and every row crosses
+    // the client-side 180s isStale() line into a false "stale · 11h ago". A plain
+    // interval guarantees the view self-heals within ~30s regardless (react-query
+    // pauses it while hidden, resumes on visibility).
+    refetchInterval: 30_000,
   })
   const nodes = useQuery({
     queryKey: ["nodes", scopeOrg],
     queryFn: () => nodesApi.list(scopeOrg),
     enabled: !!scopeOrg,
+    refetchInterval: 30_000,
   })
 
   // A deep-linked device may sit under collapsed ancestors — open the path to it
@@ -937,7 +948,7 @@ export function TopologyPage() {
             {probeFilter && (
               <button
                 className="flex items-center gap-1.5 self-center rounded-full border bg-card px-2.5 py-0.5 text-[0.75rem] font-medium text-muted-foreground transition-colors hover:text-foreground"
-                title="Showing only this probe's devices — click to clear"
+                title="Showing only this probe's devices. Click to clear"
                 onClick={() => setProbeFilter(null)}>
                 {probeFilter}
                 <X className="size-3" />
@@ -967,7 +978,7 @@ export function TopologyPage() {
         {isLoading && <Skeleton className="h-40 w-full" />}
         {!isLoading && devices.length === 0 && (
           <p className="rounded-lg border border-dashed py-10 text-center text-sm text-muted-foreground">
-            {probeFilter ? `No devices assigned to ${probeFilter}.` : "No devices yet — add one above."}
+            {probeFilter ? `No devices assigned to ${probeFilter}.` : "No devices yet. Add one above."}
           </p>
         )}
         {devices.length > 0 && (

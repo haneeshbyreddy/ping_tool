@@ -77,7 +77,7 @@ export function HourStrip({ buckets, hours = 24 }: { buckets: TrendBucket[]; hou
         const t = top - (hours - 1 - i) * HOUR
         const b = byTime.get(t)
         if (!b) {
-          return <span key={t} title={`${hourLabel(t)} — no data`}
+          return <span key={t} title={`${hourLabel(t)}: no data`}
             className="h-4 min-w-0 flex-1 rounded-[2px] border border-border/60" />
         }
         const trouble = bucketTrouble(b)

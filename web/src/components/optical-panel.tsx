@@ -120,7 +120,7 @@ function OnuRow({ o, deviceId }: { o: OnuOptic; deviceId: number }) {
     <div className="flex items-center gap-3 py-1.5 text-xs">
       <span className={cn("size-2 shrink-0 rounded-full", DOT[onuSev(o)])} />
       <span className="min-w-0 flex-1 truncate">
-        {o.name || <span className="text-muted-foreground">— unnamed</span>}
+        {o.name || <span className="text-muted-foreground">unnamed</span>}
       </span>
       <span className="hidden w-32 shrink-0 truncate font-mono text-[0.6875rem] text-muted-foreground sm:inline">
         {o.serial || o.onu_key}
@@ -252,7 +252,7 @@ export function OpticalPanel({ device }: { device: OrgDevice }) {
     return (
       <p className="rounded-lg border bg-muted/40 px-3 py-6 text-center text-xs text-muted-foreground">
         No ONU optical readings yet. The edge walks this OLT's GPON MIB on its slow SNMP
-        cadence — readings appear after the first walk (enable SNMP on the OLT if you
+        cadence. Readings appear after the first walk (enable SNMP on the OLT if you
         haven't).
       </p>
     )

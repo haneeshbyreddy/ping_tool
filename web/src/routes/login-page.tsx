@@ -39,7 +39,7 @@ export function LoginPage() {
       navigate(from || "/", { replace: true })
     } catch (err) {
       // server messages arrive lowercase ("invalid credentials") — display-cased here
-      const msg = err instanceof ApiError ? err.message : "Sign-in failed — try again."
+      const msg = err instanceof ApiError ? err.message : "Sign-in failed. Try again."
       setError(msg.charAt(0).toUpperCase() + msg.slice(1))
       passwordRef.current?.focus()
       passwordRef.current?.select()
@@ -70,7 +70,7 @@ export function LoginPage() {
           <form className="flex flex-col gap-4" onSubmit={onSubmit}>
             {expired && !error && (
               <p role="status" className="rounded-lg border bg-muted px-3 py-2 text-xs text-muted-foreground">
-                Your session expired — sign in again.
+                Your session expired. Sign in again.
               </p>
             )}
             <div className="flex flex-col gap-1.5">
@@ -129,7 +129,7 @@ export function LoginPage() {
         </CardContent>
       </Card>
       <p className="relative mt-6 text-xs text-muted-foreground/70">
-        WISP Central — uptime monitoring for ISPs
+        WISP Central: uptime monitoring for ISPs
       </p>
     </div>
   )

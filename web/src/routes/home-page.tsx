@@ -231,7 +231,7 @@ export function HomePage() {
       {!triageLoading && triageCount === 0 && (
         <div className="flex items-center gap-3 rounded-lg border bg-card px-5 py-4 text-sm text-muted-foreground">
           <StatusDot tone="success" />
-          All clear — no open outages, every probe reporting.
+          All clear. No open outages, every probe reporting.
         </div>
       )}
       {!triageLoading && triageCount > 0 && (
@@ -269,7 +269,7 @@ export function HomePage() {
           <Panel title="Network" action={{ label: "Topology", to: "/topology" }}>
             {devices.isLoading && <Skeleton className="m-4 h-40" />}
             {!devices.isLoading && deviceList.length === 0 && (
-              <PanelEmpty>No devices yet — add them on the Network page.</PanelEmpty>
+              <PanelEmpty>No devices yet. Add them on the Network page.</PanelEmpty>
             )}
             {visibleDevices.map((d) => {
               const uptime = uptimeByDevice.get(d.id)

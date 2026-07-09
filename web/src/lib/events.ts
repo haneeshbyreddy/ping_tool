@@ -28,7 +28,7 @@ export function describeEvent(ev: LogEvent): string {
     case "OUTAGE_POSTMORTEM": {
       const cause = (p.root_cause as string) || "no cause given"
       const notes = p.resolution_notes as string | undefined
-      return notes ? `${cause} — ${notes}` : cause
+      return notes ? `${cause}: ${notes}` : cause
     }
     default:
       return ev.state ? `${ev.type} · ${ev.state}` : ev.type

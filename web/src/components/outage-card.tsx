@@ -92,13 +92,13 @@ export function OutageCard({ outage }: { outage: Outage }) {
         </div>
 
         {outage.status === "in_progress" && (
-          <p className="text-xs text-muted-foreground">Acknowledged by {outage.acknowledged_by} — waiting for recovery.</p>
+          <p className="text-xs text-muted-foreground">Acknowledged by {outage.acknowledged_by}. Waiting for recovery.</p>
         )}
 
         {outage.root_cause && (
           <p className="text-xs text-muted-foreground">
             <span className="font-semibold text-foreground">{outage.root_cause}</span>
-            {outage.resolution_notes ? ` — ${outage.resolution_notes}` : ""}
+            {outage.resolution_notes ? `: ${outage.resolution_notes}` : ""}
           </p>
         )}
 

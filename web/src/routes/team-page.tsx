@@ -78,7 +78,7 @@ function HistoryStrip({
         return (
           <button
             key={day}
-            title={`${day} — ${present ? "present" : "absent"}${canWrite ? " (click to change)" : ""}`}
+            title={`${day}: ${present ? "present" : "absent"}${canWrite ? " (click to change)" : ""}`}
             disabled={!canWrite}
             onClick={() => onToggle(day, !present)}
             className={cn(
@@ -192,7 +192,7 @@ export function TeamPage() {
       {team.isLoading && <Skeleton className="h-24 w-full" />}
       {!team.isLoading && workers.length === 0 && (
         <p className="rounded-lg border border-dashed py-10 text-center text-sm text-muted-foreground">
-          No team members yet — add one above.
+          No team members yet. Add one above.
         </p>
       )}
       {workers.length > 0 && (
@@ -274,7 +274,7 @@ export function TeamPage() {
       {/* the strip itself is sm+-only, so the hint hides with it */}
       {att && att.days.length > 1 && workers.some((w) => attByWorker.has(w.id)) && (
         <p className="hidden text-xs text-muted-foreground/70 sm:block">
-          Squares show the past {att.days.length - 1} days{canWrite ? " — click one to correct a missed day." : "."}
+          Squares show the past {att.days.length - 1} days{canWrite ? ". Click one to correct a missed day." : "."}
         </p>
       )}
     </div>

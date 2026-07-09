@@ -115,7 +115,7 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
           </div>
         ))}
         <p className="max-w-lg text-xs text-muted-foreground">
-          Topics are generated, not chosen — anyone who knows a topic name can subscribe to it
+          Topics are generated, not chosen. Anyone who knows a topic name can subscribe to it
           on ntfy, so a random one is the only safe kind. Randomize, save, then re-subscribe
           the team's phones to the new topic.
         </p>
@@ -154,7 +154,7 @@ function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
   const rename = useMutation({
     mutationFn: () => regionsApi.rename(org, renaming!, renameTo.trim()),
     onSuccess: () => {
-      toast.success("Region renamed — devices and members follow")
+      toast.success("Region renamed. Devices and members follow")
       setRenaming(null); invalidate()
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to rename region"),
@@ -178,7 +178,7 @@ function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-10 w-full" /></div>}
         {!isLoading && regions.length === 0 && (
           <p className="px-4 pb-3 text-xs text-muted-foreground">
-            No regions yet — add one here, or pick "New region…" while editing a device.
+            No regions yet. Add one here, or pick "New region…" while editing a device.
           </p>
         )}
         {regions.map((r) => {
@@ -214,7 +214,7 @@ function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
                     <Pencil className="size-3.5" />
                   </Button>
                   <Button variant="ghost" size="icon" className="size-7" disabled={inUse > 0 || remove.isPending}
-                    title={inUse > 0 ? "In use — reassign its devices/members first" : "Delete region"}
+                    title={inUse > 0 ? "In use. Reassign its devices/members first" : "Delete region"}
                     onClick={() => remove.mutate(r.name)}>
                     <Trash2 className="size-3.5" />
                   </Button>
@@ -313,7 +313,7 @@ function ResetPasswordDialog({ target }: { target: AccountUser }) {
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Reset password — {target.username}</DialogTitle>
+          <DialogTitle>Reset password: {target.username}</DialogTitle>
         </DialogHeader>
         <div className="flex flex-col gap-1.5">
           <Label>New password</Label>

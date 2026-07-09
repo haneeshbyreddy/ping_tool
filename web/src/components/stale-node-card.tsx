@@ -17,7 +17,7 @@ export function StaleNodeCard({ node }: { node: NodeToken }) {
             <div className="min-w-0">
               <p className="truncate font-mono text-sm font-semibold">{node.node_id}</p>
               <p className="text-xs text-muted-foreground">
-                Probe offline — central can't see any device behind it
+                Probe offline. Central can't see any device behind it
               </p>
             </div>
           </div>

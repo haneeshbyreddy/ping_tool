@@ -54,7 +54,7 @@ export function RegionSelect({ org, value, onChange, className, inputClassName }
     }}>
       <SelectTrigger className={className}><SelectValue /></SelectTrigger>
       <SelectContent>
-        <SelectItem value={NONE}>— none —</SelectItem>
+        <SelectItem value={NONE}>None</SelectItem>
         {options.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
         <SelectSeparator />
         <SelectItem value={NEW}>

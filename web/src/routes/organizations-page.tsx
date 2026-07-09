@@ -58,7 +58,7 @@ export function OrganizationsPage() {
     <div className="mx-auto flex max-w-4xl flex-col gap-4 p-4 md:p-6 xl:p-8">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Organizations</h1>
-        <p className="text-sm text-muted-foreground">Every org on this platform — create new ISPs and manage their topology, team, and alert routing.</p>
+        <p className="text-sm text-muted-foreground">Every org on this platform. Create new ISPs and manage their topology, team, and alert routing.</p>
       </div>
 
       <ServerHealthCard />
@@ -74,7 +74,7 @@ export function OrganizationsPage() {
             <Label>Org id</Label>
             <Input placeholder="e.g. acme-wisp" className="max-w-sm font-mono text-xs"
               value={orgId} onChange={(e) => setOrgId(e.target.value)} />
-            <p className="text-xs text-muted-foreground">Lowercase, no spaces — used internally and can't be changed later.</p>
+            <p className="text-xs text-muted-foreground">Lowercase, no spaces. Used internally and can't be changed later.</p>
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Display name</Label>
@@ -104,7 +104,7 @@ export function OrganizationsPage() {
             </div>
           )}
           {!isLoading && orgs.length === 0 && (
-            <p className="px-4 pb-4 text-sm text-muted-foreground">No orgs yet — create one above to get started.</p>
+            <p className="px-4 pb-4 text-sm text-muted-foreground">No orgs yet. Create one above to get started.</p>
           )}
           {orgs.map((o) => (
             <div key={o.org_id}

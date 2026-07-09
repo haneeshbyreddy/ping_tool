@@ -19,9 +19,9 @@ import {
 // leaves you always want when starting cold.
 const ROOT_PRESETS: Array<{ label: string; oid: string; hint: string }> = [
   { label: "System", oid: "1.3.6.1.2.1.1", hint: "name, descr, sysObjectID (who made it)" },
-  { label: "Enterprise (private)", oid: "1.3.6.1.4.1", hint: "vendor tree — CPU/temp/RAM live here" },
+  { label: "Enterprise (private)", oid: "1.3.6.1.4.1", hint: "vendor tree; CPU/temp/RAM live here" },
   { label: "Interfaces", oid: "1.3.6.1.2.1.2.2", hint: "per-port counters & status" },
-  { label: "Everything (MIB-2)", oid: "1.3.6.1", hint: "large — bounded by the varbind cap" },
+  { label: "Everything (MIB-2)", oid: "1.3.6.1", hint: "large, bounded by the varbind cap" },
 ]
 
 function StatusPill({ w }: { w: SnmpWalk }) {
@@ -119,7 +119,7 @@ export function SnmpWalkDialog({ device, open, onOpenChange }: {
   const start = useMutation({
     mutationFn: () => snmpApi.startWalk(device.id, oid.trim()),
     onSuccess: () => {
-      toast.success("Walk queued — it runs on the probe's next report")
+      toast.success("Walk queued. It runs on the probe's next report")
       queryClient.invalidateQueries({ queryKey: ["snmp-walks", device.id] })
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Could not queue the walk"),
@@ -132,7 +132,7 @@ export function SnmpWalkDialog({ device, open, onOpenChange }: {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>SNMP walk — {device.name}</DialogTitle>
+          <DialogTitle>SNMP walk: {device.name}</DialogTitle>
           <DialogDescription>
             Ask the assigned probe to dump an OID subtree from {device.ip_address}. Use this
             to discover a new vendor's OIDs, then turn them into a health profile.
@@ -143,7 +143,7 @@ export function SnmpWalkDialog({ device, open, onOpenChange }: {
           <p className="rounded-lg border border-warning/30 bg-warning-soft/40 px-3 py-2 text-xs text-warning">
             {device.snmp_enabled !== 1
               ? "Enable SNMP on this device (with a community) first."
-              : "Assign this device to a probe first — the walk runs from its assigned node."}
+              : "Assign this device to a probe first. The walk runs from its assigned node."}
           </p>
         ) : (
           <>

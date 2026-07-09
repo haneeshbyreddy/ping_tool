@@ -78,10 +78,10 @@ function CredentialReveal({
       <CardContent className="flex flex-col gap-3 px-4">
         <div className="flex items-center gap-2">
           <KeyRound className="size-4 text-primary" />
-          <p className="text-sm font-semibold">Probe credential for {nodeId} — shown once</p>
+          <p className="text-sm font-semibold">Probe credential for {nodeId} (shown once)</p>
         </div>
         <p className="text-xs text-muted-foreground">
-          Copy the token now — it will not be shown again (rotate it if lost). Then install
+          Copy the token now. It will not be shown again (rotate it if lost). Then install
           the probe on the machine that will do the pinging:
         </p>
         <div className="flex items-center justify-between gap-2 rounded-lg border bg-muted/50 px-4 py-2.5">
@@ -121,7 +121,7 @@ function CredentialReveal({
             <Step n={3}>
               <span>
                 Done. The WISP tray icon (near the clock, under "Show hidden icons") turns
-                green once the probe reports — and this probe's row below goes live, usually
+                green once the probe reports, and this probe's row below goes live, usually
                 within a minute.
               </span>
             </Step>
@@ -138,7 +138,7 @@ function CredentialReveal({
           <TabsContent value="linux" className="flex flex-col gap-3 pt-1">
             <Step n={1}>
               <div className="flex flex-wrap items-center gap-2">
-                <span>Paste this on the probe box — installs, configures, and starts it:</span>
+                <span>Paste this on the probe box. Installs, configures, and starts it:</span>
                 <div className="ml-auto flex gap-1">
                   {(["amd64", "arm64"] as const).map((a) => (
                     <Button key={a} size="sm" variant={linuxArch === a ? "secondary" : "ghost"}
@@ -195,7 +195,7 @@ function ProbeRow({
   const update = useMutation({
     mutationFn: () => nodesApi.update(org, node.node_id),
     onSuccess: (r) => {
-      toast.success(`Update to ${r.target_version} queued — the probe pulls it on its next heartbeat`)
+      toast.success(`Update to ${r.target_version} queued. The probe pulls it on its next heartbeat`)
       invalidate()
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Update failed"),
@@ -254,7 +254,7 @@ function ProbeRow({
             filtered ? "border-primary/40 bg-primary-soft text-primary"
               : "text-muted-foreground hover:bg-accent hover:text-foreground",
           )}
-          title={filtered ? "Showing only this probe's devices — click to clear"
+          title={filtered ? "Showing only this probe's devices. Click to clear"
             : "Show only this probe's devices"}
           onClick={onFilter}>
           {deviceCount} device{deviceCount === 1 ? "" : "s"}
@@ -262,7 +262,7 @@ function ProbeRow({
       )}
       {!node.registered && (
         <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-muted-foreground"
-          title="Reporting to central without a dashboard-issued credential — a leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
+          title="Reporting to central without a dashboard-issued credential. A leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
           unregistered
         </span>
       )}
@@ -276,13 +276,13 @@ function ProbeRow({
       )}
       {updateInFlight && (
         <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-muted-foreground"
-          title={`Updating to ${rollout!.target_version} — applied by the probe's supervisor after its next heartbeat`}>
+          title={`Updating to ${rollout!.target_version}. Applied by the probe's supervisor after its next heartbeat`}>
           updating…
         </span>
       )}
       {updateStalled && (
         <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-warning"
-          title={`The rollout to ${rollout!.target_version} halted — the probe never came back healthy on the new version within the window. Check logs\\edge.log on the probe box, then retry from the menu.`}>
+          title={`The rollout to ${rollout!.target_version} halted. The probe never came back healthy on the new version within the window. Check logs\\edge.log on the probe box, then retry from the menu.`}>
           update stalled
         </span>
       )}
@@ -418,7 +418,7 @@ export function ProbesPanel({
       {isLoading && <Skeleton className="h-10 w-full" />}
       {!isLoading && nodes.length === 0 && (
         <p className="rounded-lg border border-dashed py-4 text-center text-xs text-muted-foreground">
-          No probes registered yet — register one to start monitoring.
+          No probes registered yet. Register one to start monitoring.
         </p>
       )}
       {nodes.length > 0 && (
