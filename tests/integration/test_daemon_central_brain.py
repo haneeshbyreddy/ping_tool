@@ -227,9 +227,25 @@ class GatherSnmpPortsTest(unittest.TestCase):
 
         devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
                   _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
-        cfg = Config(snmp_walk_timeout_s=0.05)
+        # Port walks are capped by their own dedicated timeout, not snmp_walk_timeout_s.
+        cfg = Config(port_walk_timeout_s=0.05)
         ports = asyncio.run(daemon._gather_snmp_ports(_HangingPoller(), devices, cfg))
         self.assertEqual(set(ports), {2})
+
+    def test_slow_port_walk_rides_the_port_cap_not_the_snmp_cap(self):
+        # A big OLT (HILL/PYLON class, 200+ interfaces) blows the generic 20s cap on
+        # the ifTable walk but must still land under the dedicated port budget — the
+        # 2026-07-09 stale-ports regression: switch_ports starved by snmp_walk_timeout_s
+        # while health/optics (smaller walks) stayed fresh.
+        class _SlowPoller:
+            async def walk(self, target):
+                await asyncio.sleep(0.1)
+                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+
+        devices = [_dev(8, "10.0.0.8", snmp_enabled=True, snmp_community="public")]
+        cfg = Config(snmp_walk_timeout_s=0.01, port_walk_timeout_s=5.0)
+        ports = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
+        self.assertEqual(set(ports), {8})
 
     def test_walks_run_concurrently_not_serially(self):
         inflight = {"now": 0, "peak": 0}

@@ -84,10 +84,10 @@ async def _gather_snmp_ports(
         async with sem:
             try:
                 ports = await asyncio.wait_for(
-                    snmp_poller.walk(target), timeout=cfg.snmp_walk_timeout_s or None)
+                    snmp_poller.walk(target), timeout=cfg.port_walk_timeout_s or None)
             except asyncio.TimeoutError:
-                log.warning("SNMP walk of device %s (%s) exceeded %.0fs cap; skipping",
-                            d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
+                log.warning("SNMP port walk of device %s (%s) exceeded %.0fs cap; skipping",
+                            d.get("id"), d["ip_address"], cfg.port_walk_timeout_s)
                 return None
             except Exception:
                 log.exception("SNMP walk failed for device %s (%s); continuing",

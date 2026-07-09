@@ -80,6 +80,14 @@ class Config:
     # stale optics (field-diagnosed 2026-07-09 via remote diag walks).
     gpon_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_GPON_WALK_TIMEOUT_S", 75.0))
+    # Port (ifTable) walks get their own cap for the same reason GPON does: a big OLT
+    # (HILL/PYLON class, 200+ interfaces x 10 columns) can't finish 10 bulk-walk
+    # columns inside 20s, timed out every cycle, and left switch_ports permanently
+    # stale while health/optics stayed fresh (same box, smaller walks) — field-
+    # diagnosed 2026-07-09. Like optics it's a background task under the SNMP
+    # semaphore, so a slow OLT delays nothing but its own port reading.
+    port_walk_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_PORT_WALK_TIMEOUT_S", 60.0))
     snmp_max_inflight: int = field(
         default_factory=lambda: _env_int("WISP_SNMP_MAX_INFLIGHT", 4))
     snmp_down_consecutive: int = field(
