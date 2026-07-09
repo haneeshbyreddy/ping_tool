@@ -1,4 +1,4 @@
-"""Central host health snapshot — CPU, memory — pure stdlib.
+"""Central host health snapshot — CPU, memory, disk — pure stdlib.
 
 Linux-first: CPU and memory come from /proc (the deployment target); every field
 degrades to None elsewhere or on read failure so the endpoint never 500s over a
@@ -10,6 +10,7 @@ first call so it never reports a meaningless since-boot average.
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import threading
 import time
@@ -70,6 +71,16 @@ def _meminfo() -> dict | None:
             "percent": round(100.0 * used / total, 1)}
 
 
+def _disk(path: Path) -> dict | None:
+    probe = path if path.exists() else path.parent
+    try:
+        du = shutil.disk_usage(probe)
+    except OSError:
+        return None
+    return {"total_bytes": du.total, "used_bytes": du.used, "free_bytes": du.free,
+            "percent": round(100.0 * du.used / du.total, 1) if du.total else 0.0}
+
+
 def _uptime_s() -> float | None:
     try:
         with open("/proc/uptime") as fh:
@@ -104,5 +115,6 @@ def snapshot(db_path: Path) -> dict:
         "cpu": {"percent": _cpu_percent(), "cores": os.cpu_count(),
                 "load": list(load) if load else None},
         "memory": _meminfo(),
+        "disk": _disk(Path(db_path).resolve()),
         "process": {"rss_bytes": _process_rss_bytes(), "db_bytes": db_bytes},
     }

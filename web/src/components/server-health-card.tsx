@@ -37,15 +37,21 @@ export function ServerHealthCard() {
         {data && (
           <>
             <Meter label="CPU" pct={data.cpu.percent}
-              detail={data.cpu.load
-                ? `load ${data.cpu.load.map((l) => l.toFixed(2)).join(" ")}`
-                : `${data.cpu.cores ?? "—"} cores`} />
+              detail={data.cpu.cores != null
+                ? `${data.cpu.cores} core${data.cpu.cores === 1 ? "" : "s"}`
+                : "—"} />
             <Meter label="Memory" pct={data.memory?.percent ?? null}
               detail={data.memory
                 ? `${fmtBytes(data.memory.used_bytes)} / ${fmtBytes(data.memory.total_bytes)}`
                 : "—"} />
+            <Meter label="Disk" pct={data.disk?.percent ?? null}
+              detail={data.disk
+                ? `${fmtBytes(data.disk.free_bytes)} free of ${fmtBytes(data.disk.total_bytes)}`
+                : "—"} />
             <p className="mt-1 text-[0.75rem] text-muted-foreground">
-              {data.cpu.cores != null && <>{data.cpu.cores} core{data.cpu.cores === 1 ? "" : "s"} · </>}
+              {data.cpu.load && (
+                <>load {data.cpu.load.map((l) => l.toFixed(2)).join(" ")} (1m/5m/15m) · </>
+              )}
               service {fmtBytes(data.process.rss_bytes)} RSS · database {fmtBytes(data.process.db_bytes)}
             </p>
             <p className="text-[0.75rem]">
