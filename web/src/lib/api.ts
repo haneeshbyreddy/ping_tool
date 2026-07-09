@@ -1,5 +1,5 @@
 import type {
-  AccountUser, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  AccountUser, AdminOverview, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
   SnmpProfilesResponse, SnmpWalk, SnmpWalkResult, Summary, SwitchPort, SystemStats,
   TrendBucket, Worker,
@@ -41,6 +41,10 @@ export const summaryApi = {
 
 export const systemApi = {
   get: () => request<SystemStats>("/api/system"),
+}
+
+export const adminApi = {
+  overview: () => request<AdminOverview>("/api/admin/overview"),
 }
 
 export const orgsApi = {

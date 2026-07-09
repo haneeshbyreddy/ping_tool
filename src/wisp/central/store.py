@@ -1986,6 +1986,118 @@ class CentralStore:
                 "SELECT value FROM meta WHERE key='release_sync'").fetchone()
         return json.loads(row["value"]) if row else None
 
+    def admin_overview(self, fresh_window_s: int = 900,
+                       now: datetime | None = None) -> dict:
+        """Superadmin fleet coverage: per org, how much of the configured
+        SNMP / GPON-optics / port monitoring is actually landing fresh data.
+
+        "Working" means a reading newer than `fresh_window_s` — the edge SNMP
+        cadence is ~90s, so 15 minutes of silence is a broken pipeline, not a
+        gap between walks. Never-reported and gone-stale are distinguished in
+        `problems` because they need different fixes (config vs dead agent).
+        Optics/ports problems are suppressed on a device whose SNMP is dead
+        outright — one root cause, one line.
+        """
+        now = now or datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=fresh_window_s)).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            org_names = {r["org_id"]: r["name"] for r in conn.execute(
+                "SELECT org_id, name FROM orgs ORDER BY org_id")}
+            rows = conn.execute(
+                "SELECT d.id, d.org_id, d.name, d.device_type, d.snmp_enabled,"
+                " h.updated_at AS health_at,"
+                " g.updated_at AS optics_at, g.onus_total, g.onus_online,"
+                " ps.discovered AS ports_discovered, ps.monitored AS ports_monitored,"
+                " ps.fresh AS ports_fresh, ps.alarms AS ports_alarms,"
+                " ps.newest AS ports_at"
+                " FROM org_devices d"
+                " LEFT JOIN device_health h ON h.device_id = d.id"
+                " LEFT JOIN olt_optics g ON g.device_id = d.id"
+                " LEFT JOIN (SELECT device_id, COUNT(*) AS discovered,"
+                "    SUM(monitored) AS monitored,"
+                "    SUM(CASE WHEN monitored=1 AND updated_at >= ? THEN 1 ELSE 0 END)"
+                "      AS fresh,"
+                "    SUM(CASE WHEN monitored=1 AND alarm=1 THEN 1 ELSE 0 END) AS alarms,"
+                "    MAX(updated_at) AS newest"
+                "    FROM switch_ports GROUP BY device_id) ps ON ps.device_id = d.id"
+                " WHERE d.is_active=1 ORDER BY d.org_id, d.name",
+                (cutoff,)).fetchall()
+
+        def _fresh(ts: str | None) -> bool:
+            return ts is not None and ts >= cutoff
+
+        def _blank() -> dict:
+            return {"devices": 0,
+                    "snmp": {"enabled": 0, "working": 0},
+                    "optics": {"olts": 0, "working": 0,
+                               "onus_total": 0, "onus_online": 0},
+                    "ports": {"switches": 0, "discovered": 0, "monitored": 0,
+                              "working": 0, "alarms": 0},
+                    "problems": []}
+
+        orgs: dict[str, dict] = {oid: _blank() for oid in org_names}
+        for r in rows:
+            o = orgs.setdefault(r["org_id"], _blank())
+            o["devices"] += 1
+            is_olt = r["device_type"] == "OLT"
+            snmp_on = bool(r["snmp_enabled"])
+            last = max(filter(None, (r["health_at"], r["optics_at"],
+                                     r["ports_at"])), default=None)
+            snmp_ok = _fresh(last)
+            problem = None
+            if snmp_on:
+                o["snmp"]["enabled"] += 1
+                if snmp_ok:
+                    o["snmp"]["working"] += 1
+                elif last is None:
+                    problem = ("snmp", "never", "SNMP enabled but no data has "
+                               "ever arrived — device silent or edge not walking it")
+                else:
+                    problem = ("snmp", "stale", "SNMP data stopped arriving")
+            if is_olt and snmp_on:
+                o["optics"]["olts"] += 1
+                if _fresh(r["optics_at"]):
+                    o["optics"]["working"] += 1
+                    o["optics"]["onus_total"] += r["onus_total"] or 0
+                    o["optics"]["onus_online"] += r["onus_online"] or 0
+                elif snmp_ok:
+                    problem = (("optics", "stale", "optics stopped arriving")
+                               if r["optics_at"] is not None else
+                               ("optics", "never", "no optics reported — vendor "
+                                "unmatched (check sysObjectID) or ONU table empty"))
+            if r["ports_discovered"]:
+                o["ports"]["switches"] += 1
+                o["ports"]["discovered"] += r["ports_discovered"]
+                o["ports"]["monitored"] += r["ports_monitored"] or 0
+                o["ports"]["working"] += r["ports_fresh"] or 0
+                o["ports"]["alarms"] += r["ports_alarms"] or 0
+                stale_ports = (r["ports_monitored"] or 0) - (r["ports_fresh"] or 0)
+                if stale_ports > 0 and snmp_ok and problem is None:
+                    problem = ("ports", "stale",
+                               f"{stale_ports} of {r['ports_monitored']} monitored "
+                               "ports have stale status")
+            if problem is not None:
+                area, reason, detail = problem
+                o["problems"].append({
+                    "device_id": r["id"], "name": r["name"], "area": area,
+                    "reason": reason, "detail": detail, "last_at": last})
+
+        totals = _blank()
+        problems_total = 0
+        for o in orgs.values():
+            totals["devices"] += o["devices"]
+            for section in ("snmp", "optics", "ports"):
+                for k in totals[section]:
+                    totals[section][k] += o[section][k]
+            problems_total += len(o["problems"])
+        totals.pop("problems")
+
+        return {"fresh_window_s": fresh_window_s,
+                "generated_at": now.isoformat(timespec="seconds"),
+                "totals": totals, "problems_total": problems_total,
+                "orgs": [{"org_id": oid, "name": org_names.get(oid), **o}
+                         for oid, o in sorted(orgs.items())]}
+
     def get_release(self, version: str) -> dict | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()

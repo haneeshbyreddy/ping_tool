@@ -309,6 +309,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 doc["latest_release"] = releases[0]["version"] if releases else None
                 self._reply(200, doc)
                 return
+            if route == "/api/admin/overview":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                if not user["is_superadmin"]:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, store.admin_overview())
+                return
             if route == "/api/events":
                 user = self._reader()
                 if not user:

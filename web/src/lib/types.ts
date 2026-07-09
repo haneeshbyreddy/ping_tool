@@ -363,3 +363,34 @@ export interface SystemStats {
   release_sync: { ok: boolean; detail: string; at: string } | null
   latest_release: string | null
 }
+
+/** One broken-coverage device on the superadmin Overview page. */
+export interface OverviewProblem {
+  device_id: number
+  name: string
+  area: "snmp" | "optics" | "ports"
+  reason: "never" | "stale"
+  detail: string
+  last_at: string | null
+}
+
+export interface OverviewCounts {
+  devices: number
+  snmp: { enabled: number; working: number }
+  optics: { olts: number; working: number; onus_total: number; onus_online: number }
+  ports: { switches: number; discovered: number; monitored: number; working: number; alarms: number }
+}
+
+export interface OverviewOrg extends OverviewCounts {
+  org_id: string
+  name: string | null
+  problems: OverviewProblem[]
+}
+
+export interface AdminOverview {
+  fresh_window_s: number
+  generated_at: string
+  totals: OverviewCounts
+  problems_total: number
+  orgs: OverviewOrg[]
+}

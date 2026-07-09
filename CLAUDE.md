@@ -237,8 +237,16 @@ Src layout, zero-install:
 - **Dashboard writes send real pushes** (`/api/test-alert`), so `make_server`/
   `_make_handler` take an injectable `notifier` (default `build_notifier(cfg)`); tests
   inject a recording double. Follow this for anything central sends.
-- **Tests:** `unit/test_central_inventory`, `integration/test_central.OrgDevicesTest`,
-  `test_central_auth`, `test_central_analytics`.
+- **Superadmin Overview page = coverage, not alarms** (`GET /api/admin/overview` →
+  `store.admin_overview()`, SPA `/#/overview`, also home of the Central-server stats
+  card). Per org: SNMP/optics/ports "enabled vs working", where working = ANY
+  SNMP-derived reading (`device_health`/`olt_optics`/`switch_ports.updated_at`) fresher
+  than `fresh_window_s` (900s) — never-reported and gone-stale are distinct `problems`
+  reasons because the fixes differ (config vs dead agent). Optics/ports problems are
+  suppressed on a device whose SNMP is dead outright (one root cause, one line). Pure
+  read-side rollup: no new storage, no pages, never opens anything.
+- **Tests:** `unit/test_central_inventory`, `integration/test_central.OrgDevicesTest`
+  (+ `AdminOverviewTest`), `test_central_auth`, `test_central_analytics`.
 
 ## Central dashboard (React + Tailwind + shadcn/ui)
 

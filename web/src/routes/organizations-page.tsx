@@ -12,8 +12,6 @@ import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { ServerHealthCard } from "@/components/server-health-card"
-
 function orgInitials(o: { name: string | null; org_id: string }): string {
   return (o.name || o.org_id).slice(0, 2).toUpperCase()
 }
@@ -60,8 +58,6 @@ export function OrganizationsPage() {
         <h1 className="text-lg font-semibold tracking-tight">Organizations</h1>
         <p className="text-sm text-muted-foreground">Every org on this platform. Create new ISPs and manage their topology, team, and alert routing.</p>
       </div>
-
-      <ServerHealthCard />
 
       <Card>
         <CardHeader>

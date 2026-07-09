@@ -688,6 +688,104 @@ class CentralServerTest(unittest.TestCase):
         self.assertNotEqual(version_before, version_after)
         conn.close()
 
+class AdminOverviewTest(unittest.TestCase):
+    """GET /api/admin/overview — superadmin fleet coverage rollup."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          central_bind="127.0.0.1", central_port=0,
+                          central_token="s3cret")
+        self.store = CentralStore(self.cfg.central_db)
+        from wisp.central import auth
+        auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
+        self.server = make_server(self.cfg, self.store)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def _req(self, method, path, body=None, token=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if cookie:
+            headers["Cookie"] = cookie
+        conn.request(method, path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        setcookie = resp.getheader("Set-Cookie")
+        conn.close()
+        return resp.status, (json.loads(raw) if raw else {}), setcookie
+
+    def _dev(self, name, ip, dtype, snmp=True):
+        did = self.store.create_org_device("ispA", {
+            "name": name, "ip_address": ip, "device_type": dtype,
+            "region": None, "parent_device_id": None})
+        if snmp:
+            self.store.set_org_device_snmp("ispA", did, {
+                "snmp_enabled": 1, "snmp_version": "2c",
+                "snmp_community": "public", "snmp_port": 161})
+        return did
+
+    def test_requires_superadmin(self):
+        self.assertEqual(self._req("GET", "/api/admin/overview")[0], 401)
+        _, _, setcookie = self._req("POST", "/api/login",
+                                    {"username": "owner", "password": "ownerpassword"})
+        cookie = setcookie.split(";")[0]
+        status, _, _ = self._req("GET", "/api/admin/overview", cookie=cookie)
+        self.assertEqual(status, 403)
+
+    def test_coverage_counts_and_problems(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        fresh = now.isoformat(timespec="seconds")
+        stale = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+
+        # Fresh switch: health + one monitored fresh port -> fully working.
+        sw = self._dev("sw1", "10.0.0.1", "Switch")
+        self.store.upsert_device_health("ispA", sw, {"cpu_pct": 12.0}, fresh)
+        self.store.upsert_switch_port("ispA", sw, 1, "eth1", None, "up", "up",
+                                      None, 0, False, None, fresh)
+        pid = self.store.list_switch_ports("ispA", sw)[0]["id"]
+        self.store.set_port_monitored("ispA", pid, True)
+        # OLT with fresh health but no optics ever -> optics "never" problem.
+        olt = self._dev("olt1", "10.0.0.2", "OLT")
+        self.store.upsert_device_health("ispA", olt, {"cpu_pct": 20.0}, fresh)
+        # SNMP-enabled but silent -> snmp "never" problem.
+        self._dev("dead1", "10.0.0.3", "Switch")
+        # SNMP data stopped -> snmp "stale" problem.
+        gone = self._dev("stale1", "10.0.0.4", "Router")
+        self.store.upsert_device_health("ispA", gone, {"cpu_pct": 30.0}, stale)
+        # No SNMP at all -> counted in devices only, never a problem.
+        self._dev("plain", "10.0.0.5", "Router", snmp=False)
+
+        status, body, _ = self._req("GET", "/api/admin/overview", token="s3cret")
+        self.assertEqual(status, 200)
+        org = next(o for o in body["orgs"] if o["org_id"] == "ispA")
+        self.assertEqual(org["devices"], 5)
+        self.assertEqual(org["snmp"], {"enabled": 4, "working": 2})
+        self.assertEqual(org["optics"]["olts"], 1)
+        self.assertEqual(org["optics"]["working"], 0)
+        self.assertEqual(org["ports"]["monitored"], 1)
+        self.assertEqual(org["ports"]["working"], 1)
+        problems = {(p["name"], p["area"], p["reason"]) for p in org["problems"]}
+        self.assertEqual(problems, {("dead1", "snmp", "never"),
+                                    ("olt1", "optics", "never"),
+                                    ("stale1", "snmp", "stale")})
+        self.assertEqual(body["problems_total"], 3)
+        self.assertEqual(body["totals"]["snmp"], {"enabled": 4, "working": 2})
+
 class DownloadRouteTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

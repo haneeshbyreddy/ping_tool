@@ -1,5 +1,5 @@
 import {
-  LayoutDashboard, Network, Users, Settings, Terminal, Building2,
+  LayoutDashboard, Network, Users, Settings, Terminal, Building2, Gauge,
   type LucideIcon,
 } from "lucide-react"
 
@@ -19,6 +19,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/team", label: "Team", icon: Users, mobile: true },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false },
   { to: "/logs", label: "Logs", icon: Terminal, mobile: false },
+  { to: "/overview", label: "Overview", icon: Gauge, mobile: false, superadminOnly: true },
   { to: "/orgs", label: "Organizations", icon: Building2, mobile: false, superadminOnly: true },
 ]
 
