@@ -54,6 +54,9 @@ class GponProfile:
     oid_ident_key: str = ""
     oid_ident_pon: str = ""
     oid_ident_onu: str = ""
+    oid_ident_state: str = ""
+    oid_ident_distance: str = ""
+    oid_ident_name: str = ""
     format_pon_label: Callable[[str], str] = lambda pon: pon
 
 def _huawei_state(raw: str) -> str:
@@ -76,7 +79,14 @@ HUAWEI = GponProfile(
     decode_state=_huawei_state, format_pon=_huawei_pon,
 )
 
-def _cdata_state(raw: str) -> str:
+def _dbc_state(raw: str) -> str:
+    s = str(raw).strip().lower()
+    if s in ("1", "online"):
+        return STATE_ONLINE
+    if s in ("0", "offline"):
+        return STATE_OFFLINE
+    # The .28 optical table carries no state column; a row that shows up only there
+    # is a live ONU with a fresh Rx reading, so treat a blank as online.
     return STATE_ONLINE
 
 DBC = GponProfile(
@@ -84,10 +94,18 @@ DBC = GponProfile(
     oid_rx="1.3.6.1.4.1.37950.1.1.5.12.1.28.1.3",
     oid_serial="1.3.6.1.4.1.37950.1.1.5.12.1.28.1.2",
     rx_scale=1.0,
-    decode_state=_cdata_state,
+    distance_scale=1.0,
+    decode_state=_dbc_state,
+    # The .12 registration table is the authoritative ONU roster — every ONU on
+    # every EPON port, online or not. Enumerate from it (not the sparse .28 optical
+    # cache, which on this OLT held ~16 mostly-one-PON readings) so all PON ports
+    # show up, then join Rx by MAC. col6=MAC, col2=PON, col3=ONU-id, col5=state
+    # (1=online/0=offline), col13=distance(m).
     oid_ident_key="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.6",
     oid_ident_pon="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.2",
     oid_ident_onu="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.3",
+    oid_ident_state="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.5",
+    oid_ident_distance="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.13",
     format_pon_label=lambda pon: f"EPON0/{pon}",
 )
 
@@ -120,81 +138,117 @@ def _index_after(oid: str, prefix: str) -> str | None:
 def _mac_norm(s: str) -> str:
     return re.sub(r"[^0-9a-f]", "", (s or "").lower())
 
+def _derive_onu_id(idx: str) -> int | None:
+    parts = idx.rsplit(".", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return int(parts[1])
+    return int(idx) if idx.isdigit() else None
+
+def _as_int(raw) -> int | None:
+    return int(raw) if (raw not in (None, "") and str(raw).isdigit()) else None
+
+def _place(oid: str, val: str, cols: dict[str, str], out: dict[str, dict]) -> bool:
+    for prefix, fieldname in cols.items():
+        if not prefix:
+            continue
+        idx = _index_after(oid, prefix)
+        if idx is not None:
+            out.setdefault(idx, {})[fieldname] = val
+            return True
+    return False
+
+def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
+    serial = (cells.get("serial") or "").strip() or None
+    return OnuOptic(
+        onu_key=serial or idx,
+        pon_port=profile.format_pon(idx),
+        onu_id=_derive_onu_id(idx),
+        name=(cells.get("name") or "").strip() or None,
+        serial=serial,
+        state=profile.decode_state(cells.get("state", "")),
+        rx_dbm=_to_float(cells.get("rx"), profile.rx_scale),
+        tx_dbm=_to_float(cells.get("tx"), profile.tx_scale),
+        distance_m=_to_int(cells.get("distance"), profile.distance_scale),
+    )
+
 def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> list[OnuOptic]:
-    cols = {
+    metric_cols = {
         profile.oid_rx: "rx", profile.oid_tx: "tx", profile.oid_state: "state",
         profile.oid_distance: "distance", profile.oid_serial: "serial",
         profile.oid_name: "name",
     }
     ident_cols = {
         profile.oid_ident_key: "key", profile.oid_ident_pon: "pon",
-        profile.oid_ident_onu: "onu",
+        profile.oid_ident_onu: "onu", profile.oid_ident_state: "state",
+        profile.oid_ident_distance: "distance", profile.oid_ident_name: "name",
     }
-    rows: dict[str, dict] = {}
+    metric: dict[str, dict] = {}
     ident: dict[str, dict] = {}
     for oid, val in varbinds:
-        placed = False
-        for prefix, fieldname in cols.items():
-            if not prefix:
-                continue
-            idx = _index_after(oid, prefix)
-            if idx is not None:
-                rows.setdefault(idx, {})[fieldname] = val
-                placed = True
-                break
-        if placed:
+        if not _place(oid, val, metric_cols, metric):
+            _place(oid, val, ident_cols, ident)
+
+    # No registration table (e.g. Huawei) — the metric table's OID index already
+    # encodes pon.onu, so each metric row is exactly one ONU.
+    if not (profile.oid_ident_key and ident):
+        return [_onu_from_metric(idx, cells, profile) for idx, cells in metric.items()]
+
+    # Registration table present (DBC): it is the authoritative ONU roster across
+    # every PON. Index the (sparse) optical readings by MAC — and by MAC+onu-id, to
+    # disambiguate a MAC that re-registered on a second PON — then walk every
+    # registered ONU and attach an Rx only where the OLT actually measured one.
+    opt_by_mac: dict[str, list[tuple[str, dict]]] = {}
+    opt_by_mac_onu: dict[tuple[str, int], tuple[str, dict]] = {}
+    for midx, cells in metric.items():
+        mac = _mac_norm(cells.get("serial", ""))
+        if not mac:
             continue
-        for prefix, fieldname in ident_cols.items():
-            if not prefix:
-                continue
-            idx = _index_after(oid, prefix)
-            if idx is not None:
-                ident.setdefault(idx, {})[fieldname] = val
-                break
-    pair_pon: dict[tuple[str, int], str] = {}
-    mac_rows: dict[str, list[tuple[str | None, str | None]]] = {}
-    for cells in ident.values():
-        k = _mac_norm(cells.get("key", ""))
-        if not k:
-            continue
-        pon, onu = cells.get("pon"), cells.get("onu")
-        mac_rows.setdefault(k, []).append((pon, onu))
-        if pon not in (None, "") and onu not in (None, "") and str(onu).isdigit():
-            pair_pon[(k, int(onu))] = str(pon)
+        opt_by_mac.setdefault(mac, []).append((midx, cells))
+        onu = _derive_onu_id(midx)
+        if onu is not None:
+            opt_by_mac_onu.setdefault((mac, onu), (midx, cells))
+
+    consumed: set[str] = set()
     out: list[OnuOptic] = []
-    for idx, cells in rows.items():
-        parts = idx.rsplit(".", 1)
-        onu_id = None
-        if len(parts) == 2 and parts[1].isdigit():
-            onu_id = int(parts[1])
-        elif idx.isdigit():
-            onu_id = int(idx)
-        serial = (cells.get("serial") or "").strip() or None
-        pon_port = profile.format_pon(idx)
-        key = _mac_norm(serial) if serial else ""
-        if key and mac_rows:
-            pon = None
-            if onu_id is not None and (key, onu_id) in pair_pon:
-                pon = pair_pon[(key, onu_id)]
+    for cells in ident.values():
+        mac_raw = (cells.get("key") or "").strip()
+        mac = _mac_norm(mac_raw)
+        onu_id = _as_int(cells.get("onu"))
+        pon = cells.get("pon")
+        match = None
+        if mac:
+            exact = opt_by_mac_onu.get((mac, onu_id)) if onu_id is not None else None
+            if exact and exact[0] not in consumed:
+                match = exact
             else:
-                only = mac_rows.get(key)
-                if only and len(only) == 1:
-                    pon, onu_raw = only[0]
-                    if onu_raw not in (None, "") and str(onu_raw).isdigit():
-                        onu_id = int(onu_raw)
-            if pon not in (None, ""):
-                pon_port = profile.format_pon_label(str(pon))
+                match = next((c for c in opt_by_mac.get(mac, []) if c[0] not in consumed),
+                             None)
+        ocells: dict = {}
+        if match:
+            consumed.add(match[0])
+            ocells = match[1]
+        pon_port = (profile.format_pon_label(str(pon)) if pon not in (None, "")
+                    else profile.format_pon(str(onu_id) if onu_id is not None else ""))
+        # Identity is the ONU's physical slot (pon.onu), not its MAC: a MAC that
+        # re-registers on another PON leaves a stale ghost sharing the MAC, so a
+        # MAC key would collapse two distinct roster slots into one.
         out.append(OnuOptic(
-            onu_key=serial or idx,
+            onu_key=(f"{pon}.{onu_id}" if (pon not in (None, "") and onu_id is not None)
+                     else (mac_raw.upper() or str(pon or onu_id or "?"))),
             pon_port=pon_port,
             onu_id=onu_id,
             name=(cells.get("name") or "").strip() or None,
-            serial=serial,
+            serial=(mac_raw.upper() or None),
             state=profile.decode_state(cells.get("state", "")),
-            rx_dbm=_to_float(cells.get("rx"), profile.rx_scale),
-            tx_dbm=_to_float(cells.get("tx"), profile.tx_scale),
+            rx_dbm=_to_float(ocells.get("rx"), profile.rx_scale),
+            tx_dbm=_to_float(ocells.get("tx"), profile.tx_scale),
             distance_m=_to_int(cells.get("distance"), profile.distance_scale),
         ))
+    # Optical readings whose MAC never appeared in the roster still deserve a row
+    # (roster walk truncated, or an ONU registering right now) — index-derived pon.
+    for midx, cells in metric.items():
+        if midx not in consumed:
+            out.append(_onu_from_metric(midx, cells, profile))
     return out
 
 class PysnmpGponPoller:
@@ -216,7 +270,9 @@ class PysnmpGponPoller:
         p = self.profile
         columns = [c for c in (p.oid_rx, p.oid_tx, p.oid_state, p.oid_distance,
                                p.oid_serial, p.oid_name,
-                               p.oid_ident_key, p.oid_ident_pon, p.oid_ident_onu) if c]
+                               p.oid_ident_key, p.oid_ident_pon, p.oid_ident_onu,
+                               p.oid_ident_state, p.oid_ident_distance,
+                               p.oid_ident_name) if c]
         if self._engine is None:
             self._engine = SnmpEngine()
         engine = self._engine

@@ -67,27 +67,37 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(o.rx_dbm, -14.62)
         self.assertEqual(o.state, STATE_ONLINE)
 
-    def test_dbc_joins_pon_onu_from_master_table(self):
+    def test_dbc_enumerates_whole_roster_and_joins_rx_by_mac(self):
+        # The .12 roster lists every ONU on every PON; the sparse .28 optical table
+        # only measured one of them. Both ONUs must show; Rx attaches to its MAC.
         vbs = [
             (f"{DBC.oid_serial}.2", "98:2F:3C:B9:42:F8"),
             (f"{DBC.oid_rx}.2", "-14.62"),
             (f"{DBC.oid_ident_key}.1", "98:2f:3c:b9:42:f8"),
             (f"{DBC.oid_ident_pon}.1", "1"),
             (f"{DBC.oid_ident_onu}.1", "2"),
+            (f"{DBC.oid_ident_state}.1", "1"),
             (f"{DBC.oid_ident_key}.77", "aa:bb:cc:dd:ee:ff"),
             (f"{DBC.oid_ident_pon}.77", "3"),
             (f"{DBC.oid_ident_onu}.77", "9"),
+            (f"{DBC.oid_ident_state}.77", "0"),
         ]
-        onus = parse_onu_table(vbs, DBC)
-        self.assertEqual(len(onus), 1)
-        o = onus[0]
-        self.assertEqual(o.onu_key, "98:2F:3C:B9:42:F8")
-        self.assertEqual(o.rx_dbm, -14.62)
-        self.assertEqual(o.state, STATE_ONLINE)
-        self.assertEqual(o.pon_port, "EPON0/1")
-        self.assertEqual(o.onu_id, 2)
+        onus = {o.onu_key: o for o in parse_onu_table(vbs, DBC)}
+        self.assertEqual(set(onus), {"1.2", "3.9"})
+        lit = onus["1.2"]
+        self.assertEqual(lit.pon_port, "EPON0/1")
+        self.assertEqual(lit.onu_id, 2)
+        self.assertEqual(lit.serial, "98:2F:3C:B9:42:F8")
+        self.assertEqual(lit.rx_dbm, -14.62)
+        self.assertEqual(lit.state, STATE_ONLINE)
+        dark = onus["3.9"]
+        self.assertEqual(dark.pon_port, "EPON0/3")
+        self.assertEqual(dark.state, STATE_OFFLINE)
+        self.assertIsNone(dark.rx_dbm)  # not in the optical table
 
-    def test_dbc_duplicate_mac_resolved_by_onu_id(self):
+    def test_dbc_reregistered_mac_stays_two_distinct_slots(self):
+        # Same MAC on two PONs (an ONU moved, leaving a stale ghost) must remain two
+        # rows keyed by slot, and the single Rx reading lands on the matching onu-id.
         vbs = [
             (f"{DBC.oid_serial}.23", "80:B5:75:20:98:BA"),
             (f"{DBC.oid_rx}.23", "-14.53"),
@@ -98,9 +108,10 @@ class ParseTest(unittest.TestCase):
             (f"{DBC.oid_ident_pon}.101", "3"),
             (f"{DBC.oid_ident_onu}.101", "51"),
         ]
-        o = parse_onu_table(vbs, DBC)[0]
-        self.assertEqual(o.pon_port, "EPON0/1")
-        self.assertEqual(o.onu_id, 23)
+        onus = {o.onu_key: o for o in parse_onu_table(vbs, DBC)}
+        self.assertEqual(set(onus), {"1.23", "3.51"})
+        self.assertEqual(onus["1.23"].rx_dbm, -14.53)   # onu-id 23 matches .28 idx 23
+        self.assertIsNone(onus["3.51"].rx_dbm)
 
     def test_dbc_without_master_row_falls_back_to_index(self):
         onus = parse_onu_table(_vb(DBC, "7", rx="-15.0", serial="DE:AD:BE:EF:00:07"), DBC)
