@@ -378,6 +378,22 @@ class GatherTest(unittest.TestCase):
         self.assertEqual(huawei.walked, ["10.0.0.1"])
         self.assertEqual(zte.walked, ["10.0.0.2"])
 
+    def test_slow_olt_rides_the_gpon_cap_not_the_snmp_cap(self):
+        # A slow EPON agent (PYLON/NDN class) blows the generic 20s walk cap but
+        # must still land under the dedicated GPON budget — the 2026-07-09 stale-
+        # optics regression: roster walks starved by snmp_walk_timeout_s.
+        class Slow(_FakePoller):
+            async def walk(self, target):
+                await asyncio.sleep(0.1)
+                return await super().walk(target)
+
+        devices = [{"id": 8, "ip_address": "10.0.0.8", "device_type": "OLT",
+                    "snmp_enabled": 1}]
+        poller = Slow({"10.0.0.8": [OnuOptic("K8", state="online")]})
+        cfg = Config(snmp_walk_timeout_s=0.01, gpon_walk_timeout_s=5.0)
+        out = self._run(_gather_onu_optics(_OnePool(poller), devices, cfg))
+        self.assertEqual(set(out), {8})
+
     def test_unresolved_vendor_skips_the_olt_entirely(self):
         walked = _FakePoller({"10.0.0.1": [OnuOptic("HW", state="online")]})
 

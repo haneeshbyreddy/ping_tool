@@ -150,10 +150,10 @@ async def _gather_onu_optics(
                 return None
             try:
                 onus = await asyncio.wait_for(
-                    poller.walk(target), timeout=cfg.snmp_walk_timeout_s or None)
+                    poller.walk(target), timeout=cfg.gpon_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("GPON walk of OLT %s (%s) exceeded %.0fs cap; skipping",
-                            d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
+                            d.get("id"), d["ip_address"], cfg.gpon_walk_timeout_s)
                 return None
             except Exception:
                 log.exception("GPON walk failed for OLT %s (%s); continuing",

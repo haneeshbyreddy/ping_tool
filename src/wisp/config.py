@@ -73,6 +73,13 @@ class Config:
     snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 90))
     snmp_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_SNMP_WALK_TIMEOUT_S", 20.0))
+    # GPON roster walks get their own, larger cap: a slow EPON agent (PYLON/NDN
+    # class) needs >20s for 5 roster columns x hundreds of ONUs, and the optics
+    # sweep is a background task under the SNMP semaphore — a slow OLT delays
+    # nothing but its own reading. 20s starved those boxes into permanently
+    # stale optics (field-diagnosed 2026-07-09 via remote diag walks).
+    gpon_walk_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_GPON_WALK_TIMEOUT_S", 75.0))
     snmp_max_inflight: int = field(
         default_factory=lambda: _env_int("WISP_SNMP_MAX_INFLIGHT", 4))
     snmp_down_consecutive: int = field(
