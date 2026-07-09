@@ -207,17 +207,18 @@ function DeviceForm({
                 onChange={(e) => setForm({ ...form, snmp_port: e.target.value })} />
             </>
           )}
-          {/* GPON vendor is per-OLT — which MIB the edge walks for ONU optics. Only an
-              OLT has ONUs, so surface it only for that type (auto = the fleet default). */}
+          {/* GPON vendor is per-OLT — which MIB the edge walks for ONU optics. The edge
+              auto-detects it from the box's sysObjectID; picking a vendor here is an
+              OVERRIDE for a box whose sysObjectID is missing or wrong. */}
           {form.device_type === "OLT" && (
             <div className="flex items-center gap-2 text-sm">
               <Label className="text-muted-foreground">GPON vendor</Label>
               <Select value={form.gpon_vendor || "auto"}
                 onValueChange={(v) => setForm({ ...form, gpon_vendor: v === "auto" ? "" : v })}>
-                <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-44"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="auto">auto (default)</SelectItem>
-                  {GPON_VENDORS.map((v) => <SelectItem key={v} value={v}>{v}</SelectItem>)}
+                  <SelectItem value="auto">auto-detect (default)</SelectItem>
+                  {GPON_VENDORS.map((v) => <SelectItem key={v} value={v}>{v} (override)</SelectItem>)}
                 </SelectContent>
               </Select>
             </div>

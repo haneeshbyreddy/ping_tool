@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS org_devices (
     snmp_version     TEXT NOT NULL DEFAULT '2c',
     snmp_community   TEXT,
     snmp_port        INTEGER NOT NULL DEFAULT 161,
-    gpon_vendor      TEXT,                 -- OLT only: which GponProfile the edge walks
+    gpon_vendor      TEXT,                 -- OLT only: manual override; NULL = the edge
+                                           -- auto-detects the GponProfile via sysObjectID
                                             -- (ingress/gpon.py); NULL = fall back to the
                                             -- edge's WISP_GPON_VENDOR env, then huawei
     is_active        INTEGER NOT NULL DEFAULT 1,
@@ -230,6 +231,13 @@ CREATE TABLE IF NOT EXISTS rollouts (
     started_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     note           TEXT
+);
+-- Tiny central-wide KV (not org-scoped): release-sync health lives here so a dead
+-- mirror is visible/pageable instead of rotting silently (the 2026-07 expired-PAT
+-- incident stalled a rollout for days with zero signal).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(org_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(org_id, node_id, device_id, id);
@@ -1954,6 +1962,29 @@ class CentralStore:
                 " channel=excluded.channel, artifacts=excluded.artifacts",
                 (version, channel, json.dumps(artifacts, separators=(",", ":")), _now_iso()))
             conn.commit()
+
+    def set_release_sync_status(self, ok: bool, detail: str,
+                                now: str | None = None) -> dict | None:
+        """Record the latest release-sync outcome; returns the PREVIOUS status.
+
+        The previous status is what makes transition-only paging possible — the
+        sync timer fires every 15 min and a broken mirror must page once, not 96x/day.
+        """
+        prev = self.release_sync_status()
+        doc = {"ok": bool(ok), "detail": detail, "at": now or _now_iso()}
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('release_sync', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(doc, separators=(",", ":")),))
+            conn.commit()
+        return prev
+
+    def release_sync_status(self) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='release_sync'").fetchone()
+        return json.loads(row["value"]) if row else None
 
     def get_release(self, version: str) -> dict | None:
         with self._connect() as conn:

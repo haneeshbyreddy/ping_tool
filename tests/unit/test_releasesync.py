@@ -158,10 +158,65 @@ class SyncReleaseTest(unittest.TestCase):
         version, n = releasesync.sync_release(self.store, cfg=self.cfg, gh=gh)
         self.assertEqual((version, n), ("0.13.0", 1))  # publish still succeeds
 
-    def test_missing_token_raises_before_network(self):
-        cfg = dataclasses.replace(self.cfg, github_token="")
+    def test_missing_token_is_fine_public_repo(self):
+        # Public repo: no token = unauthenticated sync, no Authorization header.
+        gh = releasesync.GithubReleases("o/r")
+        self.assertNotIn("Authorization", gh._headers("application/vnd.github+json"))
+
+    def test_missing_repo_raises_before_network(self):
         with self.assertRaises(releasesync.ReleaseSyncError):
-            releasesync.sync_release(self.store, cfg=cfg)
+            releasesync.GithubReleases("", "tok")
+
+
+class _RecordingNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, recipient, title, body, priority):
+        self.sent.append((recipient, title, priority))
+        class R:  # matches NotifyResult's .ok surface
+            ok = True
+        return R()
+
+
+class SyncAndRecordTest(unittest.TestCase):
+    """Monitor-the-monitor: sync outcome is stamped, pages fire on transitions only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.store = CentralStore(root / "c.db")
+        self.cfg = dataclasses.replace(CONFIG, release_cache_dir=root / "releases",
+                                       github_token="", releases_repo="o/r")
+        self.notifier = _RecordingNotifier()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, gh):
+        return releasesync.sync_and_record(self.store, self.notifier,
+                                           cfg=self.cfg, gh=gh)
+
+    def test_success_records_status_and_stays_quiet(self):
+        self._run(_FakeGh("v0.13.0", _scenario()))
+        st = self.store.release_sync_status()
+        self.assertTrue(st["ok"])
+        self.assertEqual(st["detail"], "0.13.0")
+        self.assertEqual(self.notifier.sent, [])  # healthy from the start: no page
+
+    def test_failure_pages_once_then_recovery_pages_once(self):
+        broken = _FakeGh("v0.13.0", {})  # no manifest.json asset
+        for _ in range(3):  # timer fires repeatedly; page only on the transition
+            with self.assertRaises(releasesync.ReleaseSyncError):
+                self._run(broken)
+        self.assertFalse(self.store.release_sync_status()["ok"])
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertIn("RELEASE SYNC FAILING", self.notifier.sent[0][1])
+
+        self._run(_FakeGh("v0.13.0", _scenario()))
+        self.assertTrue(self.store.release_sync_status()["ok"])
+        self.assertEqual(len(self.notifier.sent), 2)
+        self.assertIn("recovered", self.notifier.sent[1][1])
 
 
 class GithubDownloadRedirectTest(unittest.TestCase):

@@ -141,8 +141,13 @@ async def _gather_onu_optics(
     async def one(d: dict) -> tuple[int, list[dict]] | None:
         target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
                             port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
-        poller = pool.for_vendor(d.get("gpon_vendor"))
         async with sem:
+            # Vendor resolution inside the semaphore: the auto-detect path may do a
+            # one-varbind sysObjectID read, and ALL SNMP I/O stays bounded. None =
+            # no profile claims this box — optics deliberately off, never guessed.
+            poller = await pool.resolve(d, target)
+            if poller is None:
+                return None
             try:
                 onus = await asyncio.wait_for(
                     poller.walk(target), timeout=cfg.snmp_walk_timeout_s or None)

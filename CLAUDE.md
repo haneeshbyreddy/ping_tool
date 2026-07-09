@@ -192,6 +192,19 @@ Src layout, zero-install:
   row (dashboard: Settings → SNMP health profiles), NEVER an edge code change or rollout.
   Deliberately tiny vocabulary — a vendor encoding this can't express is the rare case that
   still warrants code, not a reason to grow a DSL.
+- **GPON vendor is AUTO-DETECTED from sysObjectID; unmatched = optics OFF, never guess.**
+  `ingress/gpon.py:match_gpon_profile` longest-prefix matches the OLT's sysObjectID
+  against each `GponProfile.match_sysobjectid` (same rule as the health profiles;
+  model-specific beats vendor-wide — author prefixes at the most specific arc verified,
+  a vendor-wide one can claim a sibling product: MAIPU lives under Fiberhome's PEN 5651).
+  Precedence in `GponPollerPool.resolve`: device `gpon_vendor` (dashboard dropdown, now
+  an OVERRIDE for a box whose sysObjectID is missing/lying) > `WISP_GPON_VENDOR`
+  (fleet-wide escape hatch, default EMPTY = auto) > sysObjectID match > None. A None
+  poller means that OLT reports no optics at all — a missing reading is recoverable, a
+  fabricated dBm is the DBC `28.1.3` placeholder trap. Detection is one varbind, cached
+  per device (1h ok / 15min on silence — catches a hardware swap at the same IP), runs
+  inside the SNMP semaphore, and its reader reuses ONE lazy `SnmpEngine` (the leak
+  invariant). Tests: `unit/test_gpon` (`MatchProfileTest`/`ResolveTest`/`GatherTest`).
 - **Tests:** `integration/test_central_brain.py`, `test_daemon_central_brain.py`,
   `test_central_ports.py`, `test_central_redundancy.py`, `test_central_perf.py`,
   `test_central_snmp_walk.py` (walk channel + profiles), `unit/test_health.py`
@@ -472,21 +485,23 @@ Src layout, zero-install:
   notes (`RELEASE_NOTES.md` → `body_path`, kept OUTSIDE `release/` so it isn't uploaded
   as an asset): an install table pointing at the setup exe/.debs plus an explicit
   "everything else is the self-update channel" line.
-- **The GitHub repo is PRIVATE; central is the release mirror — nothing else touches
-  GitHub.** `central/releasesync.py:sync_release` (run by `wisp-release-sync.timer` →
-  `admin sync-releases`) pulls the latest release via the GitHub REST API using
-  `WISP_GITHUB_TOKEN` (fine-grained PAT, Contents:read — the ONLY GitHub credential in
-  the system, lives in `deploy/central.env`), downloads `manifest.json` + every agent
-  binary it lists + the installers into `cfg.release_cache_dir` (`data/releases/<ver>/`),
-  **verifies each agent binary against the manifest's sha256 before caching**, then
-  rewrites the artifact URLs to central-relative `/download/<ver>/<name>` (sha256
-  unchanged) and records the release. Private-repo asset downloads are a two-hop dance:
-  the asset API 302s to a signed S3 URL that REJECTS an `Authorization` header, so
-  `GithubReleases.download` captures the `Location` and re-fetches it clean (don't let
-  urllib auto-follow with the token attached — `_NoRedirect`). `server.py`'s public
-  `/download/<ver|latest>/<name>` route serves the cache (no auth — compiled artifacts
-  aren't secrets, the SOURCE is what's private; edges self-update from here with no
-  session). The supervisor resolves a leading-`/` directive URL against its own
+- **The GitHub repo is PUBLIC (since 2026-07-09); central is still the release mirror —
+  edges never touch GitHub.** `central/releasesync.py:sync_release` (run by
+  `wisp-release-sync.timer` → `admin sync-releases`) pulls the latest release via the
+  GitHub REST API **unauthenticated** — `WISP_GITHUB_TOKEN` is optional, only for a
+  private repo or the 60/h anonymous rate limit (the 2026-07 expired-PAT incident that
+  silently blocked the v0.14.0 rollout is why tokenless is the default). Downloads
+  `manifest.json` + every agent binary it lists + the installers into
+  `cfg.release_cache_dir` (`data/releases/<ver>/`), **verifies each agent binary
+  against the manifest's sha256 before caching**, then rewrites the artifact URLs to
+  central-relative `/download/<ver>/<name>` (sha256 unchanged) and records the release.
+  Asset downloads stay a two-hop dance: the asset API 302s to a signed S3 URL that
+  REJECTS an `Authorization` header, so `GithubReleases.download` captures the
+  `Location` and re-fetches it clean (don't let urllib auto-follow with a token
+  attached — `_NoRedirect`; harmless tokenless, load-bearing with a token). `server.py`'s
+  public `/download/<ver|latest>/<name>` route serves the cache (no auth; edges
+  self-update from here with no session — the mirror stays the ONLY artifact source so
+  edge delivery never depends on GitHub reachability or auth). The supervisor resolves a leading-`/` directive URL against its own
   `WISP_CENTRAL_URL` (`apps/supervisor/main.py:_download`). Tests: `unit/test_releasesync`
   (FakeGh + the redirect/auth-drop case), `integration/test_central.DownloadRouteTest`.
 - **Install-artifact asset names are VERSION-LESS and load-bearing**

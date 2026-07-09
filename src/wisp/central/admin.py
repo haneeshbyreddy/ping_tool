@@ -48,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("sync-releases", help="mirror the latest GitHub release (installers + "
                    "agent binaries) into central and publish it (run on a timer so "
-                   "central auto-learns each tag; needs WISP_GITHUB_TOKEN for a private repo)")
+                   "central auto-learns each tag; unauthenticated — the repo is public, "
+                   "WISP_GITHUB_TOKEN only needed if it ever goes private)")
 
     p = sub.add_parser("start-rollout", help="begin a staged rollout to an org")
     p.add_argument("--org", required=True)
@@ -109,8 +110,9 @@ def main(argv: list[str] | None = None) -> int:
                 plats = ", ".join(sorted(rel["artifacts"])) or "(no artifacts)"
                 print(f"  {r['version']:<16} {r['channel']:<8} {r['created_at']}  {plats}")
         elif args.cmd == "sync-releases":
+            from wisp.egress.notifiers import build_notifier
             try:
-                version, n = releasesync.sync_release(store)
+                version, n = releasesync.sync_and_record(store, build_notifier(CONFIG))
             except releasesync.ReleaseSyncError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1

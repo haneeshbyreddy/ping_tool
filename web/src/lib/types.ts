@@ -358,8 +358,8 @@ export interface SystemStats {
   memory: {
     total_bytes: number; used_bytes: number; available_bytes: number; percent: number
   } | null
-  disk: {
-    total_bytes: number; used_bytes: number; free_bytes: number; percent: number
-  } | null
   process: { rss_bytes: number | null; db_bytes: number | null }
+  /** Release-mirror health: null until the first sync ever runs. */
+  release_sync: { ok: boolean; detail: string; at: string } | null
+  latest_release: string | null
 }

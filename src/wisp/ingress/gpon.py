@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from wisp.config import CONFIG, Config
+from wisp.ingress.health import OID_SYS_OBJECT_ID, sys_object_id
 from wisp.ingress.snmp import SnmpTarget
 
 log = logging.getLogger(__name__)
@@ -40,7 +42,9 @@ class OnuOptic:
 @dataclass(frozen=True)
 class GponProfile:
     name: str
-    oid_rx: str
+    # Optional on purpose: a vendor whose real Rx OID is unknown ships WITHOUT one
+    # (roster/state/distance only) rather than a plausible-but-wrong column.
+    oid_rx: str = ""
     oid_tx: str = ""
     oid_state: str = ""
     oid_distance: str = ""
@@ -58,6 +62,12 @@ class GponProfile:
     oid_ident_distance: str = ""
     oid_ident_name: str = ""
     format_pon_label: Callable[[str], str] = lambda pon: pon
+    # The maker's sysObjectID arc (PEN prefix) this profile claims. Vendor
+    # auto-detect matches an untagged OLT's sysObjectID against these by longest
+    # prefix — author at the most specific arc actually verified (a vendor-wide
+    # prefix can silently claim a sibling product: MAIPU sits under Fiberhome's
+    # PEN 5651, for example).
+    match_sysobjectid: str = ""
 
 def _huawei_state(raw: str) -> str:
     m = {"1": STATE_ONLINE, "2": STATE_OFFLINE, "online": STATE_ONLINE,
@@ -77,6 +87,7 @@ HUAWEI = GponProfile(
     oid_name="1.3.6.1.4.1.2011.6.128.1.1.2.46.1.4",
     rx_scale=0.01, tx_scale=0.01, distance_scale=1.0,
     decode_state=_huawei_state, format_pon=_huawei_pon,
+    match_sysobjectid="1.3.6.1.4.1.2011",
 )
 
 def _dbc_state(raw: str) -> str:
@@ -91,8 +102,13 @@ def _dbc_state(raw: str) -> str:
 
 DBC = GponProfile(
     name="dbc",
-    oid_rx="1.3.6.1.4.1.37950.1.1.5.12.1.28.1.3",
-    oid_serial="1.3.6.1.4.1.37950.1.1.5.12.1.28.1.2",
+    # NO Rx column on purpose. The `.28` optical cache (`...5.12.1.28.1.3`) was
+    # field-DEBUNKED on the PYLON EPOLT-3304: near-uniform ~-15 dBm, PON1-only,
+    # r≈0.13 against the web OPM-Diag truth — these OLTs populate per-ONU optical
+    # ON DEMAND (live EPON-OAM query), so no passive walk holds real Rx. Until a
+    # warm-capture walk finds a true OID, DBC ships roster/state/distance only:
+    # a blank Rx is recoverable, a fabricated one pages people. Restore by setting
+    # oid_rx (+ oid_serial `...28.1.2` for the MAC join) to the VALIDATED column.
     rx_scale=1.0,
     distance_scale=1.0,
     decode_state=_dbc_state,
@@ -107,9 +123,32 @@ DBC = GponProfile(
     oid_ident_state="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.5",
     oid_ident_distance="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.13",
     format_pon_label=lambda pon: f"EPON0/{pon}",
+    match_sysobjectid="1.3.6.1.4.1.37950",
 )
 
 PROFILES: dict[str, GponProfile] = {HUAWEI.name: HUAWEI, DBC.name: DBC}
+
+def match_gpon_profile(sysobjectid: str | None) -> GponProfile | None:
+    """Vendor auto-detect: longest sysObjectID-prefix wins (same rule as
+    health.py's match_profile — model-specific beats vendor-wide).
+
+    None when no profile claims the arc: that OLT reports NO optics — we never
+    probe candidate OID roots and guess. A missing reading is recoverable; a
+    plausible-but-wrong dBm is the DBC 28.1.3 placeholder trap all over again.
+    """
+    soid = (sysobjectid or "").strip().strip(".")
+    if not soid:
+        return None
+    best: GponProfile | None = None
+    best_len = -1
+    for p in PROFILES.values():
+        prefix = p.match_sysobjectid.strip().strip(".")
+        if not prefix:
+            continue
+        if soid == prefix or soid.startswith(prefix + "."):
+            if len(prefix) > best_len:
+                best, best_len = p, len(prefix)
+    return best
 
 class GponPoller(Protocol):
     async def walk(self, target: SnmpTarget) -> list[OnuOptic]: ...
@@ -298,35 +337,112 @@ class PysnmpGponPoller:
             raise RuntimeError(f"GPON walk of {target.ip} failed: {exc}") from exc
         return parse_onu_table(varbinds, p)
 
-def _resolve_profile(vendor: str) -> GponProfile:
-    profile = PROFILES.get(vendor)
-    if profile is None:
-        log.warning("unknown GPON vendor %r; falling back to huawei profile", vendor)
-        return HUAWEI
-    return profile
+# Auto-detect cache cadence: a successful read is re-checked hourly (one varbind;
+# catches a hardware swap at the same IP without an edge restart), a silent box is
+# retried sooner so optics light up quickly once its SNMP agent comes back.
+_DETECT_TTL_S = 3600.0
+_DETECT_RETRY_S = 900.0
 
-def build_gpon_poller(cfg: Config = CONFIG) -> GponPoller:
-    vendor = (getattr(cfg, "gpon_vendor", "") or "huawei").lower()
-    return PysnmpGponPoller(_resolve_profile(vendor), cfg)
+class PysnmpSysObjectIdReader:
+    """One-varbind sysObjectID fetch for vendor auto-detect.
+
+    Same engine-reuse invariant as the pollers: ONE lazy SnmpEngine for the
+    reader's lifetime, never one per read — a per-call engine leaks ~1 MiB RSS
+    + a socket FD each (see CLAUDE.md's SnmpEngine note).
+    """
+
+    def __init__(self, cfg: Config = CONFIG) -> None:
+        self._timeout = cfg.snmp_timeout_s
+        self._engine = None
+
+    async def read(self, target: SnmpTarget) -> str | None:
+        try:
+            from pysnmp.hlapi.asyncio import (
+                SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+                ObjectType, ObjectIdentity, bulk_walk_cmd,
+            )
+        except ImportError as exc:
+            raise RuntimeError("GPON auto-detect needs 'pysnmp' (pip install pysnmp).") from exc
+        if self._engine is None:
+            self._engine = SnmpEngine()
+        community = CommunityData(target.community, mpModel=1)
+        transport = await UdpTransportTarget.create(
+            (target.ip, target.port), timeout=self._timeout, retries=1)
+        varbinds: list[tuple[str, str]] = []
+        async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
+            self._engine, community, transport, ContextData(),
+            0, 2, ObjectType(ObjectIdentity(OID_SYS_OBJECT_ID)),
+            lexicographicMode=False,
+        ):
+            if errInd or errStat:
+                raise RuntimeError(
+                    f"sysObjectID read of {target.ip} failed: {errInd or errStat}")
+            for name, val in binds:
+                varbinds.append((str(name), val.prettyPrint()))
+        return sys_object_id(varbinds)
 
 class GponPollerPool:
+    """One shared poller per profile + per-OLT vendor selection.
+
+    Precedence (the dashboard dropdown is an OVERRIDE, not the primary path):
+    device `gpon_vendor` > `WISP_GPON_VENDOR` (fleet-wide escape hatch) >
+    sysObjectID longest-prefix auto-detect. Nothing matches = None: that OLT
+    reports no optics — never guess OIDs at a box.
+    """
 
     def __init__(self, cfg: Config = CONFIG,
-                 factory: Callable[[GponProfile, Config], GponPoller] = PysnmpGponPoller):
+                 factory: Callable[[GponProfile, Config], GponPoller] = PysnmpGponPoller,
+                 detector=None):
         self._cfg = cfg
         self._factory = factory
-        self._fallback = (getattr(cfg, "gpon_vendor", "") or "huawei").lower()
+        self._fallback = (getattr(cfg, "gpon_vendor", "") or "").strip().lower()
         self._pollers: dict[str, GponPoller] = {}
-        self._resolved: dict[str, str] = {}
+        self._detector = detector  # .read(target) -> str | None; lazily built
+        self._detected: dict[object, tuple[str | None, float]] = {}
 
-    def for_vendor(self, vendor: str | None) -> GponPoller:
+    def for_vendor(self, vendor: str | None) -> GponPoller | None:
         name = (vendor or "").strip().lower() or self._fallback
-        key = self._resolved.get(name)
-        if key is None:
-            key = _resolve_profile(name).name
-            self._resolved[name] = key
-        poller = self._pollers.get(key)
+        if not name:
+            return None
+        profile = PROFILES.get(name)
+        if profile is None:
+            log.warning("unknown GPON vendor %r; optics skipped — never guess OIDs", name)
+            return None
+        return self._poller_for(profile)
+
+    async def resolve(self, device: dict, target: SnmpTarget) -> GponPoller | None:
+        """Pick the poller for one OLT; None means optics stay off for it."""
+        vendor = (device.get("gpon_vendor") or "").strip().lower() or self._fallback
+        if vendor:
+            return self.for_vendor(vendor)
+        soid = await self._sysobjectid(device.get("id") or target.ip, target)
+        profile = match_gpon_profile(soid)
+        if profile is None:
+            log.debug("OLT %s (%s): sysObjectID %r matches no GPON profile; optics off",
+                      device.get("id"), target.ip, soid)
+            return None
+        return self._poller_for(profile)
+
+    def _poller_for(self, profile: GponProfile) -> GponPoller:
+        poller = self._pollers.get(profile.name)
         if poller is None:
-            poller = self._factory(_resolve_profile(key), self._cfg)
-            self._pollers[key] = poller
+            poller = self._factory(profile, self._cfg)
+            self._pollers[profile.name] = poller
         return poller
+
+    async def _sysobjectid(self, key, target: SnmpTarget) -> str | None:
+        now = time.monotonic()
+        cached = self._detected.get(key)
+        if cached is not None:
+            soid, at = cached
+            if now - at < (_DETECT_TTL_S if soid else _DETECT_RETRY_S):
+                return soid
+        if self._detector is None:
+            self._detector = PysnmpSysObjectIdReader(self._cfg)
+        try:
+            soid = await self._detector.read(target)
+        except Exception as exc:
+            log.debug("sysObjectID detect failed for %s: %s", target.ip, exc)
+            soid = None
+        self._detected[key] = (soid, now)
+        return soid

@@ -86,7 +86,11 @@ class Config:
     optical_crit_dbm: float = field(
         default_factory=lambda: _env_float("WISP_OPTICAL_CRIT_DBM", -27.0))
     optical_alerts: bool = field(default_factory=lambda: _env_bool("WISP_OPTICAL_ALERTS", True))
-    gpon_vendor: str = field(default_factory=lambda: _env("WISP_GPON_VENDOR", "huawei"))
+    # Empty = per-OLT sysObjectID auto-detect (the normal path). Set to force one
+    # vendor profile on every untagged OLT this edge probes — an escape hatch for
+    # a box whose sysObjectID is missing or lies; per-device `gpon_vendor` from the
+    # dashboard overrides both.
+    gpon_vendor: str = field(default_factory=lambda: _env("WISP_GPON_VENDOR", ""))
 
     latency_threshold_ms: float = field(
         default_factory=lambda: _env_float("WISP_LATENCY_MS", 150.0)
@@ -131,10 +135,11 @@ class Config:
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
-    # Private-repo release mirror: central is the ONLY box holding a GitHub token.
-    # It pulls the latest release's assets (installers + agent binaries + manifest)
-    # into `release_cache_dir` and serves them at /download/ — nobody else talks to
-    # GitHub, so the source repo can stay private.
+    # Release mirror: central pulls the latest release's assets (installers +
+    # agent binaries + manifest) into `release_cache_dir` and serves them at
+    # /download/ — edges never talk to GitHub. The repo is public, so the token
+    # is optional (only needed to lift the anonymous API rate limit or if the
+    # repo ever goes private again).
     releases_repo: str = field(default_factory=lambda: _env(
         "WISP_RELEASES_REPO", "haneeshbyreddy/ping_tool"))
     github_token: str = field(default_factory=lambda: _env("WISP_GITHUB_TOKEN", ""))

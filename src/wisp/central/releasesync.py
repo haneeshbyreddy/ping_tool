@@ -60,21 +60,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 class GithubReleases:
-    """Minimal GitHub REST client for mirroring a private repo's releases (stdlib only)."""
+    """Minimal GitHub REST client for mirroring a repo's releases (stdlib only).
 
-    def __init__(self, repo: str, token: str, *, timeout: float = 30.0) -> None:
+    Works unauthenticated against a public repo (no token = no Authorization
+    header); a token is only needed for a private repo or to dodge the 60/h
+    anonymous rate limit.
+    """
+
+    def __init__(self, repo: str, token: str = "", *, timeout: float = 30.0) -> None:
         if not repo:
             raise ReleaseSyncError("WISP_RELEASES_REPO is not set")
-        if not token:
-            raise ReleaseSyncError("WISP_GITHUB_TOKEN is not set — central needs a "
-                                   "fine-grained PAT (Contents: read) to mirror a private repo")
         self.repo = repo
         self.token = token
         self.timeout = timeout
 
     def _headers(self, accept: str) -> dict:
-        return {"Authorization": f"Bearer {self.token}", "Accept": accept,
-                "User-Agent": _UA, "X-GitHub-Api-Version": "2022-11-28"}
+        headers = {"Accept": accept, "User-Agent": _UA,
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
 
     def latest(self) -> dict:
         """Return {'tag_name': str, 'assets': {name: asset_api_url}} for the latest release."""
@@ -84,7 +89,11 @@ class GithubReleases:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 doc = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
-            hint = " (check the token's repo scope)" if exc.code in (401, 403, 404) else ""
+            if exc.code in (401, 403, 404):
+                hint = (" (check the token's repo scope)" if self.token
+                        else " (repo private or rate-limited? set WISP_GITHUB_TOKEN)")
+            else:
+                hint = ""
             raise ReleaseSyncError(f"GitHub API {exc.code} for {url}{hint}") from exc
         except Exception as exc:
             raise ReleaseSyncError(f"could not reach {url}: {exc}") from exc
@@ -169,3 +178,33 @@ def sync_release(store, *, cfg: Config = CONFIG, gh: GithubReleases | None = Non
     log.info("release sync: mirrored %s (%s), %d agent artifact(s) + installers into %s",
              version, channel, len(out), version_dir)
     return version, len(out)
+
+def sync_and_record(store, notifier=None, *, cfg: Config = CONFIG,
+                    gh: GithubReleases | None = None) -> tuple[str, int]:
+    """Run sync_release, stamp the outcome in the store, page on transitions only.
+
+    The update channel is itself monitored: every attempt writes `release_sync`
+    status (surfaced on /api/system), and `cfg.central_ntfy_topic` gets one page
+    when syncs start failing and one when they recover — never per-run, the timer
+    fires every 15 min. A failed sync still raises so the CLI exits nonzero.
+    """
+    try:
+        version, n = sync_release(store, cfg=cfg, gh=gh)
+    except ReleaseSyncError as exc:
+        prev = store.set_release_sync_status(False, str(exc))
+        if notifier and (prev is None or prev.get("ok")) and cfg.central_ntfy_topic:
+            try:
+                notifier.send(cfg.central_ntfy_topic, "🚨 RELEASE SYNC FAILING",
+                              f"central can no longer mirror releases: {exc}\n"
+                              "Fleet self-updates are stalled until this is fixed.", 4)
+            except Exception:
+                log.exception("release-sync failure page could not be sent")
+        raise
+    prev = store.set_release_sync_status(True, version)
+    if notifier and prev is not None and not prev.get("ok") and cfg.central_ntfy_topic:
+        try:
+            notifier.send(cfg.central_ntfy_topic, "✅ Release sync recovered",
+                          f"release mirror is healthy again; latest mirrored: {version}", 3)
+        except Exception:
+            log.exception("release-sync recovery page could not be sent")
+    return version, n

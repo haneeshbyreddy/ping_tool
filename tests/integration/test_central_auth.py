@@ -146,7 +146,8 @@ class CentralAuthHttpTest(unittest.TestCase):
         _, cookie = self._login("root", "rootpassword")
         status, body, _ = self._req("GET", "/api/system", cookie=cookie)
         self.assertEqual(status, 200)
-        for key in ("hostname", "cpu", "memory", "disk", "process", "uptime_s"):
+        for key in ("hostname", "cpu", "memory", "process", "uptime_s",
+                    "release_sync", "latest_release"):
             self.assertIn(key, body)
         _, cookie = self._login("owner", "ownerpassword")
         status, _, _ = self._req("GET", "/api/system", cookie=cookie)

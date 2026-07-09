@@ -301,7 +301,13 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not user["is_superadmin"]:
                     self._reply(403, {"error": "forbidden"})
                     return
-                self._reply(200, sysinfo.snapshot(cfg.central_db))
+                doc = sysinfo.snapshot(cfg.central_db)
+                # Monitor-the-monitor: a dead release mirror stalls fleet
+                # self-updates, so its health rides the superadmin box-stats card.
+                doc["release_sync"] = store.release_sync_status()
+                releases = store.list_releases()
+                doc["latest_release"] = releases[0]["version"] if releases else None
+                self._reply(200, doc)
                 return
             if route == "/api/events":
                 user = self._reader()

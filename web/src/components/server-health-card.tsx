@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { Server } from "lucide-react"
 import { systemApi } from "@/lib/api"
-import { fmtBytes, fmtDur } from "@/lib/format"
+import { ago, fmtBytes, fmtDur } from "@/lib/format"
 import { Meter } from "@/components/meter"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -44,13 +44,22 @@ export function ServerHealthCard() {
               detail={data.memory
                 ? `${fmtBytes(data.memory.used_bytes)} / ${fmtBytes(data.memory.total_bytes)}`
                 : "—"} />
-            <Meter label="Disk" pct={data.disk?.percent ?? null}
-              detail={data.disk
-                ? `${fmtBytes(data.disk.free_bytes)} free of ${fmtBytes(data.disk.total_bytes)}`
-                : "—"} />
             <p className="mt-1 text-[0.75rem] text-muted-foreground">
               {data.cpu.cores != null && <>{data.cpu.cores} core{data.cpu.cores === 1 ? "" : "s"} · </>}
               service {fmtBytes(data.process.rss_bytes)} RSS · database {fmtBytes(data.process.db_bytes)}
+            </p>
+            <p className="text-[0.75rem]">
+              {data.release_sync == null ? (
+                <span className="text-muted-foreground">Release mirror: never synced</span>
+              ) : data.release_sync.ok ? (
+                <span className="text-muted-foreground">
+                  Release mirror: v{data.release_sync.detail} · synced {ago(data.release_sync.at)}
+                </span>
+              ) : (
+                <span className="text-destructive">
+                  Release mirror failing (last try {ago(data.release_sync.at)}) — {data.release_sync.detail}
+                </span>
+              )}
             </p>
           </>
         )}
