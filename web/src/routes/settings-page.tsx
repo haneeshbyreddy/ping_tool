@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { Check, Copy, Dices, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
+import { DEFAULT_MAP_REGION, MAP_REGIONS, mapRegionOf } from "@/lib/map-regions"
 import type { AccountUser, Role } from "@/lib/types"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
@@ -45,11 +46,13 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
 
   const [name, setName] = useState("")
   const [topics, setTopics] = useState({ owner: "", operator: "", tech: "" })
+  const [mapRegion, setMapRegion] = useState(DEFAULT_MAP_REGION)
   const [testResults, setTestResults] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (!current) return
     setName(current.name || "")
+    setMapRegion(mapRegionOf(current.map_region).key)
 
     setTopics({
       owner: current.ntfy_topic_owner || randomTopic("owner"),
@@ -64,6 +67,7 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
       ntfy_topic_owner: topics.owner.trim() || null,
       ntfy_topic_operator: topics.operator.trim() || null,
       ntfy_topic_tech: topics.tech.trim() || null,
+      map_region: mapRegion,
     }),
     onSuccess: () => { toast.success("Settings saved"); queryClient.invalidateQueries({ queryKey: ["orgs"] }) },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
@@ -84,6 +88,21 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
         <div className="flex flex-col gap-1.5">
           <Label>Org name</Label>
           <Input value={name} disabled={!canWrite} onChange={(e) => setName(e.target.value)} className="max-w-sm" />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Map area</Label>
+          <Select value={mapRegion} onValueChange={setMapRegion} disabled={!canWrite}>
+            <SelectTrigger className="w-full max-w-sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {MAP_REGIONS.map((r) => (
+                <SelectItem key={r.key} value={r.key}>{r.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="max-w-lg text-xs text-muted-foreground">
+            The Map view opens on this area and stays inside it. Pick your state so the
+            map is your network, not the whole country.
+          </p>
         </div>
         {ROLE_TOPICS.map(({ key, label }) => (
           <div key={key} className="flex flex-col gap-1.5">

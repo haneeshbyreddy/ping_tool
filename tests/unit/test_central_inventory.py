@@ -9,6 +9,7 @@ from wisp.central.inventory import (
     InventoryError,
     clean_backup_link,
     clean_device_payload,
+    clean_location_payload,
     clean_node_id,
     clean_port_bandwidth_payload,
     clean_region_name,
@@ -219,6 +220,36 @@ class CleanPortBandwidthPayloadTest(unittest.TestCase):
         clean = clean_port_bandwidth_payload({"threshold_mbps": 10, "max_mbps": 500})
         self.assertEqual(clean["threshold_mbps"], 10.0)
         self.assertEqual(clean["max_mbps"], 500.0)
+
+class CleanLocationPayloadTest(unittest.TestCase):
+    def test_accepts_valid_coordinates(self):
+        clean = clean_location_payload({"lat": 17.385044, "lng": 78.486671})
+        self.assertEqual(clean, {"lat": 17.385044, "lng": 78.486671})
+
+    def test_rounds_drag_noise(self):
+        clean = clean_location_payload({"lat": "17.3850441234", "lng": "78.4866719876"})
+        self.assertEqual(clean, {"lat": 17.385044, "lng": 78.486672})
+
+    def test_both_null_clears_pin(self):
+        self.assertEqual(clean_location_payload({}), {"lat": None, "lng": None})
+        self.assertEqual(clean_location_payload({"lat": None, "lng": None}),
+                         {"lat": None, "lng": None})
+
+    def test_one_missing_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_location_payload({"lat": 17.4})
+        with self.assertRaises(InventoryError):
+            clean_location_payload({"lng": 78.5})
+
+    def test_non_numeric_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_location_payload({"lat": "north", "lng": 78.5})
+
+    def test_out_of_range_rejected(self):
+        with self.assertRaises(InventoryError):
+            clean_location_payload({"lat": 91, "lng": 0})
+        with self.assertRaises(InventoryError):
+            clean_location_payload({"lat": 0, "lng": -181})
 
 class CleanRegionNameTest(unittest.TestCase):
     def test_trims_and_returns(self):

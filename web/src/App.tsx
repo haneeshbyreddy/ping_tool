@@ -9,6 +9,7 @@ import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
 import { TopologyPage } from "@/routes/topology-page"
+import { MapPage } from "@/routes/map-page"
 import { TeamPage } from "@/routes/team-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { LogsPage } from "@/routes/logs-page"
@@ -40,6 +41,7 @@ function App() {
                   <Route element={<AppShell />}>
                     <Route index element={<HomePage />} />
                     <Route path="topology" element={<TopologyPage />} />
+                    <Route path="map" element={<MapPage />} />
                     {/* Probes merged into the Network page — keep old bookmarks working */}
                     <Route path="nodes" element={<Navigate to="/topology" replace />} />
                     <Route path="team" element={<TeamPage />} />

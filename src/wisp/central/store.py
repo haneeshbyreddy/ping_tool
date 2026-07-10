@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS org_devices (
                                            -- auto-detects the GponProfile via sysObjectID
                                             -- (ingress/gpon.py); NULL = fall back to the
                                             -- edge's WISP_GPON_VENDOR env, then huawei
+    lat              REAL,                  -- map pin (WGS84); both set or both NULL
+    lng              REAL,
     is_active        INTEGER NOT NULL DEFAULT 1,
     created_at       TEXT NOT NULL
 );
@@ -173,7 +175,7 @@ CREATE TABLE IF NOT EXISTS outages (
     resolution_notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outages_open ON outages(org_id, device_id, resolved_at);
--- CLAUDE.md item 2, second slice: hourly latency/packet-loss trend (30-day retention,
+-- Hourly latency/packet-loss trend (30-day retention,
 -- hourly buckets — both decided; see CLAUDE.md). Folded incrementally at each "full"
 -- report cycle (never a recheck — see central/rollup.py), so no raw per-poll history
 -- needs to live here, just running sums per (org, device, hour). Averages are
@@ -242,7 +244,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_events_node ON events(org_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(org_id, node_id, device_id, id);
 CREATE INDEX IF NOT EXISTS idx_node_alerts ON node_alerts(org_id, node_id, id);
--- Phase C follow-up — SNMP port status, central-side (CLAUDE.md item 1). One row per
+-- SNMP port status, central-side. One row per
 -- discovered switch port, mirrors the old single-box `switch_ports` table one-for-one
 -- but org-scoped: `device_id`/`feeds_device_id` are `org_devices` ids. Discovery
 -- (every walked port) lands `monitored=0`; the operator ticks which ports to watch —
@@ -267,7 +269,7 @@ CREATE TABLE IF NOT EXISTS switch_ports (
     alarm           INTEGER NOT NULL DEFAULT 0,
     alarm_since     TEXT,
     updated_at      TEXT,
-    -- CLAUDE.md item 3: per-port throughput (bandwidth), orthogonal to oper/admin status.
+    -- Per-port throughput (bandwidth), orthogonal to oper/admin status.
     -- Operator-set (never touched by a walk): bw_threshold_mbps/bw_max_mbps/bw_direction
     -- — a floor and a ceiling on the SAME rate stream, either independently optional.
     -- Walk-refreshed: the raw octet counters (TEXT — Counter64 can exceed SQLite's
@@ -292,7 +294,7 @@ CREATE TABLE IF NOT EXISTS switch_ports (
 );
 CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(org_id, device_id);
 CREATE INDEX IF NOT EXISTS idx_switch_ports_feeds ON switch_ports(org_id, feeds_device_id);
--- CLAUDE.md item 3: graph topology backup edges, central-side. Mirrors the old single-box
+-- Graph topology backup edges, central-side. Mirrors the old single-box
 -- `device_links` one-for-one, org-scoped: the PRIMARY parent stays the single source
 -- of truth on `org_devices.parent_device_id` (every existing tree/topo query keeps
 -- working unchanged); this table carries only the EXTRA redundancy edges
@@ -319,7 +321,7 @@ CREATE TABLE IF NOT EXISTS device_redundancy (
     primary_down_since TEXT,
     updated_at         TEXT NOT NULL
 );
--- CLAUDE.md item 3: per-link performance baseline, central-side (core/baseline.py's pure
+-- Per-link performance baseline, central-side (core/baseline.py's pure
 -- median+MAD deviation math, unchanged — central's job is just the trailing-sample
 -- window + badge). device_perf_samples is a BOUNDED per-device ring buffer (trimmed to
 -- the newest cfg.perf_window rows after every insert — central/perf.py), not a full
@@ -482,7 +484,10 @@ class CentralStore:
             conn.executescript(_SCHEMA)
             self._ensure_columns(conn, "orgs", (
                 ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_operator", "TEXT"),
-                ("ntfy_topic_tech", "TEXT")))
+                ("ntfy_topic_tech", "TEXT"),
+                # Map view viewport lock; a key from the dashboard's region list
+                # (web/src/lib/map-regions.ts), e.g. "telangana". NULL = all-India.
+                ("map_region", "TEXT")))
             self._ensure_columns(conn, "switch_ports", (
                 ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
                 ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),
@@ -496,7 +501,8 @@ class CentralStore:
             self._ensure_columns(conn, "org_devices", (
                 ("assigned_node_id", "TEXT"),
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
-                ("gpon_vendor", "TEXT")))
+                ("gpon_vendor", "TEXT"),
+                ("lat", "REAL"), ("lng", "REAL")))
             conn.commit()
 
     @staticmethod
@@ -572,8 +578,8 @@ class CentralStore:
 
     def set_org(self, org_id: str, name: str | None = None,
                 ntfy_topic: str | None = None, ntfy_topic_owner: str | None = None,
-                ntfy_topic_operator: str | None = None, ntfy_topic_tech: str | None = None
-                ) -> None:
+                ntfy_topic_operator: str | None = None, ntfy_topic_tech: str | None = None,
+                map_region: str | None = None) -> None:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             self._ensure_org(conn, org_id, now)
@@ -581,10 +587,11 @@ class CentralStore:
                 "UPDATE orgs SET name=COALESCE(?, name), ntfy_topic=COALESCE(?, ntfy_topic),"
                 " ntfy_topic_owner=COALESCE(?, ntfy_topic_owner),"
                 " ntfy_topic_operator=COALESCE(?, ntfy_topic_operator),"
-                " ntfy_topic_tech=COALESCE(?, ntfy_topic_tech)"
+                " ntfy_topic_tech=COALESCE(?, ntfy_topic_tech),"
+                " map_region=COALESCE(?, map_region)"
                 " WHERE org_id=?",
                 (name, ntfy_topic, ntfy_topic_owner, ntfy_topic_operator, ntfy_topic_tech,
-                 org_id))
+                 map_region, org_id))
             conn.commit()
 
     def org_topic(self, org_id: str) -> str | None:
@@ -613,7 +620,7 @@ class CentralStore:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
-                " o.ntfy_topic_operator, o.ntfy_topic_tech,"
+                " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
                 " FROM orgs o ORDER BY o.org_id")]
 
@@ -1018,6 +1025,7 @@ class CentralStore:
                 "SELECT d.id, d.org_id, d.name, d.ip_address, d.device_type, d.region,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
+                " d.lat, d.lng,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
                 " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
@@ -1028,6 +1036,11 @@ class CentralStore:
                 "  AND p.monitored = 1 AND p.bw_high_alarm = 1) AS ports_bw_high,"
                 " g.onus_total AS onus_total, g.onus_online AS onus_online,"
                 " g.warn_count AS onus_warn, g.crit_count AS onus_crit,"
+                " g.updated_at AS optics_updated_at,"
+                " (SELECT MAX(p.updated_at) FROM switch_ports p"
+                "  WHERE p.device_id = d.id) AS ports_updated_at,"
+                " (SELECT MAX(o.started_at) FROM outages o WHERE o.device_id = d.id"
+                "  AND o.resolved_at IS NULL) AS outage_started_at,"
                 " s.state AS state, s.latency_ms AS latency_ms, s.packet_loss AS packet_loss,"
                 " s.jitter_ms AS jitter_ms, s.updated_at AS state_updated_at,"
                 " h.cpu_pct AS health_cpu_pct, h.mem_pct AS health_mem_pct,"
@@ -1116,6 +1129,15 @@ class CentralStore:
                         " AND resolved_at IS NULL", (_now_iso(), org_id, device_id))
                     conn.executemany("DELETE FROM escalations WHERE outage_id=?",
                                      [(oid,) for oid in open_ids])
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_org_device_location(self, org_id: str, device_id: int,
+                                lat: float | None, lng: float | None) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET lat=?, lng=? WHERE id=? AND org_id=? AND is_active=1",
+                (lat, lng, device_id, org_id))
             conn.commit()
             return cur.rowcount > 0
 

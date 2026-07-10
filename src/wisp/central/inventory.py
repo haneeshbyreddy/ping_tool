@@ -74,6 +74,22 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             "region": region, "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor}
 
+def clean_location_payload(data: dict) -> dict:
+    """Map pin for a device: both coordinates, or both null (= remove the pin)."""
+    lat_raw, lng_raw = data.get("lat"), data.get("lng")
+    if lat_raw in (None, "", "null") and lng_raw in (None, "", "null"):
+        return {"lat": None, "lng": None}
+    try:
+        lat, lng = float(lat_raw), float(lng_raw)
+    except (TypeError, ValueError):
+        raise InventoryError("lat and lng must both be numbers (or both null to clear)")
+    if not (-90.0 <= lat <= 90.0):
+        raise InventoryError("lat must be between -90 and 90")
+    if not (-180.0 <= lng <= 180.0):
+        raise InventoryError("lng must be between -180 and 180")
+    # ~1e-6° ≈ 0.1 m — anything longer is float noise from a drag event
+    return {"lat": round(lat, 6), "lng": round(lng, 6)}
+
 def clean_region_name(raw) -> str:
     name = str(raw).strip() if raw is not None else ""
     if not name:

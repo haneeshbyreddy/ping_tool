@@ -54,6 +54,7 @@ export const orgsApi = {
   save: (body: {
     org_id: string; name?: string | null
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
+    map_region?: string | null
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
@@ -80,6 +81,8 @@ export const inventoryApi = {
     request<{ ok: boolean; reason?: string }>("/api/inventory/delete", { method: "POST", body: { id } }),
   setMaintenance: (id: number, on: boolean) =>
     request<{ ok: boolean }>("/api/inventory/maintenance", { method: "POST", body: { id, on } }),
+  setLocation: (id: number, lat: number | null, lng: number | null) =>
+    request<{ ok: boolean }>("/api/inventory/location", { method: "POST", body: { id, lat, lng } }),
   setSnmp: (id: number, body: {
     snmp_enabled: boolean; snmp_community?: string | null; snmp_port?: number | string
   }) => request<{ ok: boolean }>("/api/inventory/snmp", { method: "POST", body: { id, ...body } }),

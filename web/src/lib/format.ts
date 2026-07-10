@@ -76,6 +76,15 @@ export function isStale(ts: string | null | undefined): boolean {
   return (Date.now() - toUtcDate(ts).getTime()) / 1000 > STALE_AFTER_S
 }
 
+// SNMP optics/port sweeps run far slower than the ICMP cadence, so "working"
+// mirrors the superadmin Overview: a reading fresher than 900s counts as live.
+export const SNMP_FRESH_AFTER_S = 900
+
+export function isFresh(ts: string | null | undefined, withinS = SNMP_FRESH_AFTER_S): boolean {
+  if (!ts) return false
+  return (Date.now() - toUtcDate(ts).getTime()) / 1000 <= withinS
+}
+
 export function deviceTone(
   state: DeviceState | string | null | undefined,
   stateUpdatedAt: string | null | undefined,

@@ -8,15 +8,15 @@
  * removes them. Data (`window.__WISP_SHOWCASE__`) is injected server-side from
  * the live DB; the offer copy lives here so it's trivial to tweak.
  *
- * Design: on-brand for the WISP dark/near-black canvas with the gold (#D8BC84)
+ * Design: on-brand for the WISP dark/near-black canvas with the gold (#5680bd)
  * accent — restrained SaaS chrome, not a blinking marquee. Top bar = the
  * limited-time offer (urgency); bottom bar = social proof (trust).
  */
 (function () {
   "use strict";
   try {
-    var GOLD = "#D8BC84";
-    var CANVAS = "#0B0A08";
+    var GOLD = "#5680bd";
+    var CANVAS = "#09090b";
     var STYLE_ID = "wisp-showcase-style";
     var OFFER_ID = "wisp-offer";
     var TRUST_ID = "wisp-trust";
@@ -59,7 +59,7 @@
         "@keyframes wisp-pulse{0%,100%{opacity:1}50%{opacity:.35}}" +
         "#" + TRUST_ID + " .wisp-track{animation:wisp-marquee var(--wisp-dur,40s) linear infinite}" +
         "#" + TRUST_ID + ":hover .wisp-track{animation-play-state:paused}" +
-        "#" + OFFER_ID + " a.wisp-cta:hover{background:rgba(216,188,132,.16)}" +
+        "#" + OFFER_ID + " a.wisp-cta:hover{background:rgba(86,128,189,.16)}" +
         "@media (max-width:640px){#" + OFFER_ID + " .wisp-cta{display:none!important}}";
       (document.head || document.documentElement).appendChild(s);
     }
@@ -71,8 +71,8 @@
         "position:fixed;top:0;left:0;right:0;height:" + H_OFFER + "px;" +
           "z-index:2147483000;display:flex;align-items:center;justify-content:center;" +
           "gap:14px;padding:0 16px;font:500 14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
-          "color:#e7e4dd;background:linear-gradient(180deg,#141109,#100d08);" +
-          "border-bottom:1px solid rgba(216,188,132,.28);" +
+          "color:#e5e5ea;background:linear-gradient(180deg,#101014,#0e0e11);" +
+          "border-bottom:1px solid rgba(86,128,189,.28);" +
           "box-shadow:0 1px 0 rgba(0,0,0,.4);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)"
       );
       bar.id = OFFER_ID;
@@ -92,7 +92,7 @@
       var cta = el(
         "a",
         "flex:0 0 auto;text-decoration:none;color:" + GOLD + ";font-weight:600;" +
-          "border:1px solid rgba(216,188,132,.4);border-radius:999px;padding:5px 13px;" +
+          "border:1px solid rgba(86,128,189,.4);border-radius:999px;padding:5px 13px;" +
           "font-size:13px;transition:background .15s ease;white-space:nowrap"
       );
       cta.className = "wisp-cta";
@@ -126,15 +126,15 @@
         "div",
         "position:fixed;bottom:0;left:0;right:0;height:" + H_TRUST + "px;z-index:2147482999;" +
           "display:flex;align-items:center;background:" + CANVAS + ";" +
-          "border-top:1px solid rgba(216,188,132,.16);" +
-          "font:14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#8f8b81"
+          "border-top:1px solid rgba(86,128,189,.16);" +
+          "font:14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#8e8e97"
       );
       bar.id = TRUST_ID;
 
       var label = el(
         "div",
         "flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:0 18px;height:100%;" +
-          "border-right:1px solid rgba(216,188,132,.14);color:" + GOLD + ";" +
+          "border-right:1px solid rgba(86,128,189,.14);color:" + GOLD + ";" +
           "font-weight:600;letter-spacing:.2px;white-space:nowrap"
       );
       label.className = "wisp-label";
@@ -166,7 +166,7 @@
           var chip = el(
             "span",
             "display:inline-flex;align-items:center;gap:10px;padding:0 22px;" +
-              "white-space:nowrap;color:#c9c4b8;font-weight:500"
+              "white-space:nowrap;color:#c6c6cd;font-weight:500"
           );
           chip.appendChild(document.createTextNode(nm));
           chip.appendChild(

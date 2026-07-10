@@ -1,13 +1,13 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+@import "@fontsource-variable/inter";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
     --font-heading: var(--font-sans);
-    --font-sans: 'Geist Variable', sans-serif;
+    --font-sans: 'Inter Variable', system-ui, sans-serif;
     --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
@@ -65,21 +65,21 @@
 }
 
 :root {
-    --background: #f7f5f0;
-    --foreground: #26221a;
-    --card: #fffdf8;
-    --card-foreground: #26221a;
-    --popover: #fffdf8;
-    --popover-foreground: #26221a;
-    --primary: #9c7f3e;
+    --background: #f7f7f8;
+    --foreground: #1b1b20;
+    --card: #ffffff;
+    --card-foreground: #1b1b20;
+    --popover: #ffffff;
+    --popover-foreground: #1b1b20;
+    --primary: #3467a8;
     --primary-foreground: #ffffff;
-    --primary-soft: rgba(156,127,62,0.10);
-    --secondary: #efece4;
-    --secondary-foreground: #26221a;
-    --muted: #efece4;
-    --muted-foreground: #6b7180;
-    --accent: #efece4;
-    --accent-foreground: #26221a;
+    --primary-soft: rgba(52,103,168,0.10);
+    --secondary: #ededf0;
+    --secondary-foreground: #1b1b20;
+    --muted: #ededf0;
+    --muted-foreground: #5d5d68;
+    --accent: #ededf0;
+    --accent-foreground: #1b1b20;
     --destructive: #b8503d;
     --destructive-foreground: #ffffff;
     --destructive-soft: rgba(184,80,61,0.10);
@@ -89,42 +89,42 @@
     --warning: #a97c22;
     --warning-foreground: #ffffff;
     --warning-soft: rgba(169,124,34,0.10);
-    --border: #e6e2d8;
-    --input: #d9d5c9;
-    --ring: #b3ab97;
-    --chart-1: #9c7f3e;
+    --border: #e2e2e7;
+    --input: #d2d2da;
+    --ring: #8aa8cf;
+    --chart-1: #3467a8;
     --chart-2: #3f8a5c;
     --chart-3: #a97c22;
     --chart-4: #b8503d;
-    --chart-5: #8a8578;
+    --chart-5: #71717c;
     --radius: 0.75rem;
-    --sidebar: #fbfaf6;
-    --sidebar-foreground: #26221a;
-    --sidebar-primary: #9c7f3e;
+    --sidebar: #fafafb;
+    --sidebar-foreground: #1b1b20;
+    --sidebar-primary: #3467a8;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #efece4;
-    --sidebar-accent-foreground: #26221a;
-    --sidebar-border: #e6e2d8;
-    --sidebar-ring: #b3ab97;
+    --sidebar-accent: #ededf0;
+    --sidebar-accent-foreground: #1b1b20;
+    --sidebar-border: #e2e2e7;
+    --sidebar-ring: #8aa8cf;
 }
 
 .dark {
-    --background: #08080a;
-    --foreground: #ece3d1;
-    --card: #0d0d0f;
-    --card-foreground: #ece3d1;
-    --popover: #141417;
-    --popover-foreground: #ece3d1;
-    --primary: #cdb98a;
-    --primary-foreground: #1a160e;
-    --primary-soft: rgba(205,185,138,0.14);
+    --background: #09090b;
+    --foreground: #e7e7ea;
+    --card: #0e0e11;
+    --card-foreground: #e7e7ea;
+    --popover: #151519;
+    --popover-foreground: #e7e7ea;
+    --primary: #5680bd;
+    --primary-foreground: #0d1626;
+    --primary-soft: rgba(86,128,189,0.14);
     --secondary: #17171a;
-    --secondary-foreground: #ece3d1;
+    --secondary-foreground: #e7e7ea;
     --muted: #17171a;
 
-    --muted-foreground: #8d94a1;
+    --muted-foreground: #a1a1ab;
     --accent: #1c1c20;
-    --accent-foreground: #ece3d1;
+    --accent-foreground: #e7e7ea;
     --destructive: #d76a58;
     --destructive-foreground: #ffffff;
     --destructive-soft: rgba(215,106,88,0.15);
@@ -135,22 +135,22 @@
     --warning-foreground: #1f1608;
     --warning-soft: rgba(217,169,78,0.13);
 
-    --border: #37373f;
-    --input: #3d3d46;
-    --ring: #5c574a;
-    --chart-1: #cdb98a;
+    --border: #303038;
+    --input: #3b3b44;
+    --ring: #4a6a99;
+    --chart-1: #5680bd;
     --chart-2: #6cb583;
     --chart-3: #d9a94e;
     --chart-4: #d76a58;
-    --chart-5: #8a8578;
-    --sidebar: #0a0a0c;
-    --sidebar-foreground: #ece3d1;
-    --sidebar-primary: #cdb98a;
-    --sidebar-primary-foreground: #1a160e;
+    --chart-5: #8b8b95;
+    --sidebar: #0b0b0d;
+    --sidebar-foreground: #e7e7ea;
+    --sidebar-primary: #5680bd;
+    --sidebar-primary-foreground: #0d1626;
     --sidebar-accent: #17171a;
-    --sidebar-accent-foreground: #ece3d1;
-    --sidebar-border: #37373f;
-    --sidebar-ring: #5c574a;
+    --sidebar-accent-foreground: #e7e7ea;
+    --sidebar-border: #303038;
+    --sidebar-ring: #4a6a99;
 }
 
 @layer base {
@@ -159,6 +159,8 @@
     }
   body {
     @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     }
   html {
     @apply font-sans;
@@ -174,4 +176,197 @@
       font-size: 18px;
       }
     }
+}
+
+/* Map view (routes/map-page.tsx) — pins are divIcons so everything below is
+   plain CSS on theme tokens; status colors must stay the loudest thing on the
+   basemap, hence the near-invisible tile desaturation instead of tinted pins. */
+.wisp-map {
+  background: var(--background);
+  font: inherit;
+}
+.wisp-map .leaflet-tile-pane {
+  filter: saturate(0.72);
+}
+.wisp-map-placing .leaflet-container {
+  cursor: crosshair;
+}
+.wisp-map .leaflet-control-attribution {
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  color: var(--muted-foreground);
+  font-size: 0.625rem;
+}
+.wisp-map .leaflet-control-attribution a {
+  color: var(--muted-foreground);
+}
+.wisp-map .leaflet-bar {
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+.wisp-map .leaflet-bar a {
+  background: var(--card);
+  color: var(--foreground);
+  border-bottom-color: var(--border);
+}
+.wisp-map .leaflet-bar a:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+.wisp-map .leaflet-bar a.leaflet-disabled {
+  background: var(--card);
+  color: var(--muted-foreground);
+}
+
+.wisp-pin-anchor {
+  background: none;
+  border: none;
+}
+.wisp-pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+.wisp-pin__dot {
+  position: relative; /* hosts the ::after optical ring */
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  border: 2px solid var(--background);
+  box-shadow: 0 0 0 1px var(--border);
+}
+.wisp-pin__label {
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 0.375rem;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+  padding: 0 5px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  line-height: 1.15rem;
+  color: var(--muted-foreground);
+}
+.wisp-pin--success .wisp-pin__dot { background: var(--success); }
+.wisp-pin--warning .wisp-pin__dot { background: var(--warning); }
+.wisp-pin--muted .wisp-pin__dot { background: var(--muted-foreground); }
+.wisp-pin--destructive .wisp-pin__dot {
+  background: var(--destructive);
+  animation: wisp-pin-pulse 1.6s ease-out infinite;
+}
+.wisp-pin--warning .wisp-pin__label,
+.wisp-pin--destructive .wisp-pin__label {
+  color: var(--foreground);
+  font-weight: 600;
+}
+.wisp-pin--selected .wisp-pin__dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 55%, transparent);
+}
+.wisp-pin--selected .wisp-pin__label {
+  border-color: var(--ring);
+  color: var(--foreground);
+}
+@keyframes wisp-pin-pulse {
+  0% { box-shadow: 0 0 0 1px var(--border), 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
+  70% { box-shadow: 0 0 0 1px var(--border), 0 0 0 12px transparent; }
+  100% { box-shadow: 0 0 0 1px var(--border), 0 0 0 0 transparent; }
+}
+
+/* Map v2: dimming, blast-radius rings, maintenance pins, zoom-aware labels,
+   NOC-wall fullscreen. */
+.wisp-pin--dim {
+  opacity: 0.28;
+}
+.wisp-pin--impact .wisp-pin__dot {
+  box-shadow: 0 0 0 1px var(--border),
+    0 0 0 3.5px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+.wisp-pin--maint .wisp-pin__dot {
+  background: var(--muted-foreground);
+  border: 2px dashed var(--warning);
+}
+.wisp-pin--selected .wisp-pin__dot,
+.wisp-pin--selected.wisp-pin--impact .wisp-pin__dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 55%, transparent);
+}
+/* Zoomed out to tower-map altitude, labels are soup — keep only the ones that
+   matter: trouble and the selection. Dots stay for everything. */
+.wisp-map-lowzoom .wisp-pin__label {
+  display: none;
+}
+.wisp-map-lowzoom .wisp-pin--destructive .wisp-pin__label,
+.wisp-map-lowzoom .wisp-pin--warning .wisp-pin__label,
+.wisp-map-lowzoom .wisp-pin--selected .wisp-pin__label {
+  display: block;
+}
+.wisp-map-wrap:fullscreen {
+  height: 100vh;
+  background: var(--background);
+}
+
+/* PON on the map: an OLT with weak ONUs grows an optical ring (Phase 1), and
+   selecting it fans out per-ONU spokes at ranged distance (Phase 2). The ring
+   is a ::after so it stacks with the box-shadow selection/impact rings. */
+.wisp-pin--optic-warn .wisp-pin__dot::after,
+.wisp-pin--optic-crit .wisp-pin__dot::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--warning);
+  pointer-events: none;
+}
+.wisp-pin--optic-crit .wisp-pin__dot::after {
+  border-color: var(--destructive);
+}
+
+/* ONU spoke ends — tiny divIcon dots at the ranged distance from the OLT */
+.wisp-onu {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--background);
+  cursor: pointer;
+}
+.wisp-onu--ok { background: var(--success); opacity: 0.8; }
+.wisp-onu--warn { background: var(--warning); }
+.wisp-onu--crit { background: var(--destructive); }
+.wisp-onu--offline { background: var(--muted-foreground); opacity: 0.6; }
+.wisp-onu--los { background: var(--destructive); opacity: 0.85; }
+.wisp-onu--gasp {
+  background: var(--destructive);
+  animation: wisp-pin-pulse 1.6s ease-out infinite;
+}
+/* dying-gasp spokes breathe so a powering-down ONU is unmissable */
+.wisp-spoke--gasp {
+  animation: wisp-spoke-gasp 1.2s ease-in-out infinite;
+}
+@keyframes wisp-spoke-gasp {
+  0%, 100% { stroke-opacity: 0.9; }
+  50% { stroke-opacity: 0.25; }
+}
+/* "+N more" pill under a capped fan — click-through to the Optical tab */
+.wisp-onu-more {
+  position: absolute;
+  transform: translate(-50%, -34px);
+  white-space: nowrap;
+  border-radius: 0.375rem;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+  padding: 0 5px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  line-height: 1.15rem;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.wisp-onu-more:hover {
+  color: var(--foreground);
 }

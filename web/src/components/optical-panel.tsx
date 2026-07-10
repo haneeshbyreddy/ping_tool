@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
@@ -105,7 +105,7 @@ function CellStrip({ onus }: { onus: OnuOptic[] }) {
   )
 }
 
-function OnuRow({ o, deviceId }: { o: OnuOptic; deviceId: number }) {
+function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focused?: boolean }) {
   const qc = useQueryClient()
   const acked = ackActive(o)
   const ack = useMutation({
@@ -116,8 +116,14 @@ function OnuRow({ o, deviceId }: { o: OnuOptic; deviceId: number }) {
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Acknowledge failed"),
   })
+  // clicked on the map — bring the row into view so the spoke and the numbers meet
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (focused) ref.current?.scrollIntoView({ block: "nearest" })
+  }, [focused])
   return (
-    <div className="flex items-center gap-3 py-1.5 text-xs">
+    <div ref={ref} className={cn("flex items-center gap-3 py-1.5 text-xs",
+      focused && "-mx-1.5 rounded-md bg-accent/60 px-1.5")}>
       <span className={cn("size-2 shrink-0 rounded-full", DOT[onuSev(o)])} />
       <span className="min-w-0 flex-1 truncate">
         {o.name || <span className="text-muted-foreground">unnamed</span>}
@@ -185,14 +191,25 @@ function PonRow({ pon, open, onToggle }: {
 
 const WORST_N = 6
 
-function PonDetail({ pon, deviceId }: { pon: Pon; deviceId: number }) {
+function PonDetail({ pon, deviceId, focusOnuId }: {
+  pon: Pon; deviceId: number; focusOnuId?: number | null
+}) {
   const [showAll, setShowAll] = useState(false)
-  const worst = useMemo(
-    () => [...pon.onus]
+  const worst = useMemo(() => {
+    const rows = [...pon.onus]
       .filter((o) => o.state === "online" && o.rx_dbm != null)
-      .sort((a, b) => a.rx_dbm! - b.rx_dbm!),
-    [pon],
-  )
+      .sort((a, b) => a.rx_dbm! - b.rx_dbm!)
+    // a focused offline/LOS ONU has no Rx and would vanish — surface it on top
+    const focus = focusOnuId != null ? pon.onus.find((o) => o.id === focusOnuId) : undefined
+    if (focus && !rows.includes(focus)) rows.unshift(focus)
+    return rows
+  }, [pon, focusOnuId])
+  // the focused ONU may sit past the worst-N cut; expand rather than hide it
+  useEffect(() => {
+    if (focusOnuId != null && worst.findIndex((o) => o.id === focusOnuId) >= WORST_N) {
+      setShowAll(true)
+    }
+  }, [focusOnuId, worst])
   if (!worst.length) {
     return (
       <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2 text-[0.6875rem] text-muted-foreground">
@@ -207,7 +224,7 @@ function PonDetail({ pon, deviceId }: { pon: Pon; deviceId: number }) {
       </div>
       <div className="divide-y divide-border/60">
         {(showAll ? worst : worst.slice(0, WORST_N)).map((o) => (
-          <OnuRow key={o.id} o={o} deviceId={deviceId} />
+          <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId} />
         ))}
       </div>
       {worst.length > WORST_N && (
@@ -220,7 +237,11 @@ function PonDetail({ pon, deviceId }: { pon: Pon; deviceId: number }) {
   )
 }
 
-export function OpticalPanel({ device }: { device: OrgDevice }) {
+export function OpticalPanel({ device, focusOnuId }: {
+  device: OrgDevice
+  /** map spoke click-through: open this ONU's PON group and highlight its row */
+  focusOnuId?: number | null
+}) {
   const q = useQuery<OpticsResponse>({
     queryKey: ["optics", device.id],
     queryFn: () => inventoryApi.optics(device.id),
@@ -235,6 +256,14 @@ export function OpticalPanel({ device }: { device: OrgDevice }) {
   }, [pons])
 
   const [openPort, setOpenPort] = useState<string | null | undefined>(undefined)
+  const focusPort = useMemo(() => {
+    if (focusOnuId == null) return null
+    const o = (q.data?.onus ?? []).find((x) => x.id === focusOnuId)
+    return o ? o.pon_port ?? "—" : null // "—" is groupByPon's null-port bucket
+  }, [focusOnuId, q.data])
+  useEffect(() => {
+    if (focusPort != null) setOpenPort(focusPort)
+  }, [focusPort, focusOnuId])
   const activePort = openPort === undefined ? worstPon : openPort
   const toggle = (port: string) =>
     setOpenPort((prev) => ((prev === undefined ? worstPon : prev) === port ? null : port))
@@ -291,7 +320,9 @@ export function OpticalPanel({ device }: { device: OrgDevice }) {
         {pons.map((pon) => (
           <div key={pon.port}>
             <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} />
-            {pon.port === activePort && <PonDetail pon={pon} deviceId={device.id} />}
+            {pon.port === activePort && (
+              <PonDetail pon={pon} deviceId={device.id} focusOnuId={focusOnuId} />
+            )}
           </div>
         ))}
       </div>

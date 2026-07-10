@@ -977,10 +977,14 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if not self._can_write(user, org):
                     self._reply(403, {"error": "forbidden"})
                     return
+                map_region = body.get("map_region")
+                if map_region is not None:
+                    map_region = str(map_region).strip().lower()[:64] or None
                 store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                               ntfy_topic_owner=body.get("ntfy_topic_owner"),
                               ntfy_topic_operator=body.get("ntfy_topic_operator"),
-                              ntfy_topic_tech=body.get("ntfy_topic_tech"))
+                              ntfy_topic_tech=body.get("ntfy_topic_tech"),
+                              map_region=map_region)
                 self._reply(200, {"ok": True})
                 return
             if route == "/api/test-alert":
@@ -1042,6 +1046,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     self._reply(403, {"error": "forbidden"})
                     return
                 ok = store.set_org_device_maintenance(org, did, bool(body.get("on")))
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/location":
+                did = int(body.get("id") or 0)
+                org = store.device_org(did)
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                loc = inventory.clean_location_payload(body)
+                ok = store.set_org_device_location(org, did, loc["lat"], loc["lng"])
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/snmp":

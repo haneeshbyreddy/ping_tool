@@ -21,6 +21,7 @@ export interface Org {
   ntfy_topic_owner: string | null
   ntfy_topic_operator: string | null
   ntfy_topic_tech: string | null
+  map_region: string | null
   node_count: number
 }
 
@@ -54,6 +55,8 @@ export interface OrgDevice {
   snmp_port: number
 
   gpon_vendor: string | null
+  lat: number | null
+  lng: number | null
   child_count: number
   backup_parents: number[]
 
@@ -65,6 +68,10 @@ export interface OrgDevice {
   onus_online: number | null
   onus_warn: number | null
   onus_crit: number | null
+  optics_updated_at: string | null
+  ports_updated_at: string | null
+  /** started_at of the still-open outage, if any — "down for 43m" on the map */
+  outage_started_at: string | null
 
   state: DeviceState | null
   latency_ms: number | null
