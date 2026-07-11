@@ -21,7 +21,7 @@ const CELL: Record<Sev, string> = {
   ok: "bg-success/70",
   warn: "bg-warning",
   crit: "bg-destructive",
-  offline: "bg-muted-foreground/25",
+  offline: "bg-muted-foreground/40",
 }
 const DOT: Record<Sev, string> = {
   ok: "bg-success", warn: "bg-warning", crit: "bg-destructive", offline: "bg-muted-foreground/40",
@@ -129,15 +129,18 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
       <span className="min-w-0 flex-1 truncate">
         {o.name || <span className="text-muted-foreground">unnamed</span>}
       </span>
-      <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground sm:inline">
+      {/* extra columns key off the PANEL's width (@container on the panel
+          root), not the viewport — the 380px map panel renders on a wide
+          desktop screen, so sm:/md:/lg: guards all pass and overflow it */}
+      <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground @xl:inline">
         {o.serial || o.onu_key}
       </span>
       <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
         onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
         {fmtDbm(o.rx_dbm)} dBm
       </span>
-      <span className="hidden w-20 shrink-0 text-right text-2xs md:inline"><Drift o={o} /></span>
-      <span className="hidden w-16 shrink-0 text-right font-mono text-2xs text-muted-foreground lg:inline">
+      <span className="hidden w-20 shrink-0 text-right text-2xs @md:inline"><Drift o={o} /></span>
+      <span className="hidden w-16 shrink-0 text-right font-mono text-2xs text-muted-foreground @2xl:inline">
         {fmtKm(o.distance_m)}
       </span>
       <span className="w-14 shrink-0 text-right">
@@ -153,39 +156,48 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
   )
 }
 
+// Two lines, not columns: the header facts on one compact row and the ONU
+// heat-strip on its own FULL-WIDTH line beneath. The strip used to sit in a
+// flex-1 slot between ~275px of fixed columns; inside the 380px device panel
+// that slot collapsed to zero and the strip wrapped one 11px cell per line —
+// a PON row as tall as its ONU count with nothing visible in it.
 function PonRow({ pon, open, onToggle }: {
   pon: Pon; open: boolean; onToggle: () => void
 }) {
 
   const worstTone = pon.crit > 0 ? "text-destructive" : pon.warn > 0 ? "text-warning" : "text-muted-foreground"
+  const hasRx = pon.typicalRx != null || pon.worstRx != null
   return (
     <button onClick={onToggle} aria-expanded={open}
-      className={cn("flex w-full items-center gap-3 rounded-md px-2 py-2 text-left hover:bg-foreground/5",
+      className={cn("flex w-full flex-col gap-1.5 rounded-md px-2 py-2 text-left hover:bg-foreground/5",
         open && "bg-accent/50")}>
-      <span className="w-16 shrink-0 font-mono text-xs font-semibold">PON {pon.port}</span>
-      <span className="w-12 shrink-0 font-mono text-2xs text-muted-foreground">
-        {pon.online}/{pon.onus.length}
-      </span>
-      <span className="min-w-0 flex-1"><CellStrip onus={pon.onus} /></span>
-      {/* typical (median) + worst Rx — the pair the mockup shows on the right */}
-      <span className="hidden w-14 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground sm:inline">
-        {fmtDbm(pon.typicalRx)}
-      </span>
-      <span className={cn("w-14 shrink-0 text-right font-mono text-2xs font-semibold tabular-nums", worstTone)}>
-        {fmtDbm(pon.worstRx)}
-      </span>
-      {(pon.crit > 0 || pon.warn > 0) ? (
-        <span className="w-10 shrink-0 text-right text-2xs font-semibold">
-          {pon.crit > 0 && <span className="text-destructive">{pon.crit}</span>}
-          {pon.crit > 0 && pon.warn > 0 && <span className="text-muted-foreground"> · </span>}
-          {pon.warn > 0 && <span className="text-warning">{pon.warn}</span>}
+      <span className="flex w-full items-center gap-3">
+        <span className="shrink-0 font-mono text-xs font-semibold">PON {pon.port}</span>
+        <span className="shrink-0 font-mono text-2xs text-muted-foreground">
+          {pon.online}/{pon.onus.length}
         </span>
-      ) : (
-        <span className="w-10 shrink-0" />
-      )}
-      <span className={cn("shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
-        ▶
+        {/* typical (median) + worst Rx; a vendor with no Rx readings (EPON
+            without an optics profile) says so once instead of two dashes */}
+        {hasRx ? (
+          <span className="ml-auto flex shrink-0 items-baseline gap-3 font-mono text-2xs tabular-nums">
+            <span className="text-muted-foreground">{fmtDbm(pon.typicalRx)}</span>
+            <span className={cn("font-semibold", worstTone)}>{fmtDbm(pon.worstRx)}</span>
+          </span>
+        ) : (
+          <span className="ml-auto shrink-0 text-2xs text-faint-foreground">no Rx data</span>
+        )}
+        {(pon.crit > 0 || pon.warn > 0) && (
+          <span className="shrink-0 text-right text-2xs font-semibold">
+            {pon.crit > 0 && <span className="text-destructive">{pon.crit}</span>}
+            {pon.crit > 0 && pon.warn > 0 && <span className="text-muted-foreground"> · </span>}
+            {pon.warn > 0 && <span className="text-warning">{pon.warn}</span>}
+          </span>
+        )}
+        <span className={cn("shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
+          ▶
+        </span>
       </span>
+      <CellStrip onus={pon.onus} />
     </button>
   )
 }
@@ -289,7 +301,7 @@ export function OpticalPanel({ device, focusOnuId }: {
   const warn = onus.filter((o) => onuSev(o) === "warn").length
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
+    <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
       {/* header readout ------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span className="text-sm">

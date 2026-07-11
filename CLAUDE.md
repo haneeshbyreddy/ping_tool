@@ -204,14 +204,34 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - **Epoch-hour trap**: `HourStrip` cells floor on EPOCH hours to match `bucket_of`,
   never local hours (half-hour timezones like IST shift every cell). A query error
   in the device panel renders as an error, never the empty state.
+- **Viewport breakpoints are wrong inside the device panel** — it's a fixed 380px
+  on a wide desktop screen, so `sm:`/`md:` guards all pass and columns overflow
+  (the Optical tab's ONU heat-strip once collapsed to a one-cell-wide column, one
+  wrapped row per ONU). Width-conditional columns in panel content use CONTAINER
+  queries (`@container` on the panel block, `@md:`/`@xl:` on the columns).
 - **Sort by `occurred_at ?? received_at`, NOT insert id** (Logs day-grouping and the
   Home activity panel) — acks/post-mortems insert long after the outage. Log group
   keys include the first row's event id (day labels repeat).
 - Home is a NOC overview, never empty when healthy; outage triage is folded into it
   (status derived from `acknowledged_at`/`resolved_at`/`root_cause`, never stored;
   recovery is FSM-automatic — no manual resolve, ever).
-- **Map view (`/map`) is real** (2026-07-10, was a mockup-fake): Leaflet + CARTO
-  raster tiles fetched by the BROWSER (central needs no egress; tiles keyless).
+- **Map view (`/map`) is real** (2026-07-10, was a mockup-fake): Leaflet + raster
+  tiles fetched by the BROWSER (central needs no egress; the base three are
+  KEYLESS). Basemap switcher (2026-07-11, localStorage): Streets = CARTO Voyager
+  (default, Google-Maps-like), Satellite = Esri World Imagery, Dim = theme-matched
+  CARTO (only Dim gets the desaturation filter). **Google / Google Satellite**
+  (2026-07-11) use the Map Tiles API — the sanctioned third-party-renderer API,
+  NOT the SDK-only Maps tiles — and appear only when `orgs.google_maps_key` is
+  set (Settings; referrer-restricted, ships to browsers by design, central still
+  makes NO Google calls). `lib/google-tiles.ts`: session token (~2wk) cached in
+  localStorage per mapType; ToS needs the per-viewport copyright in the
+  attribution control + a Google wordmark overlay. Failure ladder: tile-error
+  BURST (3 in 5s, once per token — a stray rural-z20 404 must not nuke the
+  basemap) → recreate session once → toast + auto-fallback to Streets; Streets
+  renders under a pending session so the map is never blank. **Chrome-over-tiles trap**: shadcn outline Buttons carry
+  `dark:bg-input/30`, which BEATS a plain `bg-popover/95` override in dark mode —
+  invisible over dark tiles, washed-out over bright ones; map chrome needs
+  `bg-popover/95 dark:bg-popover/95`.
   `org_devices.lat/lng` write only via `POST /api/inventory/location`
   (paired-or-both-null; dashboard-side only — the edge never sees coordinates).
   Pins are divIcons styled off theme tokens; the click-through panel is the same
@@ -230,12 +250,23 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   every second and an uncached icon swaps every marker's DOM node per tick,
   restarting the down-pulse. Control buttons shift left of the open device panel
   on desktop (`md:right-[calc(380px+1.5rem)]`) or the panel covers them.
+  **Site clusters** (2026-07-11): pins that would overlap on screen fold into a
+  count badge (worst member tone on the border) — SCREEN-SPACE and zoom-dependent
+  (`buildClusters`, greedy in Web Mercator px; cluster key = member ids, so
+  zooming folds an open fan on purpose). Click = fitBounds when members are
+  genuinely spread, spider-fan (pixel-sized radius, dashed legs) when they share
+  a spot — placing devices at the same coords IS the "rack", no schema. `pinPos`
+  is each device's DISPLAY position (centroid folded / fan open); links + PON
+  spokes read it, and selecting a device force-opens its cluster so search and
+  trouble-cycle never land on a hidden pin.
 - **PON on the map** (2026-07-10): OLT pins ring amber/red off `onus_warn/crit`
-  (suppressed when maint/down/stale-optics); selecting a placed OLT fans per-ONU
-  spokes — length = ranged `distance_m` (EPON/GPON gives distance, NO bearing;
-  the angle is an even spread, never geography), severity colors, LOS/offline
-  dashed, dying_gasp pulsing, capped at 64 + "+N more". Spoke click opens the
-  Optical tab focused on that row (`focusOnuId` → DeviceDetail → OpticalPanel).
+  (suppressed when maint/down/stale-optics). The per-ONU spoke fan (Phase 2) was
+  REMOVED 2026-07-11 at the operator's request — EPON ranging gives distance but
+  no bearing, so spoke angles were fabricated, and on a map everything reads as
+  geography. **The map shows only true locations**; ONU severity lives in the pin
+  ring + the Optical tab. Don't rebuild pseudo-geographic overlays — ONUs return
+  to the map only if/when they get real coordinates (`focusOnuId` threading
+  through DeviceDetail → OpticalPanel survives for that).
   **Leaflet trap**: `pathOptions.className` is silently DROPPED (setStyle
   ignores className) — pass `className` as a top-level react-leaflet prop and
   include the tone in the key so a state change remounts the path.

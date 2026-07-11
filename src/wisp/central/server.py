@@ -1021,11 +1021,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 map_region = body.get("map_region")
                 if map_region is not None:
                     map_region = str(map_region).strip().lower()[:64] or None
+                google_key = body.get("google_maps_key")
+                if google_key is not None:
+                    # "" clears the key (set_org writes NULL). Browsers get it
+                    # verbatim (referrer-restricted by design), so only bound it.
+                    google_key = str(google_key).strip()[:128]
                 store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                               ntfy_topic_owner=body.get("ntfy_topic_owner"),
                               ntfy_topic_operator=body.get("ntfy_topic_operator"),
                               ntfy_topic_tech=body.get("ntfy_topic_tech"),
-                              map_region=map_region)
+                              map_region=map_region, google_maps_key=google_key)
                 self._reply(200, {"ok": True})
                 return
             if route == "/api/test-alert":

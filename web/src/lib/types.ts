@@ -22,6 +22,7 @@ export interface Org {
   ntfy_topic_operator: string | null
   ntfy_topic_tech: string | null
   map_region: string | null
+  google_maps_key: string | null
   node_count: number
 }
 

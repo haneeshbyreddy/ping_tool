@@ -47,12 +47,14 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   const [name, setName] = useState("")
   const [topics, setTopics] = useState({ owner: "", operator: "", tech: "" })
   const [mapRegion, setMapRegion] = useState(DEFAULT_MAP_REGION)
+  const [googleKey, setGoogleKey] = useState("")
   const [testResults, setTestResults] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (!current) return
     setName(current.name || "")
     setMapRegion(mapRegionOf(current.map_region).key)
+    setGoogleKey(current.google_maps_key || "")
 
     setTopics({
       owner: current.ntfy_topic_owner || randomTopic("owner"),
@@ -68,6 +70,8 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
       ntfy_topic_operator: topics.operator.trim() || null,
       ntfy_topic_tech: topics.tech.trim() || null,
       map_region: mapRegion,
+      // always sent: "" clears the key server-side (null would leave it unchanged)
+      google_maps_key: googleKey.trim(),
     }),
     onSuccess: () => { toast.success("Settings saved"); queryClient.invalidateQueries({ queryKey: ["orgs"] }) },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
@@ -102,6 +106,17 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
           <p className="max-w-lg text-xs text-muted-foreground">
             The Map view opens on this area and stays inside it. Pick your state so the
             map is your network, not the whole country.
+          </p>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Google Maps API key</Label>
+          <Input value={googleKey} disabled={!canWrite} placeholder="AIza…"
+            className="max-w-sm font-mono text-xs" spellCheck={false}
+            onChange={(e) => setGoogleKey(e.target.value)} />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            Optional — adds Google basemaps to the Map view (Map Tiles API). The key is
+            sent to signed-in browsers, so use a referrer-restricted key. Leave blank to
+            hide the Google options.
           </p>
         </div>
         {ROLE_TOPICS.map(({ key, label }) => (

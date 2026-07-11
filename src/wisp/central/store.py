@@ -528,7 +528,13 @@ class CentralStore:
                 ("ntfy_topic_tech", "TEXT"),
                 # Map view viewport lock; a key from the dashboard's region list
                 # (web/src/lib/map-regions.ts), e.g. "telangana". NULL = all-India.
-                ("map_region", "TEXT")))
+                ("map_region", "TEXT"),
+                # Google Map Tiles API key for the dashboard's Google basemap.
+                # Ships to signed-in browsers by design (referrer-restricted);
+                # central itself never calls Google — the browser does the
+                # session + tile fetches, same trust model as the CARTO/Esri
+                # CDNs. NULL = the Google basemap option is hidden.
+                ("google_maps_key", "TEXT")))
             self._ensure_columns(conn, "switch_ports", (
                 ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
                 ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),
@@ -620,7 +626,10 @@ class CentralStore:
     def set_org(self, org_id: str, name: str | None = None,
                 ntfy_topic: str | None = None, ntfy_topic_owner: str | None = None,
                 ntfy_topic_operator: str | None = None, ntfy_topic_tech: str | None = None,
-                map_region: str | None = None) -> None:
+                map_region: str | None = None,
+                google_maps_key: str | None = None) -> None:
+        # None = leave a field unchanged. google_maps_key alone is clearable:
+        # "" writes NULL (removing a key must be possible from Settings).
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             self._ensure_org(conn, org_id, now)
@@ -629,10 +638,12 @@ class CentralStore:
                 " ntfy_topic_owner=COALESCE(?, ntfy_topic_owner),"
                 " ntfy_topic_operator=COALESCE(?, ntfy_topic_operator),"
                 " ntfy_topic_tech=COALESCE(?, ntfy_topic_tech),"
-                " map_region=COALESCE(?, map_region)"
+                " map_region=COALESCE(?, map_region),"
+                " google_maps_key=CASE WHEN ? IS NULL THEN google_maps_key"
+                "                      WHEN ?='' THEN NULL ELSE ? END"
                 " WHERE org_id=?",
                 (name, ntfy_topic, ntfy_topic_owner, ntfy_topic_operator, ntfy_topic_tech,
-                 map_region, org_id))
+                 map_region, google_maps_key, google_maps_key, google_maps_key, org_id))
             conn.commit()
 
     def org_topic(self, org_id: str) -> str | None:
@@ -661,7 +672,7 @@ class CentralStore:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
-                " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
+                " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region, o.google_maps_key,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
                 " FROM orgs o ORDER BY o.org_id")]
 

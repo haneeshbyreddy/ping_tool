@@ -223,7 +223,9 @@ html:not(.dark) .wisp-drillin {
   background: var(--background);
   font: inherit;
 }
-.wisp-map .leaflet-tile-pane {
+/* Only the "Dim" NOC-wall basemap gets desaturated; Streets/Satellite stay
+   full-color (the muted look on those read as "dull", not "calm") */
+.wisp-map-dim .leaflet-tile-pane {
   filter: saturate(0.72);
 }
 .wisp-map-placing .leaflet-container {
@@ -271,25 +273,25 @@ html:not(.dark) .wisp-drillin {
 }
 .wisp-pin__dot {
   position: relative; /* hosts the ::after optical ring */
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 9999px;
   border: 2px solid var(--background);
-  box-shadow: 0 0 0 1px var(--border);
+  box-shadow: 0 0 0 1px var(--border-strong);
 }
 .wisp-pin__label {
-  max-width: 9rem;
+  max-width: 10rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   border-radius: 0.375rem;
   border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--card) 92%, transparent);
-  padding: 0 5px;
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+  padding: 0 6px;
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.6875rem;
-  line-height: 1.15rem;
-  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.35rem;
+  color: var(--foreground);
 }
 .wisp-pin--success .wisp-pin__dot { background: var(--success); }
 .wisp-pin--warning .wisp-pin__dot { background: var(--warning); }
@@ -311,9 +313,9 @@ html:not(.dark) .wisp-drillin {
   color: var(--foreground);
 }
 @keyframes wisp-pin-pulse {
-  0% { box-shadow: 0 0 0 1px var(--border), 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
-  70% { box-shadow: 0 0 0 1px var(--border), 0 0 0 12px transparent; }
-  100% { box-shadow: 0 0 0 1px var(--border), 0 0 0 0 transparent; }
+  0% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
+  70% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 12px transparent; }
+  100% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 transparent; }
 }
 
 /* Map v2: dimming, blast-radius rings, maintenance pins, zoom-aware labels,
@@ -363,14 +365,13 @@ html:not(.dark) .wisp-drillin {
   pointer-events: none;
 }
 
-/* PON on the map: an OLT with weak ONUs grows an optical ring (Phase 1), and
-   selecting it fans out per-ONU spokes at ranged distance (Phase 2). The ring
-   is a ::after so it stacks with the box-shadow selection/impact rings. */
+/* PON on the map: an OLT with weak ONUs grows an optical ring. The ring is a
+   ::after so it stacks with the box-shadow selection/impact rings. */
 .wisp-pin--optic-warn .wisp-pin__dot::after,
 .wisp-pin--optic-crit .wisp-pin__dot::after {
   content: "";
   position: absolute;
-  inset: -6px;
+  inset: -7px;
   border-radius: 9999px;
   border: 1.5px solid var(--warning);
   pointer-events: none;
@@ -379,48 +380,36 @@ html:not(.dark) .wisp-drillin {
   border-color: var(--destructive);
 }
 
-/* ONU spoke ends — tiny divIcon dots at the ranged distance from the OLT */
-.wisp-onu {
+/* Site clusters (routes/map-page.tsx buildClusters): overlapping pins fold
+   into one badge — the number is the member count, the worst member's status
+   owns the border. Click zooms in or spider-fans a true rack. */
+.wisp-cluster {
   position: absolute;
   transform: translate(-50%, -50%);
-  width: 9px;
-  height: 9px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 9999px;
-  border: 1.5px solid var(--background);
-  cursor: pointer;
-}
-.wisp-onu--ok { background: var(--success); opacity: 0.8; }
-.wisp-onu--warn { background: var(--warning); }
-.wisp-onu--crit { background: var(--destructive); }
-.wisp-onu--offline { background: var(--muted-foreground); opacity: 0.6; }
-.wisp-onu--los { background: var(--destructive); opacity: 0.85; }
-.wisp-onu--gasp {
-  background: var(--destructive);
-  animation: wisp-pin-pulse 1.6s ease-out infinite;
-}
-/* dying-gasp spokes breathe so a powering-down ONU is unmissable */
-.wisp-spoke--gasp {
-  animation: wisp-spoke-gasp 1.2s ease-in-out infinite;
-}
-@keyframes wisp-spoke-gasp {
-  0%, 100% { stroke-opacity: 0.9; }
-  50% { stroke-opacity: 0.25; }
-}
-/* "+N more" pill under a capped fan — click-through to the Optical tab */
-.wisp-onu-more {
-  position: absolute;
-  transform: translate(-50%, -34px);
-  white-space: nowrap;
-  border-radius: 0.375rem;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--card) 92%, transparent);
-  padding: 0 5px;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.6875rem;
-  line-height: 1.15rem;
-  color: var(--muted-foreground);
-  cursor: pointer;
-}
-.wisp-onu-more:hover {
+  background: var(--popover);
+  border: 2px solid var(--muted-foreground);
   color: var(--foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.wisp-cluster--success { border-color: var(--success); }
+.wisp-cluster--warning { border-color: var(--warning); }
+.wisp-cluster--destructive {
+  border-color: var(--destructive);
+  animation: wisp-cluster-pulse 1.6s ease-out infinite;
+}
+.wisp-cluster--dim { opacity: 0.28; }
+@keyframes wisp-cluster-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
+  70% { box-shadow: 0 0 0 12px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }

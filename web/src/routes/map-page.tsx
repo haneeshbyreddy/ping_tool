@@ -2,7 +2,7 @@
 // draw between placed parent/child pairs, and clicking a pin opens the same
 // Health/Optical/Ports panel the Network tree uses. Placement is dashboard-side
 // only (lat/lng on org_devices) — the edge never sees coordinates.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -10,15 +10,19 @@ import L from "leaflet"
 import { Circle, MapContainer, Marker, Polyline, TileLayer, ZoomControl, useMap, useMapEvents } from "react-leaflet"
 import "leaflet/dist/leaflet.css"
 import {
-  Check, ChevronRight, Copy, Crosshair, Expand, EyeOff, ListTree, LocateFixed,
+  Check, ChevronRight, Copy, Crosshair, Expand, EyeOff, Layers, ListTree, LocateFixed,
   MapPin, Maximize2, Navigation, Pencil, Search, Shrink, X,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { inventoryApi, orgsApi, ApiError } from "@/lib/api"
+import {
+  clearGoogleSession, createGoogleSession, fetchGoogleAttribution, googleTileUrl,
+  loadGoogleSession, type GoogleMapType,
+} from "@/lib/google-tiles"
 import { mapRegionOf } from "@/lib/map-regions"
-import type { OnuOptic, OrgDevice } from "@/lib/types"
-import { DeviceDetail, DeviceMetrics, isOpticalOlt, RowTag, type DeviceTab } from "@/components/device-detail"
+import type { OrgDevice } from "@/lib/types"
+import { DeviceDetail, DeviceMetrics, RowTag, type DeviceTab } from "@/components/device-detail"
 import { NeedsOrg } from "@/components/needs-org"
 import { StatusDot } from "@/components/status-badge"
 import { deviceTone, durationSince, isFresh } from "@/lib/format"
@@ -87,70 +91,6 @@ function pinIcon(d: OrgDevice, o: { selected: boolean; dim: boolean; impact: boo
     </div>`)
 }
 
-// ---- PON overlay (Phase 2) --------------------------------------------------
-// EPON/GPON ranging gives distance only, never bearing, so the "wire" to each
-// ONU is honest about what the OLT actually knows: spoke length is the ranged
-// fiber distance, the angle is an even spread stable-sorted by pon_port/onu_id
-// (a given ONU keeps its bearing between walks).
-
-type OnuTone = "ok" | "warn" | "crit" | "offline" | "los" | "gasp"
-
-function onuTone(o: OnuOptic): OnuTone {
-  if (o.state === "dying_gasp") return "gasp"
-  if (o.state === "los") return "los"
-  if (o.state !== "online") return "offline"
-  if (o.severity === "crit") return "crit"
-  if (o.severity === "warn") return "warn"
-  return "ok"
-}
-
-const SPOKE_STYLE: Record<OnuTone, { color: string; dash?: string; cls?: string; opacity: number }> = {
-  ok: { color: "var(--success)", opacity: 0.3 },
-  warn: { color: "var(--warning)", opacity: 0.75 },
-  crit: { color: "var(--destructive)", opacity: 0.9 },
-  offline: { color: "var(--muted-foreground)", dash: "3 5", opacity: 0.45 },
-  los: { color: "var(--destructive)", dash: "3 5", opacity: 0.8 },
-  gasp: { color: "var(--destructive)", cls: "wisp-spoke--gasp", opacity: 0.9 },
-}
-// when the fan is over the cap, trouble outranks health — the 65th quiet ONU
-// can hide behind "+N more"; a LOS can't
-const TONE_RANK: Record<OnuTone, number> = { gasp: 0, los: 1, crit: 2, warn: 3, offline: 4, ok: 5 }
-
-const SPOKE_CAP = 64
-const MIN_SPOKE_M = 60 // shorter than this and the spoke end hides under the OLT pin
-
-interface Spoke { onu: OnuOptic; tone: OnuTone; pos: [number, number] }
-
-function buildSpokes(onus: OnuOptic[], center: [number, number]): { spokes: Spoke[]; hidden: number } {
-  const byPon = [...onus].sort((a, b) =>
-    (a.pon_port ?? "").localeCompare(b.pon_port ?? "", undefined, { numeric: true })
-    || (a.onu_id ?? 0) - (b.onu_id ?? 0)
-    || a.onu_key.localeCompare(b.onu_key))
-  let shown = byPon
-  if (byPon.length > SPOKE_CAP) {
-    const keep = new Set([...byPon]
-      .sort((a, b) => TONE_RANK[onuTone(a)] - TONE_RANK[onuTone(b)])
-      .slice(0, SPOKE_CAP))
-    shown = byPon.filter((o) => keep.has(o)) // cap by severity, angles stay in PON order
-  }
-  const known = shown.map((o) => o.distance_m).filter((m): m is number => m != null)
-  const fallback = known.length ? [...known].sort((a, b) => a - b)[known.length >> 1] : 500
-  const latM = 111_320
-  const lngM = latM * Math.cos((center[0] * Math.PI) / 180)
-  return {
-    spokes: shown.map((o, i) => {
-      const ang = -Math.PI / 2 + (2 * Math.PI * i) / shown.length
-      const r = Math.max(o.distance_m ?? fallback, MIN_SPOKE_M)
-      return {
-        onu: o,
-        tone: onuTone(o),
-        pos: [center[0] + (r * Math.cos(ang)) / latM, center[1] + (r * Math.sin(ang)) / lngM],
-      }
-    }),
-    hidden: byPon.length - shown.length,
-  }
-}
-
 function cachedDivIcon(html: string): L.DivIcon {
   let icon = _iconCache.get(html)
   if (!icon) {
@@ -161,23 +101,68 @@ function cachedDivIcon(html: string): L.DivIcon {
   return icon
 }
 
-function onuIcon(o: OnuOptic, tone: OnuTone): L.DivIcon {
-  const title = [
-    o.name || o.serial || o.onu_key,
-    o.rx_dbm != null ? `${o.rx_dbm.toFixed(1)} dBm` : "no Rx",
-    o.distance_m != null ? fmtKm(o.distance_m / 1000) : null,
-    o.state !== "online" ? o.state : null,
-  ].filter(Boolean).join(" · ")
-  return cachedDivIcon(`<div class="wisp-onu wisp-onu--${tone}" title="${esc(title)}"></div>`)
-}
-
-function moreOnusIcon(hidden: number): L.DivIcon {
-  return cachedDivIcon(
-    `<div class="wisp-onu-more" title="Open the Optical tab for the full list">+${hidden} more</div>`)
-}
-
 function meIcon(): L.DivIcon {
   return cachedDivIcon(`<div class="wisp-me" title="You are here"></div>`)
+}
+
+// ---- Site clustering --------------------------------------------------------
+// ISP gear piles up: one cabinet/rooftop holds an OLT, a switch, a backhaul
+// radio. Pins that would overlap on screen fold into one "site" badge — the
+// count is the member total, the worst member's status wins the border.
+// Clicking it zooms in when the members are genuinely spread out (the cluster
+// splits on its own), or spider-fans them when they truly share a spot (a
+// rack). Screen-space and zoom-dependent by design: no schema, no assignment
+// workflow — placing devices at the same spot IS the rack assignment.
+
+const CLUSTER_PX = 44
+
+interface SiteCluster {
+  // sorted member ids — membership shifts with zoom, so an open fan folds on
+  // zoom change (intended, same as leaflet.markercluster)
+  key: string
+  members: Placed[]
+  center: [number, number]
+}
+
+// Web Mercator pixel position at `zoom` — mirrors what Leaflet renders
+function project(lat: number, lng: number, zoom: number): [number, number] {
+  const scale = 256 * 2 ** zoom
+  const s = Math.sin((lat * Math.PI) / 180)
+  return [
+    ((lng + 180) / 360) * scale,
+    (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * scale,
+  ]
+}
+
+function buildClusters(placed: Placed[], zoom: number): SiteCluster[] {
+  const acc: Array<{ px: [number, number]; members: Placed[] }> = []
+  for (const d of placed) {
+    const p = project(d.lat, d.lng, zoom)
+    const hit = acc.find((c) => Math.hypot(c.px[0] - p[0], c.px[1] - p[1]) < CLUSTER_PX)
+    if (hit) hit.members.push(d)
+    else acc.push({ px: p, members: [d] })
+  }
+  return acc.map((c) => ({
+    key: c.members.map((m) => m.id).sort((a, b) => a - b).join(","),
+    members: c.members,
+    center: [
+      c.members.reduce((s, m) => s + m.lat, 0) / c.members.length,
+      c.members.reduce((s, m) => s + m.lng, 0) / c.members.length,
+    ] as [number, number],
+  }))
+}
+
+const CLUSTER_TONE_ORDER = ["destructive", "warning", "success", "muted"] as const
+
+function clusterIcon(members: Placed[], dim: boolean): L.DivIcon {
+  const tones = new Set(members.map(pinTone))
+  const tone = CLUSTER_TONE_ORDER.find((t) => tones.has(t)) ?? "muted"
+  const down = members.filter((m) => pinTone(m) === "destructive").length
+  const names = members.slice(0, 6).map((m) => m.name).join(", ")
+  const title = esc(`${members.length} devices${down ? `, ${down} down` : ""} — ${names}${members.length > 6 ? ", …" : ""}`)
+  const cls = ["wisp-cluster", `wisp-cluster--${tone}`]
+  if (dim) cls.push("wisp-cluster--dim")
+  return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}">${members.length}</div>`)
 }
 
 function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
@@ -188,6 +173,149 @@ function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): num
   return 2 * R * Math.asin(Math.sqrt(h))
 }
 const fmtKm = (km: number) => km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`
+
+// Basemap styles, all browser-fetched (central needs no egress). The keyless
+// three: "streets" (CARTO Voyager, the default), "sat" (Esri World Imagery)
+// for tower/rooftop placement, "dim" the muted NOC-wall style. "google"/"gsat"
+// are Google's Map Tiles API — the sanctioned third-party-renderer API, not
+// the SDK-only Maps tiles — and only appear when the org has a key in
+// Settings (orgs.google_maps_key, referrer-restricted, ships to the browser
+// by design).
+type Basemap = "streets" | "sat" | "dim" | "google" | "gsat"
+
+const BASEMAP_KEY = "wisp:map:basemap"
+const BASEMAP_LABEL: Record<Basemap, string> = {
+  streets: "Streets", sat: "Satellite", dim: "Dim",
+  google: "Google", gsat: "Google Satellite",
+}
+const GOOGLE_BASEMAPS: Record<string, GoogleMapType> = { google: "roadmap", gsat: "satellite" }
+
+const CARTO_ATTR =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+
+function loadBasemap(): Basemap {
+  try {
+    const v = localStorage.getItem(BASEMAP_KEY)
+    return v != null && v in BASEMAP_LABEL ? (v as Basemap) : "streets"
+  } catch {
+    return "streets"
+  }
+}
+
+// The default layer, also the under-layer while a Google session is being
+// created and the landing spot when Google fails — the map is never blank.
+function StreetsTiles() {
+  return (
+    <TileLayer
+      key="streets"
+      url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+      attribution={CARTO_ATTR}
+      subdomains="abcd"
+      maxZoom={20}
+    />
+  )
+}
+
+// ToS-required dynamic attribution: Google's viewport endpoint names the data
+// providers for what's on screen. Debounced off moveend, swapped in and out of
+// Leaflet's attribution control (react-leaflet's static `attribution` prop
+// can't change per-move). Best-effort — a failed lookup keeps the generic
+// "Map data ©Google" line, tiles keep working.
+function GoogleAttribution({ session, apiKey }: { session: string; apiKey: string }) {
+  const map = useMap()
+  const shown = useRef<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    let t: number | undefined
+    const swap = (text: string) => {
+      if (shown.current === text) return
+      if (shown.current) map.attributionControl.removeAttribution(shown.current)
+      shown.current = text
+      map.attributionControl.addAttribution(text)
+    }
+    const update = () => {
+      const b = map.getBounds()
+      fetchGoogleAttribution(session, apiKey, map.getZoom(), {
+        north: b.getNorth(), south: b.getSouth(), east: b.getEast(), west: b.getWest(),
+      }).then((c) => { if (alive) swap(c) })
+        .catch(() => { /* keep whatever line is up */ })
+    }
+    const onMove = () => { window.clearTimeout(t); t = window.setTimeout(update, 700) }
+    swap("Map data ©Google")
+    update()
+    map.on("moveend", onMove)
+    return () => {
+      alive = false
+      window.clearTimeout(t)
+      map.off("moveend", onMove)
+      if (shown.current) map.attributionControl.removeAttribution(shown.current)
+      shown.current = null
+    }
+  }, [map, session, apiKey])
+  return null
+}
+
+// Google Map Tiles API layer: create/reuse a ~2-week session token (cached in
+// localStorage), render tiles, keep the viewport attribution fresh. Failure
+// ladder: an expired/revoked session shows up as a burst of tile errors →
+// recreate the session once; if createSession fails or the fresh session still
+// can't load tiles (bad key, quota out), onFail drops the map back to Streets.
+function GoogleLayer({ apiKey, mapType, onFail }: {
+  apiKey: string
+  mapType: GoogleMapType
+  onFail: (why: string) => void
+}) {
+  const [session, setSession] = useState<string | null>(() => loadGoogleSession(mapType))
+  const [gen, setGen] = useState(0) // bump = force a fresh createSession
+  const recreated = useRef(false)
+  const errTimes = useRef<number[]>([])
+  const handledSession = useRef<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    createGoogleSession(apiKey, mapType).then(
+      (s) => { if (alive) setSession(s) },
+      (e) => { if (alive) onFail(e instanceof Error ? e.message : "session request failed") },
+    )
+    return () => { alive = false }
+  }, [apiKey, mapType, gen, onFail])
+
+  // A stray single 404 (deep-zoom satellite gap, flaky link) must not nuke the
+  // basemap: act only on a burst — 3 failed tiles inside 5s — and only once per
+  // session token (one burst floods the handler with every tile on screen).
+  const onTileError = useCallback(() => {
+    const now = Date.now()
+    errTimes.current = [...errTimes.current.filter((ts) => now - ts < 5000), now]
+    if (errTimes.current.length < 3) return
+    errTimes.current = []
+    if (!session || handledSession.current === session) return
+    handledSession.current = session
+    if (!recreated.current) {
+      recreated.current = true
+      clearGoogleSession(mapType)
+      setSession(null)
+      setGen((g) => g + 1)
+    } else {
+      onFail("tiles failed to load")
+    }
+  }, [session, mapType, onFail])
+
+  if (!session) return <StreetsTiles />
+  return (
+    <>
+      <TileLayer
+        key={`g-${mapType}-${session}`}
+        url={googleTileUrl(session, apiKey)}
+        // satellite coverage thins out past z20 in rural areas; upscale instead
+        // of requesting tiles that would 404 into the error handler
+        maxNativeZoom={mapType === "satellite" ? 20 : 22}
+        maxZoom={22}
+        eventHandlers={{ tileerror: onTileError }}
+      />
+      <GoogleAttribution session={session} apiKey={apiKey} />
+    </>
+  )
+}
 
 const VIEW_KEY = "wisp:map:view"
 
@@ -296,7 +424,7 @@ function MapSearch({ devices, bounds, onDevice, onPlace }: {
       <Input
         value={q}
         placeholder="Find a device or place…"
-        className="h-8 bg-popover/95 pl-8 text-xs backdrop-blur"
+        className="h-8 bg-popover/95 dark:bg-popover/95 pl-8 text-xs backdrop-blur"
         onChange={(e) => { setQ(e.target.value); setOpen(true) }}
         onFocus={() => setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
@@ -399,9 +527,29 @@ export function MapPage() {
   const [editPins, setEditPins] = useState(false)
   const [troubleOnly, setTroubleOnly] = useState(false)
   const [lowZoom, setLowZoom] = useState(false)
+  // live zoom drives clustering; MapEvents reports it on mount and every zoomend
+  const [zoom, setZoom] = useState(4)
+  const [openSite, setOpenSite] = useState<string | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [coordsEdit, setCoordsEdit] = useState(false)
   const [coordsText, setCoordsText] = useState("")
+  const [basemap, setBasemap] = useState<Basemap>(loadBasemap)
+  const [layersOpen, setLayersOpen] = useState(false)
+  // one toast per failure, and re-picking Google from the menu re-arms the retry
+  const googleFailed = useRef(false)
+  const pickBasemap = (b: Basemap) => {
+    if (b in GOOGLE_BASEMAPS) googleFailed.current = false
+    setBasemap(b)
+    setLayersOpen(false)
+    try { localStorage.setItem(BASEMAP_KEY, b) } catch { /* private mode */ }
+  }
+  const onGoogleFail = useCallback((why: string) => {
+    if (googleFailed.current) return
+    googleFailed.current = true
+    toast.error(`Google basemap unavailable (${why}) — showing Streets instead`)
+    setBasemap("streets")
+    try { localStorage.setItem(BASEMAP_KEY, "streets") } catch { /* private mode */ }
+  }, [])
   // browser geolocation fix from the locate button; accuracy in meters
   const [myLoc, setMyLoc] = useState<{ lat: number; lng: number; acc: number } | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -425,7 +573,13 @@ export function MapPage() {
     enabled: !!scopeOrg,
     staleTime: 60_000,
   })
-  const region = mapRegionOf(orgsQ.data?.orgs.find((o) => o.org_id === scopeOrg)?.map_region)
+  const myOrg = orgsQ.data?.orgs.find((o) => o.org_id === scopeOrg)
+  const region = mapRegionOf(myOrg?.map_region)
+  const googleKey = myOrg?.google_maps_key?.trim() || null
+  // a persisted Google pick with no key (removed in Settings, orgs still
+  // loading) quietly renders Streets — no toast, the pick itself stays saved
+  const effectiveBasemap: Basemap =
+    basemap in GOOGLE_BASEMAPS && !googleKey ? "streets" : basemap
 
   const devices = useMemo(() => data?.devices ?? [], [data])
   const placed = useMemo(() => devices.filter(isPlaced), [devices])
@@ -434,46 +588,43 @@ export function MapPage() {
   const selected = selectedId != null ? byId.get(selectedId) ?? null : null
   const placing = placingId != null ? byId.get(placingId) ?? null : null
 
-  // PON overlay: selecting a placed OLT fans its ONUs out as distance-true
-  // spokes. Same query key as the Optical tab, so the two share one fetch.
-  const [focusOnuId, setFocusOnuId] = useState<number | null>(null)
-  const ponOlt = selected && isOpticalOlt(selected) && isPlaced(selected) ? selected : null
-  const opticsQ = useQuery({
-    queryKey: ["optics", ponOlt?.id],
-    queryFn: () => inventoryApi.optics(ponOlt!.id),
-    enabled: ponOlt != null,
-    refetchInterval: 30_000,
-  })
-
-  // Two boxes in one cabinet share coordinates; fan them out ~15 m so both stay
-  // visible and clickable. Display-only — the stored location is untouched.
+  // Overlapping pins fold into site clusters. pinPos is each device's DISPLAY
+  // position — raw when alone, the cluster centroid while folded, a screen-space
+  // spider fan while its cluster is open (selection opens the cluster too, so a
+  // search hit or trouble-cycle never lands on a hidden pin). Display-only —
+  // the stored location is untouched. Links and the PON fan read pinPos, so
+  // lines follow the fold.
+  const clusters = useMemo(() => buildClusters(placed, zoom), [placed, zoom])
+  const isOpenCluster = useCallback((c: SiteCluster) =>
+    c.members.length > 1 && (c.key === openSite || c.members.some((m) => m.id === selectedId)),
+    [openSite, selectedId])
   const pinPos = useMemo(() => {
-    const groups = new Map<string, Placed[]>()
-    for (const d of placed) {
-      const k = `${d.lat.toFixed(5)},${d.lng.toFixed(5)}`
-      const g = groups.get(k)
-      if (g) g.push(d)
-      else groups.set(k, [d])
-    }
     const pos = new Map<number, [number, number]>()
-    for (const g of groups.values()) {
-      if (g.length === 1) {
-        pos.set(g[0].id, [g[0].lat, g[0].lng])
-        continue
+    for (const c of clusters) {
+      if (c.members.length === 1) {
+        pos.set(c.members[0].id, [c.members[0].lat, c.members[0].lng])
+      } else if (!isOpenCluster(c)) {
+        for (const m of c.members) pos.set(m.id, c.center)
+      } else {
+        // fan radius in PIXELS (converted to meters at this zoom) so an opened
+        // rack is readable at any altitude — a fixed-meter fan vanishes below
+        // street zoom
+        const mpp = (156543.03392 * Math.cos((c.center[0] * Math.PI) / 180)) / 2 ** zoom
+        const rM = Math.min(38 + c.members.length * 7, 120) * mpp
+        const latM = 111_320
+        const lngM = latM * Math.cos((c.center[0] * Math.PI) / 180)
+        const sorted = [...c.members].sort((a, b) => a.id - b.id)
+        sorted.forEach((m, i) => {
+          const ang = -Math.PI / 2 + (2 * Math.PI * i) / sorted.length
+          pos.set(m.id, [
+            c.center[0] + (rM * Math.cos(ang)) / latM,
+            c.center[1] + (rM * Math.sin(ang)) / lngM,
+          ])
+        })
       }
-      g.sort((a, b) => a.id - b.id).forEach((d, i) => {
-        const ang = (2 * Math.PI * i) / g.length
-        pos.set(d.id, [d.lat + 0.00014 * Math.cos(ang), d.lng + 0.00018 * Math.sin(ang)])
-      })
     }
     return pos
-  }, [placed])
-
-  const pon = useMemo(() => {
-    if (!ponOlt || !opticsQ.data?.onus.length) return null
-    const center = pinPos.get(ponOlt.id) ?? [ponOlt.lat, ponOlt.lng] as [number, number]
-    return { center, ...buildSpokes(opticsQ.data.onus, center) }
-  }, [ponOlt, opticsQ.data, pinPos])
+  }, [clusters, isOpenCluster, zoom])
 
   // Blast radius: everything downstream of the selected device (full device set,
   // not just placed — the count answers "how many customers am I about to page").
@@ -554,6 +705,7 @@ export function MapPage() {
       setPlacingId(null)
     } else {
       setSelectedId(null)
+      setOpenSite(null)
     }
   }, [placingId, setLocation])
 
@@ -604,10 +756,24 @@ export function MapPage() {
     return () => document.removeEventListener("fullscreenchange", onFs)
   }, [])
 
-  const onZoom = useCallback((z: number) => setLowZoom(z < 12), [])
+  const onZoom = useCallback((z: number) => { setZoom(z); setLowZoom(z < 12) }, [])
+
+  // Click a folded site: members genuinely spread out → zoom to them and let
+  // the cluster split on its own; truly co-located (a rack) → spider-fan here.
+  const onClusterClick = (c: SiteCluster) => {
+    if (placingId != null) return
+    const b = L.latLngBounds(c.members.map((m) => [m.lat, m.lng] as [number, number]))
+    const spanM = distanceKm(b.getSouth(), b.getWest(), b.getNorth(), b.getEast()) * 1000
+    if (spanM > 30 && zoom < 17) {
+      mapRef.current?.flyToBounds(b, { padding: [64, 64], maxZoom: 18 })
+    } else {
+      setOpenSite((k) => (k === c.key ? null : c.key))
+      mapRef.current?.panTo(c.center) // a fan opening at the viewport edge clips
+    }
+  }
 
   // field flow: tech reads GPS off the phone, pastes "17.4401, 78.3489"
-  useEffect(() => { setCoordsEdit(false); setCoordsText(""); setFocusOnuId(null) }, [selectedId])
+  useEffect(() => { setCoordsEdit(false); setCoordsText("") }, [selectedId])
   const saveCoords = () => {
     if (!selected) return
     const m = coordsText.trim().match(/^(-?\d+(?:\.\d+)?)[,;\s]+(-?\d+(?:\.\d+)?)$/)
@@ -654,6 +820,7 @@ export function MapPage() {
       "wisp-map-wrap relative h-[calc(100svh-3.5rem-4rem)] md:h-[calc(100svh-3.5rem)]",
       placingId != null && "wisp-map-placing",
       lowZoom && "wisp-map-lowzoom",
+      basemap === "dim" && "wisp-map-dim",
     )}>
       <MapContainer
         ref={mapRef}
@@ -664,13 +831,32 @@ export function MapPage() {
         className="wisp-map h-full w-full"
         worldCopyJump
       >
-        <TileLayer
-          key={dark ? "dark" : "light"}
-          url={`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-          subdomains="abcd"
-          maxZoom={20}
-        />
+        {effectiveBasemap in GOOGLE_BASEMAPS && googleKey ? (
+          <GoogleLayer
+            key={`google-${GOOGLE_BASEMAPS[effectiveBasemap]}`}
+            apiKey={googleKey}
+            mapType={GOOGLE_BASEMAPS[effectiveBasemap]}
+            onFail={onGoogleFail}
+          />
+        ) : effectiveBasemap === "sat" ? (
+          <TileLayer
+            key="sat"
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            attribution="&copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics"
+            maxNativeZoom={18}
+            maxZoom={20}
+          />
+        ) : effectiveBasemap === "dim" ? (
+          <TileLayer
+            key={dark ? "dim-dark" : "dim-light"}
+            url={`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
+            attribution={CARTO_ATTR}
+            subdomains="abcd"
+            maxZoom={20}
+          />
+        ) : (
+          <StreetsTiles />
+        )}
         <ZoomControl position="bottomright" />
         <MapEvents org={scopeOrg} onMapClick={onMapClick} onZoom={onZoom} />
         <ViewController placed={placed} ready={!isLoading && orgsQ.isSuccess}
@@ -692,81 +878,66 @@ export function MapPage() {
               ]}
               pathOptions={{
                 color: emphasized && l.tone === "muted" ? "var(--primary)" : lineColor(l.tone),
-                weight: emphasized ? 2.5 : l.tone === "destructive" ? 2 : 1.5,
-                opacity: dimmed ? 0.12 : emphasized ? 0.9 : l.tone === "muted" ? 0.35 : 0.65,
+                weight: emphasized ? 3 : l.tone === "destructive" ? 2.5 : 2,
+                opacity: dimmed ? 0.12 : emphasized ? 0.9 : l.tone === "muted" ? 0.45 : 0.75,
                 dashArray: l.backup ? "4 6" : undefined,
               }}
             />
           )
         })}
-        {/* PON fan: one spoke per ONU off the selected OLT, under the pins */}
-        {pon && pon.spokes.map((s) => {
-          const st = SPOKE_STYLE[s.tone]
+        {clusters.map((c) => {
+          const open = isOpenCluster(c)
+          if (c.members.length > 1 && !open) {
+            const anyDown = c.members.some((m) => pinTone(m) === "destructive")
+            return (
+              <Marker
+                key={c.key}
+                position={c.center}
+                icon={clusterIcon(c.members, troubleOnly && !c.members.some(isTrouble))}
+                // clusters swallow map clicks too, so placement mode ignores them
+                eventHandlers={{ click: () => onClusterClick(c) }}
+                zIndexOffset={anyDown ? 500 : 100}
+              />
+            )
+          }
           return (
-            <Polyline
-              key={`onu-l-${s.onu.id}-${s.tone}`}
-              interactive={false}
-              // className is construction-only in Leaflet (setStyle ignores it),
-              // so it rides as a top-level prop and the tone-keyed remount above
-              // keeps it honest when an ONU's state changes
-              className={st.cls}
-              positions={[pon.center, s.pos]}
-              pathOptions={{
-                color: st.color,
-                weight: s.tone === "ok" ? 1 : 1.75,
-                opacity: st.opacity,
-                dashArray: st.dash,
-              }}
-            />
-          )
-        })}
-        {pon && pon.spokes.map((s) => (
-          <Marker
-            key={`onu-m-${s.onu.id}`}
-            position={s.pos}
-            icon={onuIcon(s.onu, s.tone)}
-            zIndexOffset={-200}
-            eventHandlers={{
-              click: () => {
-                if (placingId != null) return
-                setFocusOnuId(s.onu.id)
-                setDetailTab("optical")
-              },
-            }}
-          />
-        ))}
-        {pon && pon.hidden > 0 && (
-          <Marker
-            position={pon.center}
-            icon={moreOnusIcon(pon.hidden)}
-            zIndexOffset={1200}
-            eventHandlers={{ click: () => { if (placingId == null) setDetailTab("optical") } }}
-          />
-        )}
-        {placed.map((d) => {
-          const dim = troubleOnly && !isTrouble(d) && d.id !== selectedId
-          const impact = downstream.has(d.id)
-          return (
-            <Marker
-              key={d.id}
-              position={pinPos.get(d.id) ?? [d.lat, d.lng]}
-              icon={pinIcon(d, { selected: d.id === selectedId, dim, impact })}
-              draggable={editPins && canWrite}
-              // markers swallow map clicks, so placement mode ignores pin taps
-              eventHandlers={{
-                click: () => {
-                  if (placingId != null) return
-                  setDetailTab("health")
-                  setSelectedId(d.id === selectedId ? null : d.id)
-                },
-                dragend: (e) => {
-                  const ll = (e.target as L.Marker).getLatLng()
-                  setLocation.mutate({ id: d.id, lat: ll.lat, lng: ll.lng })
-                },
-              }}
-              zIndexOffset={d.id === selectedId ? 1000
-                : pinTone(d) === "destructive" ? 500 : impact ? 300 : 0}
-            />
+            <Fragment key={c.key}>
+              {/* spider legs tie the fanned pins back to where they really are */}
+              {open && c.members.map((m) => (
+                <Polyline
+                  key={`leg-${m.id}`}
+                  interactive={false}
+                  positions={[c.center, pinPos.get(m.id) ?? [m.lat, m.lng]]}
+                  pathOptions={{ color: "var(--muted-foreground)", weight: 1, opacity: 0.5, dashArray: "2 4" }}
+                />
+              ))}
+              {c.members.map((d) => {
+                const dim = troubleOnly && !isTrouble(d) && d.id !== selectedId
+                const impact = downstream.has(d.id)
+                return (
+                  <Marker
+                    key={d.id}
+                    position={pinPos.get(d.id) ?? [d.lat, d.lng]}
+                    icon={pinIcon(d, { selected: d.id === selectedId, dim, impact })}
+                    draggable={editPins && canWrite}
+                    // markers swallow map clicks, so placement mode ignores pin taps
+                    eventHandlers={{
+                      click: () => {
+                        if (placingId != null) return
+                        setDetailTab("health")
+                        setSelectedId(d.id === selectedId ? null : d.id)
+                      },
+                      dragend: (e) => {
+                        const ll = (e.target as L.Marker).getLatLng()
+                        setLocation.mutate({ id: d.id, lat: ll.lat, lng: ll.lng })
+                      },
+                    }}
+                    zIndexOffset={d.id === selectedId ? 1000
+                      : pinTone(d) === "destructive" ? 500 : impact ? 300 : 0}
+                  />
+                )
+              })}
+            </Fragment>
           )
         })}
         {/* "you are here" from the locate button — never a click target, so it
@@ -792,11 +963,24 @@ export function MapPage() {
         )}
       </MapContainer>
 
+      {/* Google ToS: their wordmark must be visible whenever Google tiles render.
+          Fixed px on purpose — it's a logo, not type-scale text. White-with-shadow
+          is how Google Maps itself renders it over both roadmap and satellite. */}
+      {effectiveBasemap in GOOGLE_BASEMAPS && googleKey && (
+        <span aria-hidden className="pointer-events-none absolute bottom-1 left-2 z-[1000] select-none font-medium"
+          style={{
+            fontFamily: "'Product Sans', Roboto, Arial, sans-serif", fontSize: "18px",
+            color: "#fff", textShadow: "0 0 4px rgba(0,0,0,.55), 0 1px 2px rgba(0,0,0,.55)",
+          }}>
+          Google
+        </span>
+      )}
+
       {/* search + status strip -------------------------------------------------- */}
       <div className="pointer-events-none absolute top-3 left-3 z-[1000] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
         <MapSearch devices={devices} bounds={region.bounds}
           onDevice={searchDevice} onPlace={searchPlace} />
-        <div className="pointer-events-auto flex h-8 items-center gap-2.5 rounded-lg border border-border-strong bg-popover/95 px-3 text-xs backdrop-blur">
+        <div className="pointer-events-auto flex h-8 items-center gap-2.5 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 px-3 text-xs backdrop-blur">
           <span className="font-semibold">{placed.length}<span className="font-normal text-muted-foreground"> / {devices.length} on map</span></span>
           {troubles.length > 0 && (
             <button className="flex items-center gap-2 font-semibold hover:brightness-125"
@@ -810,7 +994,7 @@ export function MapPage() {
         </div>
         {(troubles.length > 0 || troubleOnly) && (
           <Button variant={troubleOnly ? "default" : "outline"} size="sm"
-            className={cn("pointer-events-auto h-8 backdrop-blur", !troubleOnly && "bg-popover/95")}
+            className={cn("pointer-events-auto h-8 backdrop-blur", !troubleOnly && "bg-popover/95 dark:bg-popover/95")}
             title="Dim everything that's healthy"
             onClick={() => setTroubleOnly(!troubleOnly)}>
             <EyeOff className="size-3.5" /> Trouble only
@@ -818,7 +1002,7 @@ export function MapPage() {
         )}
         {canWrite && unplaced.length > 0 && (
           <Button variant="outline" size="sm"
-            className="pointer-events-auto h-8 bg-popover/95 backdrop-blur"
+            className="pointer-events-auto h-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
             onClick={() => { setPlaceOpen(!placeOpen); setPlacingId(null) }}>
             <MapPin className="size-3.5" /> Place devices
             <span className="rounded bg-muted px-1.5 py-px font-mono text-2xs">{unplaced.length}</span>
@@ -828,7 +1012,7 @@ export function MapPage() {
 
       {/* placement banner ------------------------------------------------------ */}
       {placing && (
-        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
           <Crosshair className="size-3.5 text-primary" />
           <span>Click the map to place <span className="font-mono font-semibold">{placing.name}</span></span>
           <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
@@ -841,21 +1025,42 @@ export function MapPage() {
       {/* controls — slide left of the device panel so they stay clickable ------- */}
       <div className={cn("absolute top-3 right-3 z-[1000] flex flex-col gap-1.5",
         selected && "md:right-[calc(380px+1.5rem)]")}>
-        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
+        <div className="relative">
+          <Button variant={layersOpen ? "default" : "outline"} size="icon"
+            className={cn("size-8 backdrop-blur", !layersOpen && "bg-popover/95 dark:bg-popover/95")}
+            title="Map style" onClick={() => setLayersOpen(!layersOpen)}>
+            <Layers className="size-3.5" />
+          </Button>
+          {layersOpen && (
+            <div className="absolute top-0 right-9 w-36 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 p-1 backdrop-blur">
+              {(Object.keys(BASEMAP_LABEL) as Basemap[])
+                .filter((b) => googleKey != null || !(b in GOOGLE_BASEMAPS))
+                .map((b) => (
+                  <button key={b}
+                    className={cn("flex w-full items-center rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5",
+                      basemap === b && "bg-accent font-medium")}
+                    onClick={() => pickBasemap(b)}>
+                    {BASEMAP_LABEL[b]}
+                  </button>
+                ))}
+            </div>
+          )}
+        </div>
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title="Fit all pins" onClick={fitAll} disabled={placed.length === 0}>
           <Maximize2 className="size-3.5" />
         </Button>
-        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title="Go to my location" onClick={locateMe}>
           <LocateFixed className="size-3.5" />
         </Button>
-        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title={fullscreen ? "Exit fullscreen" : "Fullscreen (NOC wall)"} onClick={toggleFullscreen}>
           {fullscreen ? <Shrink className="size-3.5" /> : <Expand className="size-3.5" />}
         </Button>
         {canWrite && (
           <Button variant={editPins ? "default" : "outline"} size="icon"
-            className={cn("size-8 backdrop-blur", !editPins && "bg-popover/95")}
+            className={cn("size-8 backdrop-blur", !editPins && "bg-popover/95 dark:bg-popover/95")}
             title={editPins ? "Done moving pins" : "Move pins (drag)"}
             onClick={() => setEditPins(!editPins)}>
             <Pencil className="size-3.5" />
@@ -863,7 +1068,7 @@ export function MapPage() {
         )}
       </div>
       {editPins && canWrite && (
-        <div className={cn("absolute right-3 top-[10rem] z-[1000] rounded-lg border border-warning/40 bg-popover/95 px-2.5 py-1.5 text-2xs text-warning backdrop-blur",
+        <div className={cn("absolute right-3 top-[10rem] z-[1000] rounded-lg border border-warning/40 bg-popover/95 dark:bg-popover/95 px-2.5 py-1.5 text-2xs text-warning backdrop-blur",
           selected && "md:right-[calc(380px+1.5rem)]")}>
           drag pins to move them
         </div>
@@ -871,7 +1076,7 @@ export function MapPage() {
 
       {/* unplaced drawer ------------------------------------------------------- */}
       {placeOpen && canWrite && (
-        <Card className="absolute top-14 left-3 z-[1000] flex max-h-[60%] w-72 flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 py-0 backdrop-blur">
+        <Card className="absolute top-14 left-3 z-[1000] flex max-h-[60%] w-72 flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 dark:bg-popover/95 py-0 backdrop-blur">
           <div className="flex items-center justify-between border-b px-3 py-2">
             <p className="text-xs font-semibold">Not on the map yet</p>
             <Button variant="ghost" size="icon" className="size-6" onClick={() => setPlaceOpen(false)}>
@@ -898,7 +1103,7 @@ export function MapPage() {
 
       {/* device panel ---------------------------------------------------------- */}
       {selected && (
-        <Card className="absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 py-0 backdrop-blur md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)] md:w-[380px]">
+        <Card className="absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 dark:bg-popover/95 py-0 backdrop-blur md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)] md:w-[380px]">
           <div className="flex items-start gap-2.5 border-b px-4 py-3">
             <span className="mt-1"><StatusDot tone={pinTone(selected)} /></span>
             <div className="min-w-0 flex-1">
@@ -1014,8 +1219,7 @@ export function MapPage() {
             )}
           </div>
           <div className="overflow-y-auto p-3">
-            <DeviceDetail device={selected} tab={detailTab} onTab={setDetailTab}
-              focusOnuId={focusOnuId} />
+            <DeviceDetail device={selected} tab={detailTab} onTab={setDetailTab} />
           </div>
         </Card>
       )}
@@ -1023,7 +1227,7 @@ export function MapPage() {
       {/* first-run nudge ------------------------------------------------------- */}
       {!isLoading && placed.length === 0 && !placing && (
         <div className="pointer-events-none absolute inset-0 z-[999] flex items-center justify-center">
-          <div className="pointer-events-auto flex flex-col items-center gap-2 rounded-xl border border-border-strong bg-popover/95 px-6 py-5 text-center backdrop-blur">
+          <div className="pointer-events-auto flex flex-col items-center gap-2 rounded-xl border border-border-strong bg-popover/95 dark:bg-popover/95 px-6 py-5 text-center backdrop-blur">
             <MapPin className="size-5 text-muted-foreground" />
             <p className="text-sm font-medium">No devices on the map yet</p>
             {canWrite && devices.length > 0 ? (
