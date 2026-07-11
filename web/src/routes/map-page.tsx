@@ -174,21 +174,19 @@ function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): num
 }
 const fmtKm = (km: number) => km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`
 
-// Basemap styles, all browser-fetched (central needs no egress). The keyless
-// three: "streets" (CARTO Voyager, the default), "sat" (Esri World Imagery)
-// for tower/rooftop placement, "dim" the muted NOC-wall style. "google"/"gsat"
-// are Google's Map Tiles API — the sanctioned third-party-renderer API, not
-// the SDK-only Maps tiles — and only appear when the org has a key in
-// Settings (orgs.google_maps_key, referrer-restricted, ships to the browser
-// by design).
-type Basemap = "streets" | "sat" | "dim" | "google" | "gsat"
+// Basemaps are Google's Map Tiles API only (2026-07-11: operator dropped the
+// CARTO/Esri menu entries) — the sanctioned third-party-renderer API, not the
+// SDK-only Maps tiles. The menu shows nothing without an org key in Settings
+// (orgs.google_maps_key, referrer-restricted, ships to the browser by design).
+// CARTO Voyager survives NOT as a choice but as the keyless safety net: it
+// renders for orgs with no key, under a still-creating session, and after a
+// Google failure — the map is never blank. Browser-fetched throughout;
+// central needs no egress.
+type Basemap = "google" | "gsat"
 
 const BASEMAP_KEY = "wisp:map:basemap"
-const BASEMAP_LABEL: Record<Basemap, string> = {
-  streets: "Streets", sat: "Satellite", dim: "Dim",
-  google: "Google", gsat: "Google Satellite",
-}
-const GOOGLE_BASEMAPS: Record<string, GoogleMapType> = { google: "roadmap", gsat: "satellite" }
+const BASEMAP_LABEL: Record<Basemap, string> = { google: "Google", gsat: "Google Satellite" }
+const GOOGLE_BASEMAPS: Record<Basemap, GoogleMapType> = { google: "roadmap", gsat: "satellite" }
 
 const CARTO_ATTR =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
@@ -196,14 +194,15 @@ const CARTO_ATTR =
 function loadBasemap(): Basemap {
   try {
     const v = localStorage.getItem(BASEMAP_KEY)
-    return v != null && v in BASEMAP_LABEL ? (v as Basemap) : "streets"
+    // legacy "sat" picks stay on imagery; everything else lands on roadmap
+    return v === "gsat" || v === "sat" ? "gsat" : "google"
   } catch {
-    return "streets"
+    return "google"
   }
 }
 
-// The default layer, also the under-layer while a Google session is being
-// created and the landing spot when Google fails — the map is never blank.
+// The keyless fallback layer, never in the menu: shown while a Google session
+// is being created, when the org has no key, or after a Google failure.
 function StreetsTiles() {
   return (
     <TileLayer
@@ -535,10 +534,13 @@ export function MapPage() {
   const [coordsText, setCoordsText] = useState("")
   const [basemap, setBasemap] = useState<Basemap>(loadBasemap)
   const [layersOpen, setLayersOpen] = useState(false)
-  // one toast per failure, and re-picking Google from the menu re-arms the retry
+  // Google failure drops to the fallback tiles WITHOUT forgetting the user's
+  // pick; one toast per failure, re-picking from the menu re-arms the retry
+  const [googleDown, setGoogleDown] = useState(false)
   const googleFailed = useRef(false)
   const pickBasemap = (b: Basemap) => {
-    if (b in GOOGLE_BASEMAPS) googleFailed.current = false
+    googleFailed.current = false
+    setGoogleDown(false)
     setBasemap(b)
     setLayersOpen(false)
     try { localStorage.setItem(BASEMAP_KEY, b) } catch { /* private mode */ }
@@ -546,17 +548,13 @@ export function MapPage() {
   const onGoogleFail = useCallback((why: string) => {
     if (googleFailed.current) return
     googleFailed.current = true
-    toast.error(`Google basemap unavailable (${why}) — showing Streets instead`)
-    setBasemap("streets")
-    try { localStorage.setItem(BASEMAP_KEY, "streets") } catch { /* private mode */ }
+    toast.error(`Google basemap unavailable (${why}) — showing the fallback map`)
+    setGoogleDown(true)
   }, [])
   // browser geolocation fix from the locate button; accuracy in meters
   const [myLoc, setMyLoc] = useState<{ lat: number; lng: number; acc: number } | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const troubleIdx = useRef(0)
-  // dark tiles for the dark theme; light for light. Read once — a theme flip
-  // remounts routes rarely enough that chasing it live isn't worth a listener.
-  const [dark] = useState(() => document.documentElement.classList.contains("dark"))
   useNow()
 
   const { data, isLoading } = useQuery({
@@ -576,10 +574,9 @@ export function MapPage() {
   const myOrg = orgsQ.data?.orgs.find((o) => o.org_id === scopeOrg)
   const region = mapRegionOf(myOrg?.map_region)
   const googleKey = myOrg?.google_maps_key?.trim() || null
-  // a persisted Google pick with no key (removed in Settings, orgs still
-  // loading) quietly renders Streets — no toast, the pick itself stays saved
-  const effectiveBasemap: Basemap =
-    basemap in GOOGLE_BASEMAPS && !googleKey ? "streets" : basemap
+  // no key (removed in Settings, or orgs still loading) → fallback tiles,
+  // quietly — no toast, and the saved pick survives for when a key returns
+  const googleActive = !!googleKey && !googleDown
 
   const devices = useMemo(() => data?.devices ?? [], [data])
   const placed = useMemo(() => devices.filter(isPlaced), [devices])
@@ -820,7 +817,6 @@ export function MapPage() {
       "wisp-map-wrap relative h-[calc(100svh-3.5rem-4rem)] md:h-[calc(100svh-3.5rem)]",
       placingId != null && "wisp-map-placing",
       lowZoom && "wisp-map-lowzoom",
-      basemap === "dim" && "wisp-map-dim",
     )}>
       <MapContainer
         ref={mapRef}
@@ -831,28 +827,12 @@ export function MapPage() {
         className="wisp-map h-full w-full"
         worldCopyJump
       >
-        {effectiveBasemap in GOOGLE_BASEMAPS && googleKey ? (
+        {googleActive ? (
           <GoogleLayer
-            key={`google-${GOOGLE_BASEMAPS[effectiveBasemap]}`}
-            apiKey={googleKey}
-            mapType={GOOGLE_BASEMAPS[effectiveBasemap]}
+            key={`google-${GOOGLE_BASEMAPS[basemap]}`}
+            apiKey={googleKey!}
+            mapType={GOOGLE_BASEMAPS[basemap]}
             onFail={onGoogleFail}
-          />
-        ) : effectiveBasemap === "sat" ? (
-          <TileLayer
-            key="sat"
-            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-            attribution="&copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics"
-            maxNativeZoom={18}
-            maxZoom={20}
-          />
-        ) : effectiveBasemap === "dim" ? (
-          <TileLayer
-            key={dark ? "dim-dark" : "dim-light"}
-            url={`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
-            attribution={CARTO_ATTR}
-            subdomains="abcd"
-            maxZoom={20}
           />
         ) : (
           <StreetsTiles />
@@ -966,7 +946,7 @@ export function MapPage() {
       {/* Google ToS: their wordmark must be visible whenever Google tiles render.
           Fixed px on purpose — it's a logo, not type-scale text. White-with-shadow
           is how Google Maps itself renders it over both roadmap and satellite. */}
-      {effectiveBasemap in GOOGLE_BASEMAPS && googleKey && (
+      {googleActive && (
         <span aria-hidden className="pointer-events-none absolute bottom-1 left-2 z-[1000] select-none font-medium"
           style={{
             fontFamily: "'Product Sans', Roboto, Arial, sans-serif", fontSize: "18px",
@@ -1025,17 +1005,17 @@ export function MapPage() {
       {/* controls — slide left of the device panel so they stay clickable ------- */}
       <div className={cn("absolute top-3 right-3 z-[1000] flex flex-col gap-1.5",
         selected && "md:right-[calc(380px+1.5rem)]")}>
-        <div className="relative">
-          <Button variant={layersOpen ? "default" : "outline"} size="icon"
-            className={cn("size-8 backdrop-blur", !layersOpen && "bg-popover/95 dark:bg-popover/95")}
-            title="Map style" onClick={() => setLayersOpen(!layersOpen)}>
-            <Layers className="size-3.5" />
-          </Button>
-          {layersOpen && (
-            <div className="absolute top-0 right-9 w-36 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 p-1 backdrop-blur">
-              {(Object.keys(BASEMAP_LABEL) as Basemap[])
-                .filter((b) => googleKey != null || !(b in GOOGLE_BASEMAPS))
-                .map((b) => (
+        {/* no key = no choices to offer; the fallback map is not a style */}
+        {googleKey != null && (
+          <div className="relative">
+            <Button variant={layersOpen ? "default" : "outline"} size="icon"
+              className={cn("size-8 backdrop-blur", !layersOpen && "bg-popover/95 dark:bg-popover/95")}
+              title="Map style" onClick={() => setLayersOpen(!layersOpen)}>
+              <Layers className="size-3.5" />
+            </Button>
+            {layersOpen && (
+              <div className="absolute top-0 right-9 w-36 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 p-1 backdrop-blur">
+                {(Object.keys(BASEMAP_LABEL) as Basemap[]).map((b) => (
                   <button key={b}
                     className={cn("flex w-full items-center rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5",
                       basemap === b && "bg-accent font-medium")}
@@ -1043,9 +1023,10 @@ export function MapPage() {
                     {BASEMAP_LABEL[b]}
                   </button>
                 ))}
-            </div>
-          )}
-        </div>
+              </div>
+            )}
+          </div>
+        )}
         <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title="Fit all pins" onClick={fitAll} disabled={placed.length === 0}>
           <Maximize2 className="size-3.5" />

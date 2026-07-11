@@ -223,11 +223,6 @@ html:not(.dark) .wisp-drillin {
   background: var(--background);
   font: inherit;
 }
-/* Only the "Dim" NOC-wall basemap gets desaturated; Streets/Satellite stay
-   full-color (the muted look on those read as "dull", not "calm") */
-.wisp-map-dim .leaflet-tile-pane {
-  filter: saturate(0.72);
-}
 .wisp-map-placing .leaflet-container {
   cursor: crosshair;
 }

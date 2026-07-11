@@ -216,19 +216,23 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   (status derived from `acknowledged_at`/`resolved_at`/`root_cause`, never stored;
   recovery is FSM-automatic — no manual resolve, ever).
 - **Map view (`/map`) is real** (2026-07-10, was a mockup-fake): Leaflet + raster
-  tiles fetched by the BROWSER (central needs no egress; the base three are
-  KEYLESS). Basemap switcher (2026-07-11, localStorage): Streets = CARTO Voyager
-  (default, Google-Maps-like), Satellite = Esri World Imagery, Dim = theme-matched
-  CARTO (only Dim gets the desaturation filter). **Google / Google Satellite**
-  (2026-07-11) use the Map Tiles API — the sanctioned third-party-renderer API,
-  NOT the SDK-only Maps tiles — and appear only when `orgs.google_maps_key` is
-  set (Settings; referrer-restricted, ships to browsers by design, central still
-  makes NO Google calls). `lib/google-tiles.ts`: session token (~2wk) cached in
-  localStorage per mapType; ToS needs the per-viewport copyright in the
-  attribution control + a Google wordmark overlay. Failure ladder: tile-error
-  BURST (3 in 5s, once per token — a stray rural-z20 404 must not nuke the
-  basemap) → recreate session once → toast + auto-fallback to Streets; Streets
-  renders under a pending session so the map is never blank. **Chrome-over-tiles trap**: shadcn outline Buttons carry
+  tiles fetched by the BROWSER (central needs no egress). Basemaps are
+  **Google / Google Satellite ONLY** (2026-07-11; the CARTO/Esri/Dim menu
+  entries were removed at the operator's request the same day they shipped) via
+  the Map Tiles API — the sanctioned third-party-renderer API, NOT the SDK-only
+  Maps tiles — shown only when `orgs.google_maps_key` is set (Settings;
+  referrer-restricted, ships to browsers by design, central still makes NO
+  Google calls; no key = no Layers button). CARTO Voyager survives as the
+  KEYLESS FALLBACK, never a menu option: it renders for no-key orgs, under a
+  still-creating session, and after a Google failure — the map is never blank.
+  `lib/google-tiles.ts`: session token (~2wk) cached in localStorage per
+  mapType; **dpr>1 sessions request `scaleFactor2x`+`highDpi`** (512px tiles at
+  256 CSS px — plain 256 rasters are why Google "looked blurry" on scaled
+  displays; cache key carries the scale). ToS needs the per-viewport copyright
+  in the attribution control + a Google wordmark overlay. Failure ladder:
+  tile-error BURST (3 in 5s, once per token — a stray rural-z20 404 must not
+  nuke the basemap) → recreate session once → toast + fallback tiles, WITHOUT
+  overwriting the user's saved pick. **Chrome-over-tiles trap**: shadcn outline Buttons carry
   `dark:bg-input/30`, which BEATS a plain `bg-popover/95` override in dark mode —
   invisible over dark tiles, washed-out over bright ones; map chrome needs
   `bg-popover/95 dark:bg-popover/95`.

@@ -8,7 +8,16 @@
 
 export type GoogleMapType = "roadmap" | "satellite"
 
-const sessionKey = (t: GoogleMapType) => `wisp:map:gsession:${t}`
+// HiDPI: scaleFactor2x + highDpi returns 512px tiles for the SAME coverage;
+// Leaflet still lays them out at 256 CSS px, so a dense display (retina, or
+// Windows at 125–150% scaling) gets its full pixel budget instead of an
+// upscaled 256 raster — that upscale is the "Google view looks blurry"
+// complaint. dpr 1 keeps plain tiles: downscaling 512→256 softens label
+// hinting rather than sharpening it. The session token encodes the scale, so
+// the cache key carries it too.
+const hiDpi = () => typeof window !== "undefined" && window.devicePixelRatio > 1
+
+const sessionKey = (t: GoogleMapType) => `wisp:map:gsession:${t}:${hiDpi() ? "2x" : "1x"}`
 
 interface CachedSession {
   session: string
@@ -44,7 +53,10 @@ export async function createGoogleSession(apiKey: string, mapType: GoogleMapType
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // language/region shape label choices; the org key's billing is India-based
-      body: JSON.stringify({ mapType, language: "en-IN", region: "IN" }),
+      body: JSON.stringify({
+        mapType, language: "en-IN", region: "IN",
+        ...(hiDpi() ? { scale: "scaleFactor2x", highDpi: true } : {}),
+      }),
     },
   )
   if (!res.ok) throw new Error(`createSession replied ${res.status}`)
