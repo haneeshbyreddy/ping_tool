@@ -99,7 +99,7 @@ export function AppShell() {
             onClick={() => setSearchOpen(true)}>
             <Search className="size-3.5 shrink-0" />
             <span className="flex-1 text-left">Search…</span>
-            <kbd className="pointer-events-none rounded border bg-muted px-1.5 py-px font-mono text-[0.6875rem]">
+            <kbd className="pointer-events-none rounded border bg-muted px-1.5 py-px font-mono text-2xs">
               {navigator.platform.includes("Mac") ? "⌘K" : "Ctrl K"}
             </kbd>
           </button>
@@ -124,7 +124,7 @@ export function AppShell() {
               end={item.to === "/"}
               className={({ isActive }) =>
                 cn(
-                  "flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-[0.75rem] font-medium",
+                  "flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium",
                   isActive ? "text-primary" : "text-muted-foreground",
                 )
               }
@@ -135,7 +135,7 @@ export function AppShell() {
           ))}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-[0.75rem] font-medium text-muted-foreground">
+              <button className="flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium text-muted-foreground">
                 <MoreHorizontal className="size-5" />
                 More
               </button>

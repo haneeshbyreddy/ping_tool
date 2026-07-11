@@ -285,10 +285,13 @@ function DeviceRow({
   const unassigned = !device.assigned_node_id
 
   return (
-    <div ref={rowRef} className="border-b last:border-b-0">
+    // Open = the drill-in block: row + panel fuse into one raised surface
+    // (.wisp-drillin in index.css); the row itself goes transparent so the
+    // block carries the elevation, with a hairline between row and panel.
+    <div ref={rowRef} className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
       <div
-        className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-accent/40",
-          detailOpen && "bg-accent/40")}
+        className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
+          detailOpen && "border-b")}
         onClick={() => setDetailOpen(!detailOpen)}
         title={detailOpen ? undefined : "Click for details"}
       >
@@ -311,10 +314,10 @@ function DeviceRow({
         <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
           unassigned && "text-muted-foreground")}>{device.name}</span>
         {device.device_type && (
-          <span className="hidden shrink-0 text-xs text-muted-foreground/70 lg:inline">{device.device_type}</span>
+          <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
         )}
         {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
-        {!!device.maintenance && <RowTag tone="warning">maint</RowTag>}
+        {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
         {device.backup_parents.length > 0 && <RowTag tone="success">backup</RowTag>}
         {/* Monitored-port trouble surfaces on the switch's own row — clicking a chip
             opens the ports panel straight to the story instead of making the operator
@@ -389,7 +392,7 @@ function DeviceRow({
                   <Waypoints className={cn("size-3.5",
                     device.onus_crit ? "text-destructive"
                       : device.onus_warn ? "text-warning"
-                      : opticsFresh ? "text-success" : "text-muted-foreground/40")} />
+                      : opticsFresh ? "text-success" : "text-faint-foreground")} />
                 </span>
               )}
               {hasPorts && (
@@ -399,7 +402,7 @@ function DeviceRow({
                   <Radio className={cn("size-3.5",
                     device.ports_down ? "text-destructive"
                       : (device.ports_bw_low || device.ports_bw_high) ? "text-warning"
-                      : portsFresh ? "text-success" : "text-muted-foreground/40")} />
+                      : portsFresh ? "text-success" : "text-faint-foreground")} />
                 </span>
               )}
             </div>
@@ -569,7 +572,7 @@ export function TopologyPage() {
             </h2>
             {probeFilter && (
               <button
-                className="flex items-center gap-1.5 self-center rounded-full border bg-card px-2.5 py-0.5 text-[0.75rem] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                className="flex items-center gap-1.5 self-center rounded-full border bg-card px-2.5 py-0.5 text-2xs font-medium text-muted-foreground transition-colors hover:text-foreground"
                 title="Showing only this probe's devices. Click to clear"
                 onClick={() => setProbeFilter(null)}>
                 {probeFilter}

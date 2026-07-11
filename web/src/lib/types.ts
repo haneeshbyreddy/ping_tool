@@ -358,6 +358,35 @@ export interface SnmpProfilesResponse {
   selects: string[]
 }
 
+export type SnmpSubsystem = "health" | "ports" | "optics"
+export type SnmpStatusState = "ok" | "empty" | "no_response" | "timeout" | "no_profile" | "error"
+
+/** The edge's per-subsystem SNMP sweep diagnosis — WHY a panel is blank. */
+export interface SnmpSubsystemStatus {
+  subsystem: SnmpSubsystem
+  state: SnmpStatusState
+  detail: string | null
+  sysobjectid: string | null
+  profile: string | null
+  item_count: number | null
+  updated_at: string
+  last_ok_at: string | null
+}
+
+/** Operator verdict "this hardware can't do X" — only unsupported rows exist. */
+export interface DeviceCapability {
+  subsystem: SnmpSubsystem
+  supported: boolean
+  note: string | null
+  updated_by: string | null
+  updated_at: string
+}
+
+export interface SnmpStatusResponse {
+  status: SnmpSubsystemStatus[]
+  capability: DeviceCapability[]
+}
+
 export interface SystemStats {
   hostname: string
   uptime_s: number | null

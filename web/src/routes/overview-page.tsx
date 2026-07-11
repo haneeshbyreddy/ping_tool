@@ -33,9 +33,9 @@ function ProblemRow({ p }: { p: OverviewProblem }) {
     <div className="flex items-center gap-3 px-4 py-2 md:px-5">
       <StatusDot tone={p.reason === "never" ? "destructive" : "warning"} />
       <span className="min-w-0 truncate text-sm font-medium">{p.name}</span>
-      <Badge variant="outline" className="text-[0.6875rem]">{AREA_LABEL[p.area]}</Badge>
+      <Badge variant="outline" className="text-2xs">{AREA_LABEL[p.area]}</Badge>
       <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{p.detail}</span>
-      <span className="shrink-0 text-[0.75rem] text-muted-foreground">
+      <span className="shrink-0 text-2xs text-muted-foreground">
         {p.last_at ? `last data ${ago(p.last_at)}` : "never reported"}
       </span>
     </div>
@@ -57,7 +57,7 @@ function OrgRow({ org }: { org: OverviewOrg }) {
         onClick={() => expandable && setOpen((o) => !o)}
         className={cn(
           "grid w-full grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 px-4 py-2.5 text-left md:grid-cols-[minmax(10rem,1.4fr)_repeat(4,minmax(0,1fr))_auto] md:px-5",
-          expandable && "cursor-pointer transition-colors hover:bg-accent/40",
+          expandable && "cursor-pointer transition-colors hover:bg-foreground/5",
         )}
       >
         <span className="flex min-w-0 items-center gap-2">
@@ -66,7 +66,7 @@ function OrgRow({ org }: { org: OverviewOrg }) {
             : <StatusDot tone={org.devices > 0 ? "success" : "muted"} />}
           <span className="min-w-0">
             <span className="block truncate text-sm font-medium">{org.name || org.org_id}</span>
-            <span className="block font-mono text-[0.6875rem] text-muted-foreground">{org.org_id}</span>
+            <span className="block font-mono text-2xs text-muted-foreground">{org.org_id}</span>
           </span>
         </span>
         <span className="hidden text-sm md:block">
@@ -94,7 +94,7 @@ function OrgRow({ org }: { org: OverviewOrg }) {
         </span>
         <span className="ml-auto flex items-center gap-2">
           {broken > 0 && (
-            <Badge variant="outline" className="text-[0.6875rem] text-warning">
+            <Badge variant="outline" className="text-2xs text-warning">
               {broken} not working
             </Badge>
           )}
@@ -182,7 +182,7 @@ export function OverviewPage() {
       <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
         {stats.map((s) => (
           <div key={s.key} className="bg-card px-5 py-4">
-            <p className="flex items-center gap-1.5 text-[0.75rem] font-medium tracking-wide text-muted-foreground uppercase">
+            <p className="flex items-center gap-1.5 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
               <s.icon className="size-3.5" /> {s.label}
             </p>
             {isLoading ? <Skeleton className="mt-1.5 h-8 w-16" /> : (
@@ -203,7 +203,7 @@ export function OverviewPage() {
           <CardTitle className="flex items-center gap-2 text-sm">
             Coverage by organization
             {data && (
-              <span className="ml-auto font-normal text-[0.75rem] text-muted-foreground">
+              <span className="ml-auto font-normal text-2xs text-muted-foreground">
                 working = data within the last {Math.round(data.fresh_window_s / 60)} min
               </span>
             )}

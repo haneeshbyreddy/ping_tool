@@ -20,7 +20,7 @@ export function StateBadge({ state, label }: { state: string | null | undefined;
   const tone = stateTone(state)
   return (
     <span className={cn(
-      "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[0.75rem] font-semibold capitalize",
+      "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-2xs font-semibold capitalize",
       TONE_CLASS[tone],
     )}>
       <StatusDot tone={tone} />
@@ -32,7 +32,7 @@ export function StateBadge({ state, label }: { state: string | null | undefined;
 export function TonePill({ tone, children }: { tone: keyof typeof TONE_CLASS; children: ReactNode }) {
   return (
     <span className={cn(
-      "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[0.75rem] font-semibold whitespace-nowrap",
+      "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-2xs font-semibold whitespace-nowrap",
       TONE_CLASS[tone],
     )}>
       {children}

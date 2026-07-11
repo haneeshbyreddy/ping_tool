@@ -8,6 +8,7 @@ import { analyticsApi, inventoryApi } from "@/lib/api"
 import type { OrgDevice, SwitchPort } from "@/lib/types"
 import { Meter } from "@/components/meter"
 import { OpticalPanel } from "@/components/optical-panel"
+import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
 import { ago, durationSince, fmtBytes, fmtDur, isFresh, isStale } from "@/lib/format"
@@ -45,17 +46,17 @@ function PortBandwidthForm({ port, onSaved }: { port: SwitchPort; onSaved: () =>
   return (
     <div className="flex flex-wrap items-end gap-2 text-xs">
       <div className="flex flex-col gap-0.5">
-        <Label className="text-[0.75rem] text-muted-foreground">Min Mbps</Label>
+        <Label className="text-2xs text-muted-foreground">Min Mbps</Label>
         <Input type="number" min="0" placeholder="none" value={min}
           onChange={(e) => setMin(e.target.value)} className="h-7 w-20 text-xs" />
       </div>
       <div className="flex flex-col gap-0.5">
-        <Label className="text-[0.75rem] text-muted-foreground">Max Mbps</Label>
+        <Label className="text-2xs text-muted-foreground">Max Mbps</Label>
         <Input type="number" min="0" placeholder="none" value={max}
           onChange={(e) => setMax(e.target.value)} className="h-7 w-20 text-xs" />
       </div>
       <div className="flex flex-col gap-0.5">
-        <Label className="text-[0.75rem] text-muted-foreground">Direction</Label>
+        <Label className="text-2xs text-muted-foreground">Direction</Label>
         <Select value={direction} onValueChange={setDirection}>
           <SelectTrigger className="h-7 w-24 text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -110,7 +111,8 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   if (isLoading) return <Skeleton className="h-16 w-full" />
   const ports = data?.ports ?? []
   if (ports.length === 0) {
-    return <p className="px-1 py-2 text-xs text-muted-foreground">No SNMP ports discovered yet.</p>
+    // Not a dead end: the edge diagnoses WHY each SNMP sweep came back empty.
+    return <SnmpDiagnosis device={device} subsystem="ports" />
   }
 
   // alarmed first (a down port that's alarming is the urgent one), then open/up
@@ -130,13 +132,14 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
 
   return (
     <div className="overflow-hidden rounded-lg border bg-muted/40">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-[0.75rem] text-muted-foreground">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-2xs text-muted-foreground">
         <span className="font-medium">{ports.length} ports · {watched} watched</span>
         {down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
         {bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
+        {/* stale is a data-freshness note, not an alarm — neutral, never amber */}
         {portsStale
-          ? <span className="font-semibold text-warning" title="The SNMP port walk on this device has stopped refreshing — these rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
-          : lastWalk && <span className="text-muted-foreground/70">as of {ago(lastWalk)}</span>}
+          ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing — these rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
+          : lastWalk && <span className="text-faint-foreground">as of {ago(lastWalk)}</span>}
         <span className="ml-auto hidden sm:inline">watch a port to alarm on it</span>
       </div>
       {sorted.map((p) => {
@@ -162,8 +165,8 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
               </span>
               {!!p.monitored && (
                 <button
-                  className={cn("hidden shrink-0 rounded px-1.5 py-0.5 font-mono text-[0.75rem] sm:inline",
-                    limits ? "text-muted-foreground hover:bg-accent" : "text-muted-foreground/60 hover:bg-accent")}
+                  className={cn("hidden shrink-0 rounded px-1.5 py-0.5 font-mono text-2xs sm:inline",
+                    limits ? "text-muted-foreground hover:bg-accent" : "text-faint-foreground hover:bg-accent")}
                   title="Bandwidth limits (Mbps)"
                   onClick={() => setConfigOpen(configOpen === p.id ? null : p.id)}>
                   {limits ? `${limits} ${p.bw_direction ?? "either"}` : "set limits"}
@@ -187,8 +190,8 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
 
 export function DeviceMetrics({ device }: { device: OrgDevice }) {
 
-  if (!device.assigned_node_id) return <span className="text-xs text-muted-foreground/70">not monitored</span>
-  if (!device.state) return <span className="text-xs text-muted-foreground/70">no data</span>
+  if (!device.assigned_node_id) return <span className="text-xs text-faint-foreground">not monitored</span>
+  if (!device.state) return <span className="text-xs text-faint-foreground">no data</span>
   if (isStale(device.state_updated_at)) {
     return <span className="text-xs text-muted-foreground">stale · {ago(device.state_updated_at)}</span>
   }
@@ -225,13 +228,25 @@ function hasVitals(device: OrgDevice): boolean {
 
 function DeviceVitals({ device }: { device: OrgDevice }) {
   const { health_cpu_pct: cpu, health_mem_pct: mem, health_temp_c: temp } = device
-  if (!hasVitals(device)) return null
+  if (!hasVitals(device)) {
+    // SNMP is on but no CPU/RAM/temp ever landed — say why instead of hiding the
+    // section (an SNMP-less device stays quiet; there's nothing to diagnose).
+    if (device.snmp_enabled === 1) {
+      return (
+        <div className="flex flex-col gap-2">
+          <span className="text-2xs font-medium text-muted-foreground">Device health</span>
+          <SnmpDiagnosis device={device} subsystem="health" />
+        </div>
+      )
+    }
+    return null
+  }
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-baseline justify-between text-[0.75rem] text-muted-foreground">
+      <div className="flex items-baseline justify-between text-2xs text-muted-foreground">
         <span className="font-medium">Device health</span>
         {device.health_updated_at && isStale(device.health_updated_at) && (
-          <span className="text-muted-foreground/70">as of {ago(device.health_updated_at)}</span>
+          <span className="text-faint-foreground">as of {ago(device.health_updated_at)}</span>
         )}
       </div>
       {cpu != null && (
@@ -336,7 +351,7 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
 
       {/* when was it bad, last 24 clock hours ----------------------------------- */}
       <div>
-        <div className="mb-1 flex items-baseline justify-between text-[0.75rem] text-muted-foreground">
+        <div className="mb-1 flex items-baseline justify-between text-2xs text-muted-foreground">
           <span className="font-medium">Last 24 h</span>
           <span className={cn(roughHours > 0 && "font-semibold text-warning")}>
             {trend.error ? "hourly history unavailable"
@@ -345,14 +360,14 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
           </span>
         </div>
         <HourStrip buckets={buckets} />
-        <div className="mt-0.5 flex justify-between text-[0.6875rem] text-muted-foreground">
+        <div className="mt-0.5 flex justify-between text-2xs text-muted-foreground">
           <span>24 h ago</span><span>now</span>
         </div>
       </div>
 
       {/* can I trust it --------------------------------------------------------- */}
       {rel && (
-        <p className="border-t pt-2 text-[0.75rem] text-muted-foreground">
+        <p className="border-t pt-2 text-2xs text-muted-foreground">
           Last 7 days ·{" "}
           <span className={cn("font-mono font-semibold",
             rel.uptime_pct >= 99.9 ? "text-success" : rel.uptime_pct >= 99 ? "text-foreground" : "text-warning")}>
@@ -380,7 +395,7 @@ export function RowTag({ tone, children, onClick, title }: {
   }[tone]
   return (
     <span title={title} onClick={onClick}
-      className={cn("shrink-0 rounded px-1.5 py-px text-[0.6875rem] font-semibold tracking-wide uppercase",
+      className={cn("shrink-0 rounded px-1.5 py-px text-2xs font-semibold tracking-wide uppercase",
         onClick && "cursor-pointer hover:brightness-125", cls)}>
       {children}
     </span>
@@ -410,7 +425,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
   const active = tabs.includes(tab) ? tab : "health"
   return (
     <Tabs value={active} onValueChange={(v) => onTab(v as DeviceTab)}>
-      <TabsList className="mb-2">
+      <TabsList variant="line" className="mb-2">
         {tabs.map((t) => <TabsTrigger key={t} value={t}>{TAB_LABEL[t]}</TabsTrigger>)}
       </TabsList>
       <TabsContent value="health"><DevicePerfPanel device={device} /></TabsContent>

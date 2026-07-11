@@ -412,16 +412,33 @@ class GponPollerPool:
 
     async def resolve(self, device: dict, target: SnmpTarget) -> GponPoller | None:
         """Pick the poller for one OLT; None means optics stay off for it."""
+        poller, _ = await self.resolve_info(device, target)
+        return poller
+
+    async def resolve_info(
+        self, device: dict, target: SnmpTarget,
+    ) -> tuple[GponPoller | None, dict]:
+        """resolve() plus the WHY — `{"vendor", "sysobjectid", "reason"}` where
+        reason is one of `override` (dashboard/env named the vendor), `matched`
+        (sysObjectID auto-detect hit a profile), `no_profile` (agent answered,
+        no profile claims it — the actionable "onboard this vendor" case), or
+        `no_response` (sysObjectID never came back — agent silent). The edge
+        reports this verbatim so the dashboard can guide the fix."""
         vendor = (device.get("gpon_vendor") or "").strip().lower() or self._fallback
         if vendor:
-            return self.for_vendor(vendor)
+            poller = self.for_vendor(vendor)
+            return poller, {"vendor": vendor, "sysobjectid": None,
+                            "reason": "override" if poller else "no_profile"}
         soid = await self._sysobjectid(device.get("id") or target.ip, target)
+        if soid is None:
+            return None, {"vendor": None, "sysobjectid": None, "reason": "no_response"}
         profile = match_gpon_profile(soid)
         if profile is None:
             log.debug("OLT %s (%s): sysObjectID %r matches no GPON profile; optics off",
                       device.get("id"), target.ip, soid)
-            return None
-        return self._poller_for(profile)
+            return None, {"vendor": None, "sysobjectid": soid, "reason": "no_profile"}
+        return self._poller_for(profile), {"vendor": profile.name, "sysobjectid": soid,
+                                           "reason": "matched"}
 
     def _poller_for(self, profile: GponProfile) -> GponPoller:
         poller = self._pollers.get(profile.name)

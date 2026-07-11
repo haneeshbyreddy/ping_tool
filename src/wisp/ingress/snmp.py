@@ -150,18 +150,27 @@ class PysnmpPoller:
         transport = await UdpTransportTarget.create(
             (target.ip, target.port), timeout=self._timeout, retries=1)
         varbinds: list[tuple[str, str]] = []
+        # Walk all ten ifTable/ifXTable columns TOGETHER in one multi-varbind
+        # GETBULK, not ten sequential per-column walks. They share the ifIndex
+        # index (same rows), so a combined walk returns every column per round
+        # and cuts round-trips ~10x — a 250-interface OLT that couldn't finish
+        # ten serial walks inside port_walk_timeout_s (60s) now does. parse_if_table
+        # keys by ifIndex, so interleaved varbinds parse identically. maxRepetitions
+        # is 8 here (not 25): each repetition now yields all ten columns, so 8 keeps
+        # a single PDU near ~80 varbinds instead of a jumbo response a cheap agent
+        # might truncate.
+        columns = [ObjectType(ObjectIdentity(c)) for c in WALK_COLUMNS]
         try:
-            for column in WALK_COLUMNS:
-                async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
-                    engine, community, transport, ContextData(),
-                    0, 25, ObjectType(ObjectIdentity(column)),
-                    lexicographicMode=False,
-                ):
-                    if errInd or errStat:
-                        raise RuntimeError(
-                            f"SNMP walk of {target.ip} failed: {errInd or errStat}")
-                    for name, val in binds:
-                        varbinds.append((str(name), val.prettyPrint()))
+            async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
+                engine, community, transport, ContextData(),
+                0, 8, *columns,
+                lexicographicMode=False,
+            ):
+                if errInd or errStat:
+                    raise RuntimeError(
+                        f"SNMP walk of {target.ip} failed: {errInd or errStat}")
+                for name, val in binds:
+                    varbinds.append((str(name), val.prettyPrint()))
         except RuntimeError:
             raise
         except Exception as exc:

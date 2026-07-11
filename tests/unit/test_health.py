@@ -9,10 +9,11 @@ sys.path.insert(0, os.path.dirname(_TESTS_DIR))
 
 from wisp.config import Config
 from wisp.ingress.health import (
-    DeviceHealth, OID_ENT_SENSOR_PRECISION, OID_ENT_SENSOR_SCALE, OID_ENT_SENSOR_TYPE,
-    OID_ENT_SENSOR_VALUE, OID_FH_HEALTH, OID_FH_MEM, OID_HR_CPU_LOAD, OID_HR_STORAGE_SIZE,
-    OID_HR_STORAGE_TYPE, OID_HR_STORAGE_UNITS, OID_HR_STORAGE_USED, OID_MTXR_HEALTH,
-    PysnmpHealthPoller, build_health_poller, parse_health,
+    DeviceHealth, HealthReading, OID_ENT_SENSOR_PRECISION, OID_ENT_SENSOR_SCALE,
+    OID_ENT_SENSOR_TYPE, OID_ENT_SENSOR_VALUE, OID_FH_HEALTH, OID_FH_MEM,
+    OID_HR_CPU_LOAD, OID_HR_STORAGE_SIZE, OID_HR_STORAGE_TYPE, OID_HR_STORAGE_UNITS,
+    OID_HR_STORAGE_USED, OID_MTXR_HEALTH, PysnmpHealthPoller, build_health_poller,
+    parse_health,
 )
 from apps.daemon.main import _gather_snmp_health
 
@@ -215,6 +216,8 @@ class _FakeHealthPoller:
         result = self.by_ip[target.ip]
         if isinstance(result, Exception):
             raise result
+        if isinstance(result, DeviceHealth):
+            result = HealthReading(health=result, responded=not result.is_empty())
         return result
 
 class GatherTest(unittest.TestCase):
@@ -234,11 +237,37 @@ class GatherTest(unittest.TestCase):
             "10.0.0.3": RuntimeError("boom"),
             "10.0.0.4": DeviceHealth(),  # nothing exposed -> dropped
         })
-        out = asyncio.run(_gather_snmp_health(poller, devices, cfg))
+        out, status = asyncio.run(_gather_snmp_health(poller, devices, cfg))
         self.assertEqual(set(out), {1})
         self.assertEqual(out[1]["cpu_pct"], 33.0)
         self.assertEqual(out[1]["temp_c"], 52.0)
         self.assertNotIn("10.0.0.2", poller.walked)
+        # every walked device gets a diagnosis, data or not
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertEqual(status[3]["state"], "error")
+        self.assertEqual(status[4]["state"], "no_response")
+
+    def test_gather_diagnoses_empty_vs_silent_vs_profile_miss(self):
+        cfg = Config()
+        devices = [
+            {"id": 1, "ip_address": "10.0.0.1", "snmp_enabled": 1,
+             "snmp_community": "public"},
+            {"id": 2, "ip_address": "10.0.0.2", "snmp_enabled": 1,
+             "snmp_community": "public"},
+        ]
+        # 1: agent answered sysObjectID but exposes no health OIDs — the
+        # "needs a vendor profile" case; 2: agent totally silent.
+        poller = _FakeHealthPoller({
+            "10.0.0.1": HealthReading(health=DeviceHealth(), responded=True,
+                                      sysobjectid="1.3.6.1.4.1.9999.1"),
+            "10.0.0.2": HealthReading(health=DeviceHealth(), responded=False),
+        })
+        out, status = asyncio.run(_gather_snmp_health(poller, devices, cfg))
+        self.assertEqual(out, {})
+        self.assertEqual(status[1]["state"], "empty")
+        self.assertEqual(status[1]["sysobjectid"], "1.3.6.1.4.1.9999.1")
+        self.assertIn("profile", status[1]["detail"])
+        self.assertEqual(status[2]["state"], "no_response")
 
 try:
     import pysnmp  # noqa: F401

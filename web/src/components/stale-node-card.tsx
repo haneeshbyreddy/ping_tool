@@ -21,7 +21,7 @@ export function StaleNodeCard({ node }: { node: NodeToken }) {
               </p>
             </div>
           </div>
-          <span className="shrink-0 rounded-full border border-destructive/30 bg-destructive-soft px-2 py-0.5 text-[0.75rem] font-semibold whitespace-nowrap text-destructive">
+          <span className="shrink-0 rounded-full border border-destructive/30 bg-destructive-soft px-2 py-0.5 text-2xs font-semibold whitespace-nowrap text-destructive">
             Offline
           </span>
         </div>

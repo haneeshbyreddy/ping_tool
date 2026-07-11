@@ -23,7 +23,7 @@ export function ServerHealthCard() {
             <span className="ml-auto flex items-center gap-2 font-normal text-muted-foreground">
               <span className="font-mono text-xs">{data.hostname}</span>
               {data.uptime_s != null && (
-                <span className="text-[0.75rem]">up {fmtDur(data.uptime_s)}</span>
+                <span className="text-2xs">up {fmtDur(data.uptime_s)}</span>
               )}
             </span>
           )}
@@ -48,13 +48,13 @@ export function ServerHealthCard() {
               detail={data.disk
                 ? `${fmtBytes(data.disk.free_bytes)} free of ${fmtBytes(data.disk.total_bytes)}`
                 : "—"} />
-            <p className="mt-1 text-[0.75rem] text-muted-foreground">
+            <p className="mt-1 text-2xs text-muted-foreground">
               {data.cpu.load && (
                 <>load {data.cpu.load.map((l) => l.toFixed(2)).join(" ")} (1m/5m/15m) · </>
               )}
               service {fmtBytes(data.process.rss_bytes)} RSS · database {fmtBytes(data.process.db_bytes)}
             </p>
-            <p className="text-[0.75rem]">
+            <p className="text-2xs">
               {data.release_sync == null ? (
                 <span className="text-muted-foreground">Release mirror: never synced</span>
               ) : data.release_sync.ok ? (

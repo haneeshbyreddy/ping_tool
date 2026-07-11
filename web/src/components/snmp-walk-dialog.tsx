@@ -27,15 +27,15 @@ const ROOT_PRESETS: Array<{ label: string; oid: string; hint: string }> = [
 function StatusPill({ w }: { w: SnmpWalk }) {
   if (w.status === "pending") {
     return (
-      <span className="inline-flex items-center gap-1 text-[0.75rem] font-semibold text-warning">
+      <span className="inline-flex items-center gap-1 text-2xs font-semibold text-warning">
         <Loader2 className="size-3 animate-spin" /> running
       </span>
     )
   }
   if (w.status === "error") {
-    return <span className="text-[0.75rem] font-semibold text-destructive" title={w.error ?? ""}>failed</span>
+    return <span className="text-2xs font-semibold text-destructive" title={w.error ?? ""}>failed</span>
   }
-  return <span className="text-[0.75rem] font-semibold text-success">{w.varbind_count} rows</span>
+  return <span className="text-2xs font-semibold text-success">{w.varbind_count} rows</span>
 }
 
 function downloadResult(deviceName: string, walk: { root_oid: string }, rows: Array<[string, string]>) {
@@ -61,13 +61,13 @@ function WalkRow({ device, walk }: { device: OrgDevice; walk: SnmpWalk }) {
   return (
     <div className="border-b last:border-b-0">
       <button
-        className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-accent/40 disabled:cursor-default"
+        className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-foreground/5 disabled:cursor-default"
         disabled={walk.status !== "done"}
         onClick={() => setOpen((v) => !v)}>
         <span className="font-mono text-xs">{walk.root_oid}</span>
         <span className="ml-auto flex items-center gap-3">
           <StatusPill w={walk} />
-          <span className="text-[0.6875rem] text-muted-foreground">
+          <span className="text-2xs text-muted-foreground">
             {ago(walk.completed_at ?? walk.created_at)}
           </span>
         </span>
@@ -78,7 +78,7 @@ function WalkRow({ device, walk }: { device: OrgDevice; walk: SnmpWalk }) {
           {rows.length > 0 && (
             <>
               <div className="mb-2 flex items-center justify-between">
-                <span className="text-[0.75rem] text-muted-foreground">
+                <span className="text-2xs text-muted-foreground">
                   {rows.length} varbind{rows.length === 1 ? "" : "s"}
                   {walk.max_varbinds <= rows.length && " (capped)"}
                 </span>
@@ -87,7 +87,7 @@ function WalkRow({ device, walk }: { device: OrgDevice; walk: SnmpWalk }) {
                   <Download className="size-3" /> .txt
                 </Button>
               </div>
-              <pre className="max-h-64 overflow-auto rounded border bg-card p-2 font-mono text-[0.6875rem] leading-relaxed">
+              <pre className="max-h-64 overflow-auto rounded border bg-card p-2 font-mono text-2xs leading-relaxed">
                 {rows.map(([oid, val]) => `${oid} = ${val}`).join("\n")}
               </pre>
             </>
@@ -150,7 +150,7 @@ export function SnmpWalkDialog({ device, open, onOpenChange }: {
             <div className="flex flex-wrap gap-1.5">
               {ROOT_PRESETS.map((p) => (
                 <button key={p.oid} title={p.hint}
-                  className={cn("rounded-full border px-2.5 py-0.5 text-[0.75rem] transition-colors",
+                  className={cn("rounded-full border px-2.5 py-0.5 text-2xs transition-colors",
                     oid === p.oid ? "border-primary/50 bg-primary/10 text-foreground"
                       : "text-muted-foreground hover:text-foreground")}
                   onClick={() => setOid(p.oid)}>
@@ -172,7 +172,7 @@ export function SnmpWalkDialog({ device, open, onOpenChange }: {
         )}
 
         <div className="overflow-hidden rounded-lg border">
-          <div className="border-b bg-muted/40 px-3 py-2 text-[0.75rem] font-medium text-muted-foreground">
+          <div className="border-b bg-muted/40 px-3 py-2 text-2xs font-medium text-muted-foreground">
             Recent walks
           </div>
           {isLoading && <p className="px-3 py-3 text-xs text-muted-foreground">Loading…</p>}

@@ -1,8 +1,8 @@
 import type {
   AccountUser, AdminOverview, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
-  SnmpProfilesResponse, SnmpWalk, SnmpWalkResult, Summary, SwitchPort, SystemStats,
-  TrendBucket, Worker,
+  SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  Summary, SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
 
 export class ApiError extends Error {}
@@ -116,6 +116,11 @@ export const inventoryApi = {
 }
 
 export const snmpApi = {
+  status: (deviceId: number) =>
+    request<SnmpStatusResponse>(`/api/inventory/snmp-status?device_id=${deviceId}`),
+  setCapability: (body: {
+    device_id: number; subsystem: SnmpSubsystem; supported: boolean; note?: string | null
+  }) => request<{ ok: boolean }>("/api/inventory/capability", { method: "POST", body }),
   walks: (deviceId: number) =>
     request<{ walks: SnmpWalk[] }>(`/api/inventory/snmp-walks?device_id=${deviceId}`),
   walkResult: (id: number) =>

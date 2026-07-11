@@ -13,7 +13,8 @@ class CentralBrainClient(Protocol):
     def fetch_devices(self) -> dict: ...
     def report(self, pings: dict, ts: str, *, mode: str = "full",
               ports: dict | None = None, optics: dict | None = None,
-              health: dict | None = None) -> dict: ...
+              health: dict | None = None,
+              snmp_status: dict | None = None) -> dict: ...
     def heartbeat(self, body: dict) -> dict: ...
     def walk_result(self, walk_id: int, *, varbinds: list | None = None,
                     error: str | None = None) -> dict: ...
@@ -85,7 +86,8 @@ class HttpCentralClient:
 
     def report(self, pings: dict, ts: str, *, mode: str = "full",
               ports: dict | None = None, optics: dict | None = None,
-              health: dict | None = None) -> dict:
+              health: dict | None = None,
+              snmp_status: dict | None = None) -> dict:
         env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
               "ts": ts, "mode": mode, "pings": pings}
         if ports:
@@ -94,6 +96,8 @@ class HttpCentralClient:
             env["optics"] = optics
         if health:
             env["health"] = health
+        if snmp_status:
+            env["snmp_status"] = snmp_status
         return self._post("/report", env)
 
     def heartbeat(self, body: dict) -> dict:

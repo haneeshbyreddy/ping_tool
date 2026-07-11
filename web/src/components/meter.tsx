@@ -19,15 +19,15 @@ export function Meter({ label, pct, value, detail, warn = 75, crit = 90 }: {
     : pct != null && pct >= warn ? "text-warning" : ""
   return (
     <div className="flex items-center gap-3">
-      <span className="w-14 shrink-0 text-[0.75rem] font-medium text-muted-foreground">{label}</span>
+      <span className="w-14 shrink-0 text-2xs font-medium text-muted-foreground">{label}</span>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
         <div className={cn("h-full rounded-full transition-[width] duration-500", barTone)}
           style={{ width: `${Math.min(100, Math.max(pct ?? 0, pct == null ? 0 : 2))}%` }} />
       </div>
-      <span className={cn("w-12 shrink-0 text-right text-[0.75rem] font-semibold tabular-nums", textTone)}>
+      <span className={cn("w-12 shrink-0 text-right text-2xs font-semibold tabular-nums", textTone)}>
         {value ?? (pct == null ? "—" : `${pct.toFixed(0)}%`)}
       </span>
-      <span className="hidden w-40 shrink-0 text-right text-[0.75rem] tabular-nums text-muted-foreground sm:block">
+      <span className="hidden w-40 shrink-0 text-right text-2xs tabular-nums text-muted-foreground sm:block">
         {detail}
       </span>
     </div>

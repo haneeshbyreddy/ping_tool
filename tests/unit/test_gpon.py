@@ -324,9 +324,10 @@ class _OnePool:
         self.poller = poller
         self.asked: list = []
 
-    async def resolve(self, device, target):
+    async def resolve_info(self, device, target):
         self.asked.append(device.get("gpon_vendor"))
-        return self.poller
+        return self.poller, {"vendor": "huawei", "sysobjectid": None,
+                             "reason": "override"}
 
 class GatherTest(unittest.TestCase):
     def _run(self, coro):
@@ -339,10 +340,12 @@ class GatherTest(unittest.TestCase):
             {"id": 3, "ip_address": "10.0.0.3", "device_type": "switch", "snmp_enabled": 1},
         ]
         poller = _FakePoller({"10.0.0.1": [OnuOptic("K1", rx_dbm=-20.0, state="online")]})
-        out = self._run(_gather_onu_optics(_OnePool(poller), devices, Config()))
+        out, status = self._run(_gather_onu_optics(_OnePool(poller), devices, Config()))
         self.assertEqual(set(out), {1})
         self.assertEqual(poller.walked, ["10.0.0.1"])
         self.assertEqual(out[1][0]["onu_key"], "K1")
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertNotIn(2, status)  # snmp off: no diagnosis, not "broken"
 
     def test_one_dead_olt_never_sinks_the_others(self):
         class Flaky(_FakePoller):
@@ -355,16 +358,20 @@ class GatherTest(unittest.TestCase):
             {"id": 9, "ip_address": "10.0.0.9", "device_type": "OLT", "snmp_enabled": 1},
         ]
         poller = Flaky({"10.0.0.1": [OnuOptic("K1", rx_dbm=-20.0, state="online")]})
-        out = self._run(_gather_onu_optics(_OnePool(poller), devices, Config()))
+        out, status = self._run(_gather_onu_optics(_OnePool(poller), devices, Config()))
         self.assertEqual(set(out), {1})
+        self.assertEqual(status[9]["state"], "error")
 
     def test_each_olt_walked_with_its_own_vendor_poller(self):
         huawei = _FakePoller({"10.0.0.1": [OnuOptic("HW", state="online")]})
         zte = _FakePoller({"10.0.0.2": [OnuOptic("ZT", state="online")]})
 
         class _RoutingPool:
-            async def resolve(self, device, target):
-                return zte if (device.get("gpon_vendor") or "").lower() == "zte" else huawei
+            async def resolve_info(self, device, target):
+                vendor = (device.get("gpon_vendor") or "").lower()
+                poller = zte if vendor == "zte" else huawei
+                return poller, {"vendor": vendor or "huawei", "sysobjectid": None,
+                                "reason": "override"}
 
         devices = [
             {"id": 1, "ip_address": "10.0.0.1", "device_type": "OLT", "snmp_enabled": 1,
@@ -372,7 +379,7 @@ class GatherTest(unittest.TestCase):
             {"id": 2, "ip_address": "10.0.0.2", "device_type": "OLT", "snmp_enabled": 1,
              "gpon_vendor": "zte"},
         ]
-        out = self._run(_gather_onu_optics(_RoutingPool(), devices, Config()))
+        out, _ = self._run(_gather_onu_optics(_RoutingPool(), devices, Config()))
         self.assertEqual(out[1][0]["onu_key"], "HW")
         self.assertEqual(out[2][0]["onu_key"], "ZT")
         self.assertEqual(huawei.walked, ["10.0.0.1"])
@@ -391,23 +398,30 @@ class GatherTest(unittest.TestCase):
                     "snmp_enabled": 1}]
         poller = Slow({"10.0.0.8": [OnuOptic("K8", state="online")]})
         cfg = Config(snmp_walk_timeout_s=0.01, gpon_walk_timeout_s=5.0)
-        out = self._run(_gather_onu_optics(_OnePool(poller), devices, cfg))
+        out, _ = self._run(_gather_onu_optics(_OnePool(poller), devices, cfg))
         self.assertEqual(set(out), {8})
 
     def test_unresolved_vendor_skips_the_olt_entirely(self):
         walked = _FakePoller({"10.0.0.1": [OnuOptic("HW", state="online")]})
 
         class _NonePool:
-            async def resolve(self, device, target):
-                return walked if device["id"] == 1 else None
+            async def resolve_info(self, device, target):
+                if device["id"] == 1:
+                    return walked, {"vendor": "huawei",
+                                    "sysobjectid": "1.3.6.1.4.1.2011.2",
+                                    "reason": "matched"}
+                return None, {"vendor": None, "sysobjectid": "1.3.6.1.4.1.9.1.1",
+                              "reason": "no_profile"}
 
         devices = [
             {"id": 1, "ip_address": "10.0.0.1", "device_type": "OLT", "snmp_enabled": 1},
             {"id": 2, "ip_address": "10.0.0.2", "device_type": "OLT", "snmp_enabled": 1},
         ]
-        out = self._run(_gather_onu_optics(_NonePool(), devices, Config()))
+        out, status = self._run(_gather_onu_optics(_NonePool(), devices, Config()))
         self.assertEqual(set(out), {1})
         self.assertEqual(walked.walked, ["10.0.0.1"])
+        self.assertEqual(status[2]["state"], "no_profile")
+        self.assertEqual(status[2]["sysobjectid"], "1.3.6.1.4.1.9.1.1")
 
 if __name__ == "__main__":
     unittest.main()

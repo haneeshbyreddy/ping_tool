@@ -206,7 +206,7 @@ export function HomePage() {
         {stats.map((s) => {
           const body = (
             <>
-              <p className="text-[0.75rem] font-medium tracking-wide text-muted-foreground uppercase">{s.label}</p>
+              <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">{s.label}</p>
               {s.loading ? <Skeleton className="mt-1.5 h-8 w-16" /> : (
                 <p className="mt-1 flex items-baseline gap-2">
                   <span className={cn("text-3xl font-semibold tracking-tight", s.tone === "destructive" && "text-destructive", s.tone === "warning" && "text-warning")}>
@@ -218,7 +218,7 @@ export function HomePage() {
             </>
           )
           return s.to ? (
-            <Link key={s.key} to={s.to} className="bg-card px-6 py-5 transition-colors hover:bg-accent/40">{body}</Link>
+            <Link key={s.key} to={s.to} className="bg-card px-6 py-5 transition-colors hover:bg-foreground/5">{body}</Link>
           ) : (
             <div key={s.key} className="bg-card px-6 py-5">{body}</div>
           )
@@ -277,7 +277,7 @@ export function HomePage() {
               const stale = !unassigned && !!d.state && isStale(d.state_updated_at)
               return (
                 <Link key={d.id} to="/topology" state={{ deviceId: d.id }}
-                  className="flex items-center gap-3 border-t px-5 py-2.5 transition-colors first:border-t-0 hover:bg-accent/30">
+                  className="flex items-center gap-3 border-t px-5 py-2.5 transition-colors first:border-t-0 hover:bg-foreground/5">
                   <StatusDot tone={unassigned ? "muted" : deviceTone(d.state, d.state_updated_at)} />
                   <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
                     unassigned && "text-muted-foreground")}>{d.name}</span>
@@ -289,12 +289,12 @@ export function HomePage() {
                   )}
                   <span className="ml-auto flex shrink-0 items-baseline gap-3 text-right">
                     {unassigned && (
-                      <span className="text-xs text-muted-foreground/70">not monitored</span>
+                      <span className="text-xs text-faint-foreground">not monitored</span>
                     )}
                     {!unassigned && d.maintenance === 1 && (
                       <span className="text-xs text-muted-foreground">maintenance</span>
                     )}
-                    {stale && <span className="text-xs text-warning">stale · {ago(d.state_updated_at)}</span>}
+                    {stale && <span className="text-xs text-muted-foreground">stale · {ago(d.state_updated_at)}</span>}
                     {!unassigned && !stale && d.state && d.state !== "UP" && (
                       <span className={cn("font-mono text-xs font-semibold",
                         d.state === "DEGRADED" ? "text-warning" : "text-destructive")}>

@@ -73,98 +73,167 @@ def _pings_payload(results: dict[str, PingResult]) -> dict:
         for ip, r in results.items()
     }
 
+# Per-device, per-subsystem SNMP sweep outcomes, reported to central alongside the
+# data itself ("snmp_status" on the full report). The states are a CLOSED vocabulary
+# the dashboard's guided troubleshooting switches on — extend deliberately:
+#   ok          data landed (count says how much)
+#   empty       agent answered but the subtree had nothing usable
+#   no_response agent never answered — community/ACL/SNMP-off, fix on the device
+#   timeout     walk ran past its budget — big table or rate-limited agent
+#   no_profile  agent identified itself but no vendor profile claims it
+#   error       anything else (detail carries the message)
+
+def _snmp_target(d: dict) -> SnmpTarget:
+    return SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
+                      port=d.get("snmp_port") or 161,
+                      version=d.get("snmp_version") or "2c")
+
+def _classify_snmp_exc(exc: Exception) -> tuple[str, str]:
+    msg = str(exc)[:200]
+    low = msg.lower()
+    if "no snmp response" in low or "timed out" in low or "timeout" in low:
+        return "no_response", msg
+    return "error", msg
+
 async def _gather_snmp_ports(
     snmp_poller: SnmpPoller, devices: list[dict], cfg: Config = CONFIG,
-) -> dict[int, list[dict]]:
+) -> tuple[dict[int, list[dict]], dict[int, dict]]:
     sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
 
-    async def one(d: dict) -> tuple[int, list[dict]] | None:
-        target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
-                            port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
+    async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         async with sem:
             try:
                 ports = await asyncio.wait_for(
-                    snmp_poller.walk(target), timeout=cfg.port_walk_timeout_s or None)
+                    snmp_poller.walk(_snmp_target(d)),
+                    timeout=cfg.port_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("SNMP port walk of device %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.port_walk_timeout_s)
-                return None
-            except Exception:
+                return d["id"], None, {
+                    "state": "timeout",
+                    "detail": f"port walk exceeded {cfg.port_walk_timeout_s:.0f}s"}
+            except Exception as exc:
                 log.exception("SNMP walk failed for device %s (%s); continuing",
                               d.get("id"), d["ip_address"])
-                return None
-        return d["id"], [
+                state, detail = _classify_snmp_exc(exc)
+                return d["id"], None, {"state": state, "detail": detail}
+        if not ports:
+            return d["id"], None, {
+                "state": "empty",
+                "detail": "agent answered but the interface table had no rows"}
+        wire = [
             {"if_index": p.if_index, "if_name": p.if_name, "if_alias": p.if_alias,
              "admin_status": p.admin_status, "oper_status": p.oper_status,
              "last_change": p.last_change, "in_octets": p.in_octets,
              "out_octets": p.out_octets, "speed_bps": p.speed_bps}
             for p in ports
         ]
+        return d["id"], wire, {"state": "ok", "count": len(ports)}
 
-    pairs = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
-    return {dev_id: ports for dev_id, ports in (p for p in pairs if p)}
+    rows = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
+    data = {dev_id: wire for dev_id, wire, _ in rows if wire is not None}
+    return data, {dev_id: st for dev_id, _, st in rows}
 
 async def _gather_snmp_health(
     health_poller: HealthPoller, devices: list[dict], cfg: Config = CONFIG,
     profiles: list[dict] | None = None,
-) -> dict[int, dict]:
+) -> tuple[dict[int, dict], dict[int, dict]]:
     sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
 
-    async def one(d: dict) -> tuple[int, dict] | None:
-        target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
-                            port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
+    async def one(d: dict) -> tuple[int, dict | None, dict]:
         async with sem:
             try:
-                health = await asyncio.wait_for(
-                    health_poller.walk(target, profiles),
+                reading = await asyncio.wait_for(
+                    health_poller.walk(_snmp_target(d), profiles),
                     timeout=cfg.snmp_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("SNMP health walk of device %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
-                return None
-            except Exception:
+                return d["id"], None, {
+                    "state": "timeout",
+                    "detail": f"health walk exceeded {cfg.snmp_walk_timeout_s:.0f}s"}
+            except Exception as exc:
                 log.exception("SNMP health walk failed for device %s (%s); continuing",
                               d.get("id"), d["ip_address"])
-                return None
-        if health.is_empty():
-            return None
-        return d["id"], health.to_wire()
+                state, detail = _classify_snmp_exc(exc)
+                return d["id"], None, {"state": state, "detail": detail}
+        status: dict = {"sysobjectid": reading.sysobjectid,
+                        "profile": reading.profile_name}
+        if reading.health.is_empty():
+            if not reading.responded:
+                status.update(state="no_response",
+                              detail="agent never answered any subtree")
+            elif reading.profile_name:
+                status.update(
+                    state="empty",
+                    detail=f"profile {reading.profile_name!r} matched but returned"
+                           " no readings")
+            else:
+                status.update(
+                    state="empty",
+                    detail="agent answered but exposes no standard health OIDs —"
+                           " needs a vendor profile")
+            return d["id"], None, status
+        status.update(state="ok")
+        return d["id"], reading.health.to_wire(), status
 
-    pairs = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
-    return {dev_id: h for dev_id, h in (p for p in pairs if p)}
+    rows = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
+    data = {dev_id: h for dev_id, h, _ in rows if h is not None}
+    return data, {dev_id: st for dev_id, _, st in rows}
 
 async def _gather_onu_optics(
     pool: GponPollerPool, devices: list[dict], cfg: Config = CONFIG,
-) -> dict[int, list[dict]]:
+) -> tuple[dict[int, list[dict]], dict[int, dict]]:
     sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
 
-    async def one(d: dict) -> tuple[int, list[dict]] | None:
-        target = SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
-                            port=d.get("snmp_port") or 161, version=d.get("snmp_version") or "2c")
+    async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
+        target = _snmp_target(d)
         async with sem:
             # Vendor resolution inside the semaphore: the auto-detect path may do a
             # one-varbind sysObjectID read, and ALL SNMP I/O stays bounded. None =
             # no profile claims this box — optics deliberately off, never guessed.
-            poller = await pool.resolve(d, target)
+            poller, info = await pool.resolve_info(d, target)
+            status: dict = {"sysobjectid": info.get("sysobjectid"),
+                            "profile": info.get("vendor")}
             if poller is None:
-                return None
+                if info.get("reason") == "no_response":
+                    status.update(state="no_response",
+                                  detail="sysObjectID read got no answer")
+                else:
+                    status.update(
+                        state="no_profile",
+                        detail="no GPON vendor profile claims this OLT — optics"
+                               " stay off rather than guessing OIDs")
+                return d["id"], None, status
             try:
                 onus = await asyncio.wait_for(
                     poller.walk(target), timeout=cfg.gpon_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("GPON walk of OLT %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.gpon_walk_timeout_s)
-                return None
-            except Exception:
+                status.update(
+                    state="timeout",
+                    detail=f"ONU walk exceeded {cfg.gpon_walk_timeout_s:.0f}s")
+                return d["id"], None, status
+            except Exception as exc:
                 log.exception("GPON walk failed for OLT %s (%s); continuing",
                               d.get("id"), d["ip_address"])
-                return None
-        return d["id"], [o.to_wire() for o in onus]
+                state, detail = _classify_snmp_exc(exc)
+                status.update(state=state, detail=detail)
+                return d["id"], None, status
+        status.update(state="ok", count=len(onus))
+        return d["id"], [o.to_wire() for o in onus], status
 
     eligible = [d for d in devices
                 if d.get("snmp_enabled") and (d.get("device_type") or "").upper() == "OLT"]
-    pairs = await asyncio.gather(*(one(d) for d in eligible))
-    return {dev_id: onus for dev_id, onus in (p for p in pairs if p)}
+    rows = await asyncio.gather(*(one(d) for d in eligible))
+    data = {dev_id: onus for dev_id, onus, _ in rows if onus is not None}
+    return data, {dev_id: st for dev_id, _, st in rows}
+
+def _merge_snmp_status(into: dict[int, dict], subsystem: str,
+                       statuses: dict[int, dict] | None) -> None:
+    for dev_id, st in (statuses or {}).items():
+        into.setdefault(dev_id, {})[subsystem] = st
 
 class _DiagWalkRunner:
     """Runs central-queued diagnostic SNMP walks (reply key "snmp_walks").
@@ -290,6 +359,7 @@ async def run_cycle_central_brain(
     gpon_pool: GponPollerPool | None = None,
     optics: dict[int, list[dict]] | None = None,
     health: dict[int, dict] | None = None,
+    snmp_status: dict[int, dict] | None = None,
     walk_runner: _DiagWalkRunner | None = None,
 ) -> bool:
     prober.on_cycle_start()
@@ -298,10 +368,15 @@ async def run_cycle_central_brain(
     results = await _gather_pings(
         prober, sorted(plan), plan, max_inflight=cfg.probe_max_inflight
     )
+    snmp_status = dict(snmp_status or {})
     if ports is None:
-        ports = await _gather_snmp_ports(snmp_poller, devices, cfg) if snmp_poller else {}
+        ports, st = (await _gather_snmp_ports(snmp_poller, devices, cfg)
+                     if snmp_poller else ({}, {}))
+        _merge_snmp_status(snmp_status, "ports", st)
     if optics is None:
-        optics = await _gather_onu_optics(gpon_pool, devices, cfg) if gpon_pool else {}
+        optics, st = (await _gather_onu_optics(gpon_pool, devices, cfg)
+                      if gpon_pool else ({}, {}))
+        _merge_snmp_status(snmp_status, "optics", st)
     extra: dict = {}
     if ports:
         extra["ports"] = ports
@@ -309,6 +384,8 @@ async def run_cycle_central_brain(
         extra["optics"] = optics
     if health:
         extra["health"] = health
+    if snmp_status:
+        extra["snmp_status"] = snmp_status
     try:
         reply = client.report(_pings_payload(results), ts, **extra)
     except CentralClientError as exc:
@@ -424,31 +501,36 @@ async def _run_central_brain(
                     _gather_snmp_health(health_poller, list(devices), cfg,
                                         list(snmp_profiles)))
             next_snmp = started + cfg.snmp_interval_s
+        snmp_status: dict[int, dict] = {}
         ports: dict[int, list[dict]] | None = None
         if snmp_task is not None and snmp_task.done():
             try:
-                ports = snmp_task.result()
+                ports, st = snmp_task.result()
+                _merge_snmp_status(snmp_status, "ports", st)
             except Exception:
                 log.exception("SNMP sweep failed; continuing")
             snmp_task = None
         optics: dict[int, list[dict]] | None = None
         if gpon_task is not None and gpon_task.done():
             try:
-                optics = gpon_task.result()
+                optics, st = gpon_task.result()
+                _merge_snmp_status(snmp_status, "optics", st)
             except Exception:
                 log.exception("GPON optics sweep failed; continuing")
             gpon_task = None
         health: dict[int, dict] | None = None
         if health_task is not None and health_task.done():
             try:
-                health = health_task.result()
+                health, st = health_task.result()
+                _merge_snmp_status(snmp_status, "health", st)
             except Exception:
                 log.exception("SNMP health sweep failed; continuing")
             health_task = None
         try:
             reported = await run_cycle_central_brain(
                 prober, client, devices, canary_ip, cfg, ports=ports, optics=optics,
-                health=health, walk_runner=walk_runner)
+                health=health, snmp_status=snmp_status or None,
+                walk_runner=walk_runner)
             status.write(PHASE_RUNNING, ok=reported, devices=len(devices),
                          error=None if reported else "last report to central failed")
         except Exception as exc:

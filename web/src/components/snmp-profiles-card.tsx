@@ -198,17 +198,17 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
                 <p className="flex items-center gap-2 truncate text-sm font-medium">
                   {p.name}
                   {p.org_id === null && (
-                    <span className="rounded bg-muted px-1.5 py-px text-[0.6875rem] font-semibold text-muted-foreground">
+                    <span className="rounded bg-muted px-1.5 py-px text-2xs font-semibold text-muted-foreground">
                       global
                     </span>
                   )}
                   {!p.enabled && (
-                    <span className="rounded bg-muted px-1.5 py-px text-[0.6875rem] font-semibold text-muted-foreground">
+                    <span className="rounded bg-muted px-1.5 py-px text-2xs font-semibold text-muted-foreground">
                       off
                     </span>
                   )}
                 </p>
-                <p className="truncate font-mono text-[0.6875rem] text-muted-foreground">
+                <p className="truncate font-mono text-2xs text-muted-foreground">
                   {p.match_sysobjectid} · {Object.keys(p.metrics).join(", ")}
                 </p>
               </div>

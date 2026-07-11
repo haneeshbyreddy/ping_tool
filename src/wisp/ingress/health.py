@@ -91,10 +91,23 @@ class DeviceHealth:
                 "temp_c": self.temp_c}
 
 
+@dataclass(frozen=True)
+class HealthReading:
+    """One device's health sweep result PLUS the facts needed to say WHY it's
+    empty when it is. `responded` (any varbind came back, sysObjectID included)
+    splits "agent silent — fix the device/community/ACL" from "agent alive but
+    exposes no health OIDs — needs a vendor profile"; the dashboard's guided
+    troubleshooting is built on that distinction, so keep it honest."""
+    health: DeviceHealth
+    sysobjectid: str | None = None
+    profile_name: str | None = None
+    responded: bool = False
+
+
 @runtime_checkable
 class HealthPoller(Protocol):
     async def walk(self, target,
-                   profiles: list[dict] | None = None) -> DeviceHealth: ...
+                   profiles: list[dict] | None = None) -> HealthReading: ...
 
 
 def _to_num(raw) -> float | None:
@@ -362,7 +375,7 @@ class PysnmpHealthPoller:
         self._engine = None
 
     async def walk(self, target,
-                   profiles: list[dict] | None = None) -> DeviceHealth:
+                   profiles: list[dict] | None = None) -> HealthReading:
         try:
             from pysnmp.hlapi.asyncio import (
                 SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
@@ -414,18 +427,24 @@ class PysnmpHealthPoller:
                     continue
                 varbinds.extend(column_binds)
 
-        # sysObjectID first (one varbind) so the vendor profile is known up front;
-        # its columns walk BEFORE the standard MIBs — on the boxes that need a
-        # profile the standard subtrees are usually the dead ones, and a dead column
-        # burns timeout x retries of the shared budget each.
+        # sysObjectID first, ALWAYS (one varbind): it picks the vendor profile up
+        # front AND doubles as the "agent is alive" probe the empty-vs-silent
+        # diagnosis needs. Profile columns walk BEFORE the standard MIBs — on the
+        # boxes that need a profile the standard subtrees are usually the dead
+        # ones, and a dead column burns timeout x retries of the shared budget.
         profile: dict | None = None
+        await walk_columns((OID_SYS_OBJECT_ID,))
+        soid = sys_object_id(varbinds)
         if profiles:
-            await walk_columns((OID_SYS_OBJECT_ID,))
-            profile = match_profile(profiles, sys_object_id(varbinds))
+            profile = match_profile(profiles, soid)
             if profile is not None:
                 await walk_columns(profile_walk_roots(profile))
         await walk_columns(WALK_COLUMNS)
-        return parse_health(varbinds, profile)
+        return HealthReading(
+            health=parse_health(varbinds, profile),
+            sysobjectid=soid,
+            profile_name=(profile or {}).get("name"),
+            responded=bool(varbinds))
 
 
 def build_health_poller(cfg: Config = CONFIG) -> HealthPoller:

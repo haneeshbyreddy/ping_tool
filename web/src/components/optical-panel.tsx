@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { OnuOptic, OpticsResponse, OrgDevice } from "@/lib/types"
+import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -37,7 +38,7 @@ function ackActive(o: OnuOptic): boolean {
 }
 
 function Drift({ o }: { o: OnuOptic }) {
-  if (o.rx_dbm == null || o.rx_ref_dbm == null) return <span className="text-muted-foreground/50">—</span>
+  if (o.rx_dbm == null || o.rx_ref_dbm == null) return <span className="text-faint-foreground">—</span>
   const delta = o.rx_dbm - o.rx_ref_dbm
   if (Math.abs(delta) < 0.2) return <span className="text-muted-foreground">± 0 dB</span>
   const worse = delta < 0
@@ -128,23 +129,23 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
       <span className="min-w-0 flex-1 truncate">
         {o.name || <span className="text-muted-foreground">unnamed</span>}
       </span>
-      <span className="hidden w-32 shrink-0 truncate font-mono text-[0.6875rem] text-muted-foreground sm:inline">
+      <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground sm:inline">
         {o.serial || o.onu_key}
       </span>
       <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
         onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
         {fmtDbm(o.rx_dbm)} dBm
       </span>
-      <span className="hidden w-20 shrink-0 text-right text-[0.6875rem] md:inline"><Drift o={o} /></span>
-      <span className="hidden w-16 shrink-0 text-right font-mono text-[0.6875rem] text-muted-foreground lg:inline">
+      <span className="hidden w-20 shrink-0 text-right text-2xs md:inline"><Drift o={o} /></span>
+      <span className="hidden w-16 shrink-0 text-right font-mono text-2xs text-muted-foreground lg:inline">
         {fmtKm(o.distance_m)}
       </span>
       <span className="w-14 shrink-0 text-right">
         {onuSev(o) === "ok" || o.state !== "online" ? null : acked ? (
-          <button className="text-[0.6875rem] text-muted-foreground hover:text-foreground"
+          <button className="text-2xs text-muted-foreground hover:text-foreground"
             onClick={() => ack.mutate()} disabled={ack.isPending}>acked</button>
         ) : (
-          <Button variant="outline" size="sm" className="h-6 px-2 text-[0.6875rem]"
+          <Button variant="outline" size="sm" className="h-6 px-2 text-2xs"
             onClick={() => ack.mutate()} disabled={ack.isPending}>Ack</Button>
         )}
       </span>
@@ -159,22 +160,22 @@ function PonRow({ pon, open, onToggle }: {
   const worstTone = pon.crit > 0 ? "text-destructive" : pon.warn > 0 ? "text-warning" : "text-muted-foreground"
   return (
     <button onClick={onToggle} aria-expanded={open}
-      className={cn("flex w-full items-center gap-3 rounded-md px-2 py-2 text-left hover:bg-accent/40",
+      className={cn("flex w-full items-center gap-3 rounded-md px-2 py-2 text-left hover:bg-foreground/5",
         open && "bg-accent/50")}>
       <span className="w-16 shrink-0 font-mono text-xs font-semibold">PON {pon.port}</span>
-      <span className="w-12 shrink-0 font-mono text-[0.6875rem] text-muted-foreground">
+      <span className="w-12 shrink-0 font-mono text-2xs text-muted-foreground">
         {pon.online}/{pon.onus.length}
       </span>
       <span className="min-w-0 flex-1"><CellStrip onus={pon.onus} /></span>
       {/* typical (median) + worst Rx — the pair the mockup shows on the right */}
-      <span className="hidden w-14 shrink-0 text-right font-mono text-[0.6875rem] tabular-nums text-muted-foreground sm:inline">
+      <span className="hidden w-14 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground sm:inline">
         {fmtDbm(pon.typicalRx)}
       </span>
-      <span className={cn("w-14 shrink-0 text-right font-mono text-[0.6875rem] font-semibold tabular-nums", worstTone)}>
+      <span className={cn("w-14 shrink-0 text-right font-mono text-2xs font-semibold tabular-nums", worstTone)}>
         {fmtDbm(pon.worstRx)}
       </span>
       {(pon.crit > 0 || pon.warn > 0) ? (
-        <span className="w-10 shrink-0 text-right text-[0.6875rem] font-semibold">
+        <span className="w-10 shrink-0 text-right text-2xs font-semibold">
           {pon.crit > 0 && <span className="text-destructive">{pon.crit}</span>}
           {pon.crit > 0 && pon.warn > 0 && <span className="text-muted-foreground"> · </span>}
           {pon.warn > 0 && <span className="text-warning">{pon.warn}</span>}
@@ -212,14 +213,14 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   }, [focusOnuId, worst])
   if (!worst.length) {
     return (
-      <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2 text-[0.6875rem] text-muted-foreground">
+      <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2 text-2xs text-muted-foreground">
         No online ONUs with an Rx reading on PON {pon.port} yet.
       </div>
     )
   }
   return (
     <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2">
-      <div className="mb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">
+      <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
         Worst first · PON {pon.port} · {pon.onus.length} ONUs
       </div>
       <div className="divide-y divide-border/60">
@@ -228,7 +229,7 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
         ))}
       </div>
       {worst.length > WORST_N && (
-        <button className="mt-1 text-[0.6875rem] text-muted-foreground hover:text-foreground"
+        <button className="mt-1 text-2xs text-muted-foreground hover:text-foreground"
           onClick={() => setShowAll(!showAll)}>
           {showAll ? "Show fewer" : `All ${pon.onus.length} ONUs on ${pon.port} →`}
         </button>
@@ -278,13 +279,9 @@ export function OpticalPanel({ device, focusOnuId }: {
   }
   const onus = q.data?.onus ?? []
   if (!onus.length) {
-    return (
-      <p className="rounded-lg border bg-muted/40 px-3 py-6 text-center text-xs text-muted-foreground">
-        No ONU optical readings yet. The edge walks this OLT's GPON MIB on its slow SNMP
-        cadence. Readings appear after the first walk (enable SNMP on the OLT if you
-        haven't).
-      </p>
-    )
+    // Not a dead end: the edge diagnoses WHY the ONU walk came back empty
+    // (vendor unmatched vs agent silent vs genuinely no ONUs).
+    return <SnmpDiagnosis device={device} subsystem="optics" />
   }
 
   const online = onus.filter((o) => o.state === "online").length
@@ -300,16 +297,16 @@ export function OpticalPanel({ device, focusOnuId }: {
           <span className="text-muted-foreground"> ONUs · {online} online</span>
         </span>
         {crit > 0 && (
-          <span className="rounded bg-destructive-soft px-1.5 py-0.5 text-[0.75rem] font-semibold text-destructive">
+          <span className="rounded bg-destructive-soft px-1.5 py-0.5 text-2xs font-semibold text-destructive">
             {crit} below {q.data!.crit_dbm} dBm
           </span>
         )}
         {warn > 0 && (
-          <span className="rounded bg-warning-soft px-1.5 py-0.5 text-[0.75rem] font-semibold text-warning">
+          <span className="rounded bg-warning-soft px-1.5 py-0.5 text-2xs font-semibold text-warning">
             {warn} warning
           </span>
         )}
-        <span className="ml-auto flex items-center gap-3 font-mono text-[0.6875rem] text-muted-foreground">
+        <span className="ml-auto flex items-center gap-3 font-mono text-2xs text-muted-foreground">
           {worstPon && <span>worst: PON {worstPon}</span>}
           <span>warn {q.data!.warn_dbm} · crit {q.data!.crit_dbm} dBm</span>
         </span>

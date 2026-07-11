@@ -58,7 +58,7 @@ function CommandBlock({ command }: { command: string }) {
 function Step({ n, children }: { n: number; children: ReactNode }) {
   return (
     <div className="flex gap-2.5">
-      <span className="mt-px flex size-4.5 shrink-0 items-center justify-center rounded-full bg-muted font-mono text-[0.6875rem] font-semibold text-muted-foreground">
+      <span className="mt-px flex size-4.5 shrink-0 items-center justify-center rounded-full bg-muted font-mono text-2xs font-semibold text-muted-foreground">
         {n}
       </span>
       <div className="flex min-w-0 flex-1 flex-col gap-2 text-xs leading-relaxed text-foreground">
@@ -90,7 +90,7 @@ function CredentialReveal({
         </div>
 
         <Tabs defaultValue="windows">
-          <TabsList>
+          <TabsList variant="line">
             <TabsTrigger value="windows">Windows</TabsTrigger>
             <TabsTrigger value="linux">Linux (Debian/Ubuntu)</TabsTrigger>
           </TabsList>
@@ -142,7 +142,7 @@ function CredentialReveal({
                 <div className="ml-auto flex gap-1">
                   {(["amd64", "arm64"] as const).map((a) => (
                     <Button key={a} size="sm" variant={linuxArch === a ? "secondary" : "ghost"}
-                      className="h-6 px-2 font-mono text-[0.6875rem]" onClick={() => setLinuxArch(a)}>
+                      className="h-6 px-2 font-mono text-2xs" onClick={() => setLinuxArch(a)}>
                       {a}
                     </Button>
                   ))}
@@ -239,7 +239,7 @@ function ProbeRow({
 
   return (
     <div className={cn(
-      "group flex h-11 items-center gap-2.5 border-b px-4 last:border-b-0 hover:bg-accent/40",
+      "group flex h-11 items-center gap-2.5 border-b px-4 last:border-b-0 hover:bg-foreground/5",
       !node.registered && "bg-muted/20",
     )}>
       <StatusDot tone={status.tone} />
@@ -250,7 +250,7 @@ function ProbeRow({
       {onFilter != null && (deviceCount ?? 0) > 0 && (
         <button
           className={cn(
-            "shrink-0 rounded-full border px-2 py-0.5 text-[0.6875rem] font-medium transition-colors",
+            "shrink-0 rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors",
             filtered ? "border-primary/40 bg-primary-soft text-primary"
               : "text-muted-foreground hover:bg-accent hover:text-foreground",
           )}
@@ -261,7 +261,7 @@ function ProbeRow({
         </button>
       )}
       {!node.registered && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-muted-foreground"
+        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
           title="Reporting to central without a dashboard-issued credential. A leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
           unregistered
         </span>
@@ -269,29 +269,29 @@ function ProbeRow({
       {node.version && (
         <span className={cn(
           "hidden shrink-0 font-mono text-xs sm:inline",
-          updateAvailable ? "text-warning" : "text-muted-foreground/70",
+          updateAvailable ? "text-warning" : "text-faint-foreground",
         )} title={updateAvailable ? `${latestVersion} available` : undefined}>
           {node.version}
         </span>
       )}
       {updateInFlight && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-muted-foreground"
+        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
           title={`Updating to ${rollout!.target_version}. Applied by the probe's supervisor after its next heartbeat`}>
           updating…
         </span>
       )}
       {updateStalled && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[0.6875rem] font-medium text-warning"
+        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-warning"
           title={`The rollout to ${rollout!.target_version} halted. The probe never came back healthy on the new version within the window. Check logs\\edge.log on the probe box, then retry from the menu.`}>
           update stalled
         </span>
       )}
       {(node.rss_bytes != null || node.mem_available_bytes != null) && (
-        <span className="hidden shrink-0 text-[0.75rem] text-muted-foreground/70 md:inline"
+        <span className="hidden shrink-0 text-2xs text-faint-foreground md:inline"
           title="Probe process memory · host RAM free">
           {node.rss_bytes != null && fmtBytes(node.rss_bytes)}
           {node.mem_available_bytes != null && (
-            <span className="text-muted-foreground/50">
+            <span className="text-faint-foreground">
               {node.rss_bytes != null ? " · " : ""}{fmtBytes(node.mem_available_bytes)} free
             </span>
           )}

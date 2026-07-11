@@ -98,7 +98,7 @@ export function LogsPage() {
         {FILTERS.map((f) => (
           <button key={f.label} onClick={() => setTypeFilter(f.key)}
             className={cn(
-              "rounded-full border px-2.5 py-1 text-[0.75rem] font-medium transition-colors",
+              "rounded-full border px-2.5 py-1 text-2xs font-medium transition-colors",
               typeFilter === f.key
                 ? "border-primary/40 bg-primary/10 text-foreground"
                 : "text-muted-foreground hover:bg-accent/50",
@@ -120,11 +120,11 @@ export function LogsPage() {
               repeat across groups and duplicate keys make React leave stale rows */}
           {groups.map((group) => (
             <div key={`${group.day}:${group.events[0].id}`}>
-              <p className="sticky top-0 border-y bg-muted/80 px-5 py-1.5 text-[0.75rem] font-semibold tracking-wide text-muted-foreground uppercase backdrop-blur first:border-t-0">
+              <p className="sticky top-0 border-y bg-muted/80 px-5 py-1.5 text-2xs font-semibold tracking-wide text-muted-foreground uppercase backdrop-blur first:border-t-0">
                 {group.day}
               </p>
               {group.events.map((ev) => (
-                <div key={ev.id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0 hover:bg-accent/30">
+                <div key={ev.id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0 hover:bg-foreground/5">
                   <span className="w-16 shrink-0 font-mono text-xs whitespace-nowrap text-muted-foreground">
                     {timeLabel(ev.occurred_at ?? ev.received_at)}
                   </span>
@@ -132,14 +132,14 @@ export function LogsPage() {
                   <span className="w-36 shrink-0 truncate font-mono text-xs font-medium md:w-44">
                     {ev.device_name || "—"}
                   </span>
-                  <span className="hidden w-24 shrink-0 rounded-full border bg-card px-1.5 py-0.5 text-center text-[0.6875rem] font-semibold text-muted-foreground sm:inline-block">
+                  <span className="hidden w-24 shrink-0 rounded-full border bg-card px-1.5 py-0.5 text-center text-2xs font-semibold text-muted-foreground sm:inline-block">
                     {TYPE_LABEL[ev.type] ?? ev.type}
                   </span>
                   <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
                     title={describeEvent(ev)}>
                     {describeEvent(ev)}
                     {ev.device_region && (
-                      <span className="text-muted-foreground/60"> · {ev.device_region}</span>
+                      <span className="text-faint-foreground"> · {ev.device_region}</span>
                     )}
                   </span>
                   <span className="shrink-0 text-right text-xs text-muted-foreground">

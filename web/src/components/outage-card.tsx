@@ -64,7 +64,7 @@ export function OutageCard({ outage }: { outage: Outage }) {
             <p className="truncate font-mono text-sm font-semibold">{outage.device_name}</p>
             {outage.region && <p className="text-xs text-muted-foreground">{outage.region}</p>}
           </div>
-          <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[0.75rem] font-semibold whitespace-nowrap ${meta.className}`}>
+          <span className={`shrink-0 rounded-full border px-2 py-0.5 text-2xs font-semibold whitespace-nowrap ${meta.className}`}>
             {meta.label}
           </span>
         </div>

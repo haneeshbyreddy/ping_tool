@@ -7,7 +7,7 @@ import { useNavigate } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import L from "leaflet"
-import { MapContainer, Marker, Polyline, TileLayer, ZoomControl, useMap, useMapEvents } from "react-leaflet"
+import { Circle, MapContainer, Marker, Polyline, TileLayer, ZoomControl, useMap, useMapEvents } from "react-leaflet"
 import "leaflet/dist/leaflet.css"
 import {
   Check, ChevronRight, Copy, Crosshair, Expand, EyeOff, ListTree, LocateFixed,
@@ -176,6 +176,10 @@ function moreOnusIcon(hidden: number): L.DivIcon {
     `<div class="wisp-onu-more" title="Open the Optical tab for the full list">+${hidden} more</div>`)
 }
 
+function meIcon(): L.DivIcon {
+  return cachedDivIcon(`<div class="wisp-me" title="You are here"></div>`)
+}
+
 function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
   const R = 6371, toR = Math.PI / 180
   const dLat = (bLat - aLat) * toR, dLng = (bLng - aLng) * toR
@@ -292,7 +296,7 @@ function MapSearch({ devices, bounds, onDevice, onPlace }: {
       <Input
         value={q}
         placeholder="Find a device or place…"
-        className="h-8 bg-card/95 pl-8 text-xs backdrop-blur"
+        className="h-8 bg-popover/95 pl-8 text-xs backdrop-blur"
         onChange={(e) => { setQ(e.target.value); setOpen(true) }}
         onFocus={() => setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
@@ -305,18 +309,18 @@ function MapSearch({ devices, bounds, onDevice, onPlace }: {
         <Card className="absolute top-9 right-0 left-0 z-[1001] flex max-h-80 flex-col gap-0 overflow-y-auto bg-popover py-0">
           {deviceHits.map((d) => (
             <button key={d.id}
-              className="flex h-9 w-full shrink-0 items-center gap-2 border-b px-3 text-left hover:bg-accent/40"
+              className="flex h-9 w-full shrink-0 items-center gap-2 border-b px-3 text-left hover:bg-foreground/5"
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => pick(() => onDevice(d))}>
               <StatusDot tone={pinTone(d)} />
               <span className="min-w-0 truncate font-mono text-xs font-medium">{d.name}</span>
               {!isPlaced(d) && <RowTag tone="muted">not placed</RowTag>}
-              <span className="ml-auto shrink-0 font-mono text-[0.6875rem] text-muted-foreground">{d.ip_address}</span>
+              <span className="ml-auto shrink-0 font-mono text-2xs text-muted-foreground">{d.ip_address}</span>
             </button>
           ))}
           {placeHits.map((p, i) => (
             <button key={`${p.lat},${p.lng},${i}`}
-              className="flex h-9 w-full shrink-0 items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-accent/40"
+              className="flex h-9 w-full shrink-0 items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-foreground/5"
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => pick(() => onPlace(p))}>
               <MapPin className="size-3.5 shrink-0 text-muted-foreground" />
@@ -398,6 +402,8 @@ export function MapPage() {
   const [fullscreen, setFullscreen] = useState(false)
   const [coordsEdit, setCoordsEdit] = useState(false)
   const [coordsText, setCoordsText] = useState("")
+  // browser geolocation fix from the locate button; accuracy in meters
+  const [myLoc, setMyLoc] = useState<{ lat: number; lng: number; acc: number } | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const troubleIdx = useRef(0)
   // dark tiles for the dark theme; light for light. Read once — a theme flip
@@ -559,8 +565,21 @@ export function MapPage() {
   const locateMe = () => {
     if (!navigator.geolocation) { toast.error("Geolocation is not available in this browser"); return }
     navigator.geolocation.getCurrentPosition(
-      (pos) => mapRef.current?.flyTo([pos.coords.latitude, pos.coords.longitude], 14),
-      () => toast.error("Couldn't get your location"),
+      (pos) => {
+        setMyLoc({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy })
+        mapRef.current?.flyTo([pos.coords.latitude, pos.coords.longitude], 14)
+      },
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) {
+          toast.error(window.isSecureContext
+            ? "Location blocked — allow location for this site in the browser's address bar, then retry"
+            : "Location needs HTTPS — open the dashboard over https to use it")
+        } else if (err.code === err.TIMEOUT) {
+          toast.error("Timed out getting your location — try again")
+        } else {
+          toast.error("Your device couldn't determine a location")
+        }
+      },
       { enableHighAccuracy: true, timeout: 10_000 },
     )
   }
@@ -750,13 +769,34 @@ export function MapPage() {
             />
           )
         })}
+        {/* "you are here" from the locate button — never a click target, so it
+            can't swallow placement clicks; accuracy circle only when the fix is
+            tight enough to mean something at street zoom */}
+        {myLoc && (
+          <>
+            {myLoc.acc <= 2000 && (
+              <Circle
+                center={[myLoc.lat, myLoc.lng]}
+                radius={myLoc.acc}
+                interactive={false}
+                pathOptions={{ color: "var(--primary)", weight: 1, opacity: 0.35, fillOpacity: 0.08 }}
+              />
+            )}
+            <Marker
+              position={[myLoc.lat, myLoc.lng]}
+              icon={meIcon()}
+              interactive={false}
+              zIndexOffset={800}
+            />
+          </>
+        )}
       </MapContainer>
 
       {/* search + status strip -------------------------------------------------- */}
       <div className="pointer-events-none absolute top-3 left-3 z-[1000] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
         <MapSearch devices={devices} bounds={region.bounds}
           onDevice={searchDevice} onPlace={searchPlace} />
-        <div className="pointer-events-auto flex h-8 items-center gap-2.5 rounded-lg border bg-card/95 px-3 text-xs backdrop-blur">
+        <div className="pointer-events-auto flex h-8 items-center gap-2.5 rounded-lg border border-border-strong bg-popover/95 px-3 text-xs backdrop-blur">
           <span className="font-semibold">{placed.length}<span className="font-normal text-muted-foreground"> / {devices.length} on map</span></span>
           {troubles.length > 0 && (
             <button className="flex items-center gap-2 font-semibold hover:brightness-125"
@@ -770,7 +810,7 @@ export function MapPage() {
         </div>
         {(troubles.length > 0 || troubleOnly) && (
           <Button variant={troubleOnly ? "default" : "outline"} size="sm"
-            className={cn("pointer-events-auto h-8 backdrop-blur", !troubleOnly && "bg-card/95")}
+            className={cn("pointer-events-auto h-8 backdrop-blur", !troubleOnly && "bg-popover/95")}
             title="Dim everything that's healthy"
             onClick={() => setTroubleOnly(!troubleOnly)}>
             <EyeOff className="size-3.5" /> Trouble only
@@ -778,17 +818,17 @@ export function MapPage() {
         )}
         {canWrite && unplaced.length > 0 && (
           <Button variant="outline" size="sm"
-            className="pointer-events-auto h-8 bg-card/95 backdrop-blur"
+            className="pointer-events-auto h-8 bg-popover/95 backdrop-blur"
             onClick={() => { setPlaceOpen(!placeOpen); setPlacingId(null) }}>
             <MapPin className="size-3.5" /> Place devices
-            <span className="rounded bg-muted px-1.5 py-px font-mono text-[0.6875rem]">{unplaced.length}</span>
+            <span className="rounded bg-muted px-1.5 py-px font-mono text-2xs">{unplaced.length}</span>
           </Button>
         )}
       </div>
 
       {/* placement banner ------------------------------------------------------ */}
       {placing && (
-        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-card/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
           <Crosshair className="size-3.5 text-primary" />
           <span>Click the map to place <span className="font-mono font-semibold">{placing.name}</span></span>
           <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
@@ -801,21 +841,21 @@ export function MapPage() {
       {/* controls — slide left of the device panel so they stay clickable ------- */}
       <div className={cn("absolute top-3 right-3 z-[1000] flex flex-col gap-1.5",
         selected && "md:right-[calc(380px+1.5rem)]")}>
-        <Button variant="outline" size="icon" className="size-8 bg-card/95 backdrop-blur"
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
           title="Fit all pins" onClick={fitAll} disabled={placed.length === 0}>
           <Maximize2 className="size-3.5" />
         </Button>
-        <Button variant="outline" size="icon" className="size-8 bg-card/95 backdrop-blur"
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
           title="Go to my location" onClick={locateMe}>
           <LocateFixed className="size-3.5" />
         </Button>
-        <Button variant="outline" size="icon" className="size-8 bg-card/95 backdrop-blur"
+        <Button variant="outline" size="icon" className="size-8 bg-popover/95 backdrop-blur"
           title={fullscreen ? "Exit fullscreen" : "Fullscreen (NOC wall)"} onClick={toggleFullscreen}>
           {fullscreen ? <Shrink className="size-3.5" /> : <Expand className="size-3.5" />}
         </Button>
         {canWrite && (
           <Button variant={editPins ? "default" : "outline"} size="icon"
-            className={cn("size-8 backdrop-blur", !editPins && "bg-card/95")}
+            className={cn("size-8 backdrop-blur", !editPins && "bg-popover/95")}
             title={editPins ? "Done moving pins" : "Move pins (drag)"}
             onClick={() => setEditPins(!editPins)}>
             <Pencil className="size-3.5" />
@@ -823,7 +863,7 @@ export function MapPage() {
         )}
       </div>
       {editPins && canWrite && (
-        <div className={cn("absolute right-3 top-[10rem] z-[1000] rounded-lg border border-warning/40 bg-card/95 px-2.5 py-1.5 text-[0.75rem] text-warning backdrop-blur",
+        <div className={cn("absolute right-3 top-[10rem] z-[1000] rounded-lg border border-warning/40 bg-popover/95 px-2.5 py-1.5 text-2xs text-warning backdrop-blur",
           selected && "md:right-[calc(380px+1.5rem)]")}>
           drag pins to move them
         </div>
@@ -831,7 +871,7 @@ export function MapPage() {
 
       {/* unplaced drawer ------------------------------------------------------- */}
       {placeOpen && canWrite && (
-        <Card className="absolute top-14 left-3 z-[1000] flex max-h-[60%] w-72 flex-col gap-0 overflow-hidden bg-card/95 py-0 backdrop-blur">
+        <Card className="absolute top-14 left-3 z-[1000] flex max-h-[60%] w-72 flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 py-0 backdrop-blur">
           <div className="flex items-center justify-between border-b px-3 py-2">
             <p className="text-xs font-semibold">Not on the map yet</p>
             <Button variant="ghost" size="icon" className="size-6" onClick={() => setPlaceOpen(false)}>
@@ -841,12 +881,12 @@ export function MapPage() {
           <div className="overflow-y-auto">
             {unplaced.map((d) => (
               <button key={d.id}
-                className="flex h-9 w-full items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-accent/40"
+                className="flex h-9 w-full items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-foreground/5"
                 onClick={() => { setPlacingId(d.id); setPlaceOpen(false); setSelectedId(null) }}>
                 <StatusDot tone={pinTone(d)} />
                 <span className="min-w-0 truncate font-mono text-xs font-medium">{d.name}</span>
-                {d.device_type && <span className="text-[0.6875rem] text-muted-foreground">{d.device_type}</span>}
-                <span className="ml-auto shrink-0 font-mono text-[0.6875rem] text-muted-foreground">{d.ip_address}</span>
+                {d.device_type && <span className="text-2xs text-muted-foreground">{d.device_type}</span>}
+                <span className="ml-auto shrink-0 font-mono text-2xs text-muted-foreground">{d.ip_address}</span>
               </button>
             ))}
             {unplaced.length === 0 && (
@@ -858,13 +898,13 @@ export function MapPage() {
 
       {/* device panel ---------------------------------------------------------- */}
       {selected && (
-        <Card className="absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden bg-card/95 py-0 backdrop-blur md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)] md:w-[380px]">
+        <Card className="absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 py-0 backdrop-blur md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)] md:w-[380px]">
           <div className="flex items-start gap-2.5 border-b px-4 py-3">
             <span className="mt-1"><StatusDot tone={pinTone(selected)} /></span>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <p className="min-w-0 truncate font-mono text-sm font-semibold">{selected.name}</p>
-                {!!selected.maintenance && <RowTag tone="warning">maint</RowTag>}
+                {!!selected.maintenance && <RowTag tone="muted">maint</RowTag>}
               </div>
               <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
                 <span className="font-mono">{selected.ip_address}</span>
@@ -983,7 +1023,7 @@ export function MapPage() {
       {/* first-run nudge ------------------------------------------------------- */}
       {!isLoading && placed.length === 0 && !placing && (
         <div className="pointer-events-none absolute inset-0 z-[999] flex items-center justify-center">
-          <div className="pointer-events-auto flex flex-col items-center gap-2 rounded-xl border bg-card/95 px-6 py-5 text-center backdrop-blur">
+          <div className="pointer-events-auto flex flex-col items-center gap-2 rounded-xl border border-border-strong bg-popover/95 px-6 py-5 text-center backdrop-blur">
             <MapPin className="size-5 text-muted-foreground" />
             <p className="text-sm font-medium">No devices on the map yet</p>
             {canWrite && devices.length > 0 ? (

@@ -425,6 +425,23 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                                   "decodes": list(inventory.PROFILE_DECODES),
                                   "selects": list(inventory.PROFILE_SELECTS)})
                 return
+            if route == "/api/inventory/snmp-status":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                try:
+                    did = int((qs.get("device_id") or [None])[0])
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "device_id required"})
+                    return
+                org = store.device_org(did)
+                if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"status": store.device_snmp_status(org, did),
+                                  "capability": store.device_capabilities(org, did)})
+                return
             if route == "/api/inventory/redundancy":
                 user = self._reader()
                 if not user:
@@ -710,6 +727,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._ingest_ports(org, eng, env.get("ports"), ts)
                 self._ingest_optics(org, eng, env.get("optics"), ts)
                 self._ingest_health(org, eng, env.get("health"), ts)
+                self._ingest_snmp_status(org, eng, env.get("snmp_status"), ts)
                 central_rollup.record_cycle(store, org, eng, cycle, results, ts)
                 central_perf.record_and_evaluate(store, org, eng, cycle, results, ts,
                                                  notifier, cfg)
@@ -774,6 +792,29 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     store.upsert_device_health(org, device_id, health, ts)
                 except Exception:
                     log.exception("SNMP health fold failed for %s/device=%d", org, device_id)
+
+        def _ingest_snmp_status(self, org: str, eng, status_by_device, ts: str) -> None:
+            # Per-device sweep diagnoses ({device: {subsystem: status}}). The store
+            # enforces the closed subsystem/state vocabularies and field bounds.
+            if not isinstance(status_by_device, dict):
+                return
+            rows: list[tuple[int, str, dict]] = []
+            for raw_id, subsystems in status_by_device.items():
+                try:
+                    device_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if device_id not in eng.meta or not isinstance(subsystems, dict):
+                    continue
+                for subsystem, st in subsystems.items():
+                    if isinstance(st, dict):
+                        rows.append((device_id, str(subsystem), st))
+            if not rows:
+                return
+            try:
+                store.upsert_snmp_statuses(org, rows, ts)
+            except Exception:
+                log.exception("SNMP status fold failed for %s", org)
 
         def _login(self):
             ip = self.client_address[0]
@@ -1066,6 +1107,17 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 clean = inventory.clean_snmp_payload(body)
                 ok = store.set_org_device_snmp(org, did, clean)
+                self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/capability":
+                clean = inventory.clean_capability_payload(body)
+                org = store.device_org(clean["device_id"])
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                ok = store.set_device_capability(
+                    org, clean["device_id"], clean["subsystem"], clean["supported"],
+                    clean["note"], updated_by=user["username"])
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
             if route == "/api/inventory/snmp-walk":

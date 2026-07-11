@@ -57,11 +57,12 @@ class RecordingCentralClient:
         return {"devices": self.devices, "canary_ip": self.canary_ip}
 
     def report(self, pings: dict, ts: str, *, mode: str = "full", ports=None,
-               optics=None, health=None) -> dict:
+               optics=None, health=None, snmp_status=None) -> dict:
         if self.fail_report:
             raise CentralClientError("report boom")
         self.reports.append({"pings": pings, "ts": ts, "mode": mode, "ports": ports,
-                             "optics": optics, "health": health})
+                             "optics": optics, "health": health,
+                             "snmp_status": snmp_status})
         if self._replies:
             return self._replies.pop(0)
         return {"ok": True}
@@ -211,12 +212,14 @@ class GatherSnmpPortsTest(unittest.TestCase):
                   _dev(2, "10.0.0.2", snmp_enabled=False)]
         snmp = _FakeSnmpPoller({"10.0.0.1": [PortStatus(3, "Gi0/3", "-> X", "up", "down")]})
         cfg = Config()
-        ports = asyncio.run(daemon._gather_snmp_ports(snmp, devices, cfg))
+        ports, status = asyncio.run(daemon._gather_snmp_ports(snmp, devices, cfg))
         self.assertEqual(set(ports), {1})
         self.assertEqual(ports[1], [{"if_index": 3, "if_name": "Gi0/3", "if_alias": "-> X",
                                      "admin_status": "up", "oper_status": "down",
                                      "last_change": None, "in_octets": None,
                                      "out_octets": None, "speed_bps": None}])
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertNotIn(2, status)  # snmp off: no diagnosis row
 
     def test_a_hung_walk_is_capped_not_waited_out(self):
         class _HangingPoller:
@@ -229,8 +232,9 @@ class GatherSnmpPortsTest(unittest.TestCase):
                   _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
         # Port walks are capped by their own dedicated timeout, not snmp_walk_timeout_s.
         cfg = Config(port_walk_timeout_s=0.05)
-        ports = asyncio.run(daemon._gather_snmp_ports(_HangingPoller(), devices, cfg))
+        ports, status = asyncio.run(daemon._gather_snmp_ports(_HangingPoller(), devices, cfg))
         self.assertEqual(set(ports), {2})
+        self.assertEqual(status[1]["state"], "timeout")
 
     def test_slow_port_walk_rides_the_port_cap_not_the_snmp_cap(self):
         # A big OLT (HILL/PYLON class, 200+ interfaces) blows the generic 20s cap on
@@ -244,7 +248,7 @@ class GatherSnmpPortsTest(unittest.TestCase):
 
         devices = [_dev(8, "10.0.0.8", snmp_enabled=True, snmp_community="public")]
         cfg = Config(snmp_walk_timeout_s=0.01, port_walk_timeout_s=5.0)
-        ports = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
+        ports, _ = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
         self.assertEqual(set(ports), {8})
 
     def test_walks_run_concurrently_not_serially(self):
@@ -261,7 +265,7 @@ class GatherSnmpPortsTest(unittest.TestCase):
         devices = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
                   for i in range(1, 5)]
         cfg = Config(snmp_max_inflight=4)
-        ports = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
+        ports, _ = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
         self.assertEqual(set(ports), {1, 2, 3, 4})
         self.assertGreater(inflight["peak"], 1)
 

@@ -128,7 +128,7 @@ export function LoginPage() {
           </form>
         </CardContent>
       </Card>
-      <p className="relative mt-6 text-xs text-muted-foreground/70">
+      <p className="relative mt-6 text-xs text-faint-foreground">
         WISP Central: uptime monitoring for ISPs
       </p>
     </div>

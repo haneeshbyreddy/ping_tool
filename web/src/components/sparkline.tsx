@@ -81,9 +81,10 @@ export function HourStrip({ buckets, hours = 24 }: { buckets: TrendBucket[]; hou
             className="h-4 min-w-0 flex-1 rounded-[2px] border border-border/60" />
         }
         const trouble = bucketTrouble(b)
+        // healthy hours whisper (40%) so a red/amber cell is the loudest thing here
         const cls = trouble === "down" ? "bg-destructive"
           : trouble === "loss" ? "bg-warning"
-          : "bg-success/35"
+          : "bg-success/40"
         const detail = [
           hourLabel(t),
           b.avg_latency_ms != null ? `${b.avg_latency_ms.toFixed(1)} ms avg` : "no reply all hour",

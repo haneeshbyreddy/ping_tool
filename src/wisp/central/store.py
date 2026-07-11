@@ -457,11 +457,52 @@ CREATE TABLE IF NOT EXISTS snmp_profiles (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
+-- Per-device, per-subsystem SNMP sweep diagnosis, reported by the edge on every
+-- SNMP cadence ("snmp_status" on the full report). This is what lets the dashboard
+-- say WHY a panel is blank (agent silent vs subtree empty vs walk timeout vs no
+-- vendor profile) instead of showing "no data" — the guided-troubleshooting flow
+-- reads it. state is the edge's closed vocabulary: ok | empty | no_response |
+-- timeout | no_profile | error. last_ok_at survives non-ok states so the UI can
+-- say "was working until <ts>".
+CREATE TABLE IF NOT EXISTS device_snmp_status (
+    device_id   INTEGER NOT NULL REFERENCES org_devices(id),
+    org_id      TEXT NOT NULL,
+    subsystem   TEXT NOT NULL,           -- health | ports | optics
+    state       TEXT NOT NULL,
+    detail      TEXT,
+    sysobjectid TEXT,
+    profile     TEXT,                    -- matched vendor profile, if any
+    item_count  INTEGER,
+    updated_at  TEXT NOT NULL,
+    last_ok_at  TEXT,
+    PRIMARY KEY (device_id, subsystem)
+);
+-- Operator verdicts on what a device's hardware can and cannot do. supported=0
+-- means "proven absent — stop flagging it" (e.g. a switch with no temperature
+-- sensor, an OLT whose firmware only refreshes optics from its web UI). The
+-- admin coverage overview and the device panel both suppress nagging for
+-- unsupported subsystems; the edge keeps probing regardless (cheap, and a
+-- firmware upgrade that adds the OID starts working with zero reconfiguration).
+CREATE TABLE IF NOT EXISTS device_capability (
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    org_id     TEXT NOT NULL,
+    subsystem  TEXT NOT NULL,            -- health | ports | optics
+    supported  INTEGER NOT NULL DEFAULT 1,
+    note       TEXT,
+    updated_by TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (device_id, subsystem)
+);
 """
 
 # Diagnostic walk results kept per device (newest first) — older ones are pruned at
 # create time so a chatty operator can't grow the DB unbounded.
 SNMP_WALKS_KEEP = 10
+
+# Closed vocabularies for device_snmp_status / device_capability writes — anything
+# outside them is dropped at ingest (the edge is honest, but the wire isn't trusted).
+SNMP_SUBSYSTEMS = ("health", "ports", "optics")
+SNMP_STATUS_STATES = ("ok", "empty", "no_response", "timeout", "no_profile", "error")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1201,6 +1242,10 @@ class CentralStore:
             conn.execute("DELETE FROM onu_optics WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute("DELETE FROM olt_optics WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM device_snmp_status WHERE device_id=?",
+                         (device_id,))
+            conn.execute("DELETE FROM device_capability WHERE device_id=?",
+                         (device_id,))
             conn.execute("DELETE FROM org_devices WHERE id=? AND org_id=?",
                          (device_id, org_id))
             conn.commit()
@@ -1781,6 +1826,94 @@ class CentralStore:
                  _i("mem_total_bytes"), _f("mem_pct"), _f("temp_c"), ts))
             conn.commit()
 
+    def upsert_snmp_statuses(self, org_id: str,
+                             rows: list[tuple[int, str, dict]], ts: str) -> None:
+        """Fold one report's per-device sweep diagnoses in a single transaction.
+        Rows outside the closed subsystem/state vocabularies are dropped; string
+        fields are length-bounded — the edge is trusted code but the wire isn't."""
+        def _s(v, cap: int) -> str | None:
+            return None if v is None else str(v)[:cap]
+
+        clean: list[tuple] = []
+        for device_id, subsystem, status in rows:
+            state = str((status or {}).get("state") or "")
+            if subsystem not in SNMP_SUBSYSTEMS or state not in SNMP_STATUS_STATES:
+                continue
+            count = status.get("count")
+            try:
+                count = int(count) if count is not None else None
+            except (TypeError, ValueError):
+                count = None
+            clean.append((device_id, org_id, subsystem, state,
+                          _s(status.get("detail"), 300),
+                          _s(status.get("sysobjectid"), 128),
+                          _s(status.get("profile"), 64), count, ts,
+                          ts if state == "ok" else None))
+        if not clean:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO device_snmp_status (device_id, org_id, subsystem,"
+                " state, detail, sysobjectid, profile, item_count, updated_at,"
+                " last_ok_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id, subsystem) DO UPDATE SET"
+                " state=excluded.state, detail=excluded.detail,"
+                " sysobjectid=COALESCE(excluded.sysobjectid, sysobjectid),"
+                " profile=excluded.profile, item_count=excluded.item_count,"
+                " updated_at=excluded.updated_at,"
+                " last_ok_at=COALESCE(excluded.last_ok_at, last_ok_at)",
+                clean)
+            conn.commit()
+
+    def device_snmp_status(self, org_id: str, device_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT subsystem, state, detail, sysobjectid, profile, item_count,"
+                " updated_at, last_ok_at FROM device_snmp_status"
+                " WHERE org_id=? AND device_id=? ORDER BY subsystem",
+                (org_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def device_capabilities(self, org_id: str, device_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT subsystem, supported, note, updated_by, updated_at"
+                " FROM device_capability WHERE org_id=? AND device_id=?"
+                " ORDER BY subsystem", (org_id, device_id)).fetchall()
+        out = [dict(r) for r in rows]
+        for r in out:
+            r["supported"] = bool(r["supported"])
+        return out
+
+    def set_device_capability(self, org_id: str, device_id: int, subsystem: str,
+                              supported: bool, note: str | None = None,
+                              updated_by: str | None = None) -> bool:
+        """supported=True deletes the row — supported is the default, and keeping
+        the table to only the exceptions keeps the coverage suppression query O(few)."""
+        if subsystem not in SNMP_SUBSYSTEMS:
+            return False
+        with self._write_lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM org_devices WHERE id=? AND org_id=? AND is_active=1",
+                (device_id, org_id)).fetchone()
+            if not exists:
+                return False
+            if supported:
+                conn.execute(
+                    "DELETE FROM device_capability WHERE device_id=? AND subsystem=?",
+                    (device_id, subsystem))
+            else:
+                conn.execute(
+                    "INSERT INTO device_capability (device_id, org_id, subsystem,"
+                    " supported, note, updated_by, updated_at) VALUES (?,?,?,0,?,?,?)"
+                    " ON CONFLICT(device_id, subsystem) DO UPDATE SET supported=0,"
+                    " note=excluded.note, updated_by=excluded.updated_by,"
+                    " updated_at=excluded.updated_at",
+                    (device_id, org_id, subsystem,
+                     (str(note)[:200] if note else None), updated_by, _now_iso()))
+            conn.commit()
+            return True
+
     def create_snmp_walk(self, org_id: str, device_id: int, node_id: str,
                          root_oid: str, max_varbinds: int,
                          requested_by: str | None = None) -> int:
@@ -2044,6 +2177,10 @@ class CentralStore:
                 "    FROM switch_ports GROUP BY device_id) ps ON ps.device_id = d.id"
                 " WHERE d.is_active=1 ORDER BY d.org_id, d.name",
                 (cutoff,)).fetchall()
+            # Operator-confirmed "this hardware can't do X" — those gaps are facts,
+            # not problems; drop them from both the denominators and the problem list.
+            unsupported = {(r["device_id"], r["subsystem"]) for r in conn.execute(
+                "SELECT device_id, subsystem FROM device_capability WHERE supported=0")}
 
         def _fresh(ts: str | None) -> bool:
             return ts is not None and ts >= cutoff
@@ -2076,7 +2213,7 @@ class CentralStore:
                                "ever arrived — device silent or edge not walking it")
                 else:
                     problem = ("snmp", "stale", "SNMP data stopped arriving")
-            if is_olt and snmp_on:
+            if is_olt and snmp_on and (r["id"], "optics") not in unsupported:
                 o["optics"]["olts"] += 1
                 if _fresh(r["optics_at"]):
                     o["optics"]["working"] += 1
@@ -2094,7 +2231,8 @@ class CentralStore:
                 o["ports"]["working"] += r["ports_fresh"] or 0
                 o["ports"]["alarms"] += r["ports_alarms"] or 0
                 stale_ports = (r["ports_monitored"] or 0) - (r["ports_fresh"] or 0)
-                if stale_ports > 0 and snmp_ok and problem is None:
+                if (stale_ports > 0 and snmp_ok and problem is None
+                        and (r["id"], "ports") not in unsupported):
                     problem = ("ports", "stale",
                                f"{stale_ports} of {r['ports_monitored']} monitored "
                                "ports have stale status")

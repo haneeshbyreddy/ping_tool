@@ -179,10 +179,21 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - **Theme**: minimal-gray, dark default, near-black canvas; surface steps + borders,
   never shadows; desaturated accents so status colors stay loudest. Spacing is
   8px-grid GCP-loose (`h-11` rows, `px-4`–`px-5`) — density comes from filling
-  width, not shaving padding. **Type scale is rem-only** (`--text-xs`=13px,
-  `--text-sm`=15px, root scales up ≥1600px) — a `text-[12px]` literal opts out of
-  the scaling; use tokens or rem. A resolved outage pending post-mortem renders
-  NEUTRAL, never green.
+  width, not shaving padding. **Type scale is rem-only** (`--text-2xs`=12px,
+  `--text-xs`=13px, `--text-sm`=15px, root scales up ≥1600px) — a `text-[12px]`
+  literal opts out of the scaling; use tokens or rem. A resolved outage pending
+  post-mortem renders NEUTRAL, never green.
+- **Surface ladder (2026-07-10 elevation pass)**: `--muted` sits BELOW its surface
+  (wells recess), `--popover` is THE raised/focus surface (drill-in block, map
+  chrome, menus), `--accent` is the interaction fill on raised surfaces — so a
+  fill that means "hover/selected/skeleton" must use accent, never muted (muted
+  now darkens). Row hover is `hover:bg-foreground/5` (a wash that works on every
+  surface), selection is the `.wisp-drillin` block (index.css: popover bg +
+  `--border-strong` outline; NO colored rail — tried, rejected) — hover ≠
+  selected, keep the steps
+  perceptible (adjacent surfaces ≥ ~3 ΔL*; they were 1.017:1 once). Faint text =
+  `text-faint-foreground`, not muted-foreground/70-style opacities; maint/stale
+  chips render neutral, never amber; device-panel tabs are `variant="line"`.
 - Auth rides the session cookie (`central/auth.py` untouched); 401 dispatches a
   `wisp:unauthorized` window event; org scoping mirrors `_scope_org`.
 - **Live updates**: one SSE `EventSource` per org scope (`/api/events`), invalidates

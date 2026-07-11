@@ -212,7 +212,7 @@ export function TeamPage() {
             }
             const op = attByWorker.get(w.id)
             return (
-              <div key={w.id} className="group flex h-12 items-center gap-3 border-b px-3 last:border-b-0 hover:bg-accent/40">
+              <div key={w.id} className="group flex h-12 items-center gap-3 border-b px-3 last:border-b-0 hover:bg-foreground/5">
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold">{w.name}</p>
                   <p className="text-xs text-muted-foreground capitalize">
@@ -273,7 +273,7 @@ export function TeamPage() {
       />
       {/* the strip itself is sm+-only, so the hint hides with it */}
       {att && att.days.length > 1 && workers.some((w) => attByWorker.has(w.id)) && (
-        <p className="hidden text-xs text-muted-foreground/70 sm:block">
+        <p className="hidden text-xs text-faint-foreground sm:block">
           Squares show the past {att.days.length - 1} days{canWrite ? ". Click one to correct a missed day." : "."}
         </p>
       )}

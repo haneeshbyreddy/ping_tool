@@ -238,6 +238,24 @@ def clean_walk_payload(data: dict) -> dict:
     return {"root_oid": root_oid,
             "max_varbinds": min(max_varbinds, WALK_CAP_MAX_VARBINDS)}
 
+# Subsystems an operator can mark "not supported by this hardware" — mirrors
+# store.SNMP_SUBSYSTEMS (the edge's snmp_status vocabulary).
+CAPABILITY_SUBSYSTEMS = ("health", "ports", "optics")
+
+def clean_capability_payload(data: dict) -> dict:
+    try:
+        device_id = int(data.get("device_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("device_id required")
+    subsystem = str(data.get("subsystem") or "").strip().lower()
+    if subsystem not in CAPABILITY_SUBSYSTEMS:
+        raise InventoryError(
+            f"subsystem must be one of: {', '.join(CAPABILITY_SUBSYSTEMS)}")
+    supported = str(data.get("supported", 1)) not in ("0", "false", "False", "", "None")
+    note = str(data.get("note") or "").strip()[:200] or None
+    return {"device_id": device_id, "subsystem": subsystem,
+            "supported": supported, "note": note}
+
 # The closed decode/select vocabulary the edge's profile interpreter understands
 # (ingress/health.py). Deliberately tiny — a vendor encoding this can't express is
 # the rare case that still warrants edge code, not a reason to grow this into a DSL.

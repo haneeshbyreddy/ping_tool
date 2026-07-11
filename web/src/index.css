@@ -58,14 +58,29 @@
     --radius-3xl: calc(var(--radius) * 2.2);
     --radius-4xl: calc(var(--radius) * 2.6);
 
+    --text-2xs: 0.75rem;
+    --text-2xs--line-height: 1.4;
     --text-xs: 0.8125rem;
     --text-xs--line-height: 1.4;
     --text-sm: 0.9375rem;
     --text-sm--line-height: 1.5;
+
+    /* De-emphasized text ONE step below muted-foreground — replaces the ad-hoc
+       text-muted-foreground/70 and /60 opacities so faint text is a single,
+       contrast-checked color instead of a per-callsite guess. */
+    --color-faint-foreground: var(--faint-foreground);
+    /* Outline for RAISED surfaces (drill-in block, floating map chrome). The
+       hairline --border separates siblings; this one lifts a surface. */
+    --color-border-strong: var(--border-strong);
 }
 
+/* Surface ladder (2026-07 design elevation): background sits BELOW card so white
+   cards read as raised; muted recesses BELOW its surface (wells), accent is a
+   raised interaction step, popover is THE raised/focus surface. Border is the
+   sibling hairline; border-strong (= input) outlines raised surfaces. The light
+   status trio is deepened so text-on-soft passes AA. */
 :root {
-    --background: #f7f7f8;
+    --background: #f4f4f6;
     --foreground: #1b1b20;
     --card: #ffffff;
     --card-foreground: #1b1b20;
@@ -76,54 +91,61 @@
     --primary-soft: rgba(52,103,168,0.10);
     --secondary: #ededf0;
     --secondary-foreground: #1b1b20;
-    --muted: #ededf0;
+    --muted: #efeff2;
     --muted-foreground: #5d5d68;
-    --accent: #ededf0;
+    --faint-foreground: #7c7c86;
+    --accent: #e8e8ee;
     --accent-foreground: #1b1b20;
-    --destructive: #b8503d;
+    --destructive: #a8432e;
     --destructive-foreground: #ffffff;
-    --destructive-soft: rgba(184,80,61,0.10);
-    --success: #3f8a5c;
+    --destructive-soft: rgba(168,67,46,0.10);
+    --success: #2f7d4f;
     --success-foreground: #ffffff;
-    --success-soft: rgba(63,138,92,0.10);
-    --warning: #a97c22;
+    --success-soft: rgba(47,125,79,0.10);
+    --warning: #8a6410;
     --warning-foreground: #ffffff;
-    --warning-soft: rgba(169,124,34,0.10);
-    --border: #e2e2e7;
-    --input: #d2d2da;
+    --warning-soft: rgba(138,100,16,0.10);
+    --border: #e4e4e9;
+    --input: #c9c9d3;
+    --border-strong: var(--input);
     --ring: #8aa8cf;
     --chart-1: #3467a8;
-    --chart-2: #3f8a5c;
-    --chart-3: #a97c22;
-    --chart-4: #b8503d;
+    --chart-2: #2f7d4f;
+    --chart-3: #8a6410;
+    --chart-4: #a8432e;
     --chart-5: #71717c;
-    --radius: 0.75rem;
+    --radius: 0.5rem;
     --sidebar: #fafafb;
     --sidebar-foreground: #1b1b20;
     --sidebar-primary: #3467a8;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #ededf0;
+    --sidebar-accent: #e8e8ee;
     --sidebar-accent-foreground: #1b1b20;
-    --sidebar-border: #e2e2e7;
+    --sidebar-border: #e4e4e9;
     --sidebar-ring: #8aa8cf;
 }
 
+/* Dark ladder, bottom to top: background #09090b < muted #0d0d10 (wells recess)
+   < card #121216 < popover #1c1c22 (raised/focus: drill-in panel, map chrome,
+   menus) < accent #26262e (interaction fill on raised surfaces). Steps were
+   sub-perceptual before (panel vs row = 1.017:1) — don't compress them again. */
 .dark {
     --background: #09090b;
     --foreground: #e7e7ea;
-    --card: #0e0e11;
+    --card: #121216;
     --card-foreground: #e7e7ea;
-    --popover: #151519;
+    --popover: #1c1c22;
     --popover-foreground: #e7e7ea;
     --primary: #5680bd;
     --primary-foreground: #0d1626;
     --primary-soft: rgba(86,128,189,0.14);
     --secondary: #17171a;
     --secondary-foreground: #e7e7ea;
-    --muted: #17171a;
+    --muted: #0d0d10;
 
     --muted-foreground: #a1a1ab;
-    --accent: #1c1c20;
+    --faint-foreground: #7e7e88;
+    --accent: #26262e;
     --accent-foreground: #e7e7ea;
     --destructive: #d76a58;
     --destructive-foreground: #ffffff;
@@ -135,8 +157,9 @@
     --warning-foreground: #1f1608;
     --warning-soft: rgba(217,169,78,0.13);
 
-    --border: #303038;
-    --input: #3b3b44;
+    --border: #2a2a32;
+    --input: #3e3e49;
+    --border-strong: var(--input);
     --ring: #4a6a99;
     --chart-1: #5680bd;
     --chart-2: #6cb583;
@@ -149,7 +172,7 @@
     --sidebar-primary-foreground: #0d1626;
     --sidebar-accent: #17171a;
     --sidebar-accent-foreground: #e7e7ea;
-    --sidebar-border: #303038;
+    --sidebar-border: #2a2a32;
     --sidebar-ring: #4a6a99;
 }
 
@@ -178,6 +201,21 @@
     }
 }
 
+/* Drill-in block (Network tree, routes/topology-page.tsx): the open row and its
+   expanded panel merge into ONE raised surface — popover bg + strong outline; the
+   elevation alone marks the selection (a colored rail was tried and rejected).
+   Light mode doubles the outline (hairlines read weaker on white). */
+.wisp-drillin {
+  background: var(--popover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  margin-block: 2px;
+  overflow: hidden;
+}
+html:not(.dark) .wisp-drillin {
+  box-shadow: 0 0 0 1px var(--input);
+}
+
 /* Map view (routes/map-page.tsx) — pins are divIcons so everything below is
    plain CSS on theme tokens; status colors must stay the loudest thing on the
    basemap, hence the near-invisible tile desaturation instead of tinted pins. */
@@ -199,12 +237,13 @@
 .wisp-map .leaflet-control-attribution a {
   color: var(--muted-foreground);
 }
+/* Leaflet's own controls join the floating chrome: raised surface, strong edge */
 .wisp-map .leaflet-bar {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   box-shadow: none;
 }
 .wisp-map .leaflet-bar a {
-  background: var(--card);
+  background: var(--popover);
   color: var(--foreground);
   border-bottom-color: var(--border);
 }
@@ -213,7 +252,7 @@
   color: var(--foreground);
 }
 .wisp-map .leaflet-bar a.leaflet-disabled {
-  background: var(--card);
+  background: var(--popover);
   color: var(--muted-foreground);
 }
 
@@ -307,6 +346,21 @@
 .wisp-map-wrap:fullscreen {
   height: 100vh;
   background: var(--background);
+}
+
+/* "You are here" dot from the locate button — primary-tinted so status colors
+   (red/amber pins) stay the loudest thing on the map. */
+.wisp-me {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: var(--primary);
+  border: 2px solid var(--background);
+  box-shadow: 0 0 0 1px var(--border),
+    0 0 0 4px color-mix(in srgb, var(--primary) 30%, transparent);
+  pointer-events: none;
 }
 
 /* PON on the map: an OLT with weak ONUs grows an optical ring (Phase 1), and
