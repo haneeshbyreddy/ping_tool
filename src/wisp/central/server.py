@@ -319,6 +319,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 self._reply(200, store.admin_overview())
                 return
+            if route == "/api/admin/settings":
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                if not user["is_superadmin"]:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                self._reply(200, {"google_maps_key": store.get_setting("google_maps_key")})
+                return
             if route == "/api/events":
                 user = self._reader()
                 if not user:
@@ -573,6 +583,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     orgs = store.orgs()
                     if org:
                         orgs = [o for o in orgs if o["org_id"] == org]
+                    # the ONE superadmin-pasted Google Maps key rides every org
+                    # row, so each org's Map view lights up without its own key
+                    gkey = store.get_setting("google_maps_key")
+                    for o in orgs:
+                        o["google_maps_key"] = gkey
                     self._reply(200, {"orgs": orgs})
                 elif route == "/api/users":
                     if not user["is_superadmin"] and user["role"] != "owner":
@@ -1021,16 +1036,24 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 map_region = body.get("map_region")
                 if map_region is not None:
                     map_region = str(map_region).strip().lower()[:64] or None
-                google_key = body.get("google_maps_key")
-                if google_key is not None:
-                    # "" clears the key (set_org writes NULL). Browsers get it
-                    # verbatim (referrer-restricted by design), so only bound it.
-                    google_key = str(google_key).strip()[:128]
                 store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                               ntfy_topic_owner=body.get("ntfy_topic_owner"),
                               ntfy_topic_operator=body.get("ntfy_topic_operator"),
                               ntfy_topic_tech=body.get("ntfy_topic_tech"),
-                              map_region=map_region, google_maps_key=google_key)
+                              map_region=map_region)
+                self._reply(200, {"ok": True})
+                return
+            if route == "/api/admin/settings":
+                # server-wide, superadmin-only: the Google Maps key is pasted
+                # ONCE here and served to every org (browser-exposed by design,
+                # referrer-restricted — central never calls Google)
+                if not user["is_superadmin"]:
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                google_key = body.get("google_maps_key")
+                if google_key is not None:
+                    store.set_setting("google_maps_key",
+                                      str(google_key).strip()[:128])
                 self._reply(200, {"ok": True})
                 return
             if route == "/api/test-alert":

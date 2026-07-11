@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Check, Copy, Dices, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
-import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
+import { adminApi, orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import { DEFAULT_MAP_REGION, MAP_REGIONS, mapRegionOf } from "@/lib/map-regions"
 import type { AccountUser, Role } from "@/lib/types"
 import { ConfirmDialog } from "@/components/confirm-dialog"
@@ -47,14 +47,12 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   const [name, setName] = useState("")
   const [topics, setTopics] = useState({ owner: "", operator: "", tech: "" })
   const [mapRegion, setMapRegion] = useState(DEFAULT_MAP_REGION)
-  const [googleKey, setGoogleKey] = useState("")
   const [testResults, setTestResults] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (!current) return
     setName(current.name || "")
     setMapRegion(mapRegionOf(current.map_region).key)
-    setGoogleKey(current.google_maps_key || "")
 
     setTopics({
       owner: current.ntfy_topic_owner || randomTopic("owner"),
@@ -70,8 +68,6 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
       ntfy_topic_operator: topics.operator.trim() || null,
       ntfy_topic_tech: topics.tech.trim() || null,
       map_region: mapRegion,
-      // always sent: "" clears the key server-side (null would leave it unchanged)
-      google_maps_key: googleKey.trim(),
     }),
     onSuccess: () => { toast.success("Settings saved"); queryClient.invalidateQueries({ queryKey: ["orgs"] }) },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
@@ -106,17 +102,6 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
           <p className="max-w-lg text-xs text-muted-foreground">
             The Map view opens on this area and stays inside it. Pick your state so the
             map is your network, not the whole country.
-          </p>
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label>Google Maps API key</Label>
-          <Input value={googleKey} disabled={!canWrite} placeholder="AIza…"
-            className="max-w-sm font-mono text-xs" spellCheck={false}
-            onChange={(e) => setGoogleKey(e.target.value)} />
-          <p className="max-w-lg text-xs text-muted-foreground">
-            Optional — adds Google basemaps to the Map view (Map Tiles API). The key is
-            sent to signed-in browsers, so use a referrer-restricted key. Leave blank to
-            hide the Google options.
           </p>
         </div>
         {ROLE_TOPICS.map(({ key, label }) => (
@@ -158,6 +143,57 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
             Save
           </Button>
         )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// Server-wide, superadmin-only: ONE Google Maps key lights up the Google
+// basemaps on every org's Map view — individual ISPs never paste anything.
+function GoogleMapsCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-settings"],
+    queryFn: adminApi.settings,
+  })
+  const [key, setKey] = useState("")
+  useEffect(() => { if (data) setKey(data.google_maps_key || "") }, [data])
+
+  const save = useMutation({
+    mutationFn: () => adminApi.saveSettings({ google_maps_key: key.trim() }),
+    onSuccess: () => {
+      toast.success("Google Maps key saved for all organizations")
+      queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
+      // every org's Map view reads the key off its /api/orgs row
+      queryClient.invalidateQueries({ queryKey: ["orgs"] })
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
+  })
+
+  if (isLoading) return <Skeleton className="h-24 w-full" />
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <MapPin className="size-4 text-muted-foreground" /> Google Maps (all organizations)
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2.5">
+        <div className="flex flex-col gap-1.5">
+          <Label>Map Tiles API key</Label>
+          <Input value={key} placeholder="AIza…" className="max-w-sm font-mono text-xs"
+            spellCheck={false} onChange={(e) => setKey(e.target.value)} />
+        </div>
+        <p className="max-w-lg text-xs text-muted-foreground">
+          Pasted once here, this key enables the Google basemaps on every organization's
+          Map view — org owners don't configure anything. It is sent to signed-in
+          browsers, so use a referrer-restricted key. Leave blank to hide the Google
+          options everywhere.
+        </p>
+        <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
+          Save
+        </Button>
       </CardContent>
     </Card>
   )
@@ -477,6 +513,7 @@ export function SettingsPage() {
     <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 md:p-6">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
       {scopeOrg && <OrgSettingsCard org={scopeOrg} canWrite={canWrite} />}
+      {isSuperadmin && <GoogleMapsCard />}
       {scopeOrg && <RegionsCard org={scopeOrg} canWrite={canWrite} />}
       {/* SNMP profiles: superadmin manages the global set; an org owner can add
           org-local ones. A superadmin with no org scoped still manages globals. */}

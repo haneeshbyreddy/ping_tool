@@ -45,6 +45,10 @@ export const systemApi = {
 
 export const adminApi = {
   overview: () => request<AdminOverview>("/api/admin/overview"),
+  // server-wide settings, superadmin-only; the Google key applies to every org
+  settings: () => request<{ google_maps_key: string | null }>("/api/admin/settings"),
+  saveSettings: (body: { google_maps_key?: string | null }) =>
+    request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
 }
 
 export const orgsApi = {
@@ -55,8 +59,6 @@ export const orgsApi = {
     org_id: string; name?: string | null
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
     map_region?: string | null
-    // "" clears the key; omit/null leaves it unchanged
-    google_maps_key?: string | null
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(

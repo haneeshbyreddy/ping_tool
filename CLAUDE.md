@@ -220,10 +220,14 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   **Google / Google Satellite ONLY** (2026-07-11; the CARTO/Esri/Dim menu
   entries were removed at the operator's request the same day they shipped) via
   the Map Tiles API — the sanctioned third-party-renderer API, NOT the SDK-only
-  Maps tiles — shown only when `orgs.google_maps_key` is set (Settings;
-  referrer-restricted, ships to browsers by design, central still makes NO
-  Google calls; no key = no Layers button). CARTO Voyager survives as the
-  KEYLESS FALLBACK, never a menu option: it renders for no-key orgs, under a
+  Maps tiles. **The key is SERVER-WIDE, superadmin-pasted once** (`app_settings`
+  table, Settings → "Google Maps (all organizations)", `/api/admin/settings`) —
+  org owners never see a key field; the GET `/api/orgs` reply injects it into
+  every org row so each org's map lights up (referrer-restricted, ships to
+  browsers by design, central still makes NO Google calls; no key = no Layers
+  button). A dead `orgs.google_maps_key` column may linger in older DBs from
+  the few hours it was per-org. CARTO Voyager survives as the KEYLESS FALLBACK,
+  never a menu option: it renders for no-key orgs, under a
   still-creating session, and after a Google failure — the map is never blank.
   `lib/google-tiles.ts`: session token (~2wk) cached in localStorage per
   mapType; **dpr>1 sessions request `scaleFactor2x`+`highDpi`** (512px tiles at
