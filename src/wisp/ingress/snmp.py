@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, Sequence, runtime_checkable
 
 from wisp.config import CONFIG, Config
+
+log = logging.getLogger("wisp.snmp")
 
 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
 OID_IF_ADMIN = "1.3.6.1.2.1.2.2.1.7"
@@ -126,6 +129,72 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
         ))
     return ports
 
+# GETBULK exception values (not data) that end a column mid-response.
+_END_OF_TABLE = frozenset({"EndOfMibView", "NoSuchObject", "NoSuchInstance"})
+# Each repetition carries one row of every active column, so 8 keeps a PDU near
+# ~80 varbinds instead of a jumbo response a cheap agent might truncate.
+_MAX_REPETITIONS = 8
+# 400 rounds x 8 repetitions = 3200 rows per column; the biggest fleet OLT has
+# ~333 interfaces. Past this the agent is looping, not answering.
+_MAX_ROUNDS = 400
+
+def _oid_tuple(oid: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in oid.split("."))
+
+class MultiColumnWalk:
+    """Cursor state for walking N table columns in one multi-varbind GETBULK.
+
+    The ten ifTable/ifXTable columns share their ifIndex rows, so a combined
+    walk returns every column per round and cuts round-trips ~10x vs ten serial
+    walks. pysnmp's bulk_walk_cmd accepts exactly ONE varbind — passing the ten
+    columns positionally was the v0.15.3 fleet-wide stale-ports outage — so the
+    combined walk drives raw single-PDU bulk_cmd calls by hand: request() names
+    the next OID for each still-active column, feed() consumes the
+    repetition-major response (varbind i belongs to requested column i % N;
+    GETBULK truncates only at the tail, so the mapping survives short
+    responses). A column retires when it leaves its subtree, hits an exception
+    value, or returns a non-increasing OID (a buggy agent must stall out, not
+    spin forever). Pure — no I/O — so tests drive it with canned rows.
+    """
+
+    def __init__(self, columns: Sequence[str]) -> None:
+        self._root = {c: _oid_tuple(c) for c in columns}
+        self._cursor = {c: _oid_tuple(c) for c in columns}
+        self._active = list(columns)
+        self.varbinds: list[tuple[str, str]] = []
+
+    @property
+    def done(self) -> bool:
+        return not self._active
+
+    def request(self) -> list[str]:
+        return [".".join(str(x) for x in self._cursor[c]) for c in self._active]
+
+    def feed(self, rows: Sequence[tuple[str, str, str]]) -> None:
+        """rows = [(oid, value, value_class_name), ...] in response order."""
+        cols = list(self._active)
+        if not cols:
+            return
+        if not rows:  # empty response with no error: the agent has nothing more
+            self._active = []
+            return
+        finished: set[str] = set()
+        for i, (oid, value, value_class) in enumerate(rows):
+            col = cols[i % len(cols)]
+            if col in finished:
+                continue
+            if value_class in _END_OF_TABLE:
+                finished.add(col)
+                continue
+            t = _oid_tuple(oid)
+            root = self._root[col]
+            if t[: len(root)] != root or t <= self._cursor[col]:
+                finished.add(col)
+                continue
+            self.varbinds.append((oid, value))
+            self._cursor[col] = t
+        self._active = [c for c in cols if c not in finished]
+
 class PysnmpPoller:
 
     def __init__(self, cfg: Config = CONFIG) -> None:
@@ -136,7 +205,7 @@ class PysnmpPoller:
         try:
             from pysnmp.hlapi.asyncio import (
                 SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
-                ObjectType, ObjectIdentity, bulk_walk_cmd,
+                ObjectType, ObjectIdentity, bulk_cmd, bulk_walk_cmd,
             )
         except ImportError as exc:
             raise RuntimeError(
@@ -149,28 +218,45 @@ class PysnmpPoller:
         community = CommunityData(target.community, mpModel=1)
         transport = await UdpTransportTarget.create(
             (target.ip, target.port), timeout=self._timeout, retries=1)
-        varbinds: list[tuple[str, str]] = []
-        # Walk all ten ifTable/ifXTable columns TOGETHER in one multi-varbind
-        # GETBULK, not ten sequential per-column walks. They share the ifIndex
-        # index (same rows), so a combined walk returns every column per round
-        # and cuts round-trips ~10x — a 250-interface OLT that couldn't finish
-        # ten serial walks inside port_walk_timeout_s (60s) now does. parse_if_table
-        # keys by ifIndex, so interleaved varbinds parse identically. maxRepetitions
-        # is 8 here (not 25): each repetition now yields all ten columns, so 8 keeps
-        # a single PDU near ~80 varbinds instead of a jumbo response a cheap agent
-        # might truncate.
-        columns = [ObjectType(ObjectIdentity(c)) for c in WALK_COLUMNS]
+
+        # Fast path: all ten columns in one multi-varbind GETBULK stream (see
+        # MultiColumnWalk). If it fails for ANY reason — tooBig from a cheap
+        # agent, a mis-ordered response tripping the stall guard, an API drift —
+        # fall back to the proven one-column-at-a-time walk below. Fleet-wide
+        # stale ports must never ride on one optimization again.
         try:
-            async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
-                engine, community, transport, ContextData(),
-                0, 8, *columns,
-                lexicographicMode=False,
-            ):
+            walker = MultiColumnWalk(WALK_COLUMNS)
+            rounds = 0
+            while not walker.done:
+                rounds += 1
+                if rounds > _MAX_ROUNDS:
+                    raise RuntimeError("combined ifTable walk did not terminate")
+                errInd, errStat, errIdx, binds = await bulk_cmd(
+                    engine, community, transport, ContextData(),
+                    0, _MAX_REPETITIONS,
+                    *[ObjectType(ObjectIdentity(o)) for o in walker.request()])
                 if errInd or errStat:
-                    raise RuntimeError(
-                        f"SNMP walk of {target.ip} failed: {errInd or errStat}")
-                for name, val in binds:
-                    varbinds.append((str(name), val.prettyPrint()))
+                    raise RuntimeError(str(errInd or errStat))
+                walker.feed([(str(name), val.prettyPrint(), type(val).__name__)
+                             for name, val in binds])
+            return parse_if_table(walker.varbinds)
+        except Exception as exc:
+            log.warning("combined ifTable walk of %s failed (%s); "
+                        "falling back to per-column walks", target.ip, exc)
+
+        varbinds: list[tuple[str, str]] = []
+        try:
+            for column in WALK_COLUMNS:
+                async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
+                    engine, community, transport, ContextData(),
+                    0, 25, ObjectType(ObjectIdentity(column)),
+                    lexicographicMode=False,
+                ):
+                    if errInd or errStat:
+                        raise RuntimeError(
+                            f"SNMP walk of {target.ip} failed: {errInd or errStat}")
+                    for name, val in binds:
+                        varbinds.append((str(name), val.prettyPrint()))
         except RuntimeError:
             raise
         except Exception as exc:

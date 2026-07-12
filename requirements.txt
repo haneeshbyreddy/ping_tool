@@ -2,4 +2,6 @@
 #     python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 icmplib>=3.0      # raw-socket ICMP prober (real polling; needs root/cap_net_raw)
 httpx>=0.27       # ntfy push notifier + the central shipper (Phase 10); both lazy-import it
-pysnmp>=6.2       # SNMP v2c port-status ingress (lazy-imported; asyncio HLAPI)
+pysnmp>=7.1,<8    # SNMP v2c ingress (lazy-imported). Pinned to the major we test:
+                  # the walk code depends on v7 call shapes (bulk_cmd *varBinds,
+                  # bulk_walk_cmd exactly one) — see the v0.15.3 stale-ports outage.

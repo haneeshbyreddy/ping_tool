@@ -11,7 +11,8 @@ from wisp.config import Config
 from wisp.ingress.snmp import (
     OID_IF_ADMIN, OID_IF_ALIAS, OID_IF_DESCR, OID_IF_HCIN, OID_IF_HCOUT,
     OID_IF_HIGHSPEED, OID_IF_LASTCHANGE, OID_IF_NAME, OID_IF_OPER, OID_IF_SPEED,
-    PortStatus, PysnmpPoller, SnmpTarget, parse_if_table, throughput_bps,
+    MultiColumnWalk, PortStatus, PysnmpPoller, SnmpTarget, parse_if_table,
+    throughput_bps,
 )
 
 try:
@@ -102,6 +103,148 @@ class ParseIfTable(unittest.TestCase):
         vbs = [_vb(OID_IF_ADMIN, 3, 1), _vb(OID_IF_OPER, 3, 1)]
         p = parse_if_table(vbs)[0]
         self.assertEqual((p.in_octets, p.out_octets, p.speed_bps), (None, None, None))
+
+class MultiColumnWalkTest(unittest.TestCase):
+    """The combined GETBULK cursor: response rows map to requested columns by
+    position (repetition-major), and a column retires on subtree exit, an
+    exception value, or a non-increasing OID."""
+
+    A, B = "1.2.1", "1.2.2"
+
+    def test_interleaved_rows_map_by_position(self):
+        w = MultiColumnWalk([self.A, self.B])
+        w.feed([("1.2.1.1", "a1", "OctetString"), ("1.2.2.1", "b1", "OctetString"),
+                ("1.2.1.2", "a2", "OctetString"), ("1.2.2.2", "b2", "OctetString")])
+        self.assertEqual(w.varbinds, [("1.2.1.1", "a1"), ("1.2.2.1", "b1"),
+                                      ("1.2.1.2", "a2"), ("1.2.2.2", "b2")])
+        self.assertFalse(w.done)
+        self.assertEqual(w.request(), ["1.2.1.2", "1.2.2.2"])
+
+    def test_column_retires_on_subtree_exit_and_stops_collecting(self):
+        w = MultiColumnWalk([self.A, self.B])
+        # A's agent-side successor crossed into B's subtree: A is finished, and
+        # its later repetitions in the same response must be dropped too.
+        w.feed([("1.2.2.1", "x", "OctetString"), ("1.2.2.1", "b1", "OctetString"),
+                ("1.2.2.2", "x", "OctetString"), ("1.2.2.2", "b2", "OctetString")])
+        self.assertEqual(w.varbinds, [("1.2.2.1", "b1"), ("1.2.2.2", "b2")])
+        self.assertEqual(w.request(), ["1.2.2.2"])
+
+    def test_end_of_mib_view_retires_column(self):
+        w = MultiColumnWalk([self.A, self.B])
+        w.feed([("1.2.1.1", "", "EndOfMibView"), ("1.2.2.1", "b1", "OctetString")])
+        self.assertEqual(w.varbinds, [("1.2.2.1", "b1")])
+        self.assertEqual(w.request(), ["1.2.2.1"])
+
+    def test_non_increasing_oid_retires_column(self):
+        w = MultiColumnWalk([self.A])
+        w.feed([("1.2.1.5", "a5", "OctetString")])
+        # A buggy agent replays the same OID: the column must stall out, not loop.
+        w.feed([("1.2.1.5", "a5", "OctetString")])
+        self.assertTrue(w.done)
+        self.assertEqual(w.varbinds, [("1.2.1.5", "a5")])
+
+    def test_truncated_response_maps_partial_tail(self):
+        w = MultiColumnWalk([self.A, self.B])
+        # Agent truncated mid-repetition: the odd row still lands on column A.
+        w.feed([("1.2.1.1", "a1", "OctetString"), ("1.2.2.1", "b1", "OctetString"),
+                ("1.2.1.2", "a2", "OctetString")])
+        self.assertEqual(w.request(), ["1.2.1.2", "1.2.2.1"])
+
+    def test_empty_response_finishes_the_walk(self):
+        w = MultiColumnWalk([self.A, self.B])
+        w.feed([])
+        self.assertTrue(w.done)
+
+@unittest.skipUnless(_HAS_PYSNMP, "pysnmp not installed")
+class CombinedWalkDriverTest(unittest.TestCase):
+    """walk() against fakes that enforce the pysnmp 7 call shape: multi-varbind
+    only via bulk_cmd (a coroutine per PDU), bulk_walk_cmd strictly ONE varbind.
+    Calling bulk_walk_cmd with ten columns was the v0.15.3 stale-ports outage —
+    these signatures pin the constraint."""
+
+    class _Val:
+        def __init__(self, s):
+            self._s = s
+        def prettyPrint(self):
+            return str(self._s)
+
+    class EndOfMibView(_Val):  # the class NAME is what walk() inspects
+        def __init__(self):
+            super().__init__("")
+
+    # A 2-interface agent: enough columns to prove interleaving + subtree exits.
+    _TABLE = {
+        f"{OID_IF_DESCR}.1": "Gi0/1", f"{OID_IF_DESCR}.2": "Gi0/2",
+        f"{OID_IF_ADMIN}.1": "1", f"{OID_IF_ADMIN}.2": "1",
+        f"{OID_IF_OPER}.1": "1", f"{OID_IF_OPER}.2": "2",
+        f"{OID_IF_HCIN}.1": "1000", f"{OID_IF_HCIN}.2": "2000",
+    }
+
+    @staticmethod
+    def _oid_key(oid):
+        return tuple(int(p) for p in oid.split("."))
+
+    def _fake_bulk_cmd(self, calls):
+        universe = sorted(self._TABLE, key=self._oid_key)
+
+        async def bulk_cmd(engine, authData, transport, ctx,
+                           nonRepeaters, maxRepetitions, *varBinds, **options):
+            calls.append(len(varBinds))
+            streams = [[o for o in universe if self._oid_key(o) > self._oid_key(str(vb))]
+                       for vb in varBinds]
+            binds = []
+            for rep in range(maxRepetitions):
+                for s in streams:
+                    if rep < len(s):
+                        binds.append((s[rep], self._Val(self._TABLE[s[rep]])))
+                    else:
+                        binds.append(("0.0", self.EndOfMibView()))
+            return (None, 0, 0, binds)
+        return bulk_cmd
+
+    def _run_walk(self, **patches):
+        import pysnmp.hlapi.asyncio as hlapi
+        poller = PysnmpPoller(Config(snmp_timeout_s=0.05))
+        patches.setdefault("ObjectIdentity", lambda oid: oid)
+        patches.setdefault("ObjectType", lambda ident: ident)
+        with mock.patch.multiple(hlapi, **patches):
+            try:
+                return asyncio.run(poller.walk(
+                    SnmpTarget(ip="127.0.0.1", community="public", port=1)))
+            finally:
+                if poller._engine is not None:
+                    poller._engine.close_dispatcher()
+
+    def test_combined_walk_uses_multi_varbind_bulk_cmd(self):
+        calls: list[int] = []
+        forbidden = mock.MagicMock(
+            side_effect=AssertionError("fallback must not run on success"))
+        ports = self._run_walk(bulk_cmd=self._fake_bulk_cmd(calls),
+                               bulk_walk_cmd=forbidden)
+        self.assertEqual([p.if_index for p in ports], [1, 2])
+        self.assertEqual(ports[0].if_name, "Gi0/1")
+        self.assertEqual((ports[1].oper_status, ports[1].in_octets), ("down", 2000))
+        self.assertGreater(calls[0], 1)  # genuinely multi-varbind
+        forbidden.assert_not_called()
+
+    def test_failed_combined_walk_falls_back_to_single_varbind_walks(self):
+        async def broken_bulk_cmd(*args, **options):
+            raise RuntimeError("tooBig")
+
+        table = self._TABLE
+
+        # pysnmp 7 shape: exactly ONE positional varbind. A regression back to
+        # multi-varbind bulk_walk_cmd fails this signature outright.
+        async def bulk_walk_cmd(engine, authData, transport, ctx,
+                                nonRepeaters, maxRepetitions, varBind, **options):
+            prefix = str(varBind) + "."
+            for oid in sorted(table, key=self._oid_key):
+                if oid.startswith(prefix):
+                    yield (None, 0, 0, [(oid, self._Val(table[oid]))])
+
+        ports = self._run_walk(bulk_cmd=broken_bulk_cmd, bulk_walk_cmd=bulk_walk_cmd)
+        self.assertEqual([p.if_index for p in ports], [1, 2])
+        self.assertEqual(ports[1].oper_status, "down")
 
 class ThroughputBps(unittest.TestCase):
     def test_normal_rate(self):

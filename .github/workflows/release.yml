@@ -17,6 +17,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      # Without the runtime deps, every pysnmp-gated test silently skips in CI —
+      # that's how the v0.15.3 bulk_walk_cmd signature bug shipped to the fleet.
+      - name: Install runtime deps
+        run: pip install -r requirements.txt
       - name: Run tests
         run: python -m unittest discover -s tests
 

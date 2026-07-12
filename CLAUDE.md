@@ -102,6 +102,15 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   FD exhaustion then reads as a fake mass outage. `PysnmpPoller`/`PysnmpGponPoller`
   lazily reuse `self._engine` (concurrent walks are safe — request-id demux).
   `EngineReuseTest` in `unit/test_snmp` + `unit/test_gpon` pins this.
+- **pysnmp 7 walk commands take exactly ONE varbind** — passing the ten ifTable
+  columns to `bulk_walk_cmd` positionally is a TypeError swallowed as "walk
+  failed" (v0.15.3 froze every fleet port table for 30h; only `bulk_cmd` takes
+  `*varBinds`). The combined ten-column walk is `MultiColumnWalk` driving raw
+  `bulk_cmd` PDUs, and ANY failure falls back to per-column `bulk_walk_cmd` —
+  keep the fallback; port coverage must never ride on one optimization.
+  `CombinedWalkDriverTest` pins both call shapes. Unit tests inject fake
+  pollers, so a bad HLAPI call only surfaces on a REAL walk — verify
+  `device_snmp_status` after any edge SNMP rollout.
 - **Port alarms** (`central/ports.py`): monitored-only, admin-down silent, one alarm
   not two — a port-down folds into the open outage via `stamp_outage_cause` COALESCE
   (never clobbers a post-mortem); no open outage = heads-up; SNMP never opens an
