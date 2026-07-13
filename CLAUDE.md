@@ -198,6 +198,17 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   tables need nothing.
 - `make_server`/`_make_handler` take an injectable `notifier` — tests inject a
   recording double; follow this for anything central sends.
+- **Routes live in `central/api/` route tables**, not in `server.py` if/elif
+  chains: `api/__init__.py` maps exact paths to handler functions in
+  `api/{edge,orgs,users,fleet,devices,outages}.py`. GET handlers are
+  `fn(h, qs)`, dashboard POST handlers `fn(h, user, body)`; `h` is the live
+  request handler carrying `h.cfg/h.store/h.notifier/h.registry` plus the
+  auth/reply plumbing (`_reply`, `_reader`, `_scope_org`, `_can_write`).
+  `server.py` keeps only transport, auth helpers, static/SSE/download serving,
+  login, and the edge-ingest special cases in `do_POST`. Adding an endpoint =
+  a function in the right api module + a table row. `api/common.py:DENIED` is
+  the "403 already sent" sentinel — don't test scope helpers with `if not org`
+  (superadmin legitimately yields org=None).
 - **Superadmin Overview = coverage, not alarms** (`/api/admin/overview`): per-org
   SNMP/optics/ports enabled-vs-working (working = any reading fresher than 900s);
   never-reported vs gone-stale are distinct reasons; optics/ports problems
