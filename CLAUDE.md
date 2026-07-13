@@ -264,6 +264,13 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - Home is a NOC overview, never empty when healthy; outage triage is folded into it
   (status derived from `acknowledged_at`/`resolved_at`/`root_cause`, never stored;
   recovery is FSM-automatic — no manual resolve, ever).
+- **Map helpers live in `web/src/map/`**, the page composition stays in
+  `routes/map-page.tsx`: `pins.ts` (tones + cached divIcons — the icon cache
+  invariant lives there now), `clusters.ts` (site badges), `cut.ts` (fiber-cut
+  geometry), `geometry.ts` (haversine/polyline math), `basemaps.tsx`
+  (Google/CARTO layers + failure ladder), `view.tsx` (viewport
+  persistence/lock), `search.tsx` (device + Nominatim). New map logic goes in
+  the matching module, not back into map-page.tsx.
 - **Map view (`/map`) is real** (2026-07-10, was a mockup-fake): Leaflet + raster
   tiles fetched by the BROWSER (central needs no egress). Basemaps are
   **Google / Google Satellite ONLY** (2026-07-11; the CARTO/Esri/Dim menu
