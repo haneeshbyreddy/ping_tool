@@ -4,6 +4,12 @@ import ipaddress
 import re
 
 DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
+# Passive plant: splitters, fiber distribution boxes, splice closures. They live in
+# org_devices (parent chains, map pins, routes — all shared machinery), but they
+# don't ping: no IP, no probe assignment, no FSM. Three choke points keep them away
+# from the monitoring path — org_device_topology (engine + /edge/devices),
+# node_expected_ips (no assignment), device_reliability (no uptime math).
+PASSIVE_TYPES = ("splitter", "fdb", "closure")
 SNMP_VERSIONS = ("2c",)
 
 def _gpon_vendors() -> frozenset[str]:
@@ -24,16 +30,27 @@ def _str(data: dict, key: str, *, required: bool = False, default=None):
 
 def clean_device_payload(data: dict, *, parents: dict[int, int | None],
                          device_id: int | None,
-                         registered_nodes: set[str] | None = None) -> dict:
+                         registered_nodes: set[str] | None = None,
+                         passive_ids: set[int] | None = None) -> dict:
     name = _str(data, "name", required=True)
-    ip_address = _str(data, "ip_address", required=True)
-    try:
-        ipaddress.ip_address(str(ip_address))
-    except ValueError:
-        raise InventoryError(f"'{ip_address}' is not a valid IP address")
     device_type = _str(data, "device_type")
-    if device_type and device_type not in DEVICE_TYPES:
-        raise InventoryError(f"device type must be one of: {', '.join(DEVICE_TYPES)}")
+    if device_type and device_type not in DEVICE_TYPES + PASSIVE_TYPES:
+        raise InventoryError(
+            f"device type must be one of: {', '.join(DEVICE_TYPES + PASSIVE_TYPES)}")
+    passive = device_type in PASSIVE_TYPES
+    if passive:
+        # a splitter has no address — the empty string satisfies the NOT NULL
+        # column and never reaches an edge (org_device_topology filters passives)
+        ip_address = _str(data, "ip_address") or ""
+        if ip_address:
+            raise InventoryError(
+                f"a {device_type} is passive plant — it has no IP address")
+    else:
+        ip_address = _str(data, "ip_address", required=True)
+        try:
+            ipaddress.ip_address(str(ip_address))
+        except ValueError:
+            raise InventoryError(f"'{ip_address}' is not a valid IP address")
     region = _str(data, "region")
 
     parent_raw = data.get("parent_device_id")
@@ -55,8 +72,16 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
                 break
             seen.add(cur)
             cur = parents.get(cur)
+        # a passive has no FSM state, so suppression through it is undefined —
+        # monitored gear may not hang below plant (plant hangs below gear)
+        if (not passive and passive_ids is not None and parent_id in passive_ids):
+            raise InventoryError(
+                "a monitored device can't sit under passive plant — "
+                "parent it to the powered device above instead")
 
     assigned_node_id = _str(data, "assigned_node_id")
+    if passive and assigned_node_id:
+        raise InventoryError(f"a {device_type} is passive plant — nothing probes it")
     if (assigned_node_id and registered_nodes is not None
             and assigned_node_id not in registered_nodes):
         raise InventoryError("assigned wisp client does not exist")
@@ -70,9 +95,16 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             raise InventoryError(
                 f"GPON vendor must be one of: {', '.join(sorted(_gpon_vendors()))}")
 
+    # which PON a splitter/FDB serves — the fault localizer binds passives to
+    # onu_optics rows through it (Phase D3); free-form, e.g. "0/6"
+    pon_port = _str(data, "pon_port") if passive else None
+    if pon_port and len(pon_port) > 32:
+        raise InventoryError("PON port must be 32 characters or fewer")
+
     return {"name": name, "ip_address": ip_address, "device_type": device_type,
             "region": region, "parent_device_id": parent_id,
-            "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor}
+            "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor,
+            "pon_port": pon_port}
 
 def clean_location_payload(data: dict) -> dict:
     """Map pin for a device: both coordinates, or both null (= remove the pin)."""
@@ -89,6 +121,38 @@ def clean_location_payload(data: dict) -> dict:
         raise InventoryError("lng must be between -180 and 180")
     # ~1e-6° ≈ 0.1 m — anything longer is float noise from a drag event
     return {"lat": round(lat, 6), "lng": round(lng, 6)}
+
+ROUTE_MAX_WAYPOINTS = 200
+
+def clean_route_payload(data: dict) -> dict:
+    """Drawn cable path for a link: intermediate vertices only, parent→child order.
+
+    An empty waypoint list clears the route. Endpoint devices are validated by the
+    caller (the pair must be a real link in this org)."""
+    try:
+        child_id = int(data.get("child_id"))
+        parent_id = int(data.get("parent_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("child_id and parent_id are required")
+    raw = data.get("waypoints")
+    if raw in (None, "", "null"):
+        raw = []
+    if not isinstance(raw, list):
+        raise InventoryError("waypoints must be a list of [lat, lng] pairs")
+    if len(raw) > ROUTE_MAX_WAYPOINTS:
+        raise InventoryError(f"a route can hold at most {ROUTE_MAX_WAYPOINTS} waypoints")
+    waypoints: list[list[float]] = []
+    for pair in raw:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise InventoryError("each waypoint must be a [lat, lng] pair")
+        try:
+            lat, lng = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError):
+            raise InventoryError("waypoint coordinates must be numbers")
+        if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
+            raise InventoryError("waypoint coordinates are out of range")
+        waypoints.append([round(lat, 6), round(lng, 6)])
+    return {"child_id": child_id, "parent_id": parent_id, "waypoints": waypoints}
 
 def clean_region_name(raw) -> str:
     name = str(raw).strip() if raw is not None else ""

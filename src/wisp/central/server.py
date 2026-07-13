@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import auth, inventory, pki, sysinfo
+from wisp.central import auth, incidents, inventory, pki, ponfault, sysinfo
 from wisp.central import analytics as central_analytics
 from wisp.central import engine as central_engine
 from wisp.central import perf as central_perf
@@ -24,6 +24,7 @@ from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.engine import EngineRegistry
 from wisp.central.ports import CentralPortMonitor
 from wisp.central.optics import CentralOpticsMonitor
+from wisp.central.ponalert import PonFaultAlerter
 from wisp.central import rollup as central_rollup
 from wisp.central.store import CentralStore
 from wisp.egress.notifiers import build_notifier
@@ -392,6 +393,52 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     "crit_dbm": dev.get("optical_crit_dbm") if dev.get("optical_crit_dbm") is not None else cfg.optical_crit_dbm,
                 })
                 return
+            if route == "/api/pon/faults":
+                # PON mass-drop read: dying-gasp (power) vs LOS (fiber) + a cut
+                # distance interval off ranging. Pure read-side — never pages.
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                did_raw = (qs.get("device_id") or [None])[0]
+                if did_raw is not None:
+                    try:
+                        did = int(did_raw)
+                    except (TypeError, ValueError):
+                        self._reply(400, {"error": "bad device_id"})
+                        return
+                    org = store.device_org(did)
+                    if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+                        self._reply(403, {"error": "forbidden"})
+                        return
+                    rows = store.org_onu_rows(org, did)
+                else:
+                    org = self._scope_org(user, qs)
+                    if not org:
+                        self._reply(400, {"error": "org required"})
+                        return
+                    rows = store.org_onu_rows(org)
+                dists = ponfault.passive_distances(store.list_org_devices(org),
+                                                   store.list_link_routes(org))
+                faults = ponfault.evaluate_org(rows, datetime.now(timezone.utc),
+                                               passive_dists=dists)
+                self._reply(200, {"faults": [f.as_dict() for f in faults]})
+                return
+            if route == "/api/incident/shape":
+                # power-vs-upstream annotation over the open outage wave —
+                # explains alarms, never mutes or reroutes a page
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
+                    return
+                found = incidents.evaluate(store.list_org_devices(org),
+                                           datetime.now(timezone.utc))
+                self._reply(200, {"incidents": [i.as_dict() for i in found]})
+                return
             if route == "/api/inventory/snmp-walks":
                 user = self._reader()
                 if not user:
@@ -571,6 +618,19 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 except ValueError:
                     before_id = None
                 self._reply(200, {"events": store.list_events(org, limit, before_id)})
+                return
+            if route == "/api/inventory/routes":
+                # map-only geometry, deliberately not folded into /api/inventory —
+                # every page lists devices, only the map needs cable paths
+                user = self._reader()
+                if not user:
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                org = self._scope_org(user, qs)
+                if not org:
+                    self._reply(400, {"error": "org required"})
+                    return
+                self._reply(200, {"routes": store.list_link_routes(org)})
                 return
             if route in ("/api/orgs", "/api/inventory", "/api/team", "/api/attendance",
                          "/api/users", "/api/nodes", "/api/regions"):
@@ -792,6 +852,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     monitor.sync_device(device_id, onus, ts)
                 except Exception:
                     log.exception("GPON optics fold failed for %s/device=%d", org, device_id)
+            # fault input only changes when a walk lands, so the mass-drop
+            # sweep rides the optics fold — transition-only, never an outage
+            try:
+                PonFaultAlerter(store, org, notifier, cfg).sweep(ts)
+            except Exception:
+                log.exception("PON fault sweep failed for %s", org)
 
         def _ingest_health(self, org: str, eng, health_by_device, ts: str) -> None:
             if not health_by_device:
@@ -1082,7 +1148,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 clean = inventory.clean_device_payload(
                     body, parents=store.org_device_parent_map(org), device_id=None,
-                    registered_nodes=store.registered_node_ids(org))
+                    registered_nodes=store.registered_node_ids(org),
+                    passive_ids=store.org_passive_ids(org))
                 did = store.create_org_device(org, clean)
                 self._reply(200, {"id": did})
                 return
@@ -1095,7 +1162,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 parents = store.org_device_parent_map(org)
                 clean = inventory.clean_device_payload(
                     body, parents=parents, device_id=did,
-                    registered_nodes=store.registered_node_ids(org))
+                    registered_nodes=store.registered_node_ids(org),
+                    passive_ids=store.org_passive_ids(org))
                 ok = store.update_org_device(org, did, clean)
                 self._reply(200 if ok else 404, {"ok": ok})
                 return
@@ -1126,6 +1194,27 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 loc = inventory.clean_location_payload(body)
                 ok = store.set_org_device_location(org, did, loc["lat"], loc["lng"])
                 self._reply(200 if ok else 404, {"ok": ok})
+                return
+            if route == "/api/inventory/route":
+                clean = inventory.clean_route_payload(body)
+                org = store.device_org(clean["child_id"])
+                if not self._can_write(user, org):
+                    self._reply(403, {"error": "forbidden"})
+                    return
+                # geometry only attaches to a link that actually exists in this org
+                child = store.get_org_device(org, clean["child_id"])
+                if not child:
+                    self._reply(404, {"error": "device not found"})
+                    return
+                if child.get("parent_device_id") != clean["parent_id"]:
+                    backups = {e["parent_id"] for e in store.org_device_backup_edges(org)
+                               if e["child_id"] == clean["child_id"]}
+                    if clean["parent_id"] not in backups:
+                        raise inventory.InventoryError(
+                            "no link between those devices — set the parent first")
+                store.set_link_route(org, clean["child_id"], clean["parent_id"],
+                                     clean["waypoints"], updated_by=user["username"])
+                self._reply(200, {"ok": True})
                 return
             if route == "/api/inventory/snmp":
                 did = int(body.get("id") or 0)

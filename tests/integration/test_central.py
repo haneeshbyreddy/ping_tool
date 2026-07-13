@@ -464,6 +464,113 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertTrue(row["snmp_enabled"])
         self.assertEqual(row["snmp_community"], "public")
 
+class PassivePlantTest(unittest.TestCase):
+    """Splitters/FDBs live in org_devices but must NEVER reach the probe path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "central.db")
+        self.olt = self.store.create_org_device("ispA", {
+            "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        self.splitter = self.store.create_org_device("ispA", {
+            "name": "S-3", "ip_address": "", "device_type": "splitter",
+            "region": None, "parent_device_id": self.olt, "pon_port": "0/6"})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_topology_excludes_passives(self):
+        # the single choke point: engine FSMs, fingerprint AND /edge/devices all
+        # ride org_device_topology — an empty-IP row here would get pinged
+        ids = {d["id"] for d in self.store.org_device_topology("ispA")}
+        self.assertIn(self.olt, ids)
+        self.assertNotIn(self.splitter, ids)
+
+    def test_node_expected_ips_never_carries_empty_ip(self):
+        self.assertNotIn("", self.store.node_expected_ips("ispA", "edge-1"))
+
+    def test_list_still_shows_passives_with_pon_port(self):
+        row = next(d for d in self.store.list_org_devices("ispA")
+                   if d["id"] == self.splitter)
+        self.assertEqual(row["device_type"], "splitter")
+        self.assertEqual(row["pon_port"], "0/6")
+        self.assertIsNone(row["state"])
+
+    def test_passive_ids(self):
+        self.assertEqual(self.store.org_passive_ids("ispA"), {self.splitter})
+
+    def test_reliability_skips_passives(self):
+        from wisp.central.analytics import device_reliability
+        report = device_reliability(self.store, "ispA",
+                                    "2026-07-01T00:00:00+00:00",
+                                    "2026-07-02T00:00:00+00:00")
+        self.assertEqual([r["device_id"] for r in report], [self.olt])
+
+
+class LinkRouteTest(unittest.TestCase):
+    """Drawn cable paths: geometry survives only while its link exists."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "central.db")
+        self.root = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": "core",
+            "region": None, "parent_device_id": None})
+        self.child = self.store.create_org_device("ispA", {
+            "name": "OLT", "ip_address": "10.0.0.2", "device_type": "OLT",
+            "region": None, "parent_device_id": self.root})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_set_list_round_trip(self):
+        wps = [[17.44, 78.34], [17.45, 78.35]]
+        self.store.set_link_route("ispA", self.child, self.root, wps, updated_by="op")
+        routes = self.store.list_link_routes("ispA")
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["child_id"], self.child)
+        self.assertEqual(routes[0]["parent_id"], self.root)
+        self.assertEqual(routes[0]["waypoints"], wps)
+        self.assertEqual(routes[0]["updated_by"], "op")
+
+    def test_empty_waypoints_clears(self):
+        self.store.set_link_route("ispA", self.child, self.root, [[17.4, 78.3]], updated_by="op")
+        self.store.set_link_route("ispA", self.child, self.root, [], updated_by="op")
+        self.assertEqual(self.store.list_link_routes("ispA"), [])
+
+    def test_reparented_child_hides_stale_route(self):
+        other = self.store.create_org_device("ispA", {
+            "name": "Core2", "ip_address": "10.0.0.3", "device_type": "core",
+            "region": None, "parent_device_id": None})
+        self.store.set_link_route("ispA", self.child, self.root, [[17.4, 78.3]], updated_by="op")
+        self.store.update_org_device("ispA", self.child, {
+            "name": "OLT", "ip_address": "10.0.0.2", "device_type": "OLT",
+            "region": None, "parent_device_id": other})
+        self.assertEqual(self.store.list_link_routes("ispA"), [])
+
+    def test_backup_link_route_listed(self):
+        backup = self.store.create_org_device("ispA", {
+            "name": "Core-B", "ip_address": "10.0.0.4", "device_type": "core",
+            "region": None, "parent_device_id": None})
+        self.store.create_backup_link("ispA", self.child, backup)
+        self.store.set_link_route("ispA", self.child, backup, [[17.5, 78.4]], updated_by="op")
+        routes = self.store.list_link_routes("ispA")
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["parent_id"], backup)
+
+    def test_deleting_either_end_purges_the_route(self):
+        self.store.set_link_route("ispA", self.child, self.root, [[17.4, 78.3]], updated_by="op")
+        self.store.delete_org_device("ispA", self.child)
+        with self.store._connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM link_routes").fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_org_scoping(self):
+        self.store.set_link_route("ispA", self.child, self.root, [[17.4, 78.3]], updated_by="op")
+        self.assertEqual(self.store.list_link_routes("ispB"), [])
+
+
 class RegionsTest(unittest.TestCase):
 
     def setUp(self):

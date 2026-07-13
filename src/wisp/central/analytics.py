@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from wisp.central.inventory import PASSIVE_TYPES
 from wisp.core.analytics import _parse
 from wisp.core.state_machine import DOWN
 
@@ -29,6 +30,10 @@ def device_reliability(store, org_id: str, since: str, until: str) -> list[dict]
 
     report = []
     for did, dev in devices.items():
+        # passive plant never pings — 100%-uptime rows for splitters would only
+        # pad the averages
+        if dev.get("device_type") in PASSIVE_TYPES:
+            continue
         down_s = downtime.get(did, 0.0)
         uptime_pct = 100.0 if span <= 0 else max(0.0, 100.0 * (1 - down_s / span))
         report.append({

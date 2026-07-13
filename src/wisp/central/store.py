@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from wisp.central.inventory import PASSIVE_TYPES as _PASSIVE_TYPES
 from wisp.version import version_tuple
 
 _SCHEMA = """
@@ -311,6 +312,22 @@ CREATE TABLE IF NOT EXISTS org_device_links (
 );
 CREATE INDEX IF NOT EXISTS idx_org_device_links_child ON org_device_links(org_id, child_id);
 CREATE INDEX IF NOT EXISTS idx_org_device_links_parent ON org_device_links(org_id, parent_id);
+-- Drawn cable path for one link (map view). Keyed by the (child, parent) pair so it
+-- covers both the implicit primary link (org_devices.parent_device_id) and backup
+-- rows above. Waypoints are the INTERMEDIATE vertices only, ordered parent→child —
+-- endpoints stay implicit (the device pins), so moving a pin rubber-bands the route
+-- instead of orphaning it. Dashboard-side only; the edge never sees geometry.
+CREATE TABLE IF NOT EXISTS link_routes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    child_id   INTEGER NOT NULL REFERENCES org_devices(id),
+    parent_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    waypoints  TEXT NOT NULL,            -- JSON [[lat,lng],...]
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    UNIQUE(org_id, child_id, parent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_link_routes_org ON link_routes(org_id);
 -- The on-backup badge (one row per redundancy-capable device) — central/redundancy.py
 -- writes it every full report cycle, restart-safe (a restart mid-failover reads `was`
 -- back from here rather than re-paging). Never part of the outage/escalation ladder.
@@ -401,6 +418,21 @@ CREATE TABLE IF NOT EXISTS olt_optics (
     alarm       INTEGER NOT NULL DEFAULT 0,
     alarm_since TEXT,
     updated_at  TEXT NOT NULL
+);
+-- PON fault ladder state (central/ponalert.py) — one row per (OLT, PON port),
+-- transition-only paging like device_redundancy/olt_optics: a re-walk that
+-- leaves the fault standing must not re-page. State written even when the
+-- alert gate is off. Never opens an outage — SNMP-derived facts don't.
+CREATE TABLE IF NOT EXISTS pon_fault_state (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    pon_port   TEXT NOT NULL,
+    kind       TEXT NOT NULL,            -- power | fiber
+    dark       INTEGER NOT NULL DEFAULT 0,
+    active     INTEGER NOT NULL DEFAULT 0,
+    since      TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, device_id, pon_port)
 );
 -- Device health over SNMP (CPU %, RAM, temperature) — one row per device, written
 -- off the full /report's `health` key on the edge's SNMP cadence (ingress/health.py).
@@ -554,8 +586,39 @@ class CentralStore:
                 ("assigned_node_id", "TEXT"),
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
                 ("gpon_vendor", "TEXT"),
-                ("lat", "REAL"), ("lng", "REAL")))
+                ("lat", "REAL"), ("lng", "REAL"),
+                # passive plant only (splitter/fdb/closure): which PON it serves
+                ("pon_port", "TEXT")))
+            # when this ONU was last seen online — central/ponfault.py reads it to
+            # spot a mass drop ("N ONUs dark within one walk") without a history table
+            self._ensure_columns(conn, "onu_optics", (
+                ("last_online_at", "TEXT"),))
+            self._seed_google_key(conn)
             conn.commit()
+
+    @staticmethod
+    def _seed_google_key(conn) -> None:
+        # The Google Maps key moved from the per-org orgs.google_maps_key column
+        # to the server-wide app_settings table (2026-07-11). A DB that set the
+        # key BEFORE that move still carries it only in the now-dead column, and
+        # app_settings is empty — so the map silently drops to the CARTO
+        # fallback. Promote the lingering key ONCE so Google stays the default
+        # across the upgrade. Superadmin Settings still overrides it any time.
+        has = conn.execute(
+            "SELECT 1 FROM app_settings WHERE key='google_maps_key'").fetchone()
+        if has:
+            return
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(orgs)")}
+        if "google_maps_key" not in cols:
+            return
+        row = conn.execute(
+            "SELECT google_maps_key AS k FROM orgs"
+            " WHERE google_maps_key IS NOT NULL AND TRIM(google_maps_key) <> ''"
+            " LIMIT 1").fetchone()
+        if row and row["k"]:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('google_maps_key', ?)",
+                (row["k"].strip()[:128],))
 
     @staticmethod
     def _ensure_columns(conn, table: str, coldefs: tuple[tuple[str, str], ...]) -> None:
@@ -1095,7 +1158,7 @@ class CentralStore:
                 "SELECT d.id, d.org_id, d.name, d.ip_address, d.device_type, d.region,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
-                " d.lat, d.lng,"
+                " d.lat, d.lng, d.pon_port,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
                 " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
@@ -1170,11 +1233,11 @@ class CentralStore:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO org_devices (org_id, name, ip_address, device_type, region,"
-                " parent_device_id, assigned_node_id, gpon_vendor, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                " parent_device_id, assigned_node_id, gpon_vendor, pon_port, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (org_id, clean["name"], clean["ip_address"], clean["device_type"],
                  clean["region"], clean["parent_device_id"], clean.get("assigned_node_id"),
-                 clean.get("gpon_vendor"), _now_iso()))
+                 clean.get("gpon_vendor"), clean.get("pon_port"), _now_iso()))
             conn.commit()
             return int(cur.lastrowid)
 
@@ -1182,11 +1245,11 @@ class CentralStore:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
-                " parent_device_id=?, assigned_node_id=?, gpon_vendor=? WHERE id=? AND org_id=?"
-                " AND is_active=1",
+                " parent_device_id=?, assigned_node_id=?, gpon_vendor=?, pon_port=?"
+                " WHERE id=? AND org_id=? AND is_active=1",
                 (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
                  clean["parent_device_id"], clean.get("assigned_node_id"),
-                 clean.get("gpon_vendor"), device_id, org_id))
+                 clean.get("gpon_vendor"), clean.get("pon_port"), device_id, org_id))
             if cur.rowcount > 0 and not clean.get("assigned_node_id"):
                 conn.execute("DELETE FROM device_states WHERE org_id=? AND device_id=?",
                              (org_id, device_id))
@@ -1210,6 +1273,48 @@ class CentralStore:
                 (lat, lng, device_id, org_id))
             conn.commit()
             return cur.rowcount > 0
+
+    def set_link_route(self, org_id: str, child_id: int, parent_id: int,
+                       waypoints: list[list[float]], updated_by: str | None) -> None:
+        """Upsert the drawn cable path for one link; an empty list clears it."""
+        with self._write_lock, self._connect() as conn:
+            if not waypoints:
+                conn.execute(
+                    "DELETE FROM link_routes WHERE org_id=? AND child_id=? AND parent_id=?",
+                    (org_id, child_id, parent_id))
+            else:
+                conn.execute(
+                    "INSERT INTO link_routes (org_id, child_id, parent_id, waypoints,"
+                    " updated_at, updated_by) VALUES (?,?,?,?,?,?)"
+                    " ON CONFLICT(org_id, child_id, parent_id) DO UPDATE SET"
+                    " waypoints=excluded.waypoints, updated_at=excluded.updated_at,"
+                    " updated_by=excluded.updated_by",
+                    (org_id, child_id, parent_id, json.dumps(waypoints), _now_iso(),
+                     updated_by))
+            conn.commit()
+
+    def list_link_routes(self, org_id: str) -> list[dict]:
+        # Only routes whose link still exists: a re-parented child leaves its old
+        # route row dangling — invisible here, overwritten or deleted later.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.child_id, r.parent_id, r.waypoints, r.updated_at, r.updated_by"
+                " FROM link_routes r JOIN org_devices c ON c.id = r.child_id"
+                " WHERE r.org_id=? AND c.org_id=? AND c.is_active=1"
+                " AND (c.parent_device_id = r.parent_id OR EXISTS ("
+                "   SELECT 1 FROM org_device_links l WHERE l.org_id = r.org_id"
+                "   AND l.child_id = r.child_id AND l.parent_id = r.parent_id"
+                "   AND l.is_active = 1))",
+                (org_id, org_id)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["waypoints"] = json.loads(d["waypoints"])
+            except (TypeError, ValueError):
+                d["waypoints"] = []
+            out.append(d)
+        return out
 
     def set_org_device_maintenance(self, org_id: str, device_id: int, on: bool) -> bool:
         with self._write_lock, self._connect() as conn:
@@ -1264,6 +1369,10 @@ class CentralStore:
                 "DELETE FROM org_device_links"
                 " WHERE org_id=? AND (child_id=? OR parent_id=?)",
                 (org_id, device_id, device_id))
+            conn.execute(
+                "DELETE FROM link_routes"
+                " WHERE org_id=? AND (child_id=? OR parent_id=?)",
+                (org_id, device_id, device_id))
             conn.execute("DELETE FROM device_redundancy WHERE device_id=?", (device_id,))
             conn.execute("DELETE FROM device_perf_samples WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
@@ -1271,6 +1380,8 @@ class CentralStore:
             conn.execute("DELETE FROM onu_optics WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute("DELETE FROM olt_optics WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM pon_fault_state WHERE org_id=? AND device_id=?",
+                         (org_id, device_id))
             conn.execute("DELETE FROM device_snmp_status WHERE device_id=?",
                          (device_id,))
             conn.execute("DELETE FROM device_capability WHERE device_id=?",
@@ -1281,14 +1392,29 @@ class CentralStore:
         return {"ok": True}
 
     def org_device_topology(self, org_id: str) -> list[dict]:
+        # Passive plant (splitter/fdb/closure) is filtered HERE, the single choke
+        # point: the engine never builds an FSM for it (and the topology
+        # fingerprint doesn't move when plant is added — no rebuild, no re-page)
+        # and /edge/devices never ships an empty IP for a probe to ping.
+        placeholders = ",".join("?" for _ in _PASSIVE_TYPES)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, name, ip_address, region, parent_device_id, assigned_node_id,"
                 " snmp_enabled, snmp_version, snmp_community, snmp_port, device_type,"
                 " gpon_vendor FROM org_devices"
-                " WHERE org_id=? AND is_active=1 AND maintenance=0 ORDER BY id",
-                (org_id,)).fetchall()
+                " WHERE org_id=? AND is_active=1 AND maintenance=0"
+                f" AND (device_type IS NULL OR device_type NOT IN ({placeholders}))"
+                " ORDER BY id",
+                (org_id, *_PASSIVE_TYPES)).fetchall()
         return [dict(r) for r in rows]
+
+    def org_passive_ids(self, org_id: str) -> set[int]:
+        placeholders = ",".join("?" for _ in _PASSIVE_TYPES)
+        with self._connect() as conn:
+            return {r["id"] for r in conn.execute(
+                "SELECT id FROM org_devices WHERE org_id=? AND is_active=1"
+                f" AND device_type IN ({placeholders})",
+                (org_id, *_PASSIVE_TYPES))}
 
     def device_states(self, org_id: str) -> dict[int, dict]:
         with self._connect() as conn:
@@ -1708,6 +1834,40 @@ class CentralStore:
                 (org_id, device_id)).fetchall()
         return [dict(r) for r in rows]
 
+    def org_onu_rows(self, org_id: str, device_id: int | None = None) -> list[dict]:
+        """Slim ONU rows for the PON fault detector (central/ponfault.py)."""
+        q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.name, o.state,"
+             " o.distance_m, o.last_online_at, o.updated_at, d.name AS device_name"
+             " FROM onu_optics o JOIN org_devices d ON d.id = o.device_id"
+             " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1")
+        args: list = [org_id, org_id]
+        if device_id is not None:
+            q += " AND o.device_id=?"
+            args.append(device_id)
+        with self._connect() as conn:
+            rows = conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def pon_fault_states(self, org_id: str) -> dict[tuple[int, str], dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pon_fault_state WHERE org_id=?", (org_id,)).fetchall()
+        return {(r["device_id"], r["pon_port"]): dict(r) for r in rows}
+
+    def upsert_pon_fault_state(self, org_id: str, device_id: int, pon_port: str,
+                               *, kind: str, dark: int, active: bool,
+                               since: str | None, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO pon_fault_state (org_id, device_id, pon_port, kind,"
+                " dark, active, since, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, device_id, pon_port) DO UPDATE SET"
+                " kind=excluded.kind, dark=excluded.dark, active=excluded.active,"
+                " since=excluded.since, updated_at=excluded.updated_at",
+                (org_id, device_id, pon_port, kind, dark, 1 if active else 0,
+                 since, ts))
+            conn.commit()
+
     def upsert_onu_optics(self, org_id: str, device_id: int, onu_key: str, *,
                           pon_port: str | None, onu_id: int | None, name: str | None,
                           serial: str | None, state: str | None, rx_dbm: float | None,
@@ -1718,18 +1878,22 @@ class CentralStore:
             conn.execute(
                 "INSERT INTO onu_optics (org_id, device_id, onu_key, pon_port, onu_id,"
                 " name, serial, state, rx_dbm, tx_dbm, olt_rx_dbm, distance_m,"
-                " rx_ref_dbm, rx_ref_at, severity, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " rx_ref_dbm, rx_ref_at, severity, updated_at, last_online_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(org_id, device_id, onu_key) DO UPDATE SET"
                 " pon_port=excluded.pon_port, onu_id=excluded.onu_id, name=excluded.name,"
                 " serial=excluded.serial, state=excluded.state, rx_dbm=excluded.rx_dbm,"
                 " tx_dbm=excluded.tx_dbm, olt_rx_dbm=excluded.olt_rx_dbm,"
                 " distance_m=excluded.distance_m, rx_ref_dbm=excluded.rx_ref_dbm,"
                 " rx_ref_at=excluded.rx_ref_at, severity=excluded.severity,"
-                " updated_at=excluded.updated_at",
+                " updated_at=excluded.updated_at,"
+                # freeze the timestamp the moment an ONU goes dark — the fault
+                # detector clusters cohorts on it
+                " last_online_at=CASE WHEN excluded.state='online'"
+                "   THEN excluded.updated_at ELSE onu_optics.last_online_at END",
                 (org_id, device_id, onu_key, pon_port, onu_id, name, serial, state,
                  rx_dbm, tx_dbm, olt_rx_dbm, distance_m, rx_ref_dbm, rx_ref_at,
-                 severity, ts))
+                 severity, ts, ts if state == "online" else None))
             conn.commit()
 
     def get_olt_optics(self, org_id: str, device_id: int) -> dict | None:

@@ -30,9 +30,53 @@ export interface Org {
 export const DEVICE_TYPES = [
   "core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul",
 ] as const
-export type DeviceType = (typeof DEVICE_TYPES)[number]
+/** Passive plant: on the map and in the tree, never probed — no IP, no FSM. */
+export const PASSIVE_DEVICE_TYPES = ["splitter", "fdb", "closure"] as const
+export type DeviceType =
+  (typeof DEVICE_TYPES)[number] | (typeof PASSIVE_DEVICE_TYPES)[number]
+export const isPassiveType = (t: string | null | undefined): boolean =>
+  !!t && (PASSIVE_DEVICE_TYPES as readonly string[]).includes(t)
 
 export type DeviceState = "UP" | "DOWN" | "DEGRADED" | "UNREACHABLE"
+
+/** PON mass-drop verdict (central/ponfault.py) — power vs fiber, with a cut
+    distance interval off EPON ranging when it's fiber. Read-side, never pages. */
+export interface PonFault {
+  device_id: number
+  device_name: string
+  pon_port: string | null
+  onus_total: number
+  dark: number
+  dying_gasp: number
+  since: string | null
+  kind: "power" | "fiber"
+  cut_low_m: number | null
+  cut_high_m: number | null
+  /** named passive (splitter/FDB) whose route distance sits in the cut interval */
+  suspect: string | null
+}
+
+/** Open-outage wave verdict (central/incidents.py): topology × geography.
+    Annotation only — it never mutes or reroutes a page. */
+export interface IncidentShape {
+  kind: "power" | "upstream"
+  device_ids: number[]
+  count: number
+  branches: number
+  since: string | null
+  center: [number, number] | null
+  radius_km: number | null
+  root_name: string | null
+}
+
+/** Drawn cable path for one link — intermediate vertices only, parent→child order. */
+export interface LinkRoute {
+  child_id: number
+  parent_id: number
+  waypoints: Array<[number, number]>
+  updated_at: string
+  updated_by: string | null
+}
 
 export interface OrgRegion {
   name: string
@@ -57,6 +101,8 @@ export interface OrgDevice {
   snmp_port: number
 
   gpon_vendor: string | null
+  /** passive plant only: which PON this splitter/FDB serves (e.g. "0/6") */
+  pon_port: string | null
   lat: number | null
   lng: number | null
   child_count: number

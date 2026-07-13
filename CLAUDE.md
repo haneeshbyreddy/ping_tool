@@ -129,6 +129,35 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `org_device_links` (`kind='backup'`, cycle-checked over the FULL edge set),
   `central/redundancy.py:sweep` pages enter/leave, never opens an outage, gated
   `cfg.backup_alerts`.
+- **PON mass-drop verdicts** (`central/ponfault.py` pure math, `central/ponalert.py`
+  paging shell): `onu_optics.last_online_at` FREEZES when an ONU leaves `online`
+  (upsert CASE), so "≥3 ONUs on one PON dark with a recent last_online_at" IS the
+  event — no history table. Dying-gasp majority = POWER (recorded, NEVER pages —
+  the whole point is not rolling a splicing crew for the DISCOM); LOS majority =
+  fiber, cut bracketed (max-online-short-of-dark, min-dark] in RANGING meters
+  (optical path, slack included — always a stretch, never a point). An OLT whose
+  walk is >15 min stale is skipped outright (the ICMP outage owns that page).
+  Paging is transition-only via `pon_fault_state` (ports.py pattern), gated
+  `cfg.pon_fault_alerts`, state written even when gated off. Suspect naming =
+  the deepest passive whose route distance (link_routes geometry, chord where
+  undrawn, ABORTS on any unplaced hop — never fabricate) lands in the interval.
+  Sweep rides the optics fold in `/report`. Tests: `unit/test_ponfault`,
+  `integration/test_central_ponalert`.
+- **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` =
+  splitter/fdb/closure), NOT a second registry: parent chains, map pins, routes
+  all come free. `ip_address` stays `''` (the NOT NULL column survives);
+  validation rejects an IP/probe on a passive and a PASSIVE PARENT for a
+  monitored device (passive-under-passive is fine — plant hangs below gear).
+  Containment is `org_device_topology` (the single choke point: engine FSMs,
+  the topology fingerprint — adding a splitter must NOT rebuild/re-page — and
+  `/edge/devices`) plus a `device_reliability` skip. `org_devices.pon_port`
+  (passives only) binds a splitter to its PON for suspect naming.
+- **Incident shape** (`central/incidents.py`, `/api/incident/shape`): open-outage
+  waves (15-min start gaps) × independent branches (a root = down device whose
+  parent is NOT down, judged against the FULL down set so victims of an older
+  outage never count) × geography. ≥2 branches inside 3 km = "power"; 1 branch =
+  "upstream"; scattered multi-branch = SILENT (no verdict beats a wrong one).
+  ANNOTATION ONLY — must never mute, reroute, or replace a page.
 - **Remote SNMP walks — the edge is central's hands, poll-only.** Queued from the
   dashboard, delivered in the next FULL `/report` reply under `snmp_walks` (the edge
   NEVER accepts inbound); run by a sequential background runner (`_DiagWalkRunner`)
@@ -267,15 +296,44 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   every second and an uncached icon swaps every marker's DOM node per tick,
   restarting the down-pulse. Control buttons shift left of the open device panel
   on desktop (`md:right-[calc(380px+1.5rem)]`) or the panel covers them.
-  **Site clusters** (2026-07-11): pins that would overlap on screen fold into a
-  count badge (worst member tone on the border) — SCREEN-SPACE and zoom-dependent
-  (`buildClusters`, greedy in Web Mercator px; cluster key = member ids, so
-  zooming folds an open fan on purpose). Click = fitBounds when members are
-  genuinely spread, spider-fan (pixel-sized radius, dashed legs) when they share
-  a spot — placing devices at the same coords IS the "rack", no schema. `pinPos`
-  is each device's DISPLAY position (centroid folded / fan open); links + PON
-  spokes read it, and selecting a device force-opens its cluster so search and
-  trouble-cycle never land on a hidden pin.
+  **Site clusters** (2026-07-11; spider-fan REMOVED 2026-07-12): pins that would
+  overlap on screen fold into a count badge with a conic composition ring
+  (member statuses as arcs) — SCREEN-SPACE and zoom-dependent (`buildClusters`,
+  greedy in Web Mercator px). The fan scattered pins onto real coordinates and
+  read as geography (the ONU-spoke lesson again) — co-located members resolve in
+  UI SPACE now: badge click = fitBounds when genuinely spread, else a SITE CARD
+  (left drawer) listing members, anchored by member DEVICE id (`siteAnchor`) so
+  it survives zoom reshuffles; row click drives the shared device panel. Placing
+  devices at the same coords IS the "rack", no schema — and co-location is now
+  deliberate: in placement mode a badge/pin click snaps to that site's EXACT
+  coords, and an edit-pins drag dropped within 24 px of a neighbor snaps to it
+  (near-stacks were the fan's original sin). `pinPos` is raw-or-centroid ONLY
+  (links read it); a folded selection highlights the badge (`--selected`, pulse
+  off) + auto-opens the card, so search/trouble-cycle never land on a hidden
+  pin. Don't reintroduce display positions that aren't true locations.
+- **Role shapes on pins** (2026-07-12): `wisp-pin--t-<device_type>` picks the dot's
+  SILHOUETTE (fill stays health, ::after ring stays optics) — border-radius /
+  rotation / ::before ONLY; clip-path would clip the selection box-shadow and the
+  down-pulse. Passives render small + always-muted. The legend rides the Layers
+  popover, so that button now renders for keyless orgs too (style choices still
+  need the Google key).
+- **Cable routes** (2026-07-12): `link_routes` keyed (org, child, parent) covers
+  primary AND backup links; waypoints are INTERMEDIATE vertices only, parent→child
+  order — endpoints stay implicit so moving a pin rubber-bands the route.
+  `list_link_routes` joins against the live link, so a re-parent hides stale
+  geometry instead of drawing a lie. `/api/inventory/routes` is map-only —
+  deliberately NOT folded into `list_org_devices()`. The renderer falls back to
+  the straight chord whenever an endpoint is folded into a cluster (a route
+  snaking into a centroid reads as an error), and the editor is ~100 lines of
+  plain react-leaflet (draggable divIcon vertices) — no leaflet-geoman. The
+  device panel shows "cable" (route length) AND "straight-line" (chord) —
+  labeled honestly, splicing crews quote drum meters off this.
+- **Cut overlay** (D2): walks the OLT→passive-chain path (drawn routes where
+  traced, chords where not; first hop must name the PON, deeper plant may leave
+  `pon_port` blank), clamps the RANGING interval into the geometry, paints the
+  stretch + a pulsing ✕ whose click opens the OLT's Optical tab. No placed
+  splitter chain = no overlay — the Optical tab fault card still carries the
+  distance. Power-pattern waves render a dashed warning hull + top-center banner.
 - **PON on the map** (2026-07-10): OLT pins ring amber/red off `onus_warn/crit`
   (suppressed when maint/down/stale-optics). The per-ONU spoke fan (Phase 2) was
   REMOVED 2026-07-11 at the operator's request — EPON ranging gives distance but

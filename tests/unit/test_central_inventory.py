@@ -13,6 +13,7 @@ from wisp.central.inventory import (
     clean_node_id,
     clean_port_bandwidth_payload,
     clean_region_name,
+    clean_route_payload,
     clean_snmp_payload,
 )
 
@@ -250,6 +251,85 @@ class CleanLocationPayloadTest(unittest.TestCase):
             clean_location_payload({"lat": 91, "lng": 0})
         with self.assertRaises(InventoryError):
             clean_location_payload({"lat": 0, "lng": -181})
+
+class PassiveDevicePayloadTest(unittest.TestCase):
+    def test_passive_needs_no_ip(self):
+        clean = clean_device_payload(
+            {"name": "Splitter S3", "device_type": "splitter"},
+            parents={}, device_id=None)
+        self.assertEqual(clean["ip_address"], "")
+        self.assertEqual(clean["device_type"], "splitter")
+
+    def test_passive_rejects_an_ip(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "S", "device_type": "fdb", "ip_address": "10.0.0.9"},
+                parents={}, device_id=None)
+
+    def test_passive_rejects_probe_assignment(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "S", "device_type": "splitter", "assigned_node_id": "edge-1"},
+                parents={}, device_id=None, registered_nodes={"edge-1"})
+
+    def test_monitored_device_still_requires_ip(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "R", "device_type": "router"}, parents={}, device_id=None)
+
+    def test_monitored_device_cannot_hang_under_plant(self):
+        with self.assertRaises(InventoryError):
+            clean_device_payload(
+                {"name": "SW", "device_type": "switch", "ip_address": "10.0.0.9",
+                 "parent_device_id": 4},
+                parents={4: None}, device_id=None, passive_ids={4})
+
+    def test_passive_may_hang_under_plant(self):
+        clean = clean_device_payload(
+            {"name": "S2", "device_type": "splitter", "parent_device_id": 4},
+            parents={4: None}, device_id=None, passive_ids={4})
+        self.assertEqual(clean["parent_device_id"], 4)
+
+    def test_pon_port_kept_for_passives_only(self):
+        clean = clean_device_payload(
+            {"name": "S", "device_type": "splitter", "pon_port": "0/6"},
+            parents={}, device_id=None)
+        self.assertEqual(clean["pon_port"], "0/6")
+        clean = clean_device_payload(
+            {"name": "R", "device_type": "router", "ip_address": "10.0.0.9",
+             "pon_port": "0/6"},
+            parents={}, device_id=None)
+        self.assertIsNone(clean["pon_port"])
+
+
+class CleanRoutePayloadTest(unittest.TestCase):
+    def test_round_trips_and_rounds(self):
+        clean = clean_route_payload({"child_id": 2, "parent_id": 1,
+                                     "waypoints": [[17.4401234567, 78.3489], (17.45, 78.35)]})
+        self.assertEqual(clean["child_id"], 2)
+        self.assertEqual(clean["parent_id"], 1)
+        self.assertEqual(clean["waypoints"], [[17.440123, 78.3489], [17.45, 78.35]])
+
+    def test_empty_waypoints_means_clear(self):
+        self.assertEqual(clean_route_payload(
+            {"child_id": 2, "parent_id": 1, "waypoints": []})["waypoints"], [])
+        self.assertEqual(clean_route_payload(
+            {"child_id": 2, "parent_id": 1})["waypoints"], [])
+
+    def test_requires_ids(self):
+        with self.assertRaises(InventoryError):
+            clean_route_payload({"waypoints": []})
+
+    def test_rejects_malformed_waypoints(self):
+        for bad in ("nope", [[1]], [[1, 2, 3]], [["x", "y"]], [[91, 0]], [[0, 181]]):
+            with self.assertRaises(InventoryError):
+                clean_route_payload({"child_id": 2, "parent_id": 1, "waypoints": bad})
+
+    def test_caps_waypoint_count(self):
+        wps = [[1.0, 2.0]] * 201
+        with self.assertRaises(InventoryError):
+            clean_route_payload({"child_id": 2, "parent_id": 1, "waypoints": wps})
+
 
 class CleanRegionNameTest(unittest.TestCase):
     def test_trims_and_returns(self):

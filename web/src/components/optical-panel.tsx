@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
-import type { OnuOptic, OpticsResponse, OrgDevice } from "@/lib/types"
+import type { OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
+import { durationSince } from "@/lib/format"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Button } from "@/components/ui/button"
@@ -250,6 +251,45 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   )
 }
 
+// PON mass-drop card: dying-gasp majority = the neighborhood lost power (don't
+// roll a splicing crew); LOS majority = fiber, with the cut bracketed by EPON
+// ranging. The interval wording stays honest — ranging is optical path length,
+// slack coils included, so it's a stretch of route, never a point.
+function FaultCard({ f }: { f: PonFault }) {
+  const fiber = f.kind === "fiber"
+  const range = fiber && f.cut_high_m != null
+    ? (f.cut_low_m ? `${fmtKm(f.cut_low_m)} – ${fmtKm(f.cut_high_m)}` : `within ${fmtKm(f.cut_high_m)}`)
+    : null
+  return (
+    <div className={cn(
+      "rounded-lg border px-3 py-2 text-xs",
+      fiber ? "border-destructive/40 bg-destructive-soft/40" : "border-warning/40 bg-warning-soft/40",
+    )}>
+      <p className={cn("font-semibold", fiber ? "text-destructive" : "text-warning")}>
+        {fiber ? "Suspected fiber cut" : "Power-outage pattern"} — PON {f.pon_port ?? "?"}
+      </p>
+      <p className="mt-0.5 text-muted-foreground">
+        {f.dark} of {f.onus_total} ONUs dark
+        {f.dying_gasp > 0 && <> · {f.dying_gasp} sent dying-gasp</>}
+        {f.since && <> · since {durationSince(f.since)} ago</>}
+      </p>
+      {fiber ? (
+        <p className="mt-0.5">
+          {range
+            ? <>Cut likely <span className="font-semibold">{range}</span> from the OLT (by ranging — optical path, not road meters).</>
+            : <>No ranging distances on this PON — can't bracket the cut.</>}
+          {f.suspect && <> Suspect: <span className="font-mono font-semibold">{f.suspect}</span>.</>}
+        </p>
+      ) : (
+        <p className="mt-0.5">
+          Mostly dying-gasp: customers likely lost mains power — check the area's
+          supply before dispatching a splicing crew.
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function OpticalPanel({ device, focusOnuId }: {
   device: OrgDevice
   /** map spoke click-through: open this ONU's PON group and highlight its row */
@@ -258,6 +298,11 @@ export function OpticalPanel({ device, focusOnuId }: {
   const q = useQuery<OpticsResponse>({
     queryKey: ["optics", device.id],
     queryFn: () => inventoryApi.optics(device.id),
+    refetchInterval: 30_000,
+  })
+  const faultsQ = useQuery({
+    queryKey: ["pon-faults", device.id],
+    queryFn: () => inventoryApi.ponFaults(device.id),
     refetchInterval: 30_000,
   })
   const pons = useMemo(() => groupByPon(q.data?.onus ?? []), [q.data])
@@ -302,6 +347,9 @@ export function OpticalPanel({ device, focusOnuId }: {
 
   return (
     <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
+      {(faultsQ.data?.faults ?? []).map((f) => (
+        <FaultCard key={`${f.device_id}:${f.pon_port ?? "?"}`} f={f} />
+      ))}
       {/* header readout ------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span className="text-sm">

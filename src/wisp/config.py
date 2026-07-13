@@ -101,6 +101,10 @@ class Config:
     optical_crit_dbm: float = field(
         default_factory=lambda: _env_float("WISP_OPTICAL_CRIT_DBM", -27.0))
     optical_alerts: bool = field(default_factory=lambda: _env_bool("WISP_OPTICAL_ALERTS", True))
+    # PON mass-drop heads-up (central/ponalert.py): page the operator when a
+    # PON reads as a fiber cut. State is tracked regardless; only paging gates.
+    pon_fault_alerts: bool = field(
+        default_factory=lambda: _env_bool("WISP_PON_FAULT_ALERTS", True))
     # Empty = per-OLT sysObjectID auto-detect (the normal path). Set to force one
     # vendor profile on every untagged OLT this edge probes — an escape hatch for
     # a box whose sysObjectID is missing or lies; per-device `gpon_vendor` from the

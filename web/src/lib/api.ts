@@ -1,7 +1,7 @@
 import type {
-  AccountUser, AdminOverview, AttendanceOverview, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  AccountUser, AdminOverview, AttendanceOverview, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
-  SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  PonFault, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   Summary, SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
 
@@ -74,6 +74,7 @@ export interface DevicePayload {
   parent_device_id?: number | null
   assigned_node_id?: string | null
   gpon_vendor?: string | null
+  pon_port?: string | null
 }
 
 export const inventoryApi = {
@@ -104,6 +105,11 @@ export const inventoryApi = {
   ) => request<{ ok: boolean }>("/api/inventory/ports/bandwidth", {
     method: "POST", body: { id, threshold_mbps, max_mbps, direction },
   }),
+  routes: (org?: string | null) =>
+    request<{ routes: LinkRoute[] }>(`/api/inventory/routes${tq(org)}`),
+  setRoute: (child_id: number, parent_id: number, waypoints: Array<[number, number]>) =>
+    request<{ ok: boolean }>("/api/inventory/route",
+      { method: "POST", body: { child_id, parent_id, waypoints } }),
   addBackupLink: (child_id: number, parent_id: number) =>
     request<{ ok: true }>("/api/inventory/links", { method: "POST", body: { child_id, parent_id } }),
   removeBackupLink: (child_id: number, parent_id: number) =>
@@ -111,6 +117,12 @@ export const inventoryApi = {
 
   optics: (deviceId: number) =>
     request<OpticsResponse>(`/api/inventory/optics?device_id=${deviceId}`),
+  ponFaults: (deviceId: number) =>
+    request<{ faults: PonFault[] }>(`/api/pon/faults?device_id=${deviceId}`),
+  orgPonFaults: (org?: string | null) =>
+    request<{ faults: PonFault[] }>(`/api/pon/faults${tq(org)}`),
+  incidentShape: (org?: string | null) =>
+    request<{ incidents: IncidentShape[] }>(`/api/incident/shape${tq(org)}`),
   ackOnu: (id: number, hours: number | null) =>
     request<{ ok: boolean }>("/api/inventory/optics/ack",
       { method: "POST", body: hours == null ? { id, until: "clear" } : { id, hours } }),

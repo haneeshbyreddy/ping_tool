@@ -6,7 +6,7 @@ import { ChevronRight, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Wa
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { inventoryApi, nodesApi, ApiError } from "@/lib/api"
-import { DEVICE_TYPES, type OrgDevice } from "@/lib/types"
+import { DEVICE_TYPES, PASSIVE_DEVICE_TYPES, isPassiveType, type OrgDevice } from "@/lib/types"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import {
   DeviceDetail, DeviceMetrics, RowTag, isOpticalOlt,
@@ -71,12 +71,13 @@ interface DeviceFormState {
   snmp_community: string
   snmp_port: string
   gpon_vendor: string
+  pon_port: string
 }
 
 const EMPTY_FORM: DeviceFormState = {
   name: "", ip_address: "", device_type: "", region: "", parent_device_id: "",
   assigned_node_id: "", snmp_enabled: false, snmp_community: "", snmp_port: "161",
-  gpon_vendor: "",
+  gpon_vendor: "", pon_port: "",
 }
 
 function DeviceForm({
@@ -96,6 +97,7 @@ function DeviceForm({
     snmp_enabled: !!editing.snmp_enabled, snmp_community: editing.snmp_community ?? "",
     snmp_port: String(editing.snmp_port || 161),
     gpon_vendor: editing.gpon_vendor ?? "",
+    pon_port: editing.pon_port ?? "",
   } : EMPTY_FORM)
   const [error, setError] = useState("")
 
@@ -110,25 +112,30 @@ function DeviceForm({
     queryClient.invalidateQueries({ queryKey: ["regions"] })
   }
 
+  const passive = isPassiveType(form.device_type)
   const save = useMutation({
     mutationFn: async () => {
       const payload = {
         org_id: org,
         name: form.name.trim(),
-        ip_address: form.ip_address.trim(),
+        // passive plant has no address; the server rejects one anyway
+        ip_address: passive ? "" : form.ip_address.trim(),
         device_type: form.device_type || null,
         region: form.region.trim() || null,
         parent_device_id: form.parent_device_id ? Number(form.parent_device_id) : null,
-        assigned_node_id: form.assigned_node_id || null,
+        assigned_node_id: passive ? null : (form.assigned_node_id || null),
 
         gpon_vendor: form.device_type === "OLT" ? (form.gpon_vendor || null) : null,
+        pon_port: passive ? (form.pon_port.trim() || null) : null,
       }
       if (editing) {
         await inventoryApi.update(editing.id, payload)
-        await inventoryApi.setSnmp(editing.id, {
-          snmp_enabled: form.snmp_enabled, snmp_community: form.snmp_community.trim() || null,
-          snmp_port: form.snmp_port,
-        })
+        if (!passive) {
+          await inventoryApi.setSnmp(editing.id, {
+            snmp_enabled: form.snmp_enabled, snmp_community: form.snmp_community.trim() || null,
+            snmp_port: form.snmp_port,
+          })
+        }
       } else {
         await inventoryApi.create(payload)
       }
@@ -148,9 +155,14 @@ function DeviceForm({
               onChange={(e) => setForm({ ...form, name: e.target.value })} />
           </div>
           <div className="flex flex-col gap-1.5">
-            <Label>IP address</Label>
-            <Input placeholder="10.4.1.9" className="font-mono" value={form.ip_address}
-              onChange={(e) => setForm({ ...form, ip_address: e.target.value })} />
+            <Label>{passive ? "PON port (optional)" : "IP address"}</Label>
+            {passive ? (
+              <Input placeholder="0/6" className="font-mono" value={form.pon_port}
+                onChange={(e) => setForm({ ...form, pon_port: e.target.value })} />
+            ) : (
+              <Input placeholder="10.4.1.9" className="font-mono" value={form.ip_address}
+                onChange={(e) => setForm({ ...form, ip_address: e.target.value })} />
+            )}
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Type</Label>
@@ -158,6 +170,9 @@ function DeviceForm({
               <SelectTrigger className="w-full"><SelectValue placeholder="(type)" /></SelectTrigger>
               <SelectContent>
                 {DEVICE_TYPES.map((t) => <SelectItem key={t} value={t}>{t}</SelectItem>)}
+                {PASSIVE_DEVICE_TYPES.map((t) => (
+                  <SelectItem key={t} value={t}>{t} (passive)</SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
@@ -179,20 +194,28 @@ function DeviceForm({
               </SelectContent>
             </Select>
           </div>
-          <div className="flex flex-col gap-1.5">
-            <Label>Assigned probe</Label>
-            <Select value={form.assigned_node_id || "any"}
-              onValueChange={(v) => setForm({ ...form, assigned_node_id: v === "any" ? "" : v })}>
-              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="any">Unassigned (not monitored)</SelectItem>
-                {nodeIds.map((id) => <SelectItem key={id} value={id}>{id}</SelectItem>)}
-              </SelectContent>
-            </Select>
-          </div>
+          {!passive && (
+            <div className="flex flex-col gap-1.5">
+              <Label>Assigned probe</Label>
+              <Select value={form.assigned_node_id || "any"}
+                onValueChange={(v) => setForm({ ...form, assigned_node_id: v === "any" ? "" : v })}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Unassigned (not monitored)</SelectItem>
+                  {nodeIds.map((id) => <SelectItem key={id} value={id}>{id}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-5">
+        {passive && (
+          <p className="text-xs text-muted-foreground">
+            Passive plant: lives on the map and in the tree, never probed.
+            Hang it under the OLT (or another splitter) that feeds it.
+          </p>
+        )}
+        <div className={cn("flex flex-wrap items-center gap-5", passive && "hidden")}>
           <label className="flex items-center gap-2 text-sm">
             <Checkbox checked={form.snmp_enabled}
               onCheckedChange={(v) => setForm({ ...form, snmp_enabled: !!v })} />
@@ -227,7 +250,7 @@ function DeviceForm({
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onDone}>Cancel</Button>
-          <Button size="sm" disabled={save.isPending || !form.name || !form.ip_address}
+          <Button size="sm" disabled={save.isPending || !form.name || (!passive && !form.ip_address)}
             onClick={() => save.mutate()}>
             {editing ? "Save" : "Add"}
           </Button>
@@ -282,7 +305,9 @@ function DeviceRow({
     onError: () => toast.error("Failed to update"),
   })
 
-  const unassigned = !device.assigned_node_id
+  const passive = isPassiveType(device.device_type)
+  // a splitter with no probe is by design, not a config gap
+  const unassigned = !device.assigned_node_id && !passive
 
   return (
     // Open = the drill-in block: row + panel fuse into one raised surface
@@ -317,6 +342,11 @@ function DeviceRow({
           <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
         )}
         {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
+        {passive && (
+          <RowTag tone="muted" title="Passive plant — on the map, never probed">
+            passive{device.pon_port ? ` · PON ${device.pon_port}` : ""}
+          </RowTag>
+        )}
         {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
         {device.backup_parents.length > 0 && <RowTag tone="success">backup</RowTag>}
         {/* Monitored-port trouble surfaces on the switch's own row — clicking a chip

@@ -2,7 +2,7 @@
 // draw between placed parent/child pairs, and clicking a pin opens the same
 // Health/Optical/Ports panel the Network tree uses. Placement is dashboard-side
 // only (lat/lng on org_devices) — the edge never sees coordinates.
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useNavigate } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -11,7 +11,7 @@ import { Circle, MapContainer, Marker, Polyline, TileLayer, ZoomControl, useMap,
 import "leaflet/dist/leaflet.css"
 import {
   Check, ChevronRight, Copy, Crosshair, Expand, EyeOff, Layers, ListTree, LocateFixed,
-  MapPin, Maximize2, Navigation, Pencil, Search, Shrink, X,
+  MapPin, Maximize2, Navigation, Pencil, Search, Shrink, Spline, X,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
@@ -21,7 +21,7 @@ import {
   loadGoogleSession, type GoogleMapType,
 } from "@/lib/google-tiles"
 import { mapRegionOf } from "@/lib/map-regions"
-import type { OrgDevice } from "@/lib/types"
+import { isPassiveType, type OrgDevice, type PonFault } from "@/lib/types"
 import { DeviceDetail, DeviceMetrics, RowTag, type DeviceTab } from "@/components/device-detail"
 import { NeedsOrg } from "@/components/needs-org"
 import { StatusDot } from "@/components/status-badge"
@@ -77,6 +77,8 @@ function pinIcon(d: OrgDevice, o: { selected: boolean; dim: boolean; impact: boo
     ? durationSince(d.outage_started_at).split(" ")[0] : null
   const optic = opticRing(d)
   const cls = ["wisp-pin", `wisp-pin--${tone}`]
+  // role is the third visual channel: fill = health, ring = optics, SHAPE = type
+  if (d.device_type) cls.push(`wisp-pin--t-${d.device_type.toLowerCase()}`)
   if (o.selected) cls.push("wisp-pin--selected")
   if (o.dim) cls.push("wisp-pin--dim")
   if (o.impact) cls.push("wisp-pin--impact")
@@ -105,20 +107,106 @@ function meIcon(): L.DivIcon {
   return cachedDivIcon(`<div class="wisp-me" title="You are here"></div>`)
 }
 
+function vertexIcon(): L.DivIcon {
+  return cachedDivIcon(`<div class="wisp-vertex" title="Drag to adjust — double-click to remove"></div>`)
+}
+
+const polyKm = (pts: Array<[number, number]>): number => {
+  let km = 0
+  for (let i = 1; i < pts.length; i++)
+    km += distanceKm(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+  return km
+}
+
+// ---- Fiber-cut localization (D2) -------------------------------------------
+// ponfault brackets a cut in RANGING meters from the OLT; if the operator drew
+// the PON's cable route (OLT → splitter chain), we can walk that geometry to
+// the same distance and paint the suspect stretch. Ranging is optical path
+// (slack coils included) so the stretch is an estimate — the marker says so.
+
+/** point `distM` meters along a polyline (clamped to its ends) */
+function pointAlong(path: Array<[number, number]>, distM: number): [number, number] {
+  let acc = 0
+  for (let i = 1; i < path.length; i++) {
+    const seg = distanceKm(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]) * 1000
+    if (acc + seg >= distM && seg > 0) {
+      const t = (distM - acc) / seg
+      return [
+        path[i - 1][0] + (path[i][0] - path[i - 1][0]) * t,
+        path[i - 1][1] + (path[i][1] - path[i - 1][1]) * t,
+      ]
+    }
+    acc += seg
+  }
+  return path[path.length - 1]
+}
+
+/** sub-polyline between two along-path distances (meters) */
+function subPath(path: Array<[number, number]>, d0: number, d1: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [pointAlong(path, d0)]
+  let acc = 0
+  for (let i = 1; i < path.length; i++) {
+    const seg = distanceKm(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]) * 1000
+    if (acc + seg > d0 && acc + seg < d1) out.push(path[i])
+    acc += seg
+  }
+  out.push(pointAlong(path, d1))
+  return out
+}
+
+/** The PON's drawn path: OLT pin → placed passive chain matching this port.
+    Per-link drawn routes are used where they exist, chords where they don't.
+    Returns null when no placed splitter serves the port — no fake geometry. */
+function ponPath(
+  olt: Placed, port: string | null, devices: OrgDevice[],
+  routeByKey: Map<string, Array<[number, number]>>,
+): Array<[number, number]> | null {
+  const path: Array<[number, number]> = [[olt.lat, olt.lng]]
+  const seen = new Set<number>([olt.id])
+  let cur: Placed = olt
+  let first = true
+  for (let hop = 0; hop < 20; hop++) {
+    const kids = devices.filter((d): d is Placed =>
+      d.parent_device_id === cur.id && isPassiveType(d.device_type) && isPlaced(d)
+      && !seen.has(d.id)
+      // the first hop must name the PON; deeper plant may leave it blank
+      && (first ? d.pon_port === port : (d.pon_port === port || d.pon_port == null)))
+    const next = kids.find((d) => routeByKey.has(`${d.id}:${cur.id}`)) ?? kids[0]
+    if (!next) break
+    const wps = routeByKey.get(`${next.id}:${cur.id}`) ?? []
+    path.push(...wps, [next.lat, next.lng])
+    seen.add(next.id)
+    cur = next
+    first = false
+  }
+  return path.length > 1 ? path : null
+}
+
+function cutIcon(f: PonFault, oltName: string): L.DivIcon {
+  const hi = f.cut_high_m == null ? "" : `${(f.cut_high_m / 1000).toFixed(2)} km`
+  const lo = f.cut_low_m ? `${(f.cut_low_m / 1000).toFixed(2)} km – ` : "within "
+  const title = esc(`Suspected fiber cut — ${oltName} PON ${f.pon_port ?? "?"}: `
+    + `${f.dark} ONUs dark, ${lo}${hi} from the OLT (by ranging)`)
+  return cachedDivIcon(`<div class="wisp-cut" title="${title}">✕</div>`)
+}
+
 // ---- Site clustering --------------------------------------------------------
 // ISP gear piles up: one cabinet/rooftop holds an OLT, a switch, a backhaul
 // radio. Pins that would overlap on screen fold into one "site" badge — the
-// count is the member total, the worst member's status wins the border.
+// count is the member total, a conic ring shows the status composition.
 // Clicking it zooms in when the members are genuinely spread out (the cluster
-// splits on its own), or spider-fans them when they truly share a spot (a
-// rack). Screen-space and zoom-dependent by design: no schema, no assignment
-// workflow — placing devices at the same spot IS the rack assignment.
+// splits on its own), or opens the SITE CARD when they truly share a spot (a
+// rack) — members resolve in UI space, never on tiles. The old spider-fan
+// scattered pins onto real coordinates and read as geography (the same lie the
+// removed ONU spokes told); the map shows only true locations. Screen-space
+// and zoom-dependent by design: no schema, no assignment workflow — placing
+// devices at the same spot IS the rack assignment.
 
 const CLUSTER_PX = 44
 
 interface SiteCluster {
-  // sorted member ids — membership shifts with zoom, so an open fan folds on
-  // zoom change (intended, same as leaflet.markercluster)
+  // sorted member ids — membership shifts with zoom; the site card anchors on
+  // a member DEVICE id, not this key, so it survives the reshuffle
   key: string
   members: Placed[]
   center: [number, number]
@@ -153,16 +241,41 @@ function buildClusters(placed: Placed[], zoom: number): SiteCluster[] {
 }
 
 const CLUSTER_TONE_ORDER = ["destructive", "warning", "success", "muted"] as const
+const CLUSTER_TONE_COLOR: Record<(typeof CLUSTER_TONE_ORDER)[number], string> = {
+  destructive: "var(--destructive)", warning: "var(--warning)",
+  success: "var(--success)", muted: "var(--muted-foreground)",
+}
 
-function clusterIcon(members: Placed[], dim: boolean): L.DivIcon {
-  const tones = new Set(members.map(pinTone))
-  const tone = CLUSTER_TONE_ORDER.find((t) => tones.has(t)) ?? "muted"
-  const down = members.filter((m) => pinTone(m) === "destructive").length
+const toneRank = (d: OrgDevice) => CLUSTER_TONE_ORDER.indexOf(pinTone(d))
+
+// Count badge with a conic composition ring: arc lengths are member statuses,
+// so "5 devices, one down" reads without a click. Worst tones paint first
+// (from 12 o'clock), all-healthy degenerates to a plain success ring.
+function clusterIcon(members: Placed[], o: { dim: boolean; selected: boolean }): L.DivIcon {
+  const counts = new Map<string, number>()
+  for (const m of members) {
+    const t = pinTone(m)
+    counts.set(t, (counts.get(t) ?? 0) + 1)
+  }
+  let acc = 0
+  const stops: string[] = []
+  for (const t of CLUSTER_TONE_ORDER) {
+    const n = counts.get(t) ?? 0
+    if (n === 0) continue
+    const from = (acc / members.length) * 360
+    acc += n
+    stops.push(`${CLUSTER_TONE_COLOR[t]} ${from}deg ${(acc / members.length) * 360}deg`)
+  }
+  const down = counts.get("destructive") ?? 0
   const names = members.slice(0, 6).map((m) => m.name).join(", ")
   const title = esc(`${members.length} devices${down ? `, ${down} down` : ""} — ${names}${members.length > 6 ? ", …" : ""}`)
-  const cls = ["wisp-cluster", `wisp-cluster--${tone}`]
-  if (dim) cls.push("wisp-cluster--dim")
-  return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}">${members.length}</div>`)
+  const cls = ["wisp-cluster"]
+  if (down > 0) cls.push("wisp-cluster--down")
+  if (o.selected) cls.push("wisp-cluster--selected")
+  if (o.dim) cls.push("wisp-cluster--dim")
+  return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}" style="background:conic-gradient(${stops.join(",")})">
+      <span class="wisp-cluster__n">${members.length}</span>
+    </div>`)
 }
 
 function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
@@ -523,12 +636,18 @@ export function MapPage() {
   const [detailTab, setDetailTab] = useState<DeviceTab>("health")
   const [placingId, setPlacingId] = useState<number | null>(null)
   const [placeOpen, setPlaceOpen] = useState(false)
+  // drawing a cable path for one link: clicks append vertices, drags adjust
+  const [routeEdit, setRouteEdit] = useState<{
+    childId: number; parentId: number; points: Array<[number, number]>
+  } | null>(null)
   const [editPins, setEditPins] = useState(false)
   const [troubleOnly, setTroubleOnly] = useState(false)
   const [lowZoom, setLowZoom] = useState(false)
   // live zoom drives clustering; MapEvents reports it on mount and every zoomend
   const [zoom, setZoom] = useState(4)
-  const [openSite, setOpenSite] = useState<string | null>(null)
+  // site card anchor: a member DEVICE id, not a cluster key — zoom reshuffles
+  // membership and a key-anchored card would slam shut mid-zoom
+  const [siteAnchor, setSiteAnchor] = useState<number | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [coordsEdit, setCoordsEdit] = useState(false)
   const [coordsText, setCoordsText] = useState("")
@@ -564,6 +683,39 @@ export function MapPage() {
     // same self-heal fallback as the Network page: SSE can die silently
     refetchInterval: 30_000,
   })
+  // drawn cable paths, keyed "child:parent" — map-only geometry, own endpoint
+  const routesQ = useQuery({
+    queryKey: ["routes", scopeOrg],
+    queryFn: () => inventoryApi.routes(scopeOrg),
+    enabled: !!scopeOrg,
+    staleTime: 60_000,
+  })
+  const routeByKey = useMemo(() => {
+    const m = new Map<string, Array<[number, number]>>()
+    for (const r of routesQ.data?.routes ?? [])
+      if (r.waypoints.length > 0) m.set(`${r.child_id}:${r.parent_id}`, r.waypoints)
+    return m
+  }, [routesQ.data])
+
+  // PON mass-drop verdicts (fiber cut / power pattern) for the cut overlay
+  const faultsQ = useQuery({
+    queryKey: ["pon-faults-org", scopeOrg],
+    queryFn: () => inventoryApi.orgPonFaults(scopeOrg),
+    enabled: !!scopeOrg,
+    refetchInterval: 30_000,
+  })
+  // outage-wave shape (power vs upstream) — annotation only, never a mute
+  const incidentsQ = useQuery({
+    queryKey: ["incidents", scopeOrg],
+    queryFn: () => inventoryApi.incidentShape(scopeOrg),
+    enabled: !!scopeOrg,
+    refetchInterval: 30_000,
+  })
+  const powerIncidents = useMemo(
+    () => (incidentsQ.data?.incidents ?? []).filter(
+      (i) => i.kind === "power" && i.center != null && i.radius_km != null),
+    [incidentsQ.data])
+
   // Settings → Map area (orgs.map_region): the viewport lock for this org
   const orgsQ = useQuery({
     queryKey: ["orgs", scopeOrg],
@@ -586,42 +738,55 @@ export function MapPage() {
   const placing = placingId != null ? byId.get(placingId) ?? null : null
 
   // Overlapping pins fold into site clusters. pinPos is each device's DISPLAY
-  // position — raw when alone, the cluster centroid while folded, a screen-space
-  // spider fan while its cluster is open (selection opens the cluster too, so a
-  // search hit or trouble-cycle never lands on a hidden pin). Display-only —
-  // the stored location is untouched. Links and the PON fan read pinPos, so
+  // position — raw when alone, the cluster centroid while folded. Nothing ever
+  // renders at a fabricated coordinate: folded members are listed in the site
+  // card (UI space), not scattered over the tiles. Links read pinPos, so
   // lines follow the fold.
   const clusters = useMemo(() => buildClusters(placed, zoom), [placed, zoom])
-  const isOpenCluster = useCallback((c: SiteCluster) =>
-    c.members.length > 1 && (c.key === openSite || c.members.some((m) => m.id === selectedId)),
-    [openSite, selectedId])
   const pinPos = useMemo(() => {
     const pos = new Map<number, [number, number]>()
-    for (const c of clusters) {
-      if (c.members.length === 1) {
-        pos.set(c.members[0].id, [c.members[0].lat, c.members[0].lng])
-      } else if (!isOpenCluster(c)) {
-        for (const m of c.members) pos.set(m.id, c.center)
-      } else {
-        // fan radius in PIXELS (converted to meters at this zoom) so an opened
-        // rack is readable at any altitude — a fixed-meter fan vanishes below
-        // street zoom
-        const mpp = (156543.03392 * Math.cos((c.center[0] * Math.PI) / 180)) / 2 ** zoom
-        const rM = Math.min(38 + c.members.length * 7, 120) * mpp
-        const latM = 111_320
-        const lngM = latM * Math.cos((c.center[0] * Math.PI) / 180)
-        const sorted = [...c.members].sort((a, b) => a.id - b.id)
-        sorted.forEach((m, i) => {
-          const ang = -Math.PI / 2 + (2 * Math.PI * i) / sorted.length
-          pos.set(m.id, [
-            c.center[0] + (rM * Math.cos(ang)) / latM,
-            c.center[1] + (rM * Math.sin(ang)) / lngM,
-          ])
-        })
-      }
-    }
+    for (const c of clusters)
+      for (const m of c.members)
+        pos.set(m.id, c.members.length === 1 ? [m.lat, m.lng] : c.center)
     return pos
-  }, [clusters, isOpenCluster, zoom])
+  }, [clusters])
+  // the cluster the site card is showing; a 1-member resolution means the
+  // cluster split honestly at this zoom, so there's nothing to list
+  const siteCluster = useMemo(() => {
+    if (siteAnchor == null) return null
+    const c = clusters.find((x) => x.members.some((m) => m.id === siteAnchor))
+    return c && c.members.length > 1 ? c : null
+  }, [clusters, siteAnchor])
+
+  // Fiber-cut overlays: for each fiber-kind fault, walk the drawn PON path to
+  // the ranging interval and paint the suspect stretch + an ✕. No drawn path /
+  // unplaced OLT = no overlay (the Optical tab still carries the distance).
+  const cutSegments = useMemo(() => {
+    const out: Array<{
+      key: string; fault: PonFault; pts: Array<[number, number]>
+      mid: [number, number]; oltName: string
+    }> = []
+    for (const f of faultsQ.data?.faults ?? []) {
+      if (f.kind !== "fiber" || f.cut_high_m == null) continue
+      const olt = byId.get(f.device_id)
+      if (!olt || !isPlaced(olt)) continue
+      const path = ponPath(olt, f.pon_port, devices, routeByKey)
+      if (!path) continue
+      const totalM = polyKm(path) * 1000
+      // ranging is optical length ≥ geographic length — clamp into the geometry
+      // and keep the stretch visible even when the interval collapses
+      let d1 = Math.min(f.cut_high_m, totalM)
+      let d0 = Math.min(f.cut_low_m ?? 0, d1)
+      if (d1 - d0 < 40) d0 = Math.max(0, d1 - 40)
+      if (d1 <= 0) { d0 = Math.max(0, totalM - 60); d1 = totalM }
+      out.push({
+        key: `cut-${f.device_id}-${f.pon_port ?? "?"}`,
+        fault: f, pts: subPath(path, d0, d1),
+        mid: pointAlong(path, (d0 + d1) / 2), oltName: olt.name,
+      })
+    }
+    return out
+  }, [faultsQ.data, byId, devices, routeByKey])
 
   // Blast radius: everything downstream of the selected device (full device set,
   // not just placed — the count answers "how many customers am I about to page").
@@ -663,6 +828,17 @@ export function MapPage() {
     onError: (e) => toast.error(`Couldn't save the pin${e instanceof ApiError ? `: ${e.message}` : ""}`),
   })
 
+  const setRoute = useMutation({
+    mutationFn: ({ childId, parentId, waypoints }: {
+      childId: number; parentId: number; waypoints: Array<[number, number]>
+    }) => inventoryApi.setRoute(childId, parentId, waypoints),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      setRouteEdit(null)
+    },
+    onError: (e) => toast.error(`Couldn't save the route${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
   // Search: a placed device flies to its pin; an unplaced one goes straight into
   // placement mode (search Gachibowli → pick the device → click the map).
   const searchDevice = (d: OrgDevice) => {
@@ -671,6 +847,8 @@ export function MapPage() {
       map?.flyTo([d.lat, d.lng], Math.max(map.getZoom(), 15))
       setDetailTab("health")
       setSelectedId(d.id)
+      // folded behind a badge? the site card names it — nothing hides on the map
+      setSiteAnchor(d.id)
     } else if (canWrite) {
       setSelectedId(null)
       setPlaceOpen(false)
@@ -689,22 +867,42 @@ export function MapPage() {
   const initialView = useMemo(() => loadView(scopeOrg), [scopeOrg])
 
   useEffect(() => {
-    if (placingId == null) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setPlacingId(null) }
+    if (placingId == null && routeEdit == null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { setPlacingId(null); setRouteEdit(null) }
+    }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [placingId])
+  }, [placingId, routeEdit])
 
   const onMapClick = useCallback((ll: L.LatLng) => {
-    if (placingId != null) {
+    if (routeEdit != null) {
+      setRouteEdit((re) => re && { ...re, points: [...re.points, [ll.lat, ll.lng]] })
+    } else if (placingId != null) {
       setLocation.mutate({ id: placingId, lat: ll.lat, lng: ll.lng })
       setSelectedId(placingId)
       setPlacingId(null)
     } else {
       setSelectedId(null)
-      setOpenSite(null)
+      setSiteAnchor(null)
     }
-  }, [placingId, setLocation])
+  }, [placingId, routeEdit, setLocation])
+
+  // Drag-snap: existing near-stacks (pins dropped "close enough" by eye) are
+  // exactly what made the old fan misleading — dropping a pin within a badge
+  // radius of a neighbor now joins its site at the SAME coords.
+  const nearestOther = useCallback((id: number, lat: number, lng: number): Placed | null => {
+    const p = project(lat, lng, zoom)
+    let best: Placed | null = null
+    let bestPx = 24
+    for (const d of placed) {
+      if (d.id === id) continue
+      const q = project(d.lat, d.lng, zoom)
+      const px = Math.hypot(q[0] - p[0], q[1] - p[1])
+      if (px < bestPx) { best = d; bestPx = px }
+    }
+    return best
+  }, [placed, zoom])
 
   const fitAll = () => {
     if (placed.length === 0) return
@@ -741,6 +939,7 @@ export function MapPage() {
     mapRef.current?.flyTo([d.lat, d.lng], Math.max(mapRef.current.getZoom(), 14))
     setDetailTab("health")
     setSelectedId(d.id)
+    setSiteAnchor(d.id) // a folded trouble pin surfaces in the site card
   }
 
   const toggleFullscreen = () => {
@@ -756,16 +955,28 @@ export function MapPage() {
   const onZoom = useCallback((z: number) => { setZoom(z); setLowZoom(z < 12) }, [])
 
   // Click a folded site: members genuinely spread out → zoom to them and let
-  // the cluster split on its own; truly co-located (a rack) → spider-fan here.
+  // the cluster split on its own; truly co-located (a rack) → the site card.
+  // In placement mode a badge click means "this device lives here too": snap
+  // to the site's exact coords instead of pixel-hunting next to the badge.
   const onClusterClick = (c: SiteCluster) => {
-    if (placingId != null) return
+    if (routeEdit != null) return
+    if (placingId != null) {
+      const t = c.members.reduce((best, m) =>
+        distanceKm(m.lat, m.lng, c.center[0], c.center[1])
+          < distanceKm(best.lat, best.lng, c.center[0], c.center[1]) ? m : best)
+      setLocation.mutate({ id: placingId, lat: t.lat, lng: t.lng })
+      toast.success(`Placed at ${t.name} — same site`)
+      setSelectedId(placingId)
+      setPlacingId(null)
+      return
+    }
     const b = L.latLngBounds(c.members.map((m) => [m.lat, m.lng] as [number, number]))
     const spanM = distanceKm(b.getSouth(), b.getWest(), b.getNorth(), b.getEast()) * 1000
     if (spanM > 30 && zoom < 17) {
       mapRef.current?.flyToBounds(b, { padding: [64, 64], maxZoom: 18 })
     } else {
-      setOpenSite((k) => (k === c.key ? null : c.key))
-      mapRef.current?.panTo(c.center) // a fan opening at the viewport edge clips
+      setPlaceOpen(false) // the site card takes the same corner as the drawer
+      setSiteAnchor((a) => (c.members.some((m) => m.id === a) ? null : c.members[0].id))
     }
   }
 
@@ -782,21 +993,26 @@ export function MapPage() {
   // Only links where both ends are pinned; a line inherits the child's trouble
   // so a red pin drags a red path back toward its feed.
   const links = useMemo(() => {
-    const out: Array<{ key: string; from: Placed; to: Placed; tone: string; backup: boolean }> = []
+    const out: Array<{
+      key: string; from: Placed; to: Placed; tone: string; backup: boolean
+      route?: Array<[number, number]>
+    }> = []
     const placedById = new Map(placed.map((d) => [d.id, d]))
     for (const d of placed) {
       const tone = pinTone(d)
       if (d.parent_device_id != null) {
         const p = placedById.get(d.parent_device_id)
-        if (p) out.push({ key: `p${d.id}`, from: p, to: d, tone, backup: false })
+        if (p) out.push({ key: `p${d.id}`, from: p, to: d, tone, backup: false,
+          route: routeByKey.get(`${d.id}:${p.id}`) })
       }
       for (const bp of d.backup_parents) {
         const p = placedById.get(bp)
-        if (p) out.push({ key: `b${d.id}-${bp}`, from: p, to: d, tone, backup: true })
+        if (p) out.push({ key: `b${d.id}-${bp}`, from: p, to: d, tone, backup: true,
+          route: routeByKey.get(`${d.id}:${bp}`) })
       }
     }
     return out
-  }, [placed])
+  }, [placed, routeByKey])
 
   if (!scopeOrg) return <NeedsOrg />
 
@@ -810,6 +1026,18 @@ export function MapPage() {
   const parent = selected?.parent_device_id != null ? byId.get(selected.parent_device_id) : null
   const linkKm = selected && isPlaced(selected) && parent && isPlaced(parent)
     ? distanceKm(selected.lat, selected.lng, parent.lat, parent.lng) : null
+  const selRoute = selected && parent ? routeByKey.get(`${selected.id}:${parent.id}`) : undefined
+  const routeKm = selRoute && selected && isPlaced(selected) && parent && isPlaced(parent)
+    ? polyKm([[parent.lat, parent.lng], ...selRoute, [selected.lat, selected.lng]]) : null
+
+  const startRouteEdit = () => {
+    if (!selected || !isPlaced(selected) || !parent || !isPlaced(parent)) return
+    setPlacingId(null)
+    setPlaceOpen(false)
+    setRouteEdit({ childId: selected.id, parentId: parent.id, points: selRoute ?? [] })
+  }
+  const editingChild = routeEdit ? byId.get(routeEdit.childId) : null
+  const editingParent = routeEdit ? byId.get(routeEdit.parentId) : null
 
   return (
     // header is h-14 (3.5rem); the mobile tab bar overlays the bottom ~4rem
@@ -842,20 +1070,26 @@ export function MapPage() {
         <ViewController placed={placed} ready={!isLoading && orgsQ.isSuccess}
           hasSavedView={!!initialView} bounds={region.bounds} />
         {links.map((l) => {
+          // the link being redrawn renders as the edit preview instead
+          if (routeEdit && l.to.id === routeEdit.childId && l.from.id === routeEdit.parentId)
+            return null
           // a selected device lights up its whole downstream path
           const emphasized = selectedId != null
             && (l.to.id === selectedId || downstream.has(l.to.id))
           const dimmed = troubleOnly && l.tone !== "destructive" && l.tone !== "warning" && !emphasized
+          const from = pinPos.get(l.from.id) ?? [l.from.lat, l.from.lng] as [number, number]
+          const to = pinPos.get(l.to.id) ?? [l.to.lat, l.to.lng] as [number, number]
+          // drawn route only when both ends display at their TRUE positions — a
+          // cable path snaking into a cluster centroid reads as an error
+          const atTrue = from[0] === l.from.lat && from[1] === l.from.lng
+            && to[0] === l.to.lat && to[1] === l.to.lng
           return (
             <Polyline
               key={l.key}
               // never a click target — a line crossing the viewport would otherwise
               // swallow map clicks during placement
               interactive={false}
-              positions={[
-                pinPos.get(l.from.id) ?? [l.from.lat, l.from.lng],
-                pinPos.get(l.to.id) ?? [l.to.lat, l.to.lng],
-              ]}
+              positions={l.route && atTrue ? [from, ...l.route, to] : [from, to]}
               pathOptions={{
                 color: emphasized && l.tone === "muted" ? "var(--primary)" : lineColor(l.tone),
                 weight: emphasized ? 3 : l.tone === "destructive" ? 2.5 : 2,
@@ -865,59 +1099,137 @@ export function MapPage() {
             />
           )
         })}
+        {/* power-outage hull: several independent feeds dark inside one small
+            circle — shade the area so the eye reads "feeder", not "fiber" */}
+        {powerIncidents.map((inc, i) => (
+          <Circle
+            key={`pw-${i}-${inc.since ?? ""}`}
+            center={inc.center as [number, number]}
+            radius={Math.max((inc.radius_km ?? 0) * 1000 * 1.15, 400)}
+            interactive={false}
+            pathOptions={{
+              color: "var(--warning)", weight: 1.5, opacity: 0.6,
+              fillColor: "var(--warning)", fillOpacity: 0.07, dashArray: "6 6",
+            }}
+          />
+        ))}
+        {/* suspected-cut stretch: louder than any link (thick, dashed), and the
+            ✕ is clickable — it opens the OLT's Optical tab with the verdict */}
+        {cutSegments.map((s) => (
+          <Fragment key={s.key}>
+            <Polyline
+              interactive={false}
+              positions={s.pts}
+              pathOptions={{ color: "var(--destructive)", weight: 5, opacity: 0.85, dashArray: "6 5" }}
+            />
+            <Marker
+              position={s.mid}
+              icon={cutIcon(s.fault, s.oltName)}
+              zIndexOffset={900}
+              eventHandlers={{
+                click: () => {
+                  if (placingId != null || routeEdit != null) return
+                  setDetailTab("optical")
+                  setSelectedId(s.fault.device_id)
+                },
+              }}
+            />
+          </Fragment>
+        ))}
+        {routeEdit && (() => {
+          const child = byId.get(routeEdit.childId)
+          const par = byId.get(routeEdit.parentId)
+          if (!child || !par || !isPlaced(child) || !isPlaced(par)) return null
+          return (
+            <>
+              <Polyline
+                interactive={false}
+                positions={[[par.lat, par.lng], ...routeEdit.points, [child.lat, child.lng]]}
+                pathOptions={{ color: "var(--primary)", weight: 2.5, opacity: 0.9, dashArray: "6 6" }}
+              />
+              {routeEdit.points.map((pt, i) => (
+                <Marker
+                  key={`v-${i}`}
+                  position={pt}
+                  draggable
+                  icon={vertexIcon()}
+                  zIndexOffset={1200}
+                  eventHandlers={{
+                    dragend: (e) => {
+                      const ll = (e.target as L.Marker).getLatLng()
+                      setRouteEdit((re) => re && {
+                        ...re,
+                        points: re.points.map((p, j) => (j === i ? [ll.lat, ll.lng] as [number, number] : p)),
+                      })
+                    },
+                    dblclick: () => setRouteEdit((re) => re && {
+                      ...re, points: re.points.filter((_, j) => j !== i),
+                    }),
+                  }}
+                />
+              ))}
+            </>
+          )
+        })()}
         {clusters.map((c) => {
-          const open = isOpenCluster(c)
-          if (c.members.length > 1 && !open) {
+          if (c.members.length > 1) {
             const anyDown = c.members.some((m) => pinTone(m) === "destructive")
+            // a folded selection highlights the badge — the pin itself never
+            // pops out to a fake coordinate
+            const sel = c.members.some((m) => m.id === selectedId)
             return (
               <Marker
                 key={c.key}
                 position={c.center}
-                icon={clusterIcon(c.members, troubleOnly && !c.members.some(isTrouble))}
-                // clusters swallow map clicks too, so placement mode ignores them
+                icon={clusterIcon(c.members, {
+                  dim: troubleOnly && !c.members.some(isTrouble), selected: sel,
+                })}
                 eventHandlers={{ click: () => onClusterClick(c) }}
-                zIndexOffset={anyDown ? 500 : 100}
+                zIndexOffset={sel ? 1000 : anyDown ? 500 : 100}
               />
             )
           }
+          const d = c.members[0]
+          const dim = troubleOnly && !isTrouble(d) && d.id !== selectedId
+          const impact = downstream.has(d.id)
           return (
-            <Fragment key={c.key}>
-              {/* spider legs tie the fanned pins back to where they really are */}
-              {open && c.members.map((m) => (
-                <Polyline
-                  key={`leg-${m.id}`}
-                  interactive={false}
-                  positions={[c.center, pinPos.get(m.id) ?? [m.lat, m.lng]]}
-                  pathOptions={{ color: "var(--muted-foreground)", weight: 1, opacity: 0.5, dashArray: "2 4" }}
-                />
-              ))}
-              {c.members.map((d) => {
-                const dim = troubleOnly && !isTrouble(d) && d.id !== selectedId
-                const impact = downstream.has(d.id)
-                return (
-                  <Marker
-                    key={d.id}
-                    position={pinPos.get(d.id) ?? [d.lat, d.lng]}
-                    icon={pinIcon(d, { selected: d.id === selectedId, dim, impact })}
-                    draggable={editPins && canWrite}
-                    // markers swallow map clicks, so placement mode ignores pin taps
-                    eventHandlers={{
-                      click: () => {
-                        if (placingId != null) return
-                        setDetailTab("health")
-                        setSelectedId(d.id === selectedId ? null : d.id)
-                      },
-                      dragend: (e) => {
-                        const ll = (e.target as L.Marker).getLatLng()
-                        setLocation.mutate({ id: d.id, lat: ll.lat, lng: ll.lng })
-                      },
-                    }}
-                    zIndexOffset={d.id === selectedId ? 1000
-                      : pinTone(d) === "destructive" ? 500 : impact ? 300 : 0}
-                  />
-                )
-              })}
-            </Fragment>
+            <Marker
+              key={d.id}
+              position={[d.lat, d.lng]}
+              icon={pinIcon(d, { selected: d.id === selectedId, dim, impact })}
+              draggable={editPins && canWrite}
+              eventHandlers={{
+                click: () => {
+                  if (routeEdit != null) return
+                  // placement mode: a tap on an existing pin means "same spot"
+                  // — start the rack deliberately instead of eyeballing it
+                  if (placingId != null) {
+                    if (placingId !== d.id) {
+                      setLocation.mutate({ id: placingId, lat: d.lat, lng: d.lng })
+                      toast.success(`Placed at ${d.name} — same site`)
+                      setSelectedId(placingId)
+                    }
+                    setPlacingId(null)
+                    return
+                  }
+                  setDetailTab("health")
+                  setSelectedId(d.id === selectedId ? null : d.id)
+                },
+                dragend: (e) => {
+                  const ll = (e.target as L.Marker).getLatLng()
+                  // dropping within a badge radius of a neighbor joins its site
+                  const near = nearestOther(d.id, ll.lat, ll.lng)
+                  if (near) toast.success(`Snapped to ${near.name} — same site`)
+                  setLocation.mutate({
+                    id: d.id,
+                    lat: near ? near.lat : ll.lat,
+                    lng: near ? near.lng : ll.lng,
+                  })
+                },
+              }}
+              zIndexOffset={d.id === selectedId ? 1000
+                : pinTone(d) === "destructive" ? 500 : impact ? 300 : 0}
+            />
           )
         })}
         {/* "you are here" from the locate button — never a click target, so it
@@ -983,12 +1295,35 @@ export function MapPage() {
         {canWrite && unplaced.length > 0 && (
           <Button variant="outline" size="sm"
             className="pointer-events-auto h-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
-            onClick={() => { setPlaceOpen(!placeOpen); setPlacingId(null) }}>
+            onClick={() => { setPlaceOpen(!placeOpen); setPlacingId(null); setSiteAnchor(null) }}>
             <MapPin className="size-3.5" /> Place devices
             <span className="rounded bg-muted px-1.5 py-px font-mono text-2xs">{unplaced.length}</span>
           </Button>
         )}
       </div>
+
+      {/* power-pattern banner: the verdict a veteran reads off the wall — many
+          feeds, one small circle. Explains the red, never silences it. ------- */}
+      {powerIncidents.length > 0 && (
+        <button
+          className="absolute top-3 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-warning/50 bg-popover/95 dark:bg-popover/95 px-3.5 py-1.5 text-xs backdrop-blur hover:brightness-110"
+          title="Zoom to the affected area"
+          onClick={() => {
+            const inc = powerIncidents[0]
+            if (!inc.center) return
+            mapRef.current?.flyToBounds(
+              L.latLng(inc.center[0], inc.center[1])
+                .toBounds(Math.max((inc.radius_km ?? 0) * 2600, 1200)),
+              { padding: [48, 48] })
+          }}>
+          <span className="font-semibold text-warning">⚡ Power-outage pattern</span>
+          <span className="text-muted-foreground">
+            {powerIncidents[0].count} devices · {powerIncidents[0].branches} independent feeds
+            · {(powerIncidents[0].radius_km ?? 0).toFixed(1)} km area
+            {powerIncidents[0].since && <> · {durationSince(powerIncidents[0].since)}</>}
+          </span>
+        </button>
+      )}
 
       {/* placement banner ------------------------------------------------------ */}
       {placing && (
@@ -1002,31 +1337,79 @@ export function MapPage() {
         </div>
       )}
 
+      {/* route-drawing banner ---------------------------------------------------- */}
+      {routeEdit && editingChild && editingParent && (
+        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+          <Spline className="size-3.5 text-primary" />
+          <span>
+            Click along the cable path <span className="font-mono font-semibold">{editingParent.name}</span>
+            {" → "}<span className="font-mono font-semibold">{editingChild.name}</span>
+            <span className="text-muted-foreground"> · drag to adjust, double-click removes
+              · {routeEdit.points.length} pt{routeEdit.points.length === 1 ? "" : "s"}</span>
+          </span>
+          <Button size="sm" className="h-6 px-2 text-2xs"
+            disabled={setRoute.isPending}
+            onClick={() => setRoute.mutate({
+              childId: routeEdit.childId, parentId: routeEdit.parentId, waypoints: routeEdit.points,
+            })}>
+            <Check className="size-3" /> Save
+          </Button>
+          <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
+            onClick={() => setRouteEdit(null)}>
+            <X className="size-3" />
+          </Button>
+        </div>
+      )}
+
       {/* controls — slide left of the device panel so they stay clickable ------- */}
       <div className={cn("absolute top-3 right-3 z-[1000] flex flex-col gap-1.5",
         selected && "md:right-[calc(380px+1.5rem)]")}>
-        {/* no key = no choices to offer; the fallback map is not a style */}
-        {googleKey != null && (
-          <div className="relative">
-            <Button variant={layersOpen ? "default" : "outline"} size="icon"
-              className={cn("size-8 backdrop-blur", !layersOpen && "bg-popover/95 dark:bg-popover/95")}
-              title="Map style" onClick={() => setLayersOpen(!layersOpen)}>
-              <Layers className="size-3.5" />
-            </Button>
-            {layersOpen && (
-              <div className="absolute top-0 right-9 w-36 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 p-1 backdrop-blur">
-                {(Object.keys(BASEMAP_LABEL) as Basemap[]).map((b) => (
-                  <button key={b}
-                    className={cn("flex w-full items-center rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5",
-                      basemap === b && "bg-accent font-medium")}
-                    onClick={() => pickBasemap(b)}>
-                    {BASEMAP_LABEL[b]}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        {/* style choices only with a key (the fallback map is not a style);
+            the legend rides here too, so the button now renders for everyone */}
+        <div className="relative">
+          <Button variant={layersOpen ? "default" : "outline"} size="icon"
+            className={cn("size-8 backdrop-blur", !layersOpen && "bg-popover/95 dark:bg-popover/95")}
+            title="Map style & legend" onClick={() => setLayersOpen(!layersOpen)}>
+            <Layers className="size-3.5" />
+          </Button>
+          {layersOpen && (
+            <div className="absolute top-0 right-9 w-44 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 p-1 backdrop-blur">
+              {googleKey != null && (
+                <>
+                  {(Object.keys(BASEMAP_LABEL) as Basemap[]).map((b) => (
+                    <button key={b}
+                      className={cn("flex w-full items-center rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5",
+                        basemap === b && "bg-accent font-medium")}
+                      onClick={() => pickBasemap(b)}>
+                      {BASEMAP_LABEL[b]}
+                    </button>
+                  ))}
+                  <div className="my-1 border-t" />
+                </>
+              )}
+              <p className="px-2 pt-1 pb-0.5 text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
+                Pin shapes
+              </p>
+              {([
+                [<span key="s" className="size-3 rounded-full border-2 border-muted-foreground" />, "Core / Gateway"],
+                [<span key="s" className="size-3 rounded-[2px] bg-muted-foreground" />, "OLT"],
+                [<span key="s" className="size-3 rounded-[4px] bg-muted-foreground" />, "Switch"],
+                [<span key="s" className="size-3 rotate-45 rounded-[2px] bg-muted-foreground" />, "Backhaul"],
+                [<span key="s" className="size-3 rounded-full bg-muted-foreground" />, "Router / AP"],
+                [<span key="s" className="size-2 rounded-full bg-muted-foreground" />, "CPE"],
+                [<span key="s" className="size-2 rotate-45 rounded-[1px] bg-muted-foreground/60" />, "Splitter / FDB (passive)"],
+                [<span key="s" className="flex size-3.5 items-center justify-center rounded-full border border-warning">
+                  <span className="size-2 rounded-full bg-muted-foreground" />
+                </span>, "Weak ONUs (ring)"],
+              ] as Array<[ReactNode, string]>).map(([swatch, label]) => (
+                <div key={label} className="flex items-center gap-2 px-2 py-1 text-xs">
+                  <span className="flex w-4 shrink-0 items-center justify-center">{swatch}</span>
+                  <span className="text-muted-foreground">{label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
         <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title="Fit all pins" onClick={fitAll} disabled={placed.length === 0}>
           <Maximize2 className="size-3.5" />
@@ -1081,6 +1464,73 @@ export function MapPage() {
           </div>
         </Card>
       )}
+
+      {/* site card: the members of a folded badge, resolved in UI space — the
+          map keeps ONE honest pin, this list answers "what's in that cabinet".
+          Row click drives the same device panel a pin click does. ------------ */}
+      {siteCluster && (() => {
+        const members = [...siteCluster.members].sort((a, b) =>
+          toneRank(a) - toneRank(b) || a.name.localeCompare(b.name))
+        const siteDown = members.filter((m) => pinTone(m) === "destructive").length
+        return (
+          <Card className="absolute top-14 left-3 z-[1000] flex max-h-[60%] w-72 flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 dark:bg-popover/95 py-0 backdrop-blur">
+            <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold">{members.length} devices at this site</p>
+                <p className="font-mono text-2xs text-muted-foreground">
+                  {siteCluster.center[0].toFixed(5)}, {siteCluster.center[1].toFixed(5)}
+                  {siteDown > 0 && (
+                    <span className="font-sans font-semibold text-destructive"> · {siteDown} down</span>
+                  )}
+                </p>
+              </div>
+              <Button variant="ghost" size="icon" className="size-6 shrink-0"
+                onClick={() => setSiteAnchor(null)}>
+                <X className="size-3.5" />
+              </Button>
+            </div>
+            <div className="overflow-y-auto">
+              {members.map((m) => (
+                <div key={m.id} role="button" tabIndex={0}
+                  className={cn(
+                    "flex h-9 w-full cursor-pointer items-center gap-2 border-b px-3 text-left last:border-b-0",
+                    m.id === selectedId ? "bg-accent" : "hover:bg-foreground/5",
+                  )}
+                  onClick={() => { setDetailTab("health"); setSelectedId(m.id) }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") { setDetailTab("health"); setSelectedId(m.id) }
+                  }}>
+                  <StatusDot tone={pinTone(m)} />
+                  <span className="min-w-0 truncate font-mono text-xs font-medium">{m.name}</span>
+                  {m.device_type && <span className="shrink-0 text-2xs text-muted-foreground">{m.device_type}</span>}
+                  <span className="ml-auto flex shrink-0 items-center gap-1">
+                    {isDownState(m) && m.outage_started_at ? (
+                      <span className="text-2xs font-semibold text-destructive">
+                        down {durationSince(m.outage_started_at).split(" ")[0]}
+                      </span>
+                    ) : m.maintenance ? (
+                      <RowTag tone="muted">maint</RowTag>
+                    ) : null}
+                    {canWrite && editPins && (
+                      <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
+                        title={`Move ${m.name} — click its new spot on the map`}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setSiteAnchor(null)
+                          setSelectedId(null)
+                          setPlaceOpen(false)
+                          setPlacingId(m.id)
+                        }}>
+                        <Crosshair className="size-3" />
+                      </Button>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )
+      })()}
 
       {/* device panel ---------------------------------------------------------- */}
       {selected && (
@@ -1160,9 +1610,19 @@ export function MapPage() {
                 <span className="font-mono text-muted-foreground">
                   {isPlaced(selected) ? `${selected.lat.toFixed(5)}, ${selected.lng.toFixed(5)}` : "not on the map"}
                 </span>
+                {routeKm != null && parent && (
+                  <span className="text-muted-foreground"
+                    title={`Along the drawn cable route to ${parent.name}`}>
+                    <span className="font-semibold text-foreground">{fmtKm(routeKm)}</span> cable
+                    to <span className="font-mono">{parent.name}</span>
+                  </span>
+                )}
                 {linkKm != null && parent && (
-                  <span className="text-muted-foreground" title={`Link distance to ${parent.name}`}>
-                    {fmtKm(linkKm)} to <span className="font-mono">{parent.name}</span>
+                  // labeled honestly: this is the chord, not cable length — a
+                  // splicing crew quoting drum meters off it comes up short
+                  <span className="text-muted-foreground"
+                    title={`Straight-line distance to ${parent.name} — not cable length`}>
+                    {fmtKm(linkKm)} straight-line{routeKm == null && parent ? <> to <span className="font-mono">{parent.name}</span></> : null}
                   </span>
                 )}
                 <span className="ml-auto flex items-center gap-0.5">
@@ -1184,6 +1644,14 @@ export function MapPage() {
                         </a>
                       </Button>
                     </>
+                  )}
+                  {canWrite && isPlaced(selected) && parent && isPlaced(parent) && (
+                    <Button variant="ghost" size="icon" className="size-7 text-muted-foreground"
+                      title={selRoute ? `Edit the cable route to ${parent.name}`
+                        : `Draw the cable route to ${parent.name}`}
+                      onClick={startRouteEdit}>
+                      <Spline className="size-3.5" />
+                    </Button>
                   )}
                   {canWrite && (
                     <Button variant="ghost" size="icon" className="size-7 text-muted-foreground"

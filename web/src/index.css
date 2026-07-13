@@ -375,36 +375,124 @@ html:not(.dark) .wisp-drillin {
   border-color: var(--destructive);
 }
 
+/* Suspected fiber-cut marker: an ✕ on the painted stretch of route. Pulses
+   like a down pin — it IS the emergency the map exists for. */
+.wisp-cut {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: var(--destructive);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  border: 2px solid var(--background);
+  cursor: pointer;
+  animation: wisp-pin-pulse 1.6s ease-out infinite;
+}
+
+/* Route-drawing vertex handles (map route editor): draggable, deliberately
+   small — the dashed preview line is the subject, not the handles. */
+.wisp-vertex {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 11px;
+  height: 11px;
+  border-radius: 9999px;
+  background: var(--popover);
+  border: 2px solid var(--primary);
+  box-shadow: 0 0 0 1px var(--border-strong);
+  cursor: grab;
+}
+
+/* Role shapes (routes/map-page.tsx pinIcon): device_type picks the dot's
+   SILHOUETTE — fill stays health, the ::after ring stays optics. Shapes are
+   border-radius/rotation/::before only: clip-path would clip the selection
+   box-shadow and the down-pulse, so it's off the table. Diamond rotation is
+   safe — the optic ring is a circle and circles don't rotate visibly. */
+.wisp-pin--t-olt .wisp-pin__dot { border-radius: 2.5px; }
+.wisp-pin--t-switch .wisp-pin__dot { border-radius: 5px; }
+.wisp-pin--t-backhaul .wisp-pin__dot {
+  border-radius: 2.5px;
+  transform: rotate(45deg);
+}
+/* core/gateway: donut — a ::before hole survives the box-shadow overrides
+   from selection and the down-pulse (an inset shadow wouldn't) */
+.wisp-pin--t-core .wisp-pin__dot::before,
+.wisp-pin--t-gateway .wisp-pin__dot::before {
+  content: "";
+  position: absolute;
+  inset: 2.5px;
+  border-radius: 9999px;
+  background: var(--background);
+  pointer-events: none;
+}
+.wisp-pin--t-cpe .wisp-pin__dot {
+  width: 10px;
+  height: 10px;
+}
+/* Passive plant: deliberately subordinate — small, always-muted (no FSM), the
+   silhouette still tells splitter from FDB from closure at a glance. */
+.wisp-pin--t-splitter .wisp-pin__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  transform: rotate(45deg);
+}
+.wisp-pin--t-fdb .wisp-pin__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.wisp-pin--t-closure .wisp-pin__dot {
+  width: 9px;
+  height: 9px;
+}
+
 /* Site clusters (routes/map-page.tsx buildClusters): overlapping pins fold
-   into one badge — the number is the member count, the worst member's status
-   owns the border. Click zooms in or spider-fans a true rack. */
+   into one badge — the number is the member count, the element's background
+   is an inline conic-gradient whose arcs are the members' statuses (the
+   composition ring). The inner disc covers all but a 3.5px rim. Click zooms
+   in or opens the site card; members are never scattered onto the tiles. */
 .wisp-cluster {
   position: absolute;
   transform: translate(-50%, -50%);
-  min-width: 28px;
-  height: 28px;
-  padding: 0 8px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9999px;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+.wisp-cluster__n {
+  position: absolute;
+  inset: 3.5px;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 9999px;
   background: var(--popover);
-  border: 2px solid var(--muted-foreground);
   color: var(--foreground);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.8125rem;
   font-weight: 600;
-  cursor: pointer;
 }
-.wisp-cluster--success { border-color: var(--success); }
-.wisp-cluster--warning { border-color: var(--warning); }
-.wisp-cluster--destructive {
-  border-color: var(--destructive);
+.wisp-cluster--down {
   animation: wisp-cluster-pulse 1.6s ease-out infinite;
+}
+/* selection turns the pulse off — the ring must read unambiguously */
+.wisp-cluster--selected {
+  animation: none;
+  box-shadow: 0 0 0 1px var(--border-strong),
+    0 0 0 4px color-mix(in srgb, var(--ring) 55%, transparent);
 }
 .wisp-cluster--dim { opacity: 0.28; }
 @keyframes wisp-cluster-pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
-  70% { box-shadow: 0 0 0 12px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
+  0% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
+  70% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 12px transparent; }
+  100% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 transparent; }
 }
