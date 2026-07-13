@@ -445,6 +445,11 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - Timestamps: poll/outage are ISO8601 `+00:00`; SQLite `datetime('now')` is
   space-separated naive. `core/analytics._parse` normalizes both — reuse it.
 - Schema: `central/store.py`'s `_SCHEMA` + `_ensure_columns` is the only schema.
+- **`CentralStore` is split into domain mixins** (`store_orgs/users/fleet/devices/
+  outages/snmp.py`, helpers in `store_util.py`) composed in `store.py`, which keeps
+  `_SCHEMA`, `__init__`, `_connect`/`_scope` and the class attrs. New store methods
+  go in the matching mixin file; import `CentralStore` (and `SNMP_WALKS_KEEP` etc.)
+  from `wisp.central.store` as before — the mixin modules are not a public API.
 
 ## Removed — don't go looking for these
 
