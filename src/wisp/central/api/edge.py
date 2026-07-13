@@ -15,6 +15,7 @@ from wisp.central import rollup as central_rollup
 from wisp.central.api.common import now_iso
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.optics import CentralOpticsMonitor
+from wisp.central.onualert import OnuRosterAlerter
 from wisp.central.ponalert import PonFaultAlerter
 from wisp.central.ports import CentralPortMonitor
 from wisp.ingress.probers import PingResult
@@ -167,6 +168,12 @@ def _ingest_optics(h, org: str, eng, optics_by_device, ts: str) -> None:
         PonFaultAlerter(h.store, org, h.notifier, h.cfg).sweep(ts)
     except Exception:
         log.exception("PON fault sweep failed for %s", org)
+    # roster hygiene (per-PON ONU cap + redundant MAC) rides the same fold, in
+    # its own try/except so a bad roster never sinks the report cycle
+    try:
+        OnuRosterAlerter(h.store, org, h.notifier, h.cfg).sweep(ts)
+    except Exception:
+        log.exception("ONU roster sweep failed for %s", org)
 
 
 def _ingest_health(h, org: str, eng, health_by_device, ts: str) -> None:

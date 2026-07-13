@@ -116,12 +116,16 @@ DBC = GponProfile(
     # every EPON port, online or not. Enumerate from it (not the sparse .28 optical
     # cache, which on this OLT held ~16 mostly-one-PON readings) so all PON ports
     # show up, then join Rx by MAC. col6=MAC, col2=PON, col3=ONU-id, col5=state
-    # (1=online/0=offline), col13=distance(m).
+    # (1=online/0=offline), col10=Description (the web-UI ONU name; 'NULL' when
+    # unset — filtered by _clean_name), col13=distance(m). col10 OID validated by
+    # warm-capture 2026-07-13: user set EPON0/2:1 to "HCS_RAMPRASAD", walk 80 showed
+    # it at ...12.1.12.1.10.29 alongside that ONU's MAC at ...12.1.12.1.6.29.
     oid_ident_key="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.6",
     oid_ident_pon="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.2",
     oid_ident_onu="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.3",
     oid_ident_state="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.5",
     oid_ident_distance="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.13",
+    oid_ident_name="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.10",
     format_pon_label=lambda pon: f"EPON0/{pon}",
     match_sysobjectid="1.3.6.1.4.1.37950",
 )
@@ -196,13 +200,21 @@ def _place(oid: str, val: str, cols: dict[str, str], out: dict[str, dict]) -> bo
             return True
     return False
 
+def _clean_name(raw) -> str | None:
+    # A vendor reports an unset ONU description with a sentinel, not a blank:
+    # C-Data's reg table col10 is the literal string 'NULL' (the web UI shows it
+    # as 'N/A'). Treat those as no-name so an un-described ONU renders "unnamed",
+    # never the word NULL.
+    s = (raw or "").strip()
+    return None if s.upper() in ("", "NULL", "N/A", "NONE") else s
+
 def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
     serial = (cells.get("serial") or "").strip() or None
     return OnuOptic(
         onu_key=serial or idx,
         pon_port=profile.format_pon(idx),
         onu_id=_derive_onu_id(idx),
-        name=(cells.get("name") or "").strip() or None,
+        name=_clean_name(cells.get("name")),
         serial=serial,
         state=profile.decode_state(cells.get("state", "")),
         rx_dbm=_to_float(cells.get("rx"), profile.rx_scale),
@@ -276,7 +288,7 @@ def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> li
                      else (mac_raw.upper() or str(pon or onu_id or "?"))),
             pon_port=pon_port,
             onu_id=onu_id,
-            name=(cells.get("name") or "").strip() or None,
+            name=_clean_name(cells.get("name")),
             serial=(mac_raw.upper() or None),
             state=profile.decode_state(cells.get("state", "")),
             rx_dbm=_to_float(ocells.get("rx"), profile.rx_scale),
@@ -294,7 +306,11 @@ class PysnmpGponPoller:
 
     def __init__(self, profile: GponProfile, cfg: Config = CONFIG) -> None:
         self.profile = profile
-        self._timeout = cfg.snmp_timeout_s
+        # A slow EPON agent needs more per-request slack than the fast health/port
+        # walks — a single dropped GETBULK on the big roster table otherwise fails
+        # the whole walk. Falls back to the global snmp timeout if unset.
+        self._timeout = cfg.gpon_request_timeout_s or cfg.snmp_timeout_s
+        self._retries = max(0, cfg.gpon_request_retries)
         self._engine = None
 
     async def walk(self, target: SnmpTarget) -> list[OnuOptic]:
@@ -317,7 +333,7 @@ class PysnmpGponPoller:
         engine = self._engine
         community = CommunityData(target.community, mpModel=1)
         transport = await UdpTransportTarget.create(
-            (target.ip, target.port), timeout=self._timeout, retries=1)
+            (target.ip, target.port), timeout=self._timeout, retries=self._retries)
         varbinds: list[tuple[str, str]] = []
         try:
             for column in columns:

@@ -227,12 +227,26 @@ def _clean_dbm(data: dict, key: str) -> float | None:
         raise InventoryError(f"{key} must be negative (dBm, e.g. -27)")
     return value
 
+def _clean_onu_limit(data: dict, key: str) -> int | None:
+    raw = data.get(key)
+    if raw in (None, "", "null"):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise InventoryError(f"{key} must be a whole number")
+    if value < 1:
+        raise InventoryError(f"{key} must be at least 1")
+    return value
+
 def clean_optical_thresholds(data: dict) -> dict:
     warn = _clean_dbm(data, "warn_dbm")
     crit = _clean_dbm(data, "crit_dbm")
     if warn is not None and crit is not None and crit > warn:
         raise InventoryError("crit_dbm must be lower (weaker) than warn_dbm")
-    return {"warn_dbm": warn, "crit_dbm": crit}
+    # per-OLT ONU-per-PON cap override (NULL = the global cfg.onu_pon_limit)
+    return {"warn_dbm": warn, "crit_dbm": crit,
+            "onu_pon_limit": _clean_onu_limit(data, "onu_pon_limit")}
 
 def clean_ack_until(data: dict) -> str | None:
     from datetime import datetime, timedelta, timezone

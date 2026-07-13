@@ -146,6 +146,20 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   the C-Data/DBC EPON fleet reports only online/offline — never dying_gasp/LOS —
   so the POWER verdict can't fire there and area power cuts page as "fiber"
   (multi-PON/multi-OLT simultaneous drops are the tell).
+- **ONU-roster hygiene** (`central/onuroster.py` pure math, `central/onualert.py`
+  paging shell): two checks on the ONU roster, both operator-paged transition-only
+  and riding the same optics fold as ponalert. **Per-PON ONU cap** — EPON tops out
+  at 1:64, so a PON at its limit pages "at capacity" (`cfg.onu_pon_limit` default
+  64, per-OLT `org_devices.onu_pon_limit` override so a 1:128 GPON box doesn't
+  false-page; gated `cfg.onu_limit_alerts`, `pon_capacity_state`). **Redundant MAC**
+  — a serial/MAC on ≥2 ONU slots (org-wide) pages "duplicate ONU MAC" (clone/loop/
+  double-registration; gated `cfg.onu_dup_mac_alerts`, `onu_dup_mac_state`). Both
+  read only `onuroster.current_roster` — per OLT, the rows from the FRESHEST walk
+  (identical `updated_at`) and skip an OLT staler than 900s — because `onu_optics`
+  NEVER deletes removed-ONU rows, so counting raw rows would over-count the cap and
+  fake duplicates off zombie rows. `list_org_devices` MUST carry `onu_pon_limit` or
+  the override silently no-ops in paging. Tests: `unit/test_onuroster`,
+  `integration/test_central_onualert`.
 - **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` =
   splitter/fdb/closure), NOT a second registry: parent chains, map pins, routes
   all come free. `ip_address` stays `''` (the NOT NULL column survives);
@@ -264,8 +278,9 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   wrapped row per ONU). Width-conditional columns in panel content use CONTAINER
   queries (`@container` on the panel block, `@md:`/`@xl:` on the columns).
 - **Optical drill-down degrades, never dead-ends**: a PON whose ONUs all have NULL
-  Rx (no-Rx vendors like DBC) renders a dark-first roster (state, ranging distance
-  — 0 m renders "—", it means unranged — time-dark from `last_online_at`) with an
+  Rx (no-Rx vendors like DBC) renders a roster ordered by ONU id (state, ranging
+  distance — 0 m renders "—", it means unranged — time-dark from `last_online_at`),
+  a stable slot order the tech reads down, not shuffled by which ONUs are up; with an
   honest "doesn't report Rx" note; worst-PON/threshold header hides when the whole
   OLT has no readings. Keep the empty-card branch unreachable.
 - **Sort by `occurred_at ?? received_at`, NOT insert id** (Logs day-grouping and the

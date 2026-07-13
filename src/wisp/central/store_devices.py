@@ -84,7 +84,7 @@ class DeviceStoreMixin:
                 "SELECT d.id, d.org_id, d.name, d.ip_address, d.device_type, d.region,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
-                " d.lat, d.lng, d.pon_port,"
+                " d.lat, d.lng, d.pon_port, d.onu_pon_limit,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
                 " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"

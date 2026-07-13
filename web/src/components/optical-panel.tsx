@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
-import type { OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
+import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
 import { durationSince } from "@/lib/format"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -180,12 +180,15 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
 // flex-1 slot between ~275px of fixed columns; inside the 380px device panel
 // that slot collapsed to zero and the strip wrapped one 11px cell per line —
 // a PON row as tall as its ONU count with nothing visible in it.
-function PonRow({ pon, open, onToggle }: {
-  pon: Pon; open: boolean; onToggle: () => void
+function PonRow({ pon, open, onToggle, limit }: {
+  pon: Pon; open: boolean; onToggle: () => void; limit: number
 }) {
 
   const worstTone = pon.crit > 0 ? "text-destructive" : pon.warn > 0 ? "text-warning" : "text-muted-foreground"
   const hasRx = pon.typicalRx != null || pon.worstRx != null
+  // EPON tops out at a 1:64 split — a PON that reached its cap can take no more
+  // subscribers (central/onuroster.py pages this too)
+  const atCap = pon.onus.length >= limit
   return (
     <button onClick={onToggle} aria-expanded={open}
       className={cn("flex w-full flex-col gap-1.5 rounded-md px-2 py-2 text-left hover:bg-foreground/5",
@@ -195,6 +198,11 @@ function PonRow({ pon, open, onToggle }: {
         <span className="shrink-0 font-mono text-2xs text-muted-foreground">
           {pon.online}/{pon.onus.length}
         </span>
+        {atCap && (
+          <span className="shrink-0 rounded bg-destructive-soft px-1.5 py-0.5 text-2xs font-semibold text-destructive">
+            at capacity {pon.onus.length}/{limit}
+          </span>
+        )}
         {/* typical (median) + worst Rx; a vendor with no Rx readings (EPON
             without an optics profile) says so once instead of two dashes */}
         {hasRx ? (
@@ -229,13 +237,12 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   const [showAll, setShowAll] = useState(false)
   // A vendor with no per-ONU Rx (the DBC/C-Data EPON fleet) leaves EVERY reading
   // NULL — the worst-Rx filter would render an empty card over a PON full of
-  // live ONUs. Fall back to a roster: dark ONUs first, then by ONU id.
+  // live ONUs. Fall back to a roster ordered by ONU id (a stable slot order the
+  // tech reads down, not shuffled by which ONUs are up).
   const rosterOnly = pon.onus.every((o) => o.rx_dbm == null)
   const worst = useMemo(() => {
     const rows = rosterOnly
-      ? [...pon.onus].sort((a, b) =>
-          Number(a.state === "online") - Number(b.state === "online") ||
-          (a.onu_id ?? 0) - (b.onu_id ?? 0))
+      ? [...pon.onus].sort((a, b) => (a.onu_id ?? 0) - (b.onu_id ?? 0))
       : [...pon.onus]
           .filter((o) => o.state === "online" && o.rx_dbm != null)
           .sort((a, b) => a.rx_dbm! - b.rx_dbm!)
@@ -260,7 +267,7 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   return (
     <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2">
       <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {rosterOnly ? "Dark first" : "Worst first"} · PON {pon.port} · {pon.onus.length} ONUs
+        {rosterOnly ? "By ONU ID" : "Worst first"} · PON {pon.port} · {pon.onus.length} ONUs
       </div>
       {rosterOnly && (
         <p className="mb-1 text-2xs text-faint-foreground">
@@ -322,6 +329,33 @@ function FaultCard({ f }: { f: PonFault }) {
   )
 }
 
+// Redundant-MAC card: one ONU MAC on 2+ slots means a cloned CPE, a bridging
+// loop, or a stale double-registration. Detection is org-wide; the panel shows
+// the groups that touch this OLT.
+function DupMacCard({ d }: { d: DupMac }) {
+  return (
+    <div className="rounded-lg border border-destructive/40 bg-destructive-soft/40 px-3 py-2 text-xs">
+      <p className="font-semibold text-destructive">
+        Duplicate ONU MAC — <span className="font-mono">{d.mac}</span>
+      </p>
+      <p className="mt-0.5 text-muted-foreground">
+        Registered on {d.members.length} ONU slots — likely a cloned CPE, a
+        bridging loop, or a stale double-registration.
+      </p>
+      <ul className="mt-1 space-y-0.5 font-mono text-2xs">
+        {d.members.map((m) => (
+          <li key={`${m.device_id}:${m.onu_key}`} className="text-foreground">
+            {m.device_name} · PON {m.pon_port ?? "?"} · ONU {m.onu_id ?? "?"}
+            {m.state && m.state !== "online" && (
+              <span className="text-muted-foreground"> ({m.state})</span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 export function OpticalPanel({ device, focusOnuId }: {
   device: OrgDevice
   /** map spoke click-through: open this ONU's PON group and highlight its row */
@@ -376,11 +410,16 @@ export function OpticalPanel({ device, focusOnuId }: {
   const online = onus.filter((o) => o.state === "online").length
   const crit = onus.filter((o) => onuSev(o) === "crit").length
   const warn = onus.filter((o) => onuSev(o) === "warn").length
+  const limit = q.data?.onu_pon_limit ?? Infinity
+  const dupMacs = q.data?.dup_macs ?? []
 
   return (
     <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
       {(faultsQ.data?.faults ?? []).map((f) => (
         <FaultCard key={`${f.device_id}:${f.pon_port ?? "?"}`} f={f} />
+      ))}
+      {dupMacs.map((d) => (
+        <DupMacCard key={d.mac} d={d} />
       ))}
       {/* header readout ------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -413,7 +452,7 @@ export function OpticalPanel({ device, focusOnuId }: {
       <div className="flex flex-col">
         {pons.map((pon) => (
           <div key={pon.port}>
-            <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} />
+            <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} limit={limit} />
             {pon.port === activePort && (
               <PonDetail pon={pon} deviceId={device.id} focusOnuId={focusOnuId} />
             )}

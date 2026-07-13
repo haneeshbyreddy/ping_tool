@@ -151,9 +151,12 @@ class SnmpStoreMixin:
 
 
     def org_onu_rows(self, org_id: str, device_id: int | None = None) -> list[dict]:
-        """Slim ONU rows for the PON fault detector (central/ponfault.py)."""
-        q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.name, o.state,"
-             " o.distance_m, o.last_online_at, o.updated_at, d.name AS device_name"
+        """Slim ONU rows for the PON fault detector (central/ponfault.py) and the
+        roster-hygiene checks (central/onuroster.py — serial + onu_id used there,
+        ignored by ponfault)."""
+        q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.onu_id, o.name, o.serial,"
+             " o.state, o.distance_m, o.last_online_at, o.updated_at,"
+             " d.name AS device_name"
              " FROM onu_optics o JOIN org_devices d ON d.id = o.device_id"
              " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1")
         args: list = [org_id, org_id]
@@ -184,6 +187,49 @@ class SnmpStoreMixin:
                 " since=excluded.since, updated_at=excluded.updated_at",
                 (org_id, device_id, pon_port, kind, dark, 1 if active else 0,
                  since, ts))
+            conn.commit()
+
+
+    # --- ONU-roster hygiene ladder state (central/onualert.py) -----------------
+
+    def pon_capacity_states(self, org_id: str) -> dict[tuple[int, str], dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pon_capacity_state WHERE org_id=?", (org_id,)).fetchall()
+        return {(r["device_id"], r["pon_port"]): dict(r) for r in rows}
+
+
+    def upsert_pon_capacity_state(self, org_id: str, device_id: int, pon_port: str,
+                                  *, onus: int, active: bool, since: str | None,
+                                  ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO pon_capacity_state (org_id, device_id, pon_port, onus,"
+                " active, since, updated_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, device_id, pon_port) DO UPDATE SET"
+                " onus=excluded.onus, active=excluded.active,"
+                " since=excluded.since, updated_at=excluded.updated_at",
+                (org_id, device_id, pon_port, onus, 1 if active else 0, since, ts))
+            conn.commit()
+
+
+    def onu_dup_mac_states(self, org_id: str) -> dict[str, dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM onu_dup_mac_state WHERE org_id=?", (org_id,)).fetchall()
+        return {r["mac"]: dict(r) for r in rows}
+
+
+    def upsert_onu_dup_mac_state(self, org_id: str, mac: str, *, members: int,
+                                 active: bool, since: str | None, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO onu_dup_mac_state (org_id, mac, members, active, since,"
+                " updated_at) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, mac) DO UPDATE SET members=excluded.members,"
+                " active=excluded.active, since=excluded.since,"
+                " updated_at=excluded.updated_at",
+                (org_id, mac, members, 1 if active else 0, since, ts))
             conn.commit()
 
 
@@ -258,12 +304,13 @@ class SnmpStoreMixin:
 
 
     def set_olt_optical_thresholds(self, org_id: str, device_id: int,
-                                   warn_dbm: float | None, crit_dbm: float | None) -> bool:
+                                   warn_dbm: float | None, crit_dbm: float | None,
+                                   onu_pon_limit: int | None = None) -> bool:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
-                "UPDATE org_devices SET optical_warn_dbm=?, optical_crit_dbm=?"
-                " WHERE id=? AND org_id=? AND is_active=1",
-                (warn_dbm, crit_dbm, device_id, org_id))
+                "UPDATE org_devices SET optical_warn_dbm=?, optical_crit_dbm=?,"
+                " onu_pon_limit=? WHERE id=? AND org_id=? AND is_active=1",
+                (warn_dbm, crit_dbm, onu_pon_limit, device_id, org_id))
             conn.commit()
             return cur.rowcount > 0
 

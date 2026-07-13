@@ -80,6 +80,18 @@ class Config:
     # stale optics (field-diagnosed 2026-07-09 via remote diag walks).
     gpon_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_GPON_WALK_TIMEOUT_S", 75.0))
+    # Per-REQUEST tolerance for the GPON roster walk, separate from the global 2s
+    # snmp_timeout_s. A slow C-Data/DBC EPON agent (PYLON class) intermittently
+    # drops or delays a single GETBULK on the big .12 registration table; at 2s x
+    # 1 retry one unanswered request fails the WHOLE walk ("No SNMP response
+    # received before timeout") and freezes the roster for a full snmp_interval —
+    # field-diagnosed 2026-07-13, PYLON roster stuck ~25 min while health/ports
+    # stayed fresh on the same box. More time + more retries per request rides out
+    # the slow spells; the gpon_walk_timeout_s cap still bounds the total.
+    gpon_request_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_GPON_REQUEST_TIMEOUT_S", 5.0))
+    gpon_request_retries: int = field(
+        default_factory=lambda: _env_int("WISP_GPON_REQUEST_RETRIES", 3))
     # Port (ifTable) walks get their own cap for the same reason GPON does: a big OLT
     # (HILL/PYLON class, 200+ interfaces x 10 columns) can't finish 10 bulk-walk
     # columns inside 20s, timed out every cycle, and left switch_ports permanently
@@ -105,6 +117,17 @@ class Config:
     # PON reads as a fiber cut. State is tracked regardless; only paging gates.
     pon_fault_alerts: bool = field(
         default_factory=lambda: _env_bool("WISP_PON_FAULT_ALERTS", True))
+    # ONU-roster hygiene (central/onualert.py): per-PON ONU cap (EPON tops out at a
+    # 1:64 split — page when a PON is full) and redundant-MAC detection (same ONU MAC
+    # on 2+ slots = clone/loop/double-registration). Per-OLT `onu_pon_limit` override
+    # (org_devices) raises the cap for a 1:128 GPON box. State tracked regardless of
+    # the gates, like ponalert; both page the operator transition-only.
+    onu_pon_limit: int = field(
+        default_factory=lambda: _env_int("WISP_ONU_PON_LIMIT", 64))
+    onu_limit_alerts: bool = field(
+        default_factory=lambda: _env_bool("WISP_ONU_LIMIT_ALERTS", True))
+    onu_dup_mac_alerts: bool = field(
+        default_factory=lambda: _env_bool("WISP_ONU_DUP_MAC_ALERTS", True))
     # Empty = per-OLT sysObjectID auto-detect (the normal path). Set to force one
     # vendor profile on every untagged OLT this edge probes — an escape hatch for
     # a box whose sysObjectID is missing or lies; per-device `gpon_vendor` from the

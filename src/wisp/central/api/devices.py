@@ -2,7 +2,9 @@
 links, switch ports, ONU/OLT optics, SNMP config/walks/profiles."""
 from __future__ import annotations
 
-from wisp.central import inventory
+from datetime import datetime, timezone
+
+from wisp.central import inventory, onuroster
 from wisp.central.api.common import (DENIED, body_org_write, device_read_scope,
                                      device_write_org, org_or_400, q_int_required,
                                      reader_or_401)
@@ -62,11 +64,19 @@ def optics(h, qs):
         return
     did, org = scope
     dev = h.store.get_org_device(org, did) or {}
+    # redundant-MAC groups are org-wide (a MAC cloned onto a second OLT is the
+    # dangerous case); surface only the ones that touch THIS OLT in its panel
+    dups = onuroster.duplicate_macs(h.store.org_onu_rows(org),
+                                    datetime.now(timezone.utc))
+    dup_macs = [d.as_dict() for d in dups
+                if any(m["device_id"] == did for m in d.members)]
     h._reply(200, {
         "onus": h.store.list_onu_optics(org, did),
         "olt": h.store.get_olt_optics(org, did),
         "warn_dbm": dev.get("optical_warn_dbm") if dev.get("optical_warn_dbm") is not None else h.cfg.optical_warn_dbm,
         "crit_dbm": dev.get("optical_crit_dbm") if dev.get("optical_crit_dbm") is not None else h.cfg.optical_crit_dbm,
+        "onu_pon_limit": dev.get("onu_pon_limit") if dev.get("onu_pon_limit") is not None else h.cfg.onu_pon_limit,
+        "dup_macs": dup_macs,
     })
 
 
@@ -383,7 +393,7 @@ def optics_thresholds(h, user, body):
         return
     clean = inventory.clean_optical_thresholds(body)
     ok = h.store.set_olt_optical_thresholds(
-        org, did, clean["warn_dbm"], clean["crit_dbm"])
+        org, did, clean["warn_dbm"], clean["crit_dbm"], clean["onu_pon_limit"])
     h._reply(200 if ok else 404, {"ok": ok})
 
 

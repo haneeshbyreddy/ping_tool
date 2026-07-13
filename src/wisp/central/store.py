@@ -438,6 +438,30 @@ CREATE TABLE IF NOT EXISTS pon_fault_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (org_id, device_id, pon_port)
 );
+-- ONU-roster hygiene ladder state (central/onualert.py) — transition-only paging
+-- like pon_fault_state: a re-walk that leaves the condition standing must not
+-- re-page. State written even when the alert gate is off. Never opens an outage.
+-- Per-PON ONU cap: one row per (OLT, PON) that reached its ONU limit.
+CREATE TABLE IF NOT EXISTS pon_capacity_state (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    pon_port   TEXT NOT NULL,
+    onus       INTEGER NOT NULL DEFAULT 0,   -- roster count at the transition
+    active     INTEGER NOT NULL DEFAULT 0,
+    since      TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, device_id, pon_port)
+);
+-- Redundant MAC: one row per duplicated ONU MAC (serial), org-wide across OLTs.
+CREATE TABLE IF NOT EXISTS onu_dup_mac_state (
+    org_id     TEXT NOT NULL,
+    mac        TEXT NOT NULL,                -- normalized (.strip().upper())
+    members    INTEGER NOT NULL DEFAULT 0,   -- distinct slots sharing the MAC
+    active     INTEGER NOT NULL DEFAULT 0,
+    since      TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, mac)
+);
 -- Device health over SNMP (CPU %, RAM, temperature) — one row per device, written
 -- off the full /report's `health` key on the edge's SNMP cadence (ingress/health.py).
 -- DISPLAY-ONLY: never opens an outage, never pages — the ICMP FSM owns alarms; this
@@ -591,7 +615,11 @@ class CentralStore(
                 ("gpon_vendor", "TEXT"),
                 ("lat", "REAL"), ("lng", "REAL"),
                 # passive plant only (splitter/fdb/closure): which PON it serves
-                ("pon_port", "TEXT")))
+                ("pon_port", "TEXT"),
+                # OLT only: per-PON ONU cap override (NULL = cfg.onu_pon_limit, the
+                # EPON 1:64 default); a 1:128 GPON box raises it so it never
+                # false-pages "at capacity" (central/onualert.py)
+                ("onu_pon_limit", "INTEGER")))
             # when this ONU was last seen online — central/ponfault.py reads it to
             # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (

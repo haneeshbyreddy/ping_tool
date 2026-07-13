@@ -220,11 +220,28 @@ export interface OltOptics {
   alarm_since: string | null
   updated_at: string
 }
+/** one ONU slot sharing a duplicated MAC (central/onuroster.py) */
+export interface DupMacMember {
+  device_id: number
+  device_name: string
+  pon_port: string | null
+  onu_id: number | null
+  onu_key: string
+  state: string | null
+}
+export interface DupMac {
+  mac: string
+  members: DupMacMember[]
+}
 export interface OpticsResponse {
   onus: OnuOptic[]
   olt: OltOptics | null
   warn_dbm: number
   crit_dbm: number
+  /** effective per-PON ONU cap: OLT override ?? global default */
+  onu_pon_limit: number
+  /** redundant-MAC groups touching this OLT (org-wide detection) */
+  dup_macs: DupMac[]
 }
 
 export interface ReliabilityRow {

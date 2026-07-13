@@ -112,6 +112,27 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(dark.state, STATE_OFFLINE)
         self.assertIsNone(dark.rx_dbm)  # not in the optical table
 
+    def test_dbc_walks_description_and_filters_null_sentinel(self):
+        # col10 is the web-UI "Description" (validated 2026-07-13: EPON0/2:1 set to
+        # HCS_RAMPRASAD showed at ...12.1.12.1.10.29). An unset ONU reports the
+        # literal string 'NULL' — it must render as no-name, never the word NULL.
+        self.assertTrue(DBC.oid_ident_name)  # the shipping profile carries it
+        vbs = [
+            (f"{DBC.oid_ident_key}.29", "00:d3:9e:14:35:84"),
+            (f"{DBC.oid_ident_pon}.29", "2"),
+            (f"{DBC.oid_ident_onu}.29", "1"),
+            (f"{DBC.oid_ident_state}.29", "1"),
+            (f"{DBC.oid_ident_name}.29", "HCS_RAMPRASAD"),
+            (f"{DBC.oid_ident_key}.30", "4c:ae:1c:22:2c:fe"),
+            (f"{DBC.oid_ident_pon}.30", "2"),
+            (f"{DBC.oid_ident_onu}.30", "2"),
+            (f"{DBC.oid_ident_state}.30", "1"),
+            (f"{DBC.oid_ident_name}.30", "NULL"),
+        ]
+        onus = {o.onu_key: o for o in parse_onu_table(vbs, DBC)}
+        self.assertEqual(onus["2.1"].name, "HCS_RAMPRASAD")
+        self.assertIsNone(onus["2.2"].name)  # 'NULL' sentinel filtered to no-name
+
     def test_dbc_reregistered_mac_stays_two_distinct_slots(self):
         # Same MAC on two PONs (an ONU moved, leaving a stale ghost) must remain two
         # rows keyed by slot, and the single Rx reading lands on the matching onu-id.

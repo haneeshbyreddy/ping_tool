@@ -126,9 +126,10 @@ export const inventoryApi = {
   ackOnu: (id: number, hours: number | null) =>
     request<{ ok: boolean }>("/api/inventory/optics/ack",
       { method: "POST", body: hours == null ? { id, until: "clear" } : { id, hours } }),
-  setOpticalThresholds: (device_id: number, warn_dbm: number | null, crit_dbm: number | null) =>
+  setOpticalThresholds: (device_id: number, warn_dbm: number | null, crit_dbm: number | null,
+    onu_pon_limit: number | null = null) =>
     request<{ ok: boolean }>("/api/inventory/optics/thresholds",
-      { method: "POST", body: { device_id, warn_dbm, crit_dbm } }),
+      { method: "POST", body: { device_id, warn_dbm, crit_dbm, onu_pon_limit } }),
 }
 
 export const snmpApi = {
