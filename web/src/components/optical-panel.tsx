@@ -34,6 +34,11 @@ function fmtDbm(v: number | null): string {
 function fmtKm(m: number | null): string {
   return m == null ? "—" : `${(m / 1000).toFixed(2)} km`
 }
+// ONU ranging: the DBC OLT reports 0 m for an unranged/dark ONU — that's
+// "unknown", not a zero-length drop. Cut-bracket math keeps plain fmtKm.
+function fmtOnuKm(m: number | null): string {
+  return m ? fmtKm(m) : "—"
+}
 function ackActive(o: OnuOptic): boolean {
   return !!o.ack_until && new Date(o.ack_until).getTime() > Date.now()
 }
@@ -136,13 +141,26 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
       <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground @xl:inline">
         {o.serial || o.onu_key}
       </span>
-      <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
-        onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
-        {fmtDbm(o.rx_dbm)} dBm
-      </span>
+      {/* the one data column that survives the 380px panel: Rx when the vendor
+          reports it, else ranging distance (online) or time dark — "— dBm" on
+          a no-Rx EPON vendor told the tech nothing */}
+      {o.rx_dbm != null ? (
+        <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
+          onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
+          {fmtDbm(o.rx_dbm)} dBm
+        </span>
+      ) : o.state === "online" ? (
+        <span className="w-20 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground">
+          {fmtOnuKm(o.distance_m)}
+        </span>
+      ) : (
+        <span className="w-20 shrink-0 truncate text-right text-2xs text-muted-foreground">
+          {o.last_online_at ? `dark ${durationSince(o.last_online_at)}` : "offline"}
+        </span>
+      )}
       <span className="hidden w-20 shrink-0 text-right text-2xs @md:inline"><Drift o={o} /></span>
       <span className="hidden w-16 shrink-0 text-right font-mono text-2xs text-muted-foreground @2xl:inline">
-        {fmtKm(o.distance_m)}
+        {fmtOnuKm(o.distance_m)}
       </span>
       <span className="w-14 shrink-0 text-right">
         {onuSev(o) === "ok" || o.state !== "online" ? null : acked ? (
@@ -209,15 +227,23 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   pon: Pon; deviceId: number; focusOnuId?: number | null
 }) {
   const [showAll, setShowAll] = useState(false)
+  // A vendor with no per-ONU Rx (the DBC/C-Data EPON fleet) leaves EVERY reading
+  // NULL — the worst-Rx filter would render an empty card over a PON full of
+  // live ONUs. Fall back to a roster: dark ONUs first, then by ONU id.
+  const rosterOnly = pon.onus.every((o) => o.rx_dbm == null)
   const worst = useMemo(() => {
-    const rows = [...pon.onus]
-      .filter((o) => o.state === "online" && o.rx_dbm != null)
-      .sort((a, b) => a.rx_dbm! - b.rx_dbm!)
+    const rows = rosterOnly
+      ? [...pon.onus].sort((a, b) =>
+          Number(a.state === "online") - Number(b.state === "online") ||
+          (a.onu_id ?? 0) - (b.onu_id ?? 0))
+      : [...pon.onus]
+          .filter((o) => o.state === "online" && o.rx_dbm != null)
+          .sort((a, b) => a.rx_dbm! - b.rx_dbm!)
     // a focused offline/LOS ONU has no Rx and would vanish — surface it on top
     const focus = focusOnuId != null ? pon.onus.find((o) => o.id === focusOnuId) : undefined
     if (focus && !rows.includes(focus)) rows.unshift(focus)
     return rows
-  }, [pon, focusOnuId])
+  }, [pon, focusOnuId, rosterOnly])
   // the focused ONU may sit past the worst-N cut; expand rather than hide it
   useEffect(() => {
     if (focusOnuId != null && worst.findIndex((o) => o.id === focusOnuId) >= WORST_N) {
@@ -227,15 +253,21 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
   if (!worst.length) {
     return (
       <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2 text-2xs text-muted-foreground">
-        No online ONUs with an Rx reading on PON {pon.port} yet.
+        No online ONUs with an Rx reading on PON {pon.port}.
       </div>
     )
   }
   return (
     <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2">
       <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
-        Worst first · PON {pon.port} · {pon.onus.length} ONUs
+        {rosterOnly ? "Dark first" : "Worst first"} · PON {pon.port} · {pon.onus.length} ONUs
       </div>
+      {rosterOnly && (
+        <p className="mb-1 text-2xs text-faint-foreground">
+          This OLT doesn't report per-ONU Rx over SNMP — showing state, ranging
+          distance and time dark instead.
+        </p>
+      )}
       <div className="divide-y divide-border/60">
         {(showAll ? worst : worst.slice(0, WORST_N)).map((o) => (
           <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId} />
@@ -366,10 +398,15 @@ export function OpticalPanel({ device, focusOnuId }: {
             {warn} warning
           </span>
         )}
-        <span className="ml-auto flex items-center gap-3 font-mono text-2xs text-muted-foreground">
-          {worstPon && <span>worst: PON {worstPon}</span>}
-          <span>warn {q.data!.warn_dbm} · crit {q.data!.crit_dbm} dBm</span>
-        </span>
+        {/* worst-PON + dBm thresholds only mean something when at least one
+            ONU has an Rx reading — on a no-Rx vendor they'd point at an
+            arbitrary PON and quote thresholds nothing is judged against */}
+        {onus.some((o) => o.rx_dbm != null) && (
+          <span className="ml-auto flex items-center gap-3 font-mono text-2xs text-muted-foreground">
+            {worstPon && <span>worst: PON {worstPon}</span>}
+            <span>warn {q.data!.warn_dbm} · crit {q.data!.crit_dbm} dBm</span>
+          </span>
+        )}
       </div>
 
       {/* per-PON strips, each expanding INLINE to its worst-first drill-down --- */}

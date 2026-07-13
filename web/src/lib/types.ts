@@ -206,6 +206,8 @@ export interface OnuOptic {
   severity: "ok" | "warn" | "crit" | null
   ack_until: string | null
   updated_at: string
+  /** frozen at the moment the ONU left `online` (store upsert CASE) */
+  last_online_at: string | null
 }
 
 export interface OltOptics {
