@@ -142,7 +142,10 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   the deepest passive whose route distance (link_routes geometry, chord where
   undrawn, ABORTS on any unplaced hop — never fabricate) lands in the interval.
   Sweep rides the optics fold in `/report`. Tests: `unit/test_ponfault`,
-  `integration/test_central_ponalert`.
+  `integration/test_central_ponalert`. **Hardware gap (field-proven 2026-07-13):**
+  the C-Data/DBC EPON fleet reports only online/offline — never dying_gasp/LOS —
+  so the POWER verdict can't fire there and area power cuts page as "fiber"
+  (multi-PON/multi-OLT simultaneous drops are the tell).
 - **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` =
   splitter/fdb/closure), NOT a second registry: parent chains, map pins, routes
   all come free. `ip_address` stays `''` (the NOT NULL column survives);
@@ -179,7 +182,9 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `WISP_GPON_VENDOR` (default empty = auto) > sysObjectID longest-prefix match >
   None (no optics). Detection cached per device (1h ok / 15min on silence — catches
   a hardware swap), runs inside the SNMP semaphore, reuses one lazy engine. Tests:
-  `unit/test_gpon`.
+  `unit/test_gpon`. **C-Data/DBC EPON verdict is FINAL (2026-07-13, warm-capture
+  vs 28 web-UI truth values): per-ONU Rx exists NOWHERE in that firmware's SNMP —
+  blank Rx on the `dbc` profile is correct, don't hunt for an OID.**
 
 ## Central management plane
 
@@ -258,6 +263,11 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   (the Optical tab's ONU heat-strip once collapsed to a one-cell-wide column, one
   wrapped row per ONU). Width-conditional columns in panel content use CONTAINER
   queries (`@container` on the panel block, `@md:`/`@xl:` on the columns).
+- **Optical drill-down degrades, never dead-ends**: a PON whose ONUs all have NULL
+  Rx (no-Rx vendors like DBC) renders a dark-first roster (state, ranging distance
+  — 0 m renders "—", it means unranged — time-dark from `last_online_at`) with an
+  honest "doesn't report Rx" note; worst-PON/threshold header hides when the whole
+  OLT has no readings. Keep the empty-card branch unreachable.
 - **Sort by `occurred_at ?? received_at`, NOT insert id** (Logs day-grouping and the
   Home activity panel) — acks/post-mortems insert long after the outage. Log group
   keys include the first row's event id (day labels repeat).
