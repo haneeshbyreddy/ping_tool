@@ -370,6 +370,74 @@ def clean_profile_payload(data: dict) -> dict:
     return {"name": name, "match_sysobjectid": match, "metrics": metrics,
             "enabled": enabled}
 
+# The GPON counterpart — must mirror ingress/gpon.py's gpon_profile_from_dict
+# vocabulary exactly (the edge revalidates and silently drops what it can't
+# express; rejecting here is what gives the operator an error message instead).
+GPON_PROFILE_OIDS = ("rx", "tx", "state", "distance", "serial", "name",
+                     "ident_key", "ident_pon", "ident_onu", "ident_state",
+                     "ident_distance", "ident_name")
+GPON_PROFILE_STATES = ("online", "offline", "dying_gasp", "los", "unknown")
+GPON_PON_INDEX_STRATEGIES = ("as_is", "first_segment")
+
+def clean_gpon_profile_payload(data: dict) -> dict:
+    name = _str(data, "name", required=True).lower()
+    if len(name) > 64:
+        raise InventoryError("profile name must be 64 characters or fewer")
+    match = str(data.get("match_sysobjectid") or "").strip().strip(".")
+    if match:
+        match = clean_oid(match, field="match_sysobjectid")
+    raw_oids = data.get("oids")
+    if not isinstance(raw_oids, dict):
+        raise InventoryError("oids must map ONU columns to OIDs")
+    oids: dict = {}
+    for key, val in raw_oids.items():
+        if key not in GPON_PROFILE_OIDS:
+            raise InventoryError(
+                f"unknown oid field {key!r} — must be one of: {', '.join(GPON_PROFILE_OIDS)}")
+        if str(val or "").strip():
+            oids[key] = clean_oid(val, field=f"oids.{key}")
+    if not oids:
+        raise InventoryError("profile must map at least one OID")
+    scales: dict = {}
+    for key, val in (data.get("scales") or {}).items():
+        if key not in ("rx", "tx", "distance"):
+            raise InventoryError("scales apply only to rx, tx, distance")
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            raise InventoryError(f"scales.{key} must be a number")
+        if not 0 < f <= 1000:
+            raise InventoryError(f"scales.{key} must be between 0 and 1000")
+        scales[key] = f
+    state_map_raw = data.get("state_map") or {}
+    if not isinstance(state_map_raw, dict):
+        raise InventoryError("state_map must be an object")
+    state_map: dict = {}
+    for k, v in state_map_raw.items():
+        if v not in GPON_PROFILE_STATES:
+            raise InventoryError(
+                f"state_map[{k!r}] must be one of: {', '.join(GPON_PROFILE_STATES)}")
+        state_map[str(k).strip()] = v
+    state_default = str(data.get("state_default") or "unknown").strip().lower()
+    if state_default not in GPON_PROFILE_STATES:
+        raise InventoryError(
+            f"state_default must be one of: {', '.join(GPON_PROFILE_STATES)}")
+    pon_index = str(data.get("pon_index") or "as_is").strip().lower()
+    if pon_index not in GPON_PON_INDEX_STRATEGIES:
+        raise InventoryError(
+            f"pon_index must be one of: {', '.join(GPON_PON_INDEX_STRATEGIES)}")
+    pon_label = str(data.get("pon_label") or "").strip()
+    if pon_label and "{pon}" not in pon_label:
+        raise InventoryError("pon_label template must contain '{pon}'")
+    if len(pon_label) > 32:
+        raise InventoryError("pon_label must be 32 characters or fewer")
+    enabled = str(data.get("enabled", 1)) not in ("0", "false", "False", "", "None")
+    spec = {"oids": oids, "scales": scales, "state_map": state_map,
+            "state_default": state_default, "pon_index": pon_index,
+            "pon_label": pon_label}
+    return {"name": name, "match_sysobjectid": match, "spec": spec,
+            "enabled": enabled}
+
 def clean_node_id(raw) -> str:
     node_id = str(raw or "").strip()
     if not node_id:

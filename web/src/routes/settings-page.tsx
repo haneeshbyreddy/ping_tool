@@ -9,6 +9,7 @@ import type { AccountUser, Role } from "@/lib/types"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
+import { GponProfilesCard } from "@/components/gpon-profiles-card"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -47,12 +48,14 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   const [name, setName] = useState("")
   const [topics, setTopics] = useState({ owner: "", operator: "", tech: "" })
   const [mapRegion, setMapRegion] = useState(DEFAULT_MAP_REGION)
+  const [pollInterval, setPollInterval] = useState("")
   const [testResults, setTestResults] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (!current) return
     setName(current.name || "")
     setMapRegion(mapRegionOf(current.map_region).key)
+    setPollInterval(current.poll_interval_s ? String(current.poll_interval_s) : "")
 
     setTopics({
       owner: current.ntfy_topic_owner || randomTopic("owner"),
@@ -68,6 +71,7 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
       ntfy_topic_operator: topics.operator.trim() || null,
       ntfy_topic_tech: topics.tech.trim() || null,
       map_region: mapRegion,
+      poll_interval_s: pollInterval.trim() ? Number(pollInterval) : null,
     }),
     onSuccess: () => { toast.success("Settings saved"); queryClient.invalidateQueries({ queryKey: ["orgs"] }) },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
@@ -102,6 +106,27 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
           <p className="max-w-lg text-xs text-muted-foreground">
             The Map view opens on this area and stays inside it. Pick your state so the
             map is your network, not the whole country.
+          </p>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Probe interval (seconds)</Label>
+          <Input
+            className="max-w-sm"
+            type="number"
+            min={10}
+            max={120}
+            placeholder="automatic (60s)"
+            disabled={!canWrite}
+            value={pollInterval}
+            onChange={(e) => setPollInterval(e.target.value)}
+          />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            How often every probe in this org pings its devices and reports back —
+            each cycle is one ping sweep plus one report, and outage detection speed
+            follows it (a device is confirmed DOWN after 3 failed cycles, so 30s
+            &asymp; 90s to a page, 60s &asymp; 3 min). Probes pick a change up within
+            one cycle, no restart. 10&ndash;120s; blank = automatic (60s). Lower is
+            faster detection but more ICMP load on your gear.
           </p>
         </div>
         {ROLE_TOPICS.map(({ key, label }) => (
@@ -519,6 +544,9 @@ export function SettingsPage() {
           org-local ones. A superadmin with no org scoped still manages globals. */}
       {canWrite && (scopeOrg || isSuperadmin) && (
         <SnmpProfilesCard org={scopeOrg} isSuperadmin={isSuperadmin} />
+      )}
+      {canWrite && (scopeOrg || isSuperadmin) && (
+        <GponProfilesCard org={scopeOrg} isSuperadmin={isSuperadmin} />
       )}
       <ChangePasswordCard />
       {scopeOrg && canWrite && <UsersCard org={scopeOrg} />}

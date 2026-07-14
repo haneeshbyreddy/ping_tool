@@ -5,7 +5,7 @@ import { toast } from "sonner"
 import { ChevronRight, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
-import { inventoryApi, nodesApi, ApiError } from "@/lib/api"
+import { gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
 import { DEVICE_TYPES, PASSIVE_DEVICE_TYPES, isPassiveType, type OrgDevice } from "@/lib/types"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import {
@@ -100,6 +100,17 @@ function DeviceForm({
     pon_port: editing.pon_port ?? "",
   } : EMPTY_FORM)
   const [error, setError] = useState("")
+
+  // Central-served GPON profiles join the built-ins in the override dropdown.
+  const gponProfiles = useQuery({
+    queryKey: ["gpon-profiles", org],
+    queryFn: () => gponApi.profiles(org),
+    enabled: form.device_type === "OLT",
+  })
+  const gponVendors = [...new Set([
+    ...GPON_VENDORS,
+    ...(gponProfiles.data?.profiles.filter((p) => p.enabled).map((p) => p.name) ?? []),
+  ])].sort()
 
   const cardRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -240,7 +251,7 @@ function DeviceForm({
                 <SelectTrigger className="w-44"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="auto">auto-detect (default)</SelectItem>
-                  {GPON_VENDORS.map((v) => <SelectItem key={v} value={v}>{v} (override)</SelectItem>)}
+                  {gponVendors.map((v) => <SelectItem key={v} value={v}>{v} (override)</SelectItem>)}
                 </SelectContent>
               </Select>
             </div>

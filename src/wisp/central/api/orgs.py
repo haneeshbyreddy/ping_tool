@@ -79,6 +79,22 @@ def update(h, user, body):
     map_region = body.get("map_region")
     if map_region is not None:
         map_region = str(map_region).strip().lower()[:64] or None
+    if "poll_interval_s" in body:
+        raw = body.get("poll_interval_s")
+        if raw in (None, "", "null", 0, "0"):
+            seconds = None  # back to automatic (edge env/adaptive default)
+        else:
+            try:
+                seconds = int(raw)
+            except (TypeError, ValueError):
+                h._reply(422, {"error": "poll_interval_s must be a number of seconds"})
+                return
+            # 120s cap: the fleet watchdog pages NODE_STALE at 180s (default) —
+            # a legitimate cadence must never look like a dead probe.
+            if not 10 <= seconds <= 120:
+                h._reply(422, {"error": "poll_interval_s must be between 10 and 120 seconds"})
+                return
+        h.store.set_org_poll_interval(org, seconds)
     h.store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                     ntfy_topic_owner=body.get("ntfy_topic_owner"),
                     ntfy_topic_operator=body.get("ntfy_topic_operator"),

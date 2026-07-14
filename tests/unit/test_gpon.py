@@ -1,4 +1,5 @@
 import asyncio
+import json
 import dataclasses
 import os
 import sys
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.dirname(_TESTS_DIR))
 from wisp.config import Config
 from wisp.ingress.gpon import (
     DBC, HUAWEI, GponPollerPool, GponProfile, OnuOptic, PROFILES,
-    match_gpon_profile, parse_onu_table, PysnmpGponPoller,
+    gpon_profile_from_dict, match_gpon_profile, parse_onu_table, PysnmpGponPoller,
     STATE_ONLINE, STATE_OFFLINE,
 )
 from wisp.ingress.snmp import SnmpTarget
@@ -443,6 +444,98 @@ class GatherTest(unittest.TestCase):
         self.assertEqual(walked.walked, ["10.0.0.1"])
         self.assertEqual(status[2]["state"], "no_profile")
         self.assertEqual(status[2]["sysobjectid"], "1.3.6.1.4.1.9.1.1")
+
+
+def _central_spec(name="vsol", match="1.3.6.1.4.1.999", **over):
+    spec = {
+        "name": name, "match_sysobjectid": match,
+        "oids": {"ident_key": "1.3.6.1.4.1.999.1.6", "ident_pon": "1.3.6.1.4.1.999.1.2",
+                 "ident_state": "1.3.6.1.4.1.999.1.5"},
+        "scales": {"rx": 0.1},
+        "state_map": {"1": "online", "0": "offline"}, "state_default": "offline",
+        "pon_index": "first_segment", "pon_label": "EPON0/{pon}",
+    }
+    spec.update(over)
+    return spec
+
+class CentralProfileTest(unittest.TestCase):
+    """Central-served GPON profiles: the data channel that replaces a rollout."""
+
+    def test_from_dict_builds_a_working_profile(self):
+        p = gpon_profile_from_dict(_central_spec())
+        self.assertEqual(p.name, "vsol")
+        self.assertEqual(p.rx_scale, 0.1)
+        self.assertEqual(p.decode_state("1"), STATE_ONLINE)
+        self.assertEqual(p.decode_state("weird"), STATE_OFFLINE)  # state_default
+        self.assertEqual(p.format_pon("3.7"), "3")                # first_segment
+        self.assertEqual(p.format_pon_label("2"), "EPON0/2")
+
+    def test_from_dict_rejects_anything_outside_the_vocabulary(self):
+        # A half-understood profile guessing at an OLT is the fabricated-reading
+        # trap — every reject drops the WHOLE profile.
+        bad = [
+            _central_spec(name=""),                                # no name
+            _central_spec(oids={"rx": "not-an-oid"}),              # bad OID
+            _central_spec(oids={"bogus_field": "1.2.3"}),          # unknown column
+            _central_spec(oids={}),                                # no OIDs at all
+            _central_spec(state_map={"1": "sleeping"}),            # unknown state
+            _central_spec(state_default="sleeping"),
+            _central_spec(pon_index="regex_magic"),                # unknown strategy
+            _central_spec(pon_label="EPON0/1"),                    # no {pon} slot
+            _central_spec(scales={"rx": -1}),
+            _central_spec(match="mikrotik"),                       # non-numeric prefix
+        ]
+        for raw in bad:
+            self.assertIsNone(gpon_profile_from_dict(raw), raw)
+
+    def test_central_profile_joins_auto_detect_and_wins_ties(self):
+        p = gpon_profile_from_dict(_central_spec())
+        self.assertIs(match_gpon_profile("1.3.6.1.4.1.999.5", {"vsol": p}), p)
+        # Same-name central profile shadows the built-in outright.
+        dbc2 = gpon_profile_from_dict(_central_spec(name="dbc", match="1.3.6.1.4.1.37950"))
+        self.assertIs(match_gpon_profile("1.3.6.1.4.1.37950.1", {"dbc": dbc2}), dbc2)
+        # Built-ins still match when no central profile claims the arc.
+        self.assertIs(match_gpon_profile("1.3.6.1.4.1.2011.2", {"dbc": dbc2}), HUAWEI)
+
+    def test_set_profiles_shadows_builtin_and_falls_back_on_delete(self):
+        f = _RecordingFactory()
+        pool = GponPollerPool(Config(), factory=f)
+        pool.set_profiles([_central_spec(name="dbc", match="1.3.6.1.4.1.37950")])
+        pool.for_vendor("dbc")
+        self.assertEqual(f.calls[-1][0].oid_ident_key, "1.3.6.1.4.1.999.1.6")
+        pool.set_profiles([])  # central rows deleted -> built-in returns
+        pool.for_vendor("dbc")
+        self.assertIs(f.calls[-1][0], DBC)
+
+    def test_unchanged_payload_never_rebuilds_pollers(self):
+        # A rebuilt poller is a fresh SnmpEngine (leak invariant) — the payload
+        # rides EVERY topology refresh, so same-bytes must be a no-op.
+        f = _RecordingFactory()
+        pool = GponPollerPool(Config(), factory=f)
+        payload = [_central_spec()]
+        pool.set_profiles(payload)
+        a = pool.for_vendor("vsol")
+        pool.set_profiles(json.loads(json.dumps(payload)))
+        self.assertIs(pool.for_vendor("vsol"), a)
+        self.assertEqual(len(f.calls), 1)
+        # An actual edit rebuilds exactly that poller.
+        pool.set_profiles([_central_spec(pon_label="GPON0/{pon}")])
+        self.assertIsNot(pool.for_vendor("vsol"), a)
+        self.assertEqual(len(f.calls), 2)
+
+    def test_none_payload_is_a_no_op_for_older_centrals(self):
+        pool = GponPollerPool(Config(), factory=_RecordingFactory())
+        pool.set_profiles([_central_spec()])
+        pool.set_profiles(None)  # old central: key absent -> keep last-known
+        self.assertIsNotNone(pool._profile_named("vsol"))
+
+    def test_rejected_profile_is_skipped_but_valid_siblings_install(self):
+        pool = GponPollerPool(Config(), factory=_RecordingFactory())
+        pool.set_profiles([_central_spec(),
+                           _central_spec(name="broken", pon_index="nope")])
+        self.assertIsNotNone(pool._profile_named("vsol"))
+        self.assertIsNone(pool._profile_named("broken"))
+
 
 if __name__ == "__main__":
     unittest.main()

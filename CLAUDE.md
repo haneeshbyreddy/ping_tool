@@ -66,7 +66,12 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `WISP_RETRY_INTERVAL_S` (`mode="recheck"`) until the hint is empty. A frozen cycle
   (canary down) yields no hint.
 - **Adaptive cadence** (`Config.effective_interval`): 30s while fleet ≤ 1000 and
-  `poll_interval_adaptive` on (off by default), else 60s. Computed once at startup.
+  `poll_interval_adaptive` on (off by default), else 60s. Computed once at startup —
+  EXCEPT the org override: `orgs.poll_interval_s` (Settings → probe interval) rides
+  the `/edge/devices` reply and is re-applied every cycle, no restart. Precedence:
+  CLI `--interval` > central org value > env/adaptive. Clamped 10–120s on BOTH
+  sides (API and edge) — past 120s a healthy probe outlasts the fleet watchdog's
+  180s NODE_STALE threshold and pages as dead. NULL = automatic.
 
 ## Central runs the brain
 
@@ -199,6 +204,18 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `unit/test_gpon`. **C-Data/DBC EPON verdict is FINAL (2026-07-13, warm-capture
   vs 28 web-UI truth values): per-ONU Rx exists NOWHERE in that firmware's SNMP —
   blank Rx on the `dbc` profile is correct, don't hunt for an OID.**
+- **GPON profiles are ALSO data now** (`gpon_profiles` table, 2026-07-14) — the
+  optics counterpart of `snmp_profiles`, served in the same `/edge/devices` reply.
+  The built-ins' callables travel as a CLOSED vocabulary (`state_map` +
+  `state_default`, `pon_index` `as_is|first_segment`, `pon_label` template);
+  `gpon_profile_from_dict` (ingress/gpon.py) rejects the WHOLE profile on anything
+  outside it — never a best-effort partial. A same-named row shadows a built-in
+  (huawei/dbc stay in edge code as fallbacks for fleets on an older central).
+  `GponPollerPool.set_profiles` runs every cycle and MUST stay a fingerprint-gated
+  no-op on an unchanged payload — rebuilding pollers churns SnmpEngines (the leak
+  invariant). Onboarding/fixing a vendor's ONU OIDs = a dashboard row (Settings →
+  GPON vendor profiles), never a rollout — once the fleet runs a post-2026-07-14
+  build (older edges ignore the key).
 
 ## Central management plane
 

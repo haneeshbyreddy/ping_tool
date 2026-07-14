@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -132,9 +133,105 @@ DBC = GponProfile(
 
 PROFILES: dict[str, GponProfile] = {HUAWEI.name: HUAWEI, DBC.name: DBC}
 
-def match_gpon_profile(sysobjectid: str | None) -> GponProfile | None:
+# --- central-served GPON profiles (data, not code — see CLAUDE.md) -----------------
+# A built-in profile expresses vendor quirks as Python callables; a central-served
+# one carries the same behavior as data from this CLOSED vocabulary: a state lookup
+# table, a pon-index strategy name, a pon-label template. Anything outside the
+# vocabulary rejects the WHOLE profile — a half-understood profile guessing at an
+# OLT is the fabricated-reading trap; a rejected one just leaves optics off.
+_STATE_VOCAB = (STATE_ONLINE, STATE_OFFLINE, STATE_DYING_GASP, STATE_LOS, STATE_UNKNOWN)
+_PON_INDEX_STRATEGIES: dict[str, Callable[[str], str]] = {
+    "as_is": lambda idx: idx,
+    "first_segment": lambda idx: idx.split(".", 1)[0] if idx else idx,
+}
+_PROFILE_OID_FIELDS = ("rx", "tx", "state", "distance", "serial", "name",
+                       "ident_key", "ident_pon", "ident_onu", "ident_state",
+                       "ident_distance", "ident_name")
+_OID_RE = re.compile(r"^\d+(\.\d+)+$")
+
+def _state_decoder(state_map: dict[str, str], default: str) -> Callable[[str], str]:
+    norm = {str(k).strip().lower(): v for k, v in state_map.items()}
+    return lambda raw: norm.get(str(raw).strip().lower(), default)
+
+def _label_formatter(template: str) -> Callable[[str], str]:
+    return lambda pon: template.replace("{pon}", str(pon))
+
+def gpon_profile_from_dict(raw: dict) -> GponProfile | None:
+    """Build a GponProfile from central-served JSON; None (logged) on anything
+    outside the closed vocabulary — never a best-effort partial profile."""
+    try:
+        name = str(raw.get("name") or "").strip().lower()
+        if not name:
+            raise ValueError("profile has no name")
+        match = str(raw.get("match_sysobjectid") or "").strip().strip(".")
+        if match and not _OID_RE.match(match):
+            raise ValueError(f"match_sysobjectid {match!r} is not an OID prefix")
+        oids: dict[str, str] = {}
+        for key, val in (raw.get("oids") or {}).items():
+            if key not in _PROFILE_OID_FIELDS:
+                raise ValueError(f"unknown oid field {key!r}")
+            oid = str(val or "").strip().strip(".")
+            if not oid:
+                continue
+            if not _OID_RE.match(oid):
+                raise ValueError(f"oids.{key} {oid!r} is not an OID")
+            oids[key] = oid
+        if not oids:
+            raise ValueError("profile maps no OIDs")
+        scales: dict[str, float] = {}
+        for key, val in (raw.get("scales") or {}).items():
+            if key not in ("rx", "tx", "distance"):
+                raise ValueError(f"unknown scale {key!r}")
+            f = float(val)
+            if not 0 < f <= 1000:
+                raise ValueError(f"scales.{key} out of range")
+            scales[key] = f
+        state_map = raw.get("state_map") or {}
+        if not isinstance(state_map, dict):
+            raise ValueError("state_map must be an object")
+        for k, v in state_map.items():
+            if v not in _STATE_VOCAB:
+                raise ValueError(f"state_map[{k!r}]={v!r} not in {_STATE_VOCAB}")
+        default_state = raw.get("state_default", STATE_UNKNOWN)
+        if default_state not in _STATE_VOCAB:
+            raise ValueError(f"state_default {default_state!r} not in {_STATE_VOCAB}")
+        pon_index = str(raw.get("pon_index") or "as_is").strip().lower()
+        if pon_index not in _PON_INDEX_STRATEGIES:
+            raise ValueError(
+                f"pon_index {pon_index!r} not in {tuple(_PON_INDEX_STRATEGIES)}")
+        pon_label = str(raw.get("pon_label") or "").strip()
+        if pon_label and "{pon}" not in pon_label:
+            raise ValueError("pon_label template must contain '{pon}'")
+    except (ValueError, TypeError, AttributeError) as exc:
+        log.warning("rejecting central GPON profile %r: %s — optics stay off for"
+                    " any OLT it would have claimed, never guessed",
+                    raw.get("name") if isinstance(raw, dict) else raw, exc)
+        return None
+    return GponProfile(
+        name=name,
+        oid_rx=oids.get("rx", ""), oid_tx=oids.get("tx", ""),
+        oid_state=oids.get("state", ""), oid_distance=oids.get("distance", ""),
+        oid_serial=oids.get("serial", ""), oid_name=oids.get("name", ""),
+        rx_scale=scales.get("rx", 0.01), tx_scale=scales.get("tx", 0.01),
+        distance_scale=scales.get("distance", 1.0),
+        decode_state=_state_decoder(state_map, default_state),
+        format_pon=_PON_INDEX_STRATEGIES[pon_index],
+        oid_ident_key=oids.get("ident_key", ""), oid_ident_pon=oids.get("ident_pon", ""),
+        oid_ident_onu=oids.get("ident_onu", ""),
+        oid_ident_state=oids.get("ident_state", ""),
+        oid_ident_distance=oids.get("ident_distance", ""),
+        oid_ident_name=oids.get("ident_name", ""),
+        format_pon_label=(_label_formatter(pon_label) if pon_label
+                          else (lambda pon: pon)),
+        match_sysobjectid=match,
+    )
+
+def match_gpon_profile(sysobjectid: str | None,
+                       extra: dict[str, GponProfile] | None = None) -> GponProfile | None:
     """Vendor auto-detect: longest sysObjectID-prefix wins (same rule as
-    health.py's match_profile — model-specific beats vendor-wide).
+    health.py's match_profile — model-specific beats vendor-wide). `extra` is
+    the central-served set: it shadows a same-named built-in outright and wins
+    equal-length prefix ties.
 
     None when no profile claims the arc: that OLT reports NO optics — we never
     probe candidate OID roots and guess. A missing reading is recoverable; a
@@ -143,14 +240,17 @@ def match_gpon_profile(sysobjectid: str | None) -> GponProfile | None:
     soid = (sysobjectid or "").strip().strip(".")
     if not soid:
         return None
+    extra = extra or {}
+    candidates = ([(p, False) for p in PROFILES.values() if p.name not in extra]
+                  + [(p, True) for p in extra.values()])
     best: GponProfile | None = None
     best_len = -1
-    for p in PROFILES.values():
+    for p, wins_ties in candidates:
         prefix = p.match_sysobjectid.strip().strip(".")
         if not prefix:
             continue
         if soid == prefix or soid.startswith(prefix + "."):
-            if len(prefix) > best_len:
+            if len(prefix) > best_len or (wins_ties and len(prefix) == best_len):
                 best, best_len = p, len(prefix)
     return best
 
@@ -404,6 +504,10 @@ class GponPollerPool:
     device `gpon_vendor` > `WISP_GPON_VENDOR` (fleet-wide escape hatch) >
     sysObjectID longest-prefix auto-detect. Nothing matches = None: that OLT
     reports no optics — never guess OIDs at a box.
+
+    Central-served profiles (`set_profiles`, riding the same /edge/devices reply
+    as snmp_profiles) shadow a same-named built-in and join auto-detect; the
+    built-ins stay as fallbacks for a fleet on an older central.
     """
 
     def __init__(self, cfg: Config = CONFIG,
@@ -415,12 +519,40 @@ class GponPollerPool:
         self._pollers: dict[str, GponPoller] = {}
         self._detector = detector  # .read(target) -> str | None; lazily built
         self._detected: dict[object, tuple[str | None, float]] = {}
+        self._central: dict[str, GponProfile] = {}
+        self._central_fp: str | None = None
+
+    def set_profiles(self, raw: list[dict] | None) -> None:
+        """Install central-served profiles. Cheap no-op when the payload hasn't
+        changed — this runs every topology refresh, and rebuilding a poller means
+        a fresh SnmpEngine (see the engine-reuse invariant), so pollers rebuild
+        only on an actual edit."""
+        if raw is None:
+            return
+        fp = json.dumps(raw, sort_keys=True, default=str)
+        if fp == self._central_fp:
+            return
+        self._central_fp = fp
+        parsed: dict[str, GponProfile] = {}
+        for d in raw:
+            p = gpon_profile_from_dict(d) if isinstance(d, dict) else None
+            if p is not None:
+                parsed[p.name] = p
+        stale = set(self._central) | set(parsed)
+        self._central = parsed
+        for name in stale:
+            self._pollers.pop(name, None)
+        log.info("central GPON profiles installed: %s",
+                 ", ".join(sorted(parsed)) or "(none)")
+
+    def _profile_named(self, name: str) -> GponProfile | None:
+        return self._central.get(name) or PROFILES.get(name)
 
     def for_vendor(self, vendor: str | None) -> GponPoller | None:
         name = (vendor or "").strip().lower() or self._fallback
         if not name:
             return None
-        profile = PROFILES.get(name)
+        profile = self._profile_named(name)
         if profile is None:
             log.warning("unknown GPON vendor %r; optics skipped — never guess OIDs", name)
             return None
@@ -448,7 +580,7 @@ class GponPollerPool:
         soid = await self._sysobjectid(device.get("id") or target.ip, target)
         if soid is None:
             return None, {"vendor": None, "sysobjectid": None, "reason": "no_response"}
-        profile = match_gpon_profile(soid)
+        profile = match_gpon_profile(soid, self._central)
         if profile is None:
             log.debug("OLT %s (%s): sysObjectID %r matches no GPON profile; optics off",
                       device.get("id"), target.ip, soid)

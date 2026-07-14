@@ -383,5 +383,127 @@ class SnmpProfileTest(unittest.TestCase):
         self.assertEqual({p["name"] for p in body["snmp_profiles"]}, {"global"})
 
 
+class GponProfileTest(unittest.TestCase):
+    """GPON vendor profiles as data — same auth shape as SNMP health profiles."""
+
+    setUp = SnmpProfileTest.setUp
+    tearDown = SnmpProfileTest.tearDown
+    _req = SnmpWalkHttpTest._req
+    _login = SnmpWalkHttpTest._login
+
+    @staticmethod
+    def _payload(name="vsol", org_id=None, enabled=True, **over):
+        p = {"name": name, "match_sysobjectid": "1.3.6.1.4.1.999",
+             "oids": {"ident_key": "1.3.6.1.4.1.999.1.6",
+                      "ident_state": "1.3.6.1.4.1.999.1.5"},
+             "scales": {"rx": 0.1},
+             "state_map": {"1": "online", "0": "offline"},
+             "state_default": "offline", "pon_index": "first_segment",
+             "pon_label": "EPON0/{pon}", "enabled": enabled}
+        if org_id is not None:
+            p["org_id"] = org_id
+        p.update(over)
+        return p
+
+    def test_superadmin_creates_global_owner_creates_org_local(self):
+        root = self._login("root", "rootpassword")
+        status, body, _ = self._req("POST", "/api/gpon-profiles",
+                                    self._payload(), cookie=root)
+        self.assertEqual(status, 200, body)
+        owner = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/gpon-profiles",
+                                    self._payload(name="local"), cookie=owner)
+        self.assertEqual(status, 200, body)
+        status, body, _ = self._req("GET", "/api/gpon-profiles", cookie=owner)
+        self.assertEqual({p["name"] for p in body["profiles"]}, {"vsol", "local"})
+        bowner = self._login("bowner", "bownerpassword")
+        status, body, _ = self._req("GET", "/api/gpon-profiles", cookie=bowner)
+        self.assertEqual({p["name"] for p in body["profiles"]}, {"vsol"})
+        # The closed vocabulary rides the reply for the profile editor UI.
+        self.assertIn("first_segment", body["pon_index_strategies"])
+        self.assertIn("dying_gasp", body["states"])
+
+    def test_owner_cannot_touch_a_global_profile(self):
+        root = self._login("root", "rootpassword")
+        status, body, _ = self._req("POST", "/api/gpon-profiles",
+                                    self._payload(), cookie=root)
+        pid = body["id"]
+        owner = self._login("owner", "ownerpassword")
+        payload = self._payload(name="hijack")
+        payload["id"] = pid
+        status, _, _ = self._req("POST", "/api/gpon-profiles/update", payload,
+                                 cookie=owner)
+        self.assertEqual(status, 403)
+        status, _, _ = self._req("POST", "/api/gpon-profiles/delete", {"id": pid},
+                                 cookie=owner)
+        self.assertEqual(status, 403)
+
+    def test_validation_rejects_outside_the_vocabulary(self):
+        root = self._login("root", "rootpassword")
+        for bad in (self._payload(oids={"rx": "not-an-oid"}),
+                    self._payload(oids={"fan": "1.2.3"}),
+                    self._payload(oids={}),
+                    self._payload(state_map={"1": "sleeping"}),
+                    self._payload(pon_index="regex"),
+                    self._payload(pon_label="EPON0/1")):
+            status, body, _ = self._req("POST", "/api/gpon-profiles", bad,
+                                        cookie=root)
+            self.assertEqual(status, 422, body)
+
+    def test_edge_devices_reply_carries_the_spec_the_edge_parses(self):
+        root = self._login("root", "rootpassword")
+        self._req("POST", "/api/gpon-profiles", self._payload(), cookie=root)
+        self._req("POST", "/api/gpon-profiles",
+                  self._payload(name="off", enabled=False), cookie=root)
+        status, body, _ = self._req("GET", "/edge/devices?org_id=ispA", token="tok")
+        self.assertEqual(status, 200)
+        self.assertEqual([p["name"] for p in body["gpon_profiles"]], ["vsol"])
+        # The wire shape must round-trip through the edge's validator.
+        from wisp.ingress.gpon import gpon_profile_from_dict
+        p = gpon_profile_from_dict(body["gpon_profiles"][0])
+        self.assertIsNotNone(p)
+        self.assertEqual(p.decode_state("1"), "online")
+        self.assertEqual(p.format_pon_label("2"), "EPON0/2")
+
+
+class PollIntervalTest(unittest.TestCase):
+    """Dashboard-set probe cadence, delivered over the topology channel."""
+
+    setUp = SnmpProfileTest.setUp
+    tearDown = SnmpProfileTest.tearDown
+    _req = SnmpWalkHttpTest._req
+    _login = SnmpWalkHttpTest._login
+
+    def test_set_clamp_and_clear(self):
+        owner = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("POST", "/api/org",
+                                 {"org_id": "ispA", "poll_interval_s": 30},
+                                 cookie=owner)
+        self.assertEqual(status, 200)
+        status, body, _ = self._req("GET", "/edge/devices?org_id=ispA", token="tok")
+        self.assertEqual(body["poll_interval_s"], 30)
+        # Out of the 10-120s window: the fleet watchdog pages NODE_STALE at 180s,
+        # so a slower cadence must be refused, not stored.
+        for bad in (5, 300, "soon"):
+            status, _, _ = self._req("POST", "/api/org",
+                                     {"org_id": "ispA", "poll_interval_s": bad},
+                                     cookie=owner)
+            self.assertEqual(status, 422, bad)
+        # null clears back to automatic.
+        status, _, _ = self._req("POST", "/api/org",
+                                 {"org_id": "ispA", "poll_interval_s": None},
+                                 cookie=owner)
+        self.assertEqual(status, 200)
+        status, body, _ = self._req("GET", "/edge/devices?org_id=ispA", token="tok")
+        self.assertIsNone(body["poll_interval_s"])
+
+    def test_owner_cannot_set_another_orgs_interval(self):
+        owner = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("POST", "/api/org",
+                                 {"org_id": "ispB", "poll_interval_s": 30},
+                                 cookie=owner)
+        self.assertEqual(status, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

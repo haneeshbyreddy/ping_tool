@@ -379,7 +379,10 @@ export function OpticalPanel({ device, focusOnuId }: {
       b.crit - a.crit || (a.worstRx ?? 0) - (b.worstRx ?? 0))[0].port
   }, [pons])
 
-  const [openPort, setOpenPort] = useState<string | null | undefined>(undefined)
+  // PONs start collapsed on open — the tech expands the one they want, rather
+  // than the worst PON springing open every time. A map spoke click-through
+  // still auto-opens its ONU's PON (the focusPort effect below).
+  const [openPort, setOpenPort] = useState<string | null>(null)
   const focusPort = useMemo(() => {
     if (focusOnuId == null) return null
     const o = (q.data?.onus ?? []).find((x) => x.id === focusOnuId)
@@ -388,9 +391,9 @@ export function OpticalPanel({ device, focusOnuId }: {
   useEffect(() => {
     if (focusPort != null) setOpenPort(focusPort)
   }, [focusPort, focusOnuId])
-  const activePort = openPort === undefined ? worstPon : openPort
+  const activePort = openPort
   const toggle = (port: string) =>
-    setOpenPort((prev) => ((prev === undefined ? worstPon : prev) === port ? null : port))
+    setOpenPort((prev) => (prev === port ? null : port))
 
   if (q.isLoading) return <Skeleton className="h-40 w-full" />
   if (q.error) {

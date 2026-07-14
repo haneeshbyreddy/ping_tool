@@ -38,7 +38,9 @@ def devices(h, qs):
     else:
         devs = [d for d in devs if d.get("assigned_node_id")]
     h._reply(200, {"devices": devs, "canary_ip": h.cfg.canary_ip,
-                   "snmp_profiles": h.store.snmp_profiles_for_edge(org)})
+                   "snmp_profiles": h.store.snmp_profiles_for_edge(org),
+                   "gpon_profiles": h.store.gpon_profiles_for_edge(org),
+                   "poll_interval_s": h.store.org_poll_interval(org)})
 
 
 def heartbeat_reply(h, org: str, node: str, body: dict) -> dict:

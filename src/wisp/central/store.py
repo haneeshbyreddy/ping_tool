@@ -517,6 +517,23 @@ CREATE TABLE IF NOT EXISTS snmp_profiles (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
+-- GPON/EPON vendor profiles as data — the optics counterpart of snmp_profiles.
+-- spec is the whole closed-vocabulary JSON the edge's gpon_profile_from_dict
+-- (ingress/gpon.py) validates: oids{rx,tx,state,distance,serial,name,ident_*},
+-- scales, state_map, state_default, pon_index, pon_label. Delivered in the
+-- GET /edge/devices reply; built-in huawei/dbc profiles stay in edge code as
+-- fallbacks (a same-named row here shadows them), so validating a new vendor's
+-- OIDs is a dashboard row, never an edge rollout.
+CREATE TABLE IF NOT EXISTS gpon_profiles (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id            TEXT,              -- NULL => global
+    name              TEXT NOT NULL,
+    match_sysobjectid TEXT NOT NULL DEFAULT '',
+    spec              TEXT NOT NULL,     -- JSON, closed vocabulary (see above)
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
 -- Per-device, per-subsystem SNMP sweep diagnosis, reported by the edge on every
 -- SNMP cadence ("snmp_status" on the full report). This is what lets the dashboard
 -- say WHY a panel is blank (agent silent vs subtree empty vs walk timeout vs no
@@ -598,7 +615,12 @@ class CentralStore(
                 # (google_maps_key briefly lived here too — moved to app_settings
                 # 2026-07-11, one superadmin key for every org; the org column may
                 # linger in older DBs, dead.)
-                ("map_region", "TEXT")))
+                ("map_region", "TEXT"),
+                # Dashboard-set probe cadence for this org's edges, seconds.
+                # NULL = automatic (edge env/adaptive default). API clamps to
+                # 10–120s: past 120s the fleet watchdog's 180s stale threshold
+                # would page NODE_STALE for a healthy probe.
+                ("poll_interval_s", "INTEGER")))
             self._ensure_columns(conn, "switch_ports", (
                 ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
                 ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),

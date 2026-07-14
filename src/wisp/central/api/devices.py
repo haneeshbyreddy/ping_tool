@@ -327,6 +327,61 @@ def profile_delete(h, user, body):
     _profile_mutate(h, user, body, delete=True)
 
 
+# ----- GPON vendor profiles (optics counterpart, same auth shape) -------------
+
+def gpon_profiles(h, qs):
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = h._scope_org(user, qs)
+    h._reply(200, {"profiles": h.store.list_gpon_profiles(org),
+                   "oid_fields": list(inventory.GPON_PROFILE_OIDS),
+                   "states": list(inventory.GPON_PROFILE_STATES),
+                   "pon_index_strategies": list(inventory.GPON_PON_INDEX_STRATEGIES)})
+
+
+def gpon_profile_create(h, user, body):
+    clean = inventory.clean_gpon_profile_payload(body)
+    # org_id NULL = a GLOBAL profile every org's edges receive —
+    # superadmin only. An org owner creates org-local ones.
+    if user["is_superadmin"]:
+        org = body.get("org_id") or None
+    else:
+        org = user["org_id"]
+    if org is not None and not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    pid = h.store.create_gpon_profile(org, clean)
+    h._reply(200, {"id": pid})
+
+
+def _gpon_profile_mutate(h, user, body, *, delete: bool):
+    profile = h.store.get_gpon_profile(int(body.get("id") or 0))
+    if not profile:
+        h._reply(404, {"error": "profile not found"})
+        return
+    org = profile["org_id"]
+    allowed = (user["is_superadmin"] if org is None
+               else h._can_write(user, org))
+    if not allowed:
+        h._reply(403, {"error": "forbidden"})
+        return
+    if delete:
+        ok = h.store.delete_gpon_profile(profile["id"])
+    else:
+        clean = inventory.clean_gpon_profile_payload(body)
+        ok = h.store.update_gpon_profile(profile["id"], clean)
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
+def gpon_profile_update(h, user, body):
+    _gpon_profile_mutate(h, user, body, delete=False)
+
+
+def gpon_profile_delete(h, user, body):
+    _gpon_profile_mutate(h, user, body, delete=True)
+
+
 # ----- switch ports ----------------------------------------------------------
 
 def port_monitored(h, user, body):

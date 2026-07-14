@@ -594,6 +594,79 @@ class SnmpStoreMixin:
         return out
 
 
+    # ----- GPON vendor profiles (optics counterpart of snmp_profiles) --------
+
+    @staticmethod
+    def _gpon_row(row) -> dict:
+        out = dict(row)
+        try:
+            out["spec"] = json.loads(out["spec"])
+        except (TypeError, ValueError):
+            out["spec"] = {}
+        out["enabled"] = bool(out["enabled"])
+        return out
+
+    def list_gpon_profiles(self, org_id: str | None) -> list[dict]:
+        # An org sees global profiles + its own; superadmin scope (None) sees all.
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM gpon_profiles ORDER BY org_id IS NOT NULL, name")
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM gpon_profiles WHERE org_id IS NULL OR org_id=?"
+                    " ORDER BY org_id IS NOT NULL, name", (org_id,))
+            return [self._gpon_row(r) for r in rows.fetchall()]
+
+    def gpon_profiles_for_edge(self, org_id: str) -> list[dict]:
+        # The wire shape IS the spec (name/match riding inside it) — exactly what
+        # ingress/gpon.py's gpon_profile_from_dict validates.
+        out = []
+        for p in self.list_gpon_profiles(org_id):
+            if not p["enabled"]:
+                continue
+            spec = dict(p["spec"])
+            spec["name"] = p["name"]
+            spec["match_sysobjectid"] = p["match_sysobjectid"]
+            out.append(spec)
+        return out
+
+    def create_gpon_profile(self, org_id: str | None, clean: dict) -> int:
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO gpon_profiles (org_id, name, match_sysobjectid, spec,"
+                " enabled, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (org_id, clean["name"], clean["match_sysobjectid"],
+                 json.dumps(clean["spec"], separators=(",", ":")),
+                 1 if clean.get("enabled", True) else 0, now, now))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def update_gpon_profile(self, profile_id: int, clean: dict) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE gpon_profiles SET name=?, match_sysobjectid=?, spec=?,"
+                " enabled=?, updated_at=? WHERE id=?",
+                (clean["name"], clean["match_sysobjectid"],
+                 json.dumps(clean["spec"], separators=(",", ":")),
+                 1 if clean.get("enabled", True) else 0, _now_iso(), profile_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def delete_gpon_profile(self, profile_id: int) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM gpon_profiles WHERE id=?", (profile_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_gpon_profile(self, profile_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM gpon_profiles WHERE id=?",
+                               (profile_id,)).fetchone()
+        return self._gpon_row(row) if row else None
+
+
     def admin_overview(self, fresh_window_s: int = 900,
                        now: datetime | None = None) -> dict:
         """Superadmin fleet coverage: per org, how much of the configured

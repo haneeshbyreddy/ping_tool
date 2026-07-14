@@ -458,9 +458,26 @@ async def _run_central_brain(
     devices = topo.get("devices") or []
     canary_ip = topo.get("canary_ip") or cfg.canary_ip
     snmp_profiles = topo.get("snmp_profiles") or []
+    gpon_profiles = topo.get("gpon_profiles")
+
+    def _pick_interval(central_s) -> float:
+        # CLI flag > central org setting (dashboard, refreshed every cycle) >
+        # env/adaptive default. The central value is clamped to the same 10–120s
+        # window the API enforces — a stale/hand-edited row must never stretch the
+        # cadence past the fleet watchdog's stale threshold (180s default) or a
+        # healthy probe pages NODE_STALE.
+        if cli_interval is not None:
+            return cli_interval
+        try:
+            central_s = int(central_s or 0)
+        except (TypeError, ValueError):
+            central_s = 0
+        if central_s > 0:
+            return float(min(120, max(10, central_s)))
+        return float(cfg.effective_interval(len(devices)))
 
     cli_interval = interval
-    interval = cli_interval if cli_interval is not None else cfg.effective_interval(len(devices))
+    interval = _pick_interval(topo.get("poll_interval_s"))
     status.set_interval(interval)
     print(
         f"central-brain mode: probing {len(devices)} device(s) for "
@@ -472,6 +489,8 @@ async def _run_central_brain(
     next_snmp = 0.0
     snmp_task: asyncio.Task | None = None
     gpon_pool = GponPollerPool(cfg) if cfg.snmp_interval_s > 0 else None
+    if gpon_pool is not None:
+        gpon_pool.set_profiles(gpon_profiles)
     gpon_task: asyncio.Task | None = None
     health_poller = build_health_poller(cfg) if cfg.snmp_interval_s > 0 else None
     health_task: asyncio.Task | None = None
@@ -485,6 +504,16 @@ async def _run_central_brain(
                 devices = topo.get("devices") or devices
                 canary_ip = topo.get("canary_ip") or canary_ip
                 snmp_profiles = topo.get("snmp_profiles") or snmp_profiles
+                # None (older central) keeps last-known; [] is a real "no
+                # central profiles" and must clear them, so no `or` fallback.
+                if topo.get("gpon_profiles") is not None:
+                    gpon_profiles = topo.get("gpon_profiles")
+                new_interval = _pick_interval(topo.get("poll_interval_s"))
+                if new_interval != interval:
+                    log.info("probe interval changed %.0fs -> %.0fs (central org"
+                             " setting)", interval, new_interval)
+                    interval = new_interval
+                    status.set_interval(interval)
             except CentralClientError as exc:
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
@@ -494,6 +523,7 @@ async def _run_central_brain(
                 snmp_task = asyncio.create_task(
                     _gather_snmp_ports(snmp_poller, list(devices), cfg))
             if gpon_pool is not None:
+                gpon_pool.set_profiles(gpon_profiles)
                 gpon_task = asyncio.create_task(
                     _gather_onu_optics(gpon_pool, list(devices), cfg))
             if health_poller is not None:

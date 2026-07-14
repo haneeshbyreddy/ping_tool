@@ -56,6 +56,23 @@ class OrgStoreMixin:
             conn.commit()
 
 
+    def set_org_poll_interval(self, org_id: str, seconds: int | None) -> None:
+        # Not folded into set_org: its COALESCE pattern can't write NULL, and
+        # NULL ("automatic") is a legitimate target state here.
+        with self._write_lock, self._connect() as conn:
+            self._ensure_org(conn, org_id, _now_iso())
+            conn.execute("UPDATE orgs SET poll_interval_s=? WHERE org_id=?",
+                         (seconds, org_id))
+            conn.commit()
+
+
+    def org_poll_interval(self, org_id: str) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT poll_interval_s FROM orgs WHERE org_id=?",
+                               (org_id,)).fetchone()
+        return row["poll_interval_s"] if row else None
+
+
     def org_topic(self, org_id: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute("SELECT ntfy_topic FROM orgs WHERE org_id=?",
@@ -86,6 +103,7 @@ class OrgStoreMixin:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
                 " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
+                " o.poll_interval_s,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
                 " FROM orgs o ORDER BY o.org_id")]
 

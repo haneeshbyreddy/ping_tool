@@ -24,6 +24,8 @@ export interface Org {
   map_region: string | null
   // the superadmin's server-wide Map Tiles key, injected into every org row
   google_maps_key: string | null
+  // dashboard-set probe cadence for this org's edges; null = automatic
+  poll_interval_s: number | null
   node_count: number
 }
 
@@ -423,6 +425,35 @@ export interface SnmpProfilesResponse {
   metrics: string[]
   decodes: string[]
   selects: string[]
+}
+
+/** Closed-vocabulary GPON/EPON vendor spec — what the edge's
+ *  gpon_profile_from_dict validates. All fields optional except oids. */
+export interface GponProfileSpec {
+  oids: Record<string, string>
+  scales: Record<string, number>
+  state_map: Record<string, string>
+  state_default: string
+  pon_index: string
+  pon_label: string
+}
+
+export interface GponProfile {
+  id: number
+  org_id: string | null // null = global (every org's edges receive it)
+  name: string
+  match_sysobjectid: string
+  spec: GponProfileSpec
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface GponProfilesResponse {
+  profiles: GponProfile[]
+  oid_fields: string[]
+  states: string[]
+  pon_index_strategies: string[]
 }
 
 export type SnmpSubsystem = "health" | "ports" | "optics"

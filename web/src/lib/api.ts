@@ -1,5 +1,5 @@
 import type {
-  AccountUser, AdminOverview, AttendanceOverview, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  AccountUser, AdminOverview, AttendanceOverview, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
   PonFault, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   Summary, SwitchPort, SystemStats, TrendBucket, Worker,
@@ -59,6 +59,7 @@ export const orgsApi = {
     org_id: string; name?: string | null
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
     map_region?: string | null
+    poll_interval_s?: number | null
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
@@ -158,6 +159,29 @@ export const snmpApi = {
   }) => request<{ ok: boolean }>("/api/snmp-profiles/update", { method: "POST", body: { id, ...body } }),
   removeProfile: (id: number) =>
     request<{ ok: boolean }>("/api/snmp-profiles/delete", { method: "POST", body: { id } }),
+}
+
+export interface GponProfilePayload {
+  org_id?: string
+  name: string
+  match_sysobjectid: string
+  oids: Record<string, string>
+  scales: Record<string, number>
+  state_map: Record<string, string>
+  state_default: string
+  pon_index: string
+  pon_label: string
+  enabled: boolean
+}
+
+export const gponApi = {
+  profiles: (org?: string | null) => request<GponProfilesResponse>(`/api/gpon-profiles${tq(org)}`),
+  createProfile: (body: GponProfilePayload) =>
+    request<{ id: number }>("/api/gpon-profiles", { method: "POST", body }),
+  updateProfile: (id: number, body: GponProfilePayload) =>
+    request<{ ok: boolean }>("/api/gpon-profiles/update", { method: "POST", body: { id, ...body } }),
+  removeProfile: (id: number) =>
+    request<{ ok: boolean }>("/api/gpon-profiles/delete", { method: "POST", body: { id } }),
 }
 
 export const analyticsApi = {
