@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 def _slot(m: dict) -> str:
     onu = m.get("onu_id")
     return (f"{m.get('device_name') or '?'} PON {m.get('pon_port') or '?'}"
-            f" ONU {onu if onu is not None else '?'}")
+            f" ONU {onu if onu is not None else '?'}"
+            f" ({m.get('state') or 'unknown'})")
 
 
 class OnuRosterAlerter:
@@ -73,8 +74,15 @@ class OnuRosterAlerter:
                     f"This PON is full — no more subscribers can be provisioned on it.",
                     f.device_id, ts, "ONU_LIMIT", gate=self.cfg.onu_limit_alerts)
 
+        # Clearing needs a FRESH walk that actually shows the PON below its
+        # limit. A stale OLT is skipped by the math, so its faults vanish from
+        # `current` — freeze those (skip = no verdict, the ponfault rule) or a
+        # slow C-Data agent turns every stall into a page/clear storm.
+        fresh_devs = onuroster.fresh_device_ids(rows, now)
         for key, was in prior.items():
             if key in current or not was["active"]:
+                continue
+            if key[0] not in fresh_devs:
                 continue
             self.store.upsert_pon_capacity_state(
                 self.org_id, key[0], key[1], onus=0, active=False, since=None, ts=ts)
@@ -90,31 +98,58 @@ class OnuRosterAlerter:
         dups = onuroster.duplicate_macs(rows, now)
         prior = self.store.onu_dup_mac_states(self.org_id)
         current = {d.mac: d for d in dups}
+        # Staleness-blind view of the same rosters: a MAC absent from `current`
+        # but still duplicated here only "cleared" because an OLT's walk went
+        # stale. Freeze those — clearing (and re-paging when the walk returns)
+        # is exactly the storm this fleet already produced once.
+        shadow = {d.mac for d in onuroster.duplicate_macs(rows, now, stale_s=None)}
 
         for mac, d in current.items():
             was = prior.get(mac)
+            # Pages fire only for a LIVE conflict — ≥2 slots online at once
+            # (clone/loop). C-Data reg tables keep every slot an ONU ever
+            # occupied, so a duplicate with dead members is history, not a
+            # fault: state is written (dashboard), the operator's phone stays
+            # quiet. Field census 2026-07-14: 178 duplicates, 2 live.
+            live = d.online_members >= 2
+            was_live = bool(was and was["active"]
+                            and (was["online_members"] or 0) >= 2)
             fresh = not (was and was["active"])
             self.store.upsert_onu_dup_mac_state(
-                self.org_id, mac, members=len(d.members), active=True,
+                self.org_id, mac, members=len(d.members),
+                online_members=d.online_members, active=True,
                 since=(ts if fresh or not was else was["since"]) or ts, ts=ts)
-            if fresh:
+            if live and not was_live:
                 where = "; ".join(_slot(m) for m in d.members)
                 self._page(
                     f"⚠️ Duplicate ONU MAC — {mac}",
-                    f"MAC {mac} is registered on {len(d.members)} ONU slots: {where}. "
-                    f"Likely a cloned CPE, a bridging loop, or a stale "
-                    f"double-registration — check before it flaps subscribers.",
+                    f"MAC {mac} is ONLINE on {d.online_members} ONU slots at once"
+                    f" ({len(d.members)} registered): {where}. Likely a cloned CPE"
+                    f" or a bridging loop — check before it flaps subscribers.",
+                    d.members[0]["device_id"], ts, "ONU_DUP_MAC",
+                    gate=self.cfg.onu_dup_mac_alerts)
+            elif was_live and not live:
+                self._page(
+                    f"✅ Duplicate MAC no longer live — {mac}",
+                    f"MAC {mac} is online on at most one ONU slot again. Stale"
+                    f" registration rows may remain on the OLT.",
                     d.members[0]["device_id"], ts, "ONU_DUP_MAC",
                     gate=self.cfg.onu_dup_mac_alerts)
 
         for mac, was in prior.items():
             if mac in current or not was["active"]:
                 continue
+            if mac in shadow:
+                continue  # absence explained by a stale walk — no verdict
+            was_live = (was["online_members"] or 0) >= 2
             self.store.upsert_onu_dup_mac_state(
-                self.org_id, mac, members=0, active=False, since=None, ts=ts)
-            self._page(f"✅ Duplicate MAC cleared — {mac}",
-                       f"MAC {mac} is no longer registered on more than one ONU slot.",
-                       None, ts, "ONU_DUP_MAC", gate=self.cfg.onu_dup_mac_alerts)
+                self.org_id, mac, members=0, online_members=0, active=False,
+                since=None, ts=ts)
+            if was_live:
+                self._page(
+                    f"✅ Duplicate MAC cleared — {mac}",
+                    f"MAC {mac} is no longer registered on more than one ONU slot.",
+                    None, ts, "ONU_DUP_MAC", gate=self.cfg.onu_dup_mac_alerts)
 
     # --- shared plumbing (mirrors ponalert._page) ------------------------------
 

@@ -457,6 +457,10 @@ CREATE TABLE IF NOT EXISTS onu_dup_mac_state (
     org_id     TEXT NOT NULL,
     mac        TEXT NOT NULL,                -- normalized (.strip().upper())
     members    INTEGER NOT NULL DEFAULT 0,   -- distinct slots sharing the MAC
+    -- slots ONLINE at once; >=2 = live clone/loop and the only case that pages
+    -- (C-Data reg tables keep every slot an ONU ever occupied, so dead-member
+    -- duplicates are history, not faults — state only, no ntfy)
+    online_members INTEGER NOT NULL DEFAULT 0,
     active     INTEGER NOT NULL DEFAULT 0,
     since      TEXT,
     updated_at TEXT NOT NULL,
@@ -621,6 +625,8 @@ class CentralStore(
                 # 10–120s: past 120s the fleet watchdog's 180s stale threshold
                 # would page NODE_STALE for a healthy probe.
                 ("poll_interval_s", "INTEGER")))
+            self._ensure_columns(conn, "onu_dup_mac_state", (
+                ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "switch_ports", (
                 ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
                 ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),

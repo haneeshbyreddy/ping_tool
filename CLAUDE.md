@@ -157,14 +157,21 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   at 1:64, so a PON at its limit pages "at capacity" (`cfg.onu_pon_limit` default
   64, per-OLT `org_devices.onu_pon_limit` override so a 1:128 GPON box doesn't
   false-page; gated `cfg.onu_limit_alerts`, `pon_capacity_state`). **Redundant MAC**
-  — a serial/MAC on ≥2 ONU slots (org-wide) pages "duplicate ONU MAC" (clone/loop/
-  double-registration; gated `cfg.onu_dup_mac_alerts`, `onu_dup_mac_state`). Both
-  read only `onuroster.current_roster` — per OLT, the rows from the FRESHEST walk
-  (identical `updated_at`) and skip an OLT staler than 900s — because `onu_optics`
-  NEVER deletes removed-ONU rows, so counting raw rows would over-count the cap and
-  fake duplicates off zombie rows. `list_org_devices` MUST carry `onu_pon_limit` or
-  the override silently no-ops in paging. Tests: `unit/test_onuroster`,
-  `integration/test_central_onualert`.
+  — a serial/MAC on ≥2 ONU slots (org-wide) is a duplicate (`onu_dup_mac_state`),
+  but it PAGES only when ≥2 slots are ONLINE at once (`online_members`, gated
+  `cfg.onu_dup_mac_alerts`) — field-proven 2026-07-14: C-Data reg tables keep every
+  slot an ONU ever occupied, so the byreddy fleet had 178 "duplicates" of which 2
+  were live clones/loops; dead-member dups are history, state-only, never ntfy.
+  Both read only `onuroster.current_roster` — per OLT, the rows from the FRESHEST
+  walk (identical `updated_at`) and skip an OLT staler than 900s — because
+  `onu_optics` NEVER deletes removed-ONU rows, so counting raw rows would
+  over-count the cap and fake duplicates off zombie rows. **A stale OLT FREEZES
+  its alert states, never clears them** (dup absence is checked against the
+  staleness-blind `duplicate_macs(stale_s=None)` shadow; capacity clears require
+  the device in `fresh_device_ids`) — clearing on staleness re-paged 178 MACs
+  every time a slow C-Data walk stalled (the 2026-07-14 storm). `list_org_devices`
+  MUST carry `onu_pon_limit` or the override silently no-ops in paging. Tests:
+  `unit/test_onuroster`, `integration/test_central_onualert`.
 - **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` =
   splitter/fdb/closure), NOT a second registry: parent chains, map pins, routes
   all come free. `ip_address` stays `''` (the NOT NULL column survives);

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
 from wisp.central.onuroster import (capacity_faults, current_roster,
-                                    duplicate_macs)
+                                    duplicate_macs, fresh_device_ids)
 
 NOW = datetime(2026, 7, 13, 10, 0, 0, tzinfo=timezone.utc)
 
@@ -123,6 +123,40 @@ class DuplicateMacTest(unittest.TestCase):
                 _onu("0/2.0", device_id=1, pon_port="0/2", updated_min_ago=20,
                      serial="CAFE")]
         self.assertEqual(duplicate_macs(rows, NOW), [])
+
+    def test_online_members_counts_live_slots_only(self):
+        # C-Data reg tables keep every slot an ONU ever occupied; an offline
+        # ghost row makes members=2 but online_members=1 — history, not a fault
+        rows = [_onu("0/1.0", device_id=1, serial="CAFE", state="online"),
+                _onu("0/2.0", device_id=1, pon_port="0/2", serial="CAFE",
+                     state="offline")]
+        d = duplicate_macs(rows, NOW)[0]
+        self.assertEqual(len(d.members), 2)
+        self.assertEqual(d.online_members, 1)
+        rows[1]["state"] = "online"
+        self.assertEqual(duplicate_macs(rows, NOW)[0].online_members, 2)
+
+    def test_stale_blind_view_keeps_stale_olts(self):
+        # stale_s=None is the shadow view alerting uses to tell "genuinely
+        # gone" from "walk went stale" — the stale OLT's dup must still show
+        rows = [_onu("0/1.0", device_id=1, serial="CAFE"),
+                _onu("0/2.0", device_id=2, device_name="OLT-B", pon_port="0/2",
+                     serial="CAFE", updated_min_ago=30)]
+        self.assertEqual(duplicate_macs(rows, NOW), [])
+        shadow = duplicate_macs(rows, NOW, stale_s=None)
+        self.assertEqual(len(shadow), 1)
+        self.assertEqual(shadow[0].mac, "CAFE")
+
+
+class FreshDeviceIdsTest(unittest.TestCase):
+
+    def test_only_recently_walked_olts_are_fresh(self):
+        rows = _pon(1, "0/1", 2, updated_min_ago=1) + _pon(2, "0/2", 2,
+                                                           updated_min_ago=30)
+        self.assertEqual(fresh_device_ids(rows, NOW), {1})
+
+    def test_no_rows_means_nothing_fresh(self):
+        self.assertEqual(fresh_device_ids([], NOW), set())
 
 
 if __name__ == "__main__":

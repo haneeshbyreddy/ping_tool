@@ -77,14 +77,20 @@ class PonCap:
 class DupMac:
     mac: str
     members: tuple[dict, ...]   # {device_id, device_name, pon_port, onu_id, onu_key, state}
+    online_members: int = 0     # slots currently ONLINE — ≥2 is a live clone/loop;
+                                # fewer is C-Data reg-table history (an ONU that
+                                # moved slots leaves its old row forever, offline)
 
     def as_dict(self) -> dict:
-        return {"mac": self.mac, "members": [dict(m) for m in self.members]}
+        return {"mac": self.mac, "members": [dict(m) for m in self.members],
+                "online_members": self.online_members}
 
 
 def current_roster(rows: list[dict], now: datetime, *,
-                   stale_s: int = STALE_S) -> list[dict]:
-    """Per-OLT, the rows from that OLT's freshest walk; stale OLTs dropped."""
+                   stale_s: int | None = STALE_S) -> list[dict]:
+    """Per-OLT, the rows from that OLT's freshest walk; stale OLTs dropped.
+    `stale_s=None` keeps stale OLTs (the staleness-blind view callers use to
+    tell 'genuinely gone' from 'walk went stale')."""
     now = _naive_utc(now)
     by_dev: dict[int, list[dict]] = {}
     for r in rows:
@@ -94,11 +100,28 @@ def current_roster(rows: list[dict], now: datetime, *,
     for onus in by_dev.values():
         newest = max((t for r in onus if (t := _ts(r.get("updated_at")))),
                      default=None)
-        if newest is None or (now - newest).total_seconds() > stale_s:
+        if newest is None:
+            continue
+        if stale_s is not None and (now - newest).total_seconds() > stale_s:
             continue
         out.extend(r for r in onus
                    if (t := _ts(r.get("updated_at"))) is not None and t == newest)
     return out
+
+
+def fresh_device_ids(rows: list[dict], now: datetime, *,
+                     stale_s: int = STALE_S) -> set[int]:
+    """OLTs whose newest walk is fresh — the ones this sweep actually observed.
+    A verdict about a device NOT in this set is a guess; alerting must freeze
+    its state rather than clear it (skip = no verdict, the ponfault rule)."""
+    now = _naive_utc(now)
+    newest: dict[int, datetime] = {}
+    for r in rows:
+        t = _ts(r.get("updated_at"))
+        if t is not None and (r["device_id"] not in newest or t > newest[r["device_id"]]):
+            newest[r["device_id"]] = t
+    return {dev for dev, t in newest.items()
+            if (now - t).total_seconds() <= stale_s}
 
 
 def capacity_faults(rows: list[dict], now: datetime,
@@ -126,11 +149,12 @@ def capacity_faults(rows: list[dict], now: datetime,
     return out
 
 
-def duplicate_macs(rows: list[dict], now: datetime) -> list[DupMac]:
+def duplicate_macs(rows: list[dict], now: datetime, *,
+                   stale_s: int | None = STALE_S) -> list[DupMac]:
     """MACs (serials) registered on ≥ 2 distinct ONU slots across the org's
     current roster."""
     groups: dict[str, dict[tuple[int, str], dict]] = {}
-    for r in current_roster(rows, now):
+    for r in current_roster(rows, now, stale_s=stale_s):
         mac = _norm_mac(r.get("serial"))
         if not mac:
             continue
@@ -151,6 +175,8 @@ def duplicate_macs(rows: list[dict], now: datetime) -> list[DupMac]:
         members = sorted(slots.values(),
                          key=lambda m: (m["device_name"], m["pon_port"] or "",
                                         m["onu_id"] if m["onu_id"] is not None else -1))
-        out.append(DupMac(mac=mac, members=tuple(members)))
-    out.sort(key=lambda d: (-len(d.members), d.mac))
+        out.append(DupMac(mac=mac, members=tuple(members),
+                          online_members=sum(1 for m in members
+                                             if m.get("state") == "online")))
+    out.sort(key=lambda d: (-d.online_members, -len(d.members), d.mac))
     return out

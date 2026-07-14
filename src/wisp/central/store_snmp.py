@@ -221,15 +221,17 @@ class SnmpStoreMixin:
 
 
     def upsert_onu_dup_mac_state(self, org_id: str, mac: str, *, members: int,
-                                 active: bool, since: str | None, ts: str) -> None:
+                                 active: bool, since: str | None, ts: str,
+                                 online_members: int = 0) -> None:
         with self._write_lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO onu_dup_mac_state (org_id, mac, members, active, since,"
-                " updated_at) VALUES (?,?,?,?,?,?)"
+                "INSERT INTO onu_dup_mac_state (org_id, mac, members, online_members,"
+                " active, since, updated_at) VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET members=excluded.members,"
+                " online_members=excluded.online_members,"
                 " active=excluded.active, since=excluded.since,"
                 " updated_at=excluded.updated_at",
-                (org_id, mac, members, 1 if active else 0, since, ts))
+                (org_id, mac, members, online_members, 1 if active else 0, since, ts))
             conn.commit()
 
 
