@@ -210,27 +210,24 @@ class CentralPortMonitor:
                 self.store.stamp_outage_cause(
                     self.org_id, oid, f"Port {label} down (SNMP) -> {fed_name}")
                 folded_into = feeds
-                self._page(f"\U0001f50c Port down — {fed_name}",
-                          f"{switch}: monitored port {label} is down (SNMP). This is the "
-                          f"physical cause of the {fed_name} outage.",
+                self._page(f"\U0001f50c Port down: {fed_name}",
+                          f"{switch} port {label}",
                           device_id, oid, "PORT_DOWN", ts)
             else:
-                self._page(f"\U0001f50c Uplink port down — {fed_name} at risk",
-                          f"{switch}: monitored port {label} feeding {fed_name} is down "
-                          f"(SNMP). {fed_name} is not yet reporting DOWN.",
+                self._page(f"\U0001f50c Uplink port down: {fed_name} at risk",
+                          f"{switch} port {label}",
                           device_id, None, "PORT_DOWN", ts)
         else:
-            self._page(f"\U0001f50c Port down — {switch}",
-                      f"{switch}: monitored port {label} is down (SNMP).",
+            self._page(f"\U0001f50c Port down: {switch}",
+                      f"Port {label}",
                       device_id, None, "PORT_DOWN", ts)
         return PortEvent(device_id, p.if_index, "down", label, folded_into)
 
     def _on_up(self, device_id: int, p: PortStatus, feeds: int | None, ts: str) -> PortEvent:
         switch = self._name(device_id)
         label = _label(p)
-        where = f" -> {self._name(feeds)}" if feeds is not None else ""
-        self._page(f"✅ Port restored — {switch}",
-                  f"{switch}: monitored port {label}{where} is back up (SNMP).",
+        self._page(f"✅ Port restored: {switch}",
+                  f"Port {label}",
                   device_id, None, "PORT_RESTORED", ts)
         return PortEvent(device_id, p.if_index, "up", label, feeds)
 
@@ -239,11 +236,9 @@ class CentralPortMonitor:
                    direction: str, ts: str) -> PortEvent:
         switch = self._name(device_id)
         label = _label(p)
-        where = f" -> {self._name(feeds)}" if feeds is not None else ""
-        self._page(f"\U0001f4c9 Low bandwidth — {switch}",
-                  f"{switch}: monitored port {label}{where} throughput fell below "
-                  f"{threshold:g} Mbps ({direction}). Now in {_fmt_rate(in_bps)} / "
-                  f"out {_fmt_rate(out_bps)}.",
+        self._page(f"\U0001f4c9 Low bandwidth: {switch}",
+                  f"Port {label}: in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)} "
+                  f"(< {threshold:g} Mbps)",
                   device_id, None, "PORT_BW_LOW", ts, enabled=self.cfg.snmp_bw_alerts)
         return PortEvent(device_id, p.if_index, "bw_low", label, None)
 
@@ -251,9 +246,8 @@ class CentralPortMonitor:
                   in_bps: float | None, out_bps: float | None, ts: str) -> PortEvent:
         switch = self._name(device_id)
         label = _label(p)
-        self._page(f"\U0001f4c8 Bandwidth recovered — {switch}",
-                  f"{switch}: monitored port {label} throughput is back above "
-                  f"threshold. Now in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)}.",
+        self._page(f"\U0001f4c8 Bandwidth recovered: {switch}",
+                  f"Port {label}: in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)}",
                   device_id, None, "PORT_BW_OK", ts, enabled=self.cfg.snmp_bw_alerts)
         return PortEvent(device_id, p.if_index, "bw_ok", label, None)
 
@@ -262,11 +256,9 @@ class CentralPortMonitor:
                     direction: str, ts: str) -> PortEvent:
         switch = self._name(device_id)
         label = _label(p)
-        where = f" -> {self._name(feeds)}" if feeds is not None else ""
-        self._page(f"\U0001f4c8 High bandwidth — {switch}",
-                  f"{switch}: monitored port {label}{where} throughput rose above "
-                  f"{max_mbps:g} Mbps ({direction}). Now in {_fmt_rate(in_bps)} / "
-                  f"out {_fmt_rate(out_bps)}.",
+        self._page(f"\U0001f4c8 High bandwidth: {switch}",
+                  f"Port {label}: in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)} "
+                  f"(> {max_mbps:g} Mbps)",
                   device_id, None, "PORT_BW_HIGH", ts, enabled=self.cfg.snmp_bw_alerts)
         return PortEvent(device_id, p.if_index, "bw_high", label, None)
 
@@ -274,9 +266,8 @@ class CentralPortMonitor:
                       in_bps: float | None, out_bps: float | None, ts: str) -> PortEvent:
         switch = self._name(device_id)
         label = _label(p)
-        self._page(f"\U0001f4c9 Bandwidth normalized — {switch}",
-                  f"{switch}: monitored port {label} throughput is back below "
-                  f"ceiling. Now in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)}.",
+        self._page(f"\U0001f4c9 Bandwidth normalized: {switch}",
+                  f"Port {label}: in {_fmt_rate(in_bps)} / out {_fmt_rate(out_bps)}",
                   device_id, None, "PORT_BW_NORMAL", ts, enabled=self.cfg.snmp_bw_alerts)
         return PortEvent(device_id, p.if_index, "bw_normal", label, None)
 

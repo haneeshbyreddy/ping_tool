@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Check, Copy, Dices, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react"
+import { Check, Copy, Dices, IndianRupee, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { adminApi, orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import { DEFAULT_MAP_REGION, MAP_REGIONS, mapRegionOf } from "@/lib/map-regions"
 import type { AccountUser, Role } from "@/lib/types"
+import { BillingCard } from "@/components/billing-card"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
@@ -121,8 +122,8 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
             onChange={(e) => setPollInterval(e.target.value)}
           />
           <p className="max-w-lg text-xs text-muted-foreground">
-            How often every probe in this org pings its devices and reports back —
-            each cycle is one ping sweep plus one report, and outage detection speed
+            How often every probe in this org pings its devices and reports back.
+            Each cycle is one ping sweep plus one report, and outage detection speed
             follows it (a device is confirmed DOWN after 3 failed cycles, so 30s
             &asymp; 90s to a page, 60s &asymp; 3 min). Probes pick a change up within
             one cycle, no restart. 10&ndash;120s; blank = automatic (60s). Lower is
@@ -212,9 +213,58 @@ function GoogleMapsCard() {
         </div>
         <p className="max-w-lg text-xs text-muted-foreground">
           Pasted once here, this key enables the Google basemaps on every organization's
-          Map view — org owners don't configure anything. It is sent to signed-in
+          Map view. Org owners don't configure anything. It is sent to signed-in
           browsers, so use a referrer-restricted key. Leave blank to hide the Google
           options everywhere.
+        </p>
+        <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
+          Save
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
+// Server-wide, superadmin-only: the GPay number every locked org and payment
+// reminder shows. One number for the whole platform — payments land with the
+// platform admin, who then marks the org's month paid.
+function PlatformBillingCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-settings"],
+    queryFn: adminApi.settings,
+  })
+  const [gpay, setGpay] = useState("")
+  useEffect(() => { if (data) setGpay(data.billing_gpay_number || "") }, [data])
+
+  const save = useMutation({
+    mutationFn: () => adminApi.saveSettings({ billing_gpay_number: gpay.trim() }),
+    onSuccess: () => {
+      toast.success("Payment number saved")
+      queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
+      queryClient.invalidateQueries({ queryKey: ["billing"] })
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
+  })
+
+  if (isLoading) return <Skeleton className="h-24 w-full" />
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <IndianRupee className="size-4 text-muted-foreground" /> Payments (all organizations)
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2.5">
+        <div className="flex flex-col gap-1.5">
+          <Label>GPay number</Label>
+          <Input value={gpay} placeholder="10-digit GPay number" className="max-w-sm font-mono text-xs"
+            spellCheck={false} onChange={(e) => setGpay(e.target.value)} />
+        </div>
+        <p className="max-w-lg text-xs text-muted-foreground">
+          Shown on every org's lock screen, billing card and payment reminder. Subscribers
+          pay this number by GPay; you then mark their month paid from Organizations → Billing.
         </p>
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
           Save
@@ -537,8 +587,12 @@ export function SettingsPage() {
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 md:p-6">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
+      {/* plan first — it's the page's headline fact (tier, payment runway,
+          device headroom); the org/routing form is routine config below it */}
+      {scopeOrg && <BillingCard org={scopeOrg} />}
       {scopeOrg && <OrgSettingsCard org={scopeOrg} canWrite={canWrite} />}
       {isSuperadmin && <GoogleMapsCard />}
+      {isSuperadmin && <PlatformBillingCard />}
       {scopeOrg && <RegionsCard org={scopeOrg} canWrite={canWrite} />}
       {/* SNMP profiles: superadmin manages the global set; an org owner can add
           org-local ones. A superadmin with no org scoped still manages globals. */}

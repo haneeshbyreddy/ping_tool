@@ -22,15 +22,12 @@ def sweep(store, org_id: str, eng, redundancy: dict[int, bool],
             continue
         if eff:
             _page(store, org_id, notifier, cfg, dev_id,
-                 f"\U0001f501 On backup — {dev.name} ({dev.region})",
-                 f"{dev.name} ({dev.ip_address}) lost its primary uplink and is running "
-                 f"on a backup path. It's still up, but redundancy is gone — one more "
-                 f"failure is an outage.", "ON_BACKUP", ts)
+                 f"\U0001f501 On backup: {dev.name} ({dev.region})",
+                 f"{dev.ip_address} · primary uplink down", "ON_BACKUP", ts)
         elif not node_down:
             _page(store, org_id, notifier, cfg, dev_id,
-                 f"✅ Primary restored — {dev.name} ({dev.region})",
-                 "Primary uplink is back; running on the primary path again.",
-                 "BACKUP_CLEARED", ts)
+                 f"✅ Primary restored: {dev.name} ({dev.region})",
+                 "", "BACKUP_CLEARED", ts)
 
 def _page(store, org_id: str, notifier, cfg: Config, device_id: int,
          title: str, body: str, payload: str, ts: str) -> None:

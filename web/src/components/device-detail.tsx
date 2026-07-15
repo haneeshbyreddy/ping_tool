@@ -138,7 +138,7 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
         {bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
         {/* stale is a data-freshness note, not an alarm — neutral, never amber */}
         {portsStale
-          ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing — these rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
+          ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing. These rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
           : lastWalk && <span className="text-faint-foreground">as of {ago(lastWalk)}</span>}
         <span className="ml-auto hidden sm:inline">watch a port to alarm on it</span>
       </div>

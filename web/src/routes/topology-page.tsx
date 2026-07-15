@@ -5,7 +5,7 @@ import { toast } from "sonner"
 import { ChevronRight, LayoutGrid, List, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
-import { gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
+import { billingApi, gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
 import { DEVICE_TYPES, PASSIVE_DEVICE_TYPES, isPassiveType, type OrgDevice } from "@/lib/types"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import {
@@ -16,6 +16,7 @@ import { NeedsOrg } from "@/components/needs-org"
 import { RegionSelect } from "@/components/region-select"
 import { ProbesPanel } from "@/components/probes-panel"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
+import { UpgradeNotice } from "@/components/upgrade-notice"
 import { StatusDot } from "@/components/status-badge"
 import { ago, deviceTone, isFresh, isStale } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -81,13 +82,14 @@ const EMPTY_FORM: DeviceFormState = {
 }
 
 function DeviceForm({
-  org, editing, devices, nodeIds, onDone,
+  org, editing, devices, nodeIds, onDone, initialType,
 }: {
   org: string
   editing: OrgDevice | null
   devices: OrgDevice[]
   nodeIds: string[]
   onDone: () => void
+  initialType?: string
 }) {
   const queryClient = useQueryClient()
   const [form, setForm] = useState<DeviceFormState>(() => editing ? {
@@ -98,7 +100,7 @@ function DeviceForm({
     snmp_port: String(editing.snmp_port || 161),
     gpon_vendor: editing.gpon_vendor ?? "",
     pon_port: editing.pon_port ?? "",
-  } : EMPTY_FORM)
+  } : { ...EMPTY_FORM, device_type: initialType ?? "" })
   const [error, setError] = useState("")
 
   // Central-served GPON profiles join the built-ins in the override dropdown.
@@ -305,7 +307,7 @@ function DeviceChips({ device, hasOptics, collapsed, openTab }: {
     <>
       {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
       {passive && (
-        <RowTag tone="muted" title="Passive plant — on the map, never probed">
+        <RowTag tone="muted" title="Passive plant: on the map, never probed">
           passive{device.pon_port ? ` · PON ${device.pon_port}` : ""}
         </RowTag>
       )}
@@ -339,7 +341,7 @@ function DeviceChips({ device, hasOptics, collapsed, openTab }: {
         </RowTag>
       )}
       {hasOptics && device.dup_macs > 0 && (
-        <RowTag tone="destructive" title="Duplicate ONU MAC — cloned CPE or bridging loop. Click for optics"
+        <RowTag tone="destructive" title="Duplicate ONU MAC: cloned CPE or bridging loop. Click for optics"
           onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
           {device.dup_macs === 1 ? "dup MAC" : `${device.dup_macs} dup MACs`}
         </RowTag>
@@ -659,6 +661,9 @@ export function TopologyPage() {
   const focusId = navState?.deviceId
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<OrgDevice | null>(null)
+  // set when a capped org chooses "Add passive plant" — bypasses the upgrade
+  // notice into the real form (passives never count against the device cap).
+  const [forceForm, setForceForm] = useState(false)
   const [collapsed, setCollapsed] = useState<Set<number>>(() => loadCollapsed(scopeOrg))
   const [probeFilter, setProbeFilter] = useState<string | null>(navState?.probeId ?? null)
   const [view, setView] = useState<ViewMode>(loadView)
@@ -697,6 +702,13 @@ export function TopologyPage() {
     enabled: !!scopeOrg,
     refetchInterval: 30_000,
   })
+  // Plan + device cap, so "Add device" can surface the paywall up front rather
+  // than after the form round-trips to a 422 (shared cache key with Settings).
+  const billing = useQuery({
+    queryKey: ["billing", scopeOrg],
+    queryFn: () => billingApi.get(scopeOrg),
+    enabled: !!scopeOrg && canWrite,
+  })
 
   // A deep-linked device may sit under collapsed ancestors — open the path to it
   // (in memory only; a landing shouldn't rewrite the user's saved collapse prefs).
@@ -725,6 +737,11 @@ export function TopologyPage() {
   const devices = probeFilter
     ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
     : allDevices
+  // The cap counts monitored (non-passive) devices, matching the server; compute
+  // the live count off the list so an add/delete reflects without refetching.
+  const monitoredCount = allDevices.filter((d) => !isPassiveType(d.device_type)).length
+  const deviceCap = billing.data?.device_cap ?? null
+  const atCap = deviceCap != null && monitoredCount >= deviceCap
   const gridView = view === "grid"
   // grid flattens the tree (a card grid can't carry indent/collapse); parent-
   // before-child order still groups sensibly and each card names its parent.
@@ -744,7 +761,7 @@ export function TopologyPage() {
   const degraded = fresh.filter((d) => d.state === "DEGRADED").length
 
   const openEdit = (d: OrgDevice) => { setEditing(d); setFormOpen(true) }
-  const closeForm = () => { setFormOpen(false); setEditing(null) }
+  const closeForm = () => { setFormOpen(false); setEditing(null); setForceForm(false) }
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
@@ -790,7 +807,13 @@ export function TopologyPage() {
 
         {/* Add uses the top form (no row to attach to); edit renders inline at its row. */}
         {formOpen && !editing && (
-          <DeviceForm org={scopeOrg} editing={null} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
+          atCap && !forceForm
+            ? <UpgradeNotice billing={billing.data!} resource="device"
+                note="Passive plant (splitters, FDBs, closures) doesn't count toward the limit."
+                secondary={{ label: "Add passive plant", onClick: () => setForceForm(true) }}
+                onClose={closeForm} />
+            : <DeviceForm org={scopeOrg} editing={null} devices={devices} nodeIds={nodeIds}
+                onDone={closeForm} initialType={forceForm ? "splitter" : undefined} />
         )}
 
         {isLoading && <Skeleton className="h-40 w-full" />}

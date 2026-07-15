@@ -271,7 +271,7 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
       </div>
       {rosterOnly && (
         <p className="mb-1 text-2xs text-faint-foreground">
-          This OLT doesn't report per-ONU Rx over SNMP — showing state, ranging
+          This OLT doesn't report per-ONU Rx over SNMP, so it shows state, ranging
           distance and time dark instead.
         </p>
       )}
@@ -305,7 +305,7 @@ function FaultCard({ f }: { f: PonFault }) {
       fiber ? "border-destructive/40 bg-destructive-soft/40" : "border-warning/40 bg-warning-soft/40",
     )}>
       <p className={cn("font-semibold", fiber ? "text-destructive" : "text-warning")}>
-        {fiber ? "Suspected fiber cut" : "Power-outage pattern"} — PON {f.pon_port ?? "?"}
+        {fiber ? "Suspected fiber cut" : "Power-outage pattern"} · PON {f.pon_port ?? "?"}
       </p>
       <p className="mt-0.5 text-muted-foreground">
         {f.dark} of {f.onus_total} ONUs dark
@@ -315,13 +315,13 @@ function FaultCard({ f }: { f: PonFault }) {
       {fiber ? (
         <p className="mt-0.5">
           {range
-            ? <>Cut likely <span className="font-semibold">{range}</span> from the OLT (by ranging — optical path, not road meters).</>
-            : <>No ranging distances on this PON — can't bracket the cut.</>}
+            ? <>Cut likely <span className="font-semibold">{range}</span> from the OLT (by ranging: optical path, not road meters).</>
+            : <>No ranging distances on this PON, so we can't bracket the cut.</>}
           {f.suspect && <> Suspect: <span className="font-mono font-semibold">{f.suspect}</span>.</>}
         </p>
       ) : (
         <p className="mt-0.5">
-          Mostly dying-gasp: customers likely lost mains power — check the area's
+          Mostly dying-gasp: customers likely lost mains power. Check the area's
           supply before dispatching a splicing crew.
         </p>
       )}
@@ -353,7 +353,7 @@ function FaultSection({ faults }: { faults: PonFault[] }) {
         <span className={cn("font-semibold", fiber > 0 ? "text-destructive" : "text-warning")}>
           {faults.length} PON mass-drops
         </span>
-        <span className="hidden text-muted-foreground @md:inline">— {parts.join(" · ")}</span>
+        <span className="hidden text-muted-foreground @md:inline">· {parts.join(" · ")}</span>
         <span className={cn("ml-auto shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
           ▶
         </span>
@@ -378,7 +378,7 @@ function DupMacSection({ dupMacs }: { dupMacs: DupMac[] }) {
         className="flex w-full items-center gap-2 rounded-lg border border-destructive/40 bg-destructive-soft/40 px-3 py-2 text-left text-xs hover:bg-destructive-soft/60">
         <span className="font-semibold text-destructive">{dupMacs.length} duplicate ONU MACs</span>
         <span className="hidden text-muted-foreground @md:inline">
-          — cloned CPE, bridging loop, or stale double-registration
+          · cloned CPE, bridging loop, or stale double-registration
         </span>
         <span className={cn("ml-auto shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
           ▶
@@ -396,10 +396,10 @@ function DupMacCard({ d }: { d: DupMac }) {
   return (
     <div className="rounded-lg border border-destructive/40 bg-destructive-soft/40 px-3 py-2 text-xs">
       <p className="font-semibold text-destructive">
-        Duplicate ONU MAC — <span className="font-mono">{d.mac}</span>
+        Duplicate ONU MAC · <span className="font-mono">{d.mac}</span>
       </p>
       <p className="mt-0.5 text-muted-foreground">
-        Registered on {d.members.length} ONU slots — likely a cloned CPE, a
+        Registered on {d.members.length} ONU slots, likely a cloned CPE, a
         bridging loop, or a stale double-registration.
       </p>
       <ul className="mt-1 space-y-0.5 font-mono text-2xs">
@@ -515,7 +515,7 @@ export function OpticalPanel({ device, focusOnuId }: {
             </span>
           )}
           {device.optics_updated_at && (opticsStale
-            ? <span className="font-semibold" title="The SNMP optical walk on this OLT has stopped refreshing — these readings are the last good snapshot.">stale · {ago(device.optics_updated_at)}</span>
+            ? <span className="font-semibold" title="The SNMP optical walk on this OLT has stopped refreshing. These readings are the last good snapshot.">stale · {ago(device.optics_updated_at)}</span>
             : <span className="text-faint-foreground">as of {ago(device.optics_updated_at)}</span>)}
         </div>
       </div>

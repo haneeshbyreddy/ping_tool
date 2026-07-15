@@ -80,7 +80,7 @@ export function MapPage() {
   const onGoogleFail = useCallback((why: string) => {
     if (googleFailed.current) return
     googleFailed.current = true
-    toast.error(`Google basemap unavailable (${why}) — showing the fallback map`)
+    toast.error(`Google basemap unavailable (${why}). Showing the fallback map`)
     setGoogleDown(true)
   }, [])
   // browser geolocation fix from the locate button; accuracy in meters
@@ -332,10 +332,10 @@ export function MapPage() {
       (err) => {
         if (err.code === err.PERMISSION_DENIED) {
           toast.error(window.isSecureContext
-            ? "Location blocked — allow location for this site in the browser's address bar, then retry"
-            : "Location needs HTTPS — open the dashboard over https to use it")
+            ? "Location blocked. Allow location for this site in the browser's address bar, then retry"
+            : "Location needs HTTPS. Open the dashboard over https to use it")
         } else if (err.code === err.TIMEOUT) {
-          toast.error("Timed out getting your location — try again")
+          toast.error("Timed out getting your location. Try again")
         } else {
           toast.error("Your device couldn't determine a location")
         }
@@ -378,7 +378,7 @@ export function MapPage() {
         distanceKm(m.lat, m.lng, c.center[0], c.center[1])
           < distanceKm(best.lat, best.lng, c.center[0], c.center[1]) ? m : best)
       setLocation.mutate({ id: placingId, lat: t.lat, lng: t.lng })
-      toast.success(`Placed at ${t.name} — same site`)
+      toast.success(`Placed at ${t.name} (same site)`)
       setSelectedId(placingId)
       setPlacingId(null)
       return
@@ -398,7 +398,7 @@ export function MapPage() {
   const saveCoords = () => {
     if (!selected) return
     const m = coordsText.trim().match(/^(-?\d+(?:\.\d+)?)[,;\s]+(-?\d+(?:\.\d+)?)$/)
-    if (!m) { toast.error('Use "lat, lng" — e.g. 17.4401, 78.3489'); return }
+    if (!m) { toast.error('Use "lat, lng", e.g. 17.4401, 78.3489'); return }
     setLocation.mutate({ id: selected.id, lat: Number(m[1]), lng: Number(m[2]) })
     setCoordsEdit(false)
   }
@@ -619,7 +619,7 @@ export function MapPage() {
                   if (placingId != null) {
                     if (placingId !== d.id) {
                       setLocation.mutate({ id: placingId, lat: d.lat, lng: d.lng })
-                      toast.success(`Placed at ${d.name} — same site`)
+                      toast.success(`Placed at ${d.name} (same site)`)
                       setSelectedId(placingId)
                     }
                     setPlacingId(null)
@@ -632,7 +632,7 @@ export function MapPage() {
                   const ll = (e.target as L.Marker).getLatLng()
                   // dropping within a badge radius of a neighbor joins its site
                   const near = nearestOther(d.id, ll.lat, ll.lng)
-                  if (near) toast.success(`Snapped to ${near.name} — same site`)
+                  if (near) toast.success(`Snapped to ${near.name} (same site)`)
                   setLocation.mutate({
                     id: d.id,
                     lat: near ? near.lat : ll.lat,
@@ -926,7 +926,7 @@ export function MapPage() {
                     ) : null}
                     {canWrite && editPins && (
                       <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
-                        title={`Move ${m.name} — click its new spot on the map`}
+                        title={`Move ${m.name}: click its new spot on the map`}
                         onClick={(e) => {
                           e.stopPropagation()
                           setSiteAnchor(null)
@@ -1034,7 +1034,7 @@ export function MapPage() {
                   // labeled honestly: this is the chord, not cable length — a
                   // splicing crew quoting drum meters off it comes up short
                   <span className="text-muted-foreground"
-                    title={`Straight-line distance to ${parent.name} — not cable length`}>
+                    title={`Straight-line distance to ${parent.name}, not cable length`}>
                     {fmtKm(linkKm)} straight-line{routeKm == null && parent ? <> to <span className="font-mono">{parent.name}</span></> : null}
                   </span>
                 )}

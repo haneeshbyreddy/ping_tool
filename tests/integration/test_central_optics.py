@@ -8,8 +8,11 @@ _TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
 sys.path.insert(0, _TESTS_DIR)
 
+from datetime import datetime, timezone
+
 from wisp.config import Config
 from wisp.central.optics import CentralOpticsMonitor
+from wisp.central.onuroster import current_roster
 from wisp.central.store import CentralStore
 from support import RecordingNotifier
 
@@ -120,6 +123,27 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(row["onus_online"], 3)
         self.assertEqual(row["onus_warn"], 1)
         self.assertEqual(row["onus_crit"], 1)
+
+    def test_panel_roster_drops_deleted_onus(self):
+        # onu_optics never deletes removed-ONU rows, so the raw table keeps a
+        # zombie for a deleted ONU. The optical panel shows the CURRENT roster
+        # (freshest walk, stale-blind) — a PON with an ONU deleted between walks
+        # must count only the survivors, not "13/20" against a dead slot.
+        mon = self._mon()
+        mon.sync_device(self.olt, [
+            _onu("A", -19.0, onu_id=1), _onu("B", -20.0, onu_id=2),
+            _onu("C", -21.0, onu_id=3),
+        ], TS[0])
+        # ONU B deleted from the OLT: the next walk simply omits it
+        mon.sync_device(self.olt, [
+            _onu("A", -19.0, onu_id=1), _onu("C", -21.0, onu_id=3),
+        ], TS[1])
+        # the raw table still carries B's zombie row
+        self.assertEqual(len(self.store.list_onu_optics(ORG, self.olt)), 3)
+        # what the panel renders: stale_s=None keeps a stale-but-live OLT visible
+        panel = current_roster(self.store.list_onu_optics(ORG, self.olt),
+                               datetime.now(timezone.utc), stale_s=None)
+        self.assertEqual(sorted(r["onu_key"] for r in panel), ["A", "C"])
 
     def test_delete_device_purges_optics(self):
         self._mon().sync_device(self.olt, [_onu("C", -29.8)], TS[0])

@@ -54,14 +54,13 @@ class PonFaultAlerter:
                 active=True,
                 since=(f.since if fresh or not was else was["since"]) or ts, ts=ts)
             if fresh and f.kind == "fiber":
-                where = (f"between {_fmt_km(f.cut_low_m)} and {_fmt_km(f.cut_high_m)}"
-                         if f.cut_high_m is not None else "at an unknown distance")
-                suspect = f" Suspect: {f.suspect}." if f.suspect else ""
+                where = (f"{_fmt_km(f.cut_low_m)} to {_fmt_km(f.cut_high_m)}"
+                         if f.cut_high_m is not None else "unknown distance")
+                suspect = f" · suspect {f.suspect}" if f.suspect else ""
                 self._page(
-                    f"✂️ Suspected fiber cut — {f.device_name} PON {f.pon_port or '?'}",
-                    f"{f.dark} of {f.onus_total} ONUs dropped (LOS). Cut likely "
-                    f"{where} from the OLT, by ranging (optical path — slack "
-                    f"included).{suspect}", f.device_id, ts)
+                    f"✂️ Suspected fiber cut: {f.device_name} PON {f.pon_port or '?'}",
+                    f"{f.dark}/{f.onus_total} ONUs dark · {where} from OLT{suspect}",
+                    f.device_id, ts)
 
         # Recovery needs a FRESH walk that actually shows the PON back up.
         # evaluate_org skips an OLT whose walk is >15 min stale, so its faults
@@ -79,9 +78,7 @@ class PonFaultAlerter:
                 active=False, since=None, ts=ts)
             if was["kind"] == "fiber":
                 name = self._name(key[0])
-                self._page(f"✅ PON recovered — {name} PON {key[1]}",
-                           f"{name} PON {key[1]}: the mass ONU drop has cleared.",
-                           key[0], ts)
+                self._page(f"✅ PON recovered: {name} PON {key[1]}", "", key[0], ts)
 
     def _name(self, device_id: int) -> str:
         dev = self.store.get_org_device(self.org_id, device_id)

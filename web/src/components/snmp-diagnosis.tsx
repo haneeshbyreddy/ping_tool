@@ -39,22 +39,22 @@ interface Diagnosis {
 function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined): Diagnosis {
   if (!st) {
     return {
-      cause: "No diagnosis from the probe yet — it reports one with every SNMP sweep.",
+      cause: "No diagnosis from the probe yet. It reports one with every SNMP sweep.",
       steps: [
         "Wait one sweep (~2 minutes) after enabling SNMP.",
-        "If this never fills in, the assigned probe is likely on an older agent build — update it from Network → Probes.",
+        "If this never fills in, the assigned probe is likely on an older agent build. Update it from Network → Probes.",
       ],
     }
   }
   switch (st.state) {
     case "ok":
       return {
-        cause: `The last sweep succeeded${st.item_count != null ? ` (${st.item_count} item${st.item_count === 1 ? "" : "s"})` : ""} ${ago(st.updated_at)} — data should appear shortly.`,
+        cause: `The last sweep succeeded${st.item_count != null ? ` (${st.item_count} item${st.item_count === 1 ? "" : "s"})` : ""} ${ago(st.updated_at)}. Data should appear shortly.`,
         steps: [],
       }
     case "no_response":
       return {
-        cause: "The device never answered SNMP — the probe's queries go unanswered, so the fix is on the device itself.",
+        cause: "The device never answered SNMP. The probe's queries go unanswered, so the fix is on the device itself.",
         steps: [
           "Check the SNMP agent is enabled on the device (many ship with it off).",
           "Check the community string matches what's configured here.",
@@ -64,18 +64,18 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
       }
     case "timeout":
       return {
-        cause: "The device answers, but the walk ran past its time budget — usually a very large table or a slow agent. The probe retries on every sweep.",
+        cause: "The device answers, but the walk ran past its time budget, usually a very large table or a slow agent. The probe retries on every sweep.",
         steps: [
-          "If this device worked before, it may be overloaded — check its CPU.",
-          "Persistent timeouts on a big OLT/switch are worth reporting — the walk budget is tunable per subsystem.",
+          "If this device worked before, it may be overloaded. Check its CPU.",
+          "Persistent timeouts on a big OLT/switch are worth reporting. The walk budget is tunable per subsystem.",
         ],
       }
     case "no_profile":
       return {
-        cause: `No GPON vendor profile claims this OLT (sysObjectID ${st.sysobjectid ?? "unknown"}) — optics stay off rather than guessing another vendor's OIDs.`,
+        cause: `No GPON vendor profile claims this OLT (sysObjectID ${st.sysobjectid ?? "unknown"}). Optics stay off rather than guessing another vendor's OIDs.`,
         steps: [
           "If this is a known vendor under an odd sysObjectID, set the GPON vendor override in the device's settings.",
-          "Otherwise this vendor needs support added — run a walk of its enterprise tree and share the dump.",
+          "Otherwise this vendor needs support added. Run a walk of its enterprise tree and share the dump.",
         ],
         walk: true,
         notSupported: true,
@@ -84,19 +84,19 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
       if (subsystem === "health") {
         return st.profile
           ? {
-              cause: `Profile “${st.profile}” matched this device but returned no readings — its OIDs are probably wrong for this exact model.`,
+              cause: `Profile “${st.profile}” matched this device but returned no readings. Its OIDs are probably wrong for this exact model.`,
               steps: [
                 "Run an SNMP walk of the enterprise tree to see what the device really exposes.",
-                "Fix the profile's OIDs from the walk (or create a model-specific profile — longest sysObjectID match wins).",
+                "Fix the profile's OIDs from the walk (or create a model-specific profile; longest sysObjectID match wins).",
               ],
               walk: true,
               wizard: true,
             }
           : {
-              cause: "The device answers SNMP but exposes none of the standard health OIDs — cheap gear usually hides CPU/RAM/temperature in its private vendor tree.",
+              cause: "The device answers SNMP but exposes none of the standard health OIDs. Cheap gear usually hides CPU/RAM/temperature in its private vendor tree.",
               steps: [
                 "Run an SNMP walk of the enterprise tree (one click below).",
-                "Pick the CPU/RAM/temperature rows out of the dump with the profile wizard — the probe starts using them on its next sweep, no rollout.",
+                "Pick the CPU/RAM/temperature rows out of the dump with the profile wizard. The probe starts using them on its next sweep, no rollout.",
               ],
               walk: true,
               wizard: true,
@@ -105,7 +105,7 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
       }
       if (subsystem === "ports") {
         return {
-          cause: "The device answers SNMP but its interface table (ifTable) came back empty — some gear simply doesn't expose ports over SNMP.",
+          cause: "The device answers SNMP but its interface table (ifTable) came back empty. Some gear simply doesn't expose ports over SNMP.",
           steps: [
             "Run a walk of the Interfaces subtree to confirm what the agent exposes.",
             "If the hardware genuinely has no port table, mark ports as not supported so it stops showing as a gap.",
@@ -118,7 +118,7 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
         cause: "The OLT answers SNMP and a vendor profile matched, but its ONU table came back empty.",
         steps: [
           "If no ONUs are registered yet this is normal.",
-          "Otherwise the vendor profile may not fit this model — run a walk and share the dump.",
+          "Otherwise the vendor profile may not fit this model. Run a walk and share the dump.",
         ],
         walk: true,
       }
@@ -126,7 +126,7 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
     default:
       return {
         cause: `The SNMP sweep failed: ${st.detail ?? "unknown error"}.`,
-        steps: ["Transient errors clear on the next sweep — a persistent one usually means a network path or device problem."],
+        steps: ["Transient errors clear on the next sweep. A persistent one usually means a network path or device problem."],
         walk: true,
       }
   }
@@ -187,13 +187,13 @@ function UnsupportedNote({ device, cap }: { device: OrgDevice; cap: DeviceCapabi
     <div className="rounded-lg border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
       <p>
         <span className="font-semibold text-foreground">Not supported on this hardware</span>
-        {cap.note && <> — {cap.note}</>}
+        {cap.note && <> · {cap.note}</>}
         {cap.updated_by && <span className="text-faint-foreground"> · {cap.updated_by}, {ago(cap.updated_at)}</span>}
       </p>
       {canWrite && (
         <button className="mt-1 text-2xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
           onClick={() => undo.mutate()} disabled={undo.isPending}>
-          Undo — start flagging this again
+          Undo (start flagging this again)
         </button>
       )}
     </div>
@@ -217,7 +217,7 @@ export function SnmpDiagnosis({ device, subsystem }: {
   if (device.snmp_enabled !== 1) {
     return (
       <p className="rounded-lg border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
-        SNMP is off for this device — enable it (with a community string) in the device's
+        SNMP is off for this device. Enable it (with a community string) in the device's
         settings to collect its {SUBSYSTEM_NOUN[subsystem]}.
       </p>
     )

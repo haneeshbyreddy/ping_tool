@@ -142,7 +142,7 @@ export function ProfileWizard({ device, sysObjectId, open, onOpenChange }: {
       })
     },
     onSuccess: () => {
-      toast.success("Profile created — the probe applies it on its next sweep")
+      toast.success("Profile created. The probe applies it on its next sweep")
       qc.invalidateQueries({ queryKey: ["snmp-profiles"] })
       qc.invalidateQueries({ queryKey: ["snmp-status", device.id] })
       onOpenChange(false)
@@ -162,7 +162,7 @@ export function ProfileWizard({ device, sysObjectId, open, onOpenChange }: {
           <DialogTitle>Build a health profile: {device.name}</DialogTitle>
           <DialogDescription>
             Tag the CPU / RAM / temperature rows in a walk dump. The probe matches the
-            profile to this hardware by sysObjectID and starts reporting the vitals —
+            profile to this hardware by sysObjectID and starts reporting the vitals,
             no software update needed.
           </DialogDescription>
         </DialogHeader>
@@ -170,7 +170,7 @@ export function ProfileWizard({ device, sysObjectId, open, onOpenChange }: {
         {doneWalks.length === 0 ? (
           <p className="rounded-lg border bg-muted/40 px-3 py-4 text-xs text-muted-foreground">
             No finished walk to read from yet. Run an SNMP walk of the enterprise tree
-            (1.3.6.1.4.1) first — it's the “Run SNMP walk” button one step back.
+            (1.3.6.1.4.1) first. It's the “Run SNMP walk” button one step back.
           </p>
         ) : (
           <div className="flex min-h-0 flex-col gap-3">
@@ -206,7 +206,7 @@ export function ProfileWizard({ device, sysObjectId, open, onOpenChange }: {
               </div>
               {!resultQ.isLoading && candidates.length === 0 && (
                 <p className="px-3 py-4 text-xs text-muted-foreground">
-                  This dump has no numeric rows under the vendor tree — walk
+                  This dump has no numeric rows under the vendor tree. Walk
                   “Enterprise (private)” (1.3.6.1.4.1) instead.
                 </p>
               )}
@@ -241,7 +241,7 @@ export function ProfileWizard({ device, sysObjectId, open, onOpenChange }: {
             {tagged.length > 0 && (
               <div className="rounded-lg border bg-muted/40 px-3 py-2">
                 <p className="mb-1.5 text-2xs font-medium text-muted-foreground">
-                  Reads as — fix the decode if a value looks wrong
+                  Reads as (fix the decode if a value looks wrong)
                 </p>
                 <div className="flex flex-col gap-1">
                   {tagged.map(([metric, t]) => (

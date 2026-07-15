@@ -63,7 +63,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertIn("OLT-1", caps[0]["title"])
         self.assertIn("0/1", caps[0]["title"])
         self.assertEqual(caps[0]["recipient"], "ops-topic")
-        self.assertIn("3 of 3", caps[0]["body"])
+        self.assertIn("3/3", caps[0]["body"])
         # re-walk, still full: state stands, no re-page
         self.alerter.sweep(self._t(1))
         self.assertEqual(len(self._titles("at capacity")), 1)

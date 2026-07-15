@@ -125,7 +125,7 @@ export function LoginPage() {
                 onCheckedChange={(v) => setRemember(v === true)}
                 disabled={submitting}
               />
-              Trust this device — stay signed in
+              Trust this device, stay signed in
             </Label>
             {error && (
               <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive-soft px-3 py-2 text-xs text-destructive">

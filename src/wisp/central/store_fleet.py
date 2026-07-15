@@ -84,6 +84,16 @@ class FleetStoreMixin:
         return token
 
 
+    def active_node_token_count(self, org_id: str) -> int:
+        """Registered, un-revoked probe credentials — the paywall node cap's
+        input. Deliberately NOT the `nodes` heartbeat table (it remembers
+        every identity ever seen, the watchdog lesson)."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM node_tokens WHERE org_id=? AND revoked_at IS NULL",
+                (org_id,)).fetchone()[0]
+
+
     def revoke_node_token(self, org_id: str, node_id: str) -> bool:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(

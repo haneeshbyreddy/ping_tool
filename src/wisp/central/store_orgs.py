@@ -73,6 +73,84 @@ class OrgStoreMixin:
         return row["poll_interval_s"] if row else None
 
 
+    # ----- paywall (central/billing.py owns the math) -----------------------
+
+    def org_plan(self, org_id: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT plan FROM orgs WHERE org_id=?",
+                               (org_id,)).fetchone()
+        return (row["plan"] if row and row["plan"] else "free")
+
+
+    def set_org_plan(self, org_id: str, plan: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            self._ensure_org(conn, org_id, _now_iso())
+            conn.execute("UPDATE orgs SET plan=? WHERE org_id=?", (plan, org_id))
+            conn.commit()
+
+
+    def paid_months(self, org_id: str) -> set[str]:
+        with self._connect() as conn:
+            return {r["month"] for r in conn.execute(
+                "SELECT month FROM org_billing_months WHERE org_id=?", (org_id,))}
+
+
+    def set_billing_month(self, org_id: str, month: str, paid: bool,
+                          marked_by: str | None = None) -> None:
+        with self._write_lock, self._connect() as conn:
+            if paid:
+                conn.execute(
+                    "INSERT INTO org_billing_months (org_id, month, marked_by, marked_at)"
+                    " VALUES (?,?,?,?)"
+                    " ON CONFLICT(org_id, month) DO UPDATE SET"
+                    " marked_by=excluded.marked_by, marked_at=excluded.marked_at",
+                    (org_id, month, marked_by, _now_iso()))
+            else:
+                conn.execute("DELETE FROM org_billing_months WHERE org_id=? AND month=?",
+                             (org_id, month))
+            conn.commit()
+
+
+    def billing_orgs(self) -> list[dict]:
+        """Paid-plan orgs + their page targets — the billing sweeper's input."""
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT org_id, name, plan, ntfy_topic, ntfy_topic_owner FROM orgs"
+                " WHERE plan IN ('pro','vip') ORDER BY org_id")]
+
+
+    def billing_notice(self, org_id: str, month: str, kind: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM billing_notices WHERE org_id=? AND month=? AND kind=?",
+                (org_id, month, kind)).fetchone()
+        return row["status"] if row else None
+
+
+    def record_billing_notice(self, org_id: str, month: str, kind: str,
+                              status: str, sent_at: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO billing_notices (org_id, month, kind, status, sent_at)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(org_id, month, kind) DO UPDATE SET"
+                " status=excluded.status, sent_at=excluded.sent_at",
+                (org_id, month, kind, status, sent_at))
+            conn.commit()
+
+
+    def org_monitored_device_count(self, org_id: str,
+                                   passive_types: tuple[str, ...] = ()) -> int:
+        """Active probed devices — passive plant (splitters/FDBs) never counts
+        toward the paywall device cap."""
+        ph = ",".join("?" for _ in passive_types)
+        extra = f" AND (device_type IS NULL OR device_type NOT IN ({ph}))" if ph else ""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM org_devices WHERE org_id=? AND is_active=1" + extra,
+                (org_id, *passive_types)).fetchone()[0]
+
+
     def org_topic(self, org_id: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute("SELECT ntfy_topic FROM orgs WHERE org_id=?",
@@ -103,7 +181,7 @@ class OrgStoreMixin:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
                 " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
-                " o.poll_interval_s,"
+                " o.poll_interval_s, o.plan,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
                 " FROM orgs o ORDER BY o.org_id")]
 

@@ -3,8 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import { Plus, ArrowRight, Building2, Radio } from "lucide-react"
+import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, ApiError } from "@/lib/api"
+import { planTone } from "@/lib/billing"
+import { BillingAdminDialog } from "@/components/billing-admin"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -130,9 +133,13 @@ export function OrganizationsPage() {
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-3 pl-12 sm:pl-0">
+                <Badge variant="outline" className={cn("font-medium capitalize", planTone(o.plan))}>
+                  {o.plan}
+                </Badge>
                 <Badge variant="outline" className="gap-1 font-normal text-muted-foreground">
                   <Radio className="size-3" /> {o.node_count} node{o.node_count === 1 ? "" : "s"}
                 </Badge>
+                <BillingAdminDialog org={o.org_id} name={o.name} />
                 <Button variant="outline" size="sm" onClick={() => manage(o.org_id)}>
                   Manage <ArrowRight className="size-3.5" />
                 </Button>

@@ -558,6 +558,31 @@ CREATE TABLE IF NOT EXISTS device_snmp_status (
     last_ok_at  TEXT,
     PRIMARY KEY (device_id, subsystem)
 );
+-- Paywall: which calendar months ('YYYY-MM', UTC) an org has paid for. The
+-- superadmin marks these from the Organizations page — as far ahead as he
+-- likes (pre-marked months get no reminder). A pro/vip org whose CURRENT
+-- month has no row here is locked out of the dashboard (server.py's 402
+-- gate); edge ingest and outage paging are deliberately never gated. Free
+-- plan ignores this table entirely.
+CREATE TABLE IF NOT EXISTS org_billing_months (
+    org_id    TEXT NOT NULL,
+    month     TEXT NOT NULL,
+    marked_by TEXT,
+    marked_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, month)
+);
+-- Transition-only billing reminders (central/billing.py, watchdog pattern):
+-- kind = 'due_soon' | 'locked', one row per (org, month, kind). Only
+-- status 'sent'/'skipped' suppress a retry — a failed ntfy send is retried
+-- on the next sweep instead of stranding the reminder.
+CREATE TABLE IF NOT EXISTS billing_notices (
+    org_id  TEXT NOT NULL,
+    month   TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    status  TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, month, kind)
+);
 -- Server-wide dashboard settings the SUPERADMIN manages once for every org
 -- (e.g. google_maps_key: pasted once, served to all orgs' browsers). NOT the
 -- Config env-var layer — those stay frozen WISP_* tunables; this is for
@@ -624,7 +649,11 @@ class CentralStore(
                 # NULL = automatic (edge env/adaptive default). API clamps to
                 # 10–120s: past 120s the fleet watchdog's 180s stale threshold
                 # would page NODE_STALE for a healthy probe.
-                ("poll_interval_s", "INTEGER")))
+                ("poll_interval_s", "INTEGER"),
+                # Paywall tier: free | pro | vip (central/billing.py PLANS).
+                # Superadmin-set only; drives the device cap and the monthly
+                # payment lock (org_billing_months).
+                ("plan", "TEXT NOT NULL DEFAULT 'free'")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "switch_ports", (

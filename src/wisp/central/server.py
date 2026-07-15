@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import api, auth, inventory, pki
+from wisp.central import api, auth, billing, inventory, pki
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
@@ -28,6 +28,11 @@ log = logging.getLogger("wisp.central")
 MAX_WIRE_V = WIRE_V
 _MAX_BODY = 16 * 1024 * 1024
 _STATIC = Path(__file__).resolve().parent / "static"
+
+# Routes a LOCKED org's session may still reach: exactly what the lock screen
+# needs to render (who am I + how much do I owe) plus logout. Everything else
+# under /api/ replies 402 until the admin marks the month paid.
+_BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout", "/healthz"}
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
                   engine_registry: EngineRegistry | None = None):
@@ -126,6 +131,24 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             if user["is_superadmin"]:
                 return True
             return user["role"] == "owner" and user["org_id"] == org
+
+        def _billing_blocked(self, route: str, user: dict | None = None) -> bool:
+            # The paywall gate: a locked org's dashboard session gets 402 on
+            # every /api/* route the lock screen doesn't need. Edge ingest
+            # (/report, /heartbeat, /edge/*) never passes through here —
+            # monitoring and paging must survive a lapsed bill — and
+            # superadmin/global-token readers stay exempt so the platform
+            # admin can inspect and unlock the org.
+            if not route.startswith("/api/") or route in _BILLING_EXEMPT:
+                return False
+            user = user or self._user()
+            if not user or user["is_superadmin"] or not user["org_id"]:
+                return False
+            if not billing.org_locked(store, user["org_id"]):
+                return False
+            self._reply(402, {"error": "payment required — account locked",
+                              "locked": True})
+            return True
 
         def _envelope(self, body: dict) -> dict | None:
             v = body.get("v")
@@ -255,6 +278,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             route, qs = parsed.path, parse_qs(parsed.query)
             handler = api.GET.get(route)
             if handler is not None:
+                if self._billing_blocked(route):
+                    return
                 handler(self, qs)
                 return
             if route.startswith("/download/"):
@@ -307,6 +332,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             handler = api.POST.get(route)
             if handler is None:
                 self._reply(404, {"error": "not found"})
+                return
+            if self._billing_blocked(route, user):
                 return
             try:
                 handler(self, user, body)
@@ -393,6 +420,7 @@ def serve(cfg: Config = CONFIG) -> None:
     from wisp.central.watchdog import start_central_watchdog_thread
     start_central_watchdog_thread(cfg, httpd.store)
     central_rollup.start_central_rollup_prune_thread(cfg, httpd.store)
+    billing.start_central_billing_thread(cfg, httpd.store)
     if not httpd.store.list_users():
         log.warning("no central accounts yet — bootstrap one: "
                     "PYTHONPATH=src python -m wisp.central.admin create-superadmin --username ...")

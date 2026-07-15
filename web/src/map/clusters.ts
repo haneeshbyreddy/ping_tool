@@ -79,7 +79,7 @@ export function clusterIcon(members: Placed[], o: { dim: boolean; selected: bool
   }
   const down = counts.get("destructive") ?? 0
   const names = members.slice(0, 6).map((m) => m.name).join(", ")
-  const title = esc(`${members.length} devices${down ? `, ${down} down` : ""} — ${names}${members.length > 6 ? ", …" : ""}`)
+  const title = esc(`${members.length} devices${down ? `, ${down} down` : ""}: ${names}${members.length > 6 ? ", …" : ""}`)
   const cls = ["wisp-cluster"]
   if (down > 0) cls.push("wisp-cluster--down")
   if (o.selected) cls.push("wisp-cluster--selected")

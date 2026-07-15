@@ -236,6 +236,20 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `switch_ports`, feeds, links. `/api/orgs` stays org-filtered (`_scope_org`).
 - `orgs.ntfy_topic_owner/operator/tech` (outage routing) are separate from
   `orgs.ntfy_topic` (fleet-watchdog NODE_STALE/OK) — don't merge.
+- **Paywall** (`central/billing.py`; no payment gateway BY DESIGN — GPay to the
+  admin, who marks months paid): plans free/pro/vip on `orgs.plan`, paid months
+  in `org_billing_months` ('YYYY-MM' UTC, Organizations → Billing; pre-marking
+  future months IS the "no reminder" switch). A pro/vip org whose CURRENT month
+  is unpaid 402s on every `/api/*` except `server.py:_BILLING_EXEMPT` (me,
+  billing, login/logout — what the lock screen needs); **edge ingest,
+  monitoring and outage paging are NEVER gated** — a lapsed bill must not
+  silence an alarm. Device caps (5/500/∞) enforce on CREATE only (a downgrade
+  never breaks existing monitoring); passives never count. Reminders are
+  transition-only (`billing_notices`, watchdog pattern): owner topic at ≤3 days
+  paid runway and on lock; failed sends retry next sweep, 'skipped' (no topic)
+  doesn't. GPay number: `app_settings.billing_gpay_number`, default in
+  billing.py. Free never locks. Tests: `unit/test_billing`,
+  `integration/test_central_billing`.
 - **New columns on existing tables need `_ensure_columns`** in
   `CentralStore.__init__` or an existing `central.db` keeps the old schema. New
   tables need nothing.

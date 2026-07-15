@@ -26,7 +26,43 @@ export interface Org {
   google_maps_key: string | null
   // dashboard-set probe cadence for this org's edges; null = automatic
   poll_interval_s: number | null
+  // paywall tier (central/billing.py PLANS) — superadmin-set only
+  plan: Plan
   node_count: number
+}
+
+export type Plan = "free" | "pro" | "vip"
+/** free = no billing; due_soon = ≤3 days of paid runway; locked = current
+    month unpaid → the server 402s everything but /api/me + /api/billing. */
+export type BillingStatus = "free" | "active" | "due_soon" | "locked"
+
+export interface PlanSpec {
+  label: string
+  price_inr: number
+  device_cap: number | null // null = unlimited
+  node_cap: number | null // edge probes; null = unlimited
+  features: string[]
+}
+
+/** GET /api/billing — plan + payment verdict for one org. Months are
+    'YYYY-MM' UTC keys; readable even while locked (the lock screen renders
+    from this). */
+export interface BillingInfo {
+  plan: Plan
+  status: BillingStatus
+  locked: boolean
+  current_month: string
+  paid_through: string | null
+  due_month: string | null
+  days_left: number | null
+  paid_months: string[]
+  device_count: number
+  device_cap: number | null
+  /** registered, un-revoked edge-probe credentials */
+  node_count: number
+  node_cap: number | null
+  gpay_number: string
+  plans: Record<Plan, PlanSpec>
 }
 
 export const DEVICE_TYPES = [

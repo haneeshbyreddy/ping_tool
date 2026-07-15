@@ -69,9 +69,8 @@ class OnuRosterAlerter:
                 since=(ts if fresh or not was else was["since"]) or ts, ts=ts)
             if fresh:
                 self._page(
-                    f"\U0001f534 PON at capacity — {f.device_name} PON {f.pon_port}",
-                    f"{f.onus} of {f.limit} ONUs registered on PON {f.pon_port}. "
-                    f"This PON is full — no more subscribers can be provisioned on it.",
+                    f"\U0001f534 PON at capacity: {f.device_name} PON {f.pon_port}",
+                    f"{f.onus}/{f.limit} ONUs registered",
                     f.device_id, ts, "ONU_LIMIT", gate=self.cfg.onu_limit_alerts)
 
         # Clearing needs a FRESH walk that actually shows the PON below its
@@ -87,9 +86,8 @@ class OnuRosterAlerter:
             self.store.upsert_pon_capacity_state(
                 self.org_id, key[0], key[1], onus=0, active=False, since=None, ts=ts)
             name = self._name(key[0])
-            self._page(f"✅ PON below capacity — {name} PON {key[1]}",
-                       f"{name} PON {key[1]}: the ONU count dropped back below its "
-                       f"limit.", key[0], ts, "ONU_LIMIT",
+            self._page(f"✅ PON below capacity: {name} PON {key[1]}",
+                       "", key[0], ts, "ONU_LIMIT",
                        gate=self.cfg.onu_limit_alerts)
 
     # --- redundant MAC ---------------------------------------------------------
@@ -122,17 +120,13 @@ class OnuRosterAlerter:
             if live and not was_live:
                 where = "; ".join(_slot(m) for m in d.members)
                 self._page(
-                    f"⚠️ Duplicate ONU MAC — {mac}",
-                    f"MAC {mac} is ONLINE on {d.online_members} ONU slots at once"
-                    f" ({len(d.members)} registered): {where}. Likely a cloned CPE"
-                    f" or a bridging loop — check before it flaps subscribers.",
+                    f"⚠️ Duplicate ONU MAC: {mac}",
+                    f"Online on {d.online_members} of {len(d.members)} slots: {where}",
                     d.members[0]["device_id"], ts, "ONU_DUP_MAC",
                     gate=self.cfg.onu_dup_mac_alerts)
             elif was_live and not live:
                 self._page(
-                    f"✅ Duplicate MAC no longer live — {mac}",
-                    f"MAC {mac} is online on at most one ONU slot again. Stale"
-                    f" registration rows may remain on the OLT.",
+                    f"✅ Duplicate MAC no longer live: {mac}", "",
                     d.members[0]["device_id"], ts, "ONU_DUP_MAC",
                     gate=self.cfg.onu_dup_mac_alerts)
 
@@ -147,8 +141,7 @@ class OnuRosterAlerter:
                 since=None, ts=ts)
             if was_live:
                 self._page(
-                    f"✅ Duplicate MAC cleared — {mac}",
-                    f"MAC {mac} is no longer registered on more than one ONU slot.",
+                    f"✅ Duplicate MAC cleared: {mac}", "",
                     None, ts, "ONU_DUP_MAC", gate=self.cfg.onu_dup_mac_alerts)
 
     # --- shared plumbing (mirrors ponalert._page) ------------------------------

@@ -51,12 +51,11 @@ class CentralWatchdog:
         mins = int(age // 60)
         if mark == STALE_MARK:
             title = "🚨 EDGE NODE DOWN"
-            body = (f"{org}/{node}: no heartbeat in ~{mins}m — the edge box may be down "
-                    f"or its WAN cut. Central is blind to this site until it returns.")
+            body = f"{org}/{node} · silent ~{mins}m"
             priority = 5
         else:
             title = "✅ Edge node back"
-            body = f"{org}/{node}: heartbeats resumed — central is in sync again."
+            body = f"{org}/{node}"
             priority = 3
         ok = False
         if topic:

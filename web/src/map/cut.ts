@@ -69,7 +69,7 @@ export function ponPath(
 export function cutIcon(f: PonFault, oltName: string): L.DivIcon {
   const hi = f.cut_high_m == null ? "" : `${(f.cut_high_m / 1000).toFixed(2)} km`
   const lo = f.cut_low_m ? `${(f.cut_low_m / 1000).toFixed(2)} km – ` : "within "
-  const title = esc(`Suspected fiber cut — ${oltName} PON ${f.pon_port ?? "?"}: `
+  const title = esc(`Suspected fiber cut · ${oltName} PON ${f.pon_port ?? "?"}: `
     + `${f.dark} ONUs dark, ${lo}${hi} from the OLT (by ranging)`)
   return cachedDivIcon(`<div class="wisp-cut" title="${title}">✕</div>`)
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from wisp.central import inventory, onuroster, ponfault
+from wisp.central import billing, inventory, onuroster, ponfault
 from wisp.central.api.common import (DENIED, body_org_write, device_read_scope,
                                      device_write_org, org_or_400, q_int_required,
                                      reader_or_401)
@@ -95,14 +95,22 @@ def optics(h, qs):
         return
     did, org = scope
     dev = h.store.get_org_device(org, did) or {}
+    now = datetime.now(timezone.utc)
+    # onu_optics NEVER deletes removed-ONU rows (the roster-hygiene design keeps
+    # them so last_online_at can freeze), so the raw table over-counts a PON with
+    # deleted ONUs — "13/20" when only 13 slots still exist. Show the CURRENT
+    # roster: the rows from this OLT's freshest walk, the same view capacity/
+    # dup-MAC page from. stale_s=None keeps a stale-but-live OLT's last snapshot
+    # visible (the panel flags freshness itself) instead of blanking the tab.
+    onus = onuroster.current_roster(h.store.list_onu_optics(org, did), now,
+                                    stale_s=None)
     # redundant-MAC groups are org-wide (a MAC cloned onto a second OLT is the
     # dangerous case); surface only the ones that touch THIS OLT in its panel
-    dups = onuroster.duplicate_macs(h.store.org_onu_rows(org),
-                                    datetime.now(timezone.utc))
+    dups = onuroster.duplicate_macs(h.store.org_onu_rows(org), now)
     dup_macs = [d.as_dict() for d in dups
                 if any(m["device_id"] == did for m in d.members)]
     h._reply(200, {
-        "onus": h.store.list_onu_optics(org, did),
+        "onus": onus,
         "olt": h.store.get_olt_optics(org, did),
         "warn_dbm": dev.get("optical_warn_dbm") if dev.get("optical_warn_dbm") is not None else h.cfg.optical_warn_dbm,
         "crit_dbm": dev.get("optical_crit_dbm") if dev.get("optical_crit_dbm") is not None else h.cfg.optical_crit_dbm,
@@ -202,6 +210,20 @@ def create(h, user, body):
         body, parents=h.store.org_device_parent_map(org), device_id=None,
         registered_nodes=h.store.registered_node_ids(org),
         passive_ids=h.store.org_passive_ids(org))
+    # Paywall device cap (central/billing.py) — counts probed devices only;
+    # passive plant (splitter/FDB/closure) is documentation, never metered.
+    # Enforced on CREATE only: a downgrade never breaks existing monitoring.
+    if clean.get("device_type") not in inventory.PASSIVE_TYPES:
+        plan = h.store.org_plan(org)
+        cap = billing.device_cap(plan)
+        if cap is not None and h.store.org_monitored_device_count(
+                org, inventory.PASSIVE_TYPES) >= cap:
+            label = billing.PLANS[plan]["label"]
+            upgrade = ("upgrade to Pro or VIP for more"
+                       if plan == "free" else "upgrade to VIP for unlimited devices")
+            h._reply(422, {"error": f"{label} plan is limited to {cap} monitored "
+                                    f"devices — {upgrade} (Settings → Plan & billing)"})
+            return
     did = h.store.create_org_device(org, clean)
     h._reply(200, {"id": did})
 

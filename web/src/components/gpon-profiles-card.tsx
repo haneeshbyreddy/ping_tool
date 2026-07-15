@@ -23,7 +23,7 @@ const OID_HELP: Record<string, string> = {
   distance: "ranging distance (optical table)",
   serial: "serial/MAC column (optical table)",
   name: "ONU description (optical table)",
-  ident_key: "serial/MAC (registration roster — authoritative ONU list)",
+  ident_key: "serial/MAC (registration roster, the authoritative ONU list)",
   ident_pon: "PON port number (roster)",
   ident_onu: "ONU id on the PON (roster)",
   ident_state: "ONU state (roster)",
@@ -149,7 +149,7 @@ function ProfileForm({
         <p className="text-2xs text-muted-foreground">
           ident_* columns come from a registration/roster table (every ONU, online or not);
           the plain columns from an optical table indexed pon.onu. Map only what the vendor
-          actually exposes — a column you leave out renders honestly blank, never guessed.
+          actually exposes. A column you leave out renders honestly blank, never guessed.
         </p>
       </div>
 
@@ -192,7 +192,7 @@ function ProfileForm({
         <div className="flex flex-col gap-3">
           <div className="flex flex-col gap-1.5">
             <Label>PON label</Label>
-            <Input className="h-8 text-xs" placeholder={"e.g. EPON0/{pon} — blank keeps the raw index"}
+            <Input className="h-8 text-xs" placeholder={"e.g. EPON0/{pon} (blank keeps the raw index)"}
               value={ponLabel} onChange={(e) => setPonLabel(e.target.value)} />
           </div>
           <div className="flex flex-col gap-1.5">
@@ -200,8 +200,8 @@ function ProfileForm({
             <Select value={ponIndex} onValueChange={setPonIndex}>
               <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="as_is">as_is — index is the PON</SelectItem>
-                <SelectItem value="first_segment">first_segment — pon.onu index, take pon</SelectItem>
+                <SelectItem value="as_is">as_is (index is the PON)</SelectItem>
+                <SelectItem value="first_segment">first_segment (pon.onu index, take pon)</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -282,7 +282,7 @@ export function GponProfilesCard({ org, isSuperadmin }: {
       </CardHeader>
       <CardContent className="flex flex-col gap-0 p-0">
         <p className="px-4 pb-3 text-xs text-muted-foreground">
-          Teach the edge a new OLT vendor's ONU-table OIDs as data — no code change or rollout.
+          Teach the edge a new OLT vendor's ONU-table OIDs as data. No code change or rollout.
           Edges pick these up within a minute. Built-in huawei/dbc profiles keep working;
           a profile with the same name replaces the built-in.
           {isSuperadmin && " Profiles you add here are global (every org's edges receive them)."}
@@ -290,7 +290,7 @@ export function GponProfilesCard({ org, isSuperadmin }: {
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}
         {!isLoading && profiles.length === 0 && !adding && (
           <p className="px-4 pb-4 text-xs text-muted-foreground">
-            No custom profiles — OLTs use the built-in huawei/dbc profiles.
+            No custom profiles. OLTs use the built-in huawei/dbc profiles.
           </p>
         )}
         {profiles.map((p) => (

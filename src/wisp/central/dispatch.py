@@ -76,8 +76,8 @@ class CentralAlertDispatcher:
             elif isinstance(ev, OutageResolved):
                 self._on_resolved(ev, ts)
             elif isinstance(ev, UplinkDown):
-                self._send_owner("🚨 UPLINK_DOWN", "Our internet is down — local alerts "
-                                 "frozen", ts, 5, payload="UPLINK_DOWN")
+                self._send_owner("🚨 UPLINK_DOWN", "Local alerts frozen", ts, 5,
+                                 payload="UPLINK_DOWN")
             elif isinstance(ev, UplinkRestored):
                 self._send_owner("✅ Uplink restored", "Monitoring resumed", ts, 3,
                                  payload="UPLINK_RESTORED")
@@ -98,8 +98,8 @@ class CentralAlertDispatcher:
                       "already paged this outage", ts)
             return
 
-        title = f"🔴 DOWN — {dev.name} ({dev.region})"
-        body = f"No ping response from {dev.ip_address}"
+        title = f"🔴 DOWN: {dev.name} ({dev.region})"
+        body = dev.ip_address
         res = self._publish("owner", title, body, _DOWN_PRIORITY)
         self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body, ts)
         self.store.schedule_escalation(self.org_id, oid, "hourly",
@@ -112,8 +112,7 @@ class CentralAlertDispatcher:
             self.org_id, ev.device_id) == UNREACHABLE
 
         if not was_suppressed:
-            self._broadcast(f"✅ Restored — {dev.name} ({dev.region})",
-                            "Service back up", 3)
+            self._broadcast(f"✅ Restored: {dev.name} ({dev.region})", "", 3)
 
         self.store.cancel_pending_escalations(self.org_id, ev.device_id, ts)
         self._log(None, ev.device_id, recipient,
@@ -149,11 +148,11 @@ class CentralAlertDispatcher:
         if dev is None:
             return
         elapsed = self._fmt_elapsed(row["started_at"], ts)
-        ack = (f"Acknowledged by {row['acknowledged_by']}."
-               if row["acknowledged_by"] else "Not yet acknowledged.")
+        ack = (f"acked by {row['acknowledged_by']}"
+               if row["acknowledged_by"] else "unacked")
         self._broadcast(
-            f"⏰ STILL DOWN ({elapsed}) — {dev.name} ({dev.region})",
-            f"{dev.name} ({dev.ip_address}) has been down for {elapsed}.\n{ack}", 5)
+            f"⏰ STILL DOWN ({elapsed}): {dev.name} ({dev.region})",
+            f"{dev.ip_address} · {ack}", 5)
         self._record(row["device_id"], self._topic("owner"), "sent",
                      f"hourly escalation ({elapsed})", ts)
 

@@ -1,10 +1,12 @@
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { NavLink, Outlet, useLocation } from "react-router-dom"
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Search } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
-import { orgsApi } from "@/lib/api"
+import { billingApi, orgsApi } from "@/lib/api"
+import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
+import { PlanChip } from "@/components/plan-chip"
 import { NAV_ITEMS, MORE_ITEMS } from "./nav-items"
 import { AlarmChips } from "./alarm-chips"
 import { OrgSwitcher } from "./org-switcher"
@@ -44,12 +46,42 @@ function Brand() {
 
 export function AppShell() {
   const [searchOpen, setSearchOpen] = useState(false)
-  const { user } = useAuth()
+  const { user, scopeOrg } = useAuth()
   const { pathname } = useLocation()
+  const queryClient = useQueryClient()
   const navItems = NAV_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
   const moreItems = MORE_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
 
   const isNavActive = (to: string) => (to === "/" ? pathname === "/" : pathname.startsWith(to))
+
+  // Paywall: /api/billing stays reachable while everything else 402s, so this
+  // one poll drives the lock screen AND its automatic release after payment.
+  const billingOrg = user ? (user.is_superadmin ? scopeOrg : user.org_id) : null
+  const { data: billing } = useQuery({
+    queryKey: ["billing", billingOrg],
+    queryFn: () => billingApi.get(billingOrg),
+    enabled: !!billingOrg,
+    refetchInterval: 60_000,
+  })
+
+  // A 402 mid-session (month rolled over unpaid) re-checks billing immediately
+  // instead of waiting out the poll.
+  useEffect(() => {
+    const handler = () => queryClient.invalidateQueries({ queryKey: ["billing"] })
+    window.addEventListener("wisp:payment-required", handler)
+    return () => window.removeEventListener("wisp:payment-required", handler)
+  }, [queryClient])
+
+  // On unlock, every query that 402'd while locked is stale — refetch the lot.
+  const wasLocked = useRef(false)
+  useEffect(() => {
+    if (wasLocked.current && billing && !billing.locked) queryClient.invalidateQueries()
+    wasLocked.current = !!billing?.locked
+  }, [billing, queryClient])
+
+  if (billing?.locked && user && !user.is_superadmin) {
+    return <BillingLock billing={billing} />
+  }
 
   return (
     <SidebarProvider>
@@ -91,6 +123,7 @@ export function AppShell() {
             <Brand />
           </div>
           <OrgSwitcher />
+          {billing && <PlanChip billing={billing} />}
           <div className="flex-1" />
           <AlarmChips />
           {/* input-shaped so the palette is discoverable; icon-only on mobile */}
@@ -109,6 +142,12 @@ export function AppShell() {
           </Button>
           <UserMenu />
         </header>
+
+        {billing && billingOrg && (
+          user?.is_superadmin
+            ? <BillingLockedNote billing={billing} />
+            : <BillingBanner billing={billing} org={billingOrg} />
+        )}
 
         <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
           <Outlet />

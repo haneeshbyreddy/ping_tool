@@ -58,9 +58,9 @@ export function pinIcon(d: OrgDevice, o: { selected: boolean; dim: boolean; impa
   if (d.maintenance) cls.push("wisp-pin--maint")
   if (optic) cls.push(`wisp-pin--optic-${optic}`)
   const weak = (d.onus_crit ?? 0) + (d.onus_warn ?? 0)
-  const title = esc(downFor ? `${d.name} — down for ${downFor}`
-    : d.maintenance ? `${d.name} — maintenance`
-    : optic ? `${d.name} — ${weak} ONU${weak === 1 ? "" : "s"} weak signal` : d.name)
+  const title = esc(downFor ? `${d.name} · down for ${downFor}`
+    : d.maintenance ? `${d.name} · maintenance`
+    : optic ? `${d.name} · ${weak} ONU${weak === 1 ? "" : "s"} weak signal` : d.name)
   return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}">
       <span class="wisp-pin__dot"></span><span class="wisp-pin__label">${esc(d.name)}</span>
     </div>`)
@@ -81,5 +81,5 @@ export function meIcon(): L.DivIcon {
 }
 
 export function vertexIcon(): L.DivIcon {
-  return cachedDivIcon(`<div class="wisp-vertex" title="Drag to adjust — double-click to remove"></div>`)
+  return cachedDivIcon(`<div class="wisp-vertex" title="Drag to adjust. Double-click to remove"></div>`)
 }

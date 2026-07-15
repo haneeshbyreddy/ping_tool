@@ -1,6 +1,6 @@
 import type {
-  AccountUser, AdminOverview, AttendanceOverview, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
+  AccountUser, AdminOverview, AttendanceOverview, BillingInfo, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ReliabilityRow, Role,
   PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   Summary, SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
@@ -15,6 +15,11 @@ async function request<T>(path: string, opts: { method?: string; body?: unknown 
   })
   if (res.status === 401) {
     window.dispatchEvent(new CustomEvent("wisp:unauthorized"))
+  }
+  if (res.status === 402) {
+    // paywall lock hit mid-session (month rolled over unpaid) — the app shell
+    // listens and re-checks /api/billing, which flips it to the lock screen
+    window.dispatchEvent(new CustomEvent("wisp:payment-required"))
   }
   const isJson = res.headers.get("content-type")?.includes("json")
   const data = isJson ? await res.json() : {}
@@ -46,9 +51,16 @@ export const systemApi = {
 export const adminApi = {
   overview: () => request<AdminOverview>("/api/admin/overview"),
   // server-wide settings, superadmin-only; the Google key applies to every org
-  settings: () => request<{ google_maps_key: string | null }>("/api/admin/settings"),
-  saveSettings: (body: { google_maps_key?: string | null }) =>
+  settings: () => request<{ google_maps_key: string | null; billing_gpay_number: string }>("/api/admin/settings"),
+  saveSettings: (body: { google_maps_key?: string | null; billing_gpay_number?: string | null }) =>
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
+}
+
+export const billingApi = {
+  get: (org?: string | null) => request<BillingInfo>(`/api/billing${tq(org)}`),
+  // superadmin: set the plan and/or toggle one paid month
+  adminSave: (body: { org_id: string; plan?: Plan; month?: string; paid?: boolean }) =>
+    request<{ ok: true } & BillingInfo>("/api/admin/billing", { method: "POST", body }),
 }
 
 export const orgsApi = {
