@@ -85,25 +85,37 @@ def verify_login(store, username: str, password: str) -> dict | None:
 def _sign(secret: bytes, msg: str) -> str:
     return hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def issue_session(user_id: int, cfg: Config = CONFIG, *, now: float | None = None) -> str:
+def session_ttl_s(cfg: Config = CONFIG, *, remember: bool = False) -> int:
+    """How long a freshly issued session lives. A trusted ('remember this device')
+    login gets the long window; everyone else the short default."""
+    if remember:
+        return cfg.session_remember_days * 86400
+    return cfg.session_timeout_h * 3600
+
+def issue_session(user_id: int, cfg: Config = CONFIG, *, remember: bool = False,
+                  now: float | None = None) -> str:
     issued = str(int(time.time() if now is None else now))
-    msg = f"{user_id}.{issued}"
+    # The TTL is signed into the token so a trusted session verifies against its
+    # own lifetime — verify_session no longer needs to be told the timeout.
+    ttl = str(session_ttl_s(cfg, remember=remember))
+    msg = f"{user_id}.{issued}.{ttl}"
     return f"{msg}.{_sign(get_session_secret(cfg), msg)}"
 
-def verify_session(token: str | None, *, cfg: Config = CONFIG, timeout_h: int,
+def verify_session(token: str | None, *, cfg: Config = CONFIG,
                    now: float | None = None) -> int | None:
-    if not token or token.count(".") != 2:
+    if not token or token.count(".") != 3:
         return None
-    user_part, issued, sig = token.split(".")
-    if not hmac.compare_digest(sig, _sign(get_session_secret(cfg), f"{user_part}.{issued}")):
+    user_part, issued, ttl, sig = token.split(".")
+    if not hmac.compare_digest(sig, _sign(get_session_secret(cfg), f"{user_part}.{issued}.{ttl}")):
         return None
     try:
         user_id = int(user_part)
         issued_i = int(issued)
+        ttl_i = int(ttl)
     except ValueError:
         return None
     elapsed = (time.time() if now is None else now) - issued_i
-    return user_id if 0 <= elapsed <= timeout_h * 3600 else None
+    return user_id if 0 <= elapsed <= ttl_i else None
 
 def session_cookie(token: str, *, max_age: int) -> str:
     return (f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
@@ -123,7 +135,7 @@ def cookie_token(cookie_header: str | None) -> str | None:
     return morsel.value if morsel else None
 
 def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict | None:
-    user_id = verify_session(token, cfg=cfg, timeout_h=cfg.session_timeout_h)
+    user_id = verify_session(token, cfg=cfg)
     if user_id is None:
         return None
     user = store.get_user(user_id)

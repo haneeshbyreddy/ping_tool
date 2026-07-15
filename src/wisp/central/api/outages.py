@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from wisp.central import analytics as central_analytics
-from wisp.central import incidents, ponfault
+from wisp.central import incidents, onuroster, ponfault
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import (org_or_400, q_int_or, reader_or_401)
 
@@ -118,6 +118,50 @@ def pon_faults(h, qs):
     faults = ponfault.evaluate_org(rows, datetime.now(timezone.utc),
                                    passive_dists=dists)
     h._reply(200, {"faults": [f.as_dict() for f in faults]})
+
+
+def pon_summary(h, qs):
+    # Org-wide optical/PON rollup for the dashboard KPI strip: live duplicate
+    # MACs, suspected fiber cuts, PONs at/over their ONU cap, and ONU online
+    # counts across every OLT with a fresh walk. Pure read-side — never pages.
+    # Duplicates, capacity, and roster ride the freshest-walk-per-OLT view
+    # (stale OLTs dropped), matching the per-panel numbers so the strip and the
+    # drill-down never disagree.
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    now = datetime.now(timezone.utc)
+    rows = h.store.org_onu_rows(org)
+    devs = h.store.list_org_devices(org)
+    dists = ponfault.passive_distances(devs, h.store.list_link_routes(org))
+    faults = ponfault.evaluate_org(rows, now, passive_dists=dists)
+    dups = onuroster.duplicate_macs(rows, now)
+    roster = onuroster.current_roster(rows, now)
+    online = sum(1 for r in roster if r.get("state") == "online")
+    # per-OLT cap override → cfg.onu_pon_limit, same resolution the paging
+    # sweep uses so a 1:128 GPON box isn't counted as over a 1:64 default
+    default_cap = h.cfg.onu_pon_limit
+    limits = {d["id"]: (int(d["onu_pon_limit"]) if d.get("onu_pon_limit") is not None
+                        else default_cap) for d in devs}
+    caps = onuroster.capacity_faults(
+        rows, now, lambda dev_id: limits.get(dev_id, default_cap))
+    h._reply(200, {
+        "olts": len({r["device_id"] for r in roster}),
+        "onus_total": len(roster),
+        "onus_online": online,
+        "onus_offline": len(roster) - online,
+        "fiber_cuts": sum(1 for f in faults if f.kind == "fiber"),
+        "pons_over_cap": len(caps),
+        "pon_cap": default_cap,
+        "pon_cap_worst": max((c.onus for c in caps), default=0),
+        # a MAC on ≥2 slots is "live" only when ≥2 are ONLINE at once — the
+        # paging rule; dead-member dups are C-Data reg-table history, not clones
+        "dup_macs_live": sum(1 for d in dups if d.online_members >= 2),
+        "dup_macs_total": len(dups),
+    })
 
 
 def incident_shape(h, qs):

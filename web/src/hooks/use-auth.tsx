@@ -9,7 +9,7 @@ const SCOPE_STORAGE_KEY = "wisp-central-org-scope"
 interface AuthContextValue {
   user: User | null
   isLoading: boolean
-  login: (username: string, password: string) => Promise<void>
+  login: (username: string, password: string, remember?: boolean) => Promise<void>
   logout: () => Promise<void>
   canWrite: boolean
 
@@ -26,6 +26,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryFn: authApi.me,
     retry: false,
     staleTime: Infinity,
+    // Re-check the session whenever the tab regains focus so a restored/backgrounded
+    // tab whose session lapsed lands on the login page, not a stale dashboard —
+    // "always" because staleTime:Infinity would otherwise skip the refetch.
+    refetchOnWindowFocus: "always",
   })
   const [superadminScope, setSuperadminScope] = useState<string | null>(
     () => localStorage.getItem(SCOPE_STORAGE_KEY),
@@ -46,8 +50,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const user = meQuery.data?.user ?? null
 
-  const login = async (username: string, password: string) => {
-    const data = await authApi.login(username, password)
+  const login = async (username: string, password: string, remember = false) => {
+    const data = await authApi.login(username, password, remember)
     queryClient.setQueryData(["me"], data)
   }
 

@@ -28,7 +28,10 @@ function severityRank(d: OrgDevice): number {
   return 4
 }
 
-const DEVICE_ROW_CAP = 30
+// Home panels are a glanceable preview: the three most-urgent rows each, with a
+// "view all" link into the full page. Ranking floats trouble to the top so the
+// three shown are the three worth looking at.
+const PANEL_ROW_CAP = 3
 
 function fmtUptime(pct: number): string {
   return pct >= 99.995 ? "100%" : `${pct.toFixed(2)}%`
@@ -56,6 +59,37 @@ function Panel({ title, action, children }: {
 
 function PanelEmpty({ children }: { children: React.ReactNode }) {
   return <p className="px-5 py-8 text-center text-xs text-muted-foreground">{children}</p>
+}
+
+type Stat = {
+  key: string
+  label: string
+  loading: boolean
+  value: string | number
+  detail: string
+  tone?: "destructive" | "warning"
+  to?: string
+}
+
+function StatCard({ s }: { s: Stat }) {
+  const body = (
+    <>
+      <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">{s.label}</p>
+      {s.loading ? <Skeleton className="mt-1.5 h-8 w-16" /> : (
+        <p className="mt-1 flex items-baseline gap-2">
+          <span className={cn("text-3xl font-semibold tracking-tight", s.tone === "destructive" && "text-destructive", s.tone === "warning" && "text-warning")}>
+            {s.value}
+          </span>
+          <span className="truncate text-xs text-muted-foreground">{s.detail}</span>
+        </p>
+      )}
+    </>
+  )
+  return s.to ? (
+    <Link to={s.to} className="bg-card px-6 py-5 transition-colors hover:bg-foreground/5">{body}</Link>
+  ) : (
+    <div className="bg-card px-6 py-5">{body}</div>
+  )
 }
 
 export function HomePage() {
@@ -93,6 +127,11 @@ export function HomePage() {
   const recentEvents = useQuery({
     queryKey: ["logs", scopeOrg, "recent"],
     queryFn: () => logsApi.list(scopeOrg, 8),
+    enabled: !!scopeOrg,
+  })
+  const ponSummary = useQuery({
+    queryKey: ["pon-summary", scopeOrg],
+    queryFn: () => inventoryApi.ponSummary(scopeOrg),
     enabled: !!scopeOrg,
   })
 
@@ -147,21 +186,15 @@ export function HomePage() {
       (uptimeByDevice.get(a.id) ?? 100) - (uptimeByDevice.get(b.id) ?? 100) ||
       a.name.localeCompare(b.name),
   )
-  const visibleDevices = rankedDevices.slice(0, DEVICE_ROW_CAP)
+  const visibleDevices = rankedDevices.slice(0, PANEL_ROW_CAP)
 
   const events = [...(recentEvents.data?.events ?? [])].sort((a, b) =>
     (b.occurred_at ?? b.received_at).localeCompare(a.occurred_at ?? a.received_at),
   )
+  const visibleNodes = activeNodes.slice(0, PANEL_ROW_CAP)
+  const visibleEvents = events.slice(0, PANEL_ROW_CAP)
 
-  const stats: Array<{
-    key: string
-    label: string
-    loading: boolean
-    value: string | number
-    detail: string
-    tone?: "destructive" | "warning"
-    to?: string
-  }> = [
+  const stats: Stat[] = [
     {
       key: "devices",
       label: "Devices online",
@@ -200,29 +233,64 @@ export function HomePage() {
     },
   ]
 
+  // Second strip — optical/PON plane. Only rendered once the org actually runs
+  // OLTs (a network with no fiber shouldn't stare at four zeros). All counts
+  // ride the freshest walk per OLT, so a stale C-Data box never inflates them.
+  const pon = ponSummary.data
+  const hasOptics = (pon?.olts ?? 0) > 0
+  const dupStale = pon ? pon.dup_macs_total - pon.dup_macs_live : 0
+  const opticalStats: Stat[] = [
+    {
+      key: "dup-macs",
+      label: "Duplicate MACs",
+      loading: ponSummary.isLoading,
+      value: pon?.dup_macs_live ?? 0,
+      detail: (pon?.dup_macs_live ?? 0) > 0 ? "cloned or looping"
+        : dupStale > 0 ? `${dupStale} stale-only` : "none live",
+      tone: (pon?.dup_macs_live ?? 0) > 0 ? "destructive" : undefined,
+      to: "/topology",
+    },
+    {
+      key: "fiber",
+      label: "Fiber cuts",
+      loading: ponSummary.isLoading,
+      value: pon?.fiber_cuts ?? 0,
+      detail: (pon?.fiber_cuts ?? 0) > 0 ? "check optical tab" : "none suspected",
+      tone: (pon?.fiber_cuts ?? 0) > 0 ? "destructive" : undefined,
+      to: "/topology",
+    },
+    {
+      key: "pon-cap",
+      label: "PONs at capacity",
+      loading: ponSummary.isLoading,
+      value: pon?.pons_over_cap ?? 0,
+      detail: (pon?.pons_over_cap ?? 0) > 0
+        ? `busiest has ${pon!.pon_cap_worst}`
+        : `all under ${pon?.pon_cap ?? 64}`,
+      tone: (pon?.pons_over_cap ?? 0) > 0 ? "warning" : undefined,
+      to: "/topology",
+    },
+    {
+      key: "onus",
+      label: "ONUs online",
+      loading: ponSummary.isLoading,
+      value: pon?.onus_total ? `${pon.onus_online}/${pon.onus_total}` : "—",
+      detail: (pon?.onus_offline ?? 0) > 0 ? `${pon!.onus_offline} offline` : "all up",
+      to: "/topology",
+    },
+  ]
+
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-6 p-4 md:p-6">
-      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
-        {stats.map((s) => {
-          const body = (
-            <>
-              <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">{s.label}</p>
-              {s.loading ? <Skeleton className="mt-1.5 h-8 w-16" /> : (
-                <p className="mt-1 flex items-baseline gap-2">
-                  <span className={cn("text-3xl font-semibold tracking-tight", s.tone === "destructive" && "text-destructive", s.tone === "warning" && "text-warning")}>
-                    {s.value}
-                  </span>
-                  <span className="truncate text-xs text-muted-foreground">{s.detail}</span>
-                </p>
-              )}
-            </>
-          )
-          return s.to ? (
-            <Link key={s.key} to={s.to} className="bg-card px-6 py-5 transition-colors hover:bg-foreground/5">{body}</Link>
-          ) : (
-            <div key={s.key} className="bg-card px-6 py-5">{body}</div>
-          )
-        })}
+      <div className="flex flex-col gap-2">
+        <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
+          {stats.map((s) => <StatCard key={s.key} s={s} />)}
+        </div>
+        {hasOptics && (
+          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
+            {opticalStats.map((s) => <StatCard key={s.key} s={s} />)}
+          </div>
+        )}
       </div>
 
       {/* Triage only claims screen space when something actually needs triage — a
@@ -317,7 +385,7 @@ export function HomePage() {
                 </Link>
               )
             })}
-            {rankedDevices.length > DEVICE_ROW_CAP && (
+            {rankedDevices.length > PANEL_ROW_CAP && (
               <Link to="/topology"
                 className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
                 All {rankedDevices.length} devices →
@@ -332,7 +400,7 @@ export function HomePage() {
             {!nodes.isLoading && activeNodes.length === 0 && (
               <PanelEmpty>No probes registered.</PanelEmpty>
             )}
-            {activeNodes.map((n) => {
+            {visibleNodes.map((n) => {
               const stale = !n.last_seen || isStale(n.last_seen)
               return (
                 <div key={n.node_id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0">
@@ -345,6 +413,12 @@ export function HomePage() {
                 </div>
               )
             })}
+            {activeNodes.length > PANEL_ROW_CAP && (
+              <Link to="/topology"
+                className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
+                All {activeNodes.length} probes →
+              </Link>
+            )}
           </Panel>
 
           <Panel title="Recent activity" action={{ label: "Logs", to: "/logs" }}>
@@ -352,7 +426,7 @@ export function HomePage() {
             {!recentEvents.isLoading && events.length === 0 && (
               <PanelEmpty>No events yet.</PanelEmpty>
             )}
-            {events.map((ev) => (
+            {visibleEvents.map((ev) => (
               <div key={ev.id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0">
                 <StatusDot tone={eventTone(ev)} />
                 <span className="min-w-0 shrink-0 truncate font-mono text-xs font-medium">
@@ -366,6 +440,12 @@ export function HomePage() {
                 </span>
               </div>
             ))}
+            {events.length > PANEL_ROW_CAP && (
+              <Link to="/logs"
+                className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
+                More in Logs →
+              </Link>
+            )}
           </Panel>
         </div>
       </div>

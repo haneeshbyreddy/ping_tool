@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api"
 import { SESSION_EXPIRED_KEY } from "@/lib/session"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
@@ -15,6 +16,7 @@ export function LoginPage() {
   const location = useLocation()
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
+  const [remember, setRemember] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [capsLock, setCapsLock] = useState(false)
   const [error, setError] = useState("")
@@ -35,7 +37,7 @@ export function LoginPage() {
     setShowPassword(false)
     setSubmitting(true)
     try {
-      await login(username, password)
+      await login(username, password, remember)
       navigate(from || "/", { replace: true })
     } catch (err) {
       // server messages arrive lowercase ("invalid credentials") — display-cased here
@@ -113,6 +115,18 @@ export function LoginPage() {
                 <p className="text-xs text-warning">Caps Lock is on.</p>
               )}
             </div>
+            <Label
+              htmlFor="remember"
+              className="flex items-center gap-2 text-sm font-normal text-muted-foreground"
+            >
+              <Checkbox
+                id="remember"
+                checked={remember}
+                onCheckedChange={(v) => setRemember(v === true)}
+                disabled={submitting}
+              />
+              Trust this device — stay signed in
+            </Label>
             {error && (
               <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive-soft px-3 py-2 text-xs text-destructive">
                 {error}

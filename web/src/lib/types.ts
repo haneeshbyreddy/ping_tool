@@ -58,6 +58,26 @@ export interface PonFault {
   suspect: string | null
 }
 
+/** Org-wide optical/PON rollup for the dashboard KPI strip
+    (GET /api/pon/summary). Read-side, never pages. */
+export interface PonSummary {
+  olts: number
+  onus_total: number
+  onus_online: number
+  onus_offline: number
+  fiber_cuts: number
+  /** PONs at or over their ONU cap (per-OLT override → default) */
+  pons_over_cap: number
+  /** the org default ONU-per-PON cap (per-OLT overrides not reflected here) */
+  pon_cap: number
+  /** ONU count on the busiest over-cap PON, 0 when none */
+  pon_cap_worst: number
+  /** MACs with ≥2 slots ONLINE at once — cloned CPE or a bridging loop */
+  dup_macs_live: number
+  /** every MAC on ≥2 slots, live or reg-table history */
+  dup_macs_total: number
+}
+
 /** Open-outage wave verdict (central/incidents.py): topology × geography.
     Annotation only — it never mutes or reroutes a page. */
 export interface IncidentShape {
@@ -118,6 +138,10 @@ export interface OrgDevice {
   onus_online: number | null
   onus_warn: number | null
   onus_crit: number | null
+  /** suspected fiber-cut PON mass-drops on this OLT (row chip → Optical tab) */
+  fiber_cuts: number
+  /** live duplicate-MAC groups touching this OLT (≥2 slots online at once) */
+  dup_macs: number
   optics_updated_at: string | null
   ports_updated_at: string | null
   /** started_at of the still-open outage, if any — "down for 43m" on the map */

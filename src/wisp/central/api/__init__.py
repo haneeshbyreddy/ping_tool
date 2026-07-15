@@ -37,6 +37,7 @@ GET = {
     "/api/inventory/perf": devices.perf,
     "/api/inventory/perf/samples": devices.perf_samples,
     "/api/pon/faults": outages.pon_faults,
+    "/api/pon/summary": outages.pon_summary,
     "/api/incident/shape": outages.incident_shape,
     "/api/analytics": outages.analytics,
     "/api/analytics/trend": outages.analytics_trend,

@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react"
 import { useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ChevronRight, LayoutGrid, List, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
@@ -271,37 +271,155 @@ function DeviceForm({
   )
 }
 
-function DeviceRow({
-  device, canWrite, onEdit, collapsed, onToggleCollapse, focus,
-}: {
-  device: OrgDevice & { depth: number; descendantCount: number }
-  canWrite: boolean
-  onEdit: (d: OrgDevice) => void
-  collapsed: boolean
-  onToggleCollapse: () => void
-  focus?: boolean
-}) {
-  const queryClient = useQueryClient()
+// Drill-in state shared by the tree row and the grid card: which panel tab is
+// open, whether it's expanded, and the deep-link focus effect (Home row /
+// command palette lands here — open the panel and scroll it into view).
+function useDrillIn(focus?: boolean) {
   const [detailOpen, setDetailOpen] = useState(false)
-  const [walkOpen, setWalkOpen] = useState(false)
-  const confirmDelete = useConfirm()
-  const rowRef = useRef<HTMLDivElement>(null)
-
-  // Deep-link landing (Home row / command palette): open the panel and scroll here.
+  const [detailTab, setDetailTab] = useState<DeviceTab>("health")
+  const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (focus) {
       setDetailOpen(true)
-      rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+      ref.current?.scrollIntoView({ behavior: "smooth", block: "center" })
     }
   }, [focus])
-
-  const hasOptics = isOpticalOlt(device)
-  const hasPorts = device.snmp_enabled === 1
-  const [detailTab, setDetailTab] = useState<DeviceTab>("health")
   const openTab = (t: DeviceTab) => { setDetailTab(t); setDetailOpen(true) }
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["inventory"] })
-  useNow()
+  return { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref }
+}
 
+// The trouble/status chips shared by the tree row and the grid card. Each chip
+// deep-links to the panel tab that tells its story (optics / ports / health),
+// so the operator never hunts for it. Gated on hasOptics so a stale badge from
+// before SNMP was turned off can't chip a link that goes nowhere.
+function DeviceChips({ device, hasOptics, collapsed, openTab }: {
+  device: OrgDevice & { descendantCount?: number }
+  hasOptics: boolean
+  collapsed?: boolean
+  openTab: (t: DeviceTab) => void
+}) {
+  const passive = isPassiveType(device.device_type)
+  // a splitter with no probe is by design, not a config gap
+  const unassigned = !device.assigned_node_id && !passive
+  return (
+    <>
+      {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
+      {passive && (
+        <RowTag tone="muted" title="Passive plant — on the map, never probed">
+          passive{device.pon_port ? ` · PON ${device.pon_port}` : ""}
+        </RowTag>
+      )}
+      {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
+      {device.backup_parents.length > 0 && <RowTag tone="success">backup</RowTag>}
+      {device.ports_down > 0 && (
+        <RowTag tone="destructive" title="A watched port is down. Click for ports"
+          onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
+          {device.ports_down === 1 ? "port down" : `${device.ports_down} ports down`}
+        </RowTag>
+      )}
+      {device.ports_bw_low > 0 && (
+        <RowTag tone="warning" title="A watched port is below its bandwidth floor. Click for ports"
+          onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
+          low bw
+        </RowTag>
+      )}
+      {device.ports_bw_high > 0 && (
+        <RowTag tone="warning" title="A watched port is above its bandwidth ceiling. Click for ports"
+          onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
+          high bw
+        </RowTag>
+      )}
+      {/* Suspected fiber cut / live duplicate MAC — the same verdicts the Optical
+          tab and the Home KPI strip carry, surfaced on the OLT's own row so a
+          troubled box flags in the list without the tech drilling in. */}
+      {hasOptics && device.fiber_cuts > 0 && (
+        <RowTag tone="destructive" title="Suspected fiber cut (PON mass-drop). Click for optics"
+          onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
+          {device.fiber_cuts === 1 ? "fiber cut" : `${device.fiber_cuts} fiber cuts`}
+        </RowTag>
+      )}
+      {hasOptics && device.dup_macs > 0 && (
+        <RowTag tone="destructive" title="Duplicate ONU MAC — cloned CPE or bridging loop. Click for optics"
+          onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
+          {device.dup_macs === 1 ? "dup MAC" : `${device.dup_macs} dup MACs`}
+        </RowTag>
+      )}
+      {hasOptics && !!device.onus_crit && device.onus_crit > 0 && (
+        <RowTag tone="destructive" title="ONUs below the critical Rx-power floor. Click for optics"
+          onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
+          {device.onus_crit} ONU{device.onus_crit === 1 ? "" : "s"} crit
+        </RowTag>
+      )}
+      {hasOptics && !device.onus_crit && !!device.onus_warn && device.onus_warn > 0 && (
+        <RowTag tone="warning" title="ONUs with a weak Rx-power warning. Click for optics"
+          onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
+          {device.onus_warn} ONU{device.onus_warn === 1 ? "" : "s"} weak
+        </RowTag>
+      )}
+      {/* Device vitals only chip when CRITICAL — a hot or pegged box is a fire to
+          walk toward; warn-level tints stay inside the expanded Health panel. */}
+      {(device.health_temp_c ?? 0) >= VITAL_TEMP_CRIT && (
+        <RowTag tone="destructive" title="Device temperature critical. Click for health"
+          onClick={(e) => { e.stopPropagation(); openTab("health") }}>
+          {Math.round(device.health_temp_c!)}°C
+        </RowTag>
+      )}
+      {(device.health_cpu_pct ?? 0) >= VITAL_CPU_CRIT && (
+        <RowTag tone="destructive" title="Device CPU pegged. Click for health"
+          onClick={(e) => { e.stopPropagation(); openTab("health") }}>
+          cpu {Math.round(device.health_cpu_pct!)}%
+        </RowTag>
+      )}
+      {collapsed && (device.descendantCount ?? 0) > 0 && <RowTag tone="muted">+{device.descendantCount}</RowTag>}
+    </>
+  )
+}
+
+// Capability indicators (optical / SNMP ports): they just say what this device
+// supports, tinted by the same freshness rule as the Overview — red on alarm,
+// amber on warn, green when a fresh reading is landing, dim when configured but
+// silent (no data yet / gone stale). Trouble beats working.
+function DeviceCapabilityIcons({ device, hasOptics, hasPorts }: {
+  device: OrgDevice; hasOptics: boolean; hasPorts: boolean
+}) {
+  if (!hasOptics && !hasPorts) return null
+  const opticsFresh = isFresh(device.optics_updated_at)
+  const portsFresh = isFresh(device.ports_updated_at)
+  return (
+    <div className="flex items-center gap-1.5">
+      {hasOptics && (
+        <span title={device.onus_crit ? `Optical: ${device.onus_crit} ONU(s) critical`
+          : device.onus_warn ? `Optical: ${device.onus_warn} ONU(s) weak`
+          : opticsFresh ? "Optical (GPON): reporting" : "Optical (GPON): no reading yet"}>
+          <Waypoints className={cn("size-3.5",
+            device.onus_crit ? "text-destructive"
+              : device.onus_warn ? "text-warning"
+              : opticsFresh ? "text-success" : "text-faint-foreground")} />
+        </span>
+      )}
+      {hasPorts && (
+        <span title={device.ports_down ? `SNMP: ${device.ports_down} port(s) down`
+          : (device.ports_bw_low || device.ports_bw_high) ? "SNMP: bandwidth alarm"
+          : portsFresh ? "SNMP ports: reporting" : "SNMP ports: no reading yet"}>
+          <Radio className={cn("size-3.5",
+            device.ports_down ? "text-destructive"
+              : (device.ports_bw_low || device.ports_bw_high) ? "text-warning"
+              : portsFresh ? "text-success" : "text-faint-foreground")} />
+        </span>
+      )}
+    </div>
+  )
+}
+
+// The per-device actions menu (edit / SNMP walk / maintenance / delete) plus its
+// dialogs — shared by row and card so the mutations live in one place.
+function DeviceActions({ device, canWrite, onEdit }: {
+  device: OrgDevice; canWrite: boolean; onEdit: (d: OrgDevice) => void
+}) {
+  const queryClient = useQueryClient()
+  const [walkOpen, setWalkOpen] = useState(false)
+  const confirmDelete = useConfirm()
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["inventory"] })
   const remove = useMutation({
     mutationFn: () => inventoryApi.remove(device.id),
     onSuccess: (res) => {
@@ -315,16 +433,67 @@ function DeviceRow({
     onSuccess: invalidate,
     onError: () => toast.error("Failed to update"),
   })
+  return (
+    <>
+      {canWrite && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon"
+              className="size-6 text-muted-foreground opacity-60 group-hover:opacity-100 data-[state=open]:opacity-100">
+              <MoreVertical className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => onEdit(device)}>
+              <Pencil /> Edit
+            </DropdownMenuItem>
+            {device.snmp_enabled === 1 && (
+              <DropdownMenuItem onClick={() => setWalkOpen(true)}>
+                <ScanSearch /> SNMP walk
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
+              <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
+            </DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
+              <Trash2 /> Delete
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+      <ConfirmDialog {...confirmDelete.props}
+        title={`Delete ${device.name}?`}
+        description="The device, its state, and its outage history are removed. This cannot be undone."
+        onConfirm={() => remove.mutate()} />
+      {walkOpen && (
+        <SnmpWalkDialog device={device} open={walkOpen} onOpenChange={setWalkOpen} />
+      )}
+    </>
+  )
+}
 
+function DeviceRow({
+  device, canWrite, onEdit, collapsed, onToggleCollapse, focus,
+}: {
+  device: OrgDevice & { depth: number; descendantCount: number }
+  canWrite: boolean
+  onEdit: (d: OrgDevice) => void
+  collapsed: boolean
+  onToggleCollapse: () => void
+  focus?: boolean
+}) {
+  const { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref } = useDrillIn(focus)
+  useNow()
+  const hasOptics = isOpticalOlt(device)
+  const hasPorts = device.snmp_enabled === 1
   const passive = isPassiveType(device.device_type)
-  // a splitter with no probe is by design, not a config gap
   const unassigned = !device.assigned_node_id && !passive
 
   return (
     // Open = the drill-in block: row + panel fuse into one raised surface
     // (.wisp-drillin in index.css); the row itself goes transparent so the
     // block carries the elevation, with a hairline between row and panel.
-    <div ref={rowRef} className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
+    <div ref={ref} className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
           detailOpen && "border-b")}
@@ -352,136 +521,12 @@ function DeviceRow({
         {device.device_type && (
           <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
         )}
-        {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
-        {passive && (
-          <RowTag tone="muted" title="Passive plant — on the map, never probed">
-            passive{device.pon_port ? ` · PON ${device.pon_port}` : ""}
-          </RowTag>
-        )}
-        {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
-        {device.backup_parents.length > 0 && <RowTag tone="success">backup</RowTag>}
-        {/* Monitored-port trouble surfaces on the switch's own row — clicking a chip
-            opens the ports panel straight to the story instead of making the operator
-            hunt for it behind the radio icon. */}
-        {device.ports_down > 0 && (
-          <RowTag tone="destructive" title="A watched port is down. Click for ports"
-            onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
-            {device.ports_down === 1 ? "port down" : `${device.ports_down} ports down`}
-          </RowTag>
-        )}
-        {device.ports_bw_low > 0 && (
-          <RowTag tone="warning" title="A watched port is below its bandwidth floor. Click for ports"
-            onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
-            low bw
-          </RowTag>
-        )}
-        {device.ports_bw_high > 0 && (
-          <RowTag tone="warning" title="A watched port is above its bandwidth ceiling. Click for ports"
-            onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
-            high bw
-          </RowTag>
-        )}
-        {/* OLT optical trouble surfaces on the OLT's own row — a click deep-links to the
-            Optical tab, same pattern as the port chips. Gated on hasOptics so a stale
-            badge from before SNMP was turned off can't show a chip that links nowhere. */}
-        {hasOptics && !!device.onus_crit && device.onus_crit > 0 && (
-          <RowTag tone="destructive" title="ONUs below the critical Rx-power floor. Click for optics"
-            onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
-            {device.onus_crit} ONU{device.onus_crit === 1 ? "" : "s"} crit
-          </RowTag>
-        )}
-        {hasOptics && !device.onus_crit && !!device.onus_warn && device.onus_warn > 0 && (
-          <RowTag tone="warning" title="ONUs with a weak Rx-power warning. Click for optics"
-            onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
-            {device.onus_warn} ONU{device.onus_warn === 1 ? "" : "s"} weak
-          </RowTag>
-        )}
-        {/* Device vitals only chip when CRITICAL — a hot or pegged box is a fire to
-            walk toward; warn-level tints stay inside the expanded Health panel. */}
-        {(device.health_temp_c ?? 0) >= VITAL_TEMP_CRIT && (
-          <RowTag tone="destructive" title="Device temperature critical. Click for health"
-            onClick={(e) => { e.stopPropagation(); openTab("health") }}>
-            {Math.round(device.health_temp_c!)}°C
-          </RowTag>
-        )}
-        {(device.health_cpu_pct ?? 0) >= VITAL_CPU_CRIT && (
-          <RowTag tone="destructive" title="Device CPU pegged. Click for health"
-            onClick={(e) => { e.stopPropagation(); openTab("health") }}>
-            cpu {Math.round(device.health_cpu_pct!)}%
-          </RowTag>
-        )}
-        {collapsed && device.descendantCount > 0 && <RowTag tone="muted">+{device.descendantCount}</RowTag>}
+        <DeviceChips device={device} hasOptics={hasOptics} collapsed={collapsed} openTab={openTab} />
         <div className="ml-auto flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
           <DeviceMetrics device={device} />
           <span className="hidden font-mono text-xs text-muted-foreground md:inline">{device.ip_address}</span>
-          {/* Passive capability indicators — no longer a button. They just say what this
-              device supports (optical / SNMP ports); the trouble tone matches whatever the
-              row's chips already say. Click the row to open the tabbed panel. */}
-          {(hasOptics || hasPorts) && (() => {
-            // Capability icons now carry a working/not-working tone, same freshness
-            // rule as the Overview (fresh reading = live). Trouble beats working:
-            // red on alarm, amber on warn, green when a fresh reading is landing, and
-            // dim when the capability is configured but silent (no data yet / gone stale).
-            const opticsFresh = isFresh(device.optics_updated_at)
-            const portsFresh = isFresh(device.ports_updated_at)
-            return (
-            <div className="flex items-center gap-1.5">
-              {hasOptics && (
-                <span title={device.onus_crit ? `Optical: ${device.onus_crit} ONU(s) critical`
-                  : device.onus_warn ? `Optical: ${device.onus_warn} ONU(s) weak`
-                  : opticsFresh ? "Optical (GPON): reporting" : "Optical (GPON): no reading yet"}>
-                  <Waypoints className={cn("size-3.5",
-                    device.onus_crit ? "text-destructive"
-                      : device.onus_warn ? "text-warning"
-                      : opticsFresh ? "text-success" : "text-faint-foreground")} />
-                </span>
-              )}
-              {hasPorts && (
-                <span title={device.ports_down ? `SNMP: ${device.ports_down} port(s) down`
-                  : (device.ports_bw_low || device.ports_bw_high) ? "SNMP: bandwidth alarm"
-                  : portsFresh ? "SNMP ports: reporting" : "SNMP ports: no reading yet"}>
-                  <Radio className={cn("size-3.5",
-                    device.ports_down ? "text-destructive"
-                      : (device.ports_bw_low || device.ports_bw_high) ? "text-warning"
-                      : portsFresh ? "text-success" : "text-faint-foreground")} />
-                </span>
-              )}
-            </div>
-            )
-          })()}
-          {canWrite && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon"
-                  className="size-6 text-muted-foreground opacity-60 group-hover:opacity-100 data-[state=open]:opacity-100">
-                  <MoreVertical className="size-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => onEdit(device)}>
-                  <Pencil /> Edit
-                </DropdownMenuItem>
-                {device.snmp_enabled === 1 && (
-                  <DropdownMenuItem onClick={() => setWalkOpen(true)}>
-                    <ScanSearch /> SNMP walk
-                  </DropdownMenuItem>
-                )}
-                <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
-                  <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
-                </DropdownMenuItem>
-                <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
-                  <Trash2 /> Delete
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-          <ConfirmDialog {...confirmDelete.props}
-            title={`Delete ${device.name}?`}
-            description="The device, its state, and its outage history are removed. This cannot be undone."
-            onConfirm={() => remove.mutate()} />
-          {walkOpen && (
-            <SnmpWalkDialog device={device} open={walkOpen} onOpenChange={setWalkOpen} />
-          )}
+          <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
+          <DeviceActions device={device} canWrite={canWrite} onEdit={onEdit} />
         </div>
       </div>
       {detailOpen && (
@@ -490,6 +535,70 @@ function DeviceRow({
         </div>
       )}
     </div>
+  )
+}
+
+// Grid presentation of a device — the flattened, glanceable counterpart to the
+// tree row. Same drill-in panel: clicking the card expands its DeviceDetail
+// full-width beneath the grid row (col-span-full), so the tabbed panel stays
+// identical across both views. Tree depth/collapse are list affordances and
+// don't apply here; the parent name carries the context an indent would.
+function DeviceCard({ device, canWrite, onEdit, focus, parentName }: {
+  device: OrgDevice & { depth: number; descendantCount: number }
+  canWrite: boolean
+  onEdit: (d: OrgDevice) => void
+  focus?: boolean
+  parentName?: string
+}) {
+  const { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref } = useDrillIn(focus)
+  useNow()
+  const hasOptics = isOpticalOlt(device)
+  const hasPorts = device.snmp_enabled === 1
+  const passive = isPassiveType(device.device_type)
+  const unassigned = !device.assigned_node_id && !passive
+
+  return (
+    <>
+      <div
+        ref={ref}
+        className={cn("group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
+          detailOpen && "border-border-strong bg-popover")}
+        onClick={() => setDetailOpen(!detailOpen)}
+        title={detailOpen ? undefined : "Click for details"}
+      >
+        <div className="flex items-center gap-2">
+          <span className="inline-flex shrink-0" title={unassigned ? "no probe assigned, not monitored"
+            : device.state && isStale(device.state_updated_at)
+            ? `stale, no report since ${ago(device.state_updated_at)}` : undefined}>
+            <StatusDot tone={unassigned ? "muted" : deviceTone(device.state, device.state_updated_at)} />
+          </span>
+          <span className={cn("min-w-0 flex-1 truncate font-mono text-xs font-medium",
+            unassigned && "text-muted-foreground")}>{device.name}</span>
+          <div onClick={(e) => e.stopPropagation()}>
+            <DeviceActions device={device} canWrite={canWrite} onEdit={onEdit} />
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-2xs text-muted-foreground">
+          {device.device_type && <span className="shrink-0 text-faint-foreground">{device.device_type}</span>}
+          {parentName && <span className="min-w-0 truncate" title={`under ${parentName}`}>↳ {parentName}</span>}
+          {device.ip_address && <span className="ml-auto shrink-0 font-mono">{device.ip_address}</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t pt-2">
+          <DeviceMetrics device={device} />
+          <DeviceChips device={device} hasOptics={hasOptics} openTab={openTab} />
+          <div className="ml-auto">
+            <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
+          </div>
+        </div>
+      </div>
+      {detailOpen && (
+        <div className="col-span-full">
+          <div className="wisp-drillin px-3 pt-1 pb-3">
+            <DeviceDetail device={device} tab={detailTab} onTab={setDetailTab} />
+          </div>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -515,6 +624,34 @@ function saveCollapsed(org: string | null, set: Set<number>): void {
   }
 }
 
+// One shared list/grid preference for the whole Network page (probes + devices),
+// persisted org-independently — it's a UI taste, not per-network state.
+type ViewMode = "list" | "grid"
+const VIEW_KEY = "wisp:network:view"
+
+function loadView(): ViewMode {
+  try {
+    return localStorage.getItem(VIEW_KEY) === "grid" ? "grid" : "list"
+  } catch {
+    return "list"
+  }
+}
+
+function ViewToggle({ view, onChange }: { view: ViewMode; onChange: (v: ViewMode) => void }) {
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border p-0.5">
+      {([["list", List], ["grid", LayoutGrid]] as const).map(([mode, Icon]) => (
+        <button key={mode} type="button" onClick={() => onChange(mode)}
+          aria-pressed={view === mode} title={`${mode.charAt(0).toUpperCase()}${mode.slice(1)} view`}
+          className={cn("flex size-6 items-center justify-center rounded-sm transition-colors",
+            view === mode ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground")}>
+          <Icon className="size-3.5" />
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export function TopologyPage() {
   const { scopeOrg, canWrite } = useAuth()
   const location = useLocation()
@@ -524,6 +661,12 @@ export function TopologyPage() {
   const [editing, setEditing] = useState<OrgDevice | null>(null)
   const [collapsed, setCollapsed] = useState<Set<number>>(() => loadCollapsed(scopeOrg))
   const [probeFilter, setProbeFilter] = useState<string | null>(navState?.probeId ?? null)
+  const [view, setView] = useState<ViewMode>(loadView)
+
+  const changeView = (v: ViewMode) => {
+    setView(v)
+    try { localStorage.setItem(VIEW_KEY, v) } catch { /* private mode / quota */ }
+  }
 
   useEffect(() => { setCollapsed(loadCollapsed(scopeOrg)) }, [scopeOrg])
   // arriving from a stale-probe card while already mounted
@@ -582,7 +725,11 @@ export function TopologyPage() {
   const devices = probeFilter
     ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
     : allDevices
-  const ordered = treeOrder(devices, collapsed)
+  const gridView = view === "grid"
+  // grid flattens the tree (a card grid can't carry indent/collapse); parent-
+  // before-child order still groups sensibly and each card names its parent.
+  const ordered = treeOrder(devices, gridView ? new Set<number>() : collapsed)
+  const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
   const nodeIds = activeNodes.map((n) => n.node_id)
   const deviceCounts = new Map<string, number>()
@@ -601,7 +748,12 @@ export function TopologyPage() {
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
-      <ProbesPanel org={scopeOrg} canWrite={canWrite} deviceCounts={deviceCounts}
+      <div className="flex items-center justify-between">
+        <h1 className="text-base font-semibold">Network</h1>
+        <ViewToggle view={view} onChange={changeView} />
+      </div>
+
+      <ProbesPanel org={scopeOrg} canWrite={canWrite} view={view} deviceCounts={deviceCounts}
         probeFilter={probeFilter} onProbeFilter={setProbeFilter} />
 
       <section className="flex flex-col gap-2">
@@ -647,7 +799,21 @@ export function TopologyPage() {
             {probeFilter ? `No devices assigned to ${probeFilter}.` : "No devices yet. Add one above."}
           </p>
         )}
-        {devices.length > 0 && (
+        {devices.length > 0 && (gridView ? (
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {ordered.map((d) => (
+              <Fragment key={d.id}>
+                <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit} focus={d.id === focusId}
+                  parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined} />
+                {formOpen && editing?.id === d.id && (
+                  <div className="col-span-full rounded-lg border bg-muted/30 p-3">
+                    <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
+                  </div>
+                )}
+              </Fragment>
+            ))}
+          </div>
+        ) : (
           <Card className="gap-0 overflow-hidden py-0">
             {ordered.map((d) => (
               <Fragment key={d.id}>
@@ -662,7 +828,7 @@ export function TopologyPage() {
               </Fragment>
             ))}
           </Card>
-        )}
+        ))}
       </section>
     </div>
   )

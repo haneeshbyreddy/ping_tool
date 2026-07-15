@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
-import { durationSince } from "@/lib/format"
+import { ago, durationSince, isFresh } from "@/lib/format"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Button } from "@/components/ui/button"
@@ -329,6 +329,66 @@ function FaultCard({ f }: { f: PonFault }) {
   )
 }
 
+// A single mass-drop shows its full card; more than one collapse behind a count
+// banner — an area power cut darkens every PON on the OLT at once, so a big box
+// stacks a dozen fault cards that bury the ONU strips. The banner leads with the
+// severity (any fiber verdict makes it red) and the tech expands for the detail.
+function FaultSection({ faults }: { faults: PonFault[] }) {
+  const [open, setOpen] = useState(false)
+  if (!faults.length) return null
+  if (faults.length === 1) return <FaultCard f={faults[0]} />
+  const fiber = faults.filter((f) => f.kind === "fiber").length
+  const power = faults.length - fiber
+  const parts = [
+    fiber > 0 && `${fiber} suspected fiber cut${fiber > 1 ? "s" : ""}`,
+    power > 0 && `${power} power pattern${power > 1 ? "s" : ""}`,
+  ].filter(Boolean)
+  return (
+    <div className="flex flex-col gap-2">
+      <button onClick={() => setOpen(!open)} aria-expanded={open}
+        className={cn("flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs",
+          fiber > 0
+            ? "border-destructive/40 bg-destructive-soft/40 hover:bg-destructive-soft/60"
+            : "border-warning/40 bg-warning-soft/40 hover:bg-warning-soft/60")}>
+        <span className={cn("font-semibold", fiber > 0 ? "text-destructive" : "text-warning")}>
+          {faults.length} PON mass-drops
+        </span>
+        <span className="hidden text-muted-foreground @md:inline">— {parts.join(" · ")}</span>
+        <span className={cn("ml-auto shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
+          ▶
+        </span>
+      </button>
+      {open && faults.map((f) => (
+        <FaultCard key={`${f.device_id}:${f.pon_port ?? "?"}`} f={f} />
+      ))}
+    </div>
+  )
+}
+
+// A single dup-MAC shows its full card; more than one collapse behind a count
+// banner (a big C-Data fleet can carry dozens of live clones — they'd bury the
+// PON strips otherwise) that the tech expands when they want the slot list.
+function DupMacSection({ dupMacs }: { dupMacs: DupMac[] }) {
+  const [open, setOpen] = useState(false)
+  if (!dupMacs.length) return null
+  if (dupMacs.length === 1) return <DupMacCard d={dupMacs[0]} />
+  return (
+    <div className="flex flex-col gap-2">
+      <button onClick={() => setOpen(!open)} aria-expanded={open}
+        className="flex w-full items-center gap-2 rounded-lg border border-destructive/40 bg-destructive-soft/40 px-3 py-2 text-left text-xs hover:bg-destructive-soft/60">
+        <span className="font-semibold text-destructive">{dupMacs.length} duplicate ONU MACs</span>
+        <span className="hidden text-muted-foreground @md:inline">
+          — cloned CPE, bridging loop, or stale double-registration
+        </span>
+        <span className={cn("ml-auto shrink-0 text-[0.625rem] text-muted-foreground transition-transform", open && "rotate-90")}>
+          ▶
+        </span>
+      </button>
+      {open && dupMacs.map((d) => <DupMacCard key={d.mac} d={d} />)}
+    </div>
+  )
+}
+
 // Redundant-MAC card: one ONU MAC on 2+ slots means a cloned CPE, a bridging
 // loop, or a stale double-registration. Detection is org-wide; the panel shows
 // the groups that touch this OLT.
@@ -415,15 +475,16 @@ export function OpticalPanel({ device, focusOnuId }: {
   const warn = onus.filter((o) => onuSev(o) === "warn").length
   const limit = q.data?.onu_pon_limit ?? Infinity
   const dupMacs = q.data?.dup_macs ?? []
+  // Freshness of the optics walk — same field/rule the row capability icon and
+  // map pin use (olt_optics.updated_at, 900s). Without this the panel gives no
+  // way to tell a live OLT from one whose walk quietly stopped, especially on a
+  // no-Rx vendor (DBC) where there are no dBm numbers to look stale.
+  const opticsStale = !isFresh(device.optics_updated_at)
 
   return (
     <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
-      {(faultsQ.data?.faults ?? []).map((f) => (
-        <FaultCard key={`${f.device_id}:${f.pon_port ?? "?"}`} f={f} />
-      ))}
-      {dupMacs.map((d) => (
-        <DupMacCard key={d.mac} d={d} />
-      ))}
+      <FaultSection faults={faultsQ.data?.faults ?? []} />
+      <DupMacSection dupMacs={dupMacs} />
       {/* header readout ------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span className="text-sm">
@@ -440,15 +501,23 @@ export function OpticalPanel({ device, focusOnuId }: {
             {warn} warning
           </span>
         )}
-        {/* worst-PON + dBm thresholds only mean something when at least one
-            ONU has an Rx reading — on a no-Rx vendor they'd point at an
-            arbitrary PON and quote thresholds nothing is judged against */}
-        {onus.some((o) => o.rx_dbm != null) && (
-          <span className="ml-auto flex items-center gap-3 font-mono text-2xs text-muted-foreground">
-            {worstPon && <span>worst: PON {worstPon}</span>}
-            <span>warn {q.data!.warn_dbm} · crit {q.data!.crit_dbm} dBm</span>
-          </span>
-        )}
+        {/* right side: worst-PON + dBm thresholds (only when at least one ONU
+            has an Rx reading — on a no-Rx vendor they'd point at an arbitrary
+            PON and quote thresholds nothing is judged against) followed by a
+            freshness stamp that ALWAYS shows, so a no-Rx OLT still says whether
+            its walk is landing. Stale is a data-freshness note, not an alarm —
+            neutral, never amber (mirrors the ports panel + CLAUDE.md rule). */}
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-2xs text-muted-foreground">
+          {onus.some((o) => o.rx_dbm != null) && (
+            <span className="flex items-center gap-3 font-mono">
+              {worstPon && <span>worst: PON {worstPon}</span>}
+              <span>warn {q.data!.warn_dbm} · crit {q.data!.crit_dbm} dBm</span>
+            </span>
+          )}
+          {device.optics_updated_at && (opticsStale
+            ? <span className="font-semibold" title="The SNMP optical walk on this OLT has stopped refreshing — these readings are the last good snapshot.">stale · {ago(device.optics_updated_at)}</span>
+            : <span className="text-faint-foreground">as of {ago(device.optics_updated_at)}</span>)}
+        </div>
       </div>
 
       {/* per-PON strips, each expanding INLINE to its worst-first drill-down --- */}

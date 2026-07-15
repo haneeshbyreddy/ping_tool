@@ -47,13 +47,30 @@ class CentralAuthUnitTest(unittest.TestCase):
     def test_session_round_trip_and_tamper(self):
         uid = auth.create_user(self.store, None, "root", "supersecret")
         tok = auth.issue_session(uid, self.cfg)
-        self.assertEqual(auth.verify_session(tok, cfg=self.cfg, timeout_h=12), uid)
-        self.assertIsNone(auth.verify_session(tok + "x", cfg=self.cfg, timeout_h=12))
+        self.assertEqual(auth.verify_session(tok, cfg=self.cfg), uid)
+        self.assertIsNone(auth.verify_session(tok + "x", cfg=self.cfg))
         old = auth.issue_session(uid, self.cfg, now=time.time() - 13 * 3600)
-        self.assertIsNone(auth.verify_session(old, cfg=self.cfg, timeout_h=12, now=time.time()))
+        self.assertIsNone(auth.verify_session(old, cfg=self.cfg, now=time.time()))
         user = auth.resolve_session(self.store, tok, cfg=self.cfg)
         self.assertTrue(user["is_superadmin"])
         self.assertNotIn("pw_hash", user)
+
+    def test_trusted_device_session_outlives_the_short_timeout(self):
+        uid = auth.create_user(self.store, None, "root", "supersecret")
+        # 13h past issue: a normal session is dead, a trusted one still lives.
+        past = time.time() - 13 * 3600
+        normal = auth.issue_session(uid, self.cfg, now=past)
+        trusted = auth.issue_session(uid, self.cfg, remember=True, now=past)
+        self.assertIsNone(auth.verify_session(normal, cfg=self.cfg, now=time.time()))
+        self.assertEqual(auth.verify_session(trusted, cfg=self.cfg, now=time.time()), uid)
+        # But even a trusted session expires past its own (days-long) window.
+        way_past = time.time() - (self.cfg.session_remember_days + 1) * 86400
+        stale = auth.issue_session(uid, self.cfg, remember=True, now=way_past)
+        self.assertIsNone(auth.verify_session(stale, cfg=self.cfg, now=time.time()))
+        # A tampered TTL breaks the signature.
+        u, issued, ttl, sig = normal.split(".")
+        forged = f"{u}.{issued}.{ttl}0.{sig}"
+        self.assertIsNone(auth.verify_session(forged, cfg=self.cfg))
 
 class CentralAuthHttpTest(unittest.TestCase):
     def setUp(self):
@@ -110,6 +127,15 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["user"]["org_id"], "ispA")
         self.assertEqual(body["user"]["role"], "owner")
+
+    def test_remember_me_gets_a_long_lived_cookie(self):
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword", "remember": True})
+        long_age = self.cfg.session_remember_days * 86400
+        self.assertIn(f"Max-Age={long_age}", setcookie)
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword"})
+        self.assertIn(f"Max-Age={self.cfg.session_timeout_h * 3600}", setcookie)
 
     def test_bad_login_401_and_me_requires_session(self):
         self.assertEqual(self._login("owner", "nope")[0], 401)

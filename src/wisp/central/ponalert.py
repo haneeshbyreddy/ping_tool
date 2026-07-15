@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from wisp.central import ponfault
+from wisp.central import onuroster, ponfault
 from wisp.config import CONFIG, Config
 
 log = logging.getLogger(__name__)
@@ -63,8 +63,16 @@ class PonFaultAlerter:
                     f"{where} from the OLT, by ranging (optical path — slack "
                     f"included).{suspect}", f.device_id, ts)
 
+        # Recovery needs a FRESH walk that actually shows the PON back up.
+        # evaluate_org skips an OLT whose walk is >15 min stale, so its faults
+        # vanish from `current` on every slow-walk stall — clearing (then
+        # re-paging when the walk lands) was 36 PON_FAULT pages in one hour on
+        # 2026-07-14. Freeze instead: skip = no verdict.
+        fresh_devs = onuroster.fresh_device_ids(rows, datetime.now(timezone.utc))
         for key, was in prior.items():
             if key in current or not was["active"]:
+                continue
+            if key[0] not in fresh_devs:
                 continue
             self.store.upsert_pon_fault_state(
                 self.org_id, key[0], key[1], kind=was["kind"], dark=0,

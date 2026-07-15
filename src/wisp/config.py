@@ -207,6 +207,11 @@ class Config:
         default_factory=lambda: _env_int("WISP_AGENT_HEALTH_DEADLINE_S", 300))
 
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
+    # "Trust this device" at login rides a much longer TTL so an operator's own
+    # box isn't kicked back to the sign-in form every shift. Baked into the signed
+    # cookie at issue time (auth.issue_session), not re-read per request.
+    session_remember_days: int = field(
+        default_factory=lambda: _env_int("WISP_SESSION_REMEMBER_DAYS", 30))
 
     def effective_interval(self, device_count: int) -> int:
         if self.poll_interval_adaptive and device_count <= self.small_fleet_max:

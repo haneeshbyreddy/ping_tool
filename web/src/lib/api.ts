@@ -1,7 +1,7 @@
 import type {
   AccountUser, AdminOverview, AttendanceOverview, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ReliabilityRow, Role,
-  PonFault, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   Summary, SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
 
@@ -30,8 +30,8 @@ export function tq(org?: string | null): string {
 
 export const authApi = {
   me: () => request<MeResponse>("/api/me"),
-  login: (username: string, password: string) =>
-    request<MeResponse>("/api/login", { method: "POST", body: { username, password } }),
+  login: (username: string, password: string, remember = false) =>
+    request<MeResponse>("/api/login", { method: "POST", body: { username, password, remember } }),
   logout: () => request<{ ok: true }>("/api/logout", { method: "POST" }),
 }
 
@@ -122,6 +122,8 @@ export const inventoryApi = {
     request<{ faults: PonFault[] }>(`/api/pon/faults?device_id=${deviceId}`),
   orgPonFaults: (org?: string | null) =>
     request<{ faults: PonFault[] }>(`/api/pon/faults${tq(org)}`),
+  ponSummary: (org?: string | null) =>
+    request<PonSummary>(`/api/pon/summary${tq(org)}`),
   incidentShape: (org?: string | null) =>
     request<{ incidents: IncidentShape[] }>(`/api/incident/shape${tq(org)}`),
   ackOnu: (id: number, hours: number | null) =>

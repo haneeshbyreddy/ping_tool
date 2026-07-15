@@ -329,8 +329,10 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(401, {"error": "invalid credentials"})
                 return
             throttle.reset(ip)
-            tok = auth.issue_session(user["id"], cfg)
-            cookie = auth.session_cookie(tok, max_age=cfg.session_timeout_h * 3600)
+            remember = bool(body.get("remember"))
+            ttl = auth.session_ttl_s(cfg, remember=remember)
+            tok = auth.issue_session(user["id"], cfg, remember=remember)
+            cookie = auth.session_cookie(tok, max_age=ttl)
             self._reply(200, {"user": public_user(user, store)}, cookie=cookie)
 
     # Route handlers in wisp.central.api receive the live handler instance;

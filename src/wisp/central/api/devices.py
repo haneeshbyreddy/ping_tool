@@ -4,13 +4,42 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from wisp.central import inventory, onuroster
+from wisp.central import inventory, onuroster, ponfault
 from wisp.central.api.common import (DENIED, body_org_write, device_read_scope,
                                      device_write_org, org_or_400, q_int_required,
                                      reader_or_401)
 
 
 # ----- reads ---------------------------------------------------------------
+
+def _stamp_optical_faults(h, org: str, devices: list[dict]) -> None:
+    # Row chips for the OLT list: suspected fiber cuts and LIVE duplicate MACs,
+    # the same verdicts the Optical tab and the Home KPI strip show — so the
+    # Network list flags a troubled OLT without the tech drilling in. Pure
+    # read-side; both verdicts ride the freshest-walk view (stale OLTs skipped),
+    # so the chip and the drill-down never disagree. Non-fiber orgs pay just one
+    # empty query (org_onu_rows short-circuits before any pure math runs).
+    for d in devices:
+        d["fiber_cuts"] = 0
+        d["dup_macs"] = 0
+    rows = h.store.org_onu_rows(org)
+    if not rows:
+        return
+    now = datetime.now(timezone.utc)
+    by_id = {d["id"]: d for d in devices}
+    for f in ponfault.evaluate_org(rows, now):
+        if f.kind == "fiber" and f.device_id in by_id:
+            by_id[f.device_id]["fiber_cuts"] += 1
+    # a MAC is a chip only when ≥2 slots are ONLINE at once (the paging rule);
+    # dead-member dups are C-Data reg-table history, never a clone/loop. One
+    # group can straddle two OLTs — chip every OLT it touches.
+    for dm in onuroster.duplicate_macs(rows, now):
+        if dm.online_members < 2:
+            continue
+        for dev_id in {m["device_id"] for m in dm.members}:
+            if dev_id in by_id:
+                by_id[dev_id]["dup_macs"] += 1
+
 
 def list_devices(h, qs):
     user = reader_or_401(h)
@@ -19,7 +48,9 @@ def list_devices(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    h._reply(200, {"devices": h.store.list_org_devices(org)})
+    devices = h.store.list_org_devices(org)
+    _stamp_optical_faults(h, org, devices)
+    h._reply(200, {"devices": devices})
 
 
 def regions(h, qs):

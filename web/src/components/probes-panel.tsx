@@ -170,7 +170,7 @@ function CredentialReveal({
 
 function ProbeRow({
   node, org, canWrite, onReveal, latestVersion, rollout,
-  deviceCount, filtered, onFilter,
+  deviceCount, filtered, onFilter, view = "list",
 }: {
   node: NodeToken
   org: string
@@ -181,6 +181,7 @@ function ProbeRow({
   deviceCount?: number
   filtered?: boolean
   onFilter?: () => void
+  view?: "list" | "grid"
 }) {
   const queryClient = useQueryClient()
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["nodes"] })
@@ -237,6 +238,145 @@ function ProbeRow({
             tone: stale ? "destructive" as const : "success" as const }
         : { label: "never connected", tone: "muted" as const }
 
+  const grid = view === "grid"
+
+  // Pieces shared by the row and the card — the only difference is layout, so
+  // the badges/menu are built once. Responsive `hidden` guards that make sense
+  // in a tight row drop away in the roomier card (grid).
+  const deviceBtn = onFilter != null && (deviceCount ?? 0) > 0 && (
+    <button
+      className={cn(
+        "shrink-0 rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors",
+        filtered ? "border-primary/40 bg-primary-soft text-primary"
+          : "text-muted-foreground hover:bg-accent hover:text-foreground",
+      )}
+      title={filtered ? "Showing only this probe's devices. Click to clear"
+        : "Show only this probe's devices"}
+      onClick={onFilter}>
+      {deviceCount} device{deviceCount === 1 ? "" : "s"}
+    </button>
+  )
+  const unregisteredBadge = !node.registered && (
+    <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
+      title="Reporting to central without a dashboard-issued credential. A leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
+      unregistered
+    </span>
+  )
+  const versionBadge = node.version && (
+    <span className={cn(
+      "shrink-0 font-mono text-xs",
+      grid ? "" : "hidden sm:inline",
+      updateAvailable ? "text-warning" : "text-faint-foreground",
+    )} title={updateAvailable ? `${latestVersion} available` : undefined}>
+      {node.version}
+    </span>
+  )
+  const updatingBadge = updateInFlight && (
+    <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
+      title={`Updating to ${rollout!.target_version}. Applied by the probe's supervisor after its next heartbeat`}>
+      updating…
+    </span>
+  )
+  const stalledBadge = updateStalled && (
+    <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-warning"
+      title={`The rollout to ${rollout!.target_version} halted. The probe never came back healthy on the new version within the window. Check logs\\edge.log on the probe box, then retry from the menu.`}>
+      update stalled
+    </span>
+  )
+  const memoryBadge = (node.rss_bytes != null || node.mem_available_bytes != null) && (
+    <span className={cn("shrink-0 text-2xs text-faint-foreground", grid ? "" : "hidden md:inline")}
+      title="Probe process memory · host RAM free">
+      {node.rss_bytes != null && fmtBytes(node.rss_bytes)}
+      {node.mem_available_bytes != null && (
+        <span className="text-faint-foreground">
+          {node.rss_bytes != null ? " · " : ""}{fmtBytes(node.mem_available_bytes)} free
+        </span>
+      )}
+    </span>
+  )
+  const statusLabel = (
+    <span className={cn(
+      "text-xs",
+      status.tone === "destructive" ? "font-semibold text-destructive" : "text-muted-foreground",
+    )}>
+      {status.label}
+    </span>
+  )
+  const menu = canWrite && (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon"
+          className="size-6 text-muted-foreground opacity-60 group-hover:opacity-100 data-[state=open]:opacity-100">
+          <MoreVertical className="size-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {updateAvailable && (
+          <DropdownMenuItem disabled={update.isPending}
+            onClick={() => update.mutate()}>
+            <Download /> {updateStalled ? `Retry update to ${latestVersion}` : `Update to ${latestVersion}`}
+          </DropdownMenuItem>
+        )}
+        {node.registered && (
+          <DropdownMenuItem onClick={() => rotate.mutate()}>
+            <KeyRound /> Rotate credential
+          </DropdownMenuItem>
+        )}
+        {node.registered && !node.revoked_at && (
+          <DropdownMenuItem onClick={() => revoke.mutate()}>
+            <Power /> Revoke
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
+          <Trash2 /> Delete
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+  const dialog = (
+    <ConfirmDialog {...confirmDelete.props}
+      title={node.registered
+        ? `Delete probe ${node.node_id}?`
+        : `Forget unregistered probe ${node.node_id}?`}
+      description={node.registered
+        ? "Its credential stops working and its devices go unmonitored until reassigned. This cannot be undone."
+        : "It will reappear here if it keeps reporting."}
+      confirmLabel={node.registered ? "Delete" : "Forget"}
+      onConfirm={() => remove.mutate()} />
+  )
+
+  if (grid) {
+    return (
+      <div className={cn(
+        "group flex flex-col gap-2 rounded-lg border bg-card p-3",
+        !node.registered && "bg-muted/20",
+      )}>
+        <div className="flex items-center gap-2">
+          <StatusDot tone={status.tone} />
+          <span className={cn(
+            "min-w-0 flex-1 truncate font-mono text-xs font-medium",
+            !node.registered && "text-muted-foreground",
+          )}>{node.node_id}</span>
+          {menu}
+          {dialog}
+        </div>
+        {(versionBadge || deviceBtn || unregisteredBadge || updatingBadge || stalledBadge) && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {versionBadge}
+            {deviceBtn}
+            {unregisteredBadge}
+            {updatingBadge}
+            {stalledBadge}
+          </div>
+        )}
+        <div className="flex items-center gap-2 border-t pt-2">
+          {statusLabel}
+          {memoryBadge && <span className="ml-auto">{memoryBadge}</span>}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className={cn(
       "group flex h-11 items-center gap-2.5 border-b px-4 last:border-b-0 hover:bg-foreground/5",
@@ -247,116 +387,30 @@ function ProbeRow({
         "min-w-0 truncate font-mono text-xs font-medium",
         !node.registered && "text-muted-foreground",
       )}>{node.node_id}</span>
-      {onFilter != null && (deviceCount ?? 0) > 0 && (
-        <button
-          className={cn(
-            "shrink-0 rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors",
-            filtered ? "border-primary/40 bg-primary-soft text-primary"
-              : "text-muted-foreground hover:bg-accent hover:text-foreground",
-          )}
-          title={filtered ? "Showing only this probe's devices. Click to clear"
-            : "Show only this probe's devices"}
-          onClick={onFilter}>
-          {deviceCount} device{deviceCount === 1 ? "" : "s"}
-        </button>
-      )}
-      {!node.registered && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
-          title="Reporting to central without a dashboard-issued credential. A leftover or rogue probe. Delete to forget it, or Register a probe with this id to manage it.">
-          unregistered
-        </span>
-      )}
-      {node.version && (
-        <span className={cn(
-          "hidden shrink-0 font-mono text-xs sm:inline",
-          updateAvailable ? "text-warning" : "text-faint-foreground",
-        )} title={updateAvailable ? `${latestVersion} available` : undefined}>
-          {node.version}
-        </span>
-      )}
-      {updateInFlight && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground"
-          title={`Updating to ${rollout!.target_version}. Applied by the probe's supervisor after its next heartbeat`}>
-          updating…
-        </span>
-      )}
-      {updateStalled && (
-        <span className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs font-medium text-warning"
-          title={`The rollout to ${rollout!.target_version} halted. The probe never came back healthy on the new version within the window. Check logs\\edge.log on the probe box, then retry from the menu.`}>
-          update stalled
-        </span>
-      )}
-      {(node.rss_bytes != null || node.mem_available_bytes != null) && (
-        <span className="hidden shrink-0 text-2xs text-faint-foreground md:inline"
-          title="Probe process memory · host RAM free">
-          {node.rss_bytes != null && fmtBytes(node.rss_bytes)}
-          {node.mem_available_bytes != null && (
-            <span className="text-faint-foreground">
-              {node.rss_bytes != null ? " · " : ""}{fmtBytes(node.mem_available_bytes)} free
-            </span>
-          )}
-        </span>
-      )}
+      {deviceBtn}
+      {unregisteredBadge}
+      {versionBadge}
+      {updatingBadge}
+      {stalledBadge}
+      {memoryBadge}
       <div className="ml-auto flex shrink-0 items-center gap-3">
-        <span className={cn(
-          "text-xs",
-          status.tone === "destructive" ? "font-semibold text-destructive" : "text-muted-foreground",
-        )}>
-          {status.label}
-        </span>
-        {canWrite && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon"
-                className="size-6 text-muted-foreground opacity-60 group-hover:opacity-100 data-[state=open]:opacity-100">
-                <MoreVertical className="size-3.5" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {updateAvailable && (
-                <DropdownMenuItem disabled={update.isPending}
-                  onClick={() => update.mutate()}>
-                  <Download /> {updateStalled ? `Retry update to ${latestVersion}` : `Update to ${latestVersion}`}
-                </DropdownMenuItem>
-              )}
-              {node.registered && (
-                <DropdownMenuItem onClick={() => rotate.mutate()}>
-                  <KeyRound /> Rotate credential
-                </DropdownMenuItem>
-              )}
-              {node.registered && !node.revoked_at && (
-                <DropdownMenuItem onClick={() => revoke.mutate()}>
-                  <Power /> Revoke
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
-                <Trash2 /> Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        <ConfirmDialog {...confirmDelete.props}
-          title={node.registered
-            ? `Delete probe ${node.node_id}?`
-            : `Forget unregistered probe ${node.node_id}?`}
-          description={node.registered
-            ? "Its credential stops working and its devices go unmonitored until reassigned. This cannot be undone."
-            : "It will reappear here if it keeps reporting."}
-          confirmLabel={node.registered ? "Delete" : "Forget"}
-          onConfirm={() => remove.mutate()} />
+        {statusLabel}
+        {menu}
+        {dialog}
       </div>
     </div>
   )
 }
 
 export function ProbesPanel({
-  org, canWrite, deviceCounts, probeFilter, onProbeFilter,
+  org, canWrite, deviceCounts, probeFilter, onProbeFilter, view = "list",
 }: {
   org: string
   canWrite: boolean
   deviceCounts?: Map<string, number>
   probeFilter?: string | null
   onProbeFilter?: (nodeId: string | null) => void
+  view?: "list" | "grid"
 }) {
   const queryClient = useQueryClient()
   const [addOpen, setAddOpen] = useState(false)
@@ -421,19 +475,23 @@ export function ProbesPanel({
           No probes registered yet. Register one to start monitoring.
         </p>
       )}
-      {nodes.length > 0 && (
-        <Card className="gap-0 overflow-hidden py-0">
-          {nodes.map((n) => (
-            <ProbeRow key={n.node_id} node={n} org={org} canWrite={canWrite} onReveal={setReveal}
-              latestVersion={data?.latest_version ?? null} rollout={data?.rollout ?? null}
-              deviceCount={deviceCounts?.get(n.node_id)}
-              filtered={probeFilter === n.node_id}
-              onFilter={onProbeFilter
-                ? () => onProbeFilter(probeFilter === n.node_id ? null : n.node_id)
-                : undefined} />
-          ))}
-        </Card>
-      )}
+      {nodes.length > 0 && (() => {
+        const rows = nodes.map((n) => (
+          <ProbeRow key={n.node_id} node={n} org={org} canWrite={canWrite} onReveal={setReveal}
+            view={view}
+            latestVersion={data?.latest_version ?? null} rollout={data?.rollout ?? null}
+            deviceCount={deviceCounts?.get(n.node_id)}
+            filtered={probeFilter === n.node_id}
+            onFilter={onProbeFilter
+              ? () => onProbeFilter(probeFilter === n.node_id ? null : n.node_id)
+              : undefined} />
+        ))
+        return view === "grid" ? (
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">{rows}</div>
+        ) : (
+          <Card className="gap-0 overflow-hidden py-0">{rows}</Card>
+        )
+      })()}
     </section>
   )
 }
