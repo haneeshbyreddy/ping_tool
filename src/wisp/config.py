@@ -69,6 +69,22 @@ class Config:
 
     backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
 
+    # Device web-UI proxy (reverse tunnel through the edge). Ships DARK — the
+    # whole feature is a no-op until proxy_enabled. See webplan.md. proxy_mgmt_ports
+    # is the CLOSED set of device ports the tunnel may reach; a session may target
+    # nothing else (the anti-pivot clamp, alongside the edge's device-list gate).
+    proxy_enabled: bool = field(default_factory=lambda: _env_bool("WISP_PROXY_ENABLED", False))
+    proxy_mgmt_ports: str = field(default_factory=lambda: _env("WISP_PROXY_MGMT_PORTS", "80,443"))
+    proxy_session_ttl_s: int = field(
+        default_factory=lambda: _env_int("WISP_PROXY_SESSION_TTL_S", 600))
+    proxy_poll_hold_s: float = field(
+        default_factory=lambda: _env_float("WISP_PROXY_POLL_HOLD_S", 25.0))
+    proxy_workers: int = field(default_factory=lambda: _env_int("WISP_PROXY_WORKERS", 4))
+    proxy_request_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_PROXY_REQUEST_TIMEOUT_S", 30.0))
+    proxy_max_body_bytes: int = field(
+        default_factory=lambda: _env_int("WISP_PROXY_MAX_BODY_BYTES", 8 * 1024 * 1024))
+
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
     snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 90))
     snmp_walk_timeout_s: float = field(

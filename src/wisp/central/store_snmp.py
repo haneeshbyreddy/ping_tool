@@ -688,13 +688,14 @@ class SnmpStoreMixin:
                 "SELECT org_id, name FROM orgs ORDER BY org_id")}
             rows = conn.execute(
                 "SELECT d.id, d.org_id, d.name, d.device_type, d.snmp_enabled,"
-                " h.updated_at AS health_at,"
+                " h.updated_at AS health_at, st.state AS dev_state,"
                 " g.updated_at AS optics_at, g.onus_total, g.onus_online,"
                 " ps.discovered AS ports_discovered, ps.monitored AS ports_monitored,"
                 " ps.fresh AS ports_fresh, ps.alarms AS ports_alarms,"
                 " ps.newest AS ports_at"
                 " FROM org_devices d"
                 " LEFT JOIN device_health h ON h.device_id = d.id"
+                " LEFT JOIN device_states st ON st.device_id = d.id"
                 " LEFT JOIN olt_optics g ON g.device_id = d.id"
                 " LEFT JOIN (SELECT device_id, COUNT(*) AS discovered,"
                 "    SUM(monitored) AS monitored,"
@@ -746,7 +747,11 @@ class SnmpStoreMixin:
                 if _fresh(r["optics_at"]):
                     o["optics"]["working"] += 1
                     o["optics"]["onus_total"] += r["onus_total"] or 0
-                    o["optics"]["onus_online"] += r["onus_online"] or 0
+                    # A down OLT has no reachable subscribers — its last walk is
+                    # still fresh, but none of those ONUs are online. Count them
+                    # in the total (blast radius) yet zero for online.
+                    if r["dev_state"] not in ("DOWN", "UNREACHABLE"):
+                        o["optics"]["onus_online"] += r["onus_online"] or 0
                 elif snmp_ok:
                     problem = (("optics", "stale", "optics stopped arriving")
                                if r["optics_at"] is not None else

@@ -51,9 +51,30 @@ export const systemApi = {
 export const adminApi = {
   overview: () => request<AdminOverview>("/api/admin/overview"),
   // server-wide settings, superadmin-only; the Google key applies to every org
-  settings: () => request<{ google_maps_key: string | null; billing_gpay_number: string }>("/api/admin/settings"),
-  saveSettings: (body: { google_maps_key?: string | null; billing_gpay_number?: string | null }) =>
+  settings: () => request<{
+    google_maps_key: string | null
+    billing_gpay_number: string
+    razorpay_key_id: string | null
+    razorpay_key_secret_set: boolean
+  }>("/api/admin/settings"),
+  saveSettings: (body: {
+    google_maps_key?: string | null
+    billing_gpay_number?: string | null
+    razorpay_key_id?: string | null
+    razorpay_key_secret?: string | null
+  }) =>
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
+}
+
+export interface BillingOrder {
+  order_id: string
+  amount: number
+  currency: string
+  key_id: string
+  plan: Plan
+  months: string[]
+  org_name: string
+  description: string
 }
 
 export const billingApi = {
@@ -61,6 +82,20 @@ export const billingApi = {
   // superadmin: set the plan and/or toggle one paid month
   adminSave: (body: { org_id: string; plan?: Plan; month?: string; paid?: boolean }) =>
     request<{ ok: true } & BillingInfo>("/api/admin/billing", { method: "POST", body }),
+  // Razorpay self-serve checkout (both routes stay reachable while locked)
+  order: (body: { org_id?: string | null; plan?: Plan; months?: number }) =>
+    request<BillingOrder>("/api/billing/order", { method: "POST", body }),
+  verify: (body: {
+    org_id?: string | null
+    razorpay_order_id: string
+    razorpay_payment_id: string
+    razorpay_signature: string
+  }) =>
+    request<{ ok: true } & BillingInfo>("/api/billing/verify", { method: "POST", body }),
+  // self-serve, no payment: only "free" is accepted (paid plans are entered
+  // by paying for them); reachable while locked — the escape hatch
+  setPlan: (body: { org_id?: string | null; plan: Plan }) =>
+    request<{ ok: true } & BillingInfo>("/api/billing/plan", { method: "POST", body }),
 }
 
 export const orgsApi = {

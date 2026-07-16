@@ -7,13 +7,25 @@ import {
   PLAN_ORDER, addMonths, billingStatusMeta, currentMonthKey, inr, monthLabel, monthShort,
 } from "@/lib/billing"
 import type { BillingInfo, Plan } from "@/lib/types"
+import { RazorpayWell } from "@/components/billing-lock"
+import { FreePlanButton, RazorpayPayButton } from "@/components/razorpay-pay"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 
-function PlanTier({ plan, billing }: { plan: Plan; billing: BillingInfo }) {
+function PlanTier({ plan, billing, org }: { plan: Plan; billing: BillingInfo; org: string }) {
   const spec = billing.plans[plan]
   const current = billing.plan === plan
+  // Plan moves are always on the table: paid plans (up OR down) are entered
+  // by paying their price at checkout, Free needs no payment at all.
+  const action = current ? null
+    : plan === "free"
+      ? <FreePlanButton org={org} className="mt-auto w-full" />
+      : billing.razorpay_key_id
+        ? <RazorpayPayButton org={org} plan={plan} variant="outline"
+            className="mt-auto w-full"
+            label={`${billing.plan === "free" ? "Upgrade" : "Switch"} to ${spec.label} · ${inr(spec.price_inr)}`} />
+        : null
   return (
     <div className={cn(
       "flex flex-col gap-2 rounded-lg border p-4",
@@ -39,6 +51,7 @@ function PlanTier({ plan, billing }: { plan: Plan; billing: BillingInfo }) {
           </li>
         ))}
       </ul>
+      {action}
     </div>
   )
 }
@@ -125,7 +138,7 @@ export function BillingCard({ org }: { org: string }) {
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="grid gap-3 sm:grid-cols-3">
-          {PLAN_ORDER.map((p) => <PlanTier key={p} plan={p} billing={billing} />)}
+          {PLAN_ORDER.map((p) => <PlanTier key={p} plan={p} billing={billing} org={org} />)}
         </div>
 
         <div className="flex flex-col gap-1.5">
@@ -172,11 +185,16 @@ export function BillingCard({ org }: { org: string }) {
           </div>
         )}
 
-        <PayWell billing={billing} note={
-          billing.status === "free"
-            ? `Upgrades are manual by design: pay the first month (${inr(billing.plans.pro.price_inr)} Pro, ${inr(billing.plans.vip.price_inr)} VIP) to this number and the admin will switch your plan in a moment.`
-            : `${inr(spec.price_inr)} per month for the ${spec.label} plan. The admin marks your account paid within moments of payment. Reminders go to the owner alert channel from 3 days before a month runs out.`
-        } />
+        {billing.razorpay_key_id ? (
+          // free orgs upgrade from the tier cards above; paid orgs renew here
+          billing.status !== "free" && <RazorpayWell billing={billing} org={org} />
+        ) : (
+          <PayWell billing={billing} note={
+            billing.status === "free"
+              ? `Upgrades are manual by design: pay the first month (${inr(billing.plans.pro.price_inr)} Pro, ${inr(billing.plans.vip.price_inr)} VIP) to this number and the admin will switch your plan in a moment.`
+              : `${inr(spec.price_inr)} per month for the ${spec.label} plan. The admin marks your account paid within moments of payment. Reminders go to the owner alert channel from 3 days before a month runs out.`
+          } />
+        )}
       </CardContent>
     </Card>
   )

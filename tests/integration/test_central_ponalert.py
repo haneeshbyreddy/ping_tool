@@ -166,6 +166,10 @@ class PonSummaryEndpointTest(unittest.TestCase):
         self.olt = self.store.create_org_device("ispA", {
             "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        # a live OLT reports every ICMP cycle — seed a fresh UP state so the
+        # liveness gate treats it as observed (a missing state row = probe silent)
+        self.store.write_device_states(
+            "ispA", [(self.olt, "UP", 5.0, 0.0, None)], _now())
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -268,6 +272,60 @@ class PonSummaryEndpointTest(unittest.TestCase):
         _, body = h.reply
         self.assertEqual(body["pons_over_cap"], 1)
         self.assertEqual(body["pon_cap_worst"], 3)
+
+    def test_summary_zeroes_down_olt(self):
+        from wisp.central.api import outages
+        # same fresh mass-drop + live-dup fixture as the online test …
+        self._onu("survivor", "online", distance=700)
+        for i, d in enumerate((1800, 1950, 2300)):
+            self._onu(f"dark{i}", "los", distance=d)
+        self._onu("loopA", "online", pon="0/7", serial="AA:BB:CC")
+        self._onu("loopB", "online", pon="0/7", serial="AA:BB:CC")
+        with self.store._connect() as conn:
+            conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
+                         (_now(),))
+            conn.commit()
+        # … but the OLT itself is ICMP-down: its last walk is still fresh, so
+        # without the liveness gate it would keep contributing 3 online ONUs and a
+        # phantom fiber-cut / live-dup verdict.
+        self.store.write_device_states(
+            "ispA", [(self.olt, "DOWN", None, 100.0, None)], _now())
+        h = _FakeHandler(self.store, "ispA")
+        outages.pon_summary(h, {})
+        status, body = h.reply
+        self.assertEqual(status, 200)
+        # roster still sees the fresh walk, so the OLT and its ONUs still count as
+        # the blast radius — but every one of them is offline while it's down.
+        self.assertEqual(body["olts"], 1)
+        self.assertEqual(body["onus_total"], 6)
+        self.assertEqual(body["onus_online"], 0)
+        self.assertEqual(body["onus_offline"], 6)
+        # the ICMP outage owns a down OLT — no second story off frozen optics
+        self.assertEqual(body["fiber_cuts"], 0)
+        self.assertEqual(body["dup_macs_live"], 0)
+        self.assertEqual(body["dup_macs_total"], 0)
+
+    def test_summary_drops_probe_silent_olt(self):
+        from wisp.central.api import outages
+        # ONUs online, walk fresh — but the OLT's PROBE has gone silent (its edge
+        # is down): central never marks the OLT down, yet we can't see it. The
+        # whole OLT drops out of the rollup, like a stale optics walk but off the
+        # faster ICMP signal — no ONUs left "online" for the 15-min optics window.
+        self._onu("a", "online")
+        self._onu("b", "online")
+        with self.store._connect() as conn:
+            conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
+                         (_now(),))
+            conn.commit()
+        # last ICMP report is older than the 180s node-stale threshold
+        self.store.write_device_states(
+            "ispA", [(self.olt, "UP", 5.0, 0.0, None)], _recent(10.0))
+        h = _FakeHandler(self.store, "ispA")
+        outages.pon_summary(h, {})
+        _, body = h.reply
+        self.assertEqual(body["olts"], 0)
+        self.assertEqual(body["onus_total"], 0)
+        self.assertEqual(body["onus_online"], 0)
 
     def test_summary_skips_stale_olt(self):
         from wisp.central.api import outages

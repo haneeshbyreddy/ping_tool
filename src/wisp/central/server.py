@@ -14,11 +14,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import api, auth, billing, inventory, pki
+from wisp.central import api, auth, billing, inventory, pki, razorpay
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
 from wisp.central.engine import EngineRegistry
+from wisp.central.proxy import ProxyHub
 from wisp.central.store import CentralStore
 from wisp.egress.notifiers import build_notifier
 from wisp.runtime.central_client import WIRE_V
@@ -27,19 +28,32 @@ log = logging.getLogger("wisp.central")
 
 MAX_WIRE_V = WIRE_V
 _MAX_BODY = 16 * 1024 * 1024
+
+# /api/proxy/* paths that are OUR routes, not <sid> tunnel-forwards. A sid is a
+# 32-char token so a collision can't happen by accident, but the split must be
+# explicit — a new exact route added only to the api tables would otherwise be
+# swallowed by the prefix forward and 404 as an unknown session.
+_PROXY_EXACT = frozenset({
+    "/api/proxy/session", "/api/proxy/sessions",
+    "/api/proxy/close", "/api/proxy/audit",
+})
 _STATIC = Path(__file__).resolve().parent / "static"
 
 # Routes a LOCKED org's session may still reach: exactly what the lock screen
-# needs to render (who am I + how much do I owe) plus logout. Everything else
-# under /api/ replies 402 until the admin marks the month paid.
-_BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout", "/healthz"}
+# needs to render (who am I + how much do I owe) plus logout — and the
+# Razorpay checkout routes plus the free-plan escape hatch, so a locked org
+# can pay its way out (or drop to Free) right there.
+_BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout",
+                   "/api/billing/order", "/api/billing/verify",
+                   "/api/billing/plan", "/healthz"}
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
-                  engine_registry: EngineRegistry | None = None):
+                  engine_registry: EngineRegistry | None = None, payments=None):
     token = cfg.central_token
     client_ca = cfg.central_client_ca
     notifier = notifier or build_notifier(cfg)
     registry = engine_registry or EngineRegistry(store, cfg)
+    payments = payments or razorpay.RazorpayGateway(store)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "wisp-central"
@@ -56,6 +70,40 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(raw)
+
+        def _raw_reply(self, code: int, headers, body: bytes) -> None:
+            # Non-JSON response, used by the web-UI proxy to stream a device's
+            # own bytes back to the browser verbatim. Caller has already stripped
+            # hop-by-hop headers; we own Content-Length. Headers arrive as
+            # (name, value) pairs so repeated names (multiple Set-Cookie)
+            # survive; a plain dict is accepted too.
+            self.send_response(code)
+            items = headers.items() if isinstance(headers, dict) else headers
+            for k, v in items:
+                try:
+                    self.send_header(str(k), str(v))
+                except Exception:
+                    continue
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _proxy_forward(self, method: str, route: str, query: str) -> None:
+            # /api/proxy/<sid>/<path...> — the browser-facing tunnel forward.
+            sid, _, rest = route[len("/api/proxy/"):].partition("/")
+            body = b""
+            if method == "POST":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    length = 0
+                if length > _MAX_BODY:
+                    self._reply(413, {"error": "request too large"})
+                    return
+                if length > 0:
+                    body = self.rfile.read(length)
+            api.proxy.browser_request(self, method, sid, rest, query, body)
 
         def _read_body(self) -> dict | None:
             try:
@@ -276,6 +324,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_GET(self):
             parsed = urlparse(self.path)
             route, qs = parsed.path, parse_qs(parsed.query)
+            if route == "/edge/proxy/next":
+                api.proxy.edge_next(self, qs)
+                return
+            if route.startswith("/api/proxy/") and route not in _PROXY_EXACT:
+                self._proxy_forward("GET", route, parsed.query)
+                return
             handler = api.GET.get(route)
             if handler is not None:
                 if self._billing_blocked(route):
@@ -293,7 +347,10 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_POST(self):
             parsed = urlparse(self.path)
             route = parsed.path
-            if route in ("/heartbeat", "/report", "/edge/snmp-walk"):
+            if route.startswith("/api/proxy/") and route not in _PROXY_EXACT:
+                self._proxy_forward("POST", route, parsed.query)
+                return
+            if route in ("/heartbeat", "/report", "/edge/snmp-walk", "/edge/proxy/reply"):
                 body = self._read_body()
                 if body is None or not isinstance(body, dict):
                     self._reply(400, {"error": "bad or missing JSON body"})
@@ -312,6 +369,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         self._reply(200, api.edge.heartbeat_reply(self, org, node, hb))
                     elif route == "/edge/snmp-walk":
                         api.edge.walk_result(self, org, node, env)
+                    elif route == "/edge/proxy/reply":
+                        api.proxy.edge_reply(self, org, node, env)
                     else:
                         self._reply(200, api.edge.report(self, org, env))
                 except Exception:
@@ -368,6 +427,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.store = store
     Handler.notifier = notifier
     Handler.registry = registry
+    Handler.payments = payments
+    Handler.proxy = ProxyHub()
     return Handler
 
 class _TLSThreadingHTTPServer(ThreadingHTTPServer):
@@ -398,10 +459,11 @@ def _build_tls_context(cfg: Config) -> ssl.SSLContext | None:
     return ctx
 
 def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
-                notifier=None, engine_registry: EngineRegistry | None = None
-                ) -> ThreadingHTTPServer:
+                notifier=None, engine_registry: EngineRegistry | None = None,
+                payments=None) -> ThreadingHTTPServer:
     store = store or CentralStore(cfg.central_db)
-    handler = _make_handler(cfg, store, LoginThrottle(), notifier, engine_registry)
+    handler = _make_handler(cfg, store, LoginThrottle(), notifier,
+                            engine_registry, payments)
     tls_context = _build_tls_context(cfg)
     if tls_context is not None:
         httpd = _TLSThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler, tls_context)

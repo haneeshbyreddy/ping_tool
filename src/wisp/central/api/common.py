@@ -2,17 +2,56 @@
 
 Every handler function receives the live request handler instance ``h``
 (see ``server.py``). Services ride on it as class attributes — ``h.cfg``,
-``h.store``, ``h.notifier``, ``h.registry`` — and the transport/auth
+``h.store``, ``h.notifier``, ``h.registry``, ``h.payments`` — and the transport/auth
 plumbing stays on the handler (``h._reply``, ``h._user``, ``h._reader``,
 ``h._scope_org``, ``h._can_write``, ``h._ingest_ok``).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from wisp.core.analytics import _parse
+from wisp.core.state_machine import DOWN_FAMILY
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def olt_liveness(devs: list[dict], now: datetime, node_stale_s: int
+                 ) -> tuple[set[int], set[int]]:
+    """Split OLTs (any device rows, really) by what we can currently say about
+    them, using the SAME ICMP signals the device-count KPI and row graying use —
+    not just the DOWN state:
+
+      * down  — ICMP DOWN/UNREACHABLE with a FRESH report: confirmed unreachable,
+        so its ONUs are offline (callers keep them in the total as blast radius).
+      * stale — no report since ``node_stale_s`` (the probe/edge is silent): the
+        OLT is UNKNOWN, not down. Central never marks it down (a dead edge sends
+        no reports), yet its last SNMP walk lingers "fresh" for up to STALE_S — so
+        without this it would keep its ONUs "online" for ~15 min. Callers drop it
+        from the rollup entirely, exactly like a stale optics walk, just off the
+        faster ICMP signal.
+
+    A box that is both (last state DOWN, edge now gone) counts as stale — we can no
+    longer confirm it, so we stop asserting anything about it. Returns
+    ``(down_ids, stale_ids)``, disjoint.
+    """
+    cutoff = now.replace(tzinfo=None) - timedelta(seconds=node_stale_s)
+
+    def _fresh_state(d: dict) -> bool:
+        ts = d.get("state_updated_at")
+        if not ts:
+            return False
+        try:
+            return _parse(ts) >= cutoff
+        except (ValueError, TypeError):
+            return False
+
+    stale = {d["id"] for d in devs if not _fresh_state(d)}
+    down = {d["id"] for d in devs
+            if d.get("state") in DOWN_FAMILY and d["id"] not in stale}
+    return down, stale
 
 
 def public_user(user: dict, store) -> dict:

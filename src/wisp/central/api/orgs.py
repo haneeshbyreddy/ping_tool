@@ -2,15 +2,18 @@
 stats, coverage overview, test alerts, plan/billing."""
 from __future__ import annotations
 
+import logging
 import re
 
 from wisp.central import billing as billing_mod
-from wisp.central import inventory, sysinfo
+from wisp.central import inventory, razorpay, sysinfo
 from wisp.central.api.common import (DENIED, body_org_write, org_or_400,
                                      public_user, reader_or_401,
                                      superadmin_or_403)
 
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+log = logging.getLogger("wisp.central.api.orgs")
 
 
 def healthz(h, qs):
@@ -48,7 +51,12 @@ def admin_settings(h, qs):
     if not superadmin_or_403(h):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
-                   "billing_gpay_number": billing_mod.gpay_number(h.store)})
+                   "billing_gpay_number": billing_mod.gpay_number(h.store),
+                   "razorpay_key_id": h.store.get_setting("razorpay_key_id"),
+                   # the secret never leaves central — the UI only learns
+                   # whether one is configured
+                   "razorpay_key_secret_set":
+                       bool(h.store.get_setting("razorpay_key_secret"))})
 
 
 def list_orgs(h, qs):
@@ -102,6 +110,13 @@ def update(h, user, body):
                 h._reply(422, {"error": "poll_interval_s must be between 10 and 120 seconds"})
                 return
         h.store.set_org_poll_interval(org, seconds)
+    if "web_proxy" in body:
+        # Web-UI proxy capability (webplan.md §6.7): a blast-radius switch,
+        # not an org preference — only the superadmin grants or revokes it.
+        if not user["is_superadmin"]:
+            h._reply(403, {"error": "web_proxy is superadmin-set"})
+            return
+        h.store.set_org_web_proxy(org, bool(body.get("web_proxy")))
     h.store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                     ntfy_topic_owner=body.get("ntfy_topic_owner"),
                     ntfy_topic_operator=body.get("ntfy_topic_operator"),
@@ -125,6 +140,14 @@ def admin_settings_write(h, user, body):
     if gpay is not None:
         # blank falls back to billing.DEFAULT_GPAY_NUMBER
         h.store.set_setting("billing_gpay_number", str(gpay).strip()[:32])
+    # Razorpay keys (central/razorpay.py): blank clears — no keys means the
+    # Pay buttons vanish everywhere and billing falls back to the GPay flow
+    rzp_id = body.get("razorpay_key_id")
+    if rzp_id is not None:
+        h.store.set_setting("razorpay_key_id", str(rzp_id).strip()[:64])
+    rzp_secret = body.get("razorpay_key_secret")
+    if rzp_secret is not None:
+        h.store.set_setting("razorpay_key_secret", str(rzp_secret).strip()[:64])
     h._reply(200, {"ok": True})
 
 
@@ -148,8 +171,149 @@ def billing(h, qs):
         "node_count": h.store.active_node_token_count(org),
         "node_cap": billing_mod.node_cap(st["plan"]),
         "gpay_number": billing_mod.gpay_number(h.store),
+        # Checkout needs the public key id in the browser; None = Razorpay
+        # not configured, the UI falls back to the manual GPay flow
+        "razorpay_key_id": h.payments.key_id if h.payments.enabled else None,
         "plans": billing_mod.PLANS,
     })
+
+
+def billing_order(h, user, body):
+    """Create a Razorpay order for N months of a paid plan. Deliberately
+    billing-exempt (server.py) — a LOCKED org pays its way out from the lock
+    screen. Owner-only, like every other org write."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    if not org or not h.store.org_exists(org):
+        h._reply(404, {"error": "unknown org"})
+        return
+    if not h.payments.enabled:
+        h._reply(422, {"error": "online payments are not configured — "
+                                "pay by GPay instead"})
+        return
+    plan = billing_mod.clean_plan(body.get("plan") or h.store.org_plan(org))
+    if plan not in billing_mod.PAID_PLANS:
+        h._reply(422, {"error": "plan must be one of: "
+                                + ", ".join(billing_mod.PAID_PLANS)})
+        return
+    raw_months = body.get("months")
+    try:
+        count = 1 if raw_months in (None, "") else int(raw_months)
+    except (TypeError, ValueError):
+        h._reply(422, {"error": "months must be a number"})
+        return
+    if not 1 <= count <= 12:
+        h._reply(422, {"error": "months must be between 1 and 12"})
+        return
+    months = billing_mod.months_to_pay(plan, h.store.paid_months(org), count)
+    amount = billing_mod.PLANS[plan]["price_inr"] * count * 100  # paise
+    try:
+        # network call — after this point only fast local writes (dispatch rule)
+        order = h.payments.create_order(
+            amount, receipt=f"{org[:30]}-{count}m",
+            notes={"org_id": org, "plan": plan, "months": ",".join(months)})
+    except razorpay.GatewayError as exc:
+        h._reply(502, {"error": f"payment gateway error: {exc}"})
+        return
+    h.store.create_billing_payment(order["id"], org, plan, months, amount,
+                                   created_by=user["username"])
+    label = billing_mod.PLANS[plan]["label"]
+    desc = f"{label} plan · {billing_mod.month_label(months[0])}"
+    if len(months) > 1:
+        desc += f" – {billing_mod.month_label(months[-1])} ({len(months)} months)"
+    h._reply(200, {"order_id": order["id"], "amount": amount,
+                   "currency": "INR", "key_id": h.payments.key_id,
+                   "plan": plan, "months": months,
+                   "org_name": h.store.org_name(org) or org,
+                   "description": desc})
+
+
+def billing_plan(h, user, body):
+    """Self-serve plan change WITHOUT payment: only 'free' — every paid plan
+    is entered by paying for it (billing_order/verify apply the new plan).
+    Billing-exempt: the escape hatch for a locked org that would rather drop
+    to Free than pay. Existing devices keep working; the free caps only stop
+    new creates. Owner-only."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    if not org or not h.store.org_exists(org):
+        h._reply(404, {"error": "unknown org"})
+        return
+    plan = billing_mod.clean_plan(body.get("plan"))
+    if plan != "free":
+        h._reply(422, {"error": "only the free plan can be chosen without "
+                                "payment — upgrades go through checkout"})
+        return
+    prior = h.store.org_plan(org)
+    if prior != "free":
+        h.store.set_org_plan(org, "free")
+        _notify_admin_plan_change(h, org, prior)
+    st = billing_mod.org_status(h.store, org)
+    h._reply(200, {"ok": True, **st,
+                   "paid_months": sorted(h.store.paid_months(org))})
+
+
+def _notify_admin_plan_change(h, org: str, prior: str) -> None:
+    # best-effort heads-up, same channel as payment notices — a lost churn
+    # signal must never 500 the downgrade
+    topic = h.cfg.central_ntfy_topic
+    if not topic:
+        return
+    try:
+        name = h.store.org_name(org) or org
+        h.notifier.send(topic, f"📉 {name} switched to Free",
+                        f"was {prior} — self-serve downgrade", 3)
+    except Exception:
+        log.exception("plan-change notification failed for %s", org)
+
+
+def billing_verify(h, user, body):
+    """Finalize checkout: verify Razorpay's HMAC over order|payment, then —
+    exactly once per order — apply the plan and mark the months paid.
+    Idempotent: re-submitting a settled order just re-reads status."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    order_id = str(body.get("razorpay_order_id") or "")
+    payment_id = str(body.get("razorpay_payment_id") or "")
+    signature = str(body.get("razorpay_signature") or "")
+    pay = h.store.billing_payment(order_id)
+    if not pay or (org and pay["org_id"] != org):
+        h._reply(404, {"error": "unknown order"})
+        return
+    org = pay["org_id"]  # superadmin verifying without an org scope
+    if not h.payments.verify_signature(order_id, payment_id, signature):
+        h._reply(422, {"error": "payment signature mismatch — payment "
+                                "not verified"})
+        return
+    if h.store.settle_billing_payment(order_id, payment_id):
+        if h.store.org_plan(org) != pay["plan"]:
+            h.store.set_org_plan(org, pay["plan"])
+        for m in pay["months"]:
+            h.store.set_billing_month(org, m, True,
+                                      marked_by=f"razorpay:{payment_id}")
+        _notify_admin_payment(h, org, pay, payment_id)
+    st = billing_mod.org_status(h.store, org)
+    h._reply(200, {"ok": True, **st,
+                   "paid_months": sorted(h.store.paid_months(org))})
+
+
+def _notify_admin_payment(h, org: str, pay: dict, payment_id: str) -> None:
+    # Heads-up on the platform admin's central channel — the payment is
+    # already settled, so a failed page must never 500 the checkout.
+    topic = h.cfg.central_ntfy_topic
+    if not topic:
+        return
+    try:
+        name = h.store.org_name(org) or org
+        h.notifier.send(
+            topic, f"💰 {name} paid ₹{pay['amount_paise'] // 100:,}",
+            f"{pay['plan']} · {', '.join(pay['months'])} · Razorpay {payment_id}",
+            3)
+    except Exception:
+        log.exception("payment notification failed for %s", org)
 
 
 def admin_billing_write(h, user, body):

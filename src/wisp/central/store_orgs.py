@@ -111,6 +111,42 @@ class OrgStoreMixin:
             conn.commit()
 
 
+    def create_billing_payment(self, order_id: str, org_id: str, plan: str,
+                               months: list[str], amount_paise: int,
+                               created_by: str | None = None) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO billing_payments (order_id, org_id, plan, months,"
+                " amount_paise, status, created_by, created_at)"
+                " VALUES (?,?,?,?,?,'created',?,?)",
+                (order_id, org_id, plan, ",".join(months), int(amount_paise),
+                 created_by, _now_iso()))
+            conn.commit()
+
+
+    def billing_payment(self, order_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM billing_payments WHERE order_id=?",
+                               (order_id,)).fetchone()
+        if not row:
+            return None
+        doc = dict(row)
+        doc["months"] = [m for m in doc["months"].split(",") if m]
+        return doc
+
+
+    def settle_billing_payment(self, order_id: str, payment_id: str) -> bool:
+        """created→paid exactly once — the double-submit guard: only the call
+        that wins this UPDATE applies plan/months (verify is idempotent)."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE billing_payments SET status='paid', payment_id=?, paid_at=?"
+                " WHERE order_id=? AND status='created'",
+                (payment_id, _now_iso(), order_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
     def billing_orgs(self) -> list[dict]:
         """Paid-plan orgs + their page targets — the billing sweeper's input."""
         with self._connect() as conn:
@@ -181,7 +217,7 @@ class OrgStoreMixin:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
                 " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
-                " o.poll_interval_s, o.plan,"
+                " o.poll_interval_s, o.plan, o.web_proxy,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
                 " FROM orgs o ORDER BY o.org_id")]
 

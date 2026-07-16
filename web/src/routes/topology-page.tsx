@@ -303,6 +303,12 @@ function DeviceChips({ device, hasOptics, collapsed, openTab }: {
   const passive = isPassiveType(device.device_type)
   // a splitter with no probe is by design, not a config gap
   const unassigned = !device.assigned_node_id && !passive
+  // Suppress the weak/crit/fiber/dup chips whenever the row itself isn't live —
+  // the OLT is down (its ICMP outage owns the row), or its probe has gone silent
+  // (the row is already graying to muted). Either way the optics are a stale
+  // snapshot: the map pin ring does the same, and they'd count ONUs that aren't up.
+  const isDown = device.state === "DOWN" || device.state === "UNREACHABLE"
+  const opticsChips = hasOptics && !isDown && !isStale(device.state_updated_at)
   return (
     <>
       {unassigned && <RowTag tone="muted" title="Assign a probe to start monitoring">unassigned</RowTag>}
@@ -334,25 +340,25 @@ function DeviceChips({ device, hasOptics, collapsed, openTab }: {
       {/* Suspected fiber cut / live duplicate MAC — the same verdicts the Optical
           tab and the Home KPI strip carry, surfaced on the OLT's own row so a
           troubled box flags in the list without the tech drilling in. */}
-      {hasOptics && device.fiber_cuts > 0 && (
+      {opticsChips && device.fiber_cuts > 0 && (
         <RowTag tone="destructive" title="Suspected fiber cut (PON mass-drop). Click for optics"
           onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
           {device.fiber_cuts === 1 ? "fiber cut" : `${device.fiber_cuts} fiber cuts`}
         </RowTag>
       )}
-      {hasOptics && device.dup_macs > 0 && (
+      {opticsChips && device.dup_macs > 0 && (
         <RowTag tone="destructive" title="Duplicate ONU MAC: cloned CPE or bridging loop. Click for optics"
           onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
           {device.dup_macs === 1 ? "dup MAC" : `${device.dup_macs} dup MACs`}
         </RowTag>
       )}
-      {hasOptics && !!device.onus_crit && device.onus_crit > 0 && (
+      {opticsChips && !!device.onus_crit && device.onus_crit > 0 && (
         <RowTag tone="destructive" title="ONUs below the critical Rx-power floor. Click for optics"
           onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
           {device.onus_crit} ONU{device.onus_crit === 1 ? "" : "s"} crit
         </RowTag>
       )}
-      {hasOptics && !device.onus_crit && !!device.onus_warn && device.onus_warn > 0 && (
+      {opticsChips && !device.onus_crit && !!device.onus_warn && device.onus_warn > 0 && (
         <RowTag tone="warning" title="ONUs with a weak Rx-power warning. Click for optics"
           onClick={(e) => { e.stopPropagation(); openTab("optical") }}>
           {device.onus_warn} ONU{device.onus_warn === 1 ? "" : "s"} weak

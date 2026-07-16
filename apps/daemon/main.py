@@ -30,6 +30,7 @@ from wisp.ingress.probers import PingResult, Prober, build_prober
 from wisp.ingress.health import HealthPoller, build_health_poller
 from wisp.ingress.snmp import SnmpPoller, SnmpTarget, build_snmp_poller
 from wisp.ingress.gpon import GponPollerPool
+from wisp.ingress.webproxy import ProxyTunnel, build_proxy_tunnel
 
 log = logging.getLogger("wisp.daemon")
 
@@ -361,6 +362,7 @@ async def run_cycle_central_brain(
     health: dict[int, dict] | None = None,
     snmp_status: dict[int, dict] | None = None,
     walk_runner: _DiagWalkRunner | None = None,
+    proxy_tunnel: ProxyTunnel | None = None,
 ) -> bool:
     prober.on_cycle_start()
     ts = _utc_now_iso()
@@ -393,6 +395,9 @@ async def run_cycle_central_brain(
         return False
     if walk_runner is not None:
         walk_runner.accept(reply.get("snmp_walks"), devices)
+    if proxy_tunnel is not None:
+        # dormant-until-session (webplan.md §2): this reply key is the wake-up
+        proxy_tunnel.notify_sessions(reply.get("proxy_sessions"))
     if cfg.retry_interval_s > 0:
         await _follow_recheck(prober, client, reply, cfg)
     return True
@@ -496,6 +501,17 @@ async def _run_central_brain(
     health_task: asyncio.Task | None = None
     walk_runner = _DiagWalkRunner(client, cfg) if cfg.snmp_interval_s > 0 else None
 
+    # Web-UI proxy tunnel: DARK unless WISP_PROXY_ENABLED, and DORMANT even then —
+    # workers spin up only when a /report reply carries live proxy_sessions
+    # (notify_sessions in the cycle) and stand down when the sessions lapse.
+    # Its own central client so a 25s long-poll never ties up a connection the
+    # probe/report path needs. `lambda: devices` reads the daemon's live device
+    # list (reassigned each cycle, late-bound) so the allow-list tracks
+    # re-parenting/removals with no plumbing.
+    proxy_client = build_central_client(cfg) if cfg.proxy_enabled else None
+    proxy_tunnel = (build_proxy_tunnel(proxy_client, cfg, lambda: devices)
+                    if proxy_client is not None else None)
+
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
         if max_cycles is None:
@@ -560,7 +576,7 @@ async def _run_central_brain(
             reported = await run_cycle_central_brain(
                 prober, client, devices, canary_ip, cfg, ports=ports, optics=optics,
                 health=health, snmp_status=snmp_status or None,
-                walk_runner=walk_runner)
+                walk_runner=walk_runner, proxy_tunnel=proxy_tunnel)
             status.write(PHASE_RUNNING, ok=reported, devices=len(devices),
                          error=None if reported else "last report to central failed")
         except Exception as exc:
@@ -575,6 +591,13 @@ async def _run_central_brain(
             break
         elapsed = asyncio.get_running_loop().time() - started
         await asyncio.sleep(max(0.0, interval - elapsed))
+
+    if proxy_tunnel is not None:
+        await proxy_tunnel.aclose()
+    if proxy_client is not None:
+        close = getattr(proxy_client, "close", None)
+        if close is not None:
+            close()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Village WISP polling daemon")

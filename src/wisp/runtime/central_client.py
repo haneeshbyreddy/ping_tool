@@ -18,6 +18,9 @@ class CentralBrainClient(Protocol):
     def heartbeat(self, body: dict) -> dict: ...
     def walk_result(self, walk_id: int, *, varbinds: list | None = None,
                     error: str | None = None) -> dict: ...
+    def proxy_next(self, hold_s: float) -> dict | None: ...
+    def proxy_reply(self, sid: str, req_id: int, status: int, headers: dict,
+                    body_b64: str, *, error: str | None = None) -> dict: ...
     def close(self) -> None: ...
 
 class HttpCentralClient:
@@ -113,6 +116,28 @@ class HttpCentralClient:
         else:
             env["varbinds"] = varbinds or []
         return self._post("/edge/snmp-walk", env)
+
+    def proxy_next(self, hold_s: float) -> dict | None:
+        # Long-poll: central holds this open up to its proxy_poll_hold_s, so the
+        # read timeout must outlast that, NOT ride the short ship_timeout_s.
+        client = self._http()
+        try:
+            resp = client.get(f"{self.base}/edge/proxy/next",
+                              params={"org_id": self.org_id, "node_id": self.node_id},
+                              timeout=hold_s + 10.0)
+            resp.raise_for_status()
+            return (resp.json() or {}).get("request")
+        except Exception as exc:
+            raise CentralClientError(str(exc)) from exc
+
+    def proxy_reply(self, sid: str, req_id: int, status: int, headers: dict,
+                    body_b64: str, *, error: str | None = None) -> dict:
+        env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
+               "sid": sid, "req_id": req_id, "status": status,
+               "headers": headers, "body_b64": body_b64}
+        if error:
+            env["error"] = error
+        return self._post("/edge/proxy/reply", env)
 
 def build_central_client(cfg: Config = CONFIG) -> CentralBrainClient:
     return HttpCentralClient(cfg)

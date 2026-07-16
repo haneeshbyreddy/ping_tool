@@ -62,6 +62,8 @@ export interface BillingInfo {
   node_count: number
   node_cap: number | null
   gpay_number: string
+  /** public Razorpay key id; null = gateway not configured, GPay fallback */
+  razorpay_key_id: string | null
   plans: Record<Plan, PlanSpec>
 }
 

@@ -236,20 +236,38 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `switch_ports`, feeds, links. `/api/orgs` stays org-filtered (`_scope_org`).
 - `orgs.ntfy_topic_owner/operator/tech` (outage routing) are separate from
   `orgs.ntfy_topic` (fleet-watchdog NODE_STALE/OK) — don't merge.
-- **Paywall** (`central/billing.py`; no payment gateway BY DESIGN — GPay to the
-  admin, who marks months paid): plans free/pro/vip on `orgs.plan`, paid months
-  in `org_billing_months` ('YYYY-MM' UTC, Organizations → Billing; pre-marking
-  future months IS the "no reminder" switch). A pro/vip org whose CURRENT month
-  is unpaid 402s on every `/api/*` except `server.py:_BILLING_EXEMPT` (me,
-  billing, login/logout — what the lock screen needs); **edge ingest,
-  monitoring and outage paging are NEVER gated** — a lapsed bill must not
-  silence an alarm. Device caps (5/500/∞) enforce on CREATE only (a downgrade
-  never breaks existing monitoring); passives never count. Reminders are
-  transition-only (`billing_notices`, watchdog pattern): owner topic at ≤3 days
-  paid runway and on lock; failed sends retry next sweep, 'skipped' (no topic)
-  doesn't. GPay number: `app_settings.billing_gpay_number`, default in
-  billing.py. Free never locks. Tests: `unit/test_billing`,
+- **Paywall** (`central/billing.py`): plans free/pro/vip on `orgs.plan`, paid
+  months in `org_billing_months` ('YYYY-MM' UTC, Organizations → Billing;
+  pre-marking future months IS the "no reminder" switch). A pro/vip org whose
+  CURRENT month is unpaid 402s on every `/api/*` except
+  `server.py:_BILLING_EXEMPT` (me, billing, login/logout, the two checkout
+  routes — what the lock screen needs); **edge ingest, monitoring and outage
+  paging are NEVER gated** — a lapsed bill must not silence an alarm. Device
+  caps (5/500/∞) enforce on CREATE only (a downgrade never breaks existing
+  monitoring); passives never count. Reminders are transition-only
+  (`billing_notices`, watchdog pattern): owner topic at ≤3 days paid runway
+  and on lock; failed sends retry next sweep, 'skipped' (no topic) doesn't.
+  Free never locks. Tests: `unit/test_billing`,
   `integration/test_central_billing`.
+- **Payments are Razorpay self-serve** (`central/razorpay.py`, 2026-07-16 —
+  pure stdlib: one urllib order POST + HMAC-SHA256 verify, NO razorpay SDK).
+  Keys in `app_settings` (`razorpay_key_id`/`razorpay_key_secret`,
+  superadmin-pasted, Settings → Payments; re-read per call, no restart) —
+  key_id ships to browsers, the secret never does. `POST /api/billing/order`
+  (owner-only, months 1–12 via `billing.months_to_pay` — skips prepaid
+  islands) then `POST /api/billing/verify`: HMAC over `order_id|payment_id`,
+  and `settle_billing_payment`'s status='created' guard applies plan+months
+  EXACTLY once (verify is idempotent; `billing_payments` is the ledger,
+  marked_by `razorpay:<payment_id>`). Plan moves are self-serve: paying a
+  DIFFERENT plan's order switches to it on verify (up or down), and
+  `POST /api/billing/plan` accepts ONLY 'free' (the no-payment escape hatch —
+  a paid plan must never be enterable without paying). All three routes are
+  `_BILLING_EXEMPT` — a locked org pays its way out or drops to Free — and
+  `create_order` (network) runs outside any DB lock (dispatch rule). No keys = `enabled` False: Pay buttons vanish, the
+  manual GPay flow returns (`app_settings.billing_gpay_number`, default in
+  billing.py; admin marks months by hand). The gateway is injectable
+  (`make_server(payments=…)`, notifier pattern); tests stub `_post` only, so
+  a real order POST is only proven against live keys.
 - **New columns on existing tables need `_ensure_columns`** in
   `CentralStore.__init__` or an existing `central.db` keeps the old schema. New
   tables need nothing.

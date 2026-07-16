@@ -1,0 +1,357 @@
+"""Web-UI proxy — full round trip: browser -> central -> edge -> stub device -> back.
+
+This is the M0 spike proof (webplan.md). A real central server, the real edge
+ProxyTunnel worker, and a stub HTTP "device" — a browser GET to
+/api/proxy/<sid>/... comes back carrying the device's own bytes, proving the
+reverse tunnel end to end. The on-site test against a real switch/OLT stays the
+operator's; here the device is local so the mechanism is exercised honestly.
+"""
+import asyncio
+import http.client
+import json
+import os
+import sys
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "src"))
+
+from wisp.config import Config
+from wisp.central import auth
+from wisp.central.server import make_server
+from wisp.central.store import CentralStore
+from wisp.ingress.webproxy import ProxyTunnel
+from wisp.runtime.central_client import build_central_client
+
+
+class _StubDevice(BaseHTTPRequestHandler):
+    """Stands in for a switch/OLT web UI: echoes method + path so the test can
+    prove the request reached it faithfully."""
+
+    def _emit(self, note: str):
+        body = f"STUB-DEVICE {self.command} {self.path} {note}".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/redirect":
+            # old-firmware style: root-absolute redirect + root-scoped cookie
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie", "DEVSID=abc; Path=/; HttpOnly")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/page.html":
+            body = b'<html><a href="/style.css">x</a> <img src=logo.png></html>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._emit("ok")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        self._emit(f"got{length}")
+
+    def log_message(self, *a):
+        pass
+
+
+class ProxyRoundTripTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+        # 1) stub device on an ephemeral port
+        self.device = ThreadingHTTPServer(("127.0.0.1", 0), _StubDevice)
+        self.dev_port = self.device.server_address[1]
+        self.dev_thread = threading.Thread(target=self.device.serve_forever, daemon=True)
+        self.dev_thread.start()
+
+        # 2) central — proxy on, device's port whitelisted as a mgmt port
+        self.cfg = Config(
+            central_db=Path(self.tmp.name) / "central.db",
+            central_bind="127.0.0.1", central_port=0, central_token="s3cret",
+            proxy_enabled=True, proxy_mgmt_ports=str(self.dev_port),
+            proxy_poll_hold_s=5.0, proxy_request_timeout_s=10.0,
+            proxy_max_body_bytes=1_000_000)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.set_org("ispA")
+        self.device_id = self.store.create_org_device("ispA", {
+            "name": "SW", "ip_address": "127.0.0.1", "device_type": "switch",
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
+        auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
+        # M1: the proxy is opt-in per org (superadmin-set capability flag)
+        self.store.set_org_web_proxy("ispA", True)
+
+        self.server = make_server(self.cfg, self.store)
+        self.port = self.server.server_address[1]
+        self.srv_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.srv_thread.start()
+        self.cookie = self._login("owner", "ownerpassword")
+
+        # 3) the real edge tunnel, pointed back at central
+        self.edge_cfg = Config(
+            central_url=f"http://127.0.0.1:{self.port}", central_token="s3cret",
+            org_id="ispA", node_id="edge-1",
+            proxy_enabled=True, proxy_mgmt_ports=str(self.dev_port),
+            proxy_poll_hold_s=5.0, proxy_request_timeout_s=10.0,
+            proxy_max_body_bytes=1_000_000)
+        self.edge_client = build_central_client(self.edge_cfg)
+
+    def tearDown(self):
+        try:
+            self.edge_client.close()
+        except Exception:
+            pass
+        self.server.shutdown()
+        self.srv_thread.join(timeout=2)
+        self.server.server_close()
+        self.device.shutdown()
+        self.dev_thread.join(timeout=2)
+        self.tmp.cleanup()
+
+    # -- helpers ---------------------------------------------------------------
+
+    def _login(self, username, password) -> str:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/login",
+                     body=json.dumps({"username": username, "password": password}),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        cookie = resp.getheader("Set-Cookie")
+        conn.close()
+        self.assertIsNotNone(cookie, "login did not set a session cookie")
+        return cookie.split(";")[0]
+
+    def _open_session(self, device_id=None) -> tuple[int, dict]:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/proxy/session",
+                     body=json.dumps({"device_id": device_id or self.device_id,
+                                      "port": self.dev_port}),
+                     headers={"Content-Type": "application/json", "Cookie": self.cookie})
+        resp = conn.getresponse()
+        body = json.loads(resp.read() or "{}")
+        conn.close()
+        return resp.status, body
+
+    def _browser(self, method, path, out, body=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        headers = {"Cookie": cookie or self.cookie}
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        out["status"] = resp.status
+        out["headers"] = resp.getheaders()
+        out["body"] = resp.read()
+        conn.close()
+
+    def _api(self, method, path, body=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(method, path,
+                     body=json.dumps(body) if body is not None else None,
+                     headers={"Content-Type": "application/json",
+                              "Cookie": cookie or self.cookie})
+        resp = conn.getresponse()
+        doc = json.loads(resp.read() or "{}")
+        conn.close()
+        return resp.status, doc
+
+    def _round_trip(self, method, path, devices, body=None):
+        """Fire the (blocking) browser request in a thread, serve one request from
+        the edge, return the browser's result."""
+        out = {}
+        t = threading.Thread(target=self._browser, args=(method, path, out),
+                             kwargs={"body": body})
+        t.start()
+        tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
+                             devices_provider=lambda: devices)
+        served = asyncio.run(tunnel.serve_once())
+        t.join(timeout=12)
+        return served, out
+
+    # -- tests -----------------------------------------------------------------
+
+    def test_session_requires_login(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/proxy/session",
+                     body=json.dumps({"device_id": self.device_id, "port": self.dev_port}),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 401)
+
+    def test_get_round_trip_carries_device_bytes(self):
+        status, sess = self._open_session()
+        self.assertEqual(status, 200, sess)
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/status?vlan=7",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(out["status"], 200)
+        self.assertIn(b"STUB-DEVICE GET", out["body"])
+        self.assertIn(b"/status?vlan=7", out["body"])  # path + query forwarded
+
+    def test_post_body_reaches_device(self):
+        _, sess = self._open_session()
+        served, out = self._round_trip(
+            "POST", f"/api/proxy/{sess['sid']}/save", devices=[{"ip_address": "127.0.0.1"}],
+            body=b"config=1")
+        self.assertTrue(served)
+        self.assertEqual(out["status"], 200)
+        self.assertIn(b"STUB-DEVICE POST", out["body"])
+        self.assertIn(b"got8", out["body"])  # device saw the 8-byte body
+
+    def test_edge_refuses_device_not_in_its_list(self):
+        _, sess = self._open_session()
+        # The edge's live device list does NOT contain 127.0.0.1 -> refuse.
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/status",
+            devices=[{"ip_address": "10.0.0.250"}])
+        self.assertTrue(served)
+        self.assertEqual(out["status"], 502)
+        self.assertIn(b"not a device this node probes", out["body"])
+
+    def test_unknown_session_404(self):
+        out = {}
+        self._browser("GET", "/api/proxy/deadbeef/status", out)
+        self.assertEqual(out["status"], 404)
+
+    def test_session_rejects_port_outside_mgmt_set(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/proxy/session",
+                     body=json.dumps({"device_id": self.device_id, "port": 8291}),
+                     headers={"Content-Type": "application/json", "Cookie": self.cookie})
+        resp = conn.getresponse()
+        body = json.loads(resp.read() or "{}")
+        conn.close()
+        self.assertEqual(resp.status, 400)
+        self.assertIn("proxy_mgmt_ports", body.get("error", ""))
+
+    # -- M1: sessions + security -------------------------------------------------
+
+    def test_session_requires_org_capability_flag(self):
+        self.store.set_org_web_proxy("ispA", False)
+        status, body = self._open_session()
+        self.assertEqual(status, 403)
+        self.assertIn("not enabled", body.get("error", ""))
+
+    def test_tech_role_cannot_open_session(self):
+        auth.create_user(self.store, "ispA", "tech1", "techpassword1", "tech")
+        cookie = self._login("tech1", "techpassword1")
+        status, body = self._api("POST", "/api/proxy/session",
+                                 {"device_id": self.device_id, "port": self.dev_port},
+                                 cookie=cookie)
+        self.assertEqual(status, 403)
+        self.assertIn("operator", body.get("error", ""))
+
+    def test_capability_revoked_mid_session_kills_it(self):
+        _, sess = self._open_session()
+        self.store.set_org_web_proxy("ispA", False)
+        out = {}
+        self._browser("GET", f"/api/proxy/{sess['sid']}/status", out)
+        self.assertEqual(out["status"], 403)
+        row = self.store.proxy_session_row(sess["sid"])
+        self.assertEqual(row["status"], "closed")
+
+    def test_audit_row_written_per_request(self):
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/status?vlan=7",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        rows = self.store.list_proxy_audit("ispA")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sid"], sess["sid"])
+        self.assertEqual(rows[0]["method"], "GET")
+        self.assertEqual(rows[0]["path"], "/status?vlan=7")
+        self.assertEqual(rows[0]["status"], 200)
+        self.assertEqual(rows[0]["device_id"], self.device_id)
+
+    def test_edge_refusal_audits_as_502(self):
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/status",
+                         devices=[{"ip_address": "10.0.0.250"}])
+        rows = self.store.list_proxy_audit("ispA")
+        self.assertEqual(rows[0]["status"], 502)
+
+    def test_session_record_persisted_and_listed(self):
+        _, sess = self._open_session()
+        status, doc = self._api("GET", "/api/proxy/sessions")
+        self.assertEqual(status, 200)
+        rows = [s for s in doc["sessions"] if s["sid"] == sess["sid"]]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "open")
+        self.assertTrue(rows[0]["live"])
+        self.assertEqual(rows[0]["device_name"], "SW")
+
+    def test_close_session_stops_browsing(self):
+        _, sess = self._open_session()
+        status, doc = self._api("POST", "/api/proxy/close", {"sid": sess["sid"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(doc["was_open"])
+        out = {}
+        self._browser("GET", f"/api/proxy/{sess['sid']}/status", out)
+        self.assertEqual(out["status"], 404)
+        self.assertEqual(self.store.proxy_session_row(sess["sid"])["status"], "closed")
+
+    def test_audit_view_is_owner_only(self):
+        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
+        cookie = self._login("op1", "operatorpassword")
+        status, _ = self._api("GET", "/api/proxy/audit", cookie=cookie)
+        self.assertEqual(status, 403)
+        status, doc = self._api("GET", "/api/proxy/audit")  # owner
+        self.assertEqual(status, 200)
+        self.assertIn("audit", doc)
+
+    def test_report_reply_carries_live_sessions(self):
+        _, sess = self._open_session()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/report",
+                     body=json.dumps({"v": 1, "org_id": "ispA", "node_id": "edge-1",
+                                      "ts": "2026-07-16T00:00:00+00:00",
+                                      "mode": "full", "pings": {}}),
+                     headers={"Content-Type": "application/json",
+                              "Authorization": "Bearer s3cret"})
+        resp = conn.getresponse()
+        reply = json.loads(resp.read() or "{}")
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        carried = reply.get("proxy_sessions") or []
+        self.assertEqual([s["sid"] for s in carried], [sess["sid"]])
+        self.assertGreater(carried[0]["ttl_s"], 0)
+
+    def test_redirect_and_cookie_rewritten_into_prefix(self):
+        _, sess = self._open_session()
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/redirect",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(out["status"], 302)
+        headers = {k.lower(): v for k, v in out["headers"]}
+        self.assertEqual(headers["location"], f"/api/proxy/{sess['sid']}/login")
+        self.assertIn(f"Path=/api/proxy/{sess['sid']}/", headers["set-cookie"])
+
+    def test_html_body_absolute_refs_rewritten(self):
+        _, sess = self._open_session()
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/page.html",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertIn(f'href="/api/proxy/{sess["sid"]}/style.css"'.encode(),
+                      out["body"])
+        # plain relative refs must pass through untouched
+        self.assertIn(b"src=logo.png", out["body"])
+
+
+if __name__ == "__main__":
+    unittest.main()

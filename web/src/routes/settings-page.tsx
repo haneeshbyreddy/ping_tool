@@ -225,9 +225,10 @@ function GoogleMapsCard() {
   )
 }
 
-// Server-wide, superadmin-only: the GPay number every locked org and payment
-// reminder shows. One number for the whole platform — payments land with the
-// platform admin, who then marks the org's month paid.
+// Server-wide, superadmin-only: how subscribers pay. Razorpay keys turn on
+// self-serve checkout everywhere (lock screen, billing card, reminders);
+// without them everything falls back to the manual GPay flow, where payments
+// land with the platform admin who marks the org's month paid by hand.
 function PlatformBillingCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -235,12 +236,28 @@ function PlatformBillingCard() {
     queryFn: adminApi.settings,
   })
   const [gpay, setGpay] = useState("")
-  useEffect(() => { if (data) setGpay(data.billing_gpay_number || "") }, [data])
+  const [rzpId, setRzpId] = useState("")
+  const [rzpSecret, setRzpSecret] = useState("")
+  useEffect(() => {
+    if (data) {
+      setGpay(data.billing_gpay_number || "")
+      setRzpId(data.razorpay_key_id || "")
+    }
+  }, [data])
 
   const save = useMutation({
-    mutationFn: () => adminApi.saveSettings({ billing_gpay_number: gpay.trim() }),
+    // the secret is write-only: blank means "keep what's stored" unless the
+    // key id is being cleared too, which clears both and disables checkout
+    mutationFn: () => adminApi.saveSettings({
+      billing_gpay_number: gpay.trim(),
+      razorpay_key_id: rzpId.trim(),
+      ...(rzpSecret.trim() || !rzpId.trim()
+        ? { razorpay_key_secret: rzpId.trim() ? rzpSecret.trim() : "" }
+        : {}),
+    }),
     onSuccess: () => {
-      toast.success("Payment number saved")
+      toast.success("Payment settings saved")
+      setRzpSecret("")
       queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
       queryClient.invalidateQueries({ queryKey: ["billing"] })
     },
@@ -256,15 +273,32 @@ function PlatformBillingCard() {
           <IndianRupee className="size-4 text-muted-foreground" /> Payments (all organizations)
         </CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-col gap-2.5">
+      <CardContent className="flex flex-col gap-3">
         <div className="flex flex-col gap-1.5">
-          <Label>GPay number</Label>
+          <Label>Razorpay key ID</Label>
+          <Input value={rzpId} placeholder="rzp_live_…" className="max-w-sm font-mono text-xs"
+            spellCheck={false} onChange={(e) => setRzpId(e.target.value)} />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Razorpay key secret</Label>
+          <Input value={rzpSecret} type="password"
+            placeholder={data?.razorpay_key_secret_set ? "•••••••• (saved — paste to replace)" : "key secret"}
+            className="max-w-sm font-mono text-xs"
+            spellCheck={false} onChange={(e) => setRzpSecret(e.target.value)} />
+        </div>
+        <p className="max-w-lg text-xs text-muted-foreground">
+          With Razorpay keys set, every org pays online — UPI, cards, netbanking —
+          and months mark themselves paid the moment checkout completes. The secret
+          never leaves the server. Clear the key ID to fall back to manual GPay.
+        </p>
+        <div className="flex flex-col gap-1.5">
+          <Label>GPay number (fallback)</Label>
           <Input value={gpay} placeholder="10-digit GPay number" className="max-w-sm font-mono text-xs"
             spellCheck={false} onChange={(e) => setGpay(e.target.value)} />
         </div>
         <p className="max-w-lg text-xs text-muted-foreground">
-          Shown on every org's lock screen, billing card and payment reminder. Subscribers
-          pay this number by GPay; you then mark their month paid from Organizations → Billing.
+          Shown on lock screens and reminders only while Razorpay isn't configured;
+          you then mark months paid from Organizations → Billing.
         </p>
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
           Save

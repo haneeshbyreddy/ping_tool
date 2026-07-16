@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 from wisp.central import billing, inventory, onuroster, ponfault
 from wisp.central.api.common import (DENIED, body_org_write, device_read_scope,
-                                     device_write_org, org_or_400, q_int_required,
-                                     reader_or_401)
+                                     device_write_org, olt_liveness, org_or_400,
+                                     q_int_required, reader_or_401)
 
 
 # ----- reads ---------------------------------------------------------------
@@ -26,6 +26,14 @@ def _stamp_optical_faults(h, org: str, devices: list[dict]) -> None:
     if not rows:
         return
     now = datetime.now(timezone.utc)
+    # Same liveness gate as the Home KPI strip (pon_summary): a down OLT's ICMP
+    # outage owns its row and a probe-silent OLT is unknown — neither stamps a
+    # fiber/dup verdict off its frozen last walk, so chip and strip never disagree.
+    down_olts, stale_olts = olt_liveness(devices, now, h.cfg.central_node_stale_s)
+    skip = down_olts | stale_olts
+    rows = [r for r in rows if r["device_id"] not in skip]
+    if not rows:
+        return
     by_id = {d["id"]: d for d in devices}
     for f in ponfault.evaluate_org(rows, now):
         if f.kind == "fiber" and f.device_id in by_id:

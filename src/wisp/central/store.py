@@ -9,6 +9,7 @@ from wisp.central.store_users import UserStoreMixin
 from wisp.central.store_fleet import FleetStoreMixin
 from wisp.central.store_devices import DeviceStoreMixin
 from wisp.central.store_outages import OutageStoreMixin
+from wisp.central.store_proxy import ProxyStoreMixin
 from wisp.central.store_snmp import SnmpStoreMixin
 from wisp.central.store_util import (  # noqa: F401 — re-exported
     SNMP_STATUS_STATES, SNMP_SUBSYSTEMS, SNMP_WALKS_KEEP,
@@ -571,6 +572,23 @@ CREATE TABLE IF NOT EXISTS org_billing_months (
     marked_at TEXT NOT NULL,
     PRIMARY KEY (org_id, month)
 );
+-- Razorpay checkout ledger (central/razorpay.py): one row per order created
+-- from the dashboard's Pay button. `months` is the comma-joined 'YYYY-MM'
+-- list the order buys; verification flips status created→paid exactly once
+-- (settle_billing_payment's WHERE status='created' guard) and only then are
+-- the months marked in org_billing_months (marked_by 'razorpay:<payment_id>').
+CREATE TABLE IF NOT EXISTS billing_payments (
+    order_id     TEXT PRIMARY KEY,
+    org_id       TEXT NOT NULL,
+    plan         TEXT NOT NULL,
+    months       TEXT NOT NULL,
+    amount_paise INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'created',
+    payment_id   TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    paid_at      TEXT
+);
 -- Transition-only billing reminders (central/billing.py, watchdog pattern):
 -- kind = 'due_soon' | 'locked', one row per (org, month, kind). Only
 -- status 'sent'/'skipped' suppress a retry — a failed ntfy send is retried
@@ -607,6 +625,34 @@ CREATE TABLE IF NOT EXISTS device_capability (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (device_id, subsystem)
 );
+-- Web-UI proxy (webplan.md M1). The RECORD of a tunnel session — the live
+-- tunnel itself is process memory in central/proxy.py and dies with the
+-- process; these rows are the who-opened-what-against-which-device trail.
+CREATE TABLE IF NOT EXISTS proxy_sessions (
+    sid            TEXT PRIMARY KEY,
+    org_id         TEXT NOT NULL,
+    device_id      INTEGER NOT NULL,
+    node_id        TEXT NOT NULL,
+    created_by     INTEGER,
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'open',  -- open | closed | expired
+    last_active_at TEXT
+);
+-- One row per proxied request (non-negotiable — webplan.md §6.3). Pruned to
+-- PROXY_AUDIT_KEEP_DAYS lazily on session create.
+CREATE TABLE IF NOT EXISTS proxy_audit (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid       TEXT NOT NULL,
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL,
+    user_id   INTEGER,
+    method    TEXT NOT NULL,
+    path      TEXT NOT NULL,
+    status    INTEGER,
+    ts        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_audit_org ON proxy_audit(org_id, id);
 """
 
 class CentralStore(
@@ -616,6 +662,7 @@ class CentralStore(
     DeviceStoreMixin,
     OutageStoreMixin,
     SnmpStoreMixin,
+    ProxyStoreMixin,
 ):
 
     _TENANT_TABLES = (
@@ -653,7 +700,11 @@ class CentralStore(
                 # Paywall tier: free | pro | vip (central/billing.py PLANS).
                 # Superadmin-set only; drives the device cap and the monthly
                 # payment lock (org_billing_months).
-                ("plan", "TEXT NOT NULL DEFAULT 'free'")))
+                ("plan", "TEXT NOT NULL DEFAULT 'free'"),
+                # Web-UI proxy capability (webplan.md §6.7): opt-in per org,
+                # superadmin-set. cfg.proxy_enabled stays the fleet-wide kill
+                # switch; this is the per-org enablement — both must be on.
+                ("web_proxy", "INTEGER NOT NULL DEFAULT 0")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "switch_ports", (

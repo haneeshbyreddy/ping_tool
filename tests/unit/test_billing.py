@@ -82,6 +82,72 @@ class ComputeStatusTest(unittest.TestCase):
         self.assertEqual(st["paid_through"], "2027-01")
 
 
+class MonthsToPayTest(unittest.TestCase):
+    """What one Razorpay checkout buys: the next N unpaid months."""
+
+    def test_locked_org_starts_at_current_month(self):
+        now = _utc(2026, 7, 16)
+        self.assertEqual(billing.months_to_pay("pro", set(), 3, now),
+                         ["2026-07", "2026-08", "2026-09"])
+
+    def test_active_org_extends_the_runway(self):
+        now = _utc(2026, 7, 16)
+        paid = {"2026-07", "2026-08"}
+        self.assertEqual(billing.months_to_pay("pro", paid, 2, now),
+                         ["2026-09", "2026-10"])
+
+    def test_prepaid_island_is_skipped_not_double_billed(self):
+        now = _utc(2026, 7, 16)
+        paid = {"2026-07", "2026-09"}  # admin pre-marked September
+        self.assertEqual(billing.months_to_pay("pro", paid, 2, now),
+                         ["2026-08", "2026-10"])
+
+    def test_year_rollover(self):
+        now = _utc(2026, 11, 20)
+        paid = {"2026-11", "2026-12"}
+        self.assertEqual(billing.months_to_pay("vip", paid, 2, now),
+                         ["2027-01", "2027-02"])
+
+
+class RazorpaySignatureTest(unittest.TestCase):
+    """The gateway's pure parts: HMAC verification + enabled gating. Order
+    creation (the one network call) is exercised via a double in
+    integration/test_central_billing."""
+
+    def setUp(self):
+        import hashlib as _hashlib
+        import hmac as _hmac
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "c.db")
+        from wisp.central.razorpay import RazorpayGateway
+        self.gw = RazorpayGateway(self.store)
+        self.sign = lambda msg, secret: _hmac.new(
+            secret.encode(), msg.encode(), _hashlib.sha256).hexdigest()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_disabled_until_both_keys_set(self):
+        self.assertFalse(self.gw.enabled)
+        self.store.set_setting("razorpay_key_id", "rzp_test_x")
+        self.assertFalse(self.gw.enabled)
+        self.store.set_setting("razorpay_key_secret", "sekrit")
+        self.assertTrue(self.gw.enabled)
+
+    def test_signature_roundtrip(self):
+        self.store.set_setting("razorpay_key_secret", "sekrit")
+        good = self.sign("order_1|pay_1", "sekrit")
+        self.assertTrue(self.gw.verify_signature("order_1", "pay_1", good))
+        self.assertFalse(self.gw.verify_signature("order_1", "pay_2", good))
+        self.assertFalse(self.gw.verify_signature("order_1", "pay_1",
+                                                  self.sign("order_1|pay_1", "wrong")))
+        self.assertFalse(self.gw.verify_signature("order_1", "pay_1", ""))
+
+    def test_no_secret_never_verifies(self):
+        good = self.sign("order_1|pay_1", "sekrit")
+        self.assertFalse(self.gw.verify_signature("order_1", "pay_1", good))
+
+
 class SweeperTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

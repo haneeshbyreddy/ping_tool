@@ -129,6 +129,14 @@ def report(h, org: str, env: dict) -> dict:
         walks = h.store.pending_snmp_walks(org, env.get("node_id", ""))
         if walks:
             reply["snmp_walks"] = walks
+        # Live web-proxy sessions ride the same channel (webplan.md §2): the
+        # edge's tunnel is DORMANT until this key tells it someone is browsing,
+        # so idle nodes hold no long-polls open. TTLs are relative seconds —
+        # the edge's clock is not trusted to agree with central's.
+        if h.cfg.proxy_enabled:
+            psessions = h.proxy.active_sessions_for(org, env.get("node_id", ""))
+            if psessions:
+                reply["proxy_sessions"] = psessions
     return reply
 
 

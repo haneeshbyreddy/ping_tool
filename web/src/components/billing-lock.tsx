@@ -3,8 +3,27 @@ import { Check, Copy, Lock, LogOut, TriangleAlert, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { inr, monthLabel } from "@/lib/billing"
 import type { BillingInfo } from "@/lib/types"
+import { FreePlanButton, RazorpayPayButton } from "@/components/razorpay-pay"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
+
+/** Razorpay checkout as the hero: one month, one tap to pay. Verification
+ * and unlock are server-side — the lock screen just repaints. */
+export function RazorpayWell({ billing, org }: { billing: BillingInfo; org?: string | null }) {
+  const spec = billing.plans[billing.plan]
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border bg-muted px-4 py-3">
+      <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">
+        Pay online
+      </p>
+      <RazorpayPayButton org={org} size="lg" className="w-full"
+        label={`Pay ${inr(spec.price_inr)} · UPI, card or netbanking`} />
+      <p className="text-xs text-muted-foreground">
+        Secured by Razorpay. Your account extends the moment the payment completes.
+      </p>
+    </div>
+  )
+}
 
 /** The GPay number as the hero: big, mono, one-tap copy. There is no payment
  * gateway on purpose — the whole flow is "pay this number, the admin marks
@@ -72,12 +91,32 @@ export function BillingLock({ billing }: { billing: BillingInfo }) {
               <span className="ml-1 text-xs font-normal text-muted-foreground">/month</span>
             </p>
           </div>
-          <GpayWell billing={billing} />
-          <p className="text-sm text-muted-foreground">
-            Pay <span className="font-medium text-foreground">{inr(spec.price_inr)}</span> to
-            the number above and the admin will upgrade your account in a moment. This
-            page unlocks automatically, nothing to refresh.
-          </p>
+          {billing.razorpay_key_id ? (
+            <>
+              <RazorpayWell billing={billing} />
+              <p className="text-sm text-muted-foreground">
+                Scan, pay, done — the dashboard unlocks automatically the moment
+                your payment goes through, nothing to refresh.
+              </p>
+            </>
+          ) : (
+            <>
+              <GpayWell billing={billing} />
+              <p className="text-sm text-muted-foreground">
+                Pay <span className="font-medium text-foreground">{inr(spec.price_inr)}</span> to
+                the number above and the admin will upgrade your account in a moment. This
+                page unlocks automatically, nothing to refresh.
+              </p>
+            </>
+          )}
+          {/* the no-pay exit: dropping to Free unlocks immediately, with the
+              free caps on future device/probe creates */}
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              Rather not pay? The Free plan keeps up to 5 devices monitored.
+            </p>
+            <FreePlanButton label="Go Free" className="shrink-0" />
+          </div>
           <p className="rounded-lg border bg-muted px-3 py-2 text-xs text-muted-foreground">
             Your network is still being watched: probes, monitoring and outage alerts
             keep running while the dashboard is locked.
@@ -115,14 +154,27 @@ export function BillingBanner({ billing, org }: { billing: BillingInfo; org: str
         <span className="font-medium">
           Payment due {days === 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`}
         </span>
-        <span className="text-muted-foreground">
-          : pay {inr(spec.price_inr)} for {monthLabel(dueMonth)} via GPay to{" "}
-        </span>
-        <span className="font-mono font-medium tabular-nums">{billing.gpay_number}</span>
-        <span className="text-muted-foreground">
-          {" "}and the admin will extend your account in a moment.
-        </span>
+        {billing.razorpay_key_id ? (
+          <span className="text-muted-foreground">
+            : {inr(spec.price_inr)} for {monthLabel(dueMonth)} — pay online and
+            your account extends instantly.
+          </span>
+        ) : (
+          <>
+            <span className="text-muted-foreground">
+              : pay {inr(spec.price_inr)} for {monthLabel(dueMonth)} via GPay to{" "}
+            </span>
+            <span className="font-mono font-medium tabular-nums">{billing.gpay_number}</span>
+            <span className="text-muted-foreground">
+              {" "}and the admin will extend your account in a moment.
+            </span>
+          </>
+        )}
       </p>
+      {billing.razorpay_key_id && (
+        <RazorpayPayButton org={org} label={`Pay ${inr(spec.price_inr)}`}
+          variant="outline" size="sm" className="h-7 shrink-0 px-2.5 text-xs" />
+      )}
       <button
         aria-label="Dismiss payment reminder"
         className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"

@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from wisp.central import analytics as central_analytics
 from wisp.central import incidents, onuroster, ponfault
 from wisp.central import rollup as central_rollup
-from wisp.central.api.common import (org_or_400, q_int_or, reader_or_401)
+from wisp.central.api.common import (olt_liveness, org_or_400, q_int_or,
+                                     reader_or_401)
 
 
 def summary(h, qs):
@@ -113,10 +114,16 @@ def pon_faults(h, qs):
             h._reply(400, {"error": "org required"})
             return
         rows = h.store.org_onu_rows(org)
-    dists = ponfault.passive_distances(h.store.list_org_devices(org),
-                                       h.store.list_link_routes(org))
-    faults = ponfault.evaluate_org(rows, datetime.now(timezone.utc),
-                                   passive_dists=dists)
+    devs = h.store.list_org_devices(org)
+    # A down OLT's ICMP outage owns it, and a probe-silent OLT is unknown — either
+    # way don't let its still-fresh optics walk tell a second (fiber/power) story
+    # while we can't see it (same liveness gate as pon_summary).
+    now = datetime.now(timezone.utc)
+    down_olts, stale_olts = olt_liveness(devs, now, h.cfg.central_node_stale_s)
+    skip = down_olts | stale_olts
+    rows = [r for r in rows if r["device_id"] not in skip]
+    dists = ponfault.passive_distances(devs, h.store.list_link_routes(org))
+    faults = ponfault.evaluate_org(rows, now, passive_dists=dists)
     h._reply(200, {"faults": [f.as_dict() for f in faults]})
 
 
@@ -136,18 +143,27 @@ def pon_summary(h, qs):
     now = datetime.now(timezone.utc)
     rows = h.store.org_onu_rows(org)
     devs = h.store.list_org_devices(org)
+    # Gate the rollup on ICMP liveness, in the same hierarchy the device-count KPI
+    # already uses: a confirmed-down OLT's ONUs go offline (kept in the total as
+    # blast radius); a probe-silent OLT is unknown and drops out entirely. Both
+    # matter because the last SNMP walk stays "fresh" for up to STALE_S after the
+    # OLT (or its edge) goes away — without this it keeps counting ONUs online.
+    down_olts, stale_olts = olt_liveness(devs, now, h.cfg.central_node_stale_s)
+    seen_rows = [r for r in rows if r["device_id"] not in stale_olts]
+    live_rows = [r for r in seen_rows if r["device_id"] not in down_olts]
     dists = ponfault.passive_distances(devs, h.store.list_link_routes(org))
-    faults = ponfault.evaluate_org(rows, now, passive_dists=dists)
-    dups = onuroster.duplicate_macs(rows, now)
-    roster = onuroster.current_roster(rows, now)
-    online = sum(1 for r in roster if r.get("state") == "online")
+    faults = ponfault.evaluate_org(live_rows, now, passive_dists=dists)
+    dups = onuroster.duplicate_macs(live_rows, now)
+    roster = onuroster.current_roster(seen_rows, now)
+    online = sum(1 for r in roster
+                 if r.get("state") == "online" and r["device_id"] not in down_olts)
     # per-OLT cap override → cfg.onu_pon_limit, same resolution the paging
     # sweep uses so a 1:128 GPON box isn't counted as over a 1:64 default
     default_cap = h.cfg.onu_pon_limit
     limits = {d["id"]: (int(d["onu_pon_limit"]) if d.get("onu_pon_limit") is not None
                         else default_cap) for d in devs}
     caps = onuroster.capacity_faults(
-        rows, now, lambda dev_id: limits.get(dev_id, default_cap))
+        live_rows, now, lambda dev_id: limits.get(dev_id, default_cap))
     h._reply(200, {
         "olts": len({r["device_id"] for r in roster}),
         "onus_total": len(roster),

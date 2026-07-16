@@ -470,9 +470,13 @@ export function OpticalPanel({ device, focusOnuId }: {
     return <SnmpDiagnosis device={device} subsystem="optics" />
   }
 
-  const online = onus.filter((o) => o.state === "online").length
-  const crit = onus.filter((o) => onuSev(o) === "crit").length
-  const warn = onus.filter((o) => onuSev(o) === "warn").length
+  // A down/unreachable OLT has no reachable subscribers: the last SNMP walk still
+  // says these ONUs were "online", but none are right now. Read online as 0 and
+  // mute the stale Rx alarms — the readings below stay as a labelled last snapshot.
+  const isDown = device.state === "DOWN" || device.state === "UNREACHABLE"
+  const online = isDown ? 0 : onus.filter((o) => o.state === "online").length
+  const crit = isDown ? 0 : onus.filter((o) => onuSev(o) === "crit").length
+  const warn = isDown ? 0 : onus.filter((o) => onuSev(o) === "warn").length
   const limit = q.data?.onu_pon_limit ?? Infinity
   const dupMacs = q.data?.dup_macs ?? []
   // Freshness of the optics walk — same field/rule the row capability icon and
@@ -483,6 +487,13 @@ export function OpticalPanel({ device, focusOnuId }: {
 
   return (
     <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
+      {isDown && (
+        <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">OLT offline.</span>{" "}
+          All {onus.length} ONUs are unreachable — the readings below are the last
+          snapshot before it went down.
+        </div>
+      )}
       <FaultSection faults={faultsQ.data?.faults ?? []} />
       <DupMacSection dupMacs={dupMacs} />
       {/* header readout ------------------------------------------------------- */}

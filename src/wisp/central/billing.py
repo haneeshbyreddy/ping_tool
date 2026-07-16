@@ -148,6 +148,22 @@ def compute_status(plan: str, paid_months: set[str],
             "due_month": due, "days_left": days_left}
 
 
+def months_to_pay(plan: str, paid_months: set[str], count: int,
+                  now: datetime | None = None) -> list[str]:
+    """The next `count` unpaid months for `plan` — what one checkout buys.
+    Starts at the due month (for a plan the org isn't on yet that's simply the
+    current month) and skips months already marked paid, so a prepaid island
+    never gets double-billed."""
+    now = now or datetime.now(timezone.utc)
+    month = compute_status(plan, paid_months, now)["due_month"] or month_key(now)
+    out: list[str] = []
+    while len(out) < count:
+        if month not in paid_months:
+            out.append(month)
+        month = next_month(month)
+    return out
+
+
 def org_status(store, org_id: str, now: datetime | None = None) -> dict:
     return compute_status(store.org_plan(org_id), store.paid_months(org_id), now)
 
@@ -183,15 +199,21 @@ class BillingSweeper:
         if prior in ("sent", "skipped"):
             return False
         price = PLANS[org["plan"]]["price_inr"]
-        gpay = gpay_number(self.store)
+        # with Razorpay configured the dashboard IS the checkout; the GPay
+        # number only rides the page as the manual fallback
+        if (self.store.get_setting("razorpay_key_id")
+                and self.store.get_setting("razorpay_key_secret")):
+            how = "pay online from the dashboard"
+        else:
+            how = f"GPay {gpay_number(self.store)}"
         name = org["name"] or org["org_id"]
         if kind == "due_soon":
             title = f"💳 {name}: payment due in {st['days_left']} day{'s' if st['days_left'] != 1 else ''}"
-            body = f"Pay ₹{price} for {month_label(month)} · GPay {gpay}"
+            body = f"Pay ₹{price} for {month_label(month)} · {how}"
             priority = 4
         else:
             title = f"🔒 {name}: dashboard locked, payment due"
-            body = f"Pay ₹{price} for {month_label(month)} · GPay {gpay}"
+            body = f"Pay ₹{price} for {month_label(month)} · {how}"
             priority = 5
         topic = org.get("ntfy_topic_owner") or org.get("ntfy_topic")
         status = "skipped"

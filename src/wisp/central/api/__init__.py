@@ -7,7 +7,7 @@ session check (and with AuthError/InventoryError mapped to 422 by the caller).
 """
 from __future__ import annotations
 
-from wisp.central.api import devices, edge, fleet, orgs, outages, users
+from wisp.central.api import devices, edge, fleet, orgs, outages, proxy, users
 
 GET = {
     "/healthz": orgs.healthz,
@@ -44,6 +44,8 @@ GET = {
     "/api/analytics/trend": outages.analytics_trend,
     "/api/outages": outages.list_open,
     "/api/logs": outages.logs,
+    "/api/proxy/sessions": proxy.sessions_list,
+    "/api/proxy/audit": proxy.audit_list,
 }
 
 POST = {
@@ -51,6 +53,9 @@ POST = {
     "/api/org": orgs.update,
     "/api/admin/settings": orgs.admin_settings_write,
     "/api/admin/billing": orgs.admin_billing_write,
+    "/api/billing/order": orgs.billing_order,
+    "/api/billing/verify": orgs.billing_verify,
+    "/api/billing/plan": orgs.billing_plan,
     "/api/test-alert": orgs.test_alert,
     "/api/users": users.create,
     "/api/users/deactivate": users.deactivate,
@@ -90,6 +95,8 @@ POST = {
     "/api/regions": devices.region_add,
     "/api/regions/rename": devices.region_rename,
     "/api/regions/delete": devices.region_delete,
+    "/api/proxy/session": proxy.session_create,
+    "/api/proxy/close": proxy.session_close,
     "/api/outages/acknowledge": outages.acknowledge,
     "/api/outages/postmortem": outages.postmortem,
     "/api/outages/clear-postmortems": outages.clear_postmortems,
