@@ -37,6 +37,7 @@ def nodes(h, qs):
         "nodes": h.store.list_node_tokens(org),
         "latest_version": releases[0]["version"] if releases else None,
         "rollout": h.store.get_rollout(org),
+        "auto_update": h.store.org_auto_update(org),
     })
 
 
@@ -90,6 +91,18 @@ def delete(h, user, body):
         h._reply(200, {"ok": True})
     else:
         h._reply(404, {"ok": False, "error": f"{node_id!r} isn't registered"})
+
+
+def restart(h, user, body):
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    node_id = inventory.clean_node_id(body.get("node_id"))
+    if not h.store.request_restart(org, node_id):
+        raise inventory.InventoryError(
+            f"{node_id!r} has never reported — the restart directive rides "
+            "its heartbeat, so there is no channel to deliver it through yet")
+    h._reply(200, {"ok": True})
 
 
 def update(h, user, body):

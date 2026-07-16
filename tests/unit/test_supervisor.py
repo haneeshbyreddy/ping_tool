@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
 from wisp.runtime.supervisor import (
-    Supervisor, needs_update, verify_sha256,
+    Supervisor, consume_restart, needs_update, verify_sha256,
     UPDATED, SKIPPED, VERIFY_FAILED, ROLLED_BACK, FAILED,
 )
 
@@ -37,6 +37,35 @@ class SupervisorPureTest(unittest.TestCase):
             self.assertFalse(verify_sha256(path, ""))
         finally:
             path.unlink()
+
+class ConsumeRestartTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "restart_request.json"
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_file_is_a_noop(self):
+        self.assertFalse(consume_restart(
+            self.path, stop=lambda: self.calls.append("stop"),
+            restart=lambda: self.calls.append("start")))
+        self.assertEqual(self.calls, [])
+
+    def test_file_bounces_agent_and_is_removed_first(self):
+        self.path.write_text("{}")
+        seen_at_stop = []
+        self.assertTrue(consume_restart(
+            self.path,
+            stop=lambda: (seen_at_stop.append(self.path.exists()),
+                          self.calls.append("stop")),
+            restart=lambda: self.calls.append("start")))
+        self.assertEqual(self.calls, ["stop", "start"])
+        # removed BEFORE acting — a crash mid-restart can't loop
+        self.assertEqual(seen_at_stop, [False])
+        self.assertFalse(self.path.exists())
+
 
 class SupervisorApplyTest(unittest.TestCase):
     def setUp(self):

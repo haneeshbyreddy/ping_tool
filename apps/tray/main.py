@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -14,7 +13,6 @@ from wisp.runtime import edge_status
 from wisp.runtime.win32tray import TrayApp, make_circle_icon
 
 TASK_NAME = "WISP-Edge"
-CREATE_NO_WINDOW = 0x08000000
 MB_YESNO, MB_ICONWARNING, IDYES = 0x4, 0x30, 6
 
 _COLORS = {
@@ -40,15 +38,6 @@ def _status_file(cfg: dict[str, str]) -> Path:
     db = cfg.get("WISP_DB") or str(_config_dir() / "wisp.db")
     return edge_status.status_path(db)
 
-def _task_installed() -> bool:
-    try:
-        return subprocess.run(
-            ["schtasks", "/Query", "/TN", TASK_NAME],
-            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15,
-        ).returncode == 0
-    except OSError:
-        return False
-
 def _run_elevated(command: str) -> None:
     ctypes.windll.shell32.ShellExecuteW(
         None, "runas", "powershell.exe",
@@ -69,17 +58,15 @@ class TrayController:
         self.cfg = _load_config()
         self._icons = {state: make_circle_icon(rgb) for state, rgb in _COLORS.items()}
         self.view = edge_status.StatusView(edge_status.STATE_UNKNOWN, "reading status…")
-        self.installed = True
         self.app = TrayApp(refresh=self.refresh, build_menu=self.menu)
 
     def refresh(self) -> tuple[int, str]:
-        self.cfg = self.cfg or _load_config()
-        self.installed = _task_installed()
-        if not self.installed:
-            self.view = edge_status.StatusView(
-                edge_status.STATE_UNKNOWN, "probe task not installed")
-        else:
-            self.view = edge_status.read_status(_status_file(self.cfg))
+        # status.json is the ONLY truth here. A schtasks /Query from this
+        # non-elevated session can't read the SYSTEM task, and its failure is
+        # indistinguishable from "not installed" without parsing localized
+        # output — gating the menu on it kept probes reading as dead for days.
+        self.cfg = _load_config()
+        self.view = edge_status.read_status(_status_file(self.cfg))
         node = self.cfg.get("WISP_NODE_ID", "")
         tip = f"WISP Edge{f' [{node}]' if node else ''}: {self.view.detail}"
         return self._icons[self.view.state], tip
@@ -89,15 +76,20 @@ class TrayController:
         running_ish = self.view.state in (
             edge_status.STATE_OK, edge_status.STATE_STARTING, edge_status.STATE_DEGRADED)
         start_label = "Restart probe" if running_ish else "Start probe"
+        # The agent self-updates underneath us while this tray binary only
+        # changes on an installer re-run — show the AGENT's running version
+        # (from status.json), not our own stale compile-time stamp.
+        agent_v = ((self.view.raw or {}).get("version") or "").strip()
+        title = f"WISP Edge — agent v{agent_v}" if agent_v else f"WISP Edge v{VERSION} (tray)"
         dashboard = (self.cfg.get("WISP_CENTRAL_URL") or "").strip()
         return [
-            (f"WISP Edge v{VERSION}", False, None),
+            (title, False, None),
             (self.view.detail, False, None),
             None,
             ("Open dashboard", bool(dashboard), lambda: _open(dashboard)),
             ("Open log folder", True, lambda: _open(str(_config_dir() / "logs"))),
             None,
-            (start_label, self.installed, self.start_probe),
+            (start_label, True, self.start_probe),
             None,
             ("Uninstall WISP Edge…", True, self.uninstall),
             ("Exit and stop monitoring", True, self.exit_and_stop),
@@ -114,8 +106,7 @@ class TrayController:
             "or at the next reboot).", "WISP Edge",
         ):
             return
-        if self.installed:
-            _run_elevated(f'"schtasks /End /TN {TASK_NAME}"')
+        _run_elevated(f'"schtasks /End /TN {TASK_NAME}"')
         self.app.quit()
 
     def uninstall(self) -> None:

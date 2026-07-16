@@ -100,5 +100,65 @@ class RolloutTest(unittest.TestCase):
         self.store.set_rollout("ispA", "v2", [], now=_iso(NOW))
         self.assertEqual(rollout.evaluate(self.store, "ispA", cfg=self.cfg, now=NOW), "promoted")
 
+
+class AutoRolloutTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = CentralStore(Path(self.tmp.name) / "c.db")
+        self.store.set_release("v2", ART)
+        self.store.set_org_auto_update("ispA", True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _arm(self, node="edge-1", version="v1"):
+        return rollout.maybe_auto_rollout(self.store, "ispA", node, version)
+
+    def test_arms_canary_rollout_for_stale_node(self):
+        self.assertTrue(self._arm())
+        ro = self.store.get_rollout("ispA")
+        self.assertEqual((ro["state"], ro["target_version"], ro["canary"]),
+                         ("canary", "v2", ["edge-1"]))
+
+    def test_disabled_org_never_arms(self):
+        self.store.set_org_auto_update("ispA", False)
+        self.assertFalse(self._arm())
+        self.assertIsNone(self.store.get_rollout("ispA"))
+
+    def test_current_or_ahead_node_never_arms(self):
+        self.assertFalse(self._arm(version="v2"))
+        self.assertFalse(self._arm(version="v3"))
+        self.assertIsNone(self.store.get_rollout("ispA"))
+
+    def test_live_rollout_not_replaced(self):
+        self.store.set_rollout("ispA", "v2", ["edge-9"])
+        self.assertFalse(self._arm())
+        self.assertEqual(self.store.get_rollout("ispA")["canary"], ["edge-9"])
+
+    def test_halted_same_target_needs_a_human(self):
+        # halting means the build failed its health gate — auto-retrying it
+        # would loop a broken build through the fleet forever
+        self.store.set_rollout("ispA", "v2", ["edge-1"], state="halted")
+        self.assertFalse(self._arm())
+        self.assertEqual(self.store.get_rollout("ispA")["state"], "halted")
+
+    def test_halted_older_target_rearms_for_newer_release(self):
+        self.store.set_rollout("ispA", "v1.5", ["edge-1"], state="halted")
+        self.assertTrue(self._arm())
+        self.assertEqual(self.store.get_rollout("ispA")["target_version"], "v2")
+
+    def test_done_rollout_rearms_for_fresh_install_of_old_build(self):
+        self.store.set_rollout("ispA", "v2", ["edge-1"], state="done")
+        self.assertTrue(self._arm(node="edge-new"))
+        ro = self.store.get_rollout("ispA")
+        self.assertEqual((ro["state"], ro["canary"]), ("canary", ["edge-new"]))
+
+    def test_no_release_no_arm(self):
+        with tempfile.TemporaryDirectory() as tmp2:
+            store = CentralStore(Path(tmp2) / "c2.db")
+            store.set_org_auto_update("ispA", True)
+            self.assertFalse(rollout.maybe_auto_rollout(store, "ispA", "edge-1", "v1"))
+
+
 if __name__ == "__main__":
     unittest.main()

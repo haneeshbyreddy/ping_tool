@@ -401,6 +401,7 @@ export interface NodesResponse {
   nodes: NodeToken[]
   latest_version: string | null
   rollout: OrgRollout | null
+  auto_update: boolean
 }
 
 export interface Worker {

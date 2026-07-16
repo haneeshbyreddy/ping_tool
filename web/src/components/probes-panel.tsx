@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Check, Copy, Download, KeyRound, MoreVertical, Plus, Power, Trash2 } from "lucide-react"
+import { Check, Copy, Download, KeyRound, MoreVertical, Plus, Power, RotateCw, Trash2 } from "lucide-react"
 import { useNow } from "@/hooks/use-now"
-import { billingApi, nodesApi, ApiError } from "@/lib/api"
+import { billingApi, nodesApi, orgsApi, ApiError } from "@/lib/api"
 import {
   WINDOWS_SETUP_EXE, linuxInstallCmd, probeIdentity, releaseAsset, windowsSilentCmd,
 } from "@/lib/install"
@@ -18,6 +18,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
@@ -202,6 +203,14 @@ function ProbeRow({
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Update failed"),
   })
+  const restart = useMutation({
+    mutationFn: () => nodesApi.restart(org, node.node_id),
+    onSuccess: () => {
+      toast.success("Restart queued. The probe's supervisor applies it on the next heartbeat")
+      invalidate()
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Restart failed"),
+  })
   const revoke = useMutation({
     mutationFn: () => nodesApi.revoke(org, node.node_id),
     onSuccess: invalidate,
@@ -316,6 +325,12 @@ function ProbeRow({
           <DropdownMenuItem disabled={update.isPending}
             onClick={() => update.mutate()}>
             <Download /> {updateStalled ? `Retry update to ${latestVersion}` : `Update to ${latestVersion}`}
+          </DropdownMenuItem>
+        )}
+        {!!node.last_seen && (
+          <DropdownMenuItem disabled={restart.isPending}
+            onClick={() => restart.mutate()}>
+            <RotateCw /> Restart probe
           </DropdownMenuItem>
         )}
         {node.registered && (
@@ -444,6 +459,12 @@ export function ProbesPanel({
     onError: (e) => setError(e instanceof ApiError ? e.message : "Registration failed"),
   })
 
+  const autoUpdate = useMutation({
+    mutationFn: (enabled: boolean) => orgsApi.save({ org_id: org, auto_update: enabled }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["nodes"] }),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Could not save auto-update"),
+  })
+
   const nodes = data?.nodes ?? []
   // Cap counts live credentials (registered, un-revoked), matching the server.
   const activeNodeCount = nodes.filter((n) => n.registered && !n.revoked_at).length
@@ -457,11 +478,21 @@ export function ProbesPanel({
           Probes
           {nodes.length > 0 && <span className="ml-2 font-normal text-muted-foreground">{nodes.length}</span>}
         </h2>
-        {canWrite && !addOpen && (
-          <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setAddOpen(true)}>
-            <Plus className="size-3.5" /> Register
-          </Button>
-        )}
+        <div className="flex items-center gap-3">
+          {canWrite && data && (
+            <label className="flex items-center gap-2 text-xs text-muted-foreground"
+              title="When a newer release is published, central rolls the fleet forward itself — one probe canaries first, the rest follow once it proves healthy. Off: updates wait for the Update button.">
+              Auto-update
+              <Switch checked={data.auto_update} disabled={autoUpdate.isPending}
+                onCheckedChange={(v) => autoUpdate.mutate(v)} />
+            </label>
+          )}
+          {canWrite && !addOpen && (
+            <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setAddOpen(true)}>
+              <Plus className="size-3.5" /> Register
+            </Button>
+          )}
+        </div>
       </div>
 
       {reveal && (

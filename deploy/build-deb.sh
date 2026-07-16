@@ -78,6 +78,7 @@ if command -v systemctl >/dev/null 2>&1; then
     if grep -q '^WISP_CENTRAL_URL=..*' /etc/wisp/edge.env 2>/dev/null; then
         systemctl enable wisp-edge >/dev/null 2>&1 || true
         systemctl restart wisp-edge || true
+        echo "wisp-edge: check probe health any time with: /opt/wisp/bin/wisp-edge status"
     else
         echo "wisp-edge: edit /etc/wisp/edge.env (central URL + enrollment token from"
         echo "wisp-edge: the dashboard's Probes section), then: systemctl enable --now wisp-edge"

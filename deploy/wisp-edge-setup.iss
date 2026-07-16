@@ -49,6 +49,33 @@ Filename: "powershell.exe"; \
 var
   ConfigPage: TInputQueryWizardPage;
 
+procedure KillImage(const Image: string);
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM ' + Image, '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  // A running fleet delete-locks its own images (supervisor/agent under the
+  // SYSTEM task, tray per-user), which made every reinstall fail with
+  // "old files exist" until the user manually uninstalled and deleted the
+  // folder. Stop them all BEFORE file copy — re-running this installer must
+  // always upgrade in place. CurStepChanged re-registers and restarts the
+  // task afterwards, and [Run] relaunches the tray.
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN WISP-Edge', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  KillImage('wisp-tray.exe');
+  KillImage('wisp-supervisor.exe');
+  KillImage('wisp-edge.exe');
+  Sleep(1500);
+end;
+
 function ParamOr(const Name, Default: string): string;
 begin
   Result := ExpandConstant('{param:' + Name + '|' + Default + '}');

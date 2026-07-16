@@ -110,6 +110,10 @@ def update(h, user, body):
                 h._reply(422, {"error": "poll_interval_s must be between 10 and 120 seconds"})
                 return
         h.store.set_org_poll_interval(org, seconds)
+    if "auto_update" in body:
+        # Fleet auto-update: central arms the staged rollout itself when the
+        # release mirror gets ahead of the fleet (rollout.maybe_auto_rollout).
+        h.store.set_org_auto_update(org, bool(body.get("auto_update")))
     if "web_proxy" in body:
         # Web-UI proxy capability (webplan.md §6.7): a blast-radius switch,
         # not an org preference — only the superadmin grants or revokes it.

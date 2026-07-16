@@ -343,12 +343,56 @@ class NodeUpdateHttpTest(unittest.TestCase):
                                  {"org_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
         self.assertEqual(status, 403)
 
+    def test_restart_queued_then_rides_heartbeat_exactly_once(self):
+        cookie = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/nodes/restart",
+                                    {"org_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        hb = {"v": 1, "org_id": "ispA", "node_id": "edge-a1",
+              "body": {"version": "0.2", "platform": "linux-amd64"}}
+        status, reply, _ = self._req("POST", "/heartbeat", hb, token="tok")
+        self.assertEqual(status, 200)
+        self.assertIs(reply.get("restart"), True)
+        # one-shot: delivery consumed it
+        status, reply, _ = self._req("POST", "/heartbeat", hb, token="tok")
+        self.assertNotIn("restart", reply)
+
+    def test_restart_rejects_never_seen_node(self):
+        cookie = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/nodes/restart",
+                                    {"org_id": "ispA", "node_id": "edge-ghost"}, cookie=cookie)
+        self.assertEqual(status, 422)
+        self.assertIn("never reported", body["error"])
+
+    def test_restart_gated_on_org_write(self):
+        cookie = self._login("bowner", "bownerpassword")
+        status, _, _ = self._req("POST", "/api/nodes/restart",
+                                 {"org_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
+        self.assertEqual(status, 403)
+
     def test_nodes_list_carries_latest_version_and_rollout(self):
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/nodes", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body["latest_version"], "0.2")
         self.assertIsNone(body["rollout"])
+        self.assertIs(body["auto_update"], False)
+
+    def test_auto_update_arms_and_directs_on_the_same_heartbeat(self):
+        cookie = self._login("owner", "ownerpassword")
+        status, _, _ = self._req("POST", "/api/org",
+                                 {"org_id": "ispA", "auto_update": True}, cookie=cookie)
+        self.assertEqual(status, 200)
+        status, reply, _ = self._req("POST", "/heartbeat",
+                                     {"v": 1, "org_id": "ispA", "node_id": "edge-a1",
+                                      "body": {"version": "0.1", "platform": "linux-amd64"}},
+                                     token="tok")
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["update"]["target_version"], "0.2")
+        ro = self.store.get_rollout("ispA")
+        self.assertEqual((ro["state"], ro["canary"]), ("canary", ["edge-a1"]))
+        self.assertIn("auto-update", ro["note"])
 
 if __name__ == "__main__":
     unittest.main()

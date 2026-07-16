@@ -70,6 +70,7 @@ POST = {
     "/api/nodes/revoke": fleet.revoke,
     "/api/nodes/delete": fleet.delete,
     "/api/nodes/update": fleet.update,
+    "/api/nodes/restart": fleet.restart,
     "/api/inventory": devices.create,
     "/api/inventory/update": devices.update,
     "/api/inventory/delete": devices.delete,

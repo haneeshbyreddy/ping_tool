@@ -18,6 +18,7 @@ from wisp.config import Config
 from wisp.ingress.probers import PingResult
 from wisp.ingress.snmp import PortStatus
 from wisp.runtime.central_client import CentralClientError
+from wisp.runtime.edge_status import StatusWriter
 
 def _dev(id, ip, parent=None, snmp_enabled=False, snmp_community=None):
     return {"id": id, "name": f"d{id}", "ip_address": ip, "region": "R",
@@ -570,6 +571,61 @@ class SendHeartbeatTest(unittest.TestCase):
         client = RecordingCentralClient([], fail_heartbeat=True)
         daemon._send_heartbeat(client, self.cfg, fleet_size=1)
         self.assertFalse(self.request_path.exists())
+
+    def test_restart_directive_dropped_as_restart_file(self):
+        restart_path = Path(self._tmp.name) / "restart_request.json"
+        client = RecordingCentralClient([], heartbeat_reply={"ok": True, "restart": True})
+        daemon._send_heartbeat(client, self.cfg, fleet_size=1)
+        self.assertTrue(restart_path.exists())
+        self.assertFalse(self.request_path.exists())
+
+    def test_no_restart_writes_no_restart_file(self):
+        client = RecordingCentralClient([])
+        daemon._send_heartbeat(client, self.cfg, fleet_size=1)
+        self.assertFalse((Path(self._tmp.name) / "restart_request.json").exists())
+
+
+class StatusCliTest(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_config = daemon.CONFIG
+        daemon.CONFIG = Config(db_path=Path(self._tmp.name) / "wisp.db")
+        self.addCleanup(setattr, daemon, "CONFIG", self._old_config)
+
+    def _run(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = daemon.print_status()
+        return code, out.getvalue()
+
+    def test_never_reported_exits_2(self):
+        code, out = self._run()
+        self.assertEqual(code, 2)
+        self.assertIn("never reported", out)
+
+    def test_healthy_probe_exits_0_with_identity(self):
+        w = StatusWriter(Path(self._tmp.name) / "status.json", org_id="ispA",
+                         node_id="edge-1", central_url="https://c.example",
+                         interval_s=30, version="9.9.9")
+        w.write("running", ok=True, devices=3)
+        code, out = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("ok:", out)
+        self.assertIn("agent v9.9.9", out)
+        self.assertIn("edge-1", out)
+
+    def test_failing_report_exits_1(self):
+        w = StatusWriter(Path(self._tmp.name) / "status.json", org_id="ispA",
+                         node_id="edge-1", central_url="https://c.example",
+                         interval_s=30, version="9.9.9")
+        w.write("running", ok=False, error="central unreachable")
+        code, out = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("central unreachable", out)
 
 if __name__ == "__main__":
     unittest.main()

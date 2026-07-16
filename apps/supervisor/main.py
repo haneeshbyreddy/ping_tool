@@ -12,7 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from wisp.config import CONFIG
-from wisp.runtime.supervisor import Supervisor
+from wisp.runtime.supervisor import Supervisor, consume_restart
 
 log = logging.getLogger("wisp.supervisor")
 
@@ -77,6 +77,7 @@ def main() -> None:
     runner.start()
     agent_path = Path(AGENT_BIN) if AGENT_BIN else Path(_DEV_AGENT[1])
     request_path = Path(CONFIG.db_path).parent / "update_request.json"
+    restart_path = Path(CONFIG.db_path).parent / "restart_request.json"
     deadline = CONFIG.agent_health_deadline_s
 
     def restart():
@@ -95,6 +96,10 @@ def main() -> None:
         while True:
             if not runner.alive():
                 log.warning("agent exited — restarting"); runner.start()
+            try:
+                consume_restart(restart_path, stop=runner.stop, restart=runner.start)
+            except Exception:
+                log.exception("central-requested restart failed")
             if request_path.is_file():
                 try:
                     outcome = sup.consume_request(request_path)

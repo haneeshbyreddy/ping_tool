@@ -92,7 +92,17 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - **The heartbeat is the self-update channel, not liveness.** Reply may carry an
   `update` directive (`central/rollout.py`), written ATOMICALLY as
   `update_request.json` for the supervisor. Liveness is `touch_node` off `/report`.
-  A failed heartbeat is a warning, never a crashed cycle.
+  A failed heartbeat is a warning, never a crashed cycle. The reply may also
+  carry `restart: true` (one-shot `nodes.restart_pending`, queued from the
+  Probes panel via `POST /api/nodes/restart`) — the agent drops
+  `restart_request.json`, the supervisor bounces it. DELIVERY clears the flag:
+  a directive lost in flight means the operator clicks again, never a loop.
+- **Auto-update is org-opt-in** (`orgs.auto_update`, Probes-panel toggle):
+  `rollout.maybe_auto_rollout` runs per heartbeat and arms the SAME staged
+  canary rollout the manual Update button uses (canary = first stale
+  heartbeater). A HALTED rollout for the same target is NEVER auto-retried —
+  a build that failed its health gate re-arms only via a human's dashboard
+  Retry; `done` re-arms freely (fresh install of an old build).
 - **SNMP is a BACKGROUND asyncio task, never inline in the probe cycle** (inline
   walks once made the edge report every 4 minutes). `snmp_max_inflight` (4)
   concurrent walks; no await on SNMP in the ICMP report path. Ports attach to full
@@ -503,10 +513,22 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   self-update channel — only an installer re-run updates them. Ditto
   `wisp-tray.exe` (per-user pure-ctypes tray; keep it dependency-free; control via
   elevated `schtasks`, never parse its localized output; tray "Exit" stops the
-  probe, it still auto-starts at boot).
+  probe, it still auto-starts at boot). **The tray's ONLY status truth is
+  status.json** — never gate its menu on `schtasks /Query`: the SYSTEM task is
+  unreadable from a non-elevated session, and the failure is indistinguishable
+  from "not installed" (this kept healthy probes reading "task not installed"
+  for days). It shows the AGENT's version from status.json, since its own
+  compiled stamp goes stale the first time the agent self-updates.
+- **The Windows installer upgrades in place**: `PrepareToInstall` ends the
+  WISP-Edge task and taskkills tray/supervisor/agent before file copy — a
+  running fleet delete-locks its images and reinstalls used to dead-end on
+  "old files exist". Don't remove it; `CurStepChanged` + `[Run]` restart
+  everything after.
 - **Edge health is on disk**: `status.json` (atomic, best-effort — a full disk must
   never kill the probe loop; written at startup, every full cycle, and on fatal
-  startup errors) + `logs/edge.log` (rotated at task start >5MB). The Windows
+  startup errors) + `logs/edge.log` (rotated at task start >5MB). Headless boxes
+  read it via `wisp-edge status` (exit 0 healthy / 1 starting-degraded /
+  2 stale-error; falls back to /etc/wisp when WISP_DB isn't in the shell env). The Windows
   installer WAITS for a fresh `status.json` (exit 10 = unconfirmed) — never move
   that back to fire-and-forget. Re-running the installer with `-Central` rewrites
   `edge.env.ps1` (write-once made one bad install permanently dead). Scheme-less

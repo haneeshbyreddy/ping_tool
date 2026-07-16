@@ -342,6 +342,15 @@ def _send_heartbeat(client: CentralBrainClient, cfg: Config, fleet_size: int) ->
     except CentralClientError as exc:
         log.warning("central heartbeat failed: %s", exc)
         return
+    if (reply or {}).get("restart"):
+        # Central-driven bounce: the supervisor consumes this file and restarts
+        # us. Same drop-a-file handoff as the update directive below.
+        restart_path = Path(cfg.db_path).parent / "restart_request.json"
+        tmp = restart_path.with_name("restart_request.json.tmp")
+        restart_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"requested_at": _utc_now_iso()}))
+        os.replace(tmp, restart_path)
+        log.info("central requested an agent restart; dropped %s", restart_path)
     directive = (reply or {}).get("update")
     if not directive:
         return
@@ -601,8 +610,35 @@ async def _run_central_brain(
         if close is not None:
             close()
 
+def print_status(*, now=None) -> int:
+    """`wisp-edge status` — the tray's truth surface, for headless boxes.
+
+    Reads the same status.json the Windows tray renders. Exit code: 0 healthy,
+    1 starting/degraded, 2 stale/error/never-reported (scriptable).
+    """
+    from wisp.runtime import edge_status
+    path = edge_status.status_path(CONFIG.db_path)
+    if not path.is_file():
+        # Interactive shells don't source the systemd EnvironmentFile, so
+        # WISP_DB is usually unset here — fall back to the .deb's layout.
+        deb_path = Path("/etc/wisp/status.json")
+        if deb_path.is_file():
+            path = deb_path
+    view = edge_status.read_status(path, now=now)
+    print(f"{view.state}: {view.detail}")
+    raw = view.raw or {}
+    if raw:
+        print(f"agent v{raw.get('version')} | org {raw.get('org_id')}"
+              f" | node {raw.get('node_id')} -> {raw.get('central_url')}")
+    print(f"(status file: {path})")
+    return {edge_status.STATE_OK: 0, edge_status.STATE_STARTING: 1,
+            edge_status.STATE_DEGRADED: 1}.get(view.state, 2)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Village WISP polling daemon")
+    parser.add_argument("command", nargs="?", choices=["status"],
+                        help="status: print probe health from status.json and exit"
+                             " (0 healthy, 1 starting/degraded, 2 stale/error)")
     parser.add_argument("--interval", type=float, default=None,
                         help="seconds between polls (overrides config)")
     parser.add_argument("--cycles", type=int, default=None,
@@ -615,6 +651,9 @@ def main() -> None:
         from wisp.version import VERSION
         print(VERSION)
         return
+
+    if args.command == "status":
+        raise SystemExit(print_status())
 
     logging.basicConfig(
         level=logging.INFO,

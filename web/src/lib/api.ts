@@ -108,6 +108,7 @@ export const orgsApi = {
     map_region?: string | null
     poll_interval_s?: number | null
     web_proxy?: boolean // superadmin-only capability flag
+    auto_update?: boolean // fleet auto-update: central arms rollouts itself
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
@@ -277,6 +278,8 @@ export const nodesApi = {
   list: (org?: string | null) => request<NodesResponse>(`/api/nodes${tq(org)}`),
   update: (org_id: string, node_id: string) =>
     request<{ ok: boolean; target_version: string }>("/api/nodes/update", { method: "POST", body: { org_id, node_id } }),
+  restart: (org_id: string, node_id: string) =>
+    request<{ ok: boolean }>("/api/nodes/restart", { method: "POST", body: { org_id, node_id } }),
   register: (org_id: string, node_id: string) =>
     request<{ node_id: string; token: string }>("/api/nodes", { method: "POST", body: { org_id, node_id } }),
   rotate: (org_id: string, node_id: string) =>

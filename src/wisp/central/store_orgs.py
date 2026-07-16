@@ -73,6 +73,21 @@ class OrgStoreMixin:
         return row["poll_interval_s"] if row else None
 
 
+    def set_org_auto_update(self, org_id: str, enabled: bool) -> None:
+        with self._write_lock, self._connect() as conn:
+            self._ensure_org(conn, org_id, _now_iso())
+            conn.execute("UPDATE orgs SET auto_update=? WHERE org_id=?",
+                         (1 if enabled else 0, org_id))
+            conn.commit()
+
+
+    def org_auto_update(self, org_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT auto_update FROM orgs WHERE org_id=?",
+                               (org_id,)).fetchone()
+        return bool(row["auto_update"]) if row else False
+
+
     # ----- paywall (central/billing.py owns the math) -----------------------
 
     def org_plan(self, org_id: str) -> str:

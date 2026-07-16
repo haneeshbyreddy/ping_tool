@@ -47,6 +47,7 @@ def heartbeat_reply(h, org: str, node: str, body: dict) -> dict:
     reply: dict = {"ok": True}
     try:
         from wisp.central import rollout
+        rollout.maybe_auto_rollout(h.store, org, node, body.get("version"))
         rollout.evaluate(h.store, org, cfg=h.cfg)
         directive = rollout.directive_for(h.store, org, node, body.get("version"),
                                           body.get("platform"))
@@ -54,6 +55,13 @@ def heartbeat_reply(h, org: str, node: str, body: dict) -> dict:
             reply["update"] = directive
     except Exception:
         log.exception("rollout directive failed for %s/%s", org, node)
+    try:
+        # One-shot, dashboard-queued (POST /api/nodes/restart). The supervisor
+        # bounces the agent; delivery consumes the flag.
+        if h.store.pop_restart_request(org, node):
+            reply["restart"] = True
+    except Exception:
+        log.exception("restart directive failed for %s/%s", org, node)
     return reply
 
 

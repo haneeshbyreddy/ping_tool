@@ -306,3 +306,28 @@ class FleetStoreMixin:
             return [dict(r) for r in conn.execute(
                 "SELECT node_id, version, last_seen FROM nodes WHERE org_id=?",
                 (org_id,))]
+
+
+    def request_restart(self, org_id: str, node_id: str) -> bool:
+        """Queue a one-shot agent restart; the node's next heartbeat delivers it.
+
+        Returns False when the node has never heartbeated — there is no
+        channel to deliver through (same rule as the update directive).
+        """
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE nodes SET restart_pending=1 WHERE org_id=? AND node_id=?",
+                (org_id, node_id))
+            conn.commit()
+        return cur.rowcount > 0
+
+
+    def pop_restart_request(self, org_id: str, node_id: str) -> bool:
+        """Consume the pending restart. Delivery clears it — a directive lost
+        in flight means the operator clicks Restart again, never a loop."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE nodes SET restart_pending=0 WHERE org_id=? AND node_id=?"
+                " AND restart_pending=1", (org_id, node_id))
+            conn.commit()
+        return cur.rowcount > 0

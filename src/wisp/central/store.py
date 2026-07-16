@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     health       TEXT,                     -- the raw heartbeat body (JSON)
     first_seen   TEXT NOT NULL,
     last_seen    TEXT NOT NULL,
+    restart_pending INTEGER NOT NULL DEFAULT 0,  -- one-shot; consumed by heartbeat reply
     PRIMARY KEY (org_id, node_id)
 );
 -- Self-service edge enrollment: an ISP owner/operator issues one of these per node from
@@ -705,7 +706,14 @@ class CentralStore(
                 # superadmin-set — THE activation gate since v0.15.8
                 # (cfg.proxy_enabled defaults on; =0 is the emergency kill
                 # switch, per side).
-                ("web_proxy", "INTEGER NOT NULL DEFAULT 0")))
+                ("web_proxy", "INTEGER NOT NULL DEFAULT 0"),
+                # Fleet auto-update: when a newer release lands in the mirror,
+                # central starts the (staged, health-gated) rollout itself —
+                # first stale heartbeat becomes the canary (central/rollout.py:
+                # maybe_auto_rollout). Off = updates stay dashboard-clicked.
+                ("auto_update", "INTEGER NOT NULL DEFAULT 0")))
+            self._ensure_columns(conn, "nodes", (
+                ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "switch_ports", (
