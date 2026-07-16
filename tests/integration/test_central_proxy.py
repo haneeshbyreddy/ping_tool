@@ -41,6 +41,17 @@ class _StubDevice(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/headers":
+            # echo the request headers the login-flow fix must forward
+            lines = [f"{k}: {self.headers.get(k)}"
+                     for k in ("Cookie", "Referer", "Origin", "Content-Type")]
+            body = "\n".join(lines).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/redirect":
             # old-firmware style: root-absolute redirect + root-scoped cookie
             self.send_response(302)
@@ -146,9 +157,9 @@ class ProxyRoundTripTest(unittest.TestCase):
         conn.close()
         return resp.status, body
 
-    def _browser(self, method, path, out, body=None, cookie=None):
+    def _browser(self, method, path, out, body=None, cookie=None, extra=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
-        headers = {"Cookie": cookie or self.cookie}
+        headers = {"Cookie": cookie or self.cookie, **(extra or {})}
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         out["status"] = resp.status
@@ -167,12 +178,12 @@ class ProxyRoundTripTest(unittest.TestCase):
         conn.close()
         return resp.status, doc
 
-    def _round_trip(self, method, path, devices, body=None):
+    def _round_trip(self, method, path, devices, body=None, extra=None):
         """Fire the (blocking) browser request in a thread, serve one request from
         the edge, return the browser's result."""
         out = {}
         t = threading.Thread(target=self._browser, args=(method, path, out),
-                             kwargs={"body": body})
+                             kwargs={"body": body, "extra": extra})
         t.start()
         tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
                              devices_provider=lambda: devices)
@@ -351,6 +362,63 @@ class ProxyRoundTripTest(unittest.TestCase):
                       out["body"])
         # plain relative refs must pass through untouched
         self.assertIn(b"src=logo.png", out["body"])
+
+    def test_browser_headers_forwarded_but_dashboard_cookie_stripped(self):
+        # The device login flow depends on ITS cookie coming back on every
+        # request; central's own session cookie must never leave the house, and
+        # Referer is rewritten to the device origin (firmwares CSRF-check it).
+        _, sess = self._open_session()
+        sid = sess["sid"]
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sid}/headers",
+            devices=[{"ip_address": "127.0.0.1"}],
+            extra={"Referer": f"http://127.0.0.1:{self.port}/api/proxy/{sid}/page.html",
+                   "Cookie": f"{self.cookie}; DEVSID=abc"})
+        self.assertTrue(served)
+        text = out["body"].decode()
+        self.assertIn("Cookie: DEVSID=abc", text)
+        self.assertNotIn("wisp_central_session", text)
+        self.assertIn(f"Referer: http://127.0.0.1:{self.dev_port}/page.html", text)
+
+    def test_escaped_root_absolute_url_rescued_via_referer(self):
+        # Device JS builds "/js/x.js" — it escapes the sid prefix and lands on
+        # central as an unknown route. With a live session in the Referer the
+        # server must bounce it back inside the tunnel, method preserved.
+        _, sess = self._open_session()
+        sid = sess["sid"]
+        ref = {"Referer": f"http://127.0.0.1:{self.port}/api/proxy/{sid}/index.html"}
+        out = {}
+        self._browser("GET", "/js/app.js?v=3", out, extra=ref)
+        self.assertEqual(out["status"], 307)
+        headers = {k.lower(): v for k, v in out["headers"]}
+        self.assertEqual(headers["location"], f"/api/proxy/{sid}/js/app.js?v=3")
+        out = {}
+        self._browser("POST", "/action/login.html", out, body=b"u=admin", extra=ref)
+        self.assertEqual(out["status"], 307)
+        headers = {k.lower(): v for k, v in out["headers"]}
+        self.assertEqual(headers["location"], f"/api/proxy/{sid}/action/login.html")
+
+    def test_one_session_per_node_newest_wins(self):
+        # Opening a second session on the same probe replaces the first: the
+        # old sid stops browsing (404) and its record reads closed, not open.
+        _, first = self._open_session()
+        status, second = self._open_session()
+        self.assertEqual(status, 200, second)
+        out = {}
+        self._browser("GET", f"/api/proxy/{first['sid']}/status", out)
+        self.assertEqual(out["status"], 404)
+        _, doc = self._api("GET", "/api/proxy/sessions")
+        by_sid = {s["sid"]: s for s in doc["sessions"]}
+        self.assertEqual(by_sid[first["sid"]]["status"], "closed")
+        self.assertEqual(by_sid[second["sid"]]["status"], "open")
+        self.assertTrue(by_sid[second["sid"]]["live"])
+
+    def test_escape_rescue_needs_a_live_session(self):
+        bogus = {"Referer":
+                 f"http://127.0.0.1:{self.port}/api/proxy/AAAAAAAAAAAAAAAAAAAAAAAA/x.html"}
+        out = {}
+        self._browser("GET", "/js/app.js", out, extra=bogus)
+        self.assertEqual(out["status"], 404)
 
 
 if __name__ == "__main__":

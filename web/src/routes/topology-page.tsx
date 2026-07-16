@@ -17,6 +17,7 @@ import { RegionSelect } from "@/components/region-select"
 import { ProbesPanel } from "@/components/probes-panel"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { UpgradeNotice } from "@/components/upgrade-notice"
+import { WebUiLiveIcon } from "@/components/web-proxy"
 import { StatusDot } from "@/components/status-badge"
 import { ago, deviceTone, isFresh, isStale } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -30,7 +31,8 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
+  DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
 function treeOrder(
@@ -441,6 +443,8 @@ function DeviceActions({ device, canWrite, onEdit }: {
     onSuccess: invalidate,
     onError: () => toast.error("Failed to update"),
   })
+  // the web-UI tunnel entry moved into the device panel (WebUiButton beside
+  // the Health/Optical/Ports tabs) — this menu is write-actions only again
   return (
     <>
       {canWrite && (
@@ -463,6 +467,7 @@ function DeviceActions({ device, canWrite, onEdit }: {
             <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
               <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
             </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
               <Trash2 /> Delete
             </DropdownMenuItem>
@@ -533,6 +538,7 @@ function DeviceRow({
         <div className="ml-auto flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
           <DeviceMetrics device={device} />
           <span className="hidden font-mono text-xs text-muted-foreground md:inline">{device.ip_address}</span>
+          <WebUiLiveIcon device={device} />
           <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
           <DeviceActions device={device} canWrite={canWrite} onEdit={onEdit} />
         </div>
@@ -594,7 +600,8 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName }: {
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t pt-2">
           <DeviceMetrics device={device} />
           <DeviceChips device={device} hasOptics={hasOptics} openTab={openTab} />
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-1.5">
+            <WebUiLiveIcon device={device} />
             <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
           </div>
         </div>

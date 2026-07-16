@@ -28,7 +28,39 @@ export interface Org {
   poll_interval_s: number | null
   // paywall tier (central/billing.py PLANS) — superadmin-set only
   plan: Plan
+  // device web-UI proxy capability (webplan.md §6.7) — superadmin-set only
+  web_proxy: number
   node_count: number
+}
+
+/** One web-UI proxy tunnel session (GET /api/proxy/sessions). `live` means the
+    in-memory hub still holds it — an 'open' DB row after a central restart is
+    a zombie and reports live: false. */
+export interface ProxySession {
+  sid: string
+  org_id: string
+  device_id: number
+  node_id: string
+  created_by: number | null
+  created_at: string
+  expires_at: string
+  status: "open" | "closed" | "expired"
+  last_active_at: string | null
+  device_name: string | null
+  live: boolean
+}
+
+/** One proxied browser request (GET /api/proxy/audit, owner-only). */
+export interface ProxyAudit {
+  id: number
+  sid: string
+  device_id: number
+  user_id: number | null
+  method: string
+  path: string
+  status: number | null
+  ts: string
+  device_name: string | null
 }
 
 export type Plan = "free" | "pro" | "vip"

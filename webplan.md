@@ -5,13 +5,69 @@ browser, with traffic flowing **browser → central → edge → device** and ba
 edge is already central's hands on the LAN for SNMP; this makes it central's hands
 for HTTP too.
 
-**Status:** **M0 + M1 BUILT and green (2026-07-16)** — ships DARK behind
-`WISP_PROXY_ENABLED` (default off) AND the per-org `orgs.web_proxy` capability flag
-(default off, superadmin-set via `POST /api/org`). Full suite: 754 passing
+**Status:** **M0 + M1 BUILT and green (2026-07-16)** — activation is the per-org
+`orgs.web_proxy` capability flag (default off, superadmin-set via `POST /api/org`).
+**Central-driven since v0.15.8 (2026-07-16):** `WISP_PROXY_ENABLED` now defaults ON
+and is only the emergency kill switch (`=0`, honored per edge and on central) — the
+original double-dark shipped every fresh edge with the tunnel off, and the missing
+env var surfaced as an undiagnosable 504 on every session (the Rapid Networks
+Edge_1 incident; 504 = edge never picked up, 502 = edge fetched and failed). The
+edge machinery is still DORMANT until a `/report` reply carries a live session, so
+default-on costs zero idle long-polls. Full suite: 754 passing
 (`tests/integration/test_central_proxy.py`, `tests/unit/test_webproxy.py`).
-Remaining: the on-site test against real gear (needs an edge release — no deployed
-edge carries this code yet), M2 (rewriting hardening / wildcard-host), M3
-(dashboard UI). Grounded in the existing diagnostic-SNMP-walk path
+**Field-proven 2026-07-16:** full login flow on HILL-OLT-1 (C-Data, via
+EDGE_SAGAR on v0.15.7) through the tunnel — POSTs, cookies, asset fan-out all
+held. Gotcha: the OLT refuses port 80; create the session with `port: 443`
+(a port-80 attempt surfaces as `502 edge fetch failed: All connection attempts
+failed` — the edge's httpx ConnectError relayed).
+
+**Field-test fixes + M3 BUILT (2026-07-16, central-only — works with the
+deployed v0.15.7 edge):**
+
+- **Request headers now forward browser→device** (`api/proxy.py:_forward_headers`
+  — the field test showed login bouncing because `headers={}` dropped the
+  device's session cookie). Allow-list + special cases: device cookies travel,
+  central's `wisp_central_session` is stripped; Referer/Origin rewritten to the
+  device origin (firmware CSRF checks); Authorization forwarded only for
+  `Basic` (a bearer would be central's own token). Everything else (Host,
+  Accept-Encoding, Content-Length…) stays recomputed by httpx on the edge.
+- **Escape rescue** (`server.py:_proxy_rescue`): a JS-built root-absolute URL
+  (missing icons in the field test — the documented M2 gap) lands on central as
+  an unknown route; if the Referer names a LIVE session it 307s back inside the
+  prefix (method+body preserved, full auth re-runs on the tunnel route). Wired
+  into the do_GET 404 fallthrough and do_POST unknown-route branch.
+- **M3 dashboard UI** (`web/src/components/web-proxy.tsx`): a compact "Web UI"
+  button on the RIGHT of the device panel's Health/Optical/Ports tab row
+  (`WebUiButton` in DeviceDetail — so it shows on the Network drill-in AND the
+  Map panel; its own right-aligned row when the device has no tabs). Dropdown
+  offers http/https, last-working port first (remembered in localStorage);
+  blank tab opened synchronously so popup blockers don't eat it. Moved OUT of
+  the three-dots menu (2026-07-16, user ask) — that menu is write-actions only
+  again. Owner/operator + org flag gated. Settings → "Device web UI sessions"
+  card (open/recent sessions, live badge, Close, owner-only audit trail);
+  Organizations page superadmin "web UI" toggle per org
+  (`orgsApi.save({web_proxy})`).
+
+- **One tunnel per probe (2026-07-16):** `session_create` replaces whatever was
+  open on that node — `ProxyHub.close_sessions_for` +
+  `store.close_node_proxy_sessions` (the DB sweep also retires restart
+  zombies). Newest wins; the operator never hunts a forgotten session in
+  Settings. Menu declutter: http/https live in ONE "Open web UI" submenu row
+  (last-used first — kept a submenu even for remembered devices so a firmware
+  port move stays switchable), separators between webUI / edit-group / Delete.
+- **Live indicator = a row capability icon** (`WebUiLiveIcon`, user-specified
+  form): a pulsing green globe beside the optics/ports icons on the Network
+  tree row AND grid card while that device's tunnel is live; click jumps back
+  into the session tab. (A panel strip version was built first and replaced
+  same day — the user wanted the ports/optics icon idiom.) Rides the same
+  ["proxy-sessions", org] query as the Settings card (one 15s poll shared by
+  every row); opening from the panel button invalidates it so the icon
+  appears immediately.
+
+Tests: 758 passing (new: header forwarding/cookie-strip, GET+POST rescue,
+rescue-requires-live-session, one-session-per-node). Remaining: M2
+wildcard-host (only if a vendor UI defeats prefix+rescue), WebSockets (out of
+scope v1). Grounded in the existing diagnostic-SNMP-walk path
 (`api/edge.py:report` → reply `snmp_walks` → `main.py:_DiagWalkRunner` →
 `/edge/snmp-walk`), the same request/response-over-an-outbound-channel pattern.
 
@@ -279,7 +335,8 @@ supported") rather than failing silently.
 
 ## 9. Config additions (`config.py`, frozen dataclass, `WISP_*`)
 
-- `WISP_PROXY_ENABLED` (bool, default off — ship dark).
+- `WISP_PROXY_ENABLED` (bool, default ON since v0.15.8 — `=0` is the kill switch;
+  the org flag + dormant activation are the real gates).
 - `WISP_PROXY_MGMT_PORTS` (allowed device ports, default `80,443`).
 - `WISP_PROXY_SESSION_TTL_S` (default 600).
 - `WISP_PROXY_POLL_HOLD_S` (long-poll hold, default 25).

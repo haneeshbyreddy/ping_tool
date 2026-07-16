@@ -13,8 +13,9 @@ Three actors:
   * ``edge_next`` / ``edge_reply`` — /edge/proxy/next (long-poll pickup) and
     /edge/proxy/reply (result upload): edge-credentialed, same auth as /report.
 
-Security spine (webplan.md §6): cfg.proxy_enabled is the fleet kill switch AND
-orgs.web_proxy is the per-org opt-in (superadmin-set) — both must be on. Only
+Security spine (webplan.md §6): orgs.web_proxy is the per-org opt-in
+(superadmin-set) — THE activation gate; cfg.proxy_enabled defaults on and
+WISP_PROXY_ENABLED=0 is the fleet/edge emergency kill switch. Only
 owner/operator (or superadmin) can open a session; sessions expire, activity
 extends them; the edge re-checks every target IP against its own device list.
 """
@@ -25,6 +26,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+from wisp.central import auth
 from wisp.central import proxy as proxy_mod
 from wisp.central.api.common import org_or_400, reader_or_401
 from wisp.central.proxy import MAX_INFLIGHT_PER_SESSION, parse_ports
@@ -44,6 +46,49 @@ _HOP_BY_HOP = frozenset({
 # How often browser activity syncs the session's sliding expiry to the DB row —
 # per-asset writes would hammer SQLite for nothing (the hub is authoritative).
 _DB_TOUCH_EVERY_S = 20.0
+
+# Browser->device request headers forwarded verbatim. Allow-list, not a
+# strip-list: everything else (Host, Connection, Accept-Encoding,
+# Content-Length, ...) is either wrong for the device or recomputed by httpx on
+# the edge. Cookie/Referer/Origin/Authorization get special handling below.
+_FWD_REQ_HEADERS = ("Accept", "Accept-Language", "Cache-Control", "Content-Type",
+                    "If-Modified-Since", "If-None-Match", "Pragma", "Range",
+                    "User-Agent", "X-Requested-With")
+
+
+def _device_origin(sess) -> str:
+    return f"{sess.scheme}://{sess.device_ip}:{sess.device_port}"
+
+
+def _forward_headers(h, sid: str, sess) -> dict:
+    """Filtered browser headers for the device fetch. The device's own login
+    cookie MUST travel or no device web UI can keep a session — but central's
+    dashboard cookie must never reach the device, and Referer/Origin are
+    rewritten to the device origin (firmwares CSRF-check them)."""
+    out: dict[str, str] = {}
+    for name in _FWD_REQ_HEADERS:
+        v = h.headers.get(name)
+        if v:
+            out[name] = v
+    raw_cookie = h.headers.get("Cookie") or ""
+    kept = [c.strip() for c in raw_cookie.split(";")
+            if c.strip() and not c.strip().startswith(auth.SESSION_COOKIE + "=")]
+    if kept:
+        out["Cookie"] = "; ".join(kept)
+    origin = _device_origin(sess)
+    prefix = f"/api/proxy/{sid}"
+    ref = h.headers.get("Referer") or ""
+    at = ref.find(prefix)
+    if at != -1:
+        out["Referer"] = origin + (ref[at + len(prefix):] or "/")
+    if h.headers.get("Origin"):
+        out["Origin"] = origin
+    # Basic only: a device HTTP-auth prompt works, while central's own bearer
+    # token (also an Authorization header) can never leak to a device.
+    authz = h.headers.get("Authorization") or ""
+    if authz.startswith("Basic "):
+        out["Authorization"] = authz
+    return out
 
 # Roles that may OPEN a session (webplan.md §6.5) — techs browse the dashboard,
 # not device admin UIs.
@@ -95,6 +140,13 @@ def session_create(h, user, body) -> None:
         h._reply(400, {"error": f"port {port} not in proxy_mgmt_ports"})
         return
     scheme = "https" if port == 443 else "http"
+    # One tunnel per probe: opening a session replaces whatever was open on
+    # this node (newest wins — the operator must never have to hunt down a
+    # forgotten session in Settings before opening the next device).
+    replaced = h.proxy.close_sessions_for(org, node)
+    if h.store.close_node_proxy_sessions(org, node) or replaced:
+        log.info("proxy: replacing open session(s) %s on %s/%s",
+                 [s[:8] for s in replaced] or "(db-only)", org, node)
     sess = h.proxy.open_session(
         org_id=org, device_id=device_id, node_id=node, device_ip=ip,
         device_port=port, scheme=scheme, created_by=user["id"],
@@ -242,8 +294,8 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
         h.store.touch_proxy_session(sid, _iso(new_exp))
     path = "/" + rest + (("?" + query) if query else "")
     response = h.proxy.submit(
-        sess, method=method, path=path, headers={}, body=body,
-        timeout=h.cfg.proxy_request_timeout_s)
+        sess, method=method, path=path, headers=_forward_headers(h, sid, sess),
+        body=body, timeout=h.cfg.proxy_request_timeout_s)
     if response is None:
         audit_status = 504
     elif response.get("error"):

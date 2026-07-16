@@ -39,6 +39,18 @@ class ProxyStoreMixin:
                 (expires_at, _now_iso(), sid))
             conn.commit()
 
+    def close_node_proxy_sessions(self, org_id: str, node_id: str) -> int:
+        """Retire every open session record on one probe — the one-tunnel-per-
+        node rule (a new session replaces whatever was open). Also sweeps
+        restart zombies: 'open' rows whose hub session died with the process."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE proxy_sessions SET status='closed'"
+                " WHERE org_id=? AND node_id=? AND status='open'",
+                (org_id, node_id))
+            conn.commit()
+            return cur.rowcount
+
     def close_proxy_session(self, sid: str, status: str = "closed") -> bool:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(

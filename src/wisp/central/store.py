@@ -702,8 +702,9 @@ class CentralStore(
                 # payment lock (org_billing_months).
                 ("plan", "TEXT NOT NULL DEFAULT 'free'"),
                 # Web-UI proxy capability (webplan.md §6.7): opt-in per org,
-                # superadmin-set. cfg.proxy_enabled stays the fleet-wide kill
-                # switch; this is the per-org enablement — both must be on.
+                # superadmin-set — THE activation gate since v0.15.8
+                # (cfg.proxy_enabled defaults on; =0 is the emergency kill
+                # switch, per side).
                 ("web_proxy", "INTEGER NOT NULL DEFAULT 0")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))

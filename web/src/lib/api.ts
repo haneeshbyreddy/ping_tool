@@ -1,6 +1,6 @@
 import type {
   AccountUser, AdminOverview, AttendanceOverview, BillingInfo, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ReliabilityRow, Role,
+  OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   Summary, SwitchPort, SystemStats, TrendBucket, Worker,
 } from "./types"
@@ -107,6 +107,7 @@ export const orgsApi = {
     ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
     map_region?: string | null
     poll_interval_s?: number | null
+    web_proxy?: boolean // superadmin-only capability flag
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
     request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
@@ -231,6 +232,24 @@ export const gponApi = {
     request<{ ok: boolean }>("/api/gpon-profiles/update", { method: "POST", body: { id, ...body } }),
   removeProfile: (id: number) =>
     request<{ ok: boolean }>("/api/gpon-profiles/delete", { method: "POST", body: { id } }),
+}
+
+// Device web-UI proxy tunnel (webplan.md M3). A session is opened against one
+// device; the browser then drives the device's own UI at the returned url.
+export const proxyApi = {
+  open: (device_id: number, port: number) =>
+    request<{ sid: string; url: string; device_id: number; expires_at: number }>(
+      "/api/proxy/session", { method: "POST", body: { device_id, port } }),
+  sessions: (org?: string | null) =>
+    request<{ sessions: ProxySession[] }>(`/api/proxy/sessions${tq(org)}`),
+  audit: (org: string | null | undefined, limit = 100) => {
+    const params = new URLSearchParams()
+    if (org) params.set("org", org)
+    params.set("limit", String(limit))
+    return request<{ audit: ProxyAudit[] }>(`/api/proxy/audit?${params.toString()}`)
+  },
+  close: (sid: string) =>
+    request<{ ok: true; was_open: boolean }>("/api/proxy/close", { method: "POST", body: { sid } }),
 }
 
 export const analyticsApi = {

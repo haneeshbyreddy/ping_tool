@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
+import { Switch } from "@/components/ui/switch"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 function orgInitials(o: { name: string | null; org_id: string }): string {
   return (o.name || o.org_id).slice(0, 2).toUpperCase()
@@ -48,6 +49,14 @@ export function OrganizationsPage() {
       setEdits((e) => { const next = { ...e }; delete next[id]; return next })
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to rename"),
+  })
+
+  // web-UI proxy capability — a blast-radius switch, superadmin-granted per org
+  const setWebProxy = useMutation({
+    mutationFn: ({ id, on }: { id: string; on: boolean }) =>
+      orgsApi.save({ org_id: id, web_proxy: on }),
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to update"),
   })
 
   const manage = (id: string) => { setScopeOrg(id); navigate("/settings") }
@@ -139,6 +148,12 @@ export function OrganizationsPage() {
                 <Badge variant="outline" className="gap-1 font-normal text-muted-foreground">
                   <Radio className="size-3" /> {o.node_count} node{o.node_count === 1 ? "" : "s"}
                 </Badge>
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                  title="Let this org's owners/operators open device web UIs through the probe tunnel">
+                  web UI
+                  <Switch checked={!!o.web_proxy} disabled={setWebProxy.isPending}
+                    onCheckedChange={(v) => setWebProxy.mutate({ id: o.org_id, on: v })} />
+                </label>
                 <BillingAdminDialog org={o.org_id} name={o.name} />
                 <Button variant="outline" size="sm" onClick={() => manage(o.org_id)}>
                   Manage <ArrowRight className="size-3.5" />

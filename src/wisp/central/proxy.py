@@ -119,6 +119,16 @@ class ProxyHub:
         with self._lock:
             return self._sessions.pop(sid, None) is not None
 
+    def close_sessions_for(self, org_id: str, node_id: str) -> list[str]:
+        """One tunnel per probe: drop every live session riding this node.
+        Returns the closed sids so the caller can retire their DB rows."""
+        with self._lock:
+            gone = [sid for sid, s in self._sessions.items()
+                    if s.org_id == org_id and s.node_id == node_id]
+            for sid in gone:
+                del self._sessions[sid]
+        return gone
+
     def has_session(self, sid: str) -> bool:
         with self._lock:
             return sid in self._sessions

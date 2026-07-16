@@ -11,6 +11,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
 import { GponProfilesCard } from "@/components/gpon-profiles-card"
+import { WebProxyCard } from "@/components/web-proxy"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -628,6 +629,8 @@ export function SettingsPage() {
       {isSuperadmin && <GoogleMapsCard />}
       {isSuperadmin && <PlatformBillingCard />}
       {scopeOrg && <RegionsCard org={scopeOrg} canWrite={canWrite} />}
+      {/* renders nothing until the superadmin grants the org the capability */}
+      {scopeOrg && <WebProxyCard org={scopeOrg} />}
       {/* SNMP profiles: superadmin manages the global set; an org owner can add
           org-local ones. A superadmin with no org scoped still manages globals. */}
       {canWrite && (scopeOrg || isSuperadmin) && (

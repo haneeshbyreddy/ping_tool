@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import ssl
 import sys
@@ -37,6 +38,8 @@ _PROXY_EXACT = frozenset({
     "/api/proxy/session", "/api/proxy/sessions",
     "/api/proxy/close", "/api/proxy/audit",
 })
+# Session id inside a Referer header — the escape-rescue hook (_proxy_rescue).
+_PROXY_SID_RE = re.compile(r"/api/proxy/([A-Za-z0-9_-]{16,})/")
 _STATIC = Path(__file__).resolve().parent / "static"
 
 # Routes a LOCKED org's session may still reach: exactly what the lock screen
@@ -104,6 +107,27 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 if length > 0:
                     body = self.rfile.read(length)
             api.proxy.browser_request(self, method, sid, rest, query, body)
+
+        def _proxy_rescue(self, parsed) -> bool:
+            # Device-page JS builds root-absolute URLs that escape the
+            # /api/proxy/<sid>/ prefix (the documented M2 gap) — they land here
+            # as unknown routes. If the Referer names a LIVE proxy session,
+            # bounce the request back inside it: 307 preserves method + body,
+            # and the tunnel route re-runs the full auth/org/billing gauntlet,
+            # so this grants nothing a direct tunnel request wouldn't get.
+            if not cfg.proxy_enabled:
+                return False
+            m = _PROXY_SID_RE.search(self.headers.get("Referer") or "")
+            if not m or not self.proxy.has_session(m.group(1)):
+                return False
+            loc = f"/api/proxy/{m.group(1)}{parsed.path}"
+            if parsed.query:
+                loc += "?" + parsed.query
+            self.send_response(307)
+            self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
 
         def _read_body(self) -> dict | None:
             try:
@@ -342,6 +366,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             if self._serve_static(route):
                 return
+            if self._proxy_rescue(parsed):
+                return
             self._reply(404, {"error": "not found"})
 
         def do_POST(self):
@@ -390,6 +416,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             handler = api.POST.get(route)
             if handler is None:
+                if self._proxy_rescue(parsed):
+                    return
                 self._reply(404, {"error": "not found"})
                 return
             if self._billing_blocked(route, user):

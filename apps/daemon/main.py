@@ -501,9 +501,11 @@ async def _run_central_brain(
     health_task: asyncio.Task | None = None
     walk_runner = _DiagWalkRunner(client, cfg) if cfg.snmp_interval_s > 0 else None
 
-    # Web-UI proxy tunnel: DARK unless WISP_PROXY_ENABLED, and DORMANT even then —
-    # workers spin up only when a /report reply carries live proxy_sessions
-    # (notify_sessions in the cycle) and stand down when the sessions lapse.
+    # Web-UI proxy tunnel: activation is CENTRAL-DRIVEN — the machinery is
+    # built by default (v0.15.8+) but stays DORMANT until a /report reply
+    # carries live proxy_sessions (notify_sessions in the cycle; central only
+    # sends them for orgs with web_proxy on), standing down when they lapse.
+    # WISP_PROXY_ENABLED=0 is the per-edge kill switch (tunnel never built).
     # Its own central client so a 25s long-poll never ties up a connection the
     # probe/report path needs. `lambda: devices` reads the daemon's live device
     # list (reassigned each cycle, late-bound) so the allow-list tracks

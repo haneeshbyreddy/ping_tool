@@ -33,6 +33,25 @@ class ParsePortsTest(unittest.TestCase):
         self.assertEqual(parse_ports("70000"), frozenset())
 
 
+class ProxyDefaultOnTest(unittest.TestCase):
+    """Activation is central-driven (v0.15.8): a fresh edge with no env var
+    must build the tunnel — the per-edge WISP_PROXY_ENABLED requirement was
+    the field trap (missing flag read as a 504 on every session). =0 stays
+    the explicit kill switch."""
+
+    def test_default_on_env_zero_kills(self):
+        old = os.environ.pop("WISP_PROXY_ENABLED", None)
+        try:
+            self.assertTrue(Config().proxy_enabled)
+            os.environ["WISP_PROXY_ENABLED"] = "0"
+            self.assertFalse(Config().proxy_enabled)
+        finally:
+            if old is None:
+                os.environ.pop("WISP_PROXY_ENABLED", None)
+            else:
+                os.environ["WISP_PROXY_ENABLED"] = old
+
+
 class ProxyHubTest(unittest.TestCase):
     def setUp(self):
         self.hub = ProxyHub()

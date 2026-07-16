@@ -9,6 +9,7 @@ import type { OrgDevice, SwitchPort } from "@/lib/types"
 import { Meter } from "@/components/meter"
 import { OpticalPanel } from "@/components/optical-panel"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
+import { WebUiButton, canOpenWebUi, useWebProxy } from "@/components/web-proxy"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
 import { ago, durationSince, fmtBytes, fmtDur, isFresh, isStale } from "@/lib/format"
@@ -420,13 +421,34 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
   focusOnuId?: number | null
 }) {
   const tabs = deviceTabs(device)
-  if (tabs.length === 1) return <DevicePerfPanel device={device} />
+  const webUi = useWebProxy() && canOpenWebUi(device)
+  if (tabs.length === 1) {
+    return (
+      <>
+        {/* no tab row to anchor to — the button gets its own row */}
+        {webUi && (
+          <div className="mb-2 flex justify-start">
+            <WebUiButton device={device} />
+          </div>
+        )}
+        <DevicePerfPanel device={device} />
+      </>
+    )
+  }
 
   const active = tabs.includes(tab) ? tab : "health"
   return (
     <Tabs value={active} onValueChange={(v) => onTab(v as DeviceTab)}>
+      {/* the line TabsList is w-full (its hairline spans the panel), so the
+          button rides INSIDE it, right after the last tab — a flex sibling
+          outside would always end up at the far edge */}
       <TabsList variant="line" className="mb-2">
         {tabs.map((t) => <TabsTrigger key={t} value={t}>{TAB_LABEL[t]}</TabsTrigger>)}
+        {webUi && (
+          <span className="ml-1 pb-1">
+            <WebUiButton device={device} />
+          </span>
+        )}
       </TabsList>
       <TabsContent value="health"><DevicePerfPanel device={device} /></TabsContent>
       {tabs.includes("optical") && (

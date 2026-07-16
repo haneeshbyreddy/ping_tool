@@ -69,11 +69,17 @@ class Config:
 
     backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
 
-    # Device web-UI proxy (reverse tunnel through the edge). Ships DARK — the
-    # whole feature is a no-op until proxy_enabled. See webplan.md. proxy_mgmt_ports
+    # Device web-UI proxy (reverse tunnel through the edge). Activation is
+    # CENTRAL-DRIVEN: the per-org orgs.web_proxy flag (superadmin-set) is the
+    # gate, and the edge tunnel is dormant until a /report reply carries a live
+    # session — so proxy_enabled defaults ON (since v0.15.8; the double-dark
+    # per-edge flag was the field trap: a missing env var read as a 504).
+    # WISP_PROXY_ENABLED=0 stays the kill switch, honored independently on
+    # central (routes 404) and on any single edge (tunnel never built).
+    # See webplan.md. proxy_mgmt_ports
     # is the CLOSED set of device ports the tunnel may reach; a session may target
     # nothing else (the anti-pivot clamp, alongside the edge's device-list gate).
-    proxy_enabled: bool = field(default_factory=lambda: _env_bool("WISP_PROXY_ENABLED", False))
+    proxy_enabled: bool = field(default_factory=lambda: _env_bool("WISP_PROXY_ENABLED", True))
     proxy_mgmt_ports: str = field(default_factory=lambda: _env("WISP_PROXY_MGMT_PORTS", "80,443"))
     proxy_session_ttl_s: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_SESSION_TTL_S", 600))
