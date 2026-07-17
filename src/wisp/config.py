@@ -92,7 +92,23 @@ class Config:
         default_factory=lambda: _env_int("WISP_PROXY_MAX_BODY_BYTES", 8 * 1024 * 1024))
 
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
-    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 90))
+    # Per-subsystem sweep cadence. These were ONE clock (WISP_SNMP_INTERVAL_S, 90s)
+    # until 2026-07-17: all three walks fired on the same tick AND the next sweep was
+    # gated on all three completing. On a weak C-Data/DBC agent the 75s roster walk
+    # launched alongside the 60s ifTable walk, starved it, and — because next_snmp was
+    # stamped at sweep START — overran the 90s period and re-fired immediately, walking
+    # those boxes back-to-back all day. HILL-OLT-1/PYLON sat at 0% port-walk success
+    # while their optics stayed fresh: the polling caused the failure. Each subsystem
+    # now rides its own clock, gated only on its own task.
+    #
+    # Naming mirrors the walk timeouts below: bare `snmp_*` = health, `port_*` =
+    # ifTable, `gpon_*` = ONU roster. snmp_interval_s <= 0 still disables SNMP
+    # WHOLESALE (it is the master gate, not just health's clock) — keep that.
+    # All three stay far inside the 900s staleness gates that freeze roster/port
+    # alert state; don't raise them past ~600s without revisiting those.
+    snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 300))
+    port_interval_s: int = field(default_factory=lambda: _env_int("WISP_PORT_INTERVAL_S", 120))
+    gpon_interval_s: int = field(default_factory=lambda: _env_int("WISP_GPON_INTERVAL_S", 180))
     snmp_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_SNMP_WALK_TIMEOUT_S", 20.0))
     # GPON roster walks get their own, larger cap: a slow EPON agent (PYLON/NDN

@@ -499,14 +499,18 @@ async def _run_central_brain(
         f"[prober={cfg.prober}] (Ctrl-C to stop)"
     )
 
+    # snmp_interval_s <= 0 disables SNMP wholesale (master gate); each subsystem
+    # then rides its own clock below.
     snmp_poller = build_snmp_poller(cfg) if cfg.snmp_interval_s > 0 else None
-    next_snmp = 0.0
+    next_ports = 0.0
     snmp_task: asyncio.Task | None = None
     gpon_pool = GponPollerPool(cfg) if cfg.snmp_interval_s > 0 else None
     if gpon_pool is not None:
         gpon_pool.set_profiles(gpon_profiles)
+    next_optics = 0.0
     gpon_task: asyncio.Task | None = None
     health_poller = build_health_poller(cfg) if cfg.snmp_interval_s > 0 else None
+    next_health = 0.0
     health_task: asyncio.Task | None = None
     walk_runner = _DiagWalkRunner(client, cfg) if cfg.snmp_interval_s > 0 else None
 
@@ -544,20 +548,27 @@ async def _run_central_brain(
             except CentralClientError as exc:
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
-        if (max_cycles is None and started >= next_snmp
-                and snmp_task is None and gpon_task is None and health_task is None):
-            if snmp_poller is not None:
+        # Three independent clocks (config.py): each subsystem is gated ONLY on its own
+        # task, so a slow roster walk can no longer hold the ports/health sweeps back —
+        # nor keep them fighting it for the same weak agent's airtime every tick.
+        # next_* is stamped at sweep START (period semantics, matching the old single
+        # clock); a walk that overruns its own period still self-throttles to
+        # back-to-back, which on that box is already a broken-agent signal.
+        if max_cycles is None:
+            if snmp_poller is not None and snmp_task is None and started >= next_ports:
                 snmp_task = asyncio.create_task(
                     _gather_snmp_ports(snmp_poller, list(devices), cfg))
-            if gpon_pool is not None:
+                next_ports = started + cfg.port_interval_s
+            if gpon_pool is not None and gpon_task is None and started >= next_optics:
                 gpon_pool.set_profiles(gpon_profiles)
                 gpon_task = asyncio.create_task(
                     _gather_onu_optics(gpon_pool, list(devices), cfg))
-            if health_poller is not None:
+                next_optics = started + cfg.gpon_interval_s
+            if health_poller is not None and health_task is None and started >= next_health:
                 health_task = asyncio.create_task(
                     _gather_snmp_health(health_poller, list(devices), cfg,
                                         list(snmp_profiles)))
-            next_snmp = started + cfg.snmp_interval_s
+                next_health = started + cfg.snmp_interval_s
         snmp_status: dict[int, dict] = {}
         ports: dict[int, list[dict]] | None = None
         if snmp_task is not None and snmp_task.done():

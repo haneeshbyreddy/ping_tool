@@ -112,6 +112,21 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   and timing out leaves that table permanently stale while the smaller walks stay
   fresh (same box): `port_walk_timeout_s` (60s, ifTable) and `gpon_walk_timeout_s`
   (75s, ONU roster). Both field-diagnosed 2026-07-09. Don't collapse them back.
+- **Three separate sweep CLOCKS too, not one** (2026-07-17) — same lesson as the
+  caps, one layer up. `snmp_interval_s` (300s) is health AND the master gate
+  (`<=0` = all SNMP off); `port_interval_s` (120s) and `gpon_interval_s` (180s)
+  ride their own. Until this split, one 90s clock fired all three walks on the
+  same tick and the next sweep was gated on ALL THREE completing — so a slow
+  C-Data roster walk (75s budget) launched alongside the ifTable walk, starved
+  it, and (next_snmp stamped at sweep START) overran its own period and re-fired
+  immediately, walking that agent back-to-back all day. HILL-OLT-1/PYLON sat at
+  0% port-walk success while their optics stayed fresh: **the polling caused the
+  failure.** Each subsystem is now gated only on its own task. Keep all three
+  well inside the 900s staleness gates that freeze roster/port alert state.
+  Known gap: each `_gather_*` builds its OWN `Semaphore(snmp_max_inflight)`, so
+  the "4 concurrent walks" bound is per-subsystem (up to 12 fleet-wide, and all
+  three can still hit one box at once when the clocks coincide). The interval
+  split makes that rare, not impossible — a shared semaphore is the real fix.
 - **One `SnmpEngine` per poller instance, NEVER one per walk** — a per-walk engine
   leaks ~1 MiB + one FD per walk forever (transport stays registered with the loop);
   FD exhaustion then reads as a fake mass outage. `PysnmpPoller`/`PysnmpGponPoller`

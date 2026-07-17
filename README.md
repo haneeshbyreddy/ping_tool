@@ -121,7 +121,9 @@ in `src/wisp/config.py`. The ones worth knowing:
 | `WISP_RETRY_INTERVAL_S` | `2` | fast-confirm re-probe interval (`0` = off) |
 | `WISP_PINGS_PER_POLL` / `_INFRA` | `5` / `2` | echoes per poll: leaf / aggregation gear |
 | `WISP_MAX_INFLIGHT` | `256` | concurrent probe cap |
-| `WISP_SNMP_INTERVAL_S` | `90` | SNMP sweep cadence (`0` = off) |
+| `WISP_SNMP_INTERVAL_S` | `300` | health sweep cadence — also the master gate (`0` = all SNMP off) |
+| `WISP_PORT_INTERVAL_S` | `120` | ifTable port sweep cadence |
+| `WISP_GPON_INTERVAL_S` | `180` | ONU optics roster sweep cadence |
 | `WISP_SNMP_WALK_TIMEOUT_S` | `20` | per-walk cap (health) |
 | `WISP_PORT_WALK_TIMEOUT_S` | `60` | per-walk cap for the ifTable port walk (big OLTs) |
 | `WISP_GPON_WALK_TIMEOUT_S` | `75` | per-walk cap for the ONU optics roster walk |
