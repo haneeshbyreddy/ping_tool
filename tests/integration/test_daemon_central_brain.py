@@ -287,6 +287,66 @@ class GatherSnmpPortsTest(unittest.TestCase):
         asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
         self.assertLessEqual(inflight["peak"], 2)
 
+class SharedAirtimeGateTest(unittest.TestCase):
+    # The daemon hands ONE _SnmpAirtime to every SNMP subsystem (ports, health,
+    # optics, diag walks). Two invariants ride on it: the inflight bound is
+    # fleet-wide rather than per-subsystem, and one agent is never walked by
+    # two subsystems at once — with all three sweep clocks on the same 300s
+    # period they fire on the same tick every time, and concurrent walks
+    # against a weak C-Data agent read from outside as device failure.
+
+    def test_same_device_never_walked_twice_at_once(self):
+        per_ip: dict[str, dict] = {}
+
+        class _SlowPoller:
+            async def walk(self, target):
+                st = per_ip.setdefault(target.ip, {"now": 0, "peak": 0})
+                st["now"] += 1
+                st["peak"] = max(st["peak"], st["now"])
+                await asyncio.sleep(0.02)
+                st["now"] -= 1
+                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
+                  _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
+        cfg = Config(snmp_max_inflight=8)
+
+        async def run():
+            gate = daemon._SnmpAirtime(cfg.snmp_max_inflight)
+            await asyncio.gather(
+                daemon._gather_snmp_ports(_SlowPoller(), devices, cfg, gate=gate),
+                daemon._gather_snmp_ports(_SlowPoller(), devices, cfg, gate=gate))
+
+        asyncio.run(run())
+        self.assertEqual(per_ip["10.0.0.1"]["peak"], 1)
+        self.assertEqual(per_ip["10.0.0.2"]["peak"], 1)
+
+    def test_inflight_bound_spans_subsystems(self):
+        inflight = {"now": 0, "peak": 0}
+
+        class _SlowPoller:
+            async def walk(self, target):
+                inflight["now"] += 1
+                inflight["peak"] = max(inflight["peak"], inflight["now"])
+                await asyncio.sleep(0.01)
+                inflight["now"] -= 1
+                return []
+
+        first = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
+                 for i in range(1, 4)]
+        second = [_dev(i, f"10.0.1.{i}", snmp_enabled=True, snmp_community="public")
+                  for i in range(1, 4)]
+        cfg = Config(snmp_max_inflight=2)
+
+        async def run():
+            gate = daemon._SnmpAirtime(cfg.snmp_max_inflight)
+            await asyncio.gather(
+                daemon._gather_snmp_ports(_SlowPoller(), first, cfg, gate=gate),
+                daemon._gather_snmp_ports(_SlowPoller(), second, cfg, gate=gate))
+
+        asyncio.run(run())
+        self.assertLessEqual(inflight["peak"], 2)
+
 class _FakeDiagWalker:
     def __init__(self, result=None, exc=None):
         self.calls = []

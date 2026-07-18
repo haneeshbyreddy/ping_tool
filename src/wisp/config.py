@@ -104,11 +104,15 @@ class Config:
     # Naming mirrors the walk timeouts below: bare `snmp_*` = health, `port_*` =
     # ifTable, `gpon_*` = ONU roster. snmp_interval_s <= 0 still disables SNMP
     # WHOLESALE (it is the master gate, not just health's clock) — keep that.
-    # All three stay far inside the 900s staleness gates that freeze roster/port
-    # alert state; don't raise them past ~600s without revisiting those.
+    # All three sit at 300s (reliability over freshness, 2026-07-17): a walk
+    # can fail once and the reading is still fresher than the 900s staleness
+    # gates that freeze roster/port alert state; don't raise them past ~600s
+    # without revisiting those. Equal periods mean the clocks fire on the SAME
+    # tick every time — safe only because the daemon serializes same-device
+    # walks via the shared _SnmpAirtime gate.
     snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 300))
-    port_interval_s: int = field(default_factory=lambda: _env_int("WISP_PORT_INTERVAL_S", 120))
-    gpon_interval_s: int = field(default_factory=lambda: _env_int("WISP_GPON_INTERVAL_S", 180))
+    port_interval_s: int = field(default_factory=lambda: _env_int("WISP_PORT_INTERVAL_S", 300))
+    gpon_interval_s: int = field(default_factory=lambda: _env_int("WISP_GPON_INTERVAL_S", 300))
     snmp_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_SNMP_WALK_TIMEOUT_S", 20.0))
     # GPON roster walks get their own, larger cap: a slow EPON agent (PYLON/NDN
@@ -130,6 +134,17 @@ class Config:
         default_factory=lambda: _env_float("WISP_GPON_REQUEST_TIMEOUT_S", 5.0))
     gpon_request_retries: int = field(
         default_factory=lambda: _env_int("WISP_GPON_REQUEST_RETRIES", 3))
+    # Ports/health/diag walks get the SAME per-request patience (2026-07-18,
+    # EDGE_HALIYA field diagnosis): from that edge, strict 2s x 1-retry SNMP got
+    # ZERO responses for 26h on every device while optics — same boxes, same
+    # engine pattern, but 5s x 3 retries — stayed 100% fresh, and one-off diag
+    # walks with an idle agent answered instantly. Weak agents answer whoever
+    # retries longest; a 4s per-request window loses every contended exchange.
+    # Walk caps still bound the total, the airtime gate bounds the contention.
+    snmp_request_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_SNMP_REQUEST_TIMEOUT_S", 5.0))
+    snmp_request_retries: int = field(
+        default_factory=lambda: _env_int("WISP_SNMP_REQUEST_RETRIES", 3))
     # Port (ifTable) walks get their own cap for the same reason GPON does: a big OLT
     # (HILL/PYLON class, 200+ interfaces x 10 columns) can't finish 10 bulk-walk
     # columns inside 20s, timed out every cycle, and left switch_ports permanently

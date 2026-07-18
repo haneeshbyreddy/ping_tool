@@ -36,7 +36,8 @@ class PysnmpDiagWalker:
     a per-walk engine leaks its UDP transport registration forever)."""
 
     def __init__(self, cfg: Config = CONFIG) -> None:
-        self._timeout = cfg.snmp_timeout_s
+        self._timeout = cfg.snmp_request_timeout_s or cfg.snmp_timeout_s
+        self._retries = max(1, cfg.snmp_request_retries)
         self._engine = None
 
     async def walk(self, target, root_oid: str, max_varbinds: int) -> WalkResult:
@@ -56,7 +57,8 @@ class PysnmpDiagWalker:
         community = CommunityData(target.community, mpModel=1)
         try:
             transport = await UdpTransportTarget.create(
-                (target.ip, target.port), timeout=self._timeout, retries=1)
+                (target.ip, target.port), timeout=self._timeout,
+                retries=self._retries)
         except Exception as exc:
             raise RuntimeError(f"SNMP walk of {target.ip} failed: {exc}") from exc
 

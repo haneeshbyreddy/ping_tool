@@ -198,7 +198,8 @@ class MultiColumnWalk:
 class PysnmpPoller:
 
     def __init__(self, cfg: Config = CONFIG) -> None:
-        self._timeout = cfg.snmp_timeout_s
+        self._timeout = cfg.snmp_request_timeout_s or cfg.snmp_timeout_s
+        self._retries = max(1, cfg.snmp_request_retries)
         self._engine = None
 
     async def walk(self, target: SnmpTarget) -> list[PortStatus]:
@@ -217,7 +218,7 @@ class PysnmpPoller:
         engine = self._engine
         community = CommunityData(target.community, mpModel=1)
         transport = await UdpTransportTarget.create(
-            (target.ip, target.port), timeout=self._timeout, retries=1)
+            (target.ip, target.port), timeout=self._timeout, retries=self._retries)
 
         # Fast path: all ten columns in one multi-varbind GETBULK stream (see
         # MultiColumnWalk). If it fails for ANY reason — tooBig from a cheap

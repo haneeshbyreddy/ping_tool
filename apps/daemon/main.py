@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -89,6 +90,30 @@ def _snmp_target(d: dict) -> SnmpTarget:
                       port=d.get("snmp_port") or 161,
                       version=d.get("snmp_version") or "2c")
 
+class _SnmpAirtime:
+    """One SNMP airtime gate shared by every subsystem that talks SNMP.
+
+    Two layers: a fleet-wide semaphore (snmp_max_inflight) bounding total
+    concurrent walks — per-gatherer semaphores bounded each subsystem
+    separately, so "4 concurrent" was really up to 12 — and a per-device lock
+    so two subsystems never walk the SAME agent at once. With all three sweep
+    clocks on the same 300s period they fire on the same tick every time;
+    serializing per box is what keeps a weak C-Data agent from being
+    triple-walked (the v0.15.10 lesson: our concurrency reads from outside as
+    device failure). Acquisition order is device lock FIRST — a walk queued
+    behind the same box's other walk must not pin a fleet-wide slot.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._sem = asyncio.Semaphore(max(1, limit))
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    @contextlib.asynccontextmanager
+    async def slot(self, ip: str):
+        async with self._locks.setdefault(ip, asyncio.Lock()):
+            async with self._sem:
+                yield
+
 def _classify_snmp_exc(exc: Exception) -> tuple[str, str]:
     msg = str(exc)[:200]
     low = msg.lower()
@@ -98,11 +123,12 @@ def _classify_snmp_exc(exc: Exception) -> tuple[str, str]:
 
 async def _gather_snmp_ports(
     snmp_poller: SnmpPoller, devices: list[dict], cfg: Config = CONFIG,
+    gate: _SnmpAirtime | None = None,
 ) -> tuple[dict[int, list[dict]], dict[int, dict]]:
-    sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
+    gate = gate or _SnmpAirtime(cfg.snmp_max_inflight)
 
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
-        async with sem:
+        async with gate.slot(d["ip_address"]):
             try:
                 ports = await asyncio.wait_for(
                     snmp_poller.walk(_snmp_target(d)),
@@ -138,11 +164,12 @@ async def _gather_snmp_ports(
 async def _gather_snmp_health(
     health_poller: HealthPoller, devices: list[dict], cfg: Config = CONFIG,
     profiles: list[dict] | None = None,
+    gate: _SnmpAirtime | None = None,
 ) -> tuple[dict[int, dict], dict[int, dict]]:
-    sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
+    gate = gate or _SnmpAirtime(cfg.snmp_max_inflight)
 
     async def one(d: dict) -> tuple[int, dict | None, dict]:
-        async with sem:
+        async with gate.slot(d["ip_address"]):
             try:
                 reading = await asyncio.wait_for(
                     health_poller.walk(_snmp_target(d), profiles),
@@ -184,13 +211,14 @@ async def _gather_snmp_health(
 
 async def _gather_onu_optics(
     pool: GponPollerPool, devices: list[dict], cfg: Config = CONFIG,
+    gate: _SnmpAirtime | None = None,
 ) -> tuple[dict[int, list[dict]], dict[int, dict]]:
-    sem = asyncio.Semaphore(max(1, cfg.snmp_max_inflight))
+    gate = gate or _SnmpAirtime(cfg.snmp_max_inflight)
 
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         target = _snmp_target(d)
-        async with sem:
-            # Vendor resolution inside the semaphore: the auto-detect path may do a
+        async with gate.slot(d["ip_address"]):
+            # Vendor resolution inside the gate: the auto-detect path may do a
             # one-varbind sysObjectID read, and ALL SNMP I/O stays bounded. None =
             # no profile claims this box — optics deliberately off, never guessed.
             poller, info = await pool.resolve_info(d, target)
@@ -248,10 +276,11 @@ class _DiagWalkRunner:
     """
 
     def __init__(self, client: CentralBrainClient, cfg: Config = CONFIG,
-                 walker=None) -> None:
+                 walker=None, gate: _SnmpAirtime | None = None) -> None:
         self._client = client
         self._cfg = cfg
         self._walker = walker
+        self._gate = gate or _SnmpAirtime(cfg.snmp_max_inflight)
         self._queue: list[tuple[dict, bool]] = []
         self._seen: set[int] = set()
         self._task: asyncio.Task | None = None
@@ -288,9 +317,13 @@ class _DiagWalkRunner:
                     ip=w["ip_address"], community=w.get("snmp_community") or "",
                     port=w.get("snmp_port") or 161,
                     version=w.get("snmp_version") or "2c")
-                res = await self._walker.walk(
-                    target, w.get("root_oid") or "1.3.6.1",
-                    int(w.get("max_varbinds") or 2000))
+                # Under the shared airtime gate: a diagnostic of a weak box
+                # mid-sweep is exactly the same-agent collision the gate exists
+                # to prevent.
+                async with self._gate.slot(target.ip):
+                    res = await self._walker.walk(
+                        target, w.get("root_oid") or "1.3.6.1",
+                        int(w.get("max_varbinds") or 2000))
                 self._client.walk_result(
                     wid, varbinds=[[o, v] for o, v in res.varbinds])
                 log.info("diagnostic walk %d of %s done: %d varbinds%s", wid,
@@ -500,7 +533,10 @@ async def _run_central_brain(
     )
 
     # snmp_interval_s <= 0 disables SNMP wholesale (master gate); each subsystem
-    # then rides its own clock below.
+    # then rides its own clock below. ONE airtime gate spans all of them (plus
+    # the diag runner) so a weak agent is never walked by two subsystems at
+    # once and the fleet-wide inflight bound is real, not per-subsystem.
+    airtime = _SnmpAirtime(cfg.snmp_max_inflight) if cfg.snmp_interval_s > 0 else None
     snmp_poller = build_snmp_poller(cfg) if cfg.snmp_interval_s > 0 else None
     next_ports = 0.0
     snmp_task: asyncio.Task | None = None
@@ -512,7 +548,8 @@ async def _run_central_brain(
     health_poller = build_health_poller(cfg) if cfg.snmp_interval_s > 0 else None
     next_health = 0.0
     health_task: asyncio.Task | None = None
-    walk_runner = _DiagWalkRunner(client, cfg) if cfg.snmp_interval_s > 0 else None
+    walk_runner = (_DiagWalkRunner(client, cfg, gate=airtime)
+                   if cfg.snmp_interval_s > 0 else None)
 
     # Web-UI proxy tunnel: activation is CENTRAL-DRIVEN — the machinery is
     # built by default (v0.15.8+) but stays DORMANT until a /report reply
@@ -557,17 +594,19 @@ async def _run_central_brain(
         if max_cycles is None:
             if snmp_poller is not None and snmp_task is None and started >= next_ports:
                 snmp_task = asyncio.create_task(
-                    _gather_snmp_ports(snmp_poller, list(devices), cfg))
+                    _gather_snmp_ports(snmp_poller, list(devices), cfg,
+                                       gate=airtime))
                 next_ports = started + cfg.port_interval_s
             if gpon_pool is not None and gpon_task is None and started >= next_optics:
                 gpon_pool.set_profiles(gpon_profiles)
                 gpon_task = asyncio.create_task(
-                    _gather_onu_optics(gpon_pool, list(devices), cfg))
+                    _gather_onu_optics(gpon_pool, list(devices), cfg,
+                                       gate=airtime))
                 next_optics = started + cfg.gpon_interval_s
             if health_poller is not None and health_task is None and started >= next_health:
                 health_task = asyncio.create_task(
                     _gather_snmp_health(health_poller, list(devices), cfg,
-                                        list(snmp_profiles)))
+                                        list(snmp_profiles), gate=airtime))
                 next_health = started + cfg.snmp_interval_s
         snmp_status: dict[int, dict] = {}
         ports: dict[int, list[dict]] | None = None

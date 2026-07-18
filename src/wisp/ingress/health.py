@@ -369,7 +369,8 @@ class PysnmpHealthPoller:
     slice — never the device's whole reading. Whatever answered still parses."""
 
     def __init__(self, cfg: Config = CONFIG) -> None:
-        self._timeout = cfg.snmp_timeout_s
+        self._timeout = cfg.snmp_request_timeout_s or cfg.snmp_timeout_s
+        self._retries = max(1, cfg.snmp_request_retries)
         # Stay inside the edge sweep's per-device cap with headroom to parse.
         self._budget_s = max(5.0, cfg.snmp_walk_timeout_s - 2.0)
         self._engine = None
@@ -392,7 +393,8 @@ class PysnmpHealthPoller:
         community = CommunityData(target.community, mpModel=1)
         try:
             transport = await UdpTransportTarget.create(
-                (target.ip, target.port), timeout=self._timeout, retries=1)
+                (target.ip, target.port), timeout=self._timeout,
+                retries=self._retries)
         except Exception as exc:
             raise RuntimeError(f"SNMP health walk of {target.ip} failed: {exc}") from exc
 
