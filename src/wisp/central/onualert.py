@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 
 from wisp.central import onuroster
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class OnuRosterAlerter:
         self.org_id = org_id
         self.notifier = notifier
         self.cfg = cfg
+        self.router = AlertRouter(store, org_id, notifier, cfg)
 
     def sweep(self, ts: str) -> None:
         rows = self.store.org_onu_rows(self.org_id)
@@ -152,11 +154,7 @@ class OnuRosterAlerter:
 
     def _page(self, title: str, body: str, device_id: int | None, ts: str,
               payload: str, *, gate: bool) -> None:
-        topic = self.store.org_role_topic(self.org_id, "operator")
-        if gate and topic:
-            res = self.notifier.send(topic, title, body, 3)
-            status = "sent" if res.ok else "failed"
-        else:
-            status = "suppressed"
-        self.store.log_alert(self.org_id, None, device_id, self.notifier.channel,
-                             topic, status, payload, ts)
+        self.router.emit(
+            payload, topic=self.store.org_role_topic(self.org_id, "operator"),
+            title=title, body=body, priority=3, ts=ts, device_id=device_id,
+            gate=gate)

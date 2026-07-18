@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
 from wisp.ingress.snmp import PortStatus, throughput_bps
@@ -94,6 +95,7 @@ class CentralPortMonitor:
         self.org_id = org_id
         self.notifier = notifier
         self.cfg = cfg
+        self.router = AlertRouter(store, org_id, notifier, cfg)
 
     def sync_device(self, device_id: int, raw_ports: list[dict], ts: str) -> list[PortEvent]:
         cfg = self.cfg
@@ -278,11 +280,11 @@ class CentralPortMonitor:
     def _page(self, title: str, body: str, device_id: int, outage_id: int | None,
               payload: str, ts: str, *, enabled: bool | None = None) -> None:
         gate = self.cfg.snmp_alerts if enabled is None else enabled
-        topic = self.store.org_role_topic(self.org_id, "operator")
-        if gate and topic:
-            res = self.notifier.send(topic, title, body, 3)
-            status = "sent" if res.ok else "failed"
-        else:
-            status = "suppressed"
-        self.store.log_alert(self.org_id, outage_id, device_id, self.notifier.channel,
-                             topic, status, payload, ts)
+        # Port up/down AND bandwidth crossings are per-if_index; a device-level
+        # cooldown would swallow a second port dropping (or saturating) on the
+        # same switch. All are already streak- and transition-gated, so no
+        # cooldown — matters now that bandwidth PUSHes immediately, not via digest.
+        self.router.emit(
+            payload, topic=self.store.org_role_topic(self.org_id, "operator"),
+            title=title, body=body, priority=3, ts=ts, device_id=device_id,
+            outage_id=outage_id, gate=gate, cooldown_min=0)

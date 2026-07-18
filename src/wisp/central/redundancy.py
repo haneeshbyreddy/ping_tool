@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.state_machine import DOWN_FAMILY
 
@@ -31,10 +32,7 @@ def sweep(store, org_id: str, eng, redundancy: dict[int, bool],
 
 def _page(store, org_id: str, notifier, cfg: Config, device_id: int,
          title: str, body: str, payload: str, ts: str) -> None:
-    topic = store.org_role_topic(org_id, "operator")
-    if cfg.backup_alerts and topic:
-        res = notifier.send(topic, title, body, 3)
-        status = "sent" if res.ok else "failed"
-    else:
-        status = "suppressed"
-    store.log_alert(org_id, None, device_id, notifier.channel, topic, status, payload, ts)
+    AlertRouter(store, org_id, notifier, cfg).emit(
+        payload, topic=store.org_role_topic(org_id, "operator"),
+        title=title, body=body, priority=3, ts=ts, device_id=device_id,
+        gate=cfg.backup_alerts)

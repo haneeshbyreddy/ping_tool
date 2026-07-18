@@ -210,9 +210,29 @@ CREATE TABLE IF NOT EXISTS alert_log (
     recipient  TEXT,
     sent_at    TEXT,
     status     TEXT,
-    payload    TEXT
+    payload    TEXT,
+    kind       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_alert_log_outage ON alert_log(outage_id);
+-- the cooldown index rides `kind`, added by _ensure_columns for older DBs, so
+-- it's built in __init__ AFTER that runs, not here.
+-- DIGEST-tier notifications wait here until the hourly flush composes them into
+-- one summary (central/notify_policy.py). `sent_at` NULL = still pending; the
+-- flush anchors its interval on the OLDEST pending row so no per-org clock is
+-- needed. State rows for these alerts still live in their own tables — this is
+-- only the notification queue.
+CREATE TABLE IF NOT EXISTS alert_digest (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER,
+    kind       TEXT NOT NULL,
+    title      TEXT,
+    body       TEXT,
+    created_at TEXT NOT NULL,
+    sent_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alert_digest_pending
+    ON alert_digest(org_id, sent_at, created_at);
 CREATE TABLE IF NOT EXISTS escalations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id   TEXT NOT NULL,
@@ -669,7 +689,7 @@ class CentralStore(
     _TENANT_TABLES = (
         "orgs", "nodes", "node_tokens", "devices", "events", "rollups", "node_alerts",
         "users", "org_workers", "org_attendance", "org_devices", "device_states",
-        "outages", "device_rollups", "alert_log", "escalations", "rollouts",
+        "outages", "device_rollups", "alert_log", "alert_digest", "escalations", "rollouts",
         "switch_ports", "org_device_links", "device_redundancy", "device_perf_samples",
         "device_perf",
     )
@@ -716,6 +736,14 @@ class CentralStore(
                 ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
+            # clean classification token for the notification governor + honest
+            # by-type analytics (the free-text `payload` mixes codes with outage
+            # titles). NULL on pre-governor rows. Index built here (not in
+            # _SCHEMA) so an older DB has the column before the index needs it.
+            self._ensure_columns(conn, "alert_log", (("kind", "TEXT"),))
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_log_cooldown"
+                " ON alert_log(org_id, device_id, kind, status)")
             self._ensure_columns(conn, "switch_ports", (
                 ("bw_threshold_mbps", "REAL"), ("bw_direction", "TEXT"),
                 ("in_octets", "TEXT"), ("out_octets", "TEXT"), ("counters_at", "TEXT"),

@@ -54,49 +54,58 @@ class RedundancySweepTest(unittest.TestCase):
         central_redundancy.sweep(self.store, ORG, self.eng, redundancy, states,
                                  self.notifier, ts, self.cfg)
 
+    def _queued(self):
+        # On-backup alerts are DIGEST-tier: they queue, they don't push. The
+        # transition-only contract still holds — one queued row per change.
+        return self.store.pending_digest(ORG)
+
+    def _clear_queue(self):
+        self.store.mark_digests_sent(ORG, TS)
+
     def test_enter_pages_operator_once_and_writes_badge(self):
         self._sweep({self.child: True}, {self.child: UP})
-        self.assertEqual(len(self.notifier.sent), 1)
-        msg = self.notifier.sent[0]
-        self.assertEqual(msg["recipient"], "op")
-        self.assertEqual(msg["priority"], 3)
-        self.assertIn("On backup", msg["title"])
+        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
+        q = self._queued()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["kind"], "ON_BACKUP")
+        self.assertIn("On backup", q[0]["title"])
         row = self._row()
         self.assertEqual(row["on_backup"], 1)
         self.assertEqual(row["primary_down_since"], TS)
         self.assertEqual(self._counts(), (0, 0))
         self._sweep({self.child: True}, {self.child: UP})
-        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(len(self._queued()), 1)
 
     def test_leave_sends_one_recovered_notice(self):
         self._sweep({self.child: True}, {self.child: UP})
-        self.notifier.sent.clear()
+        self._clear_queue()
         self._sweep({self.child: False}, {self.child: UP})
-        self.assertEqual(len(self.notifier.sent), 1)
-        self.assertIn("Primary restored", self.notifier.sent[0]["title"])
+        q = self._queued()
+        self.assertEqual(len(q), 1)
+        self.assertIn("Primary restored", q[0]["title"])
         self.assertEqual(self._row()["on_backup"], 0)
 
     def test_node_down_clears_badge_silently(self):
         self._sweep({self.child: True}, {self.child: UP})
-        self.notifier.sent.clear()
+        self._clear_queue()
         self._sweep({self.child: True}, {self.child: DOWN})
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         self.assertEqual(self._row()["on_backup"], 0)
 
     def test_alerts_gate_suppresses_page_keeps_badge(self):
         gated_cfg = replace(self.cfg, backup_alerts=False)
         central_redundancy.sweep(self.store, ORG, self.eng, {self.child: True},
                                  {self.child: UP}, self.notifier, TS, gated_cfg)
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         self.assertEqual(self._row()["on_backup"], 1)
 
     def test_restart_does_not_repage(self):
         self._sweep({self.child: True}, {self.child: UP})
-        self.notifier.sent.clear()
+        self._clear_queue()
         eng2 = build_engine(self.store, ORG, self.cfg)
         central_redundancy.sweep(self.store, ORG, eng2, {self.child: True},
                                  {self.child: UP}, self.notifier, TS, self.cfg)
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
 
     def test_org_isolation(self):
         other_dev = self.store.create_org_device("ispB", {

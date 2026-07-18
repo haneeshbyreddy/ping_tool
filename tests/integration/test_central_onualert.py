@@ -50,7 +50,11 @@ class OnuRosterAlerterTest(unittest.TestCase):
             severity="ok", ts=ts or self._t(0))
 
     def _titles(self, needle):
-        return [s for s in self.notifier.sent if needle in s["title"]]
+        # ONU cap + dup-MAC alerts are DIGEST-tier: they queue for the hourly
+        # summary, they don't push. Transition-only still holds — one queued row
+        # per change; the queue accumulates (tests never flush).
+        return [r for r in self.store.pending_digest("ispA")
+                if needle in (r["title"] or "")]
 
     # --- per-PON ONU cap -------------------------------------------------------
 
@@ -62,7 +66,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(len(caps), 1)
         self.assertIn("OLT-1", caps[0]["title"])
         self.assertIn("0/1", caps[0]["title"])
-        self.assertEqual(caps[0]["recipient"], "ops-topic")
+        self.assertEqual(caps[0]["kind"], "ONU_LIMIT")
         self.assertIn("3/3", caps[0]["body"])
         # re-walk, still full: state stands, no re-page
         self.alerter.sweep(self._t(1))
@@ -102,7 +106,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         dups = self._titles("Duplicate ONU MAC")
         self.assertEqual(len(dups), 1)
         self.assertIn("AA:BB:CC:00:00:01", dups[0]["title"])
-        self.assertEqual(dups[0]["recipient"], "ops-topic")
+        self.assertEqual(dups[0]["kind"], "ONU_DUP_MAC")
         self.alerter.sweep(self._t(1))
         self.assertEqual(len(self._titles("Duplicate ONU MAC")), 1)
         self.assertEqual(
@@ -116,8 +120,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self._onu("0/1.0", onu_id=0, serial="DEAD", ts=self._t(5))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="BEEF", ts=self._t(5))
         self.alerter.sweep(self._t(5))
-        self.assertTrue(any("Duplicate MAC cleared" in s["title"]
-                            for s in self.notifier.sent))
+        self.assertTrue(self._titles("Duplicate MAC cleared"))
         self.assertEqual(self.store.onu_dup_mac_states("ispA")["DEAD"]["active"], 0)
 
     def test_ghost_dup_writes_state_but_never_pages(self):
@@ -203,7 +206,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         for i in range(3):
             self._onu(f"0/1.{i}", onu_id=i, serial="SAME")  # full AND duplicated
         alerter.sweep(self._t(0))
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.store.pending_digest("ispA"), [])
         self.assertEqual(
             self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]["active"], 1)
         self.assertEqual(

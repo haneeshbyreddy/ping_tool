@@ -233,14 +233,19 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.disp.dispatch([OutageResolved(self.dev)], T0)
         self.assertEqual(self.notifier.sent, [])
 
-    def test_hourly_escalation_fans_out_and_reschedules(self):
+    def test_hourly_escalation_folds_into_digest_and_reschedules(self):
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.notifier.sent.clear()
         self.disp.sweep(T_LATER)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent},
-                         {"a-owner", "a-op", "a-tech"})
-        self.assertTrue(any("1h" in s["title"] for s in self.notifier.sent))
+        # The initial DOWN already pushed; the hourly re-nag is DIGEST-tier now
+        # (kept off the phone by operator choice) — queued, not broadcast.
+        self.assertEqual(self.notifier.sent, [])
+        q = self.store.pending_digest("ispA")
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["kind"], "HOURLY_ESCALATION")
+        self.assertIn("1h", q[0]["title"])
+        # the re-nag still reschedules for the next hour
         pending = self.store.due_escalations("ispA", "2026-01-01T09:00:00+00:00")
         self.assertEqual(len(pending), 1)
 
@@ -250,7 +255,9 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.assertTrue(self.disp.acknowledge(oid, "Suresh"))
         self.notifier.sent.clear()
         self.disp.sweep(T_LATER)
-        self.assertTrue(any("Suresh" in s["body"] for s in self.notifier.sent))
+        # escalation still fires while acked — it just folds into the digest
+        q = self.store.pending_digest("ispA")
+        self.assertTrue(any("Suresh" in (r["body"] or "") for r in q))
 
         self.store.resolve_outage("ispA", self.dev, T_LATER)
         self.disp.dispatch([OutageResolved(self.dev)], T_LATER)
@@ -677,7 +684,9 @@ class ReportEndpointTest(unittest.TestCase):
                                  token="tok")
         self.assertEqual(status, 200)
         self.assertEqual(body["redundancy"]["on_backup"], 1)
-        self.assertTrue(any("On backup" in s["title"] for s in self.notifier.sent))
+        # on-backup is DIGEST-tier: it queues rather than pushing to the phone
+        self.assertTrue(any("On backup" in (r["title"] or "")
+                            for r in self.store.pending_digest("ispA")))
 
 if __name__ == "__main__":
     unittest.main()

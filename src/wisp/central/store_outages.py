@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from wisp.central.store_util import _now_iso
+from wisp.core.analytics import _parse
 
 
 class OutageStoreMixin:
@@ -314,12 +315,52 @@ class OutageStoreMixin:
 
     def log_alert(self, org_id: str, outage_id: int | None, device_id: int | None,
                   channel: str, recipient: str | None, status: str, payload: str,
-                  ts: str) -> None:
+                  ts: str, kind: str | None = None) -> None:
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO alert_log (org_id, outage_id, device_id, channel,"
-                " recipient, sent_at, status, payload) VALUES (?,?,?,?,?,?,?,?)",
-                (org_id, outage_id, device_id, channel, recipient, ts, status, payload))
+                " recipient, sent_at, status, payload, kind)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (org_id, outage_id, device_id, channel, recipient, ts, status,
+                 payload, kind))
+            conn.commit()
+
+    def recently_pushed(self, org_id: str, device_id: int | None, kind: str,
+                        now_ts: str, within_min: int) -> bool:
+        """True if a PUSH of this (device, kind) was actually sent within the
+        window — the governor's flap backstop. `device_id IS ?` matches NULL."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(sent_at) FROM alert_log WHERE org_id=? AND device_id IS ?"
+                " AND kind=? AND status='sent'",
+                (org_id, device_id, kind)).fetchone()
+        last = row[0] if row else None
+        if not last:
+            return False
+        return (_parse(now_ts) - _parse(last)).total_seconds() < within_min * 60
+
+    def queue_digest(self, org_id: str, device_id: int | None, kind: str,
+                     title: str, body: str, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO alert_digest (org_id, device_id, kind, title, body,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (org_id, device_id, kind, title, body, ts))
+            conn.commit()
+
+    def pending_digest(self, org_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, device_id, kind, title, body, created_at FROM alert_digest"
+                " WHERE org_id=? AND sent_at IS NULL ORDER BY created_at, id",
+                (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_digests_sent(self, org_id: str, ts: str) -> None:
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE alert_digest SET sent_at=? WHERE org_id=? AND sent_at IS NULL",
+                (ts, org_id))
             conn.commit()
 
 

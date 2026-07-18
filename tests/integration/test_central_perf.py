@@ -54,13 +54,21 @@ class PerfSweepTest(unittest.TestCase):
     def _perf_row(self):
         return self.store.device_perf_state(ORG, self.dev)
 
+    def _queued(self):
+        # Perf alerts are DIGEST-tier now: they queue, they don't push. The
+        # transition-only contract still holds — one queued row per change.
+        return self.store.pending_digest(ORG)
+
+    def _clear_queue(self):
+        self.store.mark_digests_sent(ORG, "2026-01-01T00:30:00+00:00")
+
     def test_sustained_degradation_pages_operator_once(self):
         self._feed([(8.0, 0.0, 2.0, UP)] * 15 + [(120.0, 0.0, 2.0, UP)] * 3)
-        self.assertEqual(len(self.notifier.sent), 1)
-        msg = self.notifier.sent[0]
-        self.assertEqual(msg["recipient"], "op")
-        self.assertEqual(msg["priority"], 3)
-        self.assertIn("Slow link", msg["title"])
+        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
+        q = self._queued()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["kind"], "PERF_DEGRADED")
+        self.assertIn("Slow link", q[0]["title"])
         row = self._perf_row()
         self.assertEqual(row["degraded"], 1)
         self.assertEqual(row["metric"], "latency")
@@ -68,10 +76,11 @@ class PerfSweepTest(unittest.TestCase):
 
     def test_recovery_sends_one_notice(self):
         self._feed([(8.0, 0.0, 2.0, UP)] * 15 + [(120.0, 0.0, 2.0, UP)] * 3)
-        self.notifier.sent.clear()
+        self._clear_queue()
         self._feed([(8.0, 0.0, 2.0, UP)] * 3)
-        self.assertEqual(len(self.notifier.sent), 1)
-        self.assertIn("Recovered", self.notifier.sent[0]["title"])
+        q = self._queued()
+        self.assertEqual(len(q), 1)
+        self.assertIn("Recovered", q[0]["title"])
         self.assertEqual(self._perf_row()["degraded"], 0)
 
     def test_down_clears_perf_silently(self):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from wisp.central import engine as central_engine
+from wisp.central import notify_policy
 from wisp.central import perf as central_perf
 from wisp.central import redundancy as central_redundancy
 from wisp.central import rollup as central_rollup
@@ -126,6 +127,13 @@ def report(h, org: str, env: dict) -> dict:
                                          h.notifier, h.cfg)
         central_redundancy.sweep(h.store, org, eng, cycle.redundancy,
                                  cycle.states, h.notifier, ts, h.cfg)
+        # Roll any DIGEST-tier alerts queued this org into one hourly summary.
+        # Rides the full report like escalation sweeping; own try/except so a
+        # bad flush never sinks the cycle.
+        try:
+            notify_policy.flush_digests(h.store, org, h.notifier, h.cfg, ts)
+        except Exception:
+            log.exception("digest flush failed for %s", org)
 
     reply: dict = {"ok": True}
     recheck = central_engine.compute_recheck(eng, cycle, results, h.cfg)

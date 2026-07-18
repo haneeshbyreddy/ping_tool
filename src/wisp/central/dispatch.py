@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.state_machine import (
     DOWN,
@@ -33,6 +34,7 @@ class CentralAlertDispatcher:
         self.engine = engine
         self.notifier = notifier
         self.cfg = cfg
+        self.router = AlertRouter(store, org_id, notifier, cfg)
 
     def _topic(self, role: str) -> str | None:
         return self.store.org_role_topic(self.org_id, role)
@@ -58,13 +60,14 @@ class CentralAlertDispatcher:
                 primary = res
         return primary
 
-    def _log(self, outage_id, device_id, recipient, status, payload, ts) -> None:
+    def _log(self, outage_id, device_id, recipient, status, payload, ts,
+             kind=None) -> None:
         self.store.log_alert(self.org_id, outage_id, device_id, self.notifier.channel,
-                             recipient, status, payload, ts)
+                             recipient, status, payload, ts, kind=kind)
 
-    def _record(self, device_id, recipient, status, payload, ts) -> None:
+    def _record(self, device_id, recipient, status, payload, ts, kind=None) -> None:
         oid = self.store.open_outage_id(self.org_id, device_id)
-        self._log(oid, device_id, recipient, status, payload, ts)
+        self._log(oid, device_id, recipient, status, payload, ts, kind=kind)
 
     def dispatch(self, events: list[Event], ts: str) -> None:
         for ev in events:
@@ -77,16 +80,16 @@ class CentralAlertDispatcher:
                 self._on_resolved(ev, ts)
             elif isinstance(ev, UplinkDown):
                 self._send_owner("🚨 UPLINK_DOWN", "Local alerts frozen", ts, 5,
-                                 payload="UPLINK_DOWN")
+                                 payload="UPLINK_DOWN", kind="UPLINK_DOWN")
             elif isinstance(ev, UplinkRestored):
                 self._send_owner("✅ Uplink restored", "Monitoring resumed", ts, 3,
-                                 payload="UPLINK_RESTORED")
+                                 payload="UPLINK_RESTORED", kind="UPLINK_RESTORED")
 
     def _on_open(self, ev: OutageOpened, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
         if ev.state == UNREACHABLE:
             self._record(ev.device_id, self._topic("operator"), "suppressed",
-                         "UNREACHABLE (parent down)", ts)
+                         "UNREACHABLE (parent down)", ts, kind="UNREACHABLE")
             return
 
         oid = self.store.open_outage_id(self.org_id, ev.device_id)
@@ -95,13 +98,14 @@ class CentralAlertDispatcher:
         recipient = self._topic("owner")
         if self.store.already_paged(oid):
             self._log(oid, ev.device_id, recipient, "suppressed",
-                      "already paged this outage", ts)
+                      "already paged this outage", ts, kind="DEVICE_DOWN")
             return
 
         title = f"🔴 DOWN: {dev.name} ({dev.region})"
         body = dev.ip_address
         res = self._publish("owner", title, body, _DOWN_PRIORITY)
-        self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body, ts)
+        self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body,
+                  ts, kind="DEVICE_DOWN")
         self.store.schedule_escalation(self.org_id, oid, "hourly",
                                        _plus_minutes(ts, self.cfg.escalate_every_min))
 
@@ -116,14 +120,15 @@ class CentralAlertDispatcher:
 
         self.store.cancel_pending_escalations(self.org_id, ev.device_id, ts)
         self._log(None, ev.device_id, recipient,
-                  "suppressed" if was_suppressed else "sent", "restored", ts)
+                  "suppressed" if was_suppressed else "sent", "restored", ts,
+                  kind="DEVICE_RESTORED")
 
     def _send_owner(self, title: str, body: str, ts: str, priority: int, *,
-                    payload: str | None = None) -> None:
+                    payload: str | None = None, kind: str | None = None) -> None:
         res = self._publish("owner", title, body, priority)
         logged = payload if payload is not None else title
         self._log(None, None, self._topic("owner"), "sent" if res.ok else "failed",
-                  logged, ts)
+                  logged, ts, kind=kind)
 
     def sweep(self, now_ts: str) -> None:
         for row in self.store.due_escalations(self.org_id, now_ts):
@@ -150,11 +155,15 @@ class CentralAlertDispatcher:
         elapsed = self._fmt_elapsed(row["started_at"], ts)
         ack = (f"acked by {row['acknowledged_by']}"
                if row["acknowledged_by"] else "unacked")
-        self._broadcast(
-            f"⏰ STILL DOWN ({elapsed}): {dev.name} ({dev.region})",
-            f"{dev.ip_address} · {ack}", 5)
-        self._record(row["device_id"], self._topic("owner"), "sent",
-                     f"hourly escalation ({elapsed})", ts)
+        # The initial DOWN already pushed to the phone; the hourly re-nag folds
+        # into the digest (kept off the push tier by operator choice) so a long
+        # outage resurfaces once an hour without buzzing all night.
+        self.router.emit(
+            "HOURLY_ESCALATION", topic=self._topic("operator"),
+            title=f"⏰ STILL DOWN ({elapsed}): {dev.name} ({dev.region})",
+            body=f"{dev.ip_address} · {ack}", priority=5, ts=ts,
+            outage_id=row["outage_id"], device_id=row["device_id"],
+            payload=f"hourly escalation ({elapsed})")
 
     def acknowledge(self, outage_id: int, by: str) -> bool:
         return self.store.acknowledge_outage(self.org_id, outage_id, by)

@@ -173,6 +173,13 @@ class BandwidthTest(unittest.TestCase):
         return {r["if_index"]: r for r in
                self.store.list_switch_ports(ORG, self.switch)}[idx]
 
+    def _queued(self):
+        # Digest contents. Bandwidth alarms are PUSH now (operator ask
+        # 2026-07-18) — they buzz immediately via notifier.sent and must NOT
+        # land here; kept only to prove nothing bandwidth-related falls into the
+        # digest. Alarm STATE is unchanged either way.
+        return self.store.pending_digest(ORG)
+
     def _watch_bw(self, idx, threshold, direction="either"):
         self.pm.sync_device(self.switch, [_pbw(idx, 0, 0)], TS_SEQ[0])
         pid = self._row(idx)["id"]
@@ -200,9 +207,10 @@ class BandwidthTest(unittest.TestCase):
             3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_low"])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(len(self.notifier.sent), 1)   # PUSH: immediate, not digest
         self.assertEqual(self.notifier.sent[0]["recipient"], "op")
         self.assertIn("bandwidth", self.notifier.sent[0]["title"].lower())
+        self.assertEqual(self._queued(), [])           # not buried in the digest
 
     def test_single_dip_does_not_alarm(self):
         self._watch_bw(3, threshold=10)
@@ -300,9 +308,10 @@ class BandwidthTest(unittest.TestCase):
             3, 100 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_high"])
         self.assertEqual(self._row(3)["bw_high_alarm"], 1)
-        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(len(self.notifier.sent), 1)   # PUSH: immediate, not digest
         self.assertEqual(self.notifier.sent[0]["recipient"], "op")
         self.assertIn("high bandwidth", self.notifier.sent[0]["title"].lower())
+        self.assertEqual(self._queued(), [])           # not buried in the digest
 
     def test_high_bandwidth_recovery_edge_pages_once(self):
         self._watch_bw_max(3, max_mbps=40)

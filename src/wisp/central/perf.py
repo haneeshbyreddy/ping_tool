@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.baseline import Sample, evaluate_perf
 from wisp.core.state_machine import DOWN_FAMILY
@@ -35,17 +36,13 @@ def record_and_evaluate(store, org_id: str, eng, cycle, results: dict, ts: str,
 
         if not v.changed:
             continue
-        topic = store.org_role_topic(org_id, "operator")
         if v.degraded:
             title, body, payload = (f"\U0001f40c Slow link — {dev.name} ({dev.region})",
                                     v.reason, "PERF_DEGRADED")
         else:
             title, body, payload = (f"✅ Recovered — {dev.name} ({dev.region})",
                                     "Link performance back to baseline", "PERF_RECOVERED")
-        if cfg.perf_alerts and topic:
-            res_notify = notifier.send(topic, title, body, 3)
-            status = "sent" if res_notify.ok else "failed"
-        else:
-            status = "suppressed"
-        store.log_alert(org_id, None, dev_id, notifier.channel, topic, status,
-                        payload, ts)
+        AlertRouter(store, org_id, notifier, cfg).emit(
+            payload, topic=store.org_role_topic(org_id, "operator"),
+            title=title, body=body, priority=3, ts=ts, device_id=dev_id,
+            gate=cfg.perf_alerts)

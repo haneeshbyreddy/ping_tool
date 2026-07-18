@@ -77,8 +77,29 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 
 - `central/engine.py` (`load_device_meta`/`build_engine`/`apply_events`) is the only
   DB glue around the unchanged `MonitorEngine`; `central/dispatch.py` is the alerting
-  policy (dedupe per outage, owner+operator on open, all-three on escalation/resolve,
+  policy (dedupe per outage, owner+operator on open, all-three on resolve,
   ack never stops it — only recovery does).
+- **The notification GOVERNOR is the choke point** (`central/notify_policy.py`,
+  2026-07-18): every paging shell (dispatch/ponalert/onualert/ports/perf/
+  redundancy) routes its send+status+log through `AlertRouter.emit(kind, …)`
+  instead of calling the notifier inline. Two tiers keyed on a clean `kind`
+  token: PUSH = ICMP device/uplink/port down **+ their recoveries**, and port
+  bandwidth floor/ceiling crossings + their clears (`PORT_BW_*`, made PUSH by
+  operator ask 2026-07-18 — a saturated/dark uplink can't wait for the roll-up)
+  (buzz the phone); DIGEST (`_DIGEST_KINDS`) = the rest of the SNMP-derived
+  stream (PON_FAULT, ONU_LIMIT, ONU_DUP_MAC, PERF_*, ON_BACKUP/BACKUP_CLEARED)
+  **plus the hourly escalation**, queued to `alert_digest` and rolled into ONE summary
+  per org every `cfg.digest_interval_min` (default 60). **Unknown kind ⇒ PUSH**
+  (a new alert type must never be silently buried). `flush_digests` rides the
+  full `/report` sweep, anchors its interval on the OLDEST pending row (no
+  per-org clock), marks-sent only on success (a failed send retries; no topic
+  drops the batch). Escalation is now OPERATOR-topic only (was all-3). State
+  rows are still written by the shells regardless of tier/gate — this governs
+  only the notification. Reason: a DBC area power cut darkened many PONs →
+  dozens of false "fiber cut" pages → ntfy 429s that dropped REAL pages
+  (~497→~76 phone pages/day). PUSH cooldown backstop = `cfg.alert_cooldown_min`
+  per `(device,kind)` (ports pass 0 — per-if_index, already gated). Clean
+  `alert_log.kind` column feeds by-type analytics. Tests: `unit/test_notify_policy`.
 - **`EngineRegistry`: one live engine per org** (flap streaks accumulate across
   stateless `/report` calls). Rebuilds only when the topology fingerprint
   `(id, parent_device_id, d.parents)` changes; rehydrates from `device_states`.

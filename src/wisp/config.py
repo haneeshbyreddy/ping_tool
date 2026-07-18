@@ -208,6 +208,20 @@ class Config:
         default_factory=lambda: _env_int("WISP_ESCALATE_EVERY_MIN", 60)
     )
 
+    # Notification governor (central/notify_policy.py). PUSH-tier alerts (ICMP
+    # device/uplink/port down + recoveries) buzz the phone; everything SNMP-
+    # derived plus the hourly escalation queues to `alert_digest` and rolls into
+    # ONE summary per org every `digest_interval_min`. This is what keeps a
+    # C-Data area power cut (many PONs → many false "fiber cut" pages) from
+    # 429'ing ntfy's quota and taking real pages down with it. `alert_cooldown_min`
+    # is a per-(device, kind) backstop on the PUSH path only (0 = off).
+    digest_interval_min: int = field(
+        default_factory=lambda: _env_int("WISP_DIGEST_INTERVAL_MIN", 60)
+    )
+    alert_cooldown_min: int = field(
+        default_factory=lambda: _env_int("WISP_ALERT_COOLDOWN_MIN", 30)
+    )
+
     prober: str = field(default_factory=lambda: _env("WISP_PROBER", "icmp").lower())
 
     ntfy_base_url: str = field(default_factory=lambda: _env("WISP_NTFY_URL", "https://ntfy.sh"))

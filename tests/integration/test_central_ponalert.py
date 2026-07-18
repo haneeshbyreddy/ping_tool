@@ -60,18 +60,24 @@ class PonFaultAlerterTest(unittest.TestCase):
         for i, d in enumerate((1800, 1950, 2300)):
             self._onu(f"dark{i}", "los", distance=d)
 
+    def _queued(self, needle=None):
+        # PON faults are DIGEST-tier: they queue for the hourly summary, they
+        # don't push. Transition-only still holds — one queued row per change.
+        rows = self.store.pending_digest("ispA")
+        return [r for r in rows if needle is None or needle in (r["title"] or "")]
+
     def test_fresh_fiber_fault_pages_once(self):
         self._mass_drop()
         self.alerter.sweep(_now())
-        cuts = [s for s in self.notifier.sent if "fiber cut" in s["title"]]
+        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
+        cuts = self._queued("fiber cut")
         self.assertEqual(len(cuts), 1)
         self.assertIn("OLT-1", cuts[0]["title"])
         self.assertIn("0/6", cuts[0]["title"])
-        self.assertEqual(cuts[0]["recipient"], "ops-topic")
+        self.assertEqual(cuts[0]["kind"], "PON_FAULT")
         # same fault on the next walk: state stands, no re-page
         self.alerter.sweep(_now())
-        self.assertEqual(
-            len([s for s in self.notifier.sent if "fiber cut" in s["title"]]), 1)
+        self.assertEqual(len(self._queued("fiber cut")), 1)
 
     def test_recovery_pages_and_clears_state(self):
         self._mass_drop()
@@ -79,7 +85,7 @@ class PonFaultAlerterTest(unittest.TestCase):
         for i in range(3):
             self._onu(f"dark{i}", "online", distance=1800)
         self.alerter.sweep(_now())
-        self.assertTrue(any("recovered" in s["title"] for s in self.notifier.sent))
+        self.assertTrue(self._queued("recovered"))
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 0)
 
@@ -89,29 +95,27 @@ class PonFaultAlerterTest(unittest.TestCase):
         # 2026-07-14). A stale OLT freezes; recovery needs a fresh walk.
         self._mass_drop()
         self.alerter.sweep(_now())
-        self.assertEqual(
-            len([s for s in self.notifier.sent if "fiber cut" in s["title"]]), 1)
+        self.assertEqual(len(self._queued("fiber cut")), 1)
         # the OLT's walk goes stale: restamp every row 20 min into the past
         with self.store._connect() as conn:
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_recent(20.0),))
             conn.commit()
         self.alerter.sweep(_now())
-        self.assertFalse(any("recovered" in s["title"] for s in self.notifier.sent))
+        self.assertFalse(self._queued("recovered"))
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 1)
         # the walk lands again, fault unchanged: no re-page either
         self._mass_drop()
         self.alerter.sweep(_now())
-        self.assertEqual(
-            len([s for s in self.notifier.sent if "fiber cut" in s["title"]]), 1)
+        self.assertEqual(len(self._queued("fiber cut")), 1)
 
     def test_power_pattern_writes_state_but_never_pages(self):
         self._onu("survivor", "online", distance=700)
         for i in range(3):
             self._onu(f"gasp{i}", "dying_gasp", distance=1500)
         self.alerter.sweep(_now())
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["kind"], "power")
         self.assertEqual(state["active"], 1)
@@ -121,7 +125,7 @@ class PonFaultAlerterTest(unittest.TestCase):
         alerter = PonFaultAlerter(self.store, "ispA", self.notifier, cfg)
         self._mass_drop()
         alerter.sweep(_now())
-        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
 
@@ -134,7 +138,7 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.store.set_org_device_location("ispA", splitter, 17.0108, 78.4)
         self._mass_drop()
         self.alerter.sweep(_now())
-        cuts = [s for s in self.notifier.sent if "fiber cut" in s["title"]]
+        cuts = self._queued("fiber cut")
         self.assertEqual(len(cuts), 1)
         self.assertIn("FDB-14", cuts[0]["body"])
 

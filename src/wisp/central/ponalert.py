@@ -17,6 +17,7 @@ import logging
 from datetime import datetime, timezone
 
 from wisp.central import onuroster, ponfault
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class PonFaultAlerter:
         self.org_id = org_id
         self.notifier = notifier
         self.cfg = cfg
+        self.router = AlertRouter(store, org_id, notifier, cfg)
 
     def sweep(self, ts: str) -> None:
         rows = self.store.org_onu_rows(self.org_id)
@@ -78,18 +80,16 @@ class PonFaultAlerter:
                 active=False, since=None, ts=ts)
             if was["kind"] == "fiber":
                 name = self._name(key[0])
-                self._page(f"✅ PON recovered: {name} PON {key[1]}", "", key[0], ts)
+                self._page(f"✅ PON recovered: {name} PON {key[1]}", "", key[0], ts,
+                           kind="PON_RECOVERED")
 
     def _name(self, device_id: int) -> str:
         dev = self.store.get_org_device(self.org_id, device_id)
         return dev["name"] if dev else f"#{device_id}"
 
-    def _page(self, title: str, body: str, device_id: int, ts: str) -> None:
-        topic = self.store.org_role_topic(self.org_id, "operator")
-        if self.cfg.pon_fault_alerts and topic:
-            res = self.notifier.send(topic, title, body, 3)
-            status = "sent" if res.ok else "failed"
-        else:
-            status = "suppressed"
-        self.store.log_alert(self.org_id, None, device_id, self.notifier.channel,
-                             topic, status, "PON_FAULT", ts)
+    def _page(self, title: str, body: str, device_id: int, ts: str,
+              kind: str = "PON_FAULT") -> None:
+        self.router.emit(
+            kind, topic=self.store.org_role_topic(self.org_id, "operator"),
+            title=title, body=body, priority=3, ts=ts, device_id=device_id,
+            gate=self.cfg.pon_fault_alerts)
