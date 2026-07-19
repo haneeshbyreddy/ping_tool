@@ -179,8 +179,37 @@ def sync_release(store, *, cfg: Config = CONFIG, gh: GithubReleases | None = Non
              version, channel, len(out), version_dir)
     return version, len(out)
 
+def sync_app_release(*, cfg: Config = CONFIG,
+                     gh: GithubReleases | None = None) -> tuple[str, list[str]] | None:
+    """Mirror the field app's latest release .apk asset(s) into a FIXED dir.
+
+    `release_cache_dir/app/<name>` serves at /download/app/<name> through the
+    existing release route with no store involvement — deliberately: the store's
+    release table drives edge self-update "latest", and an app release must
+    never be able to poison it. The asset keeps its name (CI publishes
+    `wisp-field.apk`), so the worker-facing URL is stable across versions.
+    Unauthenticated: the app repo is public, and the release-sync token is
+    fine-grained to the main repo (it would 403 here). Returns (tag, names),
+    or None when no app repo is configured.
+    """
+    if not cfg.app_releases_repo:
+        return None
+    gh = gh or GithubReleases(cfg.app_releases_repo, "")
+    rel = gh.latest()
+    names = [n for n in rel["assets"] if n.endswith(".apk")]
+    if not names:
+        raise ReleaseSyncError(
+            f"latest {cfg.app_releases_repo} release has no .apk asset")
+    for name in names:
+        gh.download(rel["assets"][name], cfg.release_cache_dir / "app" / name)
+    log.info("app sync: mirrored %s (%s) into %s",
+             rel["tag_name"], ", ".join(names), cfg.release_cache_dir / "app")
+    return rel["tag_name"], names
+
+
 def sync_and_record(store, notifier=None, *, cfg: Config = CONFIG,
-                    gh: GithubReleases | None = None) -> tuple[str, int]:
+                    gh: GithubReleases | None = None,
+                    app_gh: GithubReleases | None = None) -> tuple[str, int]:
     """Run sync_release, stamp the outcome in the store, page on transitions only.
 
     The update channel is itself monitored: every attempt writes `release_sync`
@@ -207,4 +236,10 @@ def sync_and_record(store, notifier=None, *, cfg: Config = CONFIG,
                           f"release mirror is healthy again; latest mirrored: {version}", 3)
         except Exception:
             log.exception("release-sync recovery page could not be sent")
+    # The field-app APK rides the same timer, best-effort: a broken app mirror
+    # must never sink (or page about) the edge self-update channel above.
+    try:
+        sync_app_release(cfg=cfg, gh=app_gh)
+    except ReleaseSyncError as exc:
+        log.warning("app release sync failed: %s", exc)
     return version, n

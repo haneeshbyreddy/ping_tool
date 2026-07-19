@@ -947,6 +947,16 @@ class DownloadRouteTest(unittest.TestCase):
     def test_path_traversal_blocked(self):
         status, _ = self._raw("/download/0.13.0/..%2f..%2fcentral.db")
         self.assertEqual(status, 404)
+
+    def test_download_app_fixed_dir_no_auth(self):
+        # The field-app APK mirror (releasesync.sync_app_release) lands in the
+        # fixed app/ dir and serves through this same route with no store row —
+        # /download/app/<name> is the stable worker install URL.
+        (self.cache / "app").mkdir()
+        (self.cache / "app" / "wisp-field.apk").write_bytes(b"APK-BYTES")
+        status, data = self._raw("/download/app/wisp-field.apk")
+        self.assertEqual(status, 200)
+        self.assertEqual(data, b"APK-BYTES")
         status, _ = self._raw("/download/..%2f..%2f0.13.0/wisp-edge-linux-amd64.deb")
         self.assertEqual(status, 404)
 

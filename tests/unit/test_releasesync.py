@@ -219,6 +219,54 @@ class SyncAndRecordTest(unittest.TestCase):
         self.assertIn("recovered", self.notifier.sent[1][1])
 
 
+class AppSyncTest(unittest.TestCase):
+    """Field-app APK mirror: fixed /download/app/ dir, store never touched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.store = CentralStore(root / "c.db")
+        self.cache = root / "releases"
+        self.cfg = dataclasses.replace(CONFIG, release_cache_dir=self.cache,
+                                       releases_repo="o/r",
+                                       app_releases_repo="o/app")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_mirrors_apk_into_fixed_app_dir(self):
+        gh = _FakeGh("v0.1.0", {"wisp-field.apk": b"apk-bytes",
+                                "SHA256SUMS": b"sums"})
+        tag, names = releasesync.sync_app_release(cfg=self.cfg, gh=gh)
+        self.assertEqual((tag, names), ("v0.1.0", ["wisp-field.apk"]))
+        # asset name preserved in a FIXED dir — the stable worker URL —
+        # and only the .apk mirrored, not every asset
+        self.assertEqual((self.cache / "app" / "wisp-field.apk").read_bytes(),
+                         b"apk-bytes")
+        self.assertFalse((self.cache / "app" / "SHA256SUMS").exists())
+        # the store's release table (edge self-update "latest") stays untouched
+        self.assertEqual(self.store.list_releases(), [])
+
+    def test_unconfigured_is_a_no_op(self):
+        cfg = dataclasses.replace(self.cfg, app_releases_repo="")
+        self.assertIsNone(releasesync.sync_app_release(cfg=cfg))
+
+    def test_release_without_apk_raises(self):
+        gh = _FakeGh("v0.1.0", {"notes.txt": b"x"})
+        with self.assertRaises(releasesync.ReleaseSyncError):
+            releasesync.sync_app_release(cfg=self.cfg, gh=gh)
+
+    def test_app_failure_never_sinks_the_edge_sync(self):
+        # sync_and_record must publish the edge release and report success even
+        # when the app mirror is broken (here: a release with no .apk).
+        broken_app = _FakeGh("v0.1.0", {"notes.txt": b"x"})
+        version, n = releasesync.sync_and_record(
+            self.store, cfg=self.cfg, gh=_FakeGh("v0.13.0", _scenario()),
+            app_gh=broken_app)
+        self.assertEqual(version, "0.13.0")
+        self.assertTrue(self.store.release_sync_status()["ok"])
+
+
 class GithubDownloadRedirectTest(unittest.TestCase):
     """The riskiest bit: the token must be dropped when following GitHub's 302 to S3."""
 

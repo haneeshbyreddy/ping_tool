@@ -633,6 +633,16 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
 - **Install-artifact names are VERSION-LESS and load-bearing**
   (`wisp-edge-setup-win-amd64.exe`, `wisp-edge-linux-<arch>.deb`) — the dashboard's
   install card links `${origin}/download/latest/<asset>`.
+- **The field-app APK mirror is store-less BY DESIGN** (`sync_app_release`,
+  2026-07-19): the separate PUBLIC `wisp-field-app` repo's latest-release
+  `.apk` lands in the FIXED `release_cache_dir/app/` dir and serves at
+  `/download/app/wisp-field.apk` through the existing route (any non-`latest`
+  dir serves without a store lookup). Never `set_release` an app version —
+  the store's release table drives edge self-update "latest" and an app tag
+  there would roll the fleet. Rides the release-sync timer best-effort
+  (failure logs, never sinks or pages the edge sync); fetched
+  UNAUTHENTICATED (the fine-grained release-sync PAT would 403 on the app
+  repo). Gated `WISP_APP_RELEASES_REPO` (empty = off).
 - CI signing (`release.yml`): Authenticode per Windows binary, minisign once over
   `SHA256SUMS`; both no-op while secrets are unset. Commit `deploy/minisign.pub`
   only once a real keypair exists. Nothing has run against real keys yet.

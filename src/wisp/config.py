@@ -257,6 +257,13 @@ class Config:
     releases_repo: str = field(default_factory=lambda: _env(
         "WISP_RELEASES_REPO", "haneeshbyreddy/ping_tool"))
     github_token: str = field(default_factory=lambda: _env("WISP_GITHUB_TOKEN", ""))
+    # Field-app (APK) mirror: a PUBLIC repo whose latest release's .apk assets
+    # are mirrored to release_cache_dir/app/ and served at /download/app/<name>
+    # — a fixed dir, never recorded in the store, so it can't poison the edge
+    # self-update "latest". Empty = off. Fetched unauthenticated on purpose:
+    # the release-sync token is fine-grained to the main repo and would 403.
+    app_releases_repo: str = field(default_factory=lambda: _env(
+        "WISP_APP_RELEASES_REPO", ""))
     release_cache_dir: Path = field(
         default_factory=lambda: Path(_env("WISP_RELEASE_CACHE_DIR", str(DATA_DIR / "releases"))))
     central_tls_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_TLS_CERT", ""))
