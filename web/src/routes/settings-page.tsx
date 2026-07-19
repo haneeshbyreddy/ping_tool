@@ -226,9 +226,9 @@ function GoogleMapsCard() {
   )
 }
 
-// Server-wide, superadmin-only: how subscribers pay. Razorpay keys turn on
-// self-serve checkout everywhere (lock screen, billing card, reminders);
-// without them everything falls back to the manual GPay flow, where payments
+// Server-wide, superadmin-only: how subscribers pay. The UPIGateway key turns
+// on self-serve checkout everywhere (lock screen, billing card, reminders);
+// without it everything falls back to the manual GPay flow, where payments
 // land with the platform admin who marks the org's month paid by hand.
 function PlatformBillingCard() {
   const queryClient = useQueryClient()
@@ -237,28 +237,25 @@ function PlatformBillingCard() {
     queryFn: adminApi.settings,
   })
   const [gpay, setGpay] = useState("")
-  const [rzpId, setRzpId] = useState("")
-  const [rzpSecret, setRzpSecret] = useState("")
+  const [upiKey, setUpiKey] = useState("")
+  const [clearUpi, setClearUpi] = useState(false)
   useEffect(() => {
-    if (data) {
-      setGpay(data.billing_gpay_number || "")
-      setRzpId(data.razorpay_key_id || "")
-    }
+    if (data) setGpay(data.billing_gpay_number || "")
   }, [data])
 
   const save = useMutation({
-    // the secret is write-only: blank means "keep what's stored" unless the
-    // key id is being cleared too, which clears both and disables checkout
+    // the key is write-only: blank means "keep what's stored"; clearing is
+    // the explicit Remove toggle
     mutationFn: () => adminApi.saveSettings({
       billing_gpay_number: gpay.trim(),
-      razorpay_key_id: rzpId.trim(),
-      ...(rzpSecret.trim() || !rzpId.trim()
-        ? { razorpay_key_secret: rzpId.trim() ? rzpSecret.trim() : "" }
+      ...(upiKey.trim() || clearUpi
+        ? { upigateway_key: clearUpi ? "" : upiKey.trim() }
         : {}),
     }),
     onSuccess: () => {
       toast.success("Payment settings saved")
-      setRzpSecret("")
+      setUpiKey("")
+      setClearUpi(false)
       queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
       queryClient.invalidateQueries({ queryKey: ["billing"] })
     },
@@ -276,21 +273,26 @@ function PlatformBillingCard() {
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         <div className="flex flex-col gap-1.5">
-          <Label>Razorpay key ID</Label>
-          <Input value={rzpId} placeholder="rzp_live_…" className="max-w-sm font-mono text-xs"
-            spellCheck={false} onChange={(e) => setRzpId(e.target.value)} />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label>Razorpay key secret</Label>
-          <Input value={rzpSecret} type="password"
-            placeholder={data?.razorpay_key_secret_set ? "•••••••• (saved — paste to replace)" : "key secret"}
-            className="max-w-sm font-mono text-xs"
-            spellCheck={false} onChange={(e) => setRzpSecret(e.target.value)} />
+          <Label>UPIGateway API key</Label>
+          <div className="flex max-w-sm items-center gap-2">
+            <Input value={upiKey} type="password"
+              placeholder={data?.upigateway_key_set && !clearUpi
+                ? "•••••••• (saved — paste to replace)" : "API key from merchant.upigateway.com"}
+              className="font-mono text-xs" disabled={clearUpi}
+              spellCheck={false} onChange={(e) => setUpiKey(e.target.value)} />
+            {data?.upigateway_key_set && (
+              <Button variant="outline" size="sm" className="shrink-0"
+                onClick={() => { setClearUpi((v) => !v); setUpiKey("") }}>
+                {clearUpi ? "Keep" : "Remove"}
+              </Button>
+            )}
+          </div>
         </div>
         <p className="max-w-lg text-xs text-muted-foreground">
-          With Razorpay keys set, every org pays online — UPI, cards, netbanking —
-          and months mark themselves paid the moment checkout completes. The secret
-          never leaves the server. Clear the key ID to fall back to manual GPay.
+          With a UPIGateway key set, every org pays by scanning a UPI QR — payments
+          land straight in your bank and months mark themselves paid once the
+          gateway confirms. The key is a secret and never leaves the server.
+          Remove it to fall back to manual GPay.
         </p>
         <div className="flex flex-col gap-1.5">
           <Label>GPay number (fallback)</Label>
@@ -298,7 +300,7 @@ function PlatformBillingCard() {
             spellCheck={false} onChange={(e) => setGpay(e.target.value)} />
         </div>
         <p className="max-w-lg text-xs text-muted-foreground">
-          Shown on lock screens and reminders only while Razorpay isn't configured;
+          Shown on lock screens and reminders only while no gateway is configured;
           you then mark months paid from Organizations → Billing.
         </p>
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>

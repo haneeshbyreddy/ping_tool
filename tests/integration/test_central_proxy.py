@@ -265,7 +265,27 @@ class ProxyRoundTripTest(unittest.TestCase):
                                  {"device_id": self.device_id, "port": self.dev_port},
                                  cookie=cookie)
         self.assertEqual(status, 403)
-        self.assertIn("operator", body.get("error", ""))
+        self.assertIn("owner", body.get("error", ""))
+
+    def test_operator_role_cannot_open_session(self):
+        # operators are locked out of device admin UIs too — owner only.
+        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
+        cookie = self._login("op1", "operatorpassword")
+        status, body = self._api("POST", "/api/proxy/session",
+                                 {"device_id": self.device_id, "port": self.dev_port},
+                                 cookie=cookie)
+        self.assertEqual(status, 403)
+        self.assertIn("owner", body.get("error", ""))
+
+    def test_operator_cannot_drive_owner_session(self):
+        # even a session an owner left live must not be browsable by an operator
+        # who can see its sid.
+        _, sess = self._open_session()
+        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
+        cookie = self._login("op1", "operatorpassword")
+        out = {}
+        self._browser("GET", f"/api/proxy/{sess['sid']}/status", out, cookie=cookie)
+        self.assertEqual(out["status"], 403)
 
     def test_capability_revoked_mid_session_kills_it(self):
         _, sess = self._open_session()

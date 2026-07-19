@@ -3,23 +3,24 @@ import { Check, Copy, Lock, LogOut, TriangleAlert, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { inr, monthLabel } from "@/lib/billing"
 import type { BillingInfo } from "@/lib/types"
-import { FreePlanButton, RazorpayPayButton } from "@/components/razorpay-pay"
+import { FreePlanButton, PayOnlineButton } from "@/components/pay-online"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 
-/** Razorpay checkout as the hero: one month, one tap to pay. Verification
+/** Online checkout as the hero: one month, one tap to pay. Verification
  * and unlock are server-side — the lock screen just repaints. */
-export function RazorpayWell({ billing, org }: { billing: BillingInfo; org?: string | null }) {
+export function OnlinePayWell({ billing, org }: { billing: BillingInfo; org?: string | null }) {
   const spec = billing.plans[billing.plan]
   return (
     <div className="flex flex-col gap-3 rounded-lg border bg-muted px-4 py-3">
       <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">
         Pay online
       </p>
-      <RazorpayPayButton org={org} size="lg" className="w-full"
-        label={`Pay ${inr(spec.price_inr)} · UPI, card or netbanking`} />
+      <PayOnlineButton org={org} size="lg" className="w-full"
+        label={`Pay ${inr(spec.price_inr)} · any UPI app`} />
       <p className="text-xs text-muted-foreground">
-        Secured by Razorpay. Your account extends the moment the payment completes.
+        A payment page opens in a new tab — scan or tap from any UPI app.
+        Your account extends the moment the payment completes.
       </p>
     </div>
   )
@@ -91,9 +92,9 @@ export function BillingLock({ billing }: { billing: BillingInfo }) {
               <span className="ml-1 text-xs font-normal text-muted-foreground">/month</span>
             </p>
           </div>
-          {billing.razorpay_key_id ? (
+          {billing.upi_enabled ? (
             <>
-              <RazorpayWell billing={billing} />
+              <OnlinePayWell billing={billing} />
               <p className="text-sm text-muted-foreground">
                 Scan, pay, done — the dashboard unlocks automatically the moment
                 your payment goes through, nothing to refresh.
@@ -154,7 +155,7 @@ export function BillingBanner({ billing, org }: { billing: BillingInfo; org: str
         <span className="font-medium">
           Payment due {days === 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`}
         </span>
-        {billing.razorpay_key_id ? (
+        {billing.upi_enabled ? (
           <span className="text-muted-foreground">
             : {inr(spec.price_inr)} for {monthLabel(dueMonth)} — pay online and
             your account extends instantly.
@@ -171,8 +172,8 @@ export function BillingBanner({ billing, org }: { billing: BillingInfo; org: str
           </>
         )}
       </p>
-      {billing.razorpay_key_id && (
-        <RazorpayPayButton org={org} label={`Pay ${inr(spec.price_inr)}`}
+      {billing.upi_enabled && (
+        <PayOnlineButton org={org} label={`Pay ${inr(spec.price_inr)}`}
           variant="outline" size="sm" className="h-7 shrink-0 px-2.5 text-xs" />
       )}
       <button

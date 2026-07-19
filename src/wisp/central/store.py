@@ -364,6 +364,21 @@ CREATE TABLE IF NOT EXISTS device_redundancy (
     primary_down_since TEXT,
     updated_at         TEXT NOT NULL
 );
+-- Per-device web-UI login, so a tech never retypes a switch/OLT admin password.
+-- The password is ENCRYPTED at rest (central/secretbox.py) under a key kept
+-- outside the DB; username is plaintext (not a secret). A SEPARATE table on
+-- purpose: the ciphertext must never ride list_org_devices() into the browser.
+CREATE TABLE IF NOT EXISTS device_webui_credentials (
+    device_id    INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    org_id       TEXT NOT NULL,
+    username     TEXT,
+    password_enc TEXT,                    -- secretbox token; NULL = no password stored
+    auth_mode    TEXT NOT NULL DEFAULT 'form',   -- 'form' = login-form device (default;
+                                                  -- inject the autofill bootstrap); 'basic' =
+                                                  -- HTTP Basic popup (inject Authorization header)
+    updated_by   TEXT,
+    updated_at   TEXT NOT NULL
+);
 -- Per-link performance baseline, central-side (core/baseline.py's pure
 -- median+MAD deviation math, unchanged — central's job is just the trailing-sample
 -- window + badge). device_perf_samples is a BOUNDED per-device ring buffer (trimmed to
@@ -593,11 +608,16 @@ CREATE TABLE IF NOT EXISTS org_billing_months (
     marked_at TEXT NOT NULL,
     PRIMARY KEY (org_id, month)
 );
--- Razorpay checkout ledger (central/razorpay.py): one row per order created
+-- Online-checkout ledger (central/upigateway.py): one row per order created
 -- from the dashboard's Pay button. `months` is the comma-joined 'YYYY-MM'
 -- list the order buys; verification flips status created→paid exactly once
 -- (settle_billing_payment's WHERE status='created' guard) and only then are
--- the months marked in org_billing_months (marked_by 'razorpay:<payment_id>').
+-- the months marked in org_billing_months (marked_by
+-- 'upigateway:<payment_id>'); a failed payment flips created→failed so the
+-- sweeper stops re-checking it. `gateway` DEFAULTS to 'razorpay' as a
+-- tombstone: rows from the removed Razorpay era (2026-07-16) keep that value
+-- and are excluded from every UPIGateway settle path — new rows are always
+-- written with gateway='upigateway' explicitly.
 CREATE TABLE IF NOT EXISTS billing_payments (
     order_id     TEXT PRIMARY KEY,
     org_id       TEXT NOT NULL,
@@ -605,6 +625,7 @@ CREATE TABLE IF NOT EXISTS billing_payments (
     months       TEXT NOT NULL,
     amount_paise INTEGER NOT NULL,
     status       TEXT NOT NULL DEFAULT 'created',
+    gateway      TEXT NOT NULL DEFAULT 'razorpay',
     payment_id   TEXT,
     created_by   TEXT,
     created_at   TEXT NOT NULL,
@@ -734,6 +755,10 @@ class CentralStore(
                 ("auto_update", "INTEGER NOT NULL DEFAULT 0")))
             self._ensure_columns(conn, "nodes", (
                 ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
+            # rows from the pre-UPIGateway (Razorpay, removed 2026-07-16) era
+            # take the 'razorpay' default and stay quarantined from settling
+            self._ensure_columns(conn, "billing_payments", (
+                ("gateway", "TEXT NOT NULL DEFAULT 'razorpay'"),))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             # clean classification token for the notification governor + honest
@@ -769,6 +794,10 @@ class CentralStore(
             # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (
                 ("last_online_at", "TEXT"),))
+            # auth_mode landed after the credentials table's first cut — a DB
+            # that already created it (Phase 1) needs the column backfilled.
+            self._ensure_columns(conn, "device_webui_credentials", (
+                ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
             self._seed_google_key(conn)
             conn.commit()
 

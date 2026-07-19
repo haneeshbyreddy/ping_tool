@@ -15,9 +15,10 @@ Three actors:
 
 Security spine (webplan.md §6): orgs.web_proxy is the per-org opt-in
 (superadmin-set) — THE activation gate; cfg.proxy_enabled defaults on and
-WISP_PROXY_ENABLED=0 is the fleet/edge emergency kill switch. Only
-owner/operator (or superadmin) can open a session; sessions expire, activity
-extends them; the edge re-checks every target IP against its own device list.
+WISP_PROXY_ENABLED=0 is the fleet/edge emergency kill switch. Only the OWNER
+(or superadmin) can open a session AND drive it — operators/techs are locked
+out of device admin UIs entirely; sessions expire, activity extends them; the
+edge re-checks every target IP against its own device list.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from wisp.central import auth
 from wisp.central import proxy as proxy_mod
 from wisp.central.api.common import org_or_400, reader_or_401
 from wisp.central.proxy import MAX_INFLIGHT_PER_SESSION, parse_ports
+from wisp.central.secretbox import DecryptError
 
 log = logging.getLogger("wisp.central")
 
@@ -41,6 +43,13 @@ _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
     "proxy-authorization", "proxy-authenticate", "content-length",
     "content-encoding",
+})
+
+# Dropped from proxied responses ONLY while form-login autofill is armed, so the
+# injected inline bootstrap and its same-origin creds fetch aren't blocked.
+_CSP_HEADERS = frozenset({
+    "content-security-policy", "content-security-policy-report-only",
+    "x-content-security-policy", "x-webkit-csp",
 })
 
 # How often browser activity syncs the session's sliding expiry to the DB row —
@@ -83,16 +92,70 @@ def _forward_headers(h, sid: str, sess) -> dict:
         out["Referer"] = origin + (ref[at + len(prefix):] or "/")
     if h.headers.get("Origin"):
         out["Origin"] = origin
-    # Basic only: a device HTTP-auth prompt works, while central's own bearer
-    # token (also an Authorization header) can never leak to a device.
-    authz = h.headers.get("Authorization") or ""
-    if authz.startswith("Basic "):
-        out["Authorization"] = authz
+    # Central injects the device's STORED Basic login (resolved once at session
+    # open) so the tech never faces the HTTP-auth popup and the password never
+    # reaches the browser. It wins over anything the browser sent. Without a
+    # stored login we still forward a browser-supplied Basic header (the tech
+    # typed it into the popup); central's own bearer token can never leak here.
+    if getattr(sess, "injected_auth", None):
+        out["Authorization"] = sess.injected_auth
+    else:
+        authz = h.headers.get("Authorization") or ""
+        if authz.startswith("Basic "):
+            out["Authorization"] = authz
     return out
 
-# Roles that may OPEN a session (webplan.md §6.5) — techs browse the dashboard,
-# not device admin UIs.
-_PROXY_ROLES = ("owner", "operator")
+
+def _resolve_injected_auth(h, org_id: str, device_id: int) -> str | None:
+    """The ready ``Basic <token>`` header for a device's stored web-UI login, or
+    None. Only ``auth_mode='basic'`` devices are injected (form-login is Phase
+    2b, a different mechanism); a password that won't decrypt (key rotated) is
+    skipped, never fatal — the tunnel still opens, the tech just sees the login
+    page. Resolved ONCE here so a page's asset burst costs no extra DB reads or
+    decrypts (the cost is a stored password in process memory for a live
+    session, which is already where the tunnel lives)."""
+    row = h.store.get_device_webui_credentials(org_id, device_id)
+    if not row or (row.get("auth_mode") or "form") != "basic":
+        return None
+    enc = row.get("password_enc")
+    if not enc:
+        return None
+    try:
+        password = h.secretbox.decrypt(enc)
+    except DecryptError:
+        log.warning("proxy: could not decrypt stored login for device=%d "
+                    "(key rotated?) — opening tunnel without auth injection",
+                    device_id)
+        return None
+    user = row.get("username") or ""
+    token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+    return "Basic " + token
+
+
+def _resolve_autofill(h, org_id: str, device_id: int) -> tuple[str, str] | None:
+    """(username, password) for a FORM-login device (auth_mode='form') with a
+    stored password, else None. Fed to proxy.inject_autofill so the login page
+    pre-fills; a password that won't decrypt (key rotated) is skipped, never
+    fatal. Resolved ONCE at session open, like the Basic header."""
+    row = h.store.get_device_webui_credentials(org_id, device_id)
+    if not row or (row.get("auth_mode") or "form") != "form":
+        return None
+    enc = row.get("password_enc")
+    if not enc:
+        return None
+    try:
+        password = h.secretbox.decrypt(enc)
+    except DecryptError:
+        log.warning("proxy: could not decrypt stored login for device=%d "
+                    "(key rotated?) — opening tunnel without autofill", device_id)
+        return None
+    return (row.get("username") or "", password)
+
+# Roles that may OPEN a session (webplan.md §6.5) — owner only. Operators and
+# techs browse the dashboard, not device admin UIs (the login vault behind a
+# tunnel is an owner-grade credential). Kept as a tuple so widening it later is
+# a one-line change and the membership check below stays uniform.
+_PROXY_ROLES = ("owner",)
 
 
 def _iso(epoch: float) -> str:
@@ -116,7 +179,7 @@ def session_create(h, user, body) -> None:
         h._reply(403, {"error": "forbidden"})
         return
     if not (user["is_superadmin"] or user.get("role") in _PROXY_ROLES):
-        h._reply(403, {"error": "operator role or above required"})
+        h._reply(403, {"error": "owner role required"})
         return
     if not h.store.org_web_proxy(org):
         h._reply(403, {"error": "web proxy is not enabled for this organization"})
@@ -152,6 +215,8 @@ def session_create(h, user, body) -> None:
         device_port=port, scheme=scheme, created_by=user["id"],
         ttl_s=h.cfg.proxy_session_ttl_s)
     sess.db_synced_at = sess.created_at
+    sess.injected_auth = _resolve_injected_auth(h, org, device_id)
+    sess.autofill = _resolve_autofill(h, org, device_id)
     h.store.create_proxy_session(sess.sid, org, device_id, node, user["id"],
                                  _iso(sess.expires_at))
     log.info("proxy session %s opened by user=%s for %s/device=%d (%s:%d)",
@@ -276,6 +341,13 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
     if not (user["is_superadmin"] or user["org_id"] == sess.org_id):
         h._reply(403, {"error": "forbidden"})
         return
+    # Owner-only to DRIVE too, not just to open: a session an owner left live is
+    # otherwise reachable by any org member who can see its sid (sessions list /
+    # the live globe icon), which would let an operator browse the device UI
+    # through it. Same gate as session_create.
+    if not (user["is_superadmin"] or user.get("role") in _PROXY_ROLES):
+        h._reply(403, {"error": "owner role required"})
+        return
     if not h.store.org_web_proxy(sess.org_id):
         # superadmin revoked the capability mid-session: kill it now, not at TTL
         h.proxy.close_session(sid)
@@ -283,6 +355,17 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
         h._reply(403, {"error": "web proxy has been disabled for this organization"})
         return
     if h._billing_blocked(f"/api/proxy/{sid}/", user):
+        return
+    # Reserved same-origin endpoint the injected autofill bootstrap calls once it
+    # sees a login form: answer with the decrypted login directly (never forward to
+    # the edge). Auth is already established above (session owner + org). Only a
+    # form-login device has autofill armed; anything else 404s like a device path.
+    if rest.strip("/") == proxy_mod.AUTOFILL_PATH:
+        af = getattr(sess, "autofill", None)
+        if af:
+            h._reply(200, {"u": af[0], "p": af[1]})
+        else:
+            h._reply(404, {"error": "not found"})
         return
     if h.proxy.inflight(sid) >= MAX_INFLIGHT_PER_SESSION:
         h._reply(429, {"error": "too many concurrent requests on this session"})
@@ -314,9 +397,15 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
         h._reply(502, {"error": f"edge fetch failed: {response['error']}"})
         return
     raw = base64.b64decode(response.get("body_b64") or "")
+    autofill = getattr(sess, "autofill", None)
     pairs = [(k, v) for k, v in _norm_header_pairs(response.get("headers"))
-             if k.lower() not in _HOP_BY_HOP]
+             if k.lower() not in _HOP_BY_HOP
+             # a device CSP would block our inline autofill bootstrap (and its
+             # same-origin creds fetch); drop it only when autofill is armed
+             and not (autofill and k.lower() in _CSP_HEADERS)]
     pairs = proxy_mod.rewrite_headers(sid, sess, pairs)
     ctype = next((v for k, v in pairs if k.lower() == "content-type"), "")
     raw = proxy_mod.rewrite_body(sid, ctype, raw)
+    if autofill:  # form-login device: inject the credential-free autofill bootstrap
+        raw = proxy_mod.inject_autofill(ctype, raw, sid)
     h._raw_reply(response.get("status", 502), pairs, raw)

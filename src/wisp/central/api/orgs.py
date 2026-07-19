@@ -6,7 +6,7 @@ import logging
 import re
 
 from wisp.central import billing as billing_mod
-from wisp.central import inventory, razorpay, sysinfo
+from wisp.central import inventory, sysinfo, upigateway
 from wisp.central.api.common import (DENIED, body_org_write, org_or_400,
                                      public_user, reader_or_401,
                                      superadmin_or_403)
@@ -52,11 +52,10 @@ def admin_settings(h, qs):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
                    "billing_gpay_number": billing_mod.gpay_number(h.store),
-                   "razorpay_key_id": h.store.get_setting("razorpay_key_id"),
-                   # the secret never leaves central — the UI only learns
-                   # whether one is configured
-                   "razorpay_key_secret_set":
-                       bool(h.store.get_setting("razorpay_key_secret"))})
+                   # the key is a secret and never leaves central — the UI
+                   # only learns whether one is configured
+                   "upigateway_key_set":
+                       bool(h.store.get_setting("upigateway_key"))})
 
 
 def list_orgs(h, qs):
@@ -144,14 +143,12 @@ def admin_settings_write(h, user, body):
     if gpay is not None:
         # blank falls back to billing.DEFAULT_GPAY_NUMBER
         h.store.set_setting("billing_gpay_number", str(gpay).strip()[:32])
-    # Razorpay keys (central/razorpay.py): blank clears — no keys means the
-    # Pay buttons vanish everywhere and billing falls back to the GPay flow
-    rzp_id = body.get("razorpay_key_id")
-    if rzp_id is not None:
-        h.store.set_setting("razorpay_key_id", str(rzp_id).strip()[:64])
-    rzp_secret = body.get("razorpay_key_secret")
-    if rzp_secret is not None:
-        h.store.set_setting("razorpay_key_secret", str(rzp_secret).strip()[:64])
+    # UPIGateway API key (central/upigateway.py): a SECRET, never echoed back.
+    # Blank clears — the Pay buttons vanish everywhere and billing falls back
+    # to the manual GPay flow.
+    upi_key = body.get("upigateway_key")
+    if upi_key is not None:
+        h.store.set_setting("upigateway_key", str(upi_key).strip()[:64])
     h._reply(200, {"ok": True})
 
 
@@ -175,24 +172,28 @@ def billing(h, qs):
         "node_count": h.store.active_node_token_count(org),
         "node_cap": billing_mod.node_cap(st["plan"]),
         "gpay_number": billing_mod.gpay_number(h.store),
-        # Checkout needs the public key id in the browser; None = Razorpay
-        # not configured, the UI falls back to the manual GPay flow
-        "razorpay_key_id": h.payments.key_id if h.payments.enabled else None,
+        # UPIGateway's key is a secret so the browser only learns the
+        # boolean; the UI falls back to the manual GPay flow when the
+        # gateway isn't configured.
+        "upi_enabled": h.upi.enabled,
         "plans": billing_mod.PLANS,
     })
 
 
 def billing_order(h, user, body):
-    """Create a Razorpay order for N months of a paid plan. Deliberately
-    billing-exempt (server.py) — a LOCKED org pays its way out from the lock
-    screen. Owner-only, like every other org write."""
+    """Create a UPIGateway order for N months of a paid plan: the browser
+    opens `payment_url` (their hosted QR page) and then polls
+    /api/billing/verify — there is no signed handshake, settlement is
+    central's own status check. Deliberately billing-exempt (server.py) — a
+    LOCKED org pays its way out from the lock screen. Owner-only, like every
+    other org write."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
     if not org or not h.store.org_exists(org):
         h._reply(404, {"error": "unknown org"})
         return
-    if not h.payments.enabled:
+    if not h.upi.enabled:
         h._reply(422, {"error": "online payments are not configured — "
                                 "pay by GPay instead"})
         return
@@ -211,24 +212,33 @@ def billing_order(h, user, body):
         h._reply(422, {"error": "months must be between 1 and 12"})
         return
     months = billing_mod.months_to_pay(plan, h.store.paid_months(org), count)
-    amount = billing_mod.PLANS[plan]["price_inr"] * count * 100  # paise
-    try:
-        # network call — after this point only fast local writes (dispatch rule)
-        order = h.payments.create_order(
-            amount, receipt=f"{org[:30]}-{count}m",
-            notes={"org_id": org, "plan": plan, "months": ",".join(months)})
-    except razorpay.GatewayError as exc:
-        h._reply(502, {"error": f"payment gateway error: {exc}"})
-        return
-    h.store.create_billing_payment(order["id"], org, plan, months, amount,
-                                   created_by=user["username"])
     label = billing_mod.PLANS[plan]["label"]
     desc = f"{label} plan · {billing_mod.month_label(months[0])}"
     if len(months) > 1:
         desc += f" – {billing_mod.month_label(months[-1])} ({len(months)} months)"
-    h._reply(200, {"order_id": order["id"], "amount": amount,
-                   "currency": "INR", "key_id": h.payments.key_id,
-                   "plan": plan, "months": months,
+    txn_id = upigateway.new_txn_id()
+    # their payment page redirects here after the payer finishes; the SPA
+    # sends its own origin because central may sit behind a reverse proxy
+    origin = str(body.get("origin") or "").rstrip("/")
+    if not origin.startswith(("http://", "https://")):
+        origin = f"https://{h.headers.get('Host', '')}"
+    amount_inr = billing_mod.PLANS[plan]["price_inr"] * len(months)
+    try:
+        # network call — after this point only fast local writes (dispatch rule)
+        order = h.upi.create_order(
+            txn_id, amount_inr, desc, h.store.org_name(org) or org,
+            f"{origin}/api/billing/upi-return")
+    except upigateway.GatewayError as exc:
+        h._reply(502, {"error": f"payment gateway error: {exc}"})
+        return
+    h.store.create_billing_payment(txn_id, org, plan, months,
+                                   amount_inr * 100,
+                                   created_by=user["username"],
+                                   gateway="upigateway")
+    h._reply(200, {"gateway": "upigateway", "order_id": txn_id,
+                   "amount": amount_inr * 100, "currency": "INR",
+                   "payment_url": order["payment_url"], "plan": plan,
+                   "months": months,
                    "org_name": h.store.org_name(org) or org,
                    "description": desc})
 
@@ -274,34 +284,58 @@ def _notify_admin_plan_change(h, org: str, prior: str) -> None:
 
 
 def billing_verify(h, user, body):
-    """Finalize checkout: verify Razorpay's HMAC over order|payment, then —
-    exactly once per order — apply the plan and mark the months paid.
-    Idempotent: re-submitting a settled order just re-reads status."""
+    """Finalize checkout — exactly once per order apply the plan and mark the
+    months paid. Idempotent: re-submitting a settled order just re-reads
+    status. The proof is central's own UPIGateway status check (the SPA polls
+    this while the payment tab is open — 'pending' is a normal reply, not an
+    error)."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
-    order_id = str(body.get("razorpay_order_id") or "")
-    payment_id = str(body.get("razorpay_payment_id") or "")
-    signature = str(body.get("razorpay_signature") or "")
+    order_id = str(body.get("order_id") or "")
     pay = h.store.billing_payment(order_id)
     if not pay or (org and pay["org_id"] != org):
         h._reply(404, {"error": "unknown order"})
         return
-    org = pay["org_id"]  # superadmin verifying without an org scope
-    if not h.payments.verify_signature(order_id, payment_id, signature):
-        h._reply(422, {"error": "payment signature mismatch — payment "
-                                "not verified"})
+    if pay.get("gateway") != "upigateway":
+        # a ledger row from the removed Razorpay era — nothing can settle it
+        h._reply(422, {"error": "order predates the current payment gateway"})
         return
-    if h.store.settle_billing_payment(order_id, payment_id):
-        if h.store.org_plan(org) != pay["plan"]:
-            h.store.set_org_plan(org, pay["plan"])
-        for m in pay["months"]:
-            h.store.set_billing_month(org, m, True,
-                                      marked_by=f"razorpay:{payment_id}")
-        _notify_admin_payment(h, org, pay, payment_id)
+    org = pay["org_id"]  # superadmin verifying without an org scope
+    try:
+        # network call before any store write (dispatch rule)
+        verdict, _ = upigateway.attempt_settle(
+            h.store, h.upi, pay,
+            on_paid=lambda p, txn: _notify_admin_payment(h, org, p, txn))
+    except upigateway.GatewayError as exc:
+        h._reply(502, {"error": f"payment gateway error: {exc}"})
+        return
     st = billing_mod.org_status(h.store, org)
-    h._reply(200, {"ok": True, **st,
+    h._reply(200, {"ok": True, "payment_status": verdict, **st,
                    "paid_months": sorted(h.store.paid_months(org))})
+
+
+def billing_upi_return(h, qs):
+    """UPIGateway's browser redirect target after the payer finishes on their
+    hosted QR page. Sessionless BY DESIGN — the payer may land here in a tab
+    with no dashboard login (mobile UPI app browser). Safe because the query
+    string is never trusted: settlement still runs central's own status check
+    against the gateway. Settle best-effort, then bounce to the SPA (which
+    re-reads /api/billing and repaints)."""
+    txn_id = str((qs.get("client_txn_id") or [""])[0])
+    pay = h.store.billing_payment(txn_id) if txn_id else None
+    if pay and pay.get("gateway") == "upigateway" and h.upi.enabled:
+        try:
+            upigateway.attempt_settle(
+                h.store, h.upi, pay,
+                on_paid=lambda p, txn: _notify_admin_payment(
+                    h, p["org_id"], p, txn))
+        except upigateway.GatewayError:
+            log.exception("upi-return settle failed for %s", txn_id)
+    h.send_response(302)
+    h.send_header("Location", "/app")
+    h.send_header("Content-Length", "0")
+    h.end_headers()
 
 
 def _notify_admin_payment(h, org: str, pay: dict, payment_id: str) -> None:
@@ -314,7 +348,7 @@ def _notify_admin_payment(h, org: str, pay: dict, payment_id: str) -> None:
         name = h.store.org_name(org) or org
         h.notifier.send(
             topic, f"💰 {name} paid ₹{pay['amount_paise'] // 100:,}",
-            f"{pay['plan']} · {', '.join(pay['months'])} · Razorpay {payment_id}",
+            f"{pay['plan']} · {', '.join(pay['months'])} · UPI {payment_id}",
             3)
     except Exception:
         log.exception("payment notification failed for %s", org)

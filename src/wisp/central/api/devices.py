@@ -320,6 +320,63 @@ def capability(h, user, body):
     h._reply(200 if ok else 404, {"ok": ok})
 
 
+# ----- device web-UI credentials -------------------------------------------
+# Owner-only, like every other inventory write (the SNMP community string is a
+# device credential too and gates the same way). The stored password is never
+# returned to the browser — only whether one is set.
+
+def webui_credentials(h, qs):
+    user = reader_or_401(h)
+    if not user:
+        return
+    did = q_int_required(h, qs, "device_id")
+    if did is None:
+        return
+    org = device_write_org(h, user, did)   # owner-only; 403 already sent on deny
+    if org is DENIED:
+        return
+    row = h.store.get_device_webui_credentials(org, did) or {}
+    h._reply(200, {"credentials": {
+        "username": row.get("username") or "",
+        "has_password": bool(row.get("password_enc")),
+        "auth_mode": row.get("auth_mode") or "form",
+        "updated_by": row.get("updated_by"),
+        "updated_at": row.get("updated_at"),
+    }})
+
+
+def webui_credentials_set(h, user, body):
+    did = int(body.get("device_id") or body.get("id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    username = str(body.get("username") or "").strip()[:128]
+    # form-login is the default — most switch/OLT web UIs are a login form; Basic
+    # (the HTTP popup) is the opt-in.
+    auth_mode = "basic" if str(body.get("auth_mode") or "").lower() == "basic" else "form"
+    # Password semantics are explicit so a username-only edit never wipes a
+    # stored password: key absent / null -> leave the stored password untouched;
+    # "" -> clear it; a non-empty string -> encrypt and store.
+    raw = body.get("password", None)
+    set_password = raw is not None
+    password_enc = None
+    if set_password and raw != "":
+        password_enc = h.secretbox.encrypt(str(raw)[:512])
+    ok = h.store.set_device_webui_credentials(
+        org, did, username=username, password_enc=password_enc,
+        set_password=set_password, auth_mode=auth_mode, updated_by=user["username"])
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
+def webui_credentials_clear(h, user, body):
+    did = int(body.get("device_id") or body.get("id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    ok = h.store.clear_device_webui_credentials(org, did)
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
 def snmp_walk_create(h, user, body):
     did = int(body.get("device_id") or 0)
     org = device_write_org(h, user, did)

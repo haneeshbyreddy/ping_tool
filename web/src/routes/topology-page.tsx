@@ -275,21 +275,45 @@ function DeviceForm({
   )
 }
 
-// Drill-in state shared by the tree row and the grid card: which panel tab is
-// open, whether it's expanded, and the deep-link focus effect (Home row /
-// command palette lands here — open the panel and scroll it into view).
-function useDrillIn(focus?: boolean) {
-  const [detailOpen, setDetailOpen] = useState(false)
-  const [detailTab, setDetailTab] = useState<DeviceTab>("health")
+// The drill-in open-state (which device is expanded + which tab) lives on the
+// page, not per row/card — so opening one device auto-closes any other, and the
+// grid can place the panel at the end of the open card's visual row instead of
+// shoving its right-hand neighbours onto a new line. A row/card scrolls itself
+// into view when it becomes the deep-link focus (Home row / command palette).
+interface DrillIn {
+  open: boolean
+  tab: DeviceTab
+  onToggle: () => void
+  onTab: (t: DeviceTab) => void
+  openTab: (t: DeviceTab) => void
+}
+
+function useFocusScroll(focus?: boolean) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    if (focus) {
-      setDetailOpen(true)
-      ref.current?.scrollIntoView({ behavior: "smooth", block: "center" })
-    }
+    if (focus) ref.current?.scrollIntoView({ behavior: "smooth", block: "center" })
   }, [focus])
-  const openTab = (t: DeviceTab) => { setDetailTab(t); setDetailOpen(true) }
-  return { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref }
+  return ref
+}
+
+// Live column count of the device grid — mirrors the `grid-cols-1 sm:grid-cols-2
+// xl:grid-cols-3` classes so the parent can find the last card in the open card's
+// row (Tailwind sm=640px, xl=1280px). Grid only; the list is one device per line.
+function useGridCols(): number {
+  const [cols, setCols] = useState(1)
+  useEffect(() => {
+    const sm = window.matchMedia("(min-width: 640px)")
+    const xl = window.matchMedia("(min-width: 1280px)")
+    const update = () => setCols(xl.matches ? 3 : sm.matches ? 2 : 1)
+    update()
+    sm.addEventListener("change", update)
+    xl.addEventListener("change", update)
+    return () => {
+      sm.removeEventListener("change", update)
+      xl.removeEventListener("change", update)
+    }
+  }, [])
+  return cols
 }
 
 // The trouble/status chips shared by the tree row and the grid card. Each chip
@@ -486,7 +510,7 @@ function DeviceActions({ device, canWrite, onEdit }: {
 }
 
 function DeviceRow({
-  device, canWrite, onEdit, collapsed, onToggleCollapse, focus,
+  device, canWrite, onEdit, collapsed, onToggleCollapse, focus, drill,
 }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
@@ -494,8 +518,10 @@ function DeviceRow({
   collapsed: boolean
   onToggleCollapse: () => void
   focus?: boolean
+  drill: DrillIn
 }) {
-  const { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref } = useDrillIn(focus)
+  const { open: detailOpen, tab: detailTab, onToggle, onTab: setDetailTab, openTab } = drill
+  const ref = useFocusScroll(focus)
   useNow()
   const hasOptics = isOpticalOlt(device)
   const hasPorts = device.snmp_enabled === 1
@@ -510,7 +536,7 @@ function DeviceRow({
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
           detailOpen && "border-b")}
-        onClick={() => setDetailOpen(!detailOpen)}
+        onClick={onToggle}
         title={detailOpen ? undefined : "Click for details"}
       >
         {Array.from({ length: device.depth }).map((_, i) => (
@@ -557,29 +583,33 @@ function DeviceRow({
 // full-width beneath the grid row (col-span-full), so the tabbed panel stays
 // identical across both views. Tree depth/collapse are list affordances and
 // don't apply here; the parent name carries the context an indent would.
-function DeviceCard({ device, canWrite, onEdit, focus, parentName }: {
+function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
   onEdit: (d: OrgDevice) => void
   focus?: boolean
   parentName?: string
+  drill: DrillIn
 }) {
-  const { detailOpen, setDetailOpen, detailTab, setDetailTab, openTab, ref } = useDrillIn(focus)
+  const { open: detailOpen, onToggle, openTab } = drill
+  const ref = useFocusScroll(focus)
   useNow()
   const hasOptics = isOpticalOlt(device)
   const hasPorts = device.snmp_enabled === 1
   const passive = isPassiveType(device.device_type)
   const unassigned = !device.assigned_node_id && !passive
 
+  // The expanded detail is rendered by the grid at the end of this card's visual
+  // row (see TopologyPage) — inserting it right here would push the cards to this
+  // card's right onto the next line. The card itself only reflects open-ness.
   return (
-    <>
-      <div
-        ref={ref}
-        className={cn("group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
-          detailOpen && "border-border-strong bg-popover")}
-        onClick={() => setDetailOpen(!detailOpen)}
-        title={detailOpen ? undefined : "Click for details"}
-      >
+    <div
+      ref={ref}
+      className={cn("group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
+        detailOpen && "border-border-strong bg-popover")}
+      onClick={onToggle}
+      title={detailOpen ? undefined : "Click for details"}
+    >
         <div className="flex items-center gap-2">
           <span className="inline-flex shrink-0" title={unassigned ? "no probe assigned, not monitored"
             : device.state && isStale(device.state_updated_at)
@@ -605,15 +635,7 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName }: {
             <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
           </div>
         </div>
-      </div>
-      {detailOpen && (
-        <div className="col-span-full">
-          <div className="wisp-drillin px-3 pt-1 pb-3">
-            <DeviceDetail device={device} tab={detailTab} onTab={setDetailTab} />
-          </div>
-        </div>
-      )}
-    </>
+    </div>
   )
 }
 
@@ -680,6 +702,17 @@ export function TopologyPage() {
   const [collapsed, setCollapsed] = useState<Set<number>>(() => loadCollapsed(scopeOrg))
   const [probeFilter, setProbeFilter] = useState<string | null>(navState?.probeId ?? null)
   const [view, setView] = useState<ViewMode>(loadView)
+  // Which device is drilled in, page-wide — one at a time, so opening another
+  // auto-closes it. A row/card gets a controlled `DrillIn` derived from this.
+  const [open, setOpen] = useState<{ id: number; tab: DeviceTab } | null>(null)
+  const cols = useGridCols()
+  const drillFor = (id: number): DrillIn => ({
+    open: open?.id === id,
+    tab: open?.id === id ? open.tab : "health",
+    onToggle: () => setOpen((o) => (o?.id === id ? null : { id, tab: "health" })),
+    onTab: (t) => setOpen((o) => (o?.id === id ? { id, tab: t } : o)),
+    openTab: (t) => setOpen({ id, tab: t }),
+  })
 
   const changeView = (v: ViewMode) => {
     setView(v)
@@ -689,6 +722,8 @@ export function TopologyPage() {
   useEffect(() => { setCollapsed(loadCollapsed(scopeOrg)) }, [scopeOrg])
   // arriving from a stale-probe card while already mounted
   useEffect(() => { if (navState?.probeId) setProbeFilter(navState.probeId) }, [navState?.probeId])
+  // deep-link (Home row / command palette) opens the target's panel
+  useEffect(() => { if (focusId != null) setOpen({ id: focusId, tab: "health" }) }, [focusId])
   const toggleCollapse = (id: number) => setCollapsed((prev) => {
     const next = new Set(prev)
     if (next.has(id)) next.delete(id)
@@ -759,6 +794,12 @@ export function TopologyPage() {
   // grid flattens the tree (a card grid can't carry indent/collapse); parent-
   // before-child order still groups sensibly and each card names its parent.
   const ordered = treeOrder(devices, gridView ? new Set<number>() : collapsed)
+  // Grid drill-in: place the open card's detail after the LAST card in its visual
+  // row, so its right-hand neighbours keep their row instead of jumping a line.
+  const openIndex = open ? ordered.findIndex((d) => d.id === open.id) : -1
+  const openRowEnd = openIndex < 0 ? -1
+    : Math.min(Math.floor(openIndex / cols) * cols + cols - 1, ordered.length - 1)
+  const openDevice = openIndex < 0 ? null : ordered[openIndex]
   const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
   const nodeIds = activeNodes.map((n) => n.node_id)
@@ -837,13 +878,22 @@ export function TopologyPage() {
         )}
         {devices.length > 0 && (gridView ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-            {ordered.map((d) => (
+            {ordered.map((d, i) => (
               <Fragment key={d.id}>
                 <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit} focus={d.id === focusId}
+                  drill={drillFor(d.id)}
                   parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined} />
                 {formOpen && editing?.id === d.id && (
                   <div className="col-span-full rounded-lg border bg-muted/30 p-3">
                     <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
+                  </div>
+                )}
+                {i === openRowEnd && openDevice && (
+                  <div className="col-span-full">
+                    <div className="wisp-drillin px-3 pt-1 pb-3">
+                      <DeviceDetail device={openDevice} tab={open!.tab}
+                        onTab={(t) => setOpen((o) => (o ? { ...o, tab: t } : o))} />
+                    </div>
                   </div>
                 )}
               </Fragment>
@@ -855,7 +905,7 @@ export function TopologyPage() {
               <Fragment key={d.id}>
                 <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
                   collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)}
-                  focus={d.id === focusId} />
+                  focus={d.id === focusId} drill={drillFor(d.id)} />
                 {formOpen && editing?.id === d.id && (
                   <div className="border-t bg-muted/30 p-3">
                     <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />

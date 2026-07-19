@@ -63,6 +63,18 @@ export interface ProxyAudit {
   device_name: string | null
 }
 
+/** A device's stored web-UI login (GET /api/inventory/credentials, owner-only).
+    The password itself never crosses the wire — only whether one is set. */
+export interface WebUiCredentials {
+  username: string
+  has_password: boolean
+  /** basic = central injects Authorization: Basic into the proxy fetch (no
+      popup, password never reaches the browser); form = login-form device. */
+  auth_mode: "basic" | "form"
+  updated_by: string | null
+  updated_at: string | null
+}
+
 export type Plan = "free" | "pro" | "vip"
 /** free = no billing; due_soon = ≤3 days of paid runway; locked = current
     month unpaid → the server 402s everything but /api/me + /api/billing. */
@@ -94,8 +106,9 @@ export interface BillingInfo {
   node_count: number
   node_cap: number | null
   gpay_number: string
-  /** public Razorpay key id; null = gateway not configured, GPay fallback */
-  razorpay_key_id: string | null
+  /** UPIGateway configured server-side (its key is a secret — the browser
+      only ever learns the boolean); false = manual GPay fallback */
+  upi_enabled: boolean
   plans: Record<Plan, PlanSpec>
 }
 

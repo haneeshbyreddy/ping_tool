@@ -43,7 +43,7 @@ deployed v0.15.7 edge):**
   offers http/https, last-working port first (remembered in localStorage);
   blank tab opened synchronously so popup blockers don't eat it. Moved OUT of
   the three-dots menu (2026-07-16, user ask) — that menu is write-actions only
-  again. Owner/operator + org flag gated. Settings → "Device web UI sessions"
+  again. Owner-only + org flag gated. Settings → "Device web UI sessions"
   card (open/recent sessions, live badge, Close, owner-only audit trail);
   Organizations page superadmin "web UI" toggle per org
   (`orgsApi.save({web_proxy})`).
@@ -88,7 +88,7 @@ scope v1). Grounded in the existing diagnostic-SNMP-walk path
 | Piece | Where |
 | --- | --- |
 | `proxy_sessions` + `proxy_audit` tables, `orgs.web_proxy` flag | `store.py` `_SCHEMA`/`_ensure_columns`, `store_proxy.py` mixin |
-| Role gate (owner/operator/superadmin open; owner/creator close; audit view owner-only) | `api/proxy.py` |
+| Role gate (owner/superadmin open AND drive; owner/creator close; audit view owner-only) | `api/proxy.py` |
 | Per-org capability flag, checked on create AND every proxied request (revoke kills live sessions) | `api/proxy.py`, `api/orgs.py:update` (superadmin-only field) |
 | TTL slides on activity (hub authoritative, DB row synced ≤ every 20 s) | `central/proxy.py:extend_session`, `api/proxy.py` |
 | Audit row per proxied request incl. 502/504; pruned at 60 days | `store_proxy.py`, `api/proxy.py:browser_request` |

@@ -242,6 +242,11 @@ class Config:
         default_factory=lambda: _env_int("WISP_TRACEMALLOC_EVERY", 0))
     central_db: Path = field(
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
+    # Master key for at-rest encryption of stored device secrets (web-UI logins;
+    # central/secretbox.py). Base64 (>=32 bytes) or a passphrase. Empty = central
+    # generates and reuses a 0600 `secret.key` beside central.db. Keep it stable:
+    # rotating it makes previously-stored device passwords undecryptable.
+    secret_key: str = field(default_factory=lambda: _env("WISP_SECRET_KEY", ""))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
     # Release mirror: central pulls the latest release's assets (installers +

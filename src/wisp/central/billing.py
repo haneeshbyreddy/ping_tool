@@ -1,10 +1,11 @@
 """Subscription paywall: plan catalog, month math, and the reminder sweeper.
 
-The model is deliberately manual — there is no payment gateway. A paid-plan org
-pays the platform admin by GPay every month and the admin marks that month paid
-(``org_billing_months``) from the Organizations page, as far ahead as he likes
-(pre-marking future months IS the "no warning this month" switch). The pure
-status math lives here; enforcement is elsewhere:
+Payment is self-serve when the gateway is configured
+(``central/upigateway.py``); with no key the model falls back to manual — a
+paid-plan org pays the platform admin by GPay and the admin marks that month
+paid (``org_billing_months``) from the Organizations page, as far ahead as he
+likes (pre-marking future months IS the "no warning this month" switch). The
+pure status math lives here; enforcement is elsewhere:
 
 - dashboard lock: ``server.py``'s 402 gate (``org_locked``) — edge ingest,
   monitoring and outage paging are NEVER gated (a lapsed bill must not silence
@@ -173,15 +174,21 @@ def org_locked(store, org_id: str, now: datetime | None = None) -> bool:
 
 
 class BillingSweeper:
-    """Pages each paid-plan org's owner topic on billing transitions only."""
+    """Pages each paid-plan org's owner topic on billing transitions only —
+    and reconciles pending UPIGateway orders, so a payment whose browser tab
+    died before the redirect still gets marked paid within one sweep."""
 
-    def __init__(self, store, cfg: Config = CONFIG, notifier=None) -> None:
+    def __init__(self, store, cfg: Config = CONFIG, notifier=None,
+                 upi=None) -> None:
+        from wisp.central.upigateway import UpiGateway
         self.store = store
         self.cfg = cfg
         self.notifier = notifier or build_notifier(cfg)
+        self.upi = upi or UpiGateway(store)
 
     def check(self, now: datetime | None = None) -> list[tuple[str, str, str]]:
         now = now or datetime.now(timezone.utc)
+        self.reconcile_upi()
         sent: list[tuple[str, str, str]] = []
         for org in self.store.billing_orgs():
             st = compute_status(org["plan"], self.store.paid_months(org["org_id"]), now)
@@ -193,16 +200,50 @@ class BillingSweeper:
                     sent.append((org["org_id"], st["due_month"], "locked"))
         return sent
 
+    def reconcile_upi(self) -> int:
+        """Settle pending UPIGateway orders against the gateway's status API.
+        The safety net behind the SPA's verify poll and the return redirect —
+        per-order best-effort, a gateway hiccup never stalls the reminder
+        sweep. Returns how many orders settled this pass."""
+        if not self.upi.enabled:
+            return 0
+        from wisp.central.upigateway import GatewayError, attempt_settle
+        settled = 0
+        for pay in self.store.pending_billing_payments("upigateway"):
+            try:
+                _, done = attempt_settle(self.store, self.upi, pay,
+                                         on_paid=self._notify_paid)
+                settled += done
+            except GatewayError:
+                log.warning("upi reconcile: status check failed for %s",
+                            pay["order_id"])
+            except Exception:
+                log.exception("upi reconcile failed for %s", pay["order_id"])
+        return settled
+
+    def _notify_paid(self, pay: dict, upi_txn: str) -> None:
+        # same heads-up channel as the checkout paths; best-effort
+        topic = self.cfg.central_ntfy_topic
+        if not topic:
+            return
+        try:
+            name = self.store.org_name(pay["org_id"]) or pay["org_id"]
+            self.notifier.send(
+                topic, f"💰 {name} paid ₹{pay['amount_paise'] // 100:,}",
+                f"{pay['plan']} · {', '.join(pay['months'])}"
+                f" · UPIGateway {upi_txn} (reconciled)", 3)
+        except Exception:
+            log.exception("payment notification failed for %s", pay["org_id"])
+
     def _notify(self, org: dict, kind: str, month: str, st: dict,
                 now: datetime) -> bool:
         prior = self.store.billing_notice(org["org_id"], month, kind)
         if prior in ("sent", "skipped"):
             return False
         price = PLANS[org["plan"]]["price_inr"]
-        # with Razorpay configured the dashboard IS the checkout; the GPay
+        # with the gateway configured the dashboard IS the checkout; the GPay
         # number only rides the page as the manual fallback
-        if (self.store.get_setting("razorpay_key_id")
-                and self.store.get_setting("razorpay_key_secret")):
+        if self.store.get_setting("upigateway_key"):
             how = "pay online from the dashboard"
         else:
             how = f"GPay {gpay_number(self.store)}"

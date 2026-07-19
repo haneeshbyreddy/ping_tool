@@ -2,16 +2,26 @@
 // switch/OLT and drive its native web UI from the dashboard. The heavy lifting
 // is server-side (browser → central → edge → device); this file is the "Open
 // web UI" menu entry, the sessions/audit card, and nothing else.
+import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronDown, ExternalLink, Globe, Lock } from "lucide-react"
+import { ChevronDown, ExternalLink, Globe, KeyRound, Lock } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
-import { orgsApi, proxyApi, ApiError } from "@/lib/api"
+import { orgsApi, proxyApi, inventoryApi, ApiError } from "@/lib/api"
 import type { OrgDevice, ProxySession } from "@/lib/types"
 import { ago } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -29,15 +39,140 @@ function useOrgProxyFlag(): boolean {
   return !!data?.orgs.find((o) => o.org_id === scopeOrg)?.web_proxy
 }
 
-/** Whether the current user may open web-UI sessions in the scoped org:
-    the org capability flag AND owner/operator role — same gate the server
-    enforces on POST /api/proxy/session. */
+/** Whether the current user may open (and drive) web-UI sessions in the scoped
+    org: the org capability flag AND owner role — same gate the server enforces
+    on POST /api/proxy/session and the /api/proxy/<sid>/ browse path. Operators
+    and techs are locked out of device admin UIs entirely. */
 export function useWebProxy(): boolean {
   const { user } = useAuth()
   const flag = useOrgProxyFlag()
-  const roleOk = !!user && (user.is_superadmin
-    || user.role === "owner" || user.role === "operator")
+  const roleOk = !!user && (user.is_superadmin || user.role === "owner")
   return flag && roleOk
+}
+
+/** Whether the current user may MANAGE stored device logins: the org proxy
+    capability AND owner role — the same gate the server enforces on
+    POST /api/inventory/credentials. Same owner-only gate as opening a session. */
+export function useCanManageCreds(): boolean {
+  const { user } = useAuth()
+  const flag = useOrgProxyFlag()
+  const roleOk = !!user && (user.is_superadmin || user.role === "owner")
+  return flag && roleOk
+}
+
+/** Owner-only editor for a device's web-UI login. Stored encrypted server-side
+    (central/secretbox.py); the password is write-only from here — we only ever
+    learn whether one is set, never read it back. Caller gates with
+    useCanManageCreds()/canOpenWebUi. */
+export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
+  const queryClient = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [username, setUsername] = useState("")
+  const [password, setPassword] = useState("")
+  const [authMode, setAuthMode] = useState<"basic" | "form">("form")
+
+  const creds = useQuery({
+    queryKey: ["webui-creds", device.id],
+    queryFn: () => inventoryApi.credentials(device.id),
+    enabled: open,
+  })
+  const hasPassword = !!creds.data?.credentials.has_password
+
+  // seed the fields once the current values land
+  function onOpenChange(next: boolean) {
+    if (next) {
+      setPassword("")
+      setUsername("")
+      setAuthMode("form")
+      void creds.refetch().then((r) => {
+        setUsername(r.data?.credentials.username ?? "")
+        setAuthMode(r.data?.credentials.auth_mode ?? "form")
+      })
+    }
+    setOpen(next)
+  }
+
+  const save = useMutation({
+    // password left blank => omit it so a username-only edit keeps the stored
+    // password; a typed value replaces it.
+    mutationFn: () => inventoryApi.setCredentials(device.id, {
+      username: username.trim(),
+      auth_mode: authMode,
+      ...(password === "" ? {} : { password }),
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["webui-creds", device.id] })
+      toast.success(`Saved web UI login for ${device.name}`)
+      setOpen(false)
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save the login"),
+  })
+  const clear = useMutation({
+    mutationFn: () => inventoryApi.clearCredentials(device.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["webui-creds", device.id] })
+      toast.success(`Removed the stored login for ${device.name}`)
+      setOpen(false)
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to remove the login"),
+  })
+  const busy = save.isPending || clear.isPending
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
+        title="Store this device's web UI login" onClick={() => onOpenChange(true)}>
+        <KeyRound className="size-3.5 text-muted-foreground" /> Login
+        {hasPassword && <span className="size-1.5 rounded-full bg-success" />}
+      </Button>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Web UI login — {device.name}</DialogTitle>
+          <DialogDescription>
+            Stored encrypted so a tech never retypes it. The password is write-only
+            here — it is never shown again after saving.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-3 py-1">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="wui-user">Username</Label>
+            <Input id="wui-user" autoComplete="off" value={username}
+              onChange={(e) => setUsername(e.target.value)} placeholder="admin" />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="wui-pass">Password</Label>
+            <Input id="wui-pass" type="password" autoComplete="new-password"
+              value={password} onChange={(e) => setPassword(e.target.value)}
+              placeholder={hasPassword ? "•••••••• (leave blank to keep)" : "not set"} />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="wui-mode">Login type</Label>
+            <Select value={authMode} onValueChange={(v) => setAuthMode(v as "basic" | "form")}>
+              <SelectTrigger id="wui-mode"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="form">Login form</SelectItem>
+                <SelectItem value="basic">Basic auth (browser popup)</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-2xs text-muted-foreground">
+              {authMode === "basic"
+                ? "Signed in automatically when you open the web UI — the login never touches your browser."
+                : "The login page is pre-filled when you open the web UI; you still solve any captcha and click sign in."}
+            </p>
+          </div>
+        </div>
+        <DialogFooter className="gap-2 sm:justify-between">
+          {(hasPassword || (creds.data?.credentials.username ?? "") !== "") ? (
+            <Button variant="ghost" size="sm" className="text-destructive"
+              disabled={busy} onClick={() => clear.mutate()}>Remove</Button>
+          ) : <span />}
+          <Button size="sm" disabled={busy} onClick={() => save.mutate()}>
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 /** The live tunnel session against one device, if any. Shares the
@@ -60,8 +195,9 @@ export function useLiveWebSession(device: OrgDevice): ProxySession | undefined {
     globe while this device's web UI tunnel is live, nothing otherwise. Click
     jumps back into the session tab. */
 export function WebUiLiveIcon({ device }: { device: OrgDevice }) {
+  const allowed = useWebProxy()
   const sess = useLiveWebSession(device)
-  if (!sess) return null
+  if (!allowed || !sess) return null
   return (
     <span title={`Web UI session live · opened ${ago(sess.created_at)} — click to open`}
       className="inline-flex cursor-pointer"
@@ -121,34 +257,47 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
 }
 
 /** The device panel's "Web UI" button (right of the Health/Optical/Ports
-    tabs): a compact dropdown offering http/https, last-used first. Both stay
-    reachable — a device whose firmware moves ports must remain switchable.
-    Caller gates with useWebProxy()/canOpenWebUi. */
+    tabs): a split button — the primary "Connect" opens in one click using the
+    last-used port (http by default), and the chevron still offers http/https
+    explicitly. Both stay reachable — a device whose firmware moves ports must
+    remain switchable. Caller gates with useWebProxy()/canOpenWebUi. */
 export function WebUiButton({ device }: { device: OrgDevice }) {
   const queryClient = useQueryClient()
   const last = lastPort(device.id)
   const order: Array<80 | 443> = last === 443 ? [443, 80] : [80, 443]
+  const primary = order[0] // last used, or http for a device never opened
   const open = (p: 80 | 443) => void openDeviceWebUi(device, p).then((ok) => {
     // surface the live strip / Settings card row now, not on the next poll
     if (ok) queryClient.invalidateQueries({ queryKey: ["proxy-sessions"] })
   })
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1.5 px-2.5 text-xs">
-          <Globe className="size-3.5 text-muted-foreground" /> Web UI
-          <ChevronDown className="size-3 text-muted-foreground" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        {order.map((p) => (
-          <DropdownMenuItem key={p} onClick={() => open(p)}>
-            {p === 443 ? <Lock /> : <Globe />} {p === 443 ? "https" : "http"}
-            {last === p && <span className="ml-auto pl-2 text-2xs text-muted-foreground">last used</span>}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <div className="flex shrink-0 items-center">
+      <Button variant="outline" size="sm"
+        className="h-7 gap-1.5 rounded-r-none border-r-0 px-2.5 text-xs"
+        title={`Open the web UI over ${primary === 443 ? "https" : "http"}`}
+        onClick={() => open(primary)}>
+        <Globe className="size-3.5 text-muted-foreground" /> Connect
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="outline" size="sm" className="h-7 rounded-l-none px-1.5"
+            aria-label="Choose http or https">
+            <ChevronDown className="size-3 text-muted-foreground" />
+          </Button>
+        </DropdownMenuTrigger>
+        {/* z above the map's z-[1000] device panel — that Card is a backdrop-blur
+            stacking context, so the default z-50 menu paints behind it (invisible
+            on /map). Higher wins everywhere else too. */}
+        <DropdownMenuContent align="end" className="z-[1100]">
+          {order.map((p) => (
+            <DropdownMenuItem key={p} onClick={() => open(p)}>
+              {p === 443 ? <Lock /> : <Globe />} {p === 443 ? "https" : "http"}
+              {last === p && <span className="ml-auto pl-2 text-2xs text-muted-foreground">last used</span>}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   )
 }
 
@@ -234,7 +383,7 @@ export function WebProxyCard({ org }: { org: string }) {
               via {s.node_id} · {ago(s.created_at)}
             </span>
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {s.status === "open" && s.live && (
+              {s.status === "open" && s.live && isOwner && (
                 <Button variant="ghost" size="sm" className="h-6 px-2 text-xs"
                   onClick={() => window.open(`/api/proxy/${s.sid}/`, "_blank")}>
                   <ExternalLink className="size-3" /> Open

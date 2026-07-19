@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import api, auth, billing, inventory, pki, razorpay
+from wisp.central import api, auth, billing, inventory, pki, secretbox, upigateway
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
@@ -44,19 +44,21 @@ _STATIC = Path(__file__).resolve().parent / "static"
 
 # Routes a LOCKED org's session may still reach: exactly what the lock screen
 # needs to render (who am I + how much do I owe) plus logout — and the
-# Razorpay checkout routes plus the free-plan escape hatch, so a locked org
+# checkout routes plus the free-plan escape hatch, so a locked org
 # can pay its way out (or drop to Free) right there.
 _BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout",
                    "/api/billing/order", "/api/billing/verify",
-                   "/api/billing/plan", "/healthz"}
+                   "/api/billing/plan", "/api/billing/upi-return", "/healthz"}
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
-                  engine_registry: EngineRegistry | None = None, payments=None):
+                  engine_registry: EngineRegistry | None = None, upi=None,
+                  secret_box=None):
     token = cfg.central_token
     client_ca = cfg.central_client_ca
     notifier = notifier or build_notifier(cfg)
     registry = engine_registry or EngineRegistry(store, cfg)
-    payments = payments or razorpay.RazorpayGateway(store)
+    upi = upi or upigateway.UpiGateway(store)
+    secret_box = secret_box or secretbox.from_config(cfg)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "wisp-central"
@@ -455,7 +457,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.store = store
     Handler.notifier = notifier
     Handler.registry = registry
-    Handler.payments = payments
+    Handler.upi = upi
+    Handler.secretbox = secret_box
     Handler.proxy = ProxyHub()
     return Handler
 
@@ -488,10 +491,10 @@ def _build_tls_context(cfg: Config) -> ssl.SSLContext | None:
 
 def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
                 notifier=None, engine_registry: EngineRegistry | None = None,
-                payments=None) -> ThreadingHTTPServer:
+                upi=None, secret_box=None) -> ThreadingHTTPServer:
     store = store or CentralStore(cfg.central_db)
     handler = _make_handler(cfg, store, LoginThrottle(), notifier,
-                            engine_registry, payments)
+                            engine_registry, upi, secret_box)
     tls_context = _build_tls_context(cfg)
     if tls_context is not None:
         httpd = _TLSThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler, tls_context)

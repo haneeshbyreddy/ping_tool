@@ -83,7 +83,7 @@ class ComputeStatusTest(unittest.TestCase):
 
 
 class MonthsToPayTest(unittest.TestCase):
-    """What one Razorpay checkout buys: the next N unpaid months."""
+    """What one checkout buys: the next N unpaid months."""
 
     def test_locked_org_starts_at_current_month(self):
         now = _utc(2026, 7, 16)
@@ -109,43 +109,50 @@ class MonthsToPayTest(unittest.TestCase):
                          ["2027-01", "2027-02"])
 
 
-class RazorpaySignatureTest(unittest.TestCase):
-    """The gateway's pure parts: HMAC verification + enabled gating. Order
-    creation (the one network call) is exercised via a double in
-    integration/test_central_billing."""
+class UpiGatewayUnitTest(unittest.TestCase):
+    """UPIGateway's pure parts: the IST txn-date derivation and
+    attempt_settle's short-circuits. The network calls are exercised via a
+    double in integration/test_central_billing."""
 
     def setUp(self):
-        import hashlib as _hashlib
-        import hmac as _hmac
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "c.db")
-        from wisp.central.razorpay import RazorpayGateway
-        self.gw = RazorpayGateway(self.store)
-        self.sign = lambda msg, secret: _hmac.new(
-            secret.encode(), msg.encode(), _hashlib.sha256).hexdigest()
+        from wisp.central.upigateway import UpiGateway
+        self.gw = UpiGateway(self.store)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_disabled_until_both_keys_set(self):
+    def test_enabled_rides_the_key(self):
         self.assertFalse(self.gw.enabled)
-        self.store.set_setting("razorpay_key_id", "rzp_test_x")
-        self.assertFalse(self.gw.enabled)
-        self.store.set_setting("razorpay_key_secret", "sekrit")
+        self.store.set_setting("upigateway_key", "k")
         self.assertTrue(self.gw.enabled)
 
-    def test_signature_roundtrip(self):
-        self.store.set_setting("razorpay_key_secret", "sekrit")
-        good = self.sign("order_1|pay_1", "sekrit")
-        self.assertTrue(self.gw.verify_signature("order_1", "pay_1", good))
-        self.assertFalse(self.gw.verify_signature("order_1", "pay_2", good))
-        self.assertFalse(self.gw.verify_signature("order_1", "pay_1",
-                                                  self.sign("order_1|pay_1", "wrong")))
-        self.assertFalse(self.gw.verify_signature("order_1", "pay_1", ""))
+    def test_ist_txn_date_crosses_midnight(self):
+        from wisp.central.upigateway import ist_txn_date
+        # 20:00 UTC = 01:30 IST the NEXT day — their servers key on IST
+        self.assertEqual(ist_txn_date("2026-07-16T20:00:00+00:00"),
+                         "17-07-2026")
+        self.assertEqual(ist_txn_date("2026-07-16T10:00:00+00:00"),
+                         "16-07-2026")
+        # naive timestamps (SQLite datetime('now') style) read as UTC
+        self.assertEqual(ist_txn_date("2026-12-31T19:00:00"), "01-01-2027")
 
-    def test_no_secret_never_verifies(self):
-        good = self.sign("order_1|pay_1", "sekrit")
-        self.assertFalse(self.gw.verify_signature("order_1", "pay_1", good))
+    def test_attempt_settle_never_calls_gateway_on_dead_rows(self):
+        from wisp.central.upigateway import attempt_settle
+
+        class Boom:
+            def order_status(self, *a):  # any call = the guard failed
+                raise AssertionError("gateway asked about a settled row")
+
+        base = {"order_id": "x", "org_id": "ispA", "plan": "pro",
+                "months": ["2026-07"], "created_at": "2026-07-16T10:00:00+00:00"}
+        self.assertEqual(attempt_settle(self.store, Boom(),
+                                        {**base, "status": "paid"}),
+                         ("success", False))
+        self.assertEqual(attempt_settle(self.store, Boom(),
+                                        {**base, "status": "failed"}),
+                         ("failure", False))
 
 
 class SweeperTest(unittest.TestCase):

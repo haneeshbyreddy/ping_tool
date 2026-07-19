@@ -134,20 +134,31 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   fresh (same box): `port_walk_timeout_s` (60s, ifTable) and `gpon_walk_timeout_s`
   (75s, ONU roster). Both field-diagnosed 2026-07-09. Don't collapse them back.
 - **Three separate sweep CLOCKS too, not one** (2026-07-17) — same lesson as the
-  caps, one layer up. `snmp_interval_s` (300s) is health AND the master gate
-  (`<=0` = all SNMP off); `port_interval_s` (120s) and `gpon_interval_s` (180s)
-  ride their own. Until this split, one 90s clock fired all three walks on the
+  caps, one layer up. `snmp_interval_s` is health AND the master gate
+  (`<=0` = all SNMP off); `port_interval_s` and `gpon_interval_s` ride their
+  own. All three default 300s (reliability over freshness, operator's call) —
+  one failed walk still beats the 900s staleness gates that freeze roster/port
+  alert state; don't raise past ~600s without revisiting those. Until the
+  split, one 90s clock fired all three walks on the
   same tick and the next sweep was gated on ALL THREE completing — so a slow
   C-Data roster walk (75s budget) launched alongside the ifTable walk, starved
   it, and (next_snmp stamped at sweep START) overran its own period and re-fired
   immediately, walking that agent back-to-back all day. HILL-OLT-1/PYLON sat at
   0% port-walk success while their optics stayed fresh: **the polling caused the
-  failure.** Each subsystem is now gated only on its own task. Keep all three
-  well inside the 900s staleness gates that freeze roster/port alert state.
-  Known gap: each `_gather_*` builds its OWN `Semaphore(snmp_max_inflight)`, so
-  the "4 concurrent walks" bound is per-subsystem (up to 12 fleet-wide, and all
-  three can still hit one box at once when the clocks coincide). The interval
-  split makes that rare, not impossible — a shared semaphore is the real fix.
+  failure.** Each subsystem is now gated only on its own task.
+  **One `_SnmpAirtime` gate spans every SNMP subsystem** (ports/health/optics
+  gatherers + `_DiagWalkRunner`): a fleet-wide `Semaphore(snmp_max_inflight)`
+  (the bound is global now, not per-subsystem) PLUS a per-device lock so one
+  agent is never walked by two subsystems at once — load-bearing, because
+  equal 300s periods make the clocks fire on the same tick every sweep.
+  Device lock acquires BEFORE the semaphore (waiting on a busy box must not
+  pin a fleet slot). `SharedAirtimeGateTest` pins both invariants.
+  **Per-request patience matches gpon's** (2026-07-18, EDGE_HALIYA diagnosis):
+  ports/health/diag transports use `snmp_request_timeout_s` (5s) x
+  `snmp_request_retries` (3), not the bare 2s `snmp_timeout_s` x 1 — weak
+  agents answer whoever retries longest, and the strict window got ZERO
+  responses for 26h fleet-wide while optics (already patient) stayed fresh
+  on the same boxes. Don't quietly "optimize" the retries back down.
 - **One `SnmpEngine` per poller instance, NEVER one per walk** — a per-walk engine
   leaks ~1 MiB + one FD per walk forever (transport stays registered with the loop);
   FD exhaustion then reads as a fake mass outage. `PysnmpPoller`/`PysnmpGponPoller`
@@ -162,6 +173,24 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `CombinedWalkDriverTest` pins both call shapes. Unit tests inject fake
   pollers, so a bad HLAPI call only surfaces on a REAL walk — verify
   `device_snmp_status` after any edge SNMP rollout.
+- **`PysnmpPoller` is ADAPTIVE, vendor-agnostic** (2026-07-19, EDGE_HALIYA fix —
+  weak C-Data OLTs serve health+optics but drop the heavy combined ifTable GETBULK:
+  big OLTs `timeout`, small ones `no_response`). A per-device ladder walked from the
+  gentlest level that last WORKED: 0 combined (hard-capped at `_FAST_PATH_MAX_S`=15s
+  so a big box hands the rest of `port_walk_timeout_s` to the net instead of eating
+  the whole cap — the daemon's outer wait_for wraps BOTH paths), 1 per-column/25,
+  2 per-column/4. `_device_level`/`_promote_at` persist across sweeps (the daemon
+  reuses ONE poller) and re-probe one rung faster every `_PROMOTE_INTERVAL_S` (6h) so
+  a firmware/hardware change self-heals — NO vendor hardcode. **The per-column net is
+  now TOLERANT like the health walk** (`_percolumn_walk`): a dropped column is
+  skipped, never fatal — the old `raise`-on-first-drop is why small OLTs no_responsed
+  though the same box's health walk succeeded. Status columns first (`_PERCOLUMN_ORDER`
+  admin/oper/name…) so a budget-bounded partial still yields port up/down. A genuinely
+  dead agent (nothing answers) still RE-RAISES so the daemon keeps the no_response
+  classification; an agent that answers but has no ifTable returns `[]` (→ `empty`).
+  `AdaptivePortWalkTest` pins tolerance, status-first, the time box, the memory, and
+  the dead-agent re-raise. Unit tests inject fake pollers, so a bad HLAPI call only
+  surfaces on a REAL walk — verify `device_snmp_status` after any edge SNMP rollout.
 - **Port alarms** (`central/ports.py`): monitored-only, admin-down silent, one alarm
   not two — a port-down folds into the open outage via `stamp_outage_cause` COALESCE
   (never clobbers a post-mortem); no open outage = heads-up; SNMP never opens an
@@ -295,25 +324,37 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   and on lock; failed sends retry next sweep, 'skipped' (no topic) doesn't.
   Free never locks. Tests: `unit/test_billing`,
   `integration/test_central_billing`.
-- **Payments are Razorpay self-serve** (`central/razorpay.py`, 2026-07-16 —
-  pure stdlib: one urllib order POST + HMAC-SHA256 verify, NO razorpay SDK).
-  Keys in `app_settings` (`razorpay_key_id`/`razorpay_key_secret`,
-  superadmin-pasted, Settings → Payments; re-read per call, no restart) —
-  key_id ships to browsers, the secret never does. `POST /api/billing/order`
-  (owner-only, months 1–12 via `billing.months_to_pay` — skips prepaid
-  islands) then `POST /api/billing/verify`: HMAC over `order_id|payment_id`,
-  and `settle_billing_payment`'s status='created' guard applies plan+months
+- **Payments are UPIGateway self-serve** (`central/upigateway.py`,
+  2026-07-16 — pure stdlib urllib, NO SDK; picked after Razorpay rejected the
+  unregistered-business account, and the whole Razorpay integration was
+  REMOVED the same day). The key lives in `app_settings` (`upigateway_key`,
+  superadmin-pasted, Settings → Payments; re-read per call, no restart) and
+  is a SECRET — browsers only ever see `upi_enabled` + per-order
+  `payment_url`. `POST /api/billing/order` (owner-only, months 1–12 via
+  `billing.months_to_pay` — skips prepaid islands) opens their hosted QR
+  page; **settlement is ONLY central's own `check_order_status` call — the
+  browser redirect/query string are NEVER trusted** (no signed handshake
+  exists; `upigateway.attempt_settle` is the single funnel).
+  `settle_billing_payment`'s status='created' guard applies plan+months
   EXACTLY once (verify is idempotent; `billing_payments` is the ledger,
-  marked_by `razorpay:<payment_id>`). Plan moves are self-serve: paying a
-  DIFFERENT plan's order switches to it on verify (up or down), and
+  marked_by `upigateway:<payment_id>`; failures flip the row created→failed
+  so it's never re-checked; the `gateway` column's 'razorpay' DEFAULT is a
+  tombstone quarantining pre-removal rows). **Three settle triggers, no
+  inbound webhook** (central only dials out): the SPA polls verify ('pending'
+  is a normal 200), sessionless `GET /api/billing/upi-return` (their browser
+  redirect) settles on the way back, and `BillingSweeper.reconcile_upi`
+  catches abandoned tabs within a sweep. check_order_status keys on the IST
+  calendar date (`ist_txn_date`), not UTC. Plan moves are self-serve: paying
+  a DIFFERENT plan's order switches to it on settle (up or down), and
   `POST /api/billing/plan` accepts ONLY 'free' (the no-payment escape hatch —
-  a paid plan must never be enterable without paying). All three routes are
-  `_BILLING_EXEMPT` — a locked org pays its way out or drops to Free — and
-  `create_order` (network) runs outside any DB lock (dispatch rule). No keys = `enabled` False: Pay buttons vanish, the
-  manual GPay flow returns (`app_settings.billing_gpay_number`, default in
-  billing.py; admin marks months by hand). The gateway is injectable
-  (`make_server(payments=…)`, notifier pattern); tests stub `_post` only, so
-  a real order POST is only proven against live keys.
+  a paid plan must never be enterable without paying). order/verify/plan/
+  upi-return are `_BILLING_EXEMPT` — a locked org pays its way out or drops
+  to Free — and the gateway's network calls run outside any DB lock
+  (dispatch rule). No key = Pay buttons vanish, the manual GPay flow returns
+  (`app_settings.billing_gpay_number`, default in billing.py; admin marks
+  months by hand). The gateway is injectable (`make_server(upi=…)`, notifier
+  pattern); tests stub `_post` only, so the real API shape is only proven
+  against a live key.
 - **New columns on existing tables need `_ensure_columns`** in
   `CentralStore.__init__` or an existing `central.db` keeps the old schema. New
   tables need nothing.
@@ -621,6 +662,15 @@ curl-script installers, and the vanilla-JS dashboard.
 `core/state_machine.py`, `core/analytics.py`, `core/baseline.py` are alive — central
 imports them; grep before deleting anything in `core/`.
 
+Also gone (2026-07-16, same-day build-and-remove): the Razorpay checkout —
+`central/razorpay.py`, `web/src/lib/razorpay.ts`, the HMAC verify path, the
+`razorpay_key_id`/`razorpay_key_secret` settings and their UI. Razorpay
+refused the account (individual, no GST); UPIGateway replaced it. Dead
+`razorpay_*` rows may linger in `app_settings` on prod, and
+`billing_payments.gateway` keeps a `'razorpay'` DEFAULT purely as the
+quarantine tombstone for that era's test rows — both harmless, don't
+"clean them up" into a migration.
+
 Five tags survive (`v0.13.0`–`v0.15.1`); only `v0.14.0`/`v0.15.0`/`v0.15.1` carry a
 GitHub Release, and those are the artifacts the fleet self-updates from. `v0.1.x`–
 `v0.12.1` went with the history they pointed at. **`v0.14.0` is the rollback floor** —
@@ -634,4 +684,5 @@ doubles — no real ntfy/central network. Key files: `unit/test_state_machine`,
 `test_probers`, `test_snmp`, `test_gpon`, `test_health`, `test_supervisor`,
 `test_releasesync`, `test_central_inventory`, `test_central_pki`, `test_edge_status`;
 `integration/test_central*`, `test_daemon*`, `test_notifiers`,
-`test_single_instance`.
+`test_single_instance`. `unit/test_billing` + `integration/test_central_billing`
+cover both checkout gateways with canned doubles.

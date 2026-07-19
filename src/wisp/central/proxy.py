@@ -22,6 +22,7 @@ its own device list before fetching (ingress/webproxy.py). No raw-IP path exists
 """
 from __future__ import annotations
 
+import json
 import queue
 import re
 import secrets
@@ -68,6 +69,17 @@ class ProxySession:
     # last time the DB session record was synced — activity extends the TTL on
     # every asset request, but the row is only touched every ~20s (api/proxy.py)
     db_synced_at: float = field(default=0.0, compare=False)
+    # Ready-to-send "Basic <token>" header, resolved ONCE from the device's
+    # stored web-UI login when the session opens (api/proxy.py), so the tech
+    # never sees the HTTP-auth popup and the password never touches the browser.
+    # None = no stored Basic login (or the key couldn't decrypt it). In-memory
+    # only, like the session itself — a central restart re-resolves on reopen.
+    injected_auth: str | None = field(default=None, compare=False)
+    # (username, password) for a FORM-login device (auth_mode='form'): the login
+    # page gets an autofill script injected into its HTML (inject_autofill). Unlike
+    # injected_auth the password reaches the browser here (a form's JS may hash it
+    # client-side, so we must fill the real field) — inherent to form login.
+    autofill: tuple[str, str] | None = field(default=None, compare=False)
 
 
 class _Pending:
@@ -276,3 +288,89 @@ def rewrite_body(sid: str, content_type: str, body: bytes) -> bytes:
     if ctype == "text/html":
         body = _ATTR_RE.sub(rb"\1=\2" + prefix + rb"/", body)
     return body
+
+
+# ---- form-login autofill (webplan.md Phase 2b) --------------------------------
+#
+# For a device whose stored login is auth_mode='form', central injects a small
+# credential-FREE bootstrap into every proxied HTML *document* (not AJAX fragments).
+# It waits for a login form to exist — a `<input type=password>`, in the page OR a
+# same-origin iframe, possibly rendered by the device's own JS AFTER load (why the
+# old "password field must be in the initial HTML" gate silently no-op'd on
+# SPA-style device UIs) — via an immediate check + MutationObserver + a polling
+# fallback. ONLY once a password field appears does it fetch the credentials from
+# central over the same session (AUTOFILL_PATH), so the plaintext never rides a
+# page with no login on it. Then it fills username + password with the
+# native-setter dance (so React/Vue-controlled inputs register the change) and
+# focuses a detected captcha box. FILL-ONLY (no auto-submit): a wrong guess must
+# not lock an account and a dynamic captcha needs a human.
+#
+# The password still reaches the browser DOM at fill time — inherent to form login
+# (a form's JS often hashes it before POST, so the real <input> must be filled).
+
+# Reserved path under a session prefix: central answers it directly with the
+# decrypted login JSON instead of forwarding to the edge (api/proxy.py).
+AUTOFILL_PATH = "__wisp_autofill__"
+
+# A full HTML document, not an AJAX HTML fragment (don't append a <script> to a
+# partial that gets innerHTML'd somewhere).
+_HTML_DOC_RE = re.compile(rb"(?i)<html[\s>]|<!doctype\s+html|</body\s*>|</head\s*>")
+_BODY_CLOSE_RE = re.compile(rb"(?i)</body\s*>")
+
+_AUTOFILL_JS = (
+    b"<script>/* wisp-autofill */(function(){\n"
+    b"var U=%URL%,C=null,fetching=false,done=false;\n"
+    b"function pw(doc){try{var a=doc.querySelectorAll('input');for(var i=0;i<a.length;i++)"
+    b"{if(a[i].type==='password')return a[i];}}catch(e){}return null;}\n"
+    b"function find(){var f=pw(document);if(f)return f;var fr=document.querySelectorAll('iframe');"
+    b"for(var i=0;i<fr.length;i++){try{var d=fr[i].contentDocument;if(d){var g=pw(d);if(g)return g;}}"
+    b"catch(e){}}return null;}\n"
+    b"function ns(el,v){try{var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:"
+    b"HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(p,'value').set.call(el,v);}"
+    b"catch(e){el.value=v;}el.dispatchEvent(new Event('input',{bubbles:true}));"
+    b"el.dispatchEvent(new Event('change',{bubbles:true}));}\n"
+    b"function cap(f){var im=f.querySelectorAll('img');for(var i=0;i<im.length;i++){"
+    b"var s=(im[i].getAttribute('src')||'').toLowerCase();"
+    b"if(/captcha|verify|checkcode|randcode|validcode|authcode|vcode|kaptcha/.test(s)){"
+    b"var t=f.querySelectorAll('input[type=text],input:not([type])');"
+    b"for(var j=0;j<t.length;j++){if(!t[j].value)return t[j];}}}return null;}\n"
+    b"function fill(p){if(done||p.value)return;var f=p.form||p.ownerDocument;"
+    b"var ins=f.querySelectorAll('input');var uf=null;for(var i=0;i<ins.length;i++){"
+    b"if(ins[i]===p)break;var ty=ins[i].type;"
+    b"if(ty==='text'||ty==='email'||ty===''||ty==='tel')uf=ins[i];}"
+    b"if(uf&&C.u&&!uf.value)ns(uf,C.u);ns(p,C.p);"
+    b"var cf=cap(f);if(cf)try{cf.focus();}catch(e){}done=true;}\n"
+    b"function go(){if(done)return;var p=find();if(!p)return;if(C){fill(p);return;}"
+    b"if(fetching)return;fetching=true;"
+    b"fetch(U,{credentials:'include',cache:'no-store'}).then(function(r){return r.json();})"
+    b".then(function(d){fetching=false;if(d&&d.p){C=d;var q=find();if(q)fill(q);}})"
+    b".catch(function(){fetching=false;});}\n"
+    b"go();try{var mo=new MutationObserver(go);mo.observe(document.documentElement,"
+    b"{childList:true,subtree:true});setTimeout(function(){try{mo.disconnect();}catch(e){}},20000);}"
+    b"catch(e){}\n"
+    b"var n=0,iv=setInterval(function(){go();if(done||++n>66)clearInterval(iv);},300);\n"
+    b"})();</script>")
+
+
+def inject_autofill(content_type: str, body: bytes, sid: str) -> bytes:
+    """Append the credential-free autofill bootstrap to a full HTML document,
+    before ``</body>`` (or at the end). Non-HTML, empty, or fragment bodies pass
+    through untouched. The bootstrap fetches the login from ``AUTOFILL_PATH`` under
+    this session only after a password field appears, so credentials never ship in
+    the page itself."""
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    # An explicit non-HTML type opts out; text/html, xhtml, OR a missing type
+    # (old firmware serves login pages with no Content-Type) fall through to the
+    # document sniff, which is what actually keeps us off fragments and non-HTML.
+    if ctype and ctype not in ("text/html", "application/xhtml+xml"):
+        return body
+    if not body or not _HTML_DOC_RE.search(body):
+        return body
+    url = json.dumps(f"/api/proxy/{sid}/{AUTOFILL_PATH}").replace("<", "\\u003c")
+    script = _AUTOFILL_JS.replace(b"%URL%", url.encode("utf-8"))
+    last = None
+    for last in _BODY_CLOSE_RE.finditer(body):
+        pass
+    if last is not None:
+        return body[:last.start()] + script + body[last.start():]
+    return body + script

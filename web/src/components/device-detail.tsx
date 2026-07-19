@@ -9,7 +9,9 @@ import type { OrgDevice, SwitchPort } from "@/lib/types"
 import { Meter } from "@/components/meter"
 import { OpticalPanel } from "@/components/optical-panel"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
-import { WebUiButton, canOpenWebUi, useWebProxy } from "@/components/web-proxy"
+import {
+  WebUiButton, WebUiCredentialsButton, canOpenWebUi, useCanManageCreds, useWebProxy,
+} from "@/components/web-proxy"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
 import { ago, durationSince, fmtBytes, fmtDur, isFresh, isStale } from "@/lib/format"
@@ -422,13 +424,15 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
 }) {
   const tabs = deviceTabs(device)
   const webUi = useWebProxy() && canOpenWebUi(device)
+  const manageCreds = useCanManageCreds() && canOpenWebUi(device)
   if (tabs.length === 1) {
     return (
       <>
-        {/* no tab row to anchor to — the button gets its own row */}
-        {webUi && (
-          <div className="mb-2 flex justify-start">
-            <WebUiButton device={device} />
+        {/* no tab row to anchor to — the buttons get their own row */}
+        {(webUi || manageCreds) && (
+          <div className="mb-2 flex justify-start gap-1.5">
+            {webUi && <WebUiButton device={device} />}
+            {manageCreds && <WebUiCredentialsButton device={device} />}
           </div>
         )}
         <DevicePerfPanel device={device} />
@@ -444,9 +448,10 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
           outside would always end up at the far edge */}
       <TabsList variant="line" className="mb-2">
         {tabs.map((t) => <TabsTrigger key={t} value={t}>{TAB_LABEL[t]}</TabsTrigger>)}
-        {webUi && (
-          <span className="ml-1 pb-1">
-            <WebUiButton device={device} />
+        {(webUi || manageCreds) && (
+          <span className="ml-1 flex items-center gap-1.5 pb-1">
+            {webUi && <WebUiButton device={device} />}
+            {manageCreds && <WebUiCredentialsButton device={device} />}
           </span>
         )}
       </TabsList>

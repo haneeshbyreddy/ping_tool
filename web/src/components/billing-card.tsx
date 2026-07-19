@@ -7,8 +7,8 @@ import {
   PLAN_ORDER, addMonths, billingStatusMeta, currentMonthKey, inr, monthLabel, monthShort,
 } from "@/lib/billing"
 import type { BillingInfo, Plan } from "@/lib/types"
-import { RazorpayWell } from "@/components/billing-lock"
-import { FreePlanButton, RazorpayPayButton } from "@/components/razorpay-pay"
+import { OnlinePayWell } from "@/components/billing-lock"
+import { FreePlanButton, PayOnlineButton } from "@/components/pay-online"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -21,8 +21,8 @@ function PlanTier({ plan, billing, org }: { plan: Plan; billing: BillingInfo; or
   const action = current ? null
     : plan === "free"
       ? <FreePlanButton org={org} className="mt-auto w-full" />
-      : billing.razorpay_key_id
-        ? <RazorpayPayButton org={org} plan={plan} variant="outline"
+      : billing.upi_enabled
+        ? <PayOnlineButton org={org} plan={plan} variant="outline"
             className="mt-auto w-full"
             label={`${billing.plan === "free" ? "Upgrade" : "Switch"} to ${spec.label} · ${inr(spec.price_inr)}`} />
         : null
@@ -185,9 +185,9 @@ export function BillingCard({ org }: { org: string }) {
           </div>
         )}
 
-        {billing.razorpay_key_id ? (
+        {billing.upi_enabled ? (
           // free orgs upgrade from the tier cards above; paid orgs renew here
-          billing.status !== "free" && <RazorpayWell billing={billing} org={org} />
+          billing.status !== "free" && <OnlinePayWell billing={billing} org={org} />
         ) : (
           <PayWell billing={billing} note={
             billing.status === "free"

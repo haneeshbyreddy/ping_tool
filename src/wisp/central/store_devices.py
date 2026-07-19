@@ -310,6 +310,8 @@ class DeviceStoreMixin:
                          (device_id,))
             conn.execute("DELETE FROM device_capability WHERE device_id=?",
                          (device_id,))
+            conn.execute("DELETE FROM device_webui_credentials WHERE device_id=?",
+                         (device_id,))
             conn.execute("DELETE FROM org_devices WHERE id=? AND org_id=?",
                          (device_id, org_id))
             conn.commit()
@@ -332,6 +334,63 @@ class DeviceStoreMixin:
                 " ORDER BY id",
                 (org_id, *_PASSIVE_TYPES)).fetchall()
         return [dict(r) for r in rows]
+
+
+    # ----- device web-UI credentials -----------------------------------------
+
+    def get_device_webui_credentials(self, org_id: str, device_id: int) -> dict | None:
+        """Raw credential row for a device, INCLUDING the encrypted password blob
+        (``password_enc``). Callers returning data to the browser must drop that
+        field — decode it through the SecretBox instead."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT device_id, username, password_enc, auth_mode, updated_by,"
+                " updated_at FROM device_webui_credentials"
+                " WHERE device_id=? AND org_id=?",
+                (device_id, org_id)).fetchone()
+        return dict(row) if row else None
+
+    def set_device_webui_credentials(self, org_id: str, device_id: int, *,
+                                     username: str, password_enc: str | None,
+                                     set_password: bool, auth_mode: str,
+                                     updated_by: str) -> bool:
+        """Upsert a device's web-UI login. ``username`` is stored verbatim
+        (``''`` clears it). Password handling is explicit so a username-only edit
+        never wipes a stored password: ``set_password=False`` leaves the existing
+        ciphertext untouched; ``True`` writes ``password_enc`` (``None`` clears
+        it). Returns False if the device isn't an active member of this org."""
+        with self._write_lock, self._connect() as conn:
+            owned = conn.execute(
+                "SELECT 1 FROM org_devices WHERE id=? AND org_id=? AND is_active=1",
+                (device_id, org_id)).fetchone()
+            if not owned:
+                return False
+            if set_password:
+                pw = password_enc or None
+            else:
+                existing = conn.execute(
+                    "SELECT password_enc FROM device_webui_credentials WHERE device_id=?",
+                    (device_id,)).fetchone()
+                pw = existing["password_enc"] if existing else None
+            conn.execute(
+                "INSERT INTO device_webui_credentials"
+                " (device_id, org_id, username, password_enc, auth_mode, updated_by,"
+                "  updated_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET"
+                "   org_id=excluded.org_id, username=excluded.username,"
+                "   password_enc=excluded.password_enc, auth_mode=excluded.auth_mode,"
+                "   updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                (device_id, org_id, username, pw, auth_mode, updated_by, _now_iso()))
+            conn.commit()
+        return True
+
+    def clear_device_webui_credentials(self, org_id: str, device_id: int) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM device_webui_credentials WHERE device_id=? AND org_id=?",
+                (device_id, org_id))
+            conn.commit()
+        return cur.rowcount > 0
 
 
     def org_passive_ids(self, org_id: str) -> set[int]:

@@ -2,7 +2,7 @@
 
 Every handler function receives the live request handler instance ``h``
 (see ``server.py``). Services ride on it as class attributes — ``h.cfg``,
-``h.store``, ``h.notifier``, ``h.registry``, ``h.payments`` — and the transport/auth
+``h.store``, ``h.notifier``, ``h.registry``, ``h.upi`` — and the transport/auth
 plumbing stays on the handler (``h._reply``, ``h._user``, ``h._reader``,
 ``h._scope_org``, ``h._can_write``, ``h._ingest_ok``).
 """

@@ -5,6 +5,7 @@ schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``)
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 
 from wisp.central.store_util import _now_iso
 
@@ -128,14 +129,15 @@ class OrgStoreMixin:
 
     def create_billing_payment(self, order_id: str, org_id: str, plan: str,
                                months: list[str], amount_paise: int,
-                               created_by: str | None = None) -> None:
+                               created_by: str | None = None,
+                               gateway: str = "upigateway") -> None:
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO billing_payments (order_id, org_id, plan, months,"
-                " amount_paise, status, created_by, created_at)"
-                " VALUES (?,?,?,?,?,'created',?,?)",
+                " amount_paise, status, gateway, created_by, created_at)"
+                " VALUES (?,?,?,?,?,'created',?,?,?)",
                 (order_id, org_id, plan, ",".join(months), int(amount_paise),
-                 created_by, _now_iso()))
+                 gateway, created_by, _now_iso()))
             conn.commit()
 
 
@@ -160,6 +162,38 @@ class OrgStoreMixin:
                 (payment_id, _now_iso(), order_id))
             conn.commit()
             return cur.rowcount > 0
+
+
+    def fail_billing_payment(self, order_id: str) -> None:
+        """created→failed (UPIGateway reported the payment failed) so the
+        sweeper's reconciliation stops re-checking a dead order. Never touches
+        a settled row."""
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE billing_payments SET status='failed'"
+                " WHERE order_id=? AND status='created'", (order_id,))
+            conn.commit()
+
+
+    def pending_billing_payments(self, gateway: str,
+                                 max_age_days: int = 7) -> list[dict]:
+        """Unsettled orders young enough to still clear — the sweeper's
+        reconciliation input (a payer who closed every tab before the
+        redirect). The age bound keeps an abandoned checkout from being
+        re-checked forever."""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=max_age_days)).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM billing_payments WHERE gateway=?"
+                " AND status='created' AND created_at>=?"
+                " ORDER BY created_at", (gateway, cutoff)).fetchall()
+        out = []
+        for row in rows:
+            doc = dict(row)
+            doc["months"] = [m for m in doc["months"].split(",") if m]
+            out.append(doc)
+        return out
 
 
     def billing_orgs(self) -> list[dict]:

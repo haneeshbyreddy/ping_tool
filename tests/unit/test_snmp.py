@@ -11,8 +11,8 @@ from wisp.config import Config
 from wisp.ingress.snmp import (
     OID_IF_ADMIN, OID_IF_ALIAS, OID_IF_DESCR, OID_IF_HCIN, OID_IF_HCOUT,
     OID_IF_HIGHSPEED, OID_IF_LASTCHANGE, OID_IF_NAME, OID_IF_OPER, OID_IF_SPEED,
-    MultiColumnWalk, PortStatus, PysnmpPoller, SnmpTarget, parse_if_table,
-    throughput_bps,
+    WALK_COLUMNS, MultiColumnWalk, PortStatus, PysnmpPoller, SnmpTarget,
+    parse_if_table, throughput_bps,
 )
 
 try:
@@ -28,7 +28,10 @@ class EngineReuseTest(unittest.TestCase):
     def test_one_engine_across_walks(self):
         from pysnmp.hlapi import asyncio as hlapi
         real_engine_cls = hlapi.SnmpEngine
-        poller = PysnmpPoller(Config(snmp_timeout_s=0.05))
+        # Fast + deterministic: snmp_request_timeout_s now shadows snmp_timeout_s, so
+        # set it (and one retry) or the dead-target walk waits the 5s default x3.
+        poller = PysnmpPoller(Config(snmp_request_timeout_s=0.05, snmp_request_retries=1,
+                                     snmp_timeout_s=0.05))
 
         async def two_walks():
             for _ in range(2):
@@ -245,6 +248,162 @@ class CombinedWalkDriverTest(unittest.TestCase):
         ports = self._run_walk(bulk_cmd=broken_bulk_cmd, bulk_walk_cmd=bulk_walk_cmd)
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertEqual(ports[1].oper_status, "down")
+
+@unittest.skipUnless(_HAS_PYSNMP, "pysnmp not installed")
+class AdaptivePortWalkTest(unittest.TestCase):
+    """The adaptive ladder: a TOLERANT per-column net that survives a dropped column
+    (the EDGE_HALIYA fix — one drop must not zero the table), status columns first,
+    per-device memory that stops re-hammering a weak agent with the combined walk, a
+    time-boxed fast path that hands the budget to the net, and a preserved no_response
+    signal for a genuinely dead agent."""
+
+    _TABLE = {
+        f"{OID_IF_ADMIN}.1": "1", f"{OID_IF_ADMIN}.2": "1",
+        f"{OID_IF_OPER}.1": "1", f"{OID_IF_OPER}.2": "2",
+        f"{OID_IF_NAME}.1": "Gi0/1", f"{OID_IF_NAME}.2": "Gi0/2",
+        f"{OID_IF_DESCR}.1": "GigabitEthernet0/1",
+        f"{OID_IF_DESCR}.2": "GigabitEthernet0/2",
+        f"{OID_IF_HCIN}.1": "1000", f"{OID_IF_HCIN}.2": "2000",
+    }
+
+    class _Val:
+        def __init__(self, s):
+            self._s = str(s)
+        def prettyPrint(self):
+            return self._s
+
+    class EndOfMibView(_Val):  # NAME matters: MultiColumnWalk inspects type().__name__
+        def __init__(self):
+            super().__init__("")
+
+    @staticmethod
+    def _oid_key(oid):
+        return tuple(int(p) for p in oid.split("."))
+
+    @staticmethod
+    async def _broken_bulk_cmd(*args, **options):
+        raise RuntimeError("tooBig")
+
+    def _percolumn(self, drop=frozenset(), record=None):
+        """A per-column bulk_walk fake: yields the table rows for the requested column,
+        raises (a dropped request) for any column in `drop`, records call order."""
+        table, oid_key, Val = self._TABLE, self._oid_key, self._Val
+
+        async def bulk_walk_cmd(engine, authData, transport, ctx,
+                                nonRepeaters, maxRepetitions, varBind, **options):
+            col = str(varBind)
+            if record is not None:
+                record.append(col)
+            if col in drop:
+                raise RuntimeError("No SNMP response received before timeout")
+            prefix = col + "."
+            for oid in sorted(table, key=oid_key):
+                if oid.startswith(prefix):
+                    yield (None, 0, 0, [(oid, Val(table[oid]))])
+        return bulk_walk_cmd
+
+    def _new_poller(self, **cfg):
+        cfg.setdefault("snmp_request_timeout_s", 0.05)
+        cfg.setdefault("snmp_request_retries", 1)
+        poller = PysnmpPoller(Config(**cfg))
+        self.addCleanup(
+            lambda: poller._engine.close_dispatcher()
+            if poller._engine is not None else None)
+        return poller
+
+    def _run(self, poller, **patches):
+        import pysnmp.hlapi.asyncio as hlapi
+        patches.setdefault("ObjectIdentity", lambda oid: oid)
+        patches.setdefault("ObjectType", lambda ident: ident)
+        with mock.patch.multiple(hlapi, **patches):
+            return asyncio.run(poller.walk(
+                SnmpTarget(ip="127.0.0.1", community="public", port=1)))
+
+    def test_percolumn_tolerates_a_dropped_column(self):
+        # Combined fails, then one enrichment column (HCIN) drops mid-walk. The old
+        # brittle fallback raised on that and returned NOTHING; the tolerant net skips
+        # it and still delivers every port's up/down.
+        poller = self._new_poller()
+        ports = self._run(poller, bulk_cmd=self._broken_bulk_cmd,
+                          bulk_walk_cmd=self._percolumn(drop={OID_IF_HCIN}))
+        self.assertEqual([p.if_index for p in ports], [1, 2])
+        self.assertEqual(ports[0].if_name, "Gi0/1")
+        self.assertEqual((ports[1].admin_status, ports[1].oper_status), ("up", "down"))
+        self.assertTrue(ports[1].is_down())
+        self.assertIsNone(ports[1].in_octets)  # dropped column — port survives anyway
+
+    def test_status_columns_walk_first(self):
+        poller = self._new_poller()
+        order: list[str] = []
+        self._run(poller, bulk_cmd=self._broken_bulk_cmd,
+                  bulk_walk_cmd=self._percolumn(record=order))
+        # admin/oper decide up/down, so a budget-truncated partial is still useful.
+        self.assertEqual(order[:2], [OID_IF_ADMIN, OID_IF_OPER])
+
+    def test_dead_agent_reraises_so_daemon_sees_no_response(self):
+        # Combined fails AND every per-column request drops: nothing answered, so walk
+        # must RE-RAISE (the daemon classifies no_response) rather than a silent empty.
+        poller = self._new_poller()
+        with self.assertRaises(RuntimeError):
+            self._run(poller, bulk_cmd=self._broken_bulk_cmd,
+                      bulk_walk_cmd=self._percolumn(drop=frozenset(WALK_COLUMNS)))
+
+    def test_empty_combined_falls_through_to_percolumn(self):
+        # An empty combined response (a weak agent can return one) is NOT trusted as
+        # "table empty" — the per-column net confirms.
+        used: list[str] = []
+
+        async def empty_combined(engine, auth, transport, ctx, nonRep, maxRep,
+                                 *vbs, **o):
+            return (None, 0, 0, [("0.0", self.EndOfMibView()) for _ in vbs])
+
+        poller = self._new_poller()
+        ports = self._run(poller, bulk_cmd=empty_combined,
+                          bulk_walk_cmd=self._percolumn(record=used))
+        self.assertEqual([p.if_index for p in ports], [1, 2])
+        self.assertTrue(used)
+
+    def test_combined_time_box_hands_budget_to_the_net(self):
+        # A combined walk that hangs must be abandoned at the fast-path box so the
+        # per-column net still runs inside the port budget — not eat the whole cap.
+        poller = self._new_poller(port_walk_timeout_s=1.2)  # fast box = min(15, 0.4)
+        used: list[str] = []
+
+        async def hanging_combined(*a, **o):
+            await asyncio.sleep(3.0)
+            raise AssertionError("combined should have been abandoned at the time box")
+
+        ports = self._run(poller, bulk_cmd=hanging_combined,
+                          bulk_walk_cmd=self._percolumn(record=used))
+        self.assertEqual([p.if_index for p in ports], [1, 2])  # recovered via the net
+        self.assertTrue(used)
+
+    def test_learns_to_skip_combined_after_it_fails(self):
+        # First sweep: combined fails, per-column succeeds -> device pinned to the net.
+        # Second sweep: combined must NOT be retried (no wasted airtime on a weak box).
+        import pysnmp.hlapi.asyncio as hlapi
+        poller = self._new_poller()
+        target = SnmpTarget(ip="127.0.0.1", community="public", port=1)
+        combined_calls: list[int] = []
+
+        async def counting_broken(*a, **o):
+            combined_calls.append(1)
+            raise RuntimeError("tooBig")
+
+        async def body():
+            out = []
+            for _ in range(2):
+                with mock.patch.multiple(
+                    hlapi, ObjectIdentity=lambda o: o, ObjectType=lambda i: i,
+                    bulk_cmd=counting_broken, bulk_walk_cmd=self._percolumn(),
+                ):
+                    out.append(await poller.walk(target))
+            return out
+
+        results = asyncio.run(body())
+        self.assertEqual([p.if_index for p in results[0]], [1, 2])
+        self.assertEqual([p.if_index for p in results[1]], [1, 2])
+        self.assertEqual(len(combined_calls), 1)  # tried once, then skipped
 
 class ThroughputBps(unittest.TestCase):
     def test_normal_rate(self):
