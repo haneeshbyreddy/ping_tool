@@ -13,7 +13,7 @@ from wisp.config import CONFIG, Config
 
 SESSION_COOKIE = "wisp_central_session"
 MIN_PASSWORD_LEN = 8
-ROLES = ("owner", "operator", "tech")
+ROLES = ("owner", "operator", "tech", "worker")
 
 class AuthError(ValueError):
     pass

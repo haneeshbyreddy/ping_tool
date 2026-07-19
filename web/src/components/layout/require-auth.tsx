@@ -1,6 +1,7 @@
 import { Navigate, Outlet, useLocation } from "react-router-dom"
 import { useAuth } from "@/hooks/use-auth"
 import { useEventStream } from "@/hooks/use-event-stream"
+import { WorkerPage } from "@/routes/worker-page"
 
 export function RequireAuth() {
   const { user, isLoading, scopeOrg } = useAuth()
@@ -14,6 +15,11 @@ export function RequireAuth() {
   if (!user) {
     // Remember where the session died so login can drop the user back there.
     return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />
+  }
+  if (user.role === "worker") {
+    // Field workers get the stripped triage view for every path — the server's
+    // _WORKER_ROUTES whitelist blocks the rest of the dashboard anyway.
+    return <WorkerPage />
   }
   return <Outlet />
 }

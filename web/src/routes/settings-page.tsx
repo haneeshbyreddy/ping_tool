@@ -593,6 +593,7 @@ function UsersCard({ org }: { org: string }) {
                 <SelectItem value="owner">Owner</SelectItem>
                 <SelectItem value="operator">Operator</SelectItem>
                 <SelectItem value="tech">Tech</SelectItem>
+                <SelectItem value="worker">Worker (field app)</SelectItem>
               </SelectContent>
             </Select>
             {error && <p className="text-xs text-destructive">{error}</p>}

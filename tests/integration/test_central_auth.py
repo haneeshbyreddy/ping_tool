@@ -35,6 +35,7 @@ class CentralAuthUnitTest(unittest.TestCase):
         auth.create_user(self.store, "ispA", "alice", "longenough", "owner")
         with self.assertRaises(auth.AuthError):
             auth.create_user(self.store, "ispA", "alice", "longenough", "owner")
+        auth.create_user(self.store, "ispA", "wanda", "longenough", "worker")
 
     def test_verify_login(self):
         auth.create_user(self.store, "ispA", "alice", "correcthorse", "owner")
@@ -81,6 +82,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         auth.create_user(self.store, None, "root", "rootpassword")
         auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
         auth.create_user(self.store, "ispA", "oper", "operpassword", "operator")
+        auth.create_user(self.store, "ispA", "wrk", "workerpassword", "worker")
         self.store.touch_node("ispA", "edge-1")
         self.store.touch_node("ispB", "edge-1")
         self.notifier = RecordingNotifier()
@@ -539,6 +541,68 @@ class CentralAuthHttpTest(unittest.TestCase):
         _, own = self._login("owner", "ownerpassword")
         status, _, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=own)
         self.assertEqual(status, 403)
+
+    def test_worker_can_acknowledge_and_postmortem(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Tower", "ip_address": "10.0.5.3", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "edge-a"})
+        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispA", dev)
+        _, wrk = self._login("wrk", "workerpassword")
+        status, body, _ = self._req("GET", "/api/outages", cookie=wrk)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["outages"][0]["id"], oid)
+        status, body, _ = self._req("POST", "/api/outages/acknowledge",
+                                    {"outage_id": oid}, cookie=wrk)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        _, body, _ = self._req("GET", "/api/outages", cookie=wrk)
+        self.assertEqual(body["outages"][0]["acknowledged_by"], "wrk")
+        self.store.resolve_outage("ispA", dev, "2026-06-23T08:10:00+00:00")
+        status, body, _ = self._req(
+            "POST", "/api/outages/postmortem",
+            {"outage_id": oid, "root_cause": "fiber cut", "resolution_notes": "spliced"},
+            cookie=wrk)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+    def test_worker_cannot_touch_another_orgs_outage(self):
+        dev = self.store.create_org_device("ispB", {
+            "name": "Relay", "ip_address": "10.0.5.4", "device_type": None,
+            "region": None, "parent_device_id": None})
+        self.store.open_outage_if_absent("ispB", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        oid = self.store.open_outage_id("ispB", dev)
+        _, wrk = self._login("wrk", "workerpassword")
+        status, _, _ = self._req("POST", "/api/outages/acknowledge",
+                                 {"outage_id": oid}, cookie=wrk)
+        self.assertEqual(status, 403)
+
+    def test_worker_is_scoped_to_the_triage_surface(self):
+        # The _WORKER_ROUTES whitelist is the invariant: everything a worker
+        # session touches outside it — reads and writes alike — is a 403, so a
+        # newly added dashboard route is worker-blocked by default.
+        _, wrk = self._login("wrk", "workerpassword")
+        self.assertEqual(self._req("GET", "/api/me", cookie=wrk)[0], 200)
+        for method, path, body in [
+            ("GET", "/api/inventory", None),
+            ("GET", "/api/team", None),
+            ("GET", "/api/logs", None),
+            ("GET", "/api/nodes", None),
+            ("GET", "/api/orgs", None),
+            ("POST", "/api/inventory", {"name": "X", "ip_address": "10.0.0.7"}),
+            ("POST", "/api/team", {"name": "Bob"}),
+            ("POST", "/api/users", {"username": "x2", "password": "longenough1"}),
+        ]:
+            status, _, _ = self._req(method, path, body, cookie=wrk)
+            self.assertEqual(status, 403, f"{method} {path} should be worker-blocked")
+
+    def test_worker_can_change_own_password(self):
+        _, wrk = self._login("wrk", "workerpassword")
+        status, _, _ = self._req("POST", "/api/users/password",
+            {"current_password": "workerpassword", "new_password": "newerpassword1"},
+            cookie=wrk)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._login("wrk", "newerpassword1")[0], 200)
 
     def test_logs_endpoint_is_org_scoped(self):
         self._seed_outage_event("ispA", "Tower")

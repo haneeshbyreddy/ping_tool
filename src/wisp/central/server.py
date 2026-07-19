@@ -50,6 +50,14 @@ _BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout",
                    "/api/billing/order", "/api/billing/verify",
                    "/api/billing/plan", "/api/billing/upi-return", "/healthz"}
 
+# The whole API surface a field-worker session may reach: who am I, the triage
+# list (+ its SSE invalidation stream), acknowledge/post-mortem, own password.
+# Enforced as one choke point (the billing-gate pattern) so every new dashboard
+# route is worker-blocked by default. Login/logout are handled before the gate.
+_WORKER_ROUTES = {"/api/me", "/api/outages", "/api/events",
+                  "/api/outages/acknowledge", "/api/outages/postmortem",
+                  "/api/users/password"}
+
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
                   engine_registry: EngineRegistry | None = None, upi=None,
                   secret_box=None):
@@ -206,6 +214,15 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return True
             return user["role"] == "owner" and user["org_id"] == org
 
+        def _worker_blocked(self, route: str, user: dict | None = None) -> bool:
+            if not route.startswith("/api/") or route in _WORKER_ROUTES:
+                return False
+            user = user or self._user()
+            if not user or user.get("role") != "worker":
+                return False
+            self._reply(403, {"error": "forbidden"})
+            return True
+
         def _billing_blocked(self, route: str, user: dict | None = None) -> bool:
             # The paywall gate: a locked org's dashboard session gets 402 on
             # every /api/* route the lock screen doesn't need. Edge ingest
@@ -358,7 +375,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             handler = api.GET.get(route)
             if handler is not None:
-                if self._billing_blocked(route):
+                if self._billing_blocked(route) or self._worker_blocked(route):
                     return
                 handler(self, qs)
                 return
@@ -422,7 +439,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 self._reply(404, {"error": "not found"})
                 return
-            if self._billing_blocked(route, user):
+            if self._billing_blocked(route, user) or self._worker_blocked(route, user):
                 return
             try:
                 handler(self, user, body)

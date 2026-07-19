@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from wisp.central import analytics as central_analytics
 from wisp.central import incidents, onuroster, ponfault
 from wisp.central import rollup as central_rollup
-from wisp.central.api.common import (olt_liveness, org_or_400, q_int_or,
-                                     reader_or_401)
+from wisp.central.api.common import (can_triage, olt_liveness, org_or_400,
+                                     q_int_or, reader_or_401)
 
 
 def summary(h, qs):
@@ -197,7 +197,7 @@ def incident_shape(h, qs):
 def acknowledge(h, user, body):
     oid = int(body.get("outage_id") or 0)
     org = h.store.outage_org(oid)
-    if not h._can_write(user, org):
+    if not can_triage(user, org):
         h._reply(403, {"error": "forbidden"})
         return
     ok = h.store.acknowledge_outage(org, oid, user["username"])
@@ -207,7 +207,7 @@ def acknowledge(h, user, body):
 def postmortem(h, user, body):
     oid = int(body.get("outage_id") or 0)
     org = h.store.outage_org(oid)
-    if not h._can_write(user, org):
+    if not can_triage(user, org):
         h._reply(403, {"error": "forbidden"})
         return
     cause = str(body.get("root_cause") or "").strip()

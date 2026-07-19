@@ -311,6 +311,17 @@ staged + health-gated; probers/notifiers behind interfaces, tests inject doubles
   `switch_ports`, feeds, links. `/api/orgs` stays org-filtered (`_scope_org`).
 - `orgs.ntfy_topic_owner/operator/tech` (outage routing) are separate from
   `orgs.ntfy_topic` (fleet-watchdog NODE_STALE/OK) — don't merge.
+- **Worker role (field-app P0, 2026-07-19)**: `worker` is a fourth `users` role —
+  same table/login/session, NO parallel auth path. Scope is ONE choke point,
+  `server.py:_WORKER_ROUTES` (billing-gate pattern): a worker session reaches
+  me/outages/SSE/ack/post-mortem/own-password and 403s on every other `/api/*`,
+  so a NEW dashboard route is worker-blocked by default — only widen the set
+  deliberately. Ack/post-mortem rights = `api/common.py:can_triage`
+  (superadmin/owner/worker; operator+tech stay read-only as before). The proxy
+  tunnel stays owner-only via `_PROXY_ROLES`. The SPA routes worker sessions to
+  `web/src/routes/worker-page.tsx` for EVERY path (`require-auth.tsx`) — don't
+  hand them the full shell. `org_workers` stays a credential-less roster;
+  worker logins are deliberately not linked to it yet (P1's call).
 - **Paywall** (`central/billing.py`): plans free/pro/vip on `orgs.plan`, paid
   months in `org_billing_months` ('YYYY-MM' UTC, Organizations → Billing;
   pre-marking future months IS the "no reminder" switch). A pro/vip org whose

@@ -60,6 +60,15 @@ def public_user(user: dict, store) -> dict:
             "org_name": org_name, "role": user["role"], "is_superadmin": user["org_id"] is None}
 
 
+def can_triage(user: dict, org: str | None) -> bool:
+    """Acknowledge/post-mortem rights: the org's owner and its field workers
+    (role 'worker' exists for exactly this), superadmin anywhere. Operator and
+    tech stay read-only — same as before the worker role existed."""
+    if user["is_superadmin"]:
+        return True
+    return user["org_id"] == org and user["role"] in ("owner", "worker")
+
+
 def worker_org(store, worker_id) -> str | None:
     if worker_id is None:
         return None
