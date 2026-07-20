@@ -7,11 +7,13 @@ reverse tunnel end to end. The on-site test against a real switch/OLT stays the
 operator's; here the device is local so the mechanism is exercised honestly.
 """
 import asyncio
+import base64
 import http.client
 import json
 import os
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -250,6 +252,30 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(resp.status, 400)
         self.assertIn("proxy_mgmt_ports", body.get("error", ""))
 
+    def test_web_access_override_endpoint_used(self):
+        # The device's admin page is declared at a specific endpoint (here the stub
+        # device). The browser sends NO port, so the classic path would default to
+        # 80 and be rejected (80 isn't a mgmt port here) — a working round-trip
+        # proves the override endpoint won and drove the tunnel.
+        self.store.set_org_device_web_access(
+            "ispA", self.device_id, web_ip="127.0.0.1", web_port=self.dev_port,
+            web_scheme="http")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/proxy/session",
+                     body=json.dumps({"device_id": self.device_id}),  # no port
+                     headers={"Content-Type": "application/json", "Cookie": self.cookie})
+        resp = conn.getresponse()
+        sess = json.loads(resp.read() or "{}")
+        conn.close()
+        self.assertEqual(resp.status, 200, sess)
+        served, out = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/status",
+            devices=[{"ip_address": "127.0.0.1", "web_ip": "127.0.0.1",
+                      "web_port": self.dev_port, "web_scheme": "http"}])
+        self.assertTrue(served)
+        self.assertEqual(out["status"], 200)
+        self.assertIn(b"STUB-DEVICE GET", out["body"])
+
     # -- M1: sessions + security -------------------------------------------------
 
     def test_session_requires_org_capability_flag(self):
@@ -361,6 +387,30 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual([s["sid"] for s in carried], [sess["sid"]])
         self.assertGreater(carried[0]["ttl_s"], 0)
 
+    def _report(self) -> dict:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/report",
+                     body=json.dumps({"v": 1, "org_id": "ispA", "node_id": "edge-1",
+                                      "ts": "2026-07-20T00:00:00+00:00",
+                                      "mode": "full", "pings": {}}),
+                     headers={"Content-Type": "application/json",
+                              "Authorization": "Bearer s3cret"})
+        resp = conn.getresponse()
+        reply = json.loads(resp.read() or "{}")
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        return reply
+
+    def test_report_reply_carries_standby_flag_for_proxy_org(self):
+        # No live session: the flag alone keeps one edge long-poll warm so the
+        # FIRST browser connect doesn't wait a report cycle (2026-07-20 fix).
+        reply = self._report()
+        self.assertTrue(reply.get("proxy_standby"))
+        self.assertNotIn("proxy_sessions", reply)
+        self.store.set_org_web_proxy("ispA", False)
+        reply = self._report()
+        self.assertNotIn("proxy_standby", reply)
+
     def test_redirect_and_cookie_rewritten_into_prefix(self):
         _, sess = self._open_session()
         served, out = self._round_trip(
@@ -417,6 +467,97 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(out["status"], 307)
         headers = {k.lower(): v for k, v in out["headers"]}
         self.assertEqual(headers["location"], f"/api/proxy/{sid}/action/login.html")
+
+    # -- session-open preflight ---------------------------------------------------
+
+    def _open_with_tunnel(self, tunnel, device_id=None):
+        """Prime polled_recently, then open a session while the tunnel serves
+        the resulting preflight probe."""
+        self.edge_client.proxy_next(0.05)  # stamps last_poll on the hub
+        result = {}
+        t = threading.Thread(target=lambda: result.update(
+            dict(zip(("status", "body"), self._open_session(device_id)))))
+        t.start()
+        asyncio.run(tunnel.serve_once())
+        t.join(timeout=12)
+        return result.get("status"), result.get("body")
+
+    def test_preflight_adopts_answering_scheme(self):
+        # Owner declared the endpoint without pinning a scheme; the heuristic
+        # says http (non-443 port) but only https answers — the session must
+        # adopt https, proven by the scheme the edge is later told to fetch.
+        self.store.set_org_device_web_access(
+            "ispA", self.device_id, web_ip="127.0.0.1", web_port=self.dev_port,
+            web_scheme=None)
+        probed = []
+
+        async def prober(ip, port, scheme, timeout_s):
+            probed.append((ip, port, scheme))
+            return None if scheme == "https" else "connection refused"
+
+        fetched = []
+
+        async def fetcher(req, cfg):
+            fetched.append(req)
+            return 200, {"Content-Type": "text/plain"}, b"ok"
+
+        tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
+                             devices_provider=lambda: [
+                                 {"ip_address": "127.0.0.1",
+                                  "web_ip": "127.0.0.1",
+                                  "web_port": self.dev_port}],
+                             fetcher=fetcher, prober=prober)
+        status, sess = self._open_with_tunnel(tunnel)
+        self.assertEqual(status, 200, sess)
+        self.assertIn(("127.0.0.1", self.dev_port, "https"), probed)
+        out = {}
+        t = threading.Thread(target=self._browser,
+                             args=("GET", f"/api/proxy/{sess['sid']}/x", out))
+        t.start()
+        asyncio.run(tunnel.serve_once())
+        t.join(timeout=12)
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(fetched[0]["scheme"], "https")
+        self.assertEqual(fetched[0]["device_port"], self.dev_port)
+
+    def test_preflight_nothing_listening_fails_fast_and_clear(self):
+        async def prober(ip, port, scheme, timeout_s):
+            return "connect timeout"
+
+        tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
+                             devices_provider=lambda: [{"ip_address": "127.0.0.1"}],
+                             prober=prober)
+        status, body = self._open_with_tunnel(tunnel)
+        self.assertEqual(status, 502)
+        self.assertIn("unreachable", body.get("error", ""))
+        # the failed open must not leave a live session behind
+        _, doc = self._api("GET", "/api/proxy/sessions")
+        self.assertEqual([s for s in doc["sessions"] if s["status"] == "open"], [])
+
+    def test_no_recent_poll_skips_preflight(self):
+        # Dormant tunnel / pre-standby edge: the open must not stall — the
+        # heuristic target is kept and the session opens immediately.
+        before = time.monotonic()
+        status, sess = self._open_session()
+        self.assertEqual(status, 200, sess)
+        self.assertLess(time.monotonic() - before, 3.0)
+
+    def test_old_edge_fetch_reply_keeps_heuristic(self):
+        # An old edge doesn't know kind="preflight" and answers with a normal
+        # page fetch — central must keep the heuristic target and still open.
+        from wisp.central.api import proxy as proxy_api
+        self.edge_client.proxy_next(0.05)
+        result = {}
+        t = threading.Thread(target=lambda: result.update(
+            dict(zip(("status", "body"), self._open_session()))))
+        t.start()
+        req = self.edge_client.proxy_next(5.0)   # old edge: plain fetch reply
+        self.assertEqual(req.get("kind"), "preflight")
+        self.edge_client.proxy_reply(
+            req["sid"], req["req_id"], 200, {},
+            base64.b64encode(b"<html>a real page, not a probe report</html>").decode())
+        t.join(timeout=proxy_api._PREFLIGHT_TIMEOUT_S + 4)
+        self.assertEqual(result.get("status"), 200, result.get("body"))
 
     def test_one_session_per_node_newest_wins(self):
         # Opening a second session on the same probe replaces the first: the

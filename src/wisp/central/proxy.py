@@ -103,6 +103,9 @@ class ProxyHub:
         self._inbox: dict[tuple[str, str], queue.Queue] = {}
         self._pending: dict[int, _Pending] = {}
         self._seq = 0
+        # last time each node's tunnel long-polled us — the preflight gate:
+        # a submit against a node that isn't polling would just eat its timeout
+        self._last_poll: dict[tuple[str, str], float] = {}
 
     # -- sessions --------------------------------------------------------------
 
@@ -175,9 +178,13 @@ class ProxyHub:
     # -- browser side (blocks the calling worker thread) -----------------------
 
     def submit(self, sess: ProxySession, *, method: str, path: str,
-               headers: dict, body: bytes, timeout: float) -> dict | None:
+               headers: dict, body: bytes, timeout: float,
+               extra: dict | None = None) -> dict | None:
         """Park a browser request for the edge and wait for the reply. Returns the
-        reply dict (``status``/``headers``/``body``), or None on timeout."""
+        reply dict (``status``/``headers``/``body``), or None on timeout.
+        ``extra`` keys are merged into the parked payload (the preflight probe
+        rides this); the normal device_ip/port/scheme fields stay present, so an
+        edge that predates a given extra treats it as a plain fetch."""
         import base64
         with self._lock:
             self._seq += 1
@@ -189,6 +196,8 @@ class ProxyHub:
                 "device_ip": sess.device_ip, "device_port": sess.device_port,
                 "scheme": sess.scheme,
             }
+            if extra:
+                payload.update(extra)
             pend = _Pending(req_id, sess.org_id, sess.node_id, payload)
             self._pending[req_id] = pend
             q = self._inbox.setdefault((sess.org_id, sess.node_id), queue.Queue())
@@ -200,10 +209,19 @@ class ProxyHub:
 
     # -- edge side -------------------------------------------------------------
 
+    def polled_recently(self, org_id: str, node_id: str, within_s: float) -> bool:
+        """Has this node's tunnel long-polled within the last ``within_s``?
+        Gates the session-open preflight: probing through a dormant (or
+        pre-preflight) edge would only burn the browser's patience."""
+        with self._lock:
+            last = self._last_poll.get((org_id, node_id), 0.0)
+        return (time.time() - last) <= within_s
+
     def next_request(self, org_id: str, node_id: str, hold_s: float) -> dict | None:
         """Edge long-poll: block up to hold_s for a parked request for this node."""
         with self._lock:
             q = self._inbox.setdefault((org_id, node_id), queue.Queue())
+            self._last_poll[(org_id, node_id)] = time.time()
         try:
             pend = q.get(timeout=max(0.0, hold_s))
         except queue.Empty:

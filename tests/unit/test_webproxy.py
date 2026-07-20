@@ -6,6 +6,7 @@ lives in integration/test_central_proxy.py.
 """
 import asyncio
 import base64
+import json
 import os
 import sys
 import threading
@@ -18,7 +19,7 @@ from wisp.config import Config
 from wisp.central.proxy import (
     ProxyHub, ProxySession, parse_ports, rewrite_body, rewrite_headers,
 )
-from wisp.ingress.webproxy import ProxyTunnel
+from wisp.ingress.webproxy import ProxyTunnel, _web_endpoints
 
 
 def _b64(data: bytes) -> str:
@@ -141,6 +142,28 @@ class ProxyHubTest(unittest.TestCase):
         self.assertEqual(
             [s["sid"] for s in self.hub.active_sessions_for("o", "OTHER")],
             [other.sid])
+
+    def test_submit_extra_merges_but_keeps_base_fields(self):
+        # the preflight rides extra=; an old edge must still see a plain fetch
+        sess = self._open()
+        t = threading.Thread(target=lambda: self.hub.submit(
+            sess, method="GET", path="/", headers={}, body=b"", timeout=2,
+            extra={"kind": "preflight", "candidates": [["1.2.3.4", 443, "https"]]}))
+        t.start()
+        payload = self.hub.next_request("o", "n", 2.0)
+        self.assertEqual(payload["kind"], "preflight")
+        self.assertEqual(payload["candidates"], [["1.2.3.4", 443, "https"]])
+        self.assertEqual(payload["device_ip"], "1.2.3.4")   # base fields survive
+        self.assertEqual(payload["scheme"], "http")
+        self.hub.deliver(payload["req_id"], "o", "n",
+                         {"status": 200, "headers": {}, "body_b64": ""})
+        t.join(timeout=5)
+
+    def test_polled_recently_tracks_next_request(self):
+        self.assertFalse(self.hub.polled_recently("o", "n", 30.0))
+        self.hub.next_request("o", "n", 0.05)
+        self.assertTrue(self.hub.polled_recently("o", "n", 30.0))
+        self.assertFalse(self.hub.polled_recently("o", "OTHER", 30.0))
 
     def test_inflight_counts_parked_requests_per_session(self):
         sess = self._open()
@@ -308,9 +331,226 @@ class ProxyTunnelTest(unittest.TestCase):
         client = _FakeClient([])
         self.assertFalse(self._run(client, [], self._fetcher()))
 
+    def test_serves_owner_declared_web_endpoint(self):
+        # OLT web UI is port-forwarded to a DIFFERENT IP on a NON-mgmt port; the
+        # (web_ip, web_port) pair the owner declared is allowed even though the IP
+        # isn't the probe IP and 8080 isn't in proxy_mgmt_ports.
+        client = _FakeClient([_req(device_ip="203.0.113.9", device_port=8080)])
+        devices = [{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
+                    "web_port": 8080, "web_scheme": "http"}]
+        self._run(client, devices, self._fetcher())
+        self.assertEqual(len(self.fetched), 1)
+        self.assertEqual(client.replies[0]["status"], 200)
+
+    def test_web_override_pair_must_match_exactly(self):
+        # Same declared IP but a port the owner never declared is still refused —
+        # the override is a pair, not a blanket IP allow.
+        client = _FakeClient([_req(device_ip="203.0.113.9", device_port=9999)])
+        devices = [{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
+                    "web_port": 8080, "web_scheme": "http"}]
+        self._run(client, devices, self._fetcher())
+        self.assertEqual(len(self.fetched), 0)
+        self.assertEqual(client.replies[0]["status"], 502)
+
+
+class WebEndpointsTest(unittest.TestCase):
+    """The edge's owner-declared-endpoint resolution mirrors central's."""
+
+    def test_no_override_contributes_nothing(self):
+        self.assertEqual(_web_endpoints([{"ip_address": "10.0.0.5"}]), frozenset())
+
+    def test_ip_and_port_pair(self):
+        self.assertEqual(
+            _web_endpoints([{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
+                             "web_port": 8080}]),
+            frozenset({("203.0.113.9", 8080)}))
+
+    def test_port_only_uses_probe_ip(self):
+        # a custom mgmt port on the same box (no separate IP)
+        self.assertEqual(
+            _web_endpoints([{"ip_address": "10.0.0.5", "web_port": 8443}]),
+            frozenset({("10.0.0.5", 8443)}))
+
+    def test_scheme_only_picks_default_port(self):
+        self.assertEqual(
+            _web_endpoints([{"ip_address": "10.0.0.5", "web_scheme": "https"}]),
+            frozenset({("10.0.0.5", 443)}))
+        self.assertEqual(
+            _web_endpoints([{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
+                             "web_scheme": "http"}]),
+            frozenset({("203.0.113.9", 80)}))
+
+
+class PreflightTest(unittest.TestCase):
+    """kind="preflight": connect-probe candidates through the SAME allow-list
+    gate as fetches, never touch the device's HTTP layer."""
+
+    def setUp(self):
+        self.cfg = Config(proxy_enabled=True, proxy_mgmt_ports="80,443",
+                          proxy_poll_hold_s=0.2, proxy_workers=1,
+                          proxy_request_timeout_s=2.0,
+                          proxy_max_body_bytes=1_000_000)
+        self.probed = []
+
+    def _prober(self, ok_for=frozenset()):
+        async def probe(ip, port, scheme, timeout_s):
+            self.probed.append((ip, port, scheme))
+            return None if (ip, port, scheme) in ok_for else "connect timeout"
+        return probe
+
+    async def _no_fetch(self, req, cfg):
+        raise AssertionError("preflight must never reach the fetch path")
+
+    def _run(self, client, devices, prober):
+        tunnel = ProxyTunnel(client, self.cfg, devices_provider=lambda: devices,
+                             fetcher=self._no_fetch, prober=prober)
+        return asyncio.run(tunnel.serve_once())
+
+    @staticmethod
+    def _results(client):
+        doc = json.loads(base64.b64decode(client.replies[0]["body_b64"]))
+        return doc
+
+    def test_probes_candidates_and_reports_shape(self):
+        client = _FakeClient([_req(kind="preflight",
+                                   candidates=[["127.0.0.1", 443, "https"],
+                                               ["127.0.0.1", 80, "http"]])])
+        self._run(client, [{"ip_address": "127.0.0.1"}],
+                  self._prober(ok_for={("127.0.0.1", 80, "http")}))
+        doc = self._results(client)
+        self.assertTrue(doc["preflight"])
+        by_key = {(r[0], r[1], r[2]): r for r in doc["results"]}
+        self.assertFalse(by_key[("127.0.0.1", 443, "https")][3])
+        self.assertTrue(by_key[("127.0.0.1", 80, "http")][3])
+        self.assertEqual(client.replies[0]["status"], 200)
+        self.assertIsNone(client.replies[0]["error"])
+
+    def test_disallowed_candidate_never_probed(self):
+        client = _FakeClient([_req(kind="preflight",
+                                   candidates=[["10.9.9.9", 8080, "http"],
+                                               ["127.0.0.1", 80, "http"]])])
+        self._run(client, [{"ip_address": "127.0.0.1"}],
+                  self._prober(ok_for={("127.0.0.1", 80, "http")}))
+        self.assertNotIn(("10.9.9.9", 8080, "http"), self.probed)
+        doc = self._results(client)
+        row = next(r for r in doc["results"] if r[0] == "10.9.9.9")
+        self.assertFalse(row[3])
+        self.assertEqual(row[4], "not permitted")
+
+    def test_owner_declared_endpoint_probeable(self):
+        client = _FakeClient([_req(kind="preflight",
+                                   candidates=[["203.0.113.9", 8080, "https"]])])
+        devices = [{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
+                    "web_port": 8080}]
+        self._run(client, devices,
+                  self._prober(ok_for={("203.0.113.9", 8080, "https")}))
+        doc = self._results(client)
+        self.assertTrue(doc["results"][0][3])
+
+
+class FriendlyFetchErrorTest(unittest.TestCase):
+    """Fast-failure copy: the 502 string must name the fix, not the httpx class."""
+
+    def setUp(self):
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            self.skipTest("httpx not installed (central-only environment)")
+
+    def test_connect_timeout_names_dead_target(self):
+        import httpx
+        from wisp.ingress.webproxy import _friendly_fetch_error
+        msg = _friendly_fetch_error(httpx.ConnectTimeout("x"), "10.0.0.5", 443, "https")
+        self.assertIn("connect timeout", msg)
+        self.assertIn("10.0.0.5:443", msg)
+
+    def test_tls_failure_suggests_plain_http(self):
+        import httpx
+        from wisp.ingress.webproxy import _friendly_fetch_error
+        exc = httpx.ConnectError("[SSL: WRONG_VERSION_NUMBER] wrong version number")
+        msg = _friendly_fetch_error(exc, "10.0.0.5", 8080, "https")
+        self.assertIn("TLS", msg)
+        self.assertIn("http", msg)
+
+    def test_connection_refused_suggests_port(self):
+        import httpx
+        from wisp.ingress.webproxy import _friendly_fetch_error
+        exc = httpx.ConnectError("All connection attempts failed: connection refused")
+        msg = _friendly_fetch_error(exc, "10.0.0.5", 80, "http")
+        self.assertIn("refused", msg)
+
+    def test_protocol_garbage_suggests_other_scheme(self):
+        import httpx
+        from wisp.ingress.webproxy import _friendly_fetch_error
+        msg = _friendly_fetch_error(httpx.RemoteProtocolError("bad"), "10.0.0.5", 443, "http")
+        self.assertIn("try https", msg)
+
+    def test_unknown_exception_passes_through(self):
+        from wisp.ingress.webproxy import _friendly_fetch_error
+        self.assertEqual(
+            _friendly_fetch_error(ValueError("odd thing"), "10.0.0.5", 80, "http"),
+            "odd thing")
+
+
+class TunnelStandbyTest(unittest.TestCase):
+    """First-connect fix (2026-07-20): ``proxy_standby`` holds exactly ONE
+    long-poll while idle; a live session scales it to the full pool and back."""
+
+    def _cfg(self, workers=3):
+        return Config(proxy_enabled=True, proxy_mgmt_ports="80",
+                      proxy_poll_hold_s=0.02, proxy_workers=workers,
+                      proxy_request_timeout_s=1.0, proxy_max_body_bytes=1000)
+
+    @staticmethod
+    def _live(tunnel):
+        return sum(1 for t in tunnel._tasks if not t.done())
+
+    def test_standby_holds_exactly_one_worker(self):
+        async def run():
+            tunnel = ProxyTunnel(_FakeClient([]), self._cfg(),
+                                 devices_provider=lambda: [])
+            tunnel.notify_standby(False)      # org without the proxy: dormant
+            self.assertEqual(tunnel._tasks, [])
+            tunnel.notify_standby(True)
+            self.assertEqual(self._live(tunnel), 1)
+            tunnel.notify_standby(True)       # refresh must not add workers
+            self.assertEqual(self._live(tunnel), 1)
+            await tunnel.aclose()
+
+        asyncio.run(run())
+
+    def test_standby_lapses_without_refresh(self):
+        async def run():
+            tunnel = ProxyTunnel(_FakeClient([]), self._cfg(),
+                                 devices_provider=lambda: [])
+            tunnel._STANDBY_TTL_S = 0.15
+            tunnel.notify_standby(True)
+            self.assertEqual(self._live(tunnel), 1)
+            await asyncio.sleep(0.5)          # central stopped sending the key
+            self.assertEqual(self._live(tunnel), 0)
+            await tunnel.aclose()
+
+        asyncio.run(run())
+
+    def test_session_scales_standby_up_then_back_to_one(self):
+        async def run():
+            tunnel = ProxyTunnel(_FakeClient([]), self._cfg(workers=3),
+                                 devices_provider=lambda: [])
+            tunnel._GRACE_S = 0.0
+            tunnel.notify_standby(True)
+            self.assertEqual(self._live(tunnel), 1)
+            tunnel.notify_sessions([{"sid": "s1", "ttl_s": 0.3}])
+            self.assertEqual(self._live(tunnel), 3)
+            await asyncio.sleep(0.7)          # session lapsed, standby still armed
+            self.assertEqual(self._live(tunnel), 1)
+            await tunnel.aclose()
+
+        asyncio.run(run())
+
 
 class TunnelDormancyTest(unittest.TestCase):
-    """M1 activation model: zero long-polls while no session is live."""
+    """Activation model: zero long-polls while no session is live AND the org
+    hasn't enabled the web proxy (no ``proxy_standby`` refresh)."""
 
     def test_workers_spin_up_on_sessions_and_stand_down(self):
         cfg = Config(proxy_enabled=True, proxy_mgmt_ports="80",

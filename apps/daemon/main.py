@@ -440,6 +440,8 @@ async def run_cycle_central_brain(
     if proxy_tunnel is not None:
         # dormant-until-session (webplan.md §2): this reply key is the wake-up
         proxy_tunnel.notify_sessions(reply.get("proxy_sessions"))
+        # web-proxy org ⇒ one standby long-poll so first connect is instant
+        proxy_tunnel.notify_standby(bool(reply.get("proxy_standby")))
     if cfg.retry_interval_s > 0:
         await _follow_recheck(prober, client, reply, cfg)
     return True

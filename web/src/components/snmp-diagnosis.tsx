@@ -5,8 +5,9 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Play, Wand2 } from "lucide-react"
+import { Play, Wand2, Zap } from "lucide-react"
 import { snmpApi, ApiError } from "@/lib/api"
+import { runSnmpTest } from "@/components/snmp-test"
 import type {
   DeviceCapability, OrgDevice, SnmpSubsystem, SnmpSubsystemStatus,
 } from "@/lib/types"
@@ -205,6 +206,7 @@ export function SnmpDiagnosis({ device, subsystem }: {
   subsystem: SnmpSubsystem
 }) {
   const { canWrite } = useAuth()
+  const queryClient = useQueryClient()
   const [walkOpen, setWalkOpen] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
   const [nsOpen, setNsOpen] = useState(false)
@@ -252,8 +254,14 @@ export function SnmpDiagnosis({ device, subsystem }: {
           {st.last_ok_at && <>last worked {ago(st.last_ok_at)}</>}
         </p>
       )}
-      {canWrite && (d.walk || d.wizard || d.notSupported) && (
+      {canWrite && (
         <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+          {/* quick reachability verdict through the probe — same walk pipeline,
+              tiny system subtree, result lands in a toast in ~a report cycle */}
+          <Button variant="outline" size="sm" className="h-7 text-xs"
+            onClick={() => void runSnmpTest(device, queryClient)}>
+            <Zap className="size-3" /> Test SNMP
+          </Button>
           {d.walk && (
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setWalkOpen(true)}>
               <Play className="size-3" /> Run SNMP walk

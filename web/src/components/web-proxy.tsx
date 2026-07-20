@@ -22,6 +22,7 @@ import { Label } from "@/components/ui/label"
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -70,6 +71,12 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [authMode, setAuthMode] = useState<"basic" | "form">("form")
+  // Address override: where the admin page actually lives. Off = the device's
+  // own IP on 80/443; on = a different IP and/or port. The scheme is inferred
+  // from the port (443 = https, everything else http) — no separate control.
+  const [altAddr, setAltAddr] = useState(false)
+  const [webIp, setWebIp] = useState("")
+  const [webPort, setWebPort] = useState("")
 
   const creds = useQuery({
     queryKey: ["webui-creds", device.id],
@@ -77,6 +84,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
     enabled: open,
   })
   const hasPassword = !!creds.data?.credentials.has_password
+  const hasOverride = overridePinsEndpoint(device)
 
   // seed the fields once the current values land
   function onOpenChange(next: boolean) {
@@ -84,6 +92,9 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
       setPassword("")
       setUsername("")
       setAuthMode("form")
+      setAltAddr(overridePinsEndpoint(device))
+      setWebIp(device.web_ip ?? "")
+      setWebPort(device.web_port != null ? String(device.web_port) : "")
       void creds.refetch().then((r) => {
         setUsername(r.data?.credentials.username ?? "")
         setAuthMode(r.data?.credentials.auth_mode ?? "form")
@@ -94,18 +105,34 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
 
   const save = useMutation({
     // password left blank => omit it so a username-only edit keeps the stored
-    // password; a typed value replaces it.
-    mutationFn: () => inventoryApi.setCredentials(device.id, {
-      username: username.trim(),
-      auth_mode: authMode,
-      ...(password === "" ? {} : { password }),
-    }),
+    // password; a typed value replaces it. The address override is saved
+    // alongside so one dialog covers "how to reach + how to log into" the UI.
+    mutationFn: async () => {
+      // Only store an override that reaches somewhere the plain Connect buttons
+      // can't (a different IP or a non-standard port). Toggle off — or a
+      // redundant same-IP:80/443 entry — clears it; the server normalizes the
+      // same way (inventory.normalize_web_access).
+      const ip = webIp.trim()
+      const portNum = webPort.trim() ? Number(webPort.trim()) : null
+      const store = altAddr && (
+        (!!ip && ip !== device.ip_address) ||
+        (portNum != null && portNum !== 80 && portNum !== 443))
+      await inventoryApi.setWebAccess(device.id, store
+        ? { web_ip: ip || null, web_port: portNum, web_scheme: null }
+        : { web_ip: null, web_port: null, web_scheme: null })
+      await inventoryApi.setCredentials(device.id, {
+        username: username.trim(),
+        auth_mode: authMode,
+        ...(password === "" ? {} : { password }),
+      })
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["webui-creds", device.id] })
-      toast.success(`Saved web UI login for ${device.name}`)
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+      toast.success(`Saved web UI settings for ${device.name}`)
       setOpen(false)
     },
-    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save the login"),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save"),
   })
   const clear = useMutation({
     mutationFn: () => inventoryApi.clearCredentials(device.id),
@@ -118,22 +145,64 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   })
   const busy = save.isPending || clear.isPending
 
+  // The toggle is on but the entry reaches nowhere new (same IP, standard/blank
+  // port) — saving will collapse it to no override, so say so.
+  const typedIp = webIp.trim()
+  const typedPortNum = webPort.trim() ? Number(webPort.trim()) : null
+  const altRedundant = altAddr &&
+    !((!!typedIp && typedIp !== device.ip_address) ||
+      (typedPortNum != null && typedPortNum !== 80 && typedPortNum !== 443))
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
-        title="Store this device's web UI login" onClick={() => onOpenChange(true)}>
+        title="Configure this device's web UI address & login" onClick={() => onOpenChange(true)}>
         <KeyRound className="size-3.5 text-muted-foreground" /> Login
-        {hasPassword && <span className="size-1.5 rounded-full bg-success" />}
+        {(hasPassword || hasOverride) && <span className="size-1.5 rounded-full bg-success" />}
       </Button>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Web UI login — {device.name}</DialogTitle>
+          <DialogTitle>Web UI: {device.name}</DialogTitle>
           <DialogDescription>
-            Stored encrypted so a tech never retypes it. The password is write-only
-            here — it is never shown again after saving.
+            Where the admin page lives and how to sign in. Stored encrypted so a
+            tech never retypes it; the password is write-only here.
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-3 py-1">
+          <div className="rounded-lg border bg-muted/40 p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <Label htmlFor="wui-alt" className="text-xs font-medium">Different web UI address</Label>
+                <p className="mt-0.5 text-2xs text-muted-foreground">
+                  Turn on only if the admin page isn't at {device.ip_address} on
+                  80/443 — for example port-forwarded to a different IP or port.
+                </p>
+              </div>
+              <Switch id="wui-alt" checked={altAddr} onCheckedChange={setAltAddr}
+                className="mt-0.5 shrink-0" />
+            </div>
+            {altAddr && (
+              <>
+                <div className="mt-3 flex gap-2">
+                  <div className="flex flex-1 flex-col gap-1.5">
+                    <Label htmlFor="wui-ip" className="text-2xs">IP address</Label>
+                    <Input id="wui-ip" autoComplete="off" value={webIp} placeholder={device.ip_address}
+                      onChange={(e) => setWebIp(e.target.value)} className="h-8 text-xs" />
+                  </div>
+                  <div className="flex w-24 flex-col gap-1.5">
+                    <Label htmlFor="wui-port" className="text-2xs">Port</Label>
+                    <Input id="wui-port" autoComplete="off" inputMode="numeric" value={webPort}
+                      placeholder="80" onChange={(e) => setWebPort(e.target.value)} className="h-8 text-xs" />
+                  </div>
+                </div>
+                {altRedundant && (
+                  <p className="mt-2 text-2xs text-muted-foreground">
+                    That's the device's own address — saving will switch this off.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="wui-user">Username</Label>
             <Input id="wui-user" autoComplete="off" value={username}
@@ -164,7 +233,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
         <DialogFooter className="gap-2 sm:justify-between">
           {(hasPassword || (creds.data?.credentials.username ?? "") !== "") ? (
             <Button variant="ghost" size="sm" className="text-destructive"
-              disabled={busy} onClick={() => clear.mutate()}>Remove</Button>
+              disabled={busy} onClick={() => clear.mutate()}>Remove login</Button>
           ) : <span />}
           <Button size="sm" disabled={busy} onClick={() => save.mutate()}>
             {save.isPending ? "Saving…" : "Save"}
@@ -215,6 +284,19 @@ export function canOpenWebUi(device: OrgDevice): boolean {
   return !!device.ip_address && !!device.assigned_node_id
 }
 
+/** Whether a stored web-UI override points somewhere the plain http/https
+    buttons can't already reach — a DIFFERENT host, or a NON-standard port. Only
+    then does the override pin the endpoint (and the split button collapses to a
+    single Connect). A same-IP:80/443 or bare-scheme override is redundant: the
+    server normalizes it away (inventory.normalize_web_access), but we mirror the
+    check here so a legacy row still keeps its http/https fallback. */
+function overridePinsEndpoint(device: OrgDevice): boolean {
+  const distinctIp = !!device.web_ip && device.web_ip !== device.ip_address
+  const distinctPort =
+    device.web_port != null && device.web_port !== 80 && device.web_port !== 443
+  return distinctIp || distinctPort
+}
+
 // Last port that worked per device — the OLT that refuses port 80 (HILL-OLT-1
 // field lesson) should have its https choice float to the top next time.
 const PORT_KEY = "wisp:webui-port"
@@ -240,18 +322,27 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
   // The tab must open synchronously inside the click gesture or popup blockers
   // eat it — open blank now, point it at the session once central answers.
   const tab = window.open("", "_blank")
+  const tid = `webui-${device.id}`
+  // Session open now includes the probe's preflight (it checks what the device
+  // actually answers — http/https/nothing), so this can take a few seconds and
+  // a definite "unreachable" comes back HERE instead of a dead tab later.
+  toast.loading(`Connecting to ${device.name}…`, {
+    id: tid, description: "The probe is checking the device's web UI.",
+  })
   try {
     const sess = await proxyApi.open(device.id, port)
     rememberPort(device.id, port)
     if (tab) tab.location.replace(sess.url)
     else window.open(sess.url, "_blank")
-    toast.success(`Web UI session opened for ${device.name}`, {
-      description: "First load can take up to a minute while the probe connects — refresh the tab if it times out.",
+    toast.success(`Connected — opening ${device.name}'s web UI`, {
+      id: tid,
+      description: "If the tab stalls, the probe may still be waking — refresh it once.",
     })
     return true
   } catch (e) {
     tab?.close()
-    toast.error(e instanceof ApiError ? e.message : "Failed to open a web UI session")
+    toast.error(e instanceof ApiError ? e.message : "Failed to open a web UI session",
+      { id: tid, duration: 12_000 })
     return false
   }
 }
@@ -270,6 +361,24 @@ export function WebUiButton({ device }: { device: OrgDevice }) {
     // surface the live strip / Settings card row now, not on the next poll
     if (ok) queryClient.invalidateQueries({ queryKey: ["proxy-sessions"] })
   })
+  // A device whose override pins a DISTINCT endpoint (different host or
+  // non-standard port) has a fixed target — the port the server uses comes from
+  // the override, so the http/https chooser is moot. Show a single Connect
+  // button that names where it goes. A redundant same-IP:80/443 override does
+  // NOT pin anything (the server normalizes it away), so keep the split button.
+  const hasOverride = overridePinsEndpoint(device)
+  if (hasOverride) {
+    const scheme = device.web_scheme || (device.web_port === 443 ? "https" : "http")
+    const host = device.web_ip || device.ip_address
+    const port = device.web_port ?? (scheme === "https" ? 443 : 80)
+    return (
+      <Button variant="outline" size="sm" className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
+        title={`Open the web UI at ${scheme}://${host}:${port}`}
+        onClick={() => open(primary)}>
+        <Globe className="size-3.5 text-muted-foreground" /> Connect
+      </Button>
+    )
+  }
   return (
     <div className="flex shrink-0 items-center">
       <Button variant="outline" size="sm"

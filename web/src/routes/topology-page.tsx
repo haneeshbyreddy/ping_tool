@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react"
 import { useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, LayoutGrid, List, MoreVertical, Pencil, Plus, Radio, ScanSearch, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ChevronRight, LayoutGrid, List, MoreVertical, Pencil, Plus, Radio, ScanSearch, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { billingApi, gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
@@ -14,6 +14,8 @@ import {
 } from "@/components/device-detail"
 import { NeedsOrg } from "@/components/needs-org"
 import { RegionSelect } from "@/components/region-select"
+import { runSnmpTest } from "@/components/snmp-test"
+import { TagsInput } from "@/components/tags-input"
 import { ProbesPanel } from "@/components/probes-panel"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { UpgradeNotice } from "@/components/upgrade-notice"
@@ -31,18 +33,24 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
-  DropdownMenuTrigger,
+  DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem,
+  DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
 function treeOrder(
   devices: OrgDevice[], collapsed: Set<number>,
+  cmp?: (a: OrgDevice, b: OrgDevice) => number,
 ): Array<OrgDevice & { depth: number; descendantCount: number }> {
   const children = new Map<number | null, OrgDevice[]>()
   for (const d of devices) {
     const key = d.parent_device_id
     if (!children.has(key)) children.set(key, [])
     children.get(key)!.push(d)
+  }
+  // sibling sort only — the parent-before-child structure never changes
+  const kids = (id: number | null) => {
+    const arr = children.get(id) ?? []
+    return cmp ? [...arr].sort(cmp) : arr
   }
   const descendantCount = (id: number): number =>
     (children.get(id) ?? []).reduce((sum, k) => sum + 1 + descendantCount(k.id), 0)
@@ -51,14 +59,68 @@ function treeOrder(
   const emit = (d: OrgDevice, depth: number) => {
     out.push({ ...d, depth, descendantCount: descendantCount(d.id) })
 
-    if (!collapsed.has(d.id)) for (const k of children.get(d.id) ?? []) emit(k, depth + 1)
+    if (!collapsed.has(d.id)) for (const k of kids(d.id)) emit(k, depth + 1)
   }
-  for (const d of children.get(null) ?? []) emit(d, 0)
+  for (const d of kids(null)) emit(d, 0)
 
   for (const d of devices) {
     if (d.parent_device_id != null && !ids.has(d.parent_device_id)) emit(d, 0)
   }
   return out
+}
+
+type SortMode = "default" | "ip" | "type"
+
+// Numeric IPv4 key — a string sort puts 10.0.0.9 after 10.0.0.10. Passives and
+// anything unparseable sink to the bottom.
+function ipKey(d: OrgDevice): number {
+  const m = d.ip_address.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
+  if (!m) return Number.MAX_SAFE_INTEGER
+  return ((+m[1] * 256 + +m[2]) * 256 + +m[3]) * 256 + +m[4]
+}
+
+// Type sorts by NETWORK HIERARCHY, not the alphabet: aggregation gear first,
+// access gear after (switch above OLT), passive plant at the bottom.
+const TYPE_RANK: Record<string, number> = {
+  core: 0, router: 1, gateway: 2, backhaul: 3, switch: 4, OLT: 5, AP: 6, CPE: 7,
+  splitter: 8, fdb: 9, closure: 10,
+}
+
+function comparatorFor(mode: SortMode): ((a: OrgDevice, b: OrgDevice) => number) | undefined {
+  if (mode === "ip") return (a, b) => ipKey(a) - ipKey(b) || a.name.localeCompare(b.name)
+  if (mode === "type") {
+    return (a, b) =>
+      (TYPE_RANK[a.device_type ?? ""] ?? 99) - (TYPE_RANK[b.device_type ?? ""] ?? 99)
+      || ipKey(a) - ipKey(b) || a.name.localeCompare(b.name)
+  }
+  return undefined // insertion order (ORDER BY id), the historical behavior
+}
+
+// Substring match over the fields an operator actually types; matches keep
+// their ancestor chain so the tree renders rooted, not floating.
+function filterWithAncestors(devices: OrgDevice[], query: string): OrgDevice[] {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return devices
+  const byId = new Map(devices.map((d) => [d.id, d]))
+  const hit = (d: OrgDevice) =>
+    d.name.toLowerCase().includes(needle)
+    || d.ip_address.includes(needle)
+    || (d.device_type ?? "").toLowerCase().includes(needle)
+    || (d.region ?? "").toLowerCase().includes(needle)
+    || d.tags.some((t) => t.toLowerCase().includes(needle))
+  const keep = new Set<number>()
+  for (const d of devices) {
+    if (!hit(d)) continue
+    keep.add(d.id)
+    let cur = d.parent_device_id
+    const seen = new Set<number>()
+    while (cur != null && byId.has(cur) && !seen.has(cur)) {
+      seen.add(cur)
+      keep.add(cur)
+      cur = byId.get(cur)!.parent_device_id
+    }
+  }
+  return devices.filter((d) => keep.has(d.id))
 }
 
 const GPON_VENDORS = ["huawei", "dbc"] as const
@@ -68,6 +130,7 @@ interface DeviceFormState {
   ip_address: string
   device_type: string
   region: string
+  tags: string[]
   parent_device_id: string
   assigned_node_id: string
   snmp_enabled: boolean
@@ -78,7 +141,8 @@ interface DeviceFormState {
 }
 
 const EMPTY_FORM: DeviceFormState = {
-  name: "", ip_address: "", device_type: "", region: "", parent_device_id: "",
+  name: "", ip_address: "", device_type: "", region: "", tags: [],
+  parent_device_id: "",
   assigned_node_id: "", snmp_enabled: false, snmp_community: "", snmp_port: "161",
   gpon_vendor: "", pon_port: "",
 }
@@ -96,7 +160,8 @@ function DeviceForm({
   const queryClient = useQueryClient()
   const [form, setForm] = useState<DeviceFormState>(() => editing ? {
     name: editing.name, ip_address: editing.ip_address, device_type: editing.device_type ?? "",
-    region: editing.region ?? "", parent_device_id: editing.parent_device_id ? String(editing.parent_device_id) : "",
+    region: editing.region ?? "", tags: editing.tags ?? [],
+    parent_device_id: editing.parent_device_id ? String(editing.parent_device_id) : "",
     assigned_node_id: editing.assigned_node_id ?? "",
     snmp_enabled: !!editing.snmp_enabled, snmp_community: editing.snmp_community ?? "",
     snmp_port: String(editing.snmp_port || 161),
@@ -137,6 +202,7 @@ function DeviceForm({
         ip_address: passive ? "" : form.ip_address.trim(),
         device_type: form.device_type || null,
         region: form.region.trim() || null,
+        tags: form.tags,
         parent_device_id: form.parent_device_id ? Number(form.parent_device_id) : null,
         assigned_node_id: passive ? null : (form.assigned_node_id || null),
 
@@ -150,6 +216,21 @@ function DeviceForm({
             snmp_enabled: form.snmp_enabled, snmp_community: form.snmp_community.trim() || null,
             snmp_port: form.snmp_port,
           })
+          // Changed SNMP settings get verified immediately: a tiny system walk
+          // through the probe answers "does this community/port actually work?"
+          // right here instead of a stale panel an hour later. Fire-and-forget —
+          // the verdict lives in a toast that outlives the form.
+          const snmpChanged = form.snmp_enabled !== !!editing.snmp_enabled
+            || form.snmp_community.trim() !== (editing.snmp_community ?? "")
+            || form.snmp_port !== String(editing.snmp_port || 161)
+          if (snmpChanged && form.snmp_enabled && form.snmp_community.trim()
+              && form.assigned_node_id) {
+            void runSnmpTest({
+              id: editing.id, name: form.name.trim() || editing.name,
+              ip_address: form.ip_address.trim() || editing.ip_address,
+              snmp_port: Number(form.snmp_port) || 161,
+            }, queryClient)
+          }
         }
       } else {
         await inventoryApi.create(payload)
@@ -195,6 +276,12 @@ function DeviceForm({
             <Label>Region</Label>
             <RegionSelect org={org} value={form.region} className="w-full"
               onChange={(v) => setForm({ ...form, region: v })} />
+          </div>
+          <div className="flex flex-col gap-1.5 sm:col-span-2">
+            <Label>Tags</Label>
+            <TagsInput value={form.tags}
+              suggestions={devices.flatMap((d) => d.tags)}
+              onChange={(tags) => setForm({ ...form, tags })} />
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>Parent</Label>
@@ -320,11 +407,12 @@ function useGridCols(): number {
 // deep-links to the panel tab that tells its story (optics / ports / health),
 // so the operator never hunts for it. Gated on hasOptics so a stale badge from
 // before SNMP was turned off can't chip a link that goes nowhere.
-function DeviceChips({ device, hasOptics, collapsed, openTab }: {
+function DeviceChips({ device, hasOptics, collapsed, openTab, onTagClick }: {
   device: OrgDevice & { descendantCount?: number }
   hasOptics: boolean
   collapsed?: boolean
   openTab: (t: DeviceTab) => void
+  onTagClick?: (tag: string) => void
 }) {
   const passive = isPassiveType(device.device_type)
   // a splitter with no probe is by design, not a config gap
@@ -345,6 +433,14 @@ function DeviceChips({ device, hasOptics, collapsed, openTab }: {
       )}
       {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
       {device.backup_parents.length > 0 && <RowTag tone="success">backup</RowTag>}
+      {/* owner-assigned tags — muted so status chips stay loudest; a click
+          narrows the list to that tag */}
+      {device.tags.map((t) => (
+        <RowTag key={t} tone="muted" title={`Show only "${t}" devices`}
+          onClick={onTagClick ? (e) => { e.stopPropagation(); onTagClick(t) } : undefined}>
+          {t}
+        </RowTag>
+      ))}
       {device.ports_down > 0 && (
         <RowTag tone="destructive" title="A watched port is down. Click for ports"
           onClick={(e) => { e.stopPropagation(); openTab("ports") }}>
@@ -510,7 +606,7 @@ function DeviceActions({ device, canWrite, onEdit }: {
 }
 
 function DeviceRow({
-  device, canWrite, onEdit, collapsed, onToggleCollapse, focus, drill,
+  device, canWrite, onEdit, collapsed, onToggleCollapse, focus, drill, onTagClick,
 }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
@@ -519,6 +615,7 @@ function DeviceRow({
   onToggleCollapse: () => void
   focus?: boolean
   drill: DrillIn
+  onTagClick?: (tag: string) => void
 }) {
   const { open: detailOpen, tab: detailTab, onToggle, onTab: setDetailTab, openTab } = drill
   const ref = useFocusScroll(focus)
@@ -560,7 +657,7 @@ function DeviceRow({
         {device.device_type && (
           <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
         )}
-        <DeviceChips device={device} hasOptics={hasOptics} collapsed={collapsed} openTab={openTab} />
+        <DeviceChips device={device} hasOptics={hasOptics} collapsed={collapsed} openTab={openTab} onTagClick={onTagClick} />
         <div className="ml-auto flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
           <DeviceMetrics device={device} />
           <span className="hidden font-mono text-xs text-muted-foreground md:inline">{device.ip_address}</span>
@@ -583,13 +680,14 @@ function DeviceRow({
 // full-width beneath the grid row (col-span-full), so the tabbed panel stays
 // identical across both views. Tree depth/collapse are list affordances and
 // don't apply here; the parent name carries the context an indent would.
-function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill }: {
+function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill, onTagClick }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
   onEdit: (d: OrgDevice) => void
   focus?: boolean
   parentName?: string
   drill: DrillIn
+  onTagClick?: (tag: string) => void
 }) {
   const { open: detailOpen, onToggle, openTab } = drill
   const ref = useFocusScroll(focus)
@@ -629,7 +727,7 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill }: {
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t pt-2">
           <DeviceMetrics device={device} />
-          <DeviceChips device={device} hasOptics={hasOptics} openTab={openTab} />
+          <DeviceChips device={device} hasOptics={hasOptics} openTab={openTab} onTagClick={onTagClick} />
           <div className="ml-auto flex items-center gap-1.5">
             <WebUiLiveIcon device={device} />
             <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
@@ -674,6 +772,19 @@ function loadView(): ViewMode {
   }
 }
 
+// Sort preference, persisted like the view toggle (a UI taste).
+const SORT_KEY = "wisp:network:sort"
+
+function loadSort(): SortMode {
+  try {
+    const v = localStorage.getItem(SORT_KEY)
+    // old stored values ("name"/"status", removed 2026-07-20) degrade to default
+    return v === "ip" || v === "type" ? v : "default"
+  } catch {
+    return "default"
+  }
+}
+
 function ViewToggle({ view, onChange }: { view: ViewMode; onChange: (v: ViewMode) => void }) {
   return (
     <div className="flex items-center gap-0.5 rounded-md border p-0.5">
@@ -702,6 +813,10 @@ export function TopologyPage() {
   const [collapsed, setCollapsed] = useState<Set<number>>(() => loadCollapsed(scopeOrg))
   const [probeFilter, setProbeFilter] = useState<string | null>(navState?.probeId ?? null)
   const [view, setView] = useState<ViewMode>(loadView)
+  const [search, setSearch] = useState("")
+  const [sortMode, setSortMode] = useState<SortMode>(loadSort)
+  // active tag filter — a device must carry EVERY selected tag (narrowing)
+  const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
   // Which device is drilled in, page-wide — one at a time, so opening another
   // auto-closes it. A row/card gets a controlled `DrillIn` derived from this.
   const [open, setOpen] = useState<{ id: number; tab: DeviceTab } | null>(null)
@@ -718,8 +833,19 @@ export function TopologyPage() {
     setView(v)
     try { localStorage.setItem(VIEW_KEY, v) } catch { /* private mode / quota */ }
   }
+  const changeSort = (v: SortMode) => {
+    setSortMode(v)
+    try { localStorage.setItem(SORT_KEY, v) } catch { /* private mode / quota */ }
+  }
+  const toggleTag = (t: string) => setTagFilter((prev) => {
+    const next = new Set(prev)
+    if (next.has(t)) next.delete(t)
+    else next.add(t)
+    return next
+  })
 
   useEffect(() => { setCollapsed(loadCollapsed(scopeOrg)) }, [scopeOrg])
+  useEffect(() => { setTagFilter(new Set()) }, [scopeOrg])
   // arriving from a stale-probe card while already mounted
   useEffect(() => { if (navState?.probeId) setProbeFilter(navState.probeId) }, [navState?.probeId])
   // deep-link (Home row / command palette) opens the target's panel
@@ -782,24 +908,37 @@ export function TopologyPage() {
   if (!scopeOrg) return <NeedsOrg />
 
   const allDevices = data?.devices ?? []
-  const devices = probeFilter
+  const searching = search.trim().length > 0
+  const probeFiltered = probeFilter
     ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
     : allDevices
+  const tagFiltered = tagFilter.size === 0 ? probeFiltered
+    : probeFiltered.filter((d) => [...tagFilter].every(
+        (t) => d.tags.some((x) => x.toLowerCase() === t.toLowerCase())))
+  const devices = filterWithAncestors(tagFiltered, search)
+  // every tag in use org-wide, with device counts, for the filter menu
+  const tagCounts = new Map<string, number>()
+  for (const d of allDevices) for (const t of d.tags) {
+    tagCounts.set(t, (tagCounts.get(t) ?? 0) + 1)
+  }
+  const allTags = [...tagCounts.keys()].sort((a, b) => a.localeCompare(b))
   // The cap counts monitored (non-passive) devices, matching the server; compute
   // the live count off the list so an add/delete reflects without refetching.
   const monitoredCount = allDevices.filter((d) => !isPassiveType(d.device_type)).length
   const deviceCap = billing.data?.device_cap ?? null
   const atCap = deviceCap != null && monitoredCount >= deviceCap
   const gridView = view === "grid"
+  const cmp = comparatorFor(sortMode)
   // grid flattens the tree (a card grid can't carry indent/collapse); parent-
   // before-child order still groups sensibly and each card names its parent.
-  const ordered = treeOrder(devices, gridView ? new Set<number>() : collapsed)
-  // Grid drill-in: place the open card's detail after the LAST card in its visual
-  // row, so its right-hand neighbours keep their row instead of jumping a line.
-  const openIndex = open ? ordered.findIndex((d) => d.id === open.id) : -1
-  const openRowEnd = openIndex < 0 ? -1
-    : Math.min(Math.floor(openIndex / cols) * cols + cols - 1, ordered.length - 1)
-  const openDevice = openIndex < 0 ? null : ordered[openIndex]
+  // While searching, collapse is ignored too — a match under a collapsed parent
+  // must not be invisible.
+  const effectiveCollapsed = gridView || searching ? new Set<number>() : collapsed
+  // List view sorts SIBLINGS (parent-before-child structure is the point of the
+  // tree); grid view has no hierarchy semantics, so an active sort there orders
+  // the whole flat list — sort-by-IP reads as one ascending scan.
+  const treeOrdered = treeOrder(devices, effectiveCollapsed, cmp)
+  const ordered = gridView && cmp ? [...treeOrdered].sort(cmp) : treeOrdered
   const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
   const nodeIds = activeNodes.map((n) => n.node_id)
@@ -816,6 +955,56 @@ export function TopologyPage() {
 
   const openEdit = (d: OrgDevice) => { setEditing(d); setFormOpen(true) }
   const closeForm = () => { setFormOpen(false); setEditing(null); setForceForm(false) }
+
+  type Ordered = OrgDevice & { depth: number; descendantCount: number }
+  const renderList = (list: Ordered[]) => (
+    <Card className="gap-0 overflow-hidden py-0">
+      {list.map((d) => (
+        <Fragment key={d.id}>
+          <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
+            collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)}
+            focus={d.id === focusId} drill={drillFor(d.id)} onTagClick={toggleTag} />
+          {formOpen && editing?.id === d.id && (
+            <div className="border-t bg-muted/30 p-3">
+              <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
+            </div>
+          )}
+        </Fragment>
+      ))}
+    </Card>
+  )
+  // Grid drill-in: place the open card's detail after the LAST card in its visual
+  // row, so its right-hand neighbours keep their row instead of jumping a line.
+  const renderGrid = (list: Ordered[]) => {
+    const openIndex = open ? list.findIndex((d) => d.id === open.id) : -1
+    const openRowEnd = openIndex < 0 ? -1
+      : Math.min(Math.floor(openIndex / cols) * cols + cols - 1, list.length - 1)
+    const openDevice = openIndex < 0 ? null : list[openIndex]
+    return (
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {list.map((d, i) => (
+          <Fragment key={d.id}>
+            <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit} focus={d.id === focusId}
+              drill={drillFor(d.id)} onTagClick={toggleTag}
+              parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined} />
+            {formOpen && editing?.id === d.id && (
+              <div className="col-span-full rounded-lg border bg-muted/30 p-3">
+                <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
+              </div>
+            )}
+            {i === openRowEnd && openDevice && (
+              <div className="col-span-full">
+                <div className="wisp-drillin px-3 pt-1 pb-3">
+                  <DeviceDetail device={openDevice} tab={open!.tab}
+                    onTab={(t) => setOpen((o) => (o ? { ...o, tab: t } : o))} />
+                </div>
+              </div>
+            )}
+          </Fragment>
+        ))}
+      </div>
+    )
+  }
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
@@ -843,6 +1032,16 @@ export function TopologyPage() {
                 <X className="size-3" />
               </button>
             )}
+            {[...tagFilter].map((t) => (
+              <button key={t}
+                className="flex items-center gap-1.5 self-center rounded-full border bg-card px-2.5 py-0.5 text-2xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                title="Filtering by this tag. Click to clear"
+                onClick={() => toggleTag(t)}>
+                <Tags className="size-3" />
+                {t}
+                <X className="size-3" />
+              </button>
+            ))}
             {(down > 0 || degraded > 0) && (
               <p className="text-xs">
                 {down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
@@ -851,12 +1050,66 @@ export function TopologyPage() {
               </p>
             )}
           </div>
-          {canWrite && !formOpen && (
-            <Button variant="ghost" size="sm" className="text-muted-foreground"
-              onClick={() => { setEditing(null); setFormOpen(true) }}>
-              <Plus className="size-3.5" /> Add device
-            </Button>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input value={search} onChange={(e) => setSearch(e.target.value)}
+                placeholder="Find device…" aria-label="Find device"
+                className="h-8 w-40 pl-7 text-xs md:w-56" />
+              {search && (
+                <button className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  aria-label="Clear search" onClick={() => setSearch("")}>
+                  <X className="size-3.5" />
+                </button>
+              )}
+            </div>
+            <Select value={sortMode} onValueChange={(v) => changeSort(v as SortMode)}>
+              <SelectTrigger className="h-8 w-32 text-xs" aria-label="Sort devices">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">Sort: Recent</SelectItem>
+                <SelectItem value="ip">Sort: IP</SelectItem>
+                <SelectItem value="type">Sort: Type</SelectItem>
+              </SelectContent>
+            </Select>
+            {allTags.length > 0 && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant={tagFilter.size > 0 ? "secondary" : "ghost"} size="sm"
+                    className={cn(tagFilter.size === 0 && "text-muted-foreground")}
+                    title="Filter by tags (a device must carry every selected tag)">
+                    <Tags className="size-3.5" /> Tags{tagFilter.size > 0 && ` · ${tagFilter.size}`}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="max-h-80 overflow-y-auto">
+                  {allTags.map((t) => (
+                    <DropdownMenuCheckboxItem key={t} checked={tagFilter.has(t)}
+                      onCheckedChange={() => toggleTag(t)}
+                      // keep the menu open — picking several tags is the point
+                      onSelect={(e) => e.preventDefault()}>
+                      {t}
+                      <span className="ml-auto pl-3 text-2xs text-muted-foreground">{tagCounts.get(t)}</span>
+                    </DropdownMenuCheckboxItem>
+                  ))}
+                  {tagFilter.size > 0 && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => setTagFilter(new Set())}>
+                        <X /> Clear tag filter
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+            {canWrite && !formOpen && (
+              <Button variant="ghost" size="sm" className="text-muted-foreground"
+                onClick={() => { setEditing(null); setFormOpen(true) }}>
+                <Plus className="size-3.5" /> Add device
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Add uses the top form (no row to attach to); edit renders inline at its row. */}
@@ -866,55 +1119,20 @@ export function TopologyPage() {
                 note="Passive plant (splitters, FDBs, closures) doesn't count toward the limit."
                 secondary={{ label: "Add passive plant", onClick: () => setForceForm(true) }}
                 onClose={closeForm} />
-            : <DeviceForm org={scopeOrg} editing={null} devices={devices} nodeIds={nodeIds}
+            : <DeviceForm org={scopeOrg} editing={null} devices={allDevices} nodeIds={nodeIds}
                 onDone={closeForm} initialType={forceForm ? "splitter" : undefined} />
         )}
 
         {isLoading && <Skeleton className="h-40 w-full" />}
         {!isLoading && devices.length === 0 && (
           <p className="rounded-lg border border-dashed py-10 text-center text-sm text-muted-foreground">
-            {probeFilter ? `No devices assigned to ${probeFilter}.` : "No devices yet. Add one above."}
+            {searching ? `No devices match “${search.trim()}”.`
+              : tagFilter.size > 0 ? "No devices carry all the selected tags."
+              : probeFilter ? `No devices assigned to ${probeFilter}.`
+              : "No devices yet. Add one above."}
           </p>
         )}
-        {devices.length > 0 && (gridView ? (
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-            {ordered.map((d, i) => (
-              <Fragment key={d.id}>
-                <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit} focus={d.id === focusId}
-                  drill={drillFor(d.id)}
-                  parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined} />
-                {formOpen && editing?.id === d.id && (
-                  <div className="col-span-full rounded-lg border bg-muted/30 p-3">
-                    <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
-                  </div>
-                )}
-                {i === openRowEnd && openDevice && (
-                  <div className="col-span-full">
-                    <div className="wisp-drillin px-3 pt-1 pb-3">
-                      <DeviceDetail device={openDevice} tab={open!.tab}
-                        onTab={(t) => setOpen((o) => (o ? { ...o, tab: t } : o))} />
-                    </div>
-                  </div>
-                )}
-              </Fragment>
-            ))}
-          </div>
-        ) : (
-          <Card className="gap-0 overflow-hidden py-0">
-            {ordered.map((d) => (
-              <Fragment key={d.id}>
-                <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
-                  collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)}
-                  focus={d.id === focusId} drill={drillFor(d.id)} />
-                {formOpen && editing?.id === d.id && (
-                  <div className="border-t bg-muted/30 p-3">
-                    <DeviceForm org={scopeOrg} editing={editing} devices={devices} nodeIds={nodeIds} onDone={closeForm} />
-                  </div>
-                )}
-              </Fragment>
-            ))}
-          </Card>
-        ))}
+        {devices.length > 0 && (gridView ? renderGrid(ordered) : renderList(ordered))}
       </section>
     </div>
   )

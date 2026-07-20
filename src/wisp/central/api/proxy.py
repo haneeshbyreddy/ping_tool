@@ -23,6 +23,7 @@ edge re-checks every target IP against its own device list.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -30,7 +31,7 @@ from datetime import datetime, timezone
 from wisp.central import auth
 from wisp.central import proxy as proxy_mod
 from wisp.central.api.common import org_or_400, reader_or_401
-from wisp.central.proxy import MAX_INFLIGHT_PER_SESSION, parse_ports
+from wisp.central.proxy import MAX_INFLIGHT_PER_SESSION, ProxySession, parse_ports
 from wisp.central.secretbox import DecryptError
 
 log = logging.getLogger("wisp.central")
@@ -162,6 +163,119 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
 
 
+def _resolve_web_endpoint(h, dev: dict, body: dict) -> tuple[str, int, str, str | None]:
+    """The (ip, port, scheme) the tunnel should target for this device, plus an
+    error string (or None). A per-device web override (web_ip/web_port/web_scheme,
+    any set) is an OWNER-declared endpoint: it wins and BYPASSES the fleet-wide
+    proxy_mgmt_ports list — the edge re-validates the very same fields, so there is
+    still no arbitrary-pivot. With no override we keep the classic path: the probe
+    IP on a browser-chosen port clamped to proxy_mgmt_ports."""
+    web_ip = (dev.get("web_ip") or "").strip()
+    web_port = dev.get("web_port")
+    web_scheme = (dev.get("web_scheme") or "").strip().lower()
+    if web_ip or web_port or web_scheme:
+        ip = web_ip or (dev.get("ip_address") or "").strip()
+        if not ip:
+            return "", 0, "", "device has no IP"
+        try:
+            port = int(web_port) if web_port else (443 if web_scheme == "https" else 80)
+        except (TypeError, ValueError):
+            return "", 0, "", "device has a bad web port configured"
+        if not (1 <= port <= 65535):
+            return "", 0, "", "device has a bad web port configured"
+        scheme = web_scheme or ("https" if port == 443 else "http")
+        return ip, port, scheme, None
+    ip = (dev.get("ip_address") or "").strip()
+    if not ip:
+        return "", 0, "", "device has no IP"
+    try:
+        port = int(body.get("port") or 80)
+    except (TypeError, ValueError):
+        return "", 0, "", "bad port"
+    if port not in parse_ports(h.cfg.proxy_mgmt_ports):
+        return "", 0, "", f"port {port} not in proxy_mgmt_ports"
+    return ip, port, "https" if port == 443 else "http", None
+
+
+# Session-open preflight (2026-07-20): before the browser tab points at the
+# tunnel, ask the EDGE which candidate endpoint actually answers a TCP/TLS
+# connect — the old port⇒scheme heuristic made a wrong guess (or a dead web UI)
+# surface only as a slow opaque error in the tab. The probe rides the normal
+# submit/deliver plumbing with kind="preflight"; an OLD edge treats it as a
+# plain fetch of "/" on the heuristic target (harmless, idempotent) and the
+# non-preflight-shaped reply makes us keep the heuristic — never fail the open.
+_PREFLIGHT_TIMEOUT_S = 8.0
+
+
+def _preflight_candidates(h, dev: dict, ip: str, port: int,
+                          scheme: str) -> list[tuple[str, int, str]]:
+    """Endpoints worth probing, best-first. Override devices probe the declared
+    endpoint (both schemes when the owner didn't pin one); classic devices probe
+    the mgmt ports, preferring whatever the heuristic already picked."""
+    if (dev.get("web_ip") or dev.get("web_port") or dev.get("web_scheme")):
+        if (dev.get("web_scheme") or "").strip():
+            return [(ip, port, scheme)]
+        return [(ip, port, "https"), (ip, port, "http")]
+    allowed = parse_ports(h.cfg.proxy_mgmt_ports)
+    cands = [(ip, p, s) for p, s in ((443, "https"), (80, "http")) if p in allowed]
+    cands.sort(key=lambda c: 0 if c[1] == port else 1)
+    return cands or [(ip, port, scheme)]
+
+
+def _parse_preflight_reply(resp: dict | None) -> list | None:
+    """The edge's probe report, or None when the reply isn't preflight-shaped
+    (timeout, old edge that fetched the page, error)."""
+    if not resp or resp.get("error"):
+        return None
+    try:
+        doc = json.loads(base64.b64decode(resp.get("body_b64") or ""))
+    except (ValueError, TypeError):
+        return None
+    if not (isinstance(doc, dict) and doc.get("preflight")
+            and isinstance(doc.get("results"), list)):
+        return None
+    return doc["results"]
+
+
+def _preflight_endpoint(h, org: str, node: str, device_id: int, dev: dict,
+                        ip: str, port: int, scheme: str
+                        ) -> tuple[str, int, str, str | None]:
+    """Resolve the heuristic (ip, port, scheme) against reality. Returns the
+    (possibly corrected) target, or an error string when the edge POSITIVELY
+    confirmed nothing answers. Any inconclusive outcome keeps the heuristic."""
+    if not h.proxy.polled_recently(org, node, h.cfg.proxy_poll_hold_s + 5.0):
+        return ip, port, scheme, None  # dormant tunnel / old edge: don't stall
+    cands = _preflight_candidates(h, dev, ip, port, scheme)
+    probe = ProxySession(
+        sid="preflight", org_id=org, device_id=device_id, node_id=node,
+        device_ip=ip, device_port=port, scheme=scheme, created_by=0,
+        created_at=time.time(), expires_at=time.time() + _PREFLIGHT_TIMEOUT_S)
+    resp = h.proxy.submit(
+        probe, method="GET", path="/", headers={}, body=b"",
+        timeout=_PREFLIGHT_TIMEOUT_S,
+        extra={"kind": "preflight",
+               "candidates": [[c[0], c[1], c[2]] for c in cands]})
+    results = _parse_preflight_reply(resp)
+    if results is None:
+        return ip, port, scheme, None
+    ok: dict[tuple[str, int, str], bool] = {}
+    for row in results:
+        try:
+            ok[(str(row[0]), int(row[1]), str(row[2]))] = bool(row[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+    for cand in cands:  # candidate order IS the preference order
+        if ok.get(cand):
+            return cand[0], cand[1], cand[2], None
+    if not any(cand in ok for cand in cands):
+        return ip, port, scheme, None  # edge answered but probed nothing we know
+    tried = ", ".join(f"{s}://{i}:{p}" for i, p, s in cands)
+    return ip, port, scheme, (
+        "device web UI unreachable from the probe — nothing answered at "
+        f"{tried}. Check that the web UI is enabled and the address/port is "
+        "right (Web UI settings on the device row).")
+
+
 def session_create(h, user, body) -> None:
     if not h.cfg.proxy_enabled:
         h._reply(404, {"error": "web proxy is disabled"})
@@ -188,21 +302,21 @@ def session_create(h, user, body) -> None:
     if not dev:
         h._reply(404, {"error": "device not found"})
         return
-    ip = (dev.get("ip_address") or "").strip()
     node = dev.get("assigned_node_id")
-    if not ip or not node:
-        h._reply(400, {"error": "device has no IP or assigned probe"})
+    if not node:
+        h._reply(400, {"error": "device has no assigned probe"})
         return
-    allowed_ports = parse_ports(h.cfg.proxy_mgmt_ports)
-    try:
-        port = int(body.get("port") or 80)
-    except (TypeError, ValueError):
-        h._reply(400, {"error": "bad port"})
+    ip, port, scheme, err = _resolve_web_endpoint(h, dev, body)
+    if err:
+        h._reply(400, {"error": err})
         return
-    if port not in allowed_ports:
-        h._reply(400, {"error": f"port {port} not in proxy_mgmt_ports"})
+    # Ask the edge what actually answers before committing the tab to a guess;
+    # inconclusive (dormant tunnel, old edge, probe timeout) keeps the heuristic.
+    ip, port, scheme, err = _preflight_endpoint(
+        h, org, node, device_id, dev, ip, port, scheme)
+    if err:
+        h._reply(502, {"error": err})
         return
-    scheme = "https" if port == 443 else "http"
     # One tunnel per probe: opening a session replaces whatever was open on
     # this node (newest wins — the operator must never have to hunt down a
     # forgotten session in Settings before opening the next device).

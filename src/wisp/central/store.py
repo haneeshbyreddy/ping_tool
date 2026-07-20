@@ -124,6 +124,9 @@ CREATE TABLE IF NOT EXISTS org_devices (
     ip_address       TEXT NOT NULL,
     device_type      TEXT,
     region           TEXT,
+    tags             TEXT,               -- comma-separated free-form labels
+                                          -- (dashboard filtering); cosmetic only,
+                                          -- never in the engine topology fingerprint
     parent_device_id INTEGER REFERENCES org_devices(id),
     assigned_node_id TEXT,             -- which registered edge node probes this device;
                                         -- NULL = every node for this org covers it
@@ -789,7 +792,24 @@ class CentralStore(
                 # OLT only: per-PON ONU cap override (NULL = cfg.onu_pon_limit, the
                 # EPON 1:64 default); a 1:128 GPON box raises it so it never
                 # false-pages "at capacity" (central/onualert.py)
-                ("onu_pon_limit", "INTEGER")))
+                ("onu_pon_limit", "INTEGER"),
+                # Web-UI proxy address override: when a device's admin page isn't
+                # at ip_address:80/443 (port-forwarding / a separate mgmt IP), the
+                # owner declares where it actually lives. Any of these set = the
+                # proxy targets (web_ip or ip_address):(web_port or scheme default)
+                # over web_scheme, bypassing the fleet-wide proxy_mgmt_ports list —
+                # an owner-declared endpoint, re-validated on the edge against the
+                # SAME device fields (no arbitrary-pivot). All NULL = classic
+                # behavior (proxy the probe IP on 80/443).
+                ("web_ip", "TEXT"),
+                ("web_port", "INTEGER"),
+                ("web_scheme", "TEXT"),
+                # comma-separated free-form tags (Network page filtering);
+                # cosmetic — deliberately NOT part of org_device_topology, so
+                # editing them never rebuilds/re-pages an engine. (A dev DB may
+                # also carry a dead group_name column from the tags feature's
+                # one-day single-group predecessor — harmless.)
+                ("tags", "TEXT")))
             # when this ONU was last seen online — central/ponfault.py reads it to
             # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (

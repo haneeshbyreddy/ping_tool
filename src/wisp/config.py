@@ -88,6 +88,12 @@ class Config:
     proxy_workers: int = field(default_factory=lambda: _env_int("WISP_PROXY_WORKERS", 4))
     proxy_request_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_PROXY_REQUEST_TIMEOUT_S", 30.0))
+    # TCP-connect budget to the DEVICE, separate from the request timeout above:
+    # a LAN box either accepts within a few seconds or never will — the long
+    # timeout is for slow pages, not dead sockets (fast-failure fix 2026-07-20).
+    # Also the per-candidate budget of the session-open preflight probe.
+    proxy_connect_timeout_s: float = field(
+        default_factory=lambda: _env_float("WISP_PROXY_CONNECT_TIMEOUT_S", 5.0))
     proxy_max_body_bytes: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_MAX_BODY_BYTES", 8 * 1024 * 1024))
 

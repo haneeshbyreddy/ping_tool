@@ -309,6 +309,30 @@ def snmp(h, user, body):
     h._reply(200 if ok else 404, {"ok": ok})
 
 
+def web_access(h, user, body):
+    """Set/clear a device's web-UI proxy address override (owner-gated, like every
+    inventory write). When the device's admin page isn't at ip_address:80/443
+    (port-forwarding / a separate mgmt IP), the owner declares where it lives so
+    'Open web UI' tunnels there instead."""
+    did = int(body.get("id") or body.get("device_id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    dev = h.store.get_org_device(org, did) if org is not None else None
+    if not dev:
+        h._reply(404, {"ok": False, "error": "device not found"})
+        return
+    clean = inventory.clean_web_access_payload(body)
+    # Drop a redundant override (same IP on 80/443, or a bare scheme) to NULL so
+    # it never pins a scheme and steals the http/https fallback — see
+    # inventory.normalize_web_access.
+    clean = inventory.normalize_web_access(clean, dev.get("ip_address"))
+    ok = h.store.set_org_device_web_access(
+        org, did, web_ip=clean["web_ip"], web_port=clean["web_port"],
+        web_scheme=clean["web_scheme"])
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
 def capability(h, user, body):
     clean = inventory.clean_capability_payload(body)
     org = device_write_org(h, user, clean["device_id"])

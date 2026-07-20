@@ -52,6 +52,30 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
         except ValueError:
             raise InventoryError(f"'{ip_address}' is not a valid IP address")
     region = _str(data, "region")
+    # free-form tags (Network page filtering) — cosmetic, never reach the
+    # engine or the edge. Accepts a list or a comma-separated string; stored
+    # comma-joined, deduped case-insensitively, order preserved.
+    tags_raw = data.get("tags")
+    if isinstance(tags_raw, str):
+        parts = tags_raw.split(",")
+    elif isinstance(tags_raw, (list, tuple)):
+        parts = [str(t) for t in tags_raw]
+    else:
+        parts = []
+    tags: list[str] = []
+    seen: set[str] = set()
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        if len(t) > 32:
+            raise InventoryError("a tag must be 32 characters or fewer")
+        if t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        tags.append(t)
+    if len(tags) > 8:
+        raise InventoryError("at most 8 tags per device")
 
     parent_raw = data.get("parent_device_id")
     parent_id: int | None = None
@@ -102,7 +126,8 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
         raise InventoryError("PON port must be 32 characters or fewer")
 
     return {"name": name, "ip_address": ip_address, "device_type": device_type,
-            "region": region, "parent_device_id": parent_id,
+            "region": region, "tags": ",".join(tags) or None,
+            "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor,
             "pon_port": pon_port}
 
@@ -121,6 +146,72 @@ def clean_location_payload(data: dict) -> dict:
         raise InventoryError("lng must be between -180 and 180")
     # ~1e-6° ≈ 0.1 m — anything longer is float noise from a drag event
     return {"lat": round(lat, 6), "lng": round(lng, 6)}
+
+def clean_web_access_payload(data: dict) -> dict:
+    """Web-UI proxy address override for a device. All three fields are optional
+    and independent: a blank/absent IP means 'proxy the probe IP', a blank port
+    means 'the scheme default', a blank scheme means 'infer from the port'. All
+    blank clears the override. The IP (when given) must parse; the port must be
+    1..65535; the scheme must be http or https."""
+    ip_raw = _str(data, "web_ip") or ""
+    web_ip = ip_raw.strip()
+    if web_ip:
+        try:
+            ipaddress.ip_address(web_ip)
+        except ValueError:
+            raise InventoryError(f"'{web_ip}' is not a valid IP address")
+
+    port_raw = data.get("web_port")
+    web_port: int | None = None
+    if port_raw not in (None, "", "null"):
+        try:
+            web_port = int(port_raw)
+        except (TypeError, ValueError):
+            raise InventoryError("web port must be a whole number")
+        if not (1 <= web_port <= 65535):
+            raise InventoryError("web port must be between 1 and 65535")
+
+    scheme_raw = (_str(data, "web_scheme") or "").strip().lower()
+    if scheme_raw and scheme_raw not in ("http", "https"):
+        raise InventoryError("web scheme must be http or https")
+    web_scheme = scheme_raw or None
+
+    return {"web_ip": web_ip or None, "web_port": web_port, "web_scheme": web_scheme}
+
+
+# The two ports the plain http/https "Connect" buttons already reach on the
+# device's own IP — an override naming one of these on the same host reaches
+# nowhere new.
+_STD_WEB_PORTS = (80, 443)
+
+
+def normalize_web_access(clean: dict, device_ip: str | None) -> dict:
+    """Collapse a web-UI override that points nowhere the plain http/https buttons
+    can't already reach, so a redundant entry is never stored.
+
+    The override earns its keep ONLY when it names a genuinely distinct endpoint:
+    a DIFFERENT host, or a NON-standard port on the same host. Re-typing the
+    device's own IP on 80/443 (or a bare scheme) resolves to exactly what
+    'Connect -> http/https' already does — storing it would gain nothing and,
+    worse, collapse the http/https split button into a single pinned Connect
+    (any override field set does that), stranding the tech on the wrong scheme
+    if they guessed it. So we drop the redundant bits to NULL and keep the
+    scheme fallback for the common case. Same-host-distinct-port keeps the port
+    (+scheme) but drops the redundant IP, so a later re-parent can't pin a stale
+    host. Takes the already-cleaned/validated payload from
+    ``clean_web_access_payload``."""
+    device_ip = (device_ip or "").strip()
+    web_ip = clean.get("web_ip")
+    web_port = clean.get("web_port")
+    web_scheme = clean.get("web_scheme")
+    distinct_ip = bool(web_ip) and web_ip != device_ip
+    distinct_port = web_port is not None and web_port not in _STD_WEB_PORTS
+    if distinct_ip:
+        return {"web_ip": web_ip, "web_port": web_port, "web_scheme": web_scheme}
+    if distinct_port:
+        return {"web_ip": None, "web_port": web_port, "web_scheme": web_scheme}
+    return {"web_ip": None, "web_port": None, "web_scheme": None}
+
 
 ROUTE_MAX_WAYPOINTS = 200
 

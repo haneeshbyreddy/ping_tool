@@ -120,6 +120,7 @@ export interface DevicePayload {
   ip_address: string
   device_type?: string | null
   region?: string | null
+  tags?: string[] | null
   parent_device_id?: number | null
   assigned_node_id?: string | null
   gpon_vendor?: string | null
@@ -140,6 +141,11 @@ export const inventoryApi = {
   setSnmp: (id: number, body: {
     snmp_enabled: boolean; snmp_community?: string | null; snmp_port?: number | string
   }) => request<{ ok: boolean }>("/api/inventory/snmp", { method: "POST", body: { id, ...body } }),
+  // Web-UI proxy address override (owner-only). Blank/null fields clear that part;
+  // all blank clears the override (back to the probe IP on 80/443).
+  setWebAccess: (id: number, body: {
+    web_ip: string | null; web_port: number | null; web_scheme: string | null
+  }) => request<{ ok: boolean }>("/api/inventory/web-access", { method: "POST", body: { id, ...body } }),
   ports: (deviceId: number) => request<{ ports: SwitchPort[] }>(`/api/inventory/ports?device_id=${deviceId}`),
   perfSamples: (deviceId: number) =>
     request<{ samples: PerfSample[] }>(`/api/inventory/perf/samples?device_id=${deviceId}`),

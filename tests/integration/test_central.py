@@ -374,6 +374,24 @@ class OrgDevicesTest(unittest.TestCase):
             "region": None, "parent_device_id": None, "gpon_vendor": None})
         self.assertIsNone(self.store.get_org_device("ispA", olt)["gpon_vendor"])
 
+    def test_tags_round_trip_but_stay_out_of_topology(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "SW-1", "ip_address": "10.0.0.8", "device_type": "switch",
+            "region": None, "parent_device_id": None, "tags": "hill-site,backhaul"})
+        row = next(d for d in self.store.list_org_devices("ispA") if d["id"] == dev)
+        self.assertEqual(row["tags"], ["hill-site", "backhaul"])  # list on the wire
+
+        # cosmetic only: the engine topology fingerprint reads org_device_topology,
+        # so a tag edit must never surface there (no rebuild / re-page)
+        topo = {d["id"]: d for d in self.store.org_device_topology("ispA")}
+        self.assertNotIn("tags", topo[dev])
+
+        self.store.update_org_device("ispA", dev, {
+            "name": "SW-1", "ip_address": "10.0.0.8", "device_type": "switch",
+            "region": None, "parent_device_id": None, "tags": None})
+        row = next(d for d in self.store.list_org_devices("ispA") if d["id"] == dev)
+        self.assertEqual(row["tags"], [])
+
     def test_list_carries_monitored_port_alarm_counts(self):
         sw = self.store.create_org_device("ispA", {
             "name": "SW", "ip_address": "10.0.0.9", "device_type": "switch",
@@ -442,6 +460,12 @@ class OrgDevicesTest(unittest.TestCase):
         self.store.upsert_switch_port("ispA", switch, 1, "eth1", None, "up", "up",
                                       None, 0, False, None, "t1")
         self.store.set_port_feeds("ispA", self.store.list_switch_ports("ispA", switch)[0]["id"], d)
+        # SNMP-side rows: these FK org_devices and once broke delete with a
+        # FOREIGN KEY constraint (field bug, 2026-07-19 — Epon_8).
+        self.store.upsert_device_health("ispA", d, {"cpu_pct": 42.0}, "t1")
+        self.store.upsert_pon_capacity_state("ispA", d, "0/1", onus=64, active=True,
+                                             since="t1", ts="t1")
+        self.store.create_snmp_walk("ispA", d, "node1", "1.3.6.1.2.1.1", 10)
 
         result = self.store.delete_org_device("ispA", d)
         self.assertTrue(result["ok"], result)
@@ -450,6 +474,25 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertEqual(len(ports), 1)
         self.assertIsNone(ports[0]["feeds_device_id"])
         self.assertTrue(self.store.delete_org_device("ispA", backup)["ok"])
+
+    def test_delete_cascade_handles_every_fk_table(self):
+        # Guardrail: every table that FK-references org_devices(id) must be
+        # cleared (DELETE) or detached (UPDATE ... NULL) by delete_org_device, or
+        # a real delete 500s on "FOREIGN KEY constraint failed" (foreign_keys=ON).
+        # A static check so adding a new device-scoped table without wiring the
+        # cascade fails HERE, not in production.
+        import inspect, re
+        from wisp.central import store as store_mod
+        fk_tables = {
+            name for name, body in re.findall(
+                r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)\s*\((.*?)\n\s*\);",
+                store_mod._SCHEMA, re.S)
+            if "REFERENCES org_devices(id)" in body}
+        fk_tables.discard("org_devices")  # the row itself
+        src = inspect.getsource(store_mod.CentralStore.delete_org_device)
+        missing = [t for t in sorted(fk_tables) if not re.search(rf"\b{t}\b", src)]
+        self.assertEqual(missing, [],
+                         f"delete_org_device forgets FK table(s): {missing}")
 
     def test_maintenance_and_snmp_toggle(self):
         d = self.store.create_org_device("ispA", {

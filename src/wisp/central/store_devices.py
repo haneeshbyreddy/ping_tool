@@ -82,9 +82,11 @@ class DeviceStoreMixin:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT d.id, d.org_id, d.name, d.ip_address, d.device_type, d.region,"
+                " d.tags,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
                 " d.lat, d.lng, d.pon_port, d.onu_pon_limit,"
+                " d.web_ip, d.web_port, d.web_scheme,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
                 " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
@@ -121,6 +123,8 @@ class DeviceStoreMixin:
         out = [dict(r) for r in rows]
         for d in out:
             d["backup_parents"] = backups.get(d["id"], [])
+            # stored comma-joined; the wire carries a real list
+            d["tags"] = [t for t in (d["tags"] or "").split(",") if t]
         return out
 
 
@@ -150,10 +154,12 @@ class DeviceStoreMixin:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO org_devices (org_id, name, ip_address, device_type, region,"
-                " parent_device_id, assigned_node_id, gpon_vendor, pon_port, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " tags, parent_device_id, assigned_node_id, gpon_vendor, pon_port,"
+                " created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (org_id, clean["name"], clean["ip_address"], clean["device_type"],
-                 clean["region"], clean["parent_device_id"], clean.get("assigned_node_id"),
+                 clean["region"], clean.get("tags"),
+                 clean["parent_device_id"], clean.get("assigned_node_id"),
                  clean.get("gpon_vendor"), clean.get("pon_port"), _now_iso()))
             conn.commit()
             return int(cur.lastrowid)
@@ -163,9 +169,11 @@ class DeviceStoreMixin:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
-                " parent_device_id=?, assigned_node_id=?, gpon_vendor=?, pon_port=?"
+                " tags=?, parent_device_id=?, assigned_node_id=?, gpon_vendor=?,"
+                " pon_port=?"
                 " WHERE id=? AND org_id=? AND is_active=1",
                 (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
+                 clean.get("tags"),
                  clean["parent_device_id"], clean.get("assigned_node_id"),
                  clean.get("gpon_vendor"), clean.get("pon_port"), device_id, org_id))
             if cur.rowcount > 0 and not clean.get("assigned_node_id"):
@@ -258,6 +266,21 @@ class DeviceStoreMixin:
             return cur.rowcount > 0
 
 
+    def set_org_device_web_access(self, org_id: str, device_id: int, *,
+                                  web_ip: str | None, web_port: int | None,
+                                  web_scheme: str | None) -> bool:
+        """Set (or clear) a device's web-UI proxy address override. Each field is
+        independent: NULL ip = proxy the probe IP, NULL port = the scheme default,
+        NULL scheme = infer from port. All three NULL clears the override entirely."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET web_ip=?, web_port=?, web_scheme=?"
+                " WHERE id=? AND org_id=? AND is_active=1",
+                (web_ip or None, web_port, web_scheme or None, device_id, org_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
     def delete_org_device(self, org_id: str, device_id: int) -> dict:
         with self._connect() as conn:
             row = conn.execute(
@@ -312,6 +335,11 @@ class DeviceStoreMixin:
                          (device_id,))
             conn.execute("DELETE FROM device_webui_credentials WHERE device_id=?",
                          (device_id,))
+            conn.execute("DELETE FROM device_health WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM pon_capacity_state WHERE org_id=? AND device_id=?",
+                         (org_id, device_id))
+            conn.execute("DELETE FROM snmp_walks WHERE org_id=? AND device_id=?",
+                         (org_id, device_id))
             conn.execute("DELETE FROM org_devices WHERE id=? AND org_id=?",
                          (device_id, org_id))
             conn.commit()
@@ -328,7 +356,7 @@ class DeviceStoreMixin:
             rows = conn.execute(
                 "SELECT id, name, ip_address, region, parent_device_id, assigned_node_id,"
                 " snmp_enabled, snmp_version, snmp_community, snmp_port, device_type,"
-                " gpon_vendor FROM org_devices"
+                " gpon_vendor, web_ip, web_port, web_scheme FROM org_devices"
                 " WHERE org_id=? AND is_active=1 AND maintenance=0"
                 f" AND (device_type IS NULL OR device_type NOT IN ({placeholders}))"
                 " ORDER BY id",

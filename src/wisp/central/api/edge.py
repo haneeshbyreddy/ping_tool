@@ -153,6 +153,12 @@ def report(h, org: str, env: dict) -> dict:
             psessions = h.proxy.active_sessions_for(org, env.get("node_id", ""))
             if psessions:
                 reply["proxy_sessions"] = psessions
+            # Standby flag (first-connect fix 2026-07-20): a web-proxy org's
+            # nodes keep ONE long-poll open even with no live session, so
+            # opening a device page doesn't wait a report cycle for the
+            # tunnel to wake. Older edges ignore the key.
+            if h.store.org_web_proxy(org):
+                reply["proxy_standby"] = True
     return reply
 
 

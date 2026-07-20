@@ -80,6 +80,7 @@ POST = {
     "/api/inventory/location": devices.location,
     "/api/inventory/route": devices.route,
     "/api/inventory/snmp": devices.snmp,
+    "/api/inventory/web-access": devices.web_access,
     "/api/inventory/capability": devices.capability,
     "/api/inventory/credentials": devices.webui_credentials_set,
     "/api/inventory/credentials/clear": devices.webui_credentials_clear,

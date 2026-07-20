@@ -197,6 +197,8 @@ export interface OrgDevice {
   ip_address: string
   device_type: DeviceType | null
   region: string | null
+  /** free-form labels for Network-page filtering (≤8, cosmetic only) */
+  tags: string[]
   parent_device_id: number | null
   assigned_node_id: string | null
   maintenance: 0 | 1
@@ -208,6 +210,13 @@ export interface OrgDevice {
   gpon_vendor: string | null
   /** passive plant only: which PON this splitter/FDB serves (e.g. "0/6") */
   pon_port: string | null
+  /** web-UI proxy address override: where the admin page actually lives when
+      it isn't at ip_address:80/443 (port-forwarding / a separate mgmt IP).
+      Any set = "Open web UI" targets (web_ip||ip_address):(web_port||default)
+      over web_scheme; all null = classic behavior. */
+  web_ip: string | null
+  web_port: number | null
+  web_scheme: string | null
   lat: number | null
   lng: number | null
   child_count: number
