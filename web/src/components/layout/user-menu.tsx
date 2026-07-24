@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useNavigate } from "react-router-dom"
-import { LogOut, Moon, Sun } from "lucide-react"
+import { LogOut, Moon, Sun, UserRound } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { applyTheme, getStoredTheme, type ThemeMode } from "@/lib/theme"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
@@ -49,6 +49,10 @@ export function UserMenu() {
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => navigate("/account")}>
+          <UserRound />
+          Your account
+        </DropdownMenuItem>
         <DropdownMenuItem onClick={toggleTheme}>
           {mode === "dark" ? <Sun /> : <Moon />}
           {mode === "dark" ? "Light mode" : "Dark mode"}

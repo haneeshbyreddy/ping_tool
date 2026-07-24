@@ -4,7 +4,7 @@ import { toast } from "sonner"
 import { Navigate, useNavigate, useParams } from "react-router-dom"
 import {
   Building2, Check, Copy, Dices, IndianRupee, KeyRound, MapPin, MessageCircle,
-  Pencil, Plus, Radio, ServerCog, Trash2, X, type LucideIcon,
+  Pencil, Plus, Radio, ServerCog, Trash2, Users, X, type LucideIcon,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { cn } from "@/lib/utils"
@@ -17,7 +17,6 @@ import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { QrImage } from "@/components/qr-image"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
-import { TwoFactorCard } from "@/components/two-factor-card"
 import { GponProfilesCard } from "@/components/gpon-profiles-card"
 import { WebOpticsCard } from "@/components/web-optics-card"
 import { WebProxyCard } from "@/components/web-proxy"
@@ -593,57 +592,6 @@ function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
   )
 }
 
-function ChangePasswordCard() {
-  const [current, setCurrent] = useState("")
-  const [next, setNext] = useState("")
-  const [confirm, setConfirm] = useState("")
-  const [error, setError] = useState("")
-
-  const change = useMutation({
-    mutationFn: () => usersApi.changePassword({ current_password: current, new_password: next }),
-    onSuccess: () => {
-      toast.success("Password changed")
-      setCurrent(""); setNext(""); setConfirm(""); setError("")
-    },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "Failed to change password"),
-  })
-
-  const mismatch = confirm.length > 0 && next !== confirm
-  const canSubmit = current.length > 0 && next.length >= 8 && next === confirm && !change.isPending
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <KeyRound className="size-4 text-muted-foreground" /> Your password
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-2.5">
-        <div className="flex flex-col gap-1.5">
-          <Label>Current password</Label>
-          <Input type="password" autoComplete="current-password" className="max-w-sm"
-            value={current} onChange={(e) => setCurrent(e.target.value)} />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label>New password</Label>
-          <Input type="password" autoComplete="new-password" placeholder="min 8 characters" className="max-w-sm"
-            value={next} onChange={(e) => setNext(e.target.value)} />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label>Confirm new password</Label>
-          <Input type="password" autoComplete="new-password" className="max-w-sm"
-            value={confirm} onChange={(e) => setConfirm(e.target.value)} />
-        </div>
-        {mismatch && <p className="text-xs text-destructive">Passwords don't match.</p>}
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <Button size="sm" className="w-fit" disabled={!canSubmit} onClick={() => change.mutate()}>
-          {change.isPending ? "Changing…" : "Change password"}
-        </Button>
-      </CardContent>
-    </Card>
-  )
-}
-
 function ResetPasswordDialog({ target }: { target: AccountUser }) {
   const [open, setOpen] = useState(false)
   const [next, setNext] = useState("")
@@ -907,16 +855,14 @@ const SECTIONS: Array<{
   },
   {
     id: "accounts",
-    label: "Accounts",
-    icon: KeyRound,
-    visible: () => true, // everyone can at least change their own password
-    render: (c) => (
-      <>
-        {c.org && c.canWrite && <UsersCard org={c.org} />}
-        <ChangePasswordCard />
-        <TwoFactorCard />
-      </>
-    ),
+    label: "Users",
+    icon: Users,
+    // Org member accounts only. Personal password / 2FA / WhatsApp moved to the
+    // "Your account" page (routes/account-page.tsx), reachable by every role
+    // from the account menu — so a worker (who never opens Settings) can still
+    // change its own password.
+    visible: (c) => !!c.org && c.canWrite,
+    render: (c) => <UsersCard org={c.org!} />,
   },
   {
     id: "platform",

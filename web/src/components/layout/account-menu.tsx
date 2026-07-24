@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router-dom"
-import { CreditCard, LogOut, Moon, Settings, Sun, ChevronsUpDown } from "lucide-react"
+import { CreditCard, LogOut, Moon, Settings, Sun, UserRound, ChevronsUpDown } from "lucide-react"
 import { useState } from "react"
 import { useAuth } from "@/hooks/use-auth"
 import { applyTheme, getStoredTheme, type ThemeMode } from "@/lib/theme"
@@ -71,6 +71,13 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
+        {/* Personal settings — every role, including a worker (its only
+            password/2FA/WhatsApp surface). Distinct from the org-config Settings
+            page below, which stays owner+. */}
+        <DropdownMenuItem onClick={() => navigate("/account")}>
+          <UserRound />
+          Your account
+        </DropdownMenuItem>
         {!isWorker && (
           <DropdownMenuItem onClick={() => navigate("/settings")}>
             <Settings />

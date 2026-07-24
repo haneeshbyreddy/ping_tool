@@ -11,6 +11,7 @@ import { HomePage } from "@/routes/home-page"
 import { TopologyPage } from "@/routes/topology-page"
 import { MapPage } from "@/routes/map-page"
 import { SettingsPage } from "@/routes/settings-page"
+import { AccountPage } from "@/routes/account-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
 import { OverviewPage } from "@/routes/overview-page"
@@ -47,6 +48,9 @@ function App() {
                     {/* Sections are addressable so the account menu, the billing
                         banner and a bookmark can all land on the right one. */}
                     <Route path="settings/:section" element={<SettingsPage />} />
+                    {/* Personal settings — reachable by every role (workers too),
+                        so it lives outside the owner-only Settings page. */}
+                    <Route path="account" element={<AccountPage />} />
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />
                     <Route path="overview" element={<OverviewPage />} />
