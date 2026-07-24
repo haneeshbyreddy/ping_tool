@@ -492,6 +492,24 @@ type SectionCtx = {
   org: string | null
   canWrite: boolean
   isSuperadmin: boolean
+  /** web-proxy capability grant for the scoped org (superadmin-set). The
+   *  Monitoring "Device web UI sessions" panel self-nulls without it, so both
+   *  that panel and its jump-index entry ride this flag — otherwise the index
+   *  would advertise an anchor that scrolls to nothing. */
+  hasWebProxy: boolean
+}
+
+/** One card within a section. A section is a LIST of named panels rather than a
+ *  single opaque `render`, which is what lets the page offer a per-sub-page "On
+ *  this page" jump index: it can name a section's panels and scroll straight to
+ *  one instead of the operator hunting down a tall column. `visible` defaults to
+ *  shown — only a panel with its OWN extra gate beyond the section's (Web proxy)
+ *  needs one. */
+type Panel = {
+  id: string
+  label: string
+  visible?: (c: SectionCtx) => boolean
+  render: (c: SectionCtx) => React.ReactNode
 }
 
 const SECTIONS: Array<{
@@ -499,26 +517,29 @@ const SECTIONS: Array<{
   label: string
   icon: LucideIcon
   visible: (c: SectionCtx) => boolean
-  render: (c: SectionCtx) => React.ReactNode
+  panels: Panel[]
 }> = [
   {
     id: "billing",
     label: "Plan & billing",
     icon: IndianRupee,
     visible: (c) => !!c.org,
-    render: (c) => <BillingCard org={c.org!} />,
+    panels: [
+      { id: "billing", label: "Plan & billing", render: (c) => <BillingCard org={c.org!} /> },
+    ],
   },
   {
     id: "organization",
     label: "Organization",
     icon: Building2,
     visible: (c) => !!c.org,
-    render: (c) => (
-      <>
-        <OrgSettingsCard org={c.org!} canWrite={c.canWrite} />
-        <RegionsCard org={c.org!} canWrite={c.canWrite} />
-      </>
-    ),
+    panels: [
+      {
+        id: "org-routing", label: "Organization & alert routing",
+        render: (c) => <OrgSettingsCard org={c.org!} canWrite={c.canWrite} />,
+      },
+      { id: "regions", label: "Regions", render: (c) => <RegionsCard org={c.org!} canWrite={c.canWrite} /> },
+    ],
   },
   {
     id: "monitoring",
@@ -526,32 +547,29 @@ const SECTIONS: Array<{
     icon: Radio,
     // Vendor profiles: superadmin manages the global set, an org owner adds
     // org-local ones. A superadmin with no org scoped still manages globals.
-    // Both cards render for exactly this predicate, so the section can't come
-    // up empty. (It used to need a `hasWebProxy` data probe as well: a
-    // read-only OPERATOR saw nothing here but the proxy card, so a role-only
-    // predicate offered them a blank page. Roles collapsed to owner+worker on
-    // 2026-07-21 and workers never reach the shell — every visitor here now
-    // has canWrite, so the probe went with the role.)
+    // The three profile cards render for exactly this predicate, so the section
+    // can't come up empty. (It once needed a `hasWebProxy` data probe to gate
+    // the whole section: a read-only OPERATOR saw nothing here but the proxy
+    // card, so a role-only predicate offered them a blank page. Roles collapsed
+    // to owner+worker on 2026-07-21 and workers never reach the shell — every
+    // visitor here now has canWrite. The probe is back, but ONLY to gate the
+    // proxy PANEL and its index entry, never the whole section.)
     visible: (c) => c.canWrite && (!!c.org || c.isSuperadmin),
-    render: (c) => (
-      <>
-        {/* renders nothing until the superadmin grants the org the capability */}
-        {c.org && <WebProxyCard org={c.org} />}
-        {c.canWrite && (c.org || c.isSuperadmin) && (
-          <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} />
-        )}
-        {c.canWrite && (c.org || c.isSuperadmin) && (
-          <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} />
-        )}
-        {/* The vendors whose per-ONU dBm exists only on the OLT's own web page.
-            Central-side, so it rides the same predicate as the two above rather
-            than needing the web-proxy probe — a recipe is worth writing before
-            the capability is granted. */}
-        {c.canWrite && (c.org || c.isSuperadmin) && (
-          <WebOpticsCard org={c.org} isSuperadmin={c.isSuperadmin} />
-        )}
-      </>
-    ),
+    panels: [
+      // Self-nulls until the superadmin grants the org the capability, so both
+      // the card and its index entry ride the grant.
+      {
+        id: "web-proxy", label: "Device web UI sessions",
+        visible: (c) => !!c.org && c.hasWebProxy,
+        render: (c) => <WebProxyCard org={c.org!} />,
+      },
+      { id: "snmp-profiles", label: "SNMP health profiles", render: (c) => <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
+      { id: "gpon-profiles", label: "GPON vendor profiles", render: (c) => <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
+      // The vendors whose per-ONU dBm exists only on the OLT's own web page.
+      // Central-side, so it rides the section predicate rather than the proxy
+      // grant — a recipe is worth writing before the capability is granted.
+      { id: "web-optics", label: "Web-UI optics vendors", render: (c) => <WebOpticsCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
+    ],
   },
   {
     id: "accounts",
@@ -562,7 +580,9 @@ const SECTIONS: Array<{
     // from the account menu — so a worker (who never opens Settings) can still
     // change its own password.
     visible: (c) => !!c.org && c.canWrite,
-    render: (c) => <UsersCard org={c.org!} />,
+    panels: [
+      { id: "users", label: "Login accounts", render: (c) => <UsersCard org={c.org!} /> },
+    ],
   },
 ]
 
@@ -585,13 +605,25 @@ export function SettingsPage() {
   const { section } = useParams()
   const navigate = useNavigate()
 
+  // web_proxy grant for the scoped org — drives whether the Monitoring "Device
+  // web UI sessions" panel renders (the card self-nulls without it), so the jump
+  // index can gate its entry on the same flag. Same ["orgs", org] query
+  // OrgSettingsCard/WebProxyCard already fetch, so it's a cache hit; gated on
+  // canWrite so a worker's brief hand-typed-URL render doesn't fire a 403.
+  const { data: orgsData } = useQuery({
+    queryKey: ["orgs", scopeOrg],
+    queryFn: () => orgsApi.list(scopeOrg),
+    enabled: !!scopeOrg && canWrite,
+  })
+  const hasWebProxy = !!orgsData?.orgs.find((o) => o.org_id === scopeOrg)?.web_proxy
+
   // Settings is owner/superadmin-only. A read-only worker gets no nav entry to
   // it, so this only catches a hand-typed URL — send them Home.
   if (user && !isSuperadmin && user.role === "worker") {
     return <Navigate to="/" replace />
   }
 
-  const ctx: SectionCtx = { org: scopeOrg, canWrite, isSuperadmin }
+  const ctx: SectionCtx = { org: scopeOrg, canWrite, isSuperadmin, hasWebProxy }
   const shown = SECTIONS
     .filter((s) => s.visible(ctx))
     .sort((a, b) => sectionRank(a.id) - sectionRank(b.id))
@@ -616,6 +648,10 @@ export function SettingsPage() {
     )
   }
   if (!active) return null
+
+  // The panels this section actually renders in this context — drives both the
+  // cards below and the "On this page" jump index (so the two never disagree).
+  const panels = active.panels.filter((p) => (p.visible ? p.visible(ctx) : true))
 
   return (
     <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">
@@ -647,7 +683,36 @@ export function SettingsPage() {
           })}
         </nav>
 
-        <div className="flex min-w-0 flex-col gap-4">{active.render(ctx)}</div>
+        <div className="flex min-w-0 flex-col gap-4">
+          {/* "On this page" jump index — only worth drawing when a section has
+              more than one panel to jump between; on a single card it's noise.
+              A plain scrollIntoView (not an href="#…" anchor, which HashRouter
+              would hijack) so the router stays out of it. */}
+          {panels.length > 1 && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <span className="text-2xs font-medium tracking-wide text-faint-foreground uppercase">
+                On this page
+              </span>
+              {panels.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() =>
+                    document.getElementById(`panel-${p.id}`)
+                      ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                  className="rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {panels.map((p) => (
+            <div key={p.id} id={`panel-${p.id}`} className="flex scroll-mt-4 flex-col gap-4">
+              {p.render(ctx)}
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )
