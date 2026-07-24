@@ -6,15 +6,16 @@ import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { billingApi } from "@/lib/api"
 import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
-import { NAV_ITEMS, MORE_ITEMS } from "./nav-items"
+import { NAV_ITEMS, MORE_ITEMS, NAV_GROUPS } from "./nav-items"
 import { AlarmChips } from "./alarm-chips"
 import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
 import { AccountMenu } from "./account-menu"
 import { CommandPalette } from "./command-palette"
 import {
-  Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarHeader,
-  SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger,
+  Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
+  SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
+  SidebarTrigger,
 } from "@/components/ui/sidebar"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
@@ -96,34 +97,44 @@ export function AppShell() {
           <WorkspaceRow />
         </SidebarHeader>
         <SidebarContent>
-          <SidebarGroup>
-            <SidebarGroupContent>
-              <SidebarMenu className="gap-0.5">
-                {sidebarItems.map((item) => (
-                  <SidebarMenuItem key={item.to}>
-                    <SidebarMenuButton asChild tooltip={item.label} className="h-9 gap-3 px-3">
-                      <NavLink
-                        to={item.to}
-                        end={item.to === "/"}
-                        className={cn(
-                          "text-xs font-medium text-muted-foreground transition-colors",
-                          // Active state is elevation + a 2px inset rail, NOT a
-                          // colored fill: the accent stays reserved for things
-                          // that are actionable, so status colors keep being the
-                          // loudest thing on screen.
-                          isNavActive(item.to) &&
-                            "bg-foreground/[0.07] text-foreground shadow-[inset_2px_0_0_var(--foreground)] hover:bg-foreground/[0.07] hover:text-foreground",
-                        )}
-                      >
-                        <item.icon className="size-4" />
-                        <span>{item.label}</span>
-                      </NavLink>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+          {/* Grouped into sections (Monitor / Infrastructure / Platform). A group
+              with no visible items — e.g. Platform for a non-superadmin — is not
+              rendered, so an owner sees two sections, not an empty third. */}
+          {NAV_GROUPS.map((grp) => {
+            const items = sidebarItems.filter((i) => i.group === grp.id)
+            if (!items.length) return null
+            return (
+              <SidebarGroup key={grp.id}>
+                <SidebarGroupLabel>{grp.label}</SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu className="gap-0.5">
+                    {items.map((item) => (
+                      <SidebarMenuItem key={item.to}>
+                        <SidebarMenuButton asChild tooltip={item.label} className="h-9 gap-3 px-3">
+                          <NavLink
+                            to={item.to}
+                            end={item.to === "/"}
+                            className={cn(
+                              "text-xs font-medium text-muted-foreground transition-colors",
+                              // Active state is elevation + a 2px inset rail, NOT a
+                              // colored fill: the accent stays reserved for things
+                              // that are actionable, so status colors keep being the
+                              // loudest thing on screen.
+                              isNavActive(item.to) &&
+                                "bg-foreground/[0.07] text-foreground shadow-[inset_2px_0_0_var(--foreground)] hover:bg-foreground/[0.07] hover:text-foreground",
+                            )}
+                          >
+                            <item.icon className="size-4" />
+                            <span>{item.label}</span>
+                          </NavLink>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            )
+          })}
         </SidebarContent>
         <SidebarFooter>
           <AccountMenu billing={billing} />
