@@ -1,5 +1,5 @@
 import {
-  LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map,
+  LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
   type LucideIcon,
 } from "lucide-react"
 
@@ -45,6 +45,11 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/logs", label: "Logs", icon: Terminal, mobile: false, group: "monitor" },
   { to: "/overview", label: "Overview", icon: Gauge, mobile: false, superadminOnly: true, group: "platform" },
   { to: "/orgs", label: "Organizations", icon: Building2, mobile: false, superadminOnly: true, group: "platform" },
+  // Server-wide config (app_settings): appearance, Google Maps key, payments,
+  // WhatsApp. Labelled "Platform settings" so it doesn't collide with the
+  // "Platform" group name it sits under. Lifted out of the org-scoped Settings
+  // page, which is now identical for a superadmin and an owner.
+  { to: "/platform", label: "Platform settings", icon: ServerCog, mobile: false, superadminOnly: true, group: "platform" },
 ]
 
 export const MORE_ITEMS = NAV_ITEMS.filter((i) => !i.mobile)

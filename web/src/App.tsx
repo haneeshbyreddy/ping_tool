@@ -15,6 +15,7 @@ import { AccountPage } from "@/routes/account-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
 import { OverviewPage } from "@/routes/overview-page"
+import { PlatformPage } from "@/routes/platform-page"
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -54,6 +55,10 @@ function App() {
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />
                     <Route path="overview" element={<OverviewPage />} />
+                    {/* Server-wide config (app_settings, not the scoped org) —
+                        lifted out of the org Settings page. Self-guards on
+                        superadmin. */}
+                    <Route path="platform" element={<PlatformPage />} />
                   </Route>
                 </Route>
               </Routes>
