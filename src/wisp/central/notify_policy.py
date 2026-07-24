@@ -1,27 +1,20 @@
-"""Notification governor — the tier + digest policy that sits between every
-paging shell and the notifier.
+"""Notification governor — the paging policy that sits between every paging
+shell and the notifier.
 
-Central used to fire one ntfy message per finding, immediately, at priority 3,
-straight to the worker topic. On a fleet whose C-Data/DBC EPON agents can't
-report dying-gasp/LOS, an area power cut darkens many PONs across many OLTs at
-once and every one misclassifies as a fiber cut — so a single DISCOM outage
-produced dozens of pages, ntfy's free quota 429'd ~half of them, and the drops
-took *real* device-down pages down with them (they share one quota).
+ntfy was removed 2026-07-24 and WhatsApp is the sole channel. With that, the
+active notification set was cut to an ALLOWLIST (`_ACTIVE_KINDS`): only the
+port up/down kinds that flow through this governor still page. Device/uplink
+up/down go straight through `dispatch.py` (not this module), and probe up/down
+through the watchdog — so between them the operator's chosen set is
+device / uplink / port / probe, each up and down.
 
-The fix is two tiers, not a new transport:
+Everything else — the whole SNMP-derived stream (PON faults, ONU cap/dup-MAC,
+perf, on-backup, optics) plus the hourly escalation re-nag — is turned OFF
+"for now": `emit` logs it `suppressed` and sends nothing. The two-tier
+PUSH/DIGEST machinery below is intact but DORMANT (no active kind routes to the
+digest), kept because re-enabling a kind is a one-line edit to `_ACTIVE_KINDS`.
 
-  * PUSH   — buzz the phone now: ICMP device/uplink/port down and their
-             recoveries, PLUS port bandwidth floor/ceiling crossings and their
-             clears (operator ask 2026-07-18 — a link maxing out or going dark
-             is time-sensitive, not summary material). Already transition- and
-             hysteresis-gated, low volume.
-  * DIGEST — the rest of the SNMP-derived stream (PON faults, ONU cap/dup-MAC,
-             perf, on-backup) plus the hourly escalation re-nag. Queued to
-             `alert_digest` and rolled into ONE summary per org every
-             `cfg.digest_interval_min`.
-
-Unknown kinds default to PUSH — a new alert type must never be silently buried.
-State rows are still written by the shells regardless of tier/gate, so the
+State rows are still written by the shells regardless of allowlist/gate, so the
 dashboard stays fully live; this module only governs the *notification*.
 """
 from __future__ import annotations
@@ -45,6 +38,22 @@ DIGEST = "digest"
 # leaves the operator hanging. Port bandwidth (PORT_BW_LOW/OK/HIGH/NORMAL) is
 # PUSH by operator ask 2026-07-18 — a saturated or dark uplink can't wait for
 # the hourly roll-up.
+# The kinds that page since ntfy was removed (2026-07-24). Device/uplink up/down
+# page via dispatch.py and probe up/down via the watchdog — neither routes
+# through here — so the governor's job is port up/down PLUS port bandwidth
+# floor/ceiling crossings and their clears (operator ask 2026-07-24: bandwidth
+# high/low is wanted alongside device/port up-down). Everything else is
+# suppressed (state still written by the shell). Re-enable a kind by adding it
+# here; if it is also in `_DIGEST_KINDS` it resumes digesting.
+_ACTIVE_KINDS = frozenset({
+    "PORT_DOWN", "PORT_RESTORED",
+    # Port bandwidth: floor/ceiling alarms AND their all-clears — a page without
+    # its clear leaves the operator hanging. PUSH (not in _DIGEST_KINDS), gated
+    # per-if_index with no cooldown (see ports.py:_page).
+    "PORT_BW_HIGH", "PORT_BW_NORMAL",
+    "PORT_BW_LOW", "PORT_BW_OK",
+})
+
 _DIGEST_KINDS = frozenset({
     "PON_FAULT", "PON_RECOVERED",
     "ONU_LIMIT", "ONU_DUP_MAC",
@@ -89,7 +98,7 @@ class AlertRouter:
         self.notifier = notifier
         self.cfg = cfg
 
-    def emit(self, kind: str, *, topic: str | None, title: str, body: str,
+    def emit(self, kind: str, *, title: str, body: str,
              priority: int, ts: str, outage_id: int | None = None,
              device_id: int | None = None, payload: str | None = None,
              gate: bool = True, cooldown_min: int | None = None,
@@ -97,35 +106,49 @@ class AlertRouter:
         payload = payload if payload is not None else kind
         channel = self.notifier.channel
 
+        # One org audience for every alert (owner + worker + admin number, no
+        # per-role routing — operator choice 2026-07-24). Resolved up front only
+        # for the recipient label; an inactive/gated kind logs it and never sends.
+        numbers = (list(self.store.org_alert_recipients(self.org_id))
+                   if whatsapp is None else list(whatsapp))
+        recipient = ",".join(numbers) or None
+
         def _log(status: str) -> None:
             self.store.log_alert(self.org_id, outage_id, device_id, channel,
-                                 topic, status, payload, ts, kind=kind)
+                                 recipient, status, payload, ts, kind=kind)
 
-        # Gate off (or no channel) — the shell still wrote its state row.
-        if not (gate and topic):
+        # Since ntfy was removed, only allowlisted kinds page; the rest are OFF
+        # for now (the shell still wrote its state row, so the dashboard is live).
+        if kind not in _ACTIVE_KINDS:
+            _log("suppressed")
+            return NotifyResult(False, "inactive kind")
+
+        # Gate off — the shell still wrote its state row.
+        if not gate:
             _log("suppressed")
             return NotifyResult(False, "gated")
 
+        # DORMANT while no active kind is a digest kind; kept so re-enabling a
+        # digest kind is just adding it to `_ACTIVE_KINDS`.
         if tier_for(kind) == DIGEST:
             self.store.queue_digest(self.org_id, device_id, kind, title, body, ts)
             _log("digest")
             return NotifyResult(True, "queued for digest")
 
-        # PUSH — optional per-(device, kind) cooldown backstop against a flap.
+        # PUSH — needs a live recipient.
+        if not numbers:
+            _log("suppressed")
+            return NotifyResult(False, "no whatsapp recipients")
+
+        # Optional per-(device, kind) cooldown backstop against a flap.
         cd = self.cfg.alert_cooldown_min if cooldown_min is None else cooldown_min
         if cd > 0 and self.store.recently_pushed(
                 self.org_id, device_id, kind, ts, cd):
             _log("suppressed")
             return NotifyResult(False, "cooldown")
 
-        # Best-effort WhatsApp fan-out rides the same PUSH. Every governor caller
-        # pages the WORKER channel (the SNMP-derived stream's audience — see the
-        # module docstring), so worker numbers are the default; resolved here
-        # only on the actual send path (a suppressed/gated alert never queries).
-        numbers = (self.store.org_role_whatsapp(self.org_id, "worker")
-                   if whatsapp is None else whatsapp)
         facts = wa_facts or WhatsAppFacts.derive(title, body, kind, ts)
-        res = self.notifier.send(topic, title, body, priority,
+        res = self.notifier.send(title, body, priority,
                                  whatsapp=numbers, facts=facts)
         _log("sent" if res.ok else "failed")
         return res
@@ -163,16 +186,16 @@ def flush_digests(store, org_id: str, notifier, cfg: Config, now_ts: str) -> Non
     if age_s < cfg.digest_interval_min * 60:
         return
 
-    topic = store.org_role_topic(org_id, "worker")
-    whatsapp = store.org_role_whatsapp(org_id, "worker")
+    numbers = list(store.org_alert_recipients(org_id))
+    recipient = ",".join(numbers) or None
     title, body = compose_digest(rows)
-    if topic:
-        res = notifier.send(topic, title, body, 2, whatsapp=whatsapp,
+    if numbers:
+        res = notifier.send(title, body, 2, whatsapp=numbers,
                             facts=WhatsAppFacts.derive(title, body, "DIGEST", now_ts))
         status = "sent" if res.ok else "failed"
     else:
         status = "suppressed"
-    store.log_alert(org_id, None, None, notifier.channel, topic, status,
+    store.log_alert(org_id, None, None, notifier.channel, recipient, status,
                     "DIGEST", now_ts, kind="DIGEST")
     if status != "failed":
         store.mark_digests_sent(org_id, now_ts)
