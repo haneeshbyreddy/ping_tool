@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react"
 import { useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ArrowUpFromLine, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, LayoutGrid, List, MoreVertical, Palette, Pencil, Plus, Radio, ScanSearch, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ArrowUpFromLine, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, MoreVertical, Palette, Pencil, Plus, Radio, ScanSearch, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
@@ -18,7 +18,7 @@ import { NeedsOrg } from "@/components/needs-org"
 import { RegionSelect } from "@/components/region-select"
 import { runSnmpTest } from "@/components/snmp-test"
 import { TagsInput } from "@/components/tags-input"
-import { ProbesPanel } from "@/components/probes-panel"
+import { ViewToggle, loadView, saveView, type ViewMode } from "@/components/view-toggle"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { UpgradeNotice } from "@/components/upgrade-notice"
 import { WebUiLiveIcon } from "@/components/web-proxy"
@@ -990,19 +990,6 @@ function saveCollapsed(org: string | null, set: Set<number>): void {
   }
 }
 
-// One shared list/grid preference for the whole Network page (probes + devices),
-// persisted org-independently — it's a UI taste, not per-network state.
-type ViewMode = "list" | "grid"
-const VIEW_KEY = "wisp:network:view"
-
-function loadView(): ViewMode {
-  try {
-    return localStorage.getItem(VIEW_KEY) === "grid" ? "grid" : "list"
-  } catch {
-    return "list"
-  }
-}
-
 // Sort preference, persisted like the view toggle (a UI taste).
 const SORT_KEY = "wisp:network:sort"
 
@@ -1014,21 +1001,6 @@ function loadSort(): SortMode {
   } catch {
     return "default"
   }
-}
-
-function ViewToggle({ view, onChange }: { view: ViewMode; onChange: (v: ViewMode) => void }) {
-  return (
-    <div className="flex items-center gap-0.5 rounded-md border p-0.5">
-      {([["list", List], ["grid", LayoutGrid]] as const).map(([mode, Icon]) => (
-        <button key={mode} type="button" onClick={() => onChange(mode)}
-          aria-pressed={view === mode} title={`${mode.charAt(0).toUpperCase()}${mode.slice(1)} view`}
-          className={cn("flex size-6 items-center justify-center rounded-sm transition-colors",
-            view === mode ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground")}>
-          <Icon className="size-3.5" />
-        </button>
-      ))}
-    </div>
-  )
 }
 
 export function TopologyPage() {
@@ -1090,7 +1062,7 @@ export function TopologyPage() {
 
   const changeView = (v: ViewMode) => {
     setView(v)
-    try { localStorage.setItem(VIEW_KEY, v) } catch { /* private mode / quota */ }
+    saveView(v)
   }
   const changeSort = (v: SortMode) => {
     setSortMode(v)
@@ -1262,12 +1234,6 @@ export function TopologyPage() {
   const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
   const nodeIds = activeNodes.map((n) => n.node_id)
-  const deviceCounts = new Map<string, number>()
-  for (const d of allDevices) {
-    if (d.assigned_node_id) {
-      deviceCounts.set(d.assigned_node_id, (deviceCounts.get(d.assigned_node_id) ?? 0) + 1)
-    }
-  }
 
   const fresh = devices.filter((d) => d.assigned_node_id && d.state && !isStale(d.state_updated_at))
   const down = fresh.filter((d) => d.state === "DOWN" || d.state === "UNREACHABLE").length
@@ -1336,9 +1302,6 @@ export function TopologyPage() {
         <h1 className="text-base font-semibold">Network</h1>
         <ViewToggle view={view} onChange={changeView} />
       </div>
-
-      <ProbesPanel org={scopeOrg} canWrite={canWrite} view={view} deviceCounts={deviceCounts}
-        probeFilter={probeFilter} onProbeFilter={setProbeFilter} />
 
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">

@@ -1,6 +1,6 @@
 import {
   LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
-  type LucideIcon,
+  RadioTower, type LucideIcon,
 } from "lucide-react"
 
 /** Sidebar sections. The flat list read as one undifferentiated column of six;
@@ -40,6 +40,11 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Home", icon: LayoutDashboard, mobile: true, group: "monitor" },
   { to: "/topology", label: "Network", icon: Network, mobile: true, group: "infrastructure" },
+  // The edge-probe fleet: enrol / rotate / retire. Split out of the Network page
+  // (where it was a panel above the device tree) into its own Infrastructure
+  // destination. mobile:false — probe management is a desktop, few-times-a-month
+  // task, so it rides the mobile "More" sheet, not a bottom-tab slot.
+  { to: "/probes", label: "Probes", icon: RadioTower, mobile: false, group: "infrastructure" },
   { to: "/map", label: "Map", icon: Map, mobile: true, group: "infrastructure" },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false, account: true },
   { to: "/logs", label: "Logs", icon: Terminal, mobile: false, group: "monitor" },

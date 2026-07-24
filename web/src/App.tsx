@@ -9,6 +9,7 @@ import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
 import { TopologyPage } from "@/routes/topology-page"
+import { ProbesPage } from "@/routes/probes-page"
 import { MapPage } from "@/routes/map-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { AccountPage } from "@/routes/account-page"
@@ -42,9 +43,12 @@ function App() {
                   <Route element={<AppShell />}>
                     <Route index element={<HomePage />} />
                     <Route path="topology" element={<TopologyPage />} />
+                    <Route path="probes" element={<ProbesPage />} />
                     <Route path="map" element={<MapPage />} />
-                    {/* Probes merged into the Network page — keep old bookmarks working */}
-                    <Route path="nodes" element={<Navigate to="/topology" replace />} />
+                    {/* Probes had their own /nodes page long ago, then rode the
+                        Network page; now they have their own /probes route. Keep
+                        the oldest bookmark working. */}
+                    <Route path="nodes" element={<Navigate to="/probes" replace />} />
                     <Route path="settings" element={<SettingsPage />} />
                     {/* Sections are addressable so the account menu, the billing
                         banner and a bookmark can all land on the right one. */}
