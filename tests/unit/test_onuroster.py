@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
 from wisp.central.onuroster import (capacity_faults, current_roster,
-                                    duplicate_macs, fresh_device_ids)
+                                    duplicate_macs, fresh_device_ids,
+                                    search_key)
 
 NOW = datetime(2026, 7, 13, 10, 0, 0, tzinfo=timezone.utc)
 
@@ -157,6 +158,37 @@ class FreshDeviceIdsTest(unittest.TestCase):
 
     def test_no_rows_means_nothing_fresh(self):
         self.assertEqual(fresh_device_ids([], NOW), set())
+
+
+class SearchKeyTest(unittest.TestCase):
+    """`search_key` is the SEARCH normalizer for the Network page's MAC lookup —
+    punctuation-blind, unlike the separator-exact identity `_norm_mac` uses."""
+
+    def test_punctuation_and_case_collapse(self):
+        for raw in ("A4:F2:1B:9C:44:01", "a4-f2-1b-9c-44-01", "a4f2.1b9c.4401",
+                    " A4 F2 1B 9C 44 01 "):
+            with self.subTest(raw=raw):
+                self.assertEqual(search_key(raw), "A4F21B9C4401")
+
+    def test_a_needle_is_a_substring_of_its_serials_key(self):
+        key = search_key("A4:F2:1B:9C:44:01")
+        for typed in ("4401", "44:01", "44-01", "9c44", "a4f2"):
+            with self.subTest(typed=typed):
+                self.assertIn(search_key(typed), key)
+
+    def test_ascii_serials_survive_intact(self):
+        # a Huawei GPON serial is not hex; stripping must not mangle it
+        self.assertEqual(search_key("HWTC1234ABCD"), "HWTC1234ABCD")
+
+    def test_like_wildcards_are_stripped(self):
+        # this is what lets the store interpolate the needle into a LIKE pattern
+        self.assertEqual(search_key("%_%"), "")
+        self.assertEqual(search_key("AA%BB_CC"), "AABBCC")
+
+    def test_empty_and_none(self):
+        self.assertEqual(search_key(None), "")
+        self.assertEqual(search_key(""), "")
+        self.assertEqual(search_key(":-."), "")
 
 
 if __name__ == "__main__":

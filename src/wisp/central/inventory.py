@@ -215,6 +215,56 @@ def normalize_web_access(clean: dict, device_ip: str | None) -> dict:
 
 ROUTE_MAX_WAYPOINTS = 200
 
+# Per-link map colours: a CLOSED palette of names, never a free hex field.
+#
+# Two reasons it's names. (1) The map's loudest colours must stay the status
+# tones — a free picker lets an operator paint a healthy link the same red as a
+# down one, which fakes an alarm on the one screen that exists to show alarms.
+# Every name here is deliberately clear of --destructive / --warning / --success
+# / --primary, and the renderer only paints a link that ISN'T in trouble anyway.
+# (2) The actual values live in index.css (--map-line-*), so they stay theme
+# data rather than being frozen into DB rows the day someone picked them —
+# the same argument as theme_overrides storing a sparse diff.
+#
+# These distinguish PARALLEL cables from each other; they encode nothing. Keep
+# the vocabulary tiny.
+LINK_COLORS = ("violet", "magenta", "teal", "lime", "indigo", "chalk")
+
+# ONE colour vocabulary for the whole product, not one per feature. The map's
+# link palette came first; TAG and PROBE colours (org_colors) draw from the same
+# names, so a colour means the same thing wherever an operator meets it — and
+# every argument above carries over unchanged, in particular that none of these
+# can impersonate a status tone. Anything colour-coded later reuses this too.
+PALETTE = LINK_COLORS
+
+# What a colour is attached to. 'tag' keys on the tag text, 'node' on node_id —
+# neither is a foreign key, deliberately: a tag exists only as text inside
+# org_devices.tags, and a probe lives in node_tokens OR nodes (or both), so a
+# colour that insisted on a real row would vanish on rotation or re-enrollment.
+COLOR_KINDS = ("tag", "node")
+
+
+def clean_color(raw) -> str | None:
+    """A palette name, or None to clear. Free hex is refused — see PALETTE."""
+    if raw in (None, "", "none", "null"):
+        return None
+    if raw in PALETTE:
+        return raw
+    raise InventoryError(f"colour must be one of: {', '.join(PALETTE)}")
+
+
+def clean_color_key(kind: str, raw) -> str:
+    """The thing being coloured. Bounded because it becomes a DB key."""
+    if kind not in COLOR_KINDS:
+        raise InventoryError("unknown colour kind")
+    key = (raw or "").strip()
+    if not key:
+        raise InventoryError("nothing to colour")
+    if len(key) > 64:
+        raise InventoryError("name is too long")
+    return key
+
+
 def clean_route_payload(data: dict) -> dict:
     """Drawn cable path for a link: intermediate vertices only, parent→child order.
 
@@ -244,6 +294,46 @@ def clean_route_payload(data: dict) -> dict:
             raise InventoryError("waypoint coordinates are out of range")
         waypoints.append([round(lat, 6), round(lng, 6)])
     return {"child_id": child_id, "parent_id": parent_id, "waypoints": waypoints}
+
+
+def clean_link_style_payload(data: dict) -> dict:
+    """A link's map styling: colour and/or bandwidth-label position.
+
+    SPARSE — a key absent from the body means "leave it alone", so the colour
+    picker and the label drag can write independently without either clobbering
+    the other. An explicit null clears. Endpoint devices are validated by the
+    caller (the pair must be a real link in this org)."""
+    try:
+        child_id = int(data.get("child_id"))
+        parent_id = int(data.get("parent_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("child_id and parent_id are required")
+    fields: dict = {}
+    if "color" in data:
+        raw = data.get("color")
+        if raw in (None, "", "null", "default"):
+            fields["color"] = None
+        elif raw in LINK_COLORS:
+            fields["color"] = raw
+        else:
+            raise InventoryError(f"colour must be one of: {', '.join(LINK_COLORS)}")
+    if "label_pos" in data:
+        raw = data.get("label_pos")
+        if raw in (None, "", "null"):
+            fields["label_pos"] = None
+        else:
+            try:
+                pos = float(raw)
+            except (TypeError, ValueError):
+                raise InventoryError("label_pos must be a number between 0 and 1")
+            if not (0.0 <= pos <= 1.0):
+                raise InventoryError("label_pos must be between 0 and 1")
+            # 4dp ≈ 10cm on a 1km span — finer than a label can be dragged, and
+            # it keeps the row byte-stable so an idle drag isn't a write.
+            fields["label_pos"] = round(pos, 4)
+    if not fields:
+        raise InventoryError("nothing to set — pass color and/or label_pos")
+    return {"child_id": child_id, "parent_id": parent_id, "fields": fields}
 
 def clean_region_name(raw) -> str:
     name = str(raw).strip() if raw is not None else ""
@@ -281,6 +371,34 @@ def clean_backup_link(child_id: int, parent_id: int, *,
             continue
         seen.add(cur)
         stack.extend(edges_of.get(cur, ()))
+
+def clean_peer_link(a_id: int, b_id: int, *,
+                    parents: dict[int, int | None],
+                    backups: dict[int, set[int]],
+                    peers: dict[int, set[int]]) -> None:
+    """Validate a switch-to-switch cross-link.
+
+    Deliberately has NO cycle check — unlike a backup edge, a peer link is not a
+    dependency, and a ring of cross-linked switches IS a cycle. That's the whole
+    reason peers are a separate kind: forcing them through clean_backup_link
+    would reject exactly the topology an operator is trying to record.
+
+    A pair already joined by a dependency edge is refused in either direction: the
+    two would render as two lines between the same pins and leave the port
+    bindings ambiguous about which link they belong to.
+    """
+    if a_id not in parents:
+        raise InventoryError("node not found")
+    if b_id not in parents:
+        raise InventoryError("that device does not exist")
+    if a_id == b_id:
+        raise InventoryError("a device can't cross-link to itself")
+    if parents.get(a_id) == b_id or parents.get(b_id) == a_id:
+        raise InventoryError("those devices are already linked as parent and child")
+    if b_id in backups.get(a_id, set()) or a_id in backups.get(b_id, set()):
+        raise InventoryError("those devices are already linked as a backup uplink")
+    if b_id in peers.get(a_id, set()):
+        raise InventoryError("that cross-link already exists")
 
 BW_DIRECTIONS = ("in", "out", "either", "total")
 

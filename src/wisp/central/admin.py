@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--org", required=True)
     p.add_argument("--username", required=True)
     p.add_argument("--password")
-    p.add_argument("--role", default="operator", choices=auth.ROLES)
+    p.add_argument("--role", default="worker", choices=auth.ROLES)
 
     p = sub.add_parser("passwd", help="reset a user's password")
     p.add_argument("--username", required=True)

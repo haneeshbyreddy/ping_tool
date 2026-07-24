@@ -1,11 +1,12 @@
 // The per-device drill-down panel (Health / Optical / Ports tabs) shared by the
 // Network tree rows and the Map pin popover — one implementation, two surfaces.
-import { useState, type MouseEvent, type ReactNode } from "react"
+import { useEffect, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
+import { ChevronRight, Plus, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { analyticsApi, inventoryApi } from "@/lib/api"
-import type { OrgDevice, SwitchPort } from "@/lib/types"
+import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
 import { Meter } from "@/components/meter"
 import { OpticalPanel } from "@/components/optical-panel"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
@@ -14,7 +15,8 @@ import {
 } from "@/components/web-proxy"
 import { bucketTrouble, HourStrip } from "@/components/sparkline"
 import { StatusDot } from "@/components/status-badge"
-import { ago, durationSince, fmtBytes, fmtDur, isFresh, isStale } from "@/lib/format"
+import { ago, durationSince, fmtBytes, fmtDur, isDownState, isFresh, isStale } from "@/lib/format"
+import { paletteVarOf } from "@/lib/palette"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -132,18 +134,27 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   const lastWalk = ports.reduce<string | null>(
     (a, p) => (p.updated_at && (!a || p.updated_at > a) ? p.updated_at : a), null)
   const portsStale = !isFresh(lastWalk)
+  // A device that isn't answering ICMP isn't answering SNMP either, so every row
+  // below is the last walk before it dropped — frozen the INSTANT it went down,
+  // which is up to 15 minutes before the 900s staleness rule would notice. The
+  // per-port alarm counts go with it: "3 down" off a frozen table is a claim
+  // about now, and "0 down" would be just as false, so the header states the
+  // one thing that IS true (the box is unreachable) instead of counting.
+  const isDown = isDownState(device.state)
 
   return (
     <div className="overflow-hidden rounded-lg border bg-muted/40">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-2xs text-muted-foreground">
         <span className="font-medium">{ports.length} ports · {watched} watched</span>
-        {down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
-        {bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
+        {!isDown && down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
+        {!isDown && bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
         {/* stale is a data-freshness note, not an alarm — neutral, never amber */}
-        {portsStale
+        {isDown
+          ? <span className="font-semibold text-foreground" title="This device is unreachable, so its port table can't refresh. These rows are the last walk before it went down.">device offline · last walk {ago(lastWalk)}</span>
+          : portsStale
           ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing. These rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
           : lastWalk && <span className="text-faint-foreground">as of {ago(lastWalk)}</span>}
-        <span className="ml-auto hidden sm:inline">watch a port to alarm on it</span>
+        {!isDown && <span className="ml-auto hidden sm:inline">watch a port to alarm on it</span>}
       </div>
       {sorted.map((p) => {
         const limits = [
@@ -151,7 +162,7 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
           p.bw_max_mbps != null && `≤${p.bw_max_mbps}`,
         ].filter(Boolean).join(" ")
         return (
-          <div key={p.id} className="border-b last:border-b-0">
+          <div key={p.id} className={cn("border-b last:border-b-0", isDown && "wisp-frozen")}>
             <div className={cn("flex h-10 items-center gap-2 px-4", portAlarmed(p) && "bg-destructive-soft/30")}>
               <StatusDot tone={portTone(p)} />
               <span className={cn("min-w-0 shrink truncate font-mono text-xs font-medium",
@@ -244,27 +255,34 @@ function DeviceVitals({ device }: { device: OrgDevice }) {
     }
     return null
   }
+  // Unreachable box ⇒ these vitals are the last successful health walk, not the
+  // machine's condition now. Stamp the reading unconditionally (not just past the
+  // staleness threshold) and gray the meters: a warn/crit tint here is otherwise
+  // an alarm about a device that isn't there to be hot.
+  const isDown = isDownState(device.state)
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-baseline justify-between text-2xs text-muted-foreground">
         <span className="font-medium">Device health</span>
-        {device.health_updated_at && isStale(device.health_updated_at) && (
+        {device.health_updated_at && (isDown || isStale(device.health_updated_at)) && (
           <span className="text-faint-foreground">as of {ago(device.health_updated_at)}</span>
         )}
       </div>
-      {cpu != null && (
-        <Meter label="CPU" pct={cpu} warn={VITAL_CPU_WARN} crit={VITAL_CPU_CRIT} />
-      )}
-      {mem != null && (
-        <Meter label="RAM" pct={mem} warn={VITAL_MEM_WARN} crit={VITAL_MEM_CRIT}
-          detail={device.health_mem_used_bytes != null && device.health_mem_total_bytes != null
-            ? `${fmtBytes(device.health_mem_used_bytes)} / ${fmtBytes(device.health_mem_total_bytes)}`
-            : undefined} />
-      )}
-      {temp != null && (
-        <Meter label="Temp" pct={Math.min(100, Math.max(0, temp))} value={`${Math.round(temp)}°C`}
-          warn={VITAL_TEMP_WARN} crit={VITAL_TEMP_CRIT} />
-      )}
+      <div className={cn("flex flex-col gap-2", isDown && "wisp-frozen")}>
+        {cpu != null && (
+          <Meter label="CPU" pct={cpu} warn={VITAL_CPU_WARN} crit={VITAL_CPU_CRIT} />
+        )}
+        {mem != null && (
+          <Meter label="RAM" pct={mem} warn={VITAL_MEM_WARN} crit={VITAL_MEM_CRIT}
+            detail={device.health_mem_used_bytes != null && device.health_mem_total_bytes != null
+              ? `${fmtBytes(device.health_mem_used_bytes)} / ${fmtBytes(device.health_mem_total_bytes)}`
+              : undefined} />
+        )}
+        {temp != null && (
+          <Meter label="Temp" pct={Math.min(100, Math.max(0, temp))} value={`${Math.round(temp)}°C`}
+            warn={VITAL_TEMP_WARN} crit={VITAL_TEMP_CRIT} />
+        )}
+      </div>
     </div>
   )
 }
@@ -312,7 +330,7 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
     ?? median(buckets.filter((b) => !bucketTrouble(b) && b.avg_latency_ms != null)
       .map((b) => b.avg_latency_ms!))
   const roughHours = buckets.filter((b) => bucketTrouble(b)).length
-  const isDown = device.state === "DOWN" || device.state === "UNREACHABLE"
+  const isDown = isDownState(device.state)
 
   const fmtMs = (v: number) => v < 10 ? v.toFixed(1) : String(Math.round(v))
 
@@ -384,12 +402,363 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
   )
 }
 
-export function RowTag({ tone, children, onClick, title }: {
+// ----- physical connection (which port carries each uplink) ------------------
+// The closest-to-reality model of the plant: a link isn't just parent→child, it
+// leaves a specific port on each box. The child side writes
+// switch_ports.uplink_device_id, the parent side writes feeds_device_id — the
+// SAME column ports.py folds a port-down into the child's outage through, so
+// declaring the cabling here also arms that (once the port is watched). The map
+// reads both to hang a live bandwidth label on the link line.
+
+function UplinkPortSelect({ owner, bound, onPick, busy }: {
+  owner: OrgDevice
+  bound: SwitchPort | undefined
+  onPick: (portId: number | null) => void
+  busy: boolean
+}) {
+  const { canWrite } = useAuth()
+  const snmp = owner.snmp_enabled === 1
+  const { data, isLoading } = useQuery({
+    queryKey: ["inventory-ports", owner.id],
+    queryFn: () => inventoryApi.ports(owner.id),
+    enabled: snmp,
+    staleTime: 30_000,
+  })
+  if (!snmp) {
+    return <span className="flex h-7 items-center text-2xs text-faint-foreground">no SNMP ports</span>
+  }
+  const ports = data?.ports ?? []
+  if (!isLoading && ports.length === 0) {
+    return <span className="flex h-7 items-center text-2xs text-faint-foreground">no ports walked yet</span>
+  }
+  if (!canWrite) {
+    return (
+      <span className="flex h-7 items-center font-mono text-xs">
+        {bound ? (bound.if_name || `if${bound.if_index}`) : <span className="text-faint-foreground">not set</span>}
+      </span>
+    )
+  }
+  return (
+    <Select value={bound ? String(bound.id) : "none"} disabled={isLoading || busy}
+      onValueChange={(v) => onPick(v === "none" ? null : Number(v))}>
+      <SelectTrigger className="h-7 w-full text-xs"><SelectValue placeholder="port…" /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="none"><span className="text-muted-foreground">no port</span></SelectItem>
+        {ports.map((p) => (
+          <SelectItem key={p.id} value={String(p.id)}>
+            <span className="font-mono">{p.if_name || `if${p.if_index}`}</span>
+            {p.if_alias && <span className="text-muted-foreground"> · {p.if_alias}</span>}
+            {p.oper_status !== "up" && <span className="text-faint-foreground"> (down)</span>}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
+// One link, from the point of view of the panel we're in: `near` is this device,
+// `far` is the other end. The only thing the kind changes is how the FAR end's
+// port is bound — a dependency link uses feeds_device_id (which ports.py also
+// folds a port-down through), while an undirected cross-link uses uplink_device_id
+// on BOTH ends, deliberately: feeds_device_id would tell ports.py this port feeds
+// the peer, and a cross-link cable dropping is not the peer's outage cause.
+function LinkRow({ near, far, kind }: {
+  near: OrgDevice; far: OrgDevice; kind: "primary" | "backup" | "peer"
+}) {
+  const { canWrite } = useAuth()
+  const queryClient = useQueryClient()
+  const nearQ = useQuery({
+    queryKey: ["inventory-ports", near.id],
+    queryFn: () => inventoryApi.ports(near.id),
+    enabled: near.snmp_enabled === 1,
+    staleTime: 30_000,
+  })
+  const farQ = useQuery({
+    queryKey: ["inventory-ports", far.id],
+    queryFn: () => inventoryApi.ports(far.id),
+    enabled: far.snmp_enabled === 1,
+    staleTime: 30_000,
+  })
+  const nearBound = nearQ.data?.ports.find((p) => p.uplink_device_id === far.id)
+  const farBound = farQ.data?.ports.find((p) => kind === "peer"
+    ? p.uplink_device_id === near.id : p.feeds_device_id === near.id)
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["inventory-ports", near.id] })
+    queryClient.invalidateQueries({ queryKey: ["inventory-ports", far.id] })
+    queryClient.invalidateQueries({ queryKey: ["link-ports"] })
+  }
+  const setNearPort = useMutation({
+    // re-picking moves the binding: clear the old port, then bind the new one
+    mutationFn: async (portId: number | null) => {
+      if (nearBound && nearBound.id !== portId) await inventoryApi.setPortUplink(nearBound.id, null)
+      if (portId != null) await inventoryApi.setPortUplink(portId, far.id)
+    },
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to set the port"),
+  })
+  const setFarPort = useMutation({
+    mutationFn: async (portId: number | null) => {
+      const bind = kind === "peer" ? inventoryApi.setPortUplink : inventoryApi.setPortFeeds
+      if (farBound && farBound.id !== portId) await bind(farBound.id, null)
+      if (portId != null) await bind(portId, near.id)
+    },
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to set the port"),
+  })
+  const removeLink = useMutation({
+    mutationFn: () => kind === "peer"
+      ? inventoryApi.removePeerLink(near.id, far.id)
+      : inventoryApi.removeBackupLink(near.id, far.id),
+    onSuccess: () => {
+      toast.success(kind === "peer" ? "Cross-link removed" : "Backup link removed")
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+      invalidate()
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to remove the link"),
+  })
+
+  // live rates read off the FAR end's port when bound (its egress is this link's
+  // forward direction), normalized to this device's point of view
+  const rateSrc = farBound ?? nearBound
+  const down = farBound ? farBound.out_bps : nearBound?.in_bps ?? null
+  const up = farBound ? farBound.in_bps : nearBound?.out_bps ?? null
+  // Whichever END we read the counters off has to be reachable. A frozen
+  // "↓450 Mb/s" on a dead link is worse than no figure at all — it's the number
+  // an operator uses to rule the link OUT. Note this is the rate SOURCE, not
+  // both ends: if the far end is up, its port genuinely still counts this link
+  // (and reports the drop to zero), which is a real reading worth showing.
+  const rateOwnerDown = isDownState(farBound ? far.state : near.state)
+  const hasRates = !!rateSrc && !rateOwnerDown
+    && isFresh(rateSrc.updated_at) && (down != null || up != null)
+  const portDown = [nearBound, farBound].some(
+    (p) => p && (p.oper_status === "down" || (p.monitored === 1 && p.alarm === 1)))
+  const removable = kind !== "primary" && canWrite
+
+  return (
+    <div className="flex flex-col gap-1.5 border-b py-2 first:pt-1 last:border-b-0 last:pb-0">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 truncate font-mono text-xs font-medium">{far.name}</span>
+        {kind !== "peer" && (
+          <RowTag tone={kind === "backup" ? "success" : "muted"}>{kind}</RowTag>
+        )}
+        {portDown && <RowTag tone="destructive">port down</RowTag>}
+        {hasRates && (
+          <span className="ml-auto shrink-0 font-mono text-2xs text-muted-foreground"
+            title="Live rate on this link, toward / from this device">
+            ↓{fmtRate(down)}&ensp;↑{fmtRate(up)}
+          </span>
+        )}
+        {removable && (
+          <Button variant="ghost" size="icon"
+            className={cn("size-6 shrink-0 text-muted-foreground", !hasRates && "ml-auto")}
+            title={kind === "peer" ? `Remove the cross-link to ${far.name}`
+              : `Remove the backup link to ${far.name}`}
+            disabled={removeLink.isPending} onClick={() => removeLink.mutate()}>
+            <X className="size-3.5" />
+          </Button>
+        )}
+      </div>
+      <div className="grid grid-cols-2 items-end gap-2">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <Label className="truncate text-2xs text-muted-foreground">port on {near.name}</Label>
+          <UplinkPortSelect owner={near} bound={nearBound}
+            onPick={(id) => setNearPort.mutate(id)} busy={setNearPort.isPending} />
+        </div>
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <Label className="truncate text-2xs text-muted-foreground">port on {far.name}</Label>
+          <UplinkPortSelect owner={far} bound={farBound}
+            onPick={(id) => setFarPort.mutate(id)} busy={setFarPort.isPending} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function ConnectionPanel({ device }: { device: OrgDevice }) {
+  const { scopeOrg, canWrite } = useAuth()
+  const queryClient = useQueryClient()
+  // revealed by the "+" next to Uplinks; a device with no cross-links shows no
+  // Cross-links section at all. Resets when the panel moves to another device,
+  // so an abandoned picker never follows you around the tree.
+  const [addingPeer, setAddingPeer] = useState(false)
+  // Cabling is reference material, not status: an operator opens this to wire up
+  // ports or read a link's rate, and otherwise wants the tabs below it. So the
+  // whole block folds, closed by default, with a summary on the header so the
+  // fold still answers "what is this hanging off". Nothing ALARM-shaped hides in
+  // here — a down uplink port is already a chip on the tree row and a row in the
+  // Ports tab; this only ever hid the port pickers.
+  const [open, setOpen] = useState(false)
+  useEffect(() => { setAddingPeer(false); setOpen(false) }, [device.id])
+  const { data } = useQuery({
+    queryKey: ["inventory", scopeOrg],
+    queryFn: () => inventoryApi.list(scopeOrg),
+    enabled: !!scopeOrg,
+    staleTime: 30_000,
+  })
+  const addBackup = useMutation({
+    mutationFn: (parentId: number) => inventoryApi.addBackupLink(device.id, parentId),
+    onSuccess: () => {
+      toast.success("Backup uplink added — the ring closes here")
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to add the backup link"),
+  })
+  const addPeer = useMutation({
+    mutationFn: (peerId: number) => inventoryApi.addPeerLink(device.id, peerId),
+    onSuccess: () => {
+      toast.success("Cross-link added")
+      // the section now stands on its own rows; drop the "asked for it" flag so
+      // removing the last cross-link collapses it again
+      setAddingPeer(false)
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to add the cross-link"),
+  })
+
+  // passive plant (splitters/FDBs) has no ports and no uplink of its own
+  if (isPassiveType(device.device_type)) return null
+
+  const devices = data?.devices ?? []
+  const byId = new Map(devices.map((d) => [d.id, d]))
+  // the fresh inventory row — `device` may predate a just-added link
+  const self = byId.get(device.id) ?? device
+  const parent = self.parent_device_id != null ? byId.get(self.parent_device_id) : undefined
+  const backups = (self.backup_parents ?? [])
+    .map((id) => byId.get(id)).filter((d): d is OrgDevice => !!d)
+  const peers = (self.peer_ids ?? [])
+    .map((id) => byId.get(id)).filter((d): d is OrgDevice => !!d)
+  // anything already joined to this device — by any kind of edge — is off both
+  // menus: the server refuses a second edge between one pair, so offering it
+  // would just be an error waiting to happen
+  const taken = new Set<number>([
+    self.id, ...(self.parent_device_id != null ? [self.parent_device_id] : []),
+    ...self.backup_parents, ...(self.peer_ids ?? []),
+  ])
+  const candidates = devices.filter(
+    (d) => !taken.has(d.id) && !isPassiveType(d.device_type))
+  // a device shouldn't back up its own descendant — that's the loop the server
+  // rejects anyway; peers have no such rule (a ring of cross-links IS the point)
+  const backupCandidates = candidates.filter((d) => d.parent_device_id !== self.id)
+  // most plant is a plain tree: the section earns its space only once a
+  // cross-link exists (or the operator asked for the picker)
+  const showPeers = peers.length > 0 || addingPeer
+
+  if (!parent && backups.length === 0 && peers.length === 0 && !canWrite) return null
+
+  // What the closed header says instead of nothing: where this box hangs, and
+  // whether there's more than the one plain uplink under the fold.
+  const summary = [
+    parent ? parent.name : backups.length === 0 ? "root device" : null,
+    backups.length > 0 ? `+${backups.length} backup` : null,
+    peers.length > 0 ? `${peers.length} cross-link${peers.length === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(" · ")
+
+  return (
+    <div className="flex flex-col rounded-lg border bg-muted/40">
+      <button type="button" onClick={() => setOpen((v) => !v)}
+        className={cn("flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-foreground/5",
+          open ? "rounded-t-lg" : "rounded-lg")}
+        title="Which port carries each uplink, and any cross-links to devices at the same level">
+        <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform",
+          open && "rotate-90")} />
+        <span className="text-2xs font-medium text-muted-foreground">Uplinks</span>
+        {!open && summary && (
+          <span className="min-w-0 truncate font-mono text-2xs text-faint-foreground">{summary}</span>
+        )}
+      </button>
+      {open && (
+        <div className="flex flex-col gap-3 px-3 pb-3">
+          <div className="flex flex-col gap-1">
+            {/* the ONLY cross-link affordance until one exists — most plant is a
+                plain tree, so an operator who never cross-links never sees the
+                section, just this one quiet button */}
+            {!showPeers && canWrite && candidates.length > 0 && (
+              <Button variant="ghost" size="sm"
+                className="-mt-1 h-6 self-start px-1.5 text-2xs text-faint-foreground hover:text-foreground"
+                title="Add a cross-link — a cable to a device at the same level (documents the plant; does not affect alerting)"
+                onClick={() => setAddingPeer(true)}>
+                <Plus className="size-3" /> cross-link
+              </Button>
+            )}
+            {!parent && backups.length === 0 && (
+              <p className="text-xs text-faint-foreground">No uplink — root device.</p>
+            )}
+            {parent && <LinkRow near={self} far={parent} kind="primary" />}
+            {backups.map((b) => <LinkRow key={b.id} near={self} far={b} kind="backup" />)}
+            {canWrite && backupCandidates.length > 0 && (
+              <Select value="" disabled={addBackup.isPending}
+                onValueChange={(v) => addBackup.mutate(Number(v))}>
+                <SelectTrigger className="mt-1 h-7 w-full text-xs text-muted-foreground">
+                  <SelectValue placeholder="Add backup uplink (ring)…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {backupCandidates.map((d) => (
+                    <SelectItem key={d.id} value={String(d.id)}>
+                      <span className="font-mono">{d.name}</span>
+                      {d.device_type && <span className="text-muted-foreground"> · {d.device_type}</span>}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+
+          {/* Cross-links: cabling between boxes at the same level. Deliberately NOT
+              part of the dependency graph — whether traffic actually reroutes over
+              one depends on STP/routing state we can't see, so these describe the
+              plant (and carry bandwidth) without ever changing what pages. */}
+          {showPeers && (
+            <div className="flex flex-col gap-1 border-t pt-2.5">
+              <div className="flex items-center gap-2">
+                <span className="text-2xs font-medium text-muted-foreground"
+                  title="Switch-to-switch cabling at the same level. Records the plant and shows live bandwidth; it does not affect alerting — declare a backup uplink if a path should actually fail over.">
+                  Cross-links
+                </span>
+                {peers.length === 0 && (
+                  <Button variant="ghost" size="icon"
+                    className="ml-auto size-5 text-faint-foreground hover:text-foreground"
+                    title="Cancel" onClick={() => setAddingPeer(false)}>
+                    <X className="size-3" />
+                  </Button>
+                )}
+              </div>
+              {peers.map((p) => <LinkRow key={p.id} near={self} far={p} kind="peer" />)}
+              {canWrite && candidates.length > 0 && (
+                <Select value="" disabled={addPeer.isPending}
+                  onValueChange={(v) => addPeer.mutate(Number(v))}>
+                  <SelectTrigger className="mt-1 h-7 w-full text-xs text-muted-foreground">
+                    <SelectValue placeholder="Add cross-link…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {candidates.map((d) => (
+                      <SelectItem key={d.id} value={String(d.id)}>
+                        <span className="font-mono">{d.name}</span>
+                        {d.device_type && <span className="text-muted-foreground"> · {d.device_type}</span>}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function RowTag({ tone, children, onClick, title, color }: {
   tone: "warning" | "success" | "muted" | "destructive"
   children: ReactNode
   onClick?: (e: MouseEvent) => void
   title?: string
+  /** An operator palette name (lib/palette.ts) — only ever reaches a chip that
+   *  carries no status meaning (today: tags). It renders at the SAME weight the
+   *  tone classes do, so a coloured tag can't outshout a real alarm chip. */
+  color?: string | null
 }) {
+  const painted = paletteVarOf(color)
   const cls = {
     warning: "bg-warning-soft text-warning",
     success: "bg-success-soft text-success",
@@ -398,8 +767,11 @@ export function RowTag({ tone, children, onClick, title }: {
   }[tone]
   return (
     <span title={title} onClick={onClick}
+      // the tone is DATA, so it rides a custom property into .wisp-tag, which
+      // owns the light/dark readability correction (index.css)
+      style={painted ? ({ "--tag": painted } as CSSProperties) : undefined}
       className={cn("shrink-0 rounded px-1.5 py-px text-2xs font-semibold tracking-wide uppercase",
-        onClick && "cursor-pointer hover:brightness-125", cls)}>
+        onClick && "cursor-pointer hover:brightness-125", painted ? "wisp-tag" : cls)}>
       {children}
     </span>
   )
@@ -410,8 +782,12 @@ export function isOpticalOlt(device: OrgDevice): boolean {
   return (device.device_type ?? "").toUpperCase() === "OLT" && device.snmp_enabled === 1
 }
 export function deviceTabs(device: OrgDevice): DeviceTab[] {
-  const tabs: DeviceTab[] = ["health"]
+  // Optical leads for an OLT — it's the tab an operator actually wants first,
+  // both as the leftmost tab and (see the drill-in callers) the one that opens
+  // by default.
+  const tabs: DeviceTab[] = []
   if (isOpticalOlt(device)) tabs.push("optical")
+  tabs.push("health")
   if (device.snmp_enabled === 1) tabs.push("ports")
   return tabs
 }
@@ -435,12 +811,15 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
             {manageCreds && <WebUiCredentialsButton device={device} />}
           </div>
         )}
-        <DevicePerfPanel device={device} />
+        <div className="flex flex-col gap-2.5">
+          <DevicePerfPanel device={device} />
+          <ConnectionPanel device={device} />
+        </div>
       </>
     )
   }
 
-  const active = tabs.includes(tab) ? tab : "health"
+  const active = tabs.includes(tab) ? tab : tabs[0]
   return (
     <Tabs value={active} onValueChange={(v) => onTab(v as DeviceTab)}>
       {/* the line TabsList is w-full (its hairline spans the panel), so the
@@ -455,7 +834,12 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
           </span>
         )}
       </TabsList>
-      <TabsContent value="health"><DevicePerfPanel device={device} /></TabsContent>
+      <TabsContent value="health">
+        <div className="flex flex-col gap-2.5">
+          <DevicePerfPanel device={device} />
+          <ConnectionPanel device={device} />
+        </div>
+      </TabsContent>
       {tabs.includes("optical") && (
         <TabsContent value="optical"><OpticalPanel device={device} focusOnuId={focusOnuId} /></TabsContent>
       )}

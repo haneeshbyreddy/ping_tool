@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import timedelta
 
+from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
 
@@ -114,13 +116,13 @@ class CentralOpticsMonitor:
             warn_count=warn_count, crit_count=crit_count, alarm=alarm,
             alarm_since=since, ts=ts)
         if alarm and not was_alarm:
-            self._page(device_id,
+            self._page(device_id, "OPTICAL_CRIT",
                        f"\U0001f53b Optical critical — {self._name(device_id)}",
                        f"{self._name(device_id)}: {crit_unacked} ONU(s) below the "
                        f"critical Rx-power floor. Subscribers on those drops are at risk "
                        f"of losing sync — check the ODN / splitters.", ts)
         elif was_alarm and not alarm and crit_count == 0:
-            self._page(device_id,
+            self._page(device_id, "OPTICAL_RECOVERED",
                        f"✅ Optical recovered — {self._name(device_id)}",
                        f"{self._name(device_id)}: no ONUs remain below the critical "
                        f"Rx-power floor.", ts)
@@ -129,28 +131,51 @@ class CentralOpticsMonitor:
         dev = self.store.get_org_device(self.org_id, device_id)
         return dev["name"] if dev else f"#{device_id}"
 
-    def _page(self, device_id: int, title: str, body: str, ts: str) -> None:
-        topic = self.store.org_role_topic(self.org_id, "operator")
-        if self.cfg.optical_alerts and topic:
-            res = self.notifier.send(topic, title, body, 3)
-            status = "sent" if res.ok else "failed"
-        else:
-            status = "suppressed"
-        self.store.log_alert(self.org_id, None, device_id, self.notifier.channel,
-                             topic, status, "OPTICAL_CRIT", ts)
+    def _page(self, device_id: int, kind: str, title: str, body: str,
+              ts: str) -> None:
+        """Route through the notification GOVERNOR, like every other shell.
+
+        This was the last paging path still calling the notifier inline, and it
+        got away with it only because the metric could not fire on most of the
+        fleet: C-Data/DBC EPON exposes no per-ONU Rx in SNMP, so its OLTs never
+        produced an optical verdict at all. The web-UI scrape (weboptics.py)
+        changed that — the whole DBC fleet became capable of these overnight,
+        which is exactly the kind of new SNMP-shaped volume the governor exists
+        to keep from drowning real ICMP pages.
+
+        The tier stays PUSH (OPTICAL_* is deliberately not in `_DIGEST_KINDS`):
+        an ONU under the critical floor is a subscriber about to lose sync, and
+        burying that in an hourly roll-up is a judgement for the operator to
+        make explicitly, not a side effect of this refactor. What it gains is
+        the per-(device, kind) cooldown backstop, which is the actual fix for a
+        threshold flap — PYLON has an ONU sitting 0.01 dB off the crit line —
+        plus a clean `alert_log.kind` for the by-type analytics, which this
+        path was writing as NULL.
+        """
+        AlertRouter(self.store, self.org_id, self.notifier, self.cfg).emit(
+            kind, topic=self.store.org_role_topic(self.org_id, "worker"),
+            title=title, body=body, priority=3, ts=ts, device_id=device_id,
+            gate=self.cfg.optical_alerts)
 
 def _to_float(raw) -> float | None:
+    # Non-finite is None, not a number: float() accepts "inf"/"nan", devices do
+    # emit them for an out-of-range sensor, and an infinite dBm is both a false
+    # reading and invalid JSON — see weboptics._num for the outage it caused.
     if raw in (None, ""):
         return None
     try:
-        return float(raw)
+        val = float(raw)
     except (TypeError, ValueError):
         return None
+    return val if math.isfinite(val) else None
 
 def _to_int(raw) -> int | None:
     if raw in (None, ""):
         return None
     try:
-        return int(float(raw))
+        val = float(raw)
     except (TypeError, ValueError):
         return None
+    # int(inf) raises OverflowError and int(nan) ValueError, so this guard is
+    # load-bearing for more than correctness.
+    return int(val) if math.isfinite(val) else None

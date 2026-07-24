@@ -51,7 +51,7 @@ class RouterTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
-        self.store.set_org("ispA", ntfy_topic_operator="ops")
+        self.store.set_org("ispA", ntfy_topic_worker="ops")
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
 
     def tearDown(self):
@@ -120,7 +120,7 @@ class DigestFlushTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
-        self.store.set_org("ispA", ntfy_topic_operator="ops")
+        self.store.set_org("ispA", ntfy_topic_worker="ops")
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
 
     def tearDown(self):

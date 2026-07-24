@@ -2,12 +2,17 @@
 links, switch ports, ONU/OLT optics, SNMP config/walks/profiles."""
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import datetime, timezone
 
-from wisp.central import billing, inventory, onuroster, ponfault
+from wisp.central import (billing, inventory, onuroster, ponfault,
+                          weboptics_profiles)
 from wisp.central.api.common import (DENIED, body_org_write, device_read_scope,
                                      device_write_org, olt_liveness, org_or_400,
                                      q_int_required, reader_or_401)
+
+log = logging.getLogger("wisp.central")
 
 
 # ----- reads ---------------------------------------------------------------
@@ -58,7 +63,9 @@ def list_devices(h, qs):
         return
     devices = h.store.list_org_devices(org)
     _stamp_optical_faults(h, org, devices)
-    h._reply(200, {"devices": devices})
+    # tag colours ride the device list rather than a second GET: every consumer
+    # of one needs the other in the same render, and they invalidate together
+    h._reply(200, {"devices": devices, "tag_colors": h.store.org_colors(org, "tag")})
 
 
 def regions(h, qs):
@@ -94,6 +101,18 @@ def ports(h, qs):
     h._reply(200, {"ports": h.store.list_switch_ports(org, did)})
 
 
+def link_ports(h, qs):
+    # every port bound to a link (parent-side `feeds` + child-side `uplink`),
+    # org-wide in one query — the map draws a bandwidth label per link off this
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    h._reply(200, {"ports": h.store.list_link_ports(org)})
+
+
 def optics(h, qs):
     user = reader_or_401(h)
     if not user:
@@ -125,6 +144,92 @@ def optics(h, qs):
         "onu_pon_limit": dev.get("onu_pon_limit") if dev.get("onu_pon_limit") is not None else h.cfg.onu_pon_limit,
         "dup_macs": dup_macs,
     })
+
+
+# A two-character needle matches half a fleet's MACs; the tech types the tail of
+# a sticker, which is realistically 3+. Also the floor that keeps a bare "a" from
+# scanning every ONU row on every keystroke of an unrelated name search.
+ONU_SEARCH_MIN = 3
+# Cap what one search ships. Past this the needle is too broad to be a MAC lookup
+# anyway, and the answer is "type more", not a thousand-row payload.
+ONU_SEARCH_MAX = 50
+
+
+def onu_search(h, qs):
+    """Find ONUs by serial/MAC **or name** substring, org-wide, grouped by OLT.
+
+    Backs the Network page's device search: the identifiers a tech actually
+    holds for a subscriber are the MAC off the sticker and the name the ONU was
+    provisioned with, and until this endpoint neither reached anything in the
+    dashboard — the roster was only visible once you already knew which OLT to
+    open, which is the thing being looked up. Both fields go through the same
+    punctuation-blind key, so "hc_kiran", "HC KIRAN" and "hckiran" all land, the
+    way "a4:f2" and "a4f2" do. Read-only; never pages.
+    """
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    needle = onuroster.search_key((qs.get("q") or [""])[0])
+    if len(needle) < ONU_SEARCH_MIN:
+        return h._reply(200, {"matches": [], "truncated": False})
+    now = datetime.now(timezone.utc)
+    matches: list[dict] = []
+    shipped = 0
+    truncated = False
+    for did in h.store.onu_search_device_ids(org, needle):
+        dev = h.store.get_org_device(org, did)
+        if not dev:
+            continue
+        # Search the CURRENT roster, not the raw table. onu_optics never deletes
+        # a removed ONU's row (that's what lets last_online_at freeze), so a raw
+        # hit can be a slot that no longer exists — and clicking it would land on
+        # an Optical tab that doesn't list it. stale_s=None is what that tab
+        # itself renders, so search and drill-down can't disagree.
+        roster = onuroster.current_roster(h.store.list_onu_optics(org, did), now,
+                                          stale_s=None)
+        hits = [o for o in roster
+                if needle in onuroster.search_key(o.get("serial"))
+                or needle in onuroster.search_key(o.get("name"))]
+        if not hits:
+            continue
+        # Stable slot order the tech reads down — the Optical tab's rule, not a
+        # relevance sort that reshuffles as the roster changes underneath.
+        hits.sort(key=lambda o: (str(o.get("pon_port") or ""), o.get("onu_id") or 0,
+                                 str(o.get("onu_key") or "")))
+        room = ONU_SEARCH_MAX - shipped
+        if len(hits) > room:
+            hits = hits[:room]
+            truncated = True
+        shipped += len(hits)
+        matches.append({
+            "device_id": did,
+            "device_name": dev.get("name") or "",
+            "onus": [{
+                "id": o.get("id"),
+                "onu_key": o.get("onu_key"),
+                "pon_port": o.get("pon_port"),
+                "onu_id": o.get("onu_id"),
+                "name": o.get("name"),
+                "serial": o.get("serial"),
+                "state": o.get("state"),
+                # severity rides along so a result row colors with the SAME rule
+                # the Optical tab uses — a MAC hit that reads "ok" here and
+                # "crit" one click later would be its own little lie.
+                "severity": o.get("severity"),
+                "rx_dbm": o.get("rx_dbm"),
+                "distance_m": o.get("distance_m"),
+                "last_online_at": o.get("last_online_at"),
+                "updated_at": o.get("updated_at"),
+            } for o in hits],
+        })
+        if shipped >= ONU_SEARCH_MAX:
+            truncated = True
+            break
+    matches.sort(key=lambda m: m["device_name"].lower())
+    h._reply(200, {"matches": matches, "truncated": truncated})
 
 
 def snmp_walks(h, qs):
@@ -173,6 +278,143 @@ def snmp_status(h, qs):
     did, org = scope
     h._reply(200, {"status": h.store.device_snmp_status(org, did),
                    "capability": h.store.device_capabilities(org, did)})
+
+
+def rx_status(h, qs):
+    """WHY this OLT has no per-ONU dBm — the optical counterpart of snmp_status.
+
+    A blank Rx column has several completely different causes that look
+    identical on screen, and they take opposite actions:
+
+      * the vendor genuinely publishes no per-ONU Rx over SNMP (C-Data/DBC —
+        proven exhaustively, twice) and there is no web-UI recipe for it yet;
+      * there IS a recipe, but nobody has stored the OLT's web login;
+      * everything is configured and the scrape is failing (wrong address,
+        refused password, a firmware without that page);
+      * or it simply works and this PON's ONUs are dark.
+
+    Before this, all four rendered as an empty column, which is the exact false
+    negative the whole web-scrape subsystem exists to kill — "this vendor has no
+    Rx" concluded from a login that was never attempted. So the reply carries
+    FACTS (does a profile exist, are there credentials, is the tunnel granted,
+    what did the last scrape say) and the dashboard turns them into a sentence:
+    the same split of duties SnmpDiagnosis already runs on.
+
+    Pure read-side. Never triggers a scrape — a diagnosis page that pokes a weak
+    OLT every time it renders is how the "must never look like polling" rule
+    gets broken by accident.
+    """
+    user = reader_or_401(h)
+    if not user:
+        return
+    scope = device_read_scope(h, user, qs)
+    if not scope:
+        return
+    did, org = scope
+    dev = h.store.get_org_device(org, did) or {}
+    # Which vendor this OLT resolved as, in the SAME precedence the pollers and
+    # the sweeper use: the operator's dropdown beats the edge's detection.
+    snmp = {s["subsystem"]: s for s in h.store.device_snmp_status(org, did)}
+    optics = snmp.get("optics") or {}
+    declared = str(dev.get("gpon_vendor") or "").strip().lower()
+    detected = str(optics.get("profile") or "").strip().lower()
+    # Detection only counts with a sysObjectID behind it — see web_optics_targets.
+    if not (detected and str(optics.get("sysobjectid") or "").strip()):
+        detected = ""
+    vendor = declared or detected
+    # Scoped to this org (global rows + its own), not the whole table: another
+    # org's local vendor is none of this org's business, and `known_vendors`
+    # ships straight to the page.
+    profiles = weboptics_profiles.ProfileSet.build(
+        h.store.list_web_optics_profiles(org))
+    profile = profiles.resolve(org, vendor) if vendor else None
+    creds = h.store.get_device_webui_credentials(org, did) or {}
+    counts = h.store.onu_rx_counts(org, did)
+    sweeper = getattr(h, "weboptics", None)
+    h._reply(200, {
+        "vendor": vendor or None,
+        "vendor_source": "declared" if declared else ("detected" if detected else None),
+        # Does a web-UI recipe exist for this vendor at all? The single fact
+        # that separates "we can't read this box" from "nobody has told us how".
+        "web_profile": profile.name if profile else None,
+        "known_vendors": sorted(profiles.names()),
+        "has_credentials": bool(creds.get("username") and creds.get("password_enc")),
+        "web_proxy": h.store.org_web_proxy(org),
+        "has_node": bool(dev.get("assigned_node_id")),
+        "onus_total": counts["total"],
+        "onus_rx": counts["with_rx"],
+        "scrape": h.store.get_web_optics_status(org, did),
+        # Is a read even possible here, and is one happening right now? Asked of
+        # the SWEEPER, not re-derived from the facts above: the panel's Refresh
+        # button and the route that serves it must agree with the sweep about
+        # what is readable, and three copies of that rule would not.
+        "can_refresh": bool(sweeper and sweeper.target(org, did)),
+        "refreshing": bool(sweeper and sweeper.busy(did)),
+    })
+
+
+def rx_refresh(h, user, body):
+    """Read this OLT's optical page NOW, instead of at the next sweep.
+
+    The sweep's 15-minute clock is right for the thing it measures — Rx drifts
+    over days — but it is wrong for the moment someone is standing at a pole
+    with the fibre in their hand. A quarter-hour of "is it better yet?" is how a
+    diagnosis turns into a second site visit, so the operator gets a button.
+    The RESTRAINT stays where it was: same eligibility query, same per-OLT lock,
+    same live-browse and dormant-tunnel gates, same recorded outcome. This
+    widens WHO may ask for a read, not what a read is allowed to do.
+
+    Owner-only, because it spends the stored web-UI credential down the tunnel —
+    the same grade of action as opening a session (proxy._PROXY_ROLES), and a
+    worker has neither.
+
+    It answers immediately and scrapes on a thread: one OLT costs up to
+    web_optics_device_budget_s (120s), and a request held that long is a browser
+    timeout, a stuck spinner, and a worker thread this server does not have
+    spare. The panel watches the recorded status instead — which is the same
+    thing it reads when the sweep does the work, so there is one story about
+    what happened rather than a special one for the button.
+    """
+    try:
+        device_id = int(body.get("device_id"))
+    except (TypeError, ValueError):
+        h._reply(400, {"error": "device_id required"})
+        return
+    org = device_write_org(h, user, device_id)
+    if org is DENIED:
+        return
+    if org is None:
+        h._reply(404, {"error": "device not found"})
+        return
+    sweeper = getattr(h, "weboptics", None)
+    if sweeper is None:
+        h._reply(503, {"error": "web-UI optical reads are not enabled on this server"})
+        return
+    if sweeper.busy(device_id):
+        # Not an error the operator caused, and not a state worth overwriting
+        # the last outcome with — just say it's already happening.
+        h._reply(409, {"error": "a read of this OLT is already running"})
+        return
+    # Refused HERE rather than on the thread, so an ineligible device gets a
+    # real answer instead of a 200 followed by a status row that overwrites
+    # whatever actually happened last with "you can't read this".
+    dev = sweeper.target(org, device_id)
+    if dev is None:
+        h._reply(400, {"error": "this OLT isn't set up for web-UI optical reads "
+                                "— see the Optical tab for what's missing"})
+        return
+
+    def _run() -> None:
+        try:
+            sweeper.scrape_device(dev)
+        except Exception:
+            log.exception("manual web-optics read failed for device=%d", device_id)
+
+    threading.Thread(target=_run, name=f"wisp-rxrefresh-{device_id}",
+                     daemon=True).start()
+    log.info("manual web-optics read queued by user=%s for %s/device=%d",
+             user["id"], org, device_id)
+    h._reply(200, {"started": True})
 
 
 def redundancy(h, qs):
@@ -268,6 +510,26 @@ def maintenance(h, user, body):
     h._reply(200 if ok else 404, {"ok": ok})
 
 
+def tag_color(h, user, body):
+    """Colour-code a tag. Presentation only — a tag has no row of its own, so
+    this keys on the text; renaming a tag on every device orphans the colour."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    tag = inventory.clean_color_key("tag", body.get("tag"))
+    h.store.set_org_color(org, "tag", tag, inventory.clean_color(body.get("color")))
+    h._reply(200, {"ok": True})
+
+
+def tree_detached(h, user, body):
+    did = int(body.get("id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    ok = h.store.set_org_device_tree_detached(org, did, bool(body.get("on")))
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
 def location(h, user, body):
     did = int(body.get("id") or 0)
     org = device_write_org(h, user, did)
@@ -278,24 +540,56 @@ def location(h, user, body):
     h._reply(200 if ok else 404, {"ok": ok})
 
 
-def route(h, user, body):
-    clean = inventory.clean_route_payload(body)
+def _link_write_scope(h, user, clean):
+    """Resolve the org for a map-presentation write and prove the link is real.
+
+    Returns the org, or DENIED when a reply has already been sent. Presentation
+    (geometry, colour, label position) only ever attaches to a link that exists
+    in this org — primary, backup or cross-link.
+
+    A cross-link matches in EITHER order: org_device_links canonicalizes a peer
+    to (min, max) but link_routes keys it (child=higher, parent=lower) so the
+    waypoints still run parent→child like every other kind. Peers used to be
+    rejected outright here, so a drawn route on a cross-link 400'd even though
+    the map offered the editor."""
     org = device_write_org(h, user, clean["child_id"])
     if org is DENIED:
-        return
-    # geometry only attaches to a link that actually exists in this org
+        return DENIED
     child = h.store.get_org_device(org, clean["child_id"])
     if not child:
         h._reply(404, {"error": "device not found"})
+        return DENIED
+    if child.get("parent_device_id") == clean["parent_id"]:
+        return org
+    linked = {e["parent_id"] for e in h.store.org_device_backup_edges(org)
+              if e["child_id"] == clean["child_id"]}
+    linked |= h.store.org_device_peer_map(org).get(clean["child_id"], set())
+    if clean["parent_id"] not in linked:
+        raise inventory.InventoryError(
+            "no link between those devices — set the parent first")
+    return org
+
+
+def route(h, user, body):
+    clean = inventory.clean_route_payload(body)
+    org = _link_write_scope(h, user, clean)
+    if org is DENIED:
         return
-    if child.get("parent_device_id") != clean["parent_id"]:
-        backups = {e["parent_id"] for e in h.store.org_device_backup_edges(org)
-                   if e["child_id"] == clean["child_id"]}
-        if clean["parent_id"] not in backups:
-            raise inventory.InventoryError(
-                "no link between those devices — set the parent first")
     h.store.set_link_route(org, clean["child_id"], clean["parent_id"],
                            clean["waypoints"], updated_by=user["username"])
+    h._reply(200, {"ok": True})
+
+
+def link_style(h, user, body):
+    """Per-link map styling: colour from the closed palette, label position along
+    the line. Owner-gated like every inventory write; purely cartographic — it
+    can't reach the engine, an alert or a state row."""
+    clean = inventory.clean_link_style_payload(body)
+    org = _link_write_scope(h, user, clean)
+    if org is DENIED:
+        return
+    h.store.set_link_style(org, clean["child_id"], clean["parent_id"],
+                           clean["fields"], updated_by=user["username"])
     h._reply(200, {"ok": True})
 
 
@@ -524,6 +818,74 @@ def gpon_profile_delete(h, user, body):
     _gpon_profile_mutate(h, user, body, delete=True)
 
 
+# ----- web-UI optics vendor profiles ----------------------------------------
+# The third profile table, and the one that decides whether a vendor whose Rx
+# lives ONLY on its web page can be read at all. Same shape as the two above so
+# there is one thing to learn: org_id NULL is global (superadmin), an org owner
+# adds org-local rows, and the whole payload is refused rather than partially
+# applied — see central/weboptics_profiles.py for why a half-understood recipe
+# is worse than none.
+
+def web_optics_profiles(h, qs):
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = h._scope_org(user, qs)
+    h._reply(200, {
+        "profiles": h.store.list_web_optics_profiles(org),
+        "builtins": list(weboptics_profiles.builtin_names()),
+        # The closed vocabulary, served rather than duplicated in the SPA: a
+        # dropdown built from a second hand-kept list is how a value that the
+        # validator rejects ends up being offered in the UI.
+        "fields": list(weboptics_profiles.FIELDS),
+        "sessions": list(weboptics_profiles.SESSION_STRATEGIES),
+        "methods": list(weboptics_profiles.OPTICS_METHODS),
+        "charsets": list(weboptics_profiles.CHARSETS),
+        "onu_id_shapes": list(weboptics_profiles.ONU_ID_SHAPES),
+        # One worked example, so "what does a real one look like?" is answerable
+        # from inside the dashboard instead of from the source.
+        "example": weboptics_profiles.BUILTIN_SPECS.get("dbc", {}),
+    })
+
+
+def web_optics_profile_create(h, user, body):
+    clean = weboptics_profiles.clean_web_optics_profile_payload(body)
+    if user["is_superadmin"]:
+        org = body.get("org_id") or None
+    else:
+        org = user["org_id"]
+    if org is not None and not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    h._reply(200, {"id": h.store.create_web_optics_profile(org, clean)})
+
+
+def _web_optics_profile_mutate(h, user, body, *, delete: bool):
+    profile = h.store.get_web_optics_profile(int(body.get("id") or 0))
+    if not profile:
+        h._reply(404, {"error": "profile not found"})
+        return
+    org = profile["org_id"]
+    allowed = (user["is_superadmin"] if org is None else h._can_write(user, org))
+    if not allowed:
+        h._reply(403, {"error": "forbidden"})
+        return
+    if delete:
+        ok = h.store.delete_web_optics_profile(profile["id"])
+    else:
+        clean = weboptics_profiles.clean_web_optics_profile_payload(body)
+        ok = h.store.update_web_optics_profile(profile["id"], clean)
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
+def web_optics_profile_update(h, user, body):
+    _web_optics_profile_mutate(h, user, body, delete=False)
+
+
+def web_optics_profile_delete(h, user, body):
+    _web_optics_profile_mutate(h, user, body, delete=True)
+
+
 # ----- switch ports ----------------------------------------------------------
 
 def port_monitored(h, user, body):
@@ -554,6 +916,28 @@ def port_feeds(h, user, body):
             h._reply(422, {"error": "feeds device must belong to the same org"})
             return
     ok = h.store.set_port_feeds(org, pid, feeds)
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
+def port_uplink(h, user, body):
+    # the child-side mirror of port_feeds: THIS port faces that parent device
+    pid = int(body.get("id") or 0)
+    org = h.store.switch_port_org(pid)
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    uplink_raw = body.get("uplink_device_id")
+    uplink = None
+    if uplink_raw not in (None, "", "null"):
+        try:
+            uplink = int(uplink_raw)
+        except (TypeError, ValueError):
+            h._reply(422, {"error": "uplink_device_id must be a number"})
+            return
+        if h.store.device_org(uplink) != org:
+            h._reply(422, {"error": "uplink device must belong to the same org"})
+            return
+    ok = h.store.set_port_uplink(org, pid, uplink)
     h._reply(200 if ok else 404, {"ok": ok})
 
 
@@ -620,6 +1004,37 @@ def link_delete(h, user, body):
     if org is DENIED:
         return
     ok = h.store.delete_backup_link(org, child_id, parent_id)
+    h._reply(200 if ok else 404, {"ok": ok})
+
+
+# ----- peer (cross) links ----------------------------------------------------
+# Undirected switch-to-switch cabling. Same table as backup links under
+# kind='peer', invisible to the engine by construction (see store_devices.py).
+
+def peer_add(h, user, body):
+    a_id = int(body.get("a_id") or 0)
+    b_id = int(body.get("b_id") or 0)
+    org = device_write_org(h, user, a_id)
+    if org is DENIED:
+        return
+    if h.store.device_org(b_id) != org:
+        h._reply(422, {"error": "the other device must belong to the same org"})
+        return
+    inventory.clean_peer_link(a_id, b_id,
+                             parents=h.store.org_device_parent_map(org),
+                             backups=h.store.org_device_backup_map(org),
+                             peers=h.store.org_device_peer_map(org))
+    h.store.create_peer_link(org, a_id, b_id)
+    h._reply(200, {"ok": True})
+
+
+def peer_delete(h, user, body):
+    a_id = int(body.get("a_id") or 0)
+    b_id = int(body.get("b_id") or 0)
+    org = device_write_org(h, user, a_id)
+    if org is DENIED:
+        return
+    ok = h.store.delete_peer_link(org, a_id, b_id)
     h._reply(200 if ok else 404, {"ok": ok})
 
 

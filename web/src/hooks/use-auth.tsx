@@ -1,6 +1,6 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { authApi } from "@/lib/api"
+import { authApi, orgsApi } from "@/lib/api"
 import { SESSION_EXPIRED_KEY } from "@/lib/session"
 import type { MeResponse, User } from "@/lib/types"
 
@@ -9,7 +9,8 @@ const SCOPE_STORAGE_KEY = "wisp-central-org-scope"
 interface AuthContextValue {
   user: User | null
   isLoading: boolean
-  login: (username: string, password: string, remember?: boolean) => Promise<void>
+  login: (username: string, password: string, remember?: boolean,
+          second?: { totp?: string; recovery?: string }) => Promise<void>
   logout: () => Promise<void>
   canWrite: boolean
 
@@ -34,6 +35,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [superadminScope, setSuperadminScope] = useState<string | null>(
     () => localStorage.getItem(SCOPE_STORAGE_KEY),
   )
+  // A superadmin has no home org, so the scope starts null — "All orgs" — where
+  // Home/Network/Map/Logs each early-return <NeedsOrg/> and a fresh session lands
+  // on four dead pages. We resolve a concrete default (the first org) ONCE per
+  // session, and only when nothing is stored; this ref records that we've done
+  // so, so an explicit "All orgs" pick afterwards is respected for the rest of
+  // the session (a reload re-defaults, which is the whole point).
+  const scopeResolved = useRef(false)
 
   useEffect(() => {
     const handler = () => {
@@ -50,8 +58,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const user = meQuery.data?.user ?? null
 
-  const login = async (username: string, password: string, remember = false) => {
-    const data = await authApi.login(username, password, remember)
+  const login = async (username: string, password: string, remember = false,
+                       second?: { totp?: string; recovery?: string }) => {
+    const data = await authApi.login(username, password, remember, second)
     queryClient.setQueryData(["me"], data)
   }
 
@@ -62,6 +71,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryClient.setQueryData(["me"], null)
     setSuperadminScope(null)
     localStorage.removeItem(SCOPE_STORAGE_KEY)
+    // A different account logging in on this same tab must re-resolve its default.
+    scopeResolved.current = false
   }
 
   const setScopeOrg = (org: string | null) => {
@@ -69,6 +80,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (org) localStorage.setItem(SCOPE_STORAGE_KEY, org)
     else localStorage.removeItem(SCOPE_STORAGE_KEY)
   }
+
+  // Superadmin only: fetch the org list so the scope can default to the first
+  // org. Shares the ["orgs"] query cache with the workspace switcher, so it is
+  // not an extra round trip. Owners/workers take their scope from user.org_id
+  // and never reach this.
+  const orgsQuery = useQuery({
+    queryKey: ["orgs"],
+    queryFn: () => orgsApi.list(),
+    enabled: !!user?.is_superadmin,
+  })
+  useEffect(() => {
+    if (!user?.is_superadmin || scopeResolved.current) return
+    // Something already stored (a previous pick) — honour it, don't re-default.
+    if (localStorage.getItem(SCOPE_STORAGE_KEY)) {
+      scopeResolved.current = true
+      return
+    }
+    const first = orgsQuery.data?.orgs[0]?.org_id
+    if (first) {
+      scopeResolved.current = true
+      setScopeOrg(first)
+    }
+    // The platform pages (/overview, /orgs) don't read scope, so seeding it never
+    // hides them — it only rescues the four org-scoped pages from <NeedsOrg/>.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, orgsQuery.data])
 
   const scopeOrg = user ? (user.is_superadmin ? superadminScope : user.org_id) : null
 

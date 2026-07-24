@@ -272,7 +272,7 @@ export function WebUiLiveIcon({ device }: { device: OrgDevice }) {
       className="inline-flex cursor-pointer"
       onClick={(e) => {
         e.stopPropagation()
-        window.open(`/api/proxy/${sess.sid}/`, "_blank")
+        watchSessionTab(sess.sid, window.open(`/api/proxy/${sess.sid}/`, "_blank"))
       }}>
       <Globe className="size-3.5 animate-pulse text-success" />
     </span>
@@ -318,6 +318,45 @@ function rememberPort(deviceId: number, port: number): void {
   } catch { /* private mode etc. — a lost preference is fine */ }
 }
 
+// Sessions this browser opened, against the tab each one is being driven from.
+//
+// Nothing on the server can tell that a browser tab was closed — the tunnel is
+// request/response, so an abandoned session is indistinguishable from an idle
+// one until its TTL runs out. That was not merely untidy: the web-optics
+// sweeper stands down for a device someone is browsing, and that gate is
+// per-PROBE, so one forgotten tab quietly suppressed the optical read of every
+// OLT behind it. The server now judges a session by when it was last USED and
+// reaps timed-out ones, which is what makes that safe under every condition;
+// this closes the common case PROMPTLY, while the dashboard is still open to
+// notice. Belt and braces, and the braces are the ones that always hold.
+//
+// Deliberately NOT hooked to the dashboard's own pagehide: that fires on a
+// plain reload too, and closing a session the operator is still using in
+// another tab because they refreshed this one would be a worse bug than the one
+// being fixed. A dashboard that goes away leaves the server's idle rule to it.
+const _openTabs = new Map<string, Window>()
+let _tabWatch: number | null = null
+
+function sweepClosedTabs(): void {
+  for (const [sid, tab] of [..._openTabs]) {
+    if (!tab.closed) continue
+    _openTabs.delete(sid)
+    // Best-effort by nature — the session expires on its own anyway, so a
+    // failed close costs a few idle minutes, never correctness.
+    void proxyApi.close(sid).catch(() => { /* it will time out on its own */ })
+  }
+  if (_openTabs.size === 0 && _tabWatch != null) {
+    window.clearInterval(_tabWatch)
+    _tabWatch = null
+  }
+}
+
+function watchSessionTab(sid: string, tab: Window | null): void {
+  if (!tab) return   // popup blocked, or opened without a handle — TTL covers it
+  _openTabs.set(sid, tab)
+  _tabWatch ??= window.setInterval(sweepClosedTabs, 3_000)
+}
+
 export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promise<boolean> {
   // The tab must open synchronously inside the click gesture or popup blockers
   // eat it — open blank now, point it at the session once central answers.
@@ -332,8 +371,12 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
   try {
     const sess = await proxyApi.open(device.id, port)
     rememberPort(device.id, port)
+    let shown: Window | null = tab
     if (tab) tab.location.replace(sess.url)
-    else window.open(sess.url, "_blank")
+    else shown = window.open(sess.url, "_blank")
+    // Close the tunnel when the tech closes the tab, rather than leaving it to
+    // time out — see watchSessionTab.
+    watchSessionTab(sess.sid, shown)
     toast.success(`Connected — opening ${device.name}'s web UI`, {
       id: tid,
       description: "If the tab stalls, the probe may still be waking — refresh it once.",
@@ -494,7 +537,8 @@ export function WebProxyCard({ org }: { org: string }) {
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {s.status === "open" && s.live && isOwner && (
                 <Button variant="ghost" size="sm" className="h-6 px-2 text-xs"
-                  onClick={() => window.open(`/api/proxy/${s.sid}/`, "_blank")}>
+                  onClick={() => watchSessionTab(
+                    s.sid, window.open(`/api/proxy/${s.sid}/`, "_blank"))}>
                   <ExternalLink className="size-3" /> Open
                 </Button>
               )}

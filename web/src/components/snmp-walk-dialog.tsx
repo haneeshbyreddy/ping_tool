@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Download, Loader2, Play } from "lucide-react"
+import { AlertTriangle, Download, Loader2, Play } from "lucide-react"
 import { snmpApi, ApiError } from "@/lib/api"
 import type { OrgDevice, SnmpWalk } from "@/lib/types"
 import { ago } from "@/lib/format"
@@ -34,6 +34,17 @@ function StatusPill({ w }: { w: SnmpWalk }) {
   }
   if (w.status === "error") {
     return <span className="text-2xs font-semibold text-destructive" title={w.error ?? ""}>failed</span>
+  }
+  // A truncated walk reads as a complete one unless we say so — and "that OID
+  // holds nothing" concluded from a partial dump is a false negative that costs
+  // a whole onboarding session. Warning tone, not success.
+  if (w.truncated) {
+    return (
+      <span className="inline-flex items-center gap-1 text-2xs font-semibold text-warning"
+        title="The walk stopped at the edge's row cap or time budget. This subtree is only partly dumped — narrow the root OID and re-run before concluding an OID is absent.">
+        <AlertTriangle className="size-3" /> {w.varbind_count} rows · partial
+      </span>
+    )
   }
   return <span className="text-2xs font-semibold text-success">{w.varbind_count} rows</span>
 }

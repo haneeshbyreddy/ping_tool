@@ -69,6 +69,15 @@ export function stateTone(state: DeviceState | string | null | undefined):
   }
 }
 
+// "The box is not answering" — DOWN is the FSM's verdict, UNREACHABLE the
+// topology override for a device orphaned behind a down parent. Mirrors
+// DOWN_FAMILY in core/state_machine.py; keep the two in step.
+// Load-bearing beyond tone: a device in this family cannot be walked, so every
+// SNMP reading still on screen for it is a frozen snapshot (see .wisp-frozen).
+export function isDownState(state: DeviceState | string | null | undefined): boolean {
+  return state === "DOWN" || state === "UNREACHABLE"
+}
+
 export const STALE_AFTER_S = 180
 
 export function isStale(ts: string | null | undefined): boolean {

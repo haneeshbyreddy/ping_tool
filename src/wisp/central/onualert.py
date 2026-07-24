@@ -155,6 +155,6 @@ class OnuRosterAlerter:
     def _page(self, title: str, body: str, device_id: int | None, ts: str,
               payload: str, *, gate: bool) -> None:
         self.router.emit(
-            payload, topic=self.store.org_role_topic(self.org_id, "operator"),
+            payload, topic=self.store.org_role_topic(self.org_id, "worker"),
             title=title, body=body, priority=3, ts=ts, device_id=device_id,
             gate=gate)

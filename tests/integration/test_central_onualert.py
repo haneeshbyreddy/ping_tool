@@ -32,7 +32,7 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.notifier = RecordingNotifier()
         # low cap so we don't seed 64 rows; both gates on
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db", onu_pon_limit=3)
-        self.store.set_org("ispA", ntfy_topic_operator="ops-topic")
+        self.store.set_org("ispA", ntfy_topic_worker="ops-topic")
         self.olt = self.store.create_org_device("ispA", {
             "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})

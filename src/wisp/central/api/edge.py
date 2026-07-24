@@ -13,6 +13,7 @@ from wisp.central import notify_policy
 from wisp.central import perf as central_perf
 from wisp.central import redundancy as central_redundancy
 from wisp.central import rollup as central_rollup
+from wisp.central import weboptics
 from wisp.central.api.common import now_iso
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.optics import CentralOpticsMonitor
@@ -89,7 +90,8 @@ def walk_result(h, org: str, node: str, env: dict) -> None:
                 continue
             varbinds.append([str(pair[0])[:256], str(pair[1])[:1024]])
     ok = h.store.complete_snmp_walk(org, node, walk_id,
-                                    varbinds=varbinds, error=error)
+                                    varbinds=varbinds, error=error,
+                                    truncated=bool(env.get("truncated")))
     h._reply(200 if ok else 404, {"ok": ok})
 
 
@@ -191,6 +193,13 @@ def _ingest_optics(h, org: str, eng, optics_by_device, ts: str) -> None:
         if device_id not in eng.meta or not isinstance(onus, list):
             continue
         try:
+            # Fold in anything the web-UI scraper has for this OLT BEFORE the
+            # monitor sees the roster (central/weboptics.py). On C-Data/DBC the
+            # scrape is the only source of per-ONU Rx at all, and merging here —
+            # rather than teaching the monitor a second input — is what keeps
+            # severity, the badge, PON-fault and the Optical tab on ONE code
+            # path that neither knows nor cares where a reading came from.
+            onus = _merge_web_optics(h, org, device_id, onus, ts)
             monitor.sync_device(device_id, onus, ts)
         except Exception:
             log.exception("GPON optics fold failed for %s/device=%d", org, device_id)
@@ -206,6 +215,30 @@ def _ingest_optics(h, org: str, eng, optics_by_device, ts: str) -> None:
         OnuRosterAlerter(h.store, org, h.notifier, h.cfg).sweep(ts)
     except Exception:
         log.exception("ONU roster sweep failed for %s", org)
+
+
+def _merge_web_optics(h, org: str, device_id: int, onus: list, ts: str) -> list:
+    """The SNMP roster with any fresh scraped readings folded in, or the roster
+    untouched. Best-effort by construction: this is an enrichment riding the
+    report path, so a failure here must cost the walk's own readings nothing."""
+    if not getattr(h.cfg, "web_optics_enabled", False):
+        return onus
+    try:
+        rows = h.store.list_web_optics(org, device_id)
+        if not rows:
+            return onus
+        # now_iso(), not the report's ts: `ts` comes off the EDGE's envelope
+        # while scraped_at is central's own stamp, and a probe whose clock runs
+        # slow would otherwise age out readings that were taken seconds ago.
+        merged, count = weboptics.merge_scraped(
+            onus, rows, now_iso(), h.cfg.web_optics_max_age_s)
+        if count:
+            log.debug("web optics: merged %d reading(s) into %s/device=%d",
+                      count, org, device_id)
+        return merged
+    except Exception:
+        log.exception("web optics merge failed for %s/device=%d", org, device_id)
+        return onus
 
 
 def _ingest_health(h, org: str, eng, health_by_device, ts: str) -> None:

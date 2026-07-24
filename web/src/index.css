@@ -2,13 +2,23 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
+@import "@fontsource-variable/geist-mono";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
     --font-heading: var(--font-sans);
+    /* Inter for UI text is SETTLED — Geist was tried and pulled (2026-07-09)
+       because operators in the field found it hard to read. The NOC-design
+       mockup specifies Geist; that is a mockup default, not evidence, and it
+       does not override the complaint. Don't re-swap it.
+       Geist MONO is new and deliberate (2026-07-21): the machine columns
+       (IPs, latencies, counters) were on generic ui-monospace, which resolves
+       to a different face per OS and tabulates poorly. The mono was never what
+       operators objected to. Fonts are BUNDLED (fontsource), never CDN —
+       central makes no egress calls and a NOC on an isolated LAN must render. */
     --font-sans: 'Inter Variable', system-ui, sans-serif;
-    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -58,6 +68,12 @@
     --radius-3xl: calc(var(--radius) * 2.2);
     --radius-4xl: calc(var(--radius) * 2.6);
 
+    /* The floor is 13px (--text-xs) for anything you READ, 12px (--text-2xs)
+       for uppercase micro-labels only. The NOC-design mockup runs a step
+       tighter (13px body / 11px labels); that step was deliberately given back
+       after operators — the audience is 30s–50s, often on a wall-mounted
+       screen — said the old scale was too small. Density comes from filling
+       width, never from shaving type. Don't add a 3xs step. */
     --text-2xs: 0.75rem;
     --text-2xs--line-height: 1.4;
     --text-xs: 0.8125rem;
@@ -69,33 +85,52 @@
        text-muted-foreground/70 and /60 opacities so faint text is a single,
        contrast-checked color instead of a per-callsite guess. */
     --color-faint-foreground: var(--faint-foreground);
+    /* The FOURTH text step, below faint: decorative counts beside a section
+       eyebrow, placeholder captions. Never carries information you must read. */
+    --color-ghost-foreground: var(--ghost-foreground);
     /* Outline for RAISED surfaces (drill-in block, floating map chrome). The
        hairline --border separates siblings; this one lifts a surface. */
     --color-border-strong: var(--border-strong);
+    /* INTERNAL divider inside an already-bordered object (rows in a panel,
+       a card's header rule). Quieter than --border so a panel reads as one
+       clean object whose internal structure never competes with its outline —
+       that contrast is most of what makes the surface look composed. */
+    --color-border-subtle: var(--border-subtle);
 }
 
 /* Surface ladder (2026-07 design elevation): background sits BELOW card so white
    cards read as raised; muted recesses BELOW its surface (wells), accent is a
    raised interaction step, popover is THE raised/focus surface. Border is the
    sibling hairline; border-strong (= input) outlines raised surfaces. The light
-   status trio is deepened so text-on-soft passes AA. */
+   status trio is deepened so text-on-soft passes AA.
+
+   Borders are ALPHA, not hex (2026-07-21 NOC pass): the same token then holds a
+   constant relationship to whatever it sits on — canvas, card, popover or a
+   raster map tile — instead of being a hex tuned for exactly one surface and
+   drifting on the other four. */
 :root {
     --background: #f4f4f6;
-    --foreground: #1b1b20;
+    --foreground: #16171c;
     --card: #ffffff;
-    --card-foreground: #1b1b20;
+    --card-foreground: #16171c;
     --popover: #ffffff;
-    --popover-foreground: #1b1b20;
-    --primary: #3467a8;
+    --popover-foreground: #16171c;
+    /* Steel blue, not the old royal #2f66c9: the dark theme's accent moved to
+       the warm palette's dusty #74aec9 (hue ~197°) and an app whose brand hue
+       swings 20° when you flip the theme reads as two products. Darkened here
+       to clear AA on white; the three status hues already agreed across themes
+       (terracotta / sage / amber), so this was the only drift. */
+    --primary: #2e7391;
     --primary-foreground: #ffffff;
-    --primary-soft: rgba(52,103,168,0.10);
+    --primary-soft: rgba(46,115,145,0.10);
     --secondary: #ededf0;
-    --secondary-foreground: #1b1b20;
-    --muted: #efeff2;
-    --muted-foreground: #5d5d68;
-    --faint-foreground: #7c7c86;
+    --secondary-foreground: #16171c;
+    --muted: #eeeef2;
+    --muted-foreground: #585d66;
+    --faint-foreground: #797f88;
+    --ghost-foreground: #9ba0a8;
     --accent: #e8e8ee;
-    --accent-foreground: #1b1b20;
+    --accent-foreground: #16171c;
     --destructive: #a8432e;
     --destructive-foreground: #ffffff;
     --destructive-soft: rgba(168,67,46,0.10);
@@ -105,75 +140,162 @@
     --warning: #8a6410;
     --warning-foreground: #ffffff;
     --warning-soft: rgba(138,100,16,0.10);
-    --border: #e4e4e9;
-    --input: #c9c9d3;
+    --border: rgba(0,0,0,0.11);
+    --border-subtle: rgba(0,0,0,0.065);
+    --input: rgba(0,0,0,0.17);
     --border-strong: var(--input);
-    --ring: #8aa8cf;
-    --chart-1: #3467a8;
+    --ring: #2e7391;
+    /* Healthy topology line on the map. Deliberately a DESATURATED blue and not
+       --primary: primary is what an EMPHASIZED (selected-path) link switches to,
+       so the resting state has to sit a step below it, and the map's loudest
+       colours must stay the status tones (down/degraded). */
+    --map-link: #35789a;
+    /* Operator-picked link colours (central/inventory.py LINK_COLORS). These
+       distinguish PARALLEL cables from each other; they encode nothing, and a
+       line in trouble ignores them entirely. Every hue is deliberately clear of
+       the status tones — no red, no amber, and nothing near --success or
+       --primary — so a painted line can never read as an alarm or as one.
+
+       ONE set of values for both app themes, unlike every other token here.
+       The backdrop is raster tiles, and a line has to hold on ALL of them
+       within a single viewport — bright satellite over fields, near-black over
+       water, the light roadmap and (since 2026-07-22) Google's night roadmap
+       under dark mode. No per-mode pair can win that, because the range inside
+       one basemap is wider than the difference between the two themes; what
+       actually does the work is the dark casing under every stroke plus these
+       hues sitting mid-lightness, dark enough to read on the light roadmap and
+       light enough on night/satellite. Judge a new colour over BOTH roadmaps
+       and satellite, not against the app canvas. */
+    --map-line-violet: #a98bef;
+    --map-line-magenta: #dd7fc0;
+    --map-line-teal: #4fc3b5;
+    --map-line-lime: #b0c95f;
+    --map-line-indigo: #8093f0;
+    --map-line-chalk: #d3d7df;
+    --chart-1: #2e7391;
     --chart-2: #2f7d4f;
     --chart-3: #8a6410;
     --chart-4: #a8432e;
     --chart-5: #71717c;
-    --radius: 0.5rem;
+    /* 7px: rounded-lg = 7 (buttons, inputs, nav rows), rounded-xl = 9.8 ≈ 10
+       (cards, panels), rounded-md = 5.6 ≈ 6 (chips). One number, three shapes
+       the design actually uses — don't hand-tune radii at the callsite. */
+    --radius: 0.4375rem;
     --sidebar: #fafafb;
-    --sidebar-foreground: #1b1b20;
-    --sidebar-primary: #3467a8;
+    --sidebar-foreground: #16171c;
+    --sidebar-primary: #2e7391;
     --sidebar-primary-foreground: #ffffff;
     --sidebar-accent: #e8e8ee;
-    --sidebar-accent-foreground: #1b1b20;
-    --sidebar-border: #e4e4e9;
-    --sidebar-ring: #8aa8cf;
+    --sidebar-accent-foreground: #16171c;
+    --sidebar-border: rgba(0,0,0,0.09);
+    --sidebar-ring: #2e7391;
 }
 
-/* Dark ladder, bottom to top: background #09090b < muted #0d0d10 (wells recess)
-   < card #121216 < popover #1c1c22 (raised/focus: drill-in panel, map chrome,
-   menus) < accent #26262e (interaction fill on raised surfaces). Steps were
-   sub-perceptual before (panel vs row = 1.017:1) — don't compress them again. */
+/* Dark ladder, bottom to top: background #0c0e12 < sidebar #14171a < muted
+   #171a1e (wells recess — inputs, table header strips) < card #1c1f24 <
+   popover #24272e (raised/focus: drawer, drill-in panel, map chrome, menus) <
+   accent #2c3038 (interaction fill on raised surfaces). Steps were
+   sub-perceptual once (panel vs row = 1.017:1) — don't compress them again.
+
+   muted NO LONGER EQUALS background (2026-07-21) and restoring that equality
+   would now be a bug. It held while card sat only ~5 dL* above the canvas,
+   where "a well is the canvas showing through the card" produced a gentle
+   recess. The canvas has since dropped to #0c0e12 while card stayed at
+   #1c1f24, an ~8.3 dL* gap, at which point a canvas-colored well inside a card
+   stops reading as a recess and starts reading as a black band — `.wisp-thead`
+   strips and inputs would stripe every panel. muted is therefore its own
+   shallow step just below card.
+
+   WARM-DARK pass (2026-07-21, wisp_central_warm_dark_palette): the canvas was
+   raised off near-black (#08090b) onto warm slate and the signal tones were
+   pulled off their saturated primaries onto earthy ones — sage #5fbe83, amber
+   #e3ac57, terracotta #e27a6b, dusty steel #74aec9. Two reasons this is not
+   just taste: (1) a NOC screen is stared at for a whole shift, and pure black
+   under bright signal text is what makes thin type halate — lifting the floor
+   off zero kills the bloom without washing the surfaces out; (2) the old
+   destructive #f0716f and primary #4c7ef2 were both near-maximum chroma, so a
+   screen with one real outage and a dozen links on it had no severity ordering
+   left. The earthy tones keep red the loudest thing present while letting
+   everything else recede.
+
+   The CANVAS has moved down twice on operator ask (#15171b -> #101216 ->
+   #0c0e12) while card/popover/accent stayed on their palette values. Only the
+   canvas moves: both asks were for more separation between the dark field and
+   the panels, never for a uniformly darker or lighter app.
+
+   ATTEMPTED AND REVERTED, 2026-07-21, same session — do not redo this. Asked
+   for "the colour I see when I hover, on everything", the hover wash (card +
+   `foreground/5` ~= #26292d) was promoted to `--card`, with popover #303338
+   and accent #3a3e44 pushed up behind it. It shipped and was rejected within
+   the hour: "the gray i have now is too bright". The lesson is about what a
+   hover tone IS — a momentary highlight that reads as pleasant lift for the
+   half-second it exists reads as washed-out haze once it becomes the permanent
+   surface under every panel on the screen. A tone sampled from a transient
+   state is evidence about that state, not a candidate for a resting surface.
+   If a future ask points at a hover/selected/active colour and wants it
+   "everywhere", show a full screenshot before shipping it.
+
+   The canvas is now within ~0.4 dL* of the #08090b near-black that the
+   halation argument above rejects. With card back at #1c1f24 the body text is
+   only ~8.3 dL* above the field it sits near, so that argument is close to
+   biting again: if the canvas is asked to go darker a third time, raise card
+   with it rather than widening the gap further.
+
+   The border alpha did NOT change and must not: rgba(255,255,255,.10) resolves
+   to exactly the palette's #31353d on top of the card, which is the whole
+   argument for keeping borders alpha rather than hex — one token, right on
+   every surface including raster map tiles. */
 .dark {
-    --background: #09090b;
-    --foreground: #e7e7ea;
-    --card: #121216;
-    --card-foreground: #e7e7ea;
-    --popover: #1c1c22;
-    --popover-foreground: #e7e7ea;
-    --primary: #5680bd;
-    --primary-foreground: #0d1626;
-    --primary-soft: rgba(86,128,189,0.14);
-    --secondary: #17171a;
-    --secondary-foreground: #e7e7ea;
-    --muted: #0d0d10;
+    --background: #0c0e12;
+    --foreground: #e6e4e0;
+    --card: #1c1f24;
+    --card-foreground: #e6e4e0;
+    --popover: #24272e;
+    --popover-foreground: #e6e4e0;
+    --primary: #74aec9;
+    /* Dark ink, NOT white: at L*≈68 the steel blue only reaches 2.5:1 against
+       white, so a filled primary button would fail AA outright. Every other
+       dark tone already inks dark for the same reason. */
+    --primary-foreground: #0b1920;
+    --primary-soft: rgba(116,174,201,0.14);
+    --secondary: #202329;
+    --secondary-foreground: #e6e4e0;
+    --muted: #171a1e;
 
-    --muted-foreground: #a1a1ab;
-    --faint-foreground: #7e7e88;
-    --accent: #26262e;
-    --accent-foreground: #e7e7ea;
-    --destructive: #d76a58;
-    --destructive-foreground: #ffffff;
-    --destructive-soft: rgba(215,106,88,0.15);
-    --success: #6cb583;
-    --success-foreground: #0d1a12;
-    --success-soft: rgba(108,181,131,0.13);
-    --warning: #d9a94e;
-    --warning-foreground: #1f1608;
-    --warning-soft: rgba(217,169,78,0.13);
+    --muted-foreground: #a8abb2;
+    --faint-foreground: #868a93;
+    --ghost-foreground: #6e727a;
+    --accent: #2c3038;
+    --accent-foreground: #e6e4e0;
+    --destructive: #e27a6b;
+    --destructive-foreground: #2b120e;
+    --destructive-soft: rgba(226,122,107,0.13);
+    --success: #5fbe83;
+    --success-foreground: #0a1a11;
+    --success-soft: rgba(95,190,131,0.13);
+    --warning: #e3ac57;
+    --warning-foreground: #1e1405;
+    --warning-soft: rgba(227,172,87,0.13);
 
-    --border: #2a2a32;
-    --input: #3e3e49;
+    --border: rgba(255,255,255,0.10);
+    --border-subtle: rgba(255,255,255,0.055);
+    --input: rgba(255,255,255,0.14);
     --border-strong: var(--input);
-    --ring: #4a6a99;
-    --chart-1: #5680bd;
-    --chart-2: #6cb583;
-    --chart-3: #d9a94e;
-    --chart-4: #d76a58;
-    --chart-5: #8b8b95;
-    --sidebar: #0b0b0d;
-    --sidebar-foreground: #e7e7ea;
-    --sidebar-primary: #5680bd;
-    --sidebar-primary-foreground: #0d1626;
-    --sidebar-accent: #17171a;
-    --sidebar-accent-foreground: #e7e7ea;
-    --sidebar-border: #2a2a32;
-    --sidebar-ring: #4a6a99;
+    --ring: #74aec9;
+    --map-link: #5e8a9e;
+    --chart-1: #74aec9;
+    --chart-2: #5fbe83;
+    --chart-3: #e3ac57;
+    --chart-4: #e27a6b;
+    --chart-5: #8b8f98;
+    --sidebar: #14171a;
+    --sidebar-foreground: #e6e4e0;
+    --sidebar-primary: #74aec9;
+    --sidebar-primary-foreground: #0b1920;
+    --sidebar-accent: #2c3038;
+    --sidebar-accent-foreground: #e6e4e0;
+    --sidebar-border: rgba(255,255,255,0.07);
+    --sidebar-ring: #74aec9;
 }
 
 @layer base {
@@ -199,6 +321,157 @@
       font-size: 18px;
       }
     }
+
+  /* Every number in a NOC is read in a COLUMN — latencies against latencies,
+     counts against counts. Proportional digits make those columns ragged and
+     force the eye to re-measure each row, so all mono text tabulates. */
+  .font-mono, code, kbd, samp, pre {
+    font-variant-numeric: tabular-nums;
+    }
+
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 30%, transparent);
+    }
+
+  /* The scrollbar is chrome, not content: it recedes into the canvas and only
+     resolves on hover. A default OS bar is the loudest thing on a dark page. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+    }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+    }
+  ::-webkit-scrollbar-thumb {
+    background: var(--accent);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    border-radius: 8px;
+    }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--border-strong);
+    background-clip: padding-box;
+    }
+  * {
+    scrollbar-color: var(--accent) transparent;
+    scrollbar-width: thin;
+    }
+}
+
+/* ── NOC design primitives ───────────────────────────────────────────────────
+   Five patterns the dashboard repeats on nearly every screen. They live here as
+   classes rather than as copied Tailwind strings so the panel/eyebrow rhythm
+   stays ONE decision — the thing that makes separate screens read as one product
+   is that these never drift apart per page. */
+
+/* A panel is the standard content object: card surface, hairline outline, 10px
+   corner. Its internal rules use --border-subtle so the outline stays the
+   strongest edge and the panel reads as a single clean object. */
+.wisp-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+}
+.wisp-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+/* Rows separate from each OTHER. The row right below the header drops its rule
+   so it doesn't stack with the header's — deliberately an adjacent-sibling
+   selector and NOT :first-of-type, which matches per element type and so
+   silently fails whenever the header and the rows are both <div>s (they are, in
+   two of the three Home panels). */
+.wisp-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.wisp-panel-head + .wisp-row {
+  border-top: 0;
+}
+
+/* Page measure. TWO widths, not one per route — the app had six (48rem to
+   105rem) and changed shape every time you navigated, which reads as six
+   different products. WIDE is for anything scannable (dashboards, tables,
+   trees, the map): a NOC monitor is bought to be filled. NARROW is for
+   form-shaped pages, where a long line length is the thing that actually
+   hurts. Pick one; don't add a third. */
+.wisp-page {
+  width: 100%;
+  margin-inline: auto;
+  max-width: 105rem;
+}
+.wisp-page--narrow {
+  max-width: 66rem;
+}
+
+/* Section eyebrow: the uppercase micro-label above a group. Tracking does the
+   work here — at 11px, letter-spacing is what separates a label from body text
+   without needing a heavier weight or a brighter color. */
+.wisp-eyebrow {
+  font-size: var(--text-2xs);
+  line-height: 1.4;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint-foreground);
+}
+
+/* Column header strip for a data table: a WELL (muted recesses below the card),
+   so the header reads as part of the panel's frame rather than as a first row
+   of data competing with the real rows. */
+.wisp-thead {
+  background: var(--muted);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-2xs);
+  line-height: 1.4;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint-foreground);
+}
+
+/* Frozen readings: a block of numbers we KNOW is no longer live, because the box
+   they came from is unreachable. Every SNMP-derived row (ports, vitals, optics)
+   PERSISTS in the DB — nothing deletes it when a device drops — so a down OLT
+   goes on rendering green "up" ports, live-looking bit rates and a healthy CPU
+   meter. That reads as current, which is the one thing this dashboard must never
+   do: the whole product is "trust the alarm".
+   Desaturating the SUBTREE is deliberate, rather than a per-tone conditional in
+   each component. It catches every colored thing inside at once — status dots,
+   meter fills, alarm chips, dBm figures — including whatever gets added later,
+   so a new reading cannot quietly opt out of the rule by forgetting to check.
+   Dimmed, not hidden, and kept well above a disabled control's contrast: this is
+   still the last known truth and it's exactly what a tech reads while driving to
+   the site. Always pair it with a visible reason (banner or "as of" stamp) OUTSIDE
+   the frozen block — gray with no explanation reads as a broken panel.
+   Two things it deliberately does NOT do: `filter` doesn't block pointer events,
+   so the config controls inside stay usable, and Radix menus portal to <body>,
+   so a dropdown opened from in here renders at full strength. */
+.wisp-frozen {
+  filter: grayscale(1);
+  opacity: 0.7;
+}
+
+/* A chip painted in an OPERATOR colour (tag colours; lib/palette.ts). The tone
+   arrives as --tag from the component, because the value is data — which is
+   exactly why this is a class and not an inline style: the palette's members
+   were drawn as MAP STROKES over raster tiles, and a stroke colour is not a
+   text colour. On the dark canvas they land around 7:1 and need nothing; on
+   light mode's near-white card the same hues measure ~2:1 as text, so they get
+   mixed toward black until they read. Same relationship as a status chip
+   (full-strength ink, ~15% fill), so a coloured tag never outweighs a real
+   alarm sitting beside it. */
+.wisp-tag {
+  color: var(--tag);
+  background: color-mix(in oklab, var(--tag) 15%, transparent);
+}
+:root:not(.dark) .wisp-tag {
+  color: color-mix(in oklab, var(--tag) 62%, black);
+  background: color-mix(in oklab, var(--tag) 20%, transparent);
 }
 
 /* Drill-in block (Network tree, routes/topology-page.tsx): the open row and its
@@ -340,6 +613,18 @@ html:not(.dark) .wisp-drillin {
 .wisp-map-lowzoom .wisp-pin--selected .wisp-pin__label {
   display: block;
 }
+/* ISOLATION IS LOAD-BEARING: Leaflet stacks its own panes at z-index 400
+   (tiles/overlays), 600 (markers), 700 (popups) and 800–1000 (controls). With
+   the wrapper at `position: relative; z-index: auto` those numbers land in the
+   ROOT stacking context and beat every Radix portal (dialogs, dropdowns,
+   selects, the command palette — all z-50 on <body>), so anything opened over
+   the map rendered BEHIND the tiles. `isolation: isolate` confines Leaflet's
+   ladder to the map; the wrapper itself then competes as a plain z-auto box, so
+   portals (and the z-30 app header / mobile tab bar) paint above it. The map's
+   own chrome is INSIDE the wrapper, so its z-[1000] still wins over the panes. */
+.wisp-map-wrap {
+  isolation: isolate;
+}
 .wisp-map-wrap:fullscreen {
   height: 100vh;
   background: var(--background);
@@ -394,6 +679,124 @@ html:not(.dark) .wisp-drillin {
   border: 2px solid var(--background);
   cursor: pointer;
   animation: wisp-pin-pulse 1.6s ease-out infinite;
+}
+
+/* Link bandwidth chip (map/linklabel.ts): live ↓/↑ rates off the port bound to
+   the link. Neutral by default so status colors stay loudest; tinted only when
+   the bound port itself is down or tripping a bandwidth bound. */
+/* Bandwidth chips sit on raster tiles, not on an app surface, so the usual
+   translucent-popover treatment doesn't apply: the backdrop can be bright
+   satellite or dark basemap within one viewport. Legibility here comes from an
+   OPAQUE fill + a hairline ring (the .wisp-vertex precedent — a ring, not a
+   blur, so the "no shadows" rule holds), and the rate itself carries
+   --foreground weight while the ↓↑ arrows stay quiet. The eye should land on
+   the number without hunting for it. */
+.wisp-linkbw {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--popover);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--background) 55%, transparent);
+  color: var(--foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* token, not a px literal — a 10px literal opted out of the ≥1600px scaling */
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* arrows are orientation, not data — keep them from competing with the rate */
+.wisp-linkbw__ar { color: var(--faint-foreground); font-weight: 400; }
+.wisp-linkbw__ar + .wisp-linkbw__ar { margin-left: 5px; }
+/* no live reading: the port name is context, so it stays quiet */
+.wisp-linkbw__port { color: var(--muted-foreground); font-weight: 400; }
+.wisp-linkbw:hover { border-color: var(--ring); }
+.wisp-linkbw--warn {
+  color: var(--warning);
+  border-color: color-mix(in oklab, var(--warning) 70%, var(--border-strong));
+}
+.wisp-linkbw--down {
+  color: var(--destructive);
+  border-color: color-mix(in oklab, var(--destructive) 70%, var(--border-strong));
+}
+.wisp-linkbw--warn .wisp-linkbw__ar,
+.wisp-linkbw--down .wisp-linkbw__ar { color: inherit; opacity: 0.6; }
+/* A chip on a coloured line borrows that colour, so a stack of labels over
+   near-parallel cables says which belongs to which without a click. It lands on
+   the BORDER and a left rail, never the rate itself: the number has to stay
+   --foreground-weight legible over satellite, and six palette hues can't all
+   clear that bar as text. Tone classes come later in this file's cascade and
+   win outright — a port alarm owns the whole chip. */
+.wisp-linkbw--tinted {
+  border-color: color-mix(in oklab, var(--wisp-link-tint) 75%, var(--border-strong));
+  border-left-width: 3px;
+  border-left-color: var(--wisp-link-tint);
+  padding-left: 4px;
+}
+.wisp-linkbw--tinted .wisp-linkbw__ar { color: var(--wisp-link-tint); opacity: 0.85; }
+
+/* Hover readout: where the cursor meets a cable, how far that point is from
+   each end. Same opaque-fill-over-tiles treatment as the bandwidth chip, but it
+   sits ABOVE the cursor and is pointer-transparent end to end — it reports on
+   the pointer, so it must never become something the pointer can hit (that
+   would make it flicker against its own presence). */
+.wisp-linkhover {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.wisp-linkhover__dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: var(--foreground);
+  border: 1.5px solid var(--background);
+}
+.wisp-linkhover--tinted .wisp-linkhover__dot { background: var(--wisp-link-tint); }
+.wisp-linkhover__box {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: var(--popover);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--background) 55%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-2xs);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.wisp-linkhover--tinted .wisp-linkhover__box {
+  border-color: color-mix(in oklab, var(--wisp-link-tint) 75%, var(--border-strong));
+}
+.wisp-linkhover__end { display: flex; align-items: baseline; gap: 4px; }
+/* the distance is the answer; the end it's measured to is the label */
+.wisp-linkhover__km {
+  color: var(--foreground);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.wisp-linkhover__name { color: var(--muted-foreground); font-weight: 400; }
+/* whether this is drum metres or a chord — the one thing that must not be
+   guessed off a number a splicing crew is about to order cable against */
+.wisp-linkhover__note {
+  color: var(--faint-foreground);
+  font-weight: 400;
+  padding-left: 2px;
+  border-left: 1px solid var(--border-subtle);
 }
 
 /* Route-drawing vertex handles (map route editor): draggable, deliberately

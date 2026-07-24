@@ -30,7 +30,7 @@ class PerfSweepTest(unittest.TestCase):
             perf_deviation_factor=3.0, perf_mad_k=5.0, perf_min_baseline_ms=5.0,
         )
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(ORG, ntfy_topic_operator="op")
+        self.store.set_org(ORG, ntfy_topic_worker="op")
         self.dev = self.store.create_org_device(ORG, {
             "name": "Backhaul", "ip_address": IP, "device_type": None,
             "region": "Rampur", "parent_device_id": None})

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import api, auth, billing, inventory, pki, secretbox, upigateway
+from wisp.central import api, auth, billing, inventory, pki, secretbox, theme, totp
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
@@ -43,29 +44,59 @@ _PROXY_SID_RE = re.compile(r"/api/proxy/([A-Za-z0-9_-]{16,})/")
 _STATIC = Path(__file__).resolve().parent / "static"
 
 # Routes a LOCKED org's session may still reach: exactly what the lock screen
-# needs to render (who am I + how much do I owe) plus logout — and the
-# checkout routes plus the free-plan escape hatch, so a locked org
-# can pay its way out (or drop to Free) right there.
+# needs to render (who am I + how much do I owe) plus logout — and the "I've
+# paid" ping plus the free-plan escape hatch, so a locked org can flag its
+# payment (or drop to Free) right there.
 _BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout",
-                   "/api/billing/order", "/api/billing/verify",
-                   "/api/billing/plan", "/api/billing/upi-return", "/healthz"}
+                   "/api/billing/paid", "/api/billing/plan", "/healthz"}
 
-# The whole API surface a field-worker session may reach: who am I, the triage
-# list (+ its SSE invalidation stream), acknowledge/post-mortem, own password.
-# Enforced as one choke point (the billing-gate pattern) so every new dashboard
-# route is worker-blocked by default. Login/logout are handled before the gate.
-_WORKER_ROUTES = {"/api/me", "/api/outages", "/api/events",
-                  "/api/outages/acknowledge", "/api/outages/postmortem",
-                  "/api/users/password"}
+# Loopback peers — the only ones whose X-Forwarded-For we trust (the request came
+# through the local reverse proxy). See Handler._client_ip / cfg.trust_forwarded_for.
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
+# A field-worker session gets the FULL desktop dashboard, READ-ONLY (2026-07-23):
+# it may READ every monitoring surface the shell renders, but WRITE nothing
+# beyond incident triage. Two METHOD-scoped allowlists (the gate checks the HTTP
+# method), deny-by-default preserved — a NEW route stays worker-blocked until it
+# is deliberately placed in one of these. Enforced as one choke point, the
+# billing-gate pattern. Login/logout are handled before the gate.
+#
+# Sensitive reads are DELIBERATELY absent and stay owner/superadmin-only: the
+# per-device web-UI credential vault (/api/inventory/credentials), the proxy
+# tunnel (/api/proxy/*), server/platform config (/api/system, /api/admin/*), the
+# account list (/api/users), vendor profiles (/api/{snmp,gpon,web-optics}-
+# profiles) and the raw SNMP-walk dumps (/api/inventory/snmp-walk*, reached only
+# through the owner-gated diagnostic tool, so a worker never fetches them).
+# /api/billing IS readable — the lock screen every org member sees renders from
+# it — but its UI is hidden client-side.
+_WORKER_GET = {
+    "/api/me", "/api/outages", "/api/events", "/api/summary", "/api/billing",
+    "/api/orgs", "/api/nodes", "/api/regions",
+    "/api/inventory", "/api/inventory/routes", "/api/inventory/ports",
+    "/api/inventory/link-ports", "/api/inventory/optics",
+    "/api/inventory/onu-search", "/api/inventory/snmp-status",
+    "/api/inventory/rx-status", "/api/inventory/perf",
+    "/api/inventory/perf/samples", "/api/pon/faults", "/api/pon/summary",
+    "/api/incident/shape", "/api/analytics", "/api/analytics/trend",
+    "/api/logs",
+}
+# The ONLY writes a worker may perform: acknowledge/post-mortem (triage), its own
+# password, and the "I've paid" ping (any org member sends it from the lock
+# screen). Every config/topology/credential/proxy/billing-plan write stays owner+.
+_WORKER_POST = {
+    "/api/outages/acknowledge", "/api/outages/postmortem",
+    "/api/users/password", "/api/users/whatsapp", "/api/billing/paid",
+}
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
-                  engine_registry: EngineRegistry | None = None, upi=None,
+                  engine_registry: EngineRegistry | None = None,
                   secret_box=None):
     token = cfg.central_token
     client_ca = cfg.central_client_ca
-    notifier = notifier or build_notifier(cfg)
+    # store is handed in so the WhatsApp channel can read the superadmin's live
+    # config out of app_settings (the edge, which passes no store, stays ntfy-only).
+    notifier = notifier or build_notifier(cfg, store)
     registry = engine_registry or EngineRegistry(store, cfg)
-    upi = upi or upigateway.UpiGateway(store)
     secret_box = secret_box or secretbox.from_config(cfg)
 
     class Handler(BaseHTTPRequestHandler):
@@ -74,13 +105,60 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def log_message(self, fmt, *args):
             log.debug("%s - %s", self.address_string(), fmt % args)
 
+        def _security_headers(self) -> None:
+            # Baseline hardening on central's OWN responses. Deliberately NOT
+            # applied to _raw_reply: that streams a device's own bytes verbatim
+            # through the web-UI proxy and must not inherit our framing/nosniff
+            # policy. CSP is intentionally omitted here — a useful policy has to
+            # allowlist the map-tile/geocoding hosts the browser fetches and needs
+            # real-browser verification, so it lands as its own change.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            self.send_header("Referrer-Policy", "same-origin")
+            if cfg.session_cookie_secure:
+                # Only honoured over HTTPS, which is what session_cookie_secure
+                # asserts we're behind (Caddy TLS). Ignored on a plain-http dev box.
+                self.send_header("Strict-Transport-Security",
+                                 "max-age=31536000; includeSubDomains")
+
         def _reply(self, code: int, body: dict, *, cookie: str | None = None) -> None:
-            raw = json.dumps(body).encode()
+            # json.dumps emits bare NaN/Infinity by default, which is NOT valid
+            # JSON — JSON.parse rejects it and the browser loses the WHOLE
+            # reply, not the one bad number. It took out an OLT's Optical tab
+            # from a single ONU reporting Tx = -inf. Values are cleaned at
+            # ingest (weboptics._num, optics._to_float), but device-derived
+            # floats reach this encoder from many paths, so the guarantee that
+            # central never serves unparseable JSON belongs here too.
+            # allow_nan=False makes the C encoder RAISE instead of emitting
+            # garbage, so the common path costs nothing and only a reply that
+            # actually contains a bad float pays for the sanitising walk.
+            try:
+                raw = json.dumps(body, allow_nan=False).encode()
+            except ValueError:
+                log.warning("non-finite float in a JSON reply — nulled (%s)",
+                            self.path)
+                raw = json.dumps(_json_safe(body), allow_nan=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            # EVERY JSON API response is no-store. Without a Cache-Control header
+            # a 200 GET is heuristically cacheable (RFC 9111 §4.2.2) and we send
+            # no validator, so the browser can serve a stale body without ever
+            # asking — and never sees a corrected one. It bit ONU search first
+            # because its URL carries the needle: a `?q=BSNL` answered while
+            # search was still serial-only got its EMPTY reply pinned to that
+            # exact string, so "BSNL" stayed blank while "BSN" and "BSNL_" (never
+            # requested before, hence uncached) worked. Any endpoint whose reply
+            # changes — inventory, outages, billing — had the same exposure.
+            # Freshness is react-query's job in memory, never the HTTP cache's.
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(raw)))
-            if cookie:
-                self.send_header("Set-Cookie", cookie)
+            self._security_headers()
+            # An explicit cookie (login/logout) always wins; otherwise attach the
+            # sliding-session refresh that _user() stashed, if any (see _user).
+            send_cookie = cookie if cookie is not None else getattr(
+                self, "_refresh_cookie", None)
+            if send_cookie:
+                self.send_header("Set-Cookie", send_cookie)
             self.end_headers()
             self.wfile.write(raw)
 
@@ -190,9 +268,33 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return False
             return not token and not client_ca
 
+        def _client_ip(self) -> str:
+            # Behind Caddy the socket peer is always 127.0.0.1, so the login
+            # throttle would otherwise bucket the entire internet together. Trust
+            # X-Forwarded-For only from a loopback peer (i.e. the local proxy) and
+            # take the LAST hop — Caddy appends the real client, so a spoofed
+            # leading entry a browser sent can never displace it.
+            peer = self.client_address[0]
+            if cfg.trust_forwarded_for and peer in _LOOPBACK:
+                xff = self.headers.get("X-Forwarded-For")
+                if xff:
+                    return xff.rsplit(",", 1)[-1].strip() or peer
+            return peer
+
         def _user(self) -> dict | None:
             tok = auth.cookie_token(self.headers.get("Cookie"))
-            return auth.resolve_session(store, tok, cfg=cfg)
+            user = auth.resolve_session(store, tok, cfg=cfg)
+            if user is not None:
+                # Sliding idle window: re-issue the cookie on activity so an
+                # active operator is never logged out, while an idle one is.
+                # Throttled inside slide_session (≤ once/min); no-op for
+                # remember-me sessions. Stashed for _reply to attach.
+                fresh = auth.slide_session(tok, cfg=cfg)
+                if fresh:
+                    self._refresh_cookie = auth.session_cookie(
+                        fresh[0], max_age=fresh[1],
+                        secure=cfg.session_cookie_secure)
+            return user
 
         def _reader(self) -> dict | None:
             user = self._user()
@@ -214,11 +316,30 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return True
             return user["role"] == "owner" and user["org_id"] == org
 
-        def _worker_blocked(self, route: str, user: dict | None = None) -> bool:
-            if not route.startswith("/api/") or route in _WORKER_ROUTES:
+        def _worker_blocked(self, route: str, user: dict | None = None,
+                            method: str = "GET") -> bool:
+            if not route.startswith("/api/"):
                 return False
             user = user or self._user()
-            if not user or user.get("role") != "worker":
+            if not user:
+                return False
+            # A SUPERADMIN is org_id IS NULL, and its `role` column is
+            # meaningless — nothing reads it. Gate on identity before role or a
+            # superadmin row that happens to carry 'worker' locks the platform
+            # admin out of the whole dashboard. That is exactly what the
+            # owner+worker collapse (2026-07-21) caused: `create_user`'s default
+            # role became 'worker', and every superadmin provisioned without an
+            # explicit --role 403'd on every /api/* route.
+            if user.get("is_superadmin") or user.get("org_id") is None:
+                return False
+            if user.get("role") != "worker":
+                return False
+            # Read-only worker: reads on _WORKER_GET pass, the triage writes on
+            # _WORKER_POST pass, everything else 403s. Method-scoped so an allowed
+            # GET path (e.g. /api/inventory, /api/nodes) can't smuggle its
+            # same-path POST past the gate.
+            allowed = _WORKER_GET if method == "GET" else _WORKER_POST
+            if route in allowed:
                 return False
             self._reply(403, {"error": "forbidden"})
             return True
@@ -259,6 +380,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "close")
                 self.send_header("X-Accel-Buffering", "no")
+                self._security_headers()
                 self.end_headers()
                 self.wfile.write(b"retry: 3000\n\n")
                 self.wfile.flush()
@@ -302,13 +424,53 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             data = path.read_bytes()
             if rel == "landing.html" and cfg.showcase_enabled:
                 data = self._inject_showcase(data)
+            if rel == "index.html":
+                data = self._inject_theme(data)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-cache")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(data)
             return True
+
+        def _inject_theme(self, html: bytes) -> bytes:
+            """Put the superadmin's colour overrides on the page before first paint.
+
+            This is injection rather than a fetch on purpose: colours arriving
+            after mount means every load flashes the shipped palette and then
+            repaints, which is ugliest on the login and billing-lock screens —
+            the two that render before any session exists and so could never
+            read a superadmin-only endpoint anyway.
+
+            Appended at the END of <head>, after the bundle's stylesheet link.
+            Source order is NOT what makes this win, though — theme.py's
+            selectors are `:root:not(.dark)` / `:root.dark`, which outrank the
+            bundle's `:root` / `.dark` on specificity wherever they land. That
+            matters because relying on order alone is what broke dark mode
+            once: a `:root{}` block of light overrides placed after the bundle
+            also beats its `.dark{}`, and applies in the wrong mode. See
+            theme.py:render_css. Best-effort throughout: a store hiccup or a
+            missing </head> must serve the app on the stock palette, never 500
+            the dashboard over cosmetics.
+            """
+            try:
+                css = theme.render_css(theme.load(store))
+            except Exception:
+                logging.exception("theme overrides failed")
+                return html
+            if not css:
+                return html
+            # theme.py's allowlist already bars `<` `>` and `}` from reaching a
+            # value; this is the second belt, so a future widening of _VALUE_RE
+            # can't turn a colour field into a way to close the <style> element.
+            snippet = ('<style id="wisp-theme">'
+                       + css.replace("<", "\\3c ")
+                       + "</style>").encode("utf-8")
+            marker = b"</head>"
+            i = html.find(marker)
+            return html[:i] + snippet + html[i:] if i != -1 else html + snippet
 
         def _inject_showcase(self, html: bytes) -> bytes:
             # The landing page is an opaque pre-bundled artifact that rebuilds its
@@ -427,7 +589,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return
             body = self._read_body() or {}
             if route == "/api/logout":
-                self._reply(200, {"ok": True}, cookie=auth.clear_cookie())
+                # Bump the epoch so the token dies SERVER-side, not just in this
+                # browser — a copied cookie is invalidated too. Best-effort.
+                u = self._user()
+                if u:
+                    try:
+                        store.bump_session_epoch(u["id"])
+                    except Exception:
+                        log.debug("logout epoch bump failed", exc_info=True)
+                self._reply(200, {"ok": True},
+                            cookie=auth.clear_cookie(secure=cfg.session_cookie_secure))
                 return
             user = self._user()
             if not user:
@@ -439,7 +610,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     return
                 self._reply(404, {"error": "not found"})
                 return
-            if self._billing_blocked(route, user) or self._worker_blocked(route, user):
+            if self._billing_blocked(route, user) or self._worker_blocked(route, user, "POST"):
                 return
             try:
                 handler(self, user, body)
@@ -450,23 +621,83 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._reply(500, {"error": "internal error"})
 
         def _login(self):
-            ip = self.client_address[0]
-            wait = throttle.retry_after(ip)
+            ip = self._client_ip()
             body = self._read_body() or {}
+            username = (body.get("username") or "").strip()
+            # Throttle on BOTH the client IP and the account name so neither a
+            # single box spraying accounts nor a spray against one account runs
+            # unbounded. Either tripped counter delays the attempt.
+            ukey = f"user:{username.lower()}"
+            wait = throttle.retry_after(ip)
+            if username:
+                wait = max(wait, throttle.retry_after(ukey))
             if wait > 0:
                 self._reply(429, {"error": f"too many attempts; retry in {int(wait)+1}s"})
                 return
-            user = auth.verify_login(store, body.get("username", ""), body.get("password", ""))
+            user = auth.verify_login(store, username, body.get("password", ""))
             if not user:
                 throttle.fail(ip)
+                if username:
+                    throttle.fail(ukey)
                 self._reply(401, {"error": "invalid credentials"})
                 return
+            # Second factor for accounts that enabled it (owner/superadmin).
+            if user.get("totp_enabled"):
+                verdict = self._check_second_factor(user, body)
+                if verdict != "ok":
+                    if verdict == "required":
+                        # Password was correct — this is the normal 2FA prompt,
+                        # NOT a failed attempt, so don't burn the throttle.
+                        self._reply(401, {"error": "enter your authenticator code",
+                                          "totp_required": True})
+                    else:
+                        # A wrong code IS a failed attempt — this throttling is
+                        # what keeps the 6-digit space unbrute-forceable.
+                        throttle.fail(ip)
+                        if username:
+                            throttle.fail(ukey)
+                        self._reply(401, {"error": "that code didn't match",
+                                          "totp_required": True})
+                    return
             throttle.reset(ip)
+            throttle.reset(ukey)
             remember = bool(body.get("remember"))
-            ttl = auth.session_ttl_s(cfg, remember=remember)
-            tok = auth.issue_session(user["id"], cfg, remember=remember)
-            cookie = auth.session_cookie(tok, max_age=ttl)
+            # Owners and superadmins NEVER get a long-lived "trusted device"
+            # session — that account reconfigures the whole network, so it
+            # re-authenticates on the normal cadence no matter what the client
+            # asked for (the web form no longer even offers the box, but a
+            # crafted request or another client must not bypass this).
+            # org_id IS NULL == superadmin.
+            if user["org_id"] is None or user["role"] == "owner":
+                remember = False
+            # Bump the session generation so THIS login supersedes any other live
+            # session for the account (single active session).
+            epoch = store.bump_session_epoch(user["id"])
+            tok = auth.issue_session(user["id"], cfg, remember=remember, epoch=epoch)
+            cookie = auth.session_cookie(
+                tok, max_age=auth.session_cookie_max_age(cfg, remember=remember),
+                secure=cfg.session_cookie_secure)
             self._reply(200, {"user": public_user(user, store)}, cookie=cookie)
+
+        def _check_second_factor(self, user, body):
+            """'ok' | 'required' (no code supplied) | 'bad' (wrong code/recovery)."""
+            code = (body.get("totp") or body.get("code") or "").strip()
+            recovery = (body.get("recovery") or "").strip()
+            if not code and not recovery:
+                return "required"
+            if recovery:
+                return ("ok" if store.consume_recovery_code(
+                    user["id"], totp.recovery_hash(recovery)) else "bad")
+            try:
+                secret = self.secretbox.decrypt(user["totp_secret"] or "")
+            except Exception:
+                return "bad"
+            step = totp.verify(secret, code, after_step=user.get("totp_last_step"))
+            if step is None:
+                return "bad"
+            # Atomically claim the step so a captured code can't be replayed and
+            # two requests can't ride the same fresh code (single-use, race-free).
+            return "ok" if store.claim_totp_step(user["id"], step) else "bad"
 
     # Route handlers in wisp.central.api receive the live handler instance;
     # the request services ride on it as class attributes.
@@ -474,9 +705,15 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.store = store
     Handler.notifier = notifier
     Handler.registry = registry
-    Handler.upi = upi
     Handler.secretbox = secret_box
     Handler.proxy = ProxyHub()
+    # The web-optics sweeper is a request service too now: the Optical panel's
+    # manual refresh drives the very same object the background sweep does, so
+    # its per-OLT lock covers both and a click can't collide with a pass.
+    # Imported here rather than at module scope — it imports api.proxy, which
+    # imports back through this package.
+    from wisp.central.weboptics_sweep import build_sweeper
+    Handler.weboptics = build_sweeper(cfg, store, Handler.proxy, secret_box)
     return Handler
 
 class _TLSThreadingHTTPServer(ThreadingHTTPServer):
@@ -496,6 +733,23 @@ class _TLSThreadingHTTPServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+def _json_safe(obj):
+    """Structure with every non-finite float replaced by None.
+
+    Only ever called on the slow path, after allow_nan=False has proved there
+    is something to clean. None rather than a sentinel number because that is
+    what the column means: no reading. A dropped number costs one cell; an
+    unparseable body costs the entire page.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def _build_tls_context(cfg: Config) -> ssl.SSLContext | None:
     if not (cfg.central_tls_cert and cfg.central_tls_key):
         return None
@@ -508,16 +762,22 @@ def _build_tls_context(cfg: Config) -> ssl.SSLContext | None:
 
 def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
                 notifier=None, engine_registry: EngineRegistry | None = None,
-                upi=None, secret_box=None) -> ThreadingHTTPServer:
+                secret_box=None) -> ThreadingHTTPServer:
     store = store or CentralStore(cfg.central_db)
     handler = _make_handler(cfg, store, LoginThrottle(), notifier,
-                            engine_registry, upi, secret_box)
+                            engine_registry, secret_box)
     tls_context = _build_tls_context(cfg)
     if tls_context is not None:
         httpd = _TLSThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler, tls_context)
     else:
         httpd = ThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler)
     httpd.store = store
+    # Background sweepers need the same live services the request handlers use;
+    # the hub in particular is per-process state, so it must be the SAME object,
+    # not a fresh ProxyHub.
+    httpd.proxy = handler.proxy
+    httpd.secretbox = handler.secretbox
+    httpd.weboptics = handler.weboptics
     return httpd
 
 def serve(cfg: Config = CONFIG) -> None:
@@ -531,6 +791,9 @@ def serve(cfg: Config = CONFIG) -> None:
     start_central_watchdog_thread(cfg, httpd.store)
     central_rollup.start_central_rollup_prune_thread(cfg, httpd.store)
     billing.start_central_billing_thread(cfg, httpd.store)
+    from wisp.central.weboptics_sweep import start_web_optics_thread
+    start_web_optics_thread(cfg, httpd.store, httpd.proxy, httpd.secretbox,
+                            sweeper=httpd.weboptics)
     if not httpd.store.list_users():
         log.warning("no central accounts yet — bootstrap one: "
                     "PYTHONPATH=src python -m wisp.central.admin create-superadmin --username ...")

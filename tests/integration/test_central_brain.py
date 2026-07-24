@@ -175,7 +175,7 @@ class CentralAlertDispatcherTest(unittest.TestCase):
             "name": "Tower", "ip_address": "10.0.0.1", "device_type": None,
             "region": "Rampur", "parent_device_id": None})
         self.store.set_org("ispA", ntfy_topic_owner="a-owner",
-                           ntfy_topic_operator="a-op", ntfy_topic_tech="a-tech")
+                           ntfy_topic_worker="a-worker")
         self.engine = central_engine.build_engine(self.store, "ispA", self.cfg)
         self.notifier = RecordingNotifier()
         self.disp = CentralAlertDispatcher(self.store, "ispA", self.engine,
@@ -188,10 +188,10 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.store.open_outage_if_absent("ispA", self.dev, T0, state)
         return self.store.open_outage_id("ispA", self.dev)
 
-    def test_fresh_down_pages_owner_and_operator_and_schedules_hourly(self):
+    def test_fresh_down_pages_owner_and_worker_and_schedules_hourly(self):
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-op"})
+        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-worker"})
         with self.store._connect() as conn:
             esc = conn.execute("SELECT kind FROM escalations").fetchall()
         self.assertEqual([r["kind"] for r in esc], ["hourly"])
@@ -217,13 +217,15 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.assertEqual(len(self.notifier.sent), 2)
 
-    def test_resolved_broadcasts_to_all_three(self):
+    def test_resolved_broadcasts_to_every_channel(self):
+        # "all three" until roles collapsed to owner+worker (2026-07-21) — the
+        # tech channel went, the operator channel became the worker one.
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.notifier.sent.clear()
         self.disp.dispatch([OutageResolved(self.dev)], T0)
         self.assertEqual({s["recipient"] for s in self.notifier.sent},
-                         {"a-owner", "a-op", "a-tech"})
+                         {"a-owner", "a-worker"})
 
     def test_resolved_from_unreachable_is_silent(self):
         self._open_outage(state=UNREACHABLE)
@@ -282,7 +284,7 @@ class CentralAlertDispatcherTest(unittest.TestCase):
 
     def test_uplink_down_and_restored_pages_owner(self):
         self.disp.dispatch([UplinkDown()], T0)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-op"})
+        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-worker"})
         with self.store._connect() as conn:
             row = conn.execute("SELECT payload, recipient FROM alert_log"
                                " ORDER BY id DESC LIMIT 1").fetchone()
@@ -291,7 +293,7 @@ class CentralAlertDispatcherTest(unittest.TestCase):
 
         self.notifier.sent.clear()
         self.disp.dispatch([UplinkRestored()], T0)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-op"})
+        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-worker"})
         with self.store._connect() as conn:
             row = conn.execute("SELECT payload FROM alert_log ORDER BY id DESC LIMIT 1"
                                ).fetchone()
@@ -395,7 +397,7 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(states[b_id]["state"], "UP")
 
     def test_unassigned_device_is_never_probed_or_scored(self):
-        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_operator="a-op")
+        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_worker="a-worker")
         dev = self.store.create_org_device("ispA", {
             "name": "Orphan", "ip_address": "10.0.0.7", "device_type": None,
             "region": None, "parent_device_id": None})
@@ -434,12 +436,12 @@ class ReportEndpointTest(unittest.TestCase):
         self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
             "region": "north", "parent_device_id": None, "assigned_node_id": "edge-1"})
-        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_operator="a-op")
+        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_worker="a-worker")
         for _ in range(3):
             status, body = self._report(100.0)
             self.assertEqual(status, 200)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], DOWN)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-op"})
+        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-worker"})
 
         self.notifier.sent.clear()
         for _ in range(2):
@@ -479,7 +481,7 @@ class ReportEndpointTest(unittest.TestCase):
         self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
             "region": "north", "parent_device_id": None, "assigned_node_id": "edge-1"})
-        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_operator="a-op")
+        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_worker="a-worker")
         status, body = self._report(100.0)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], "UP")
         hint = body["recheck"]
@@ -489,7 +491,7 @@ class ReportEndpointTest(unittest.TestCase):
         status, body = self._recheck("10.0.0.1", 100.0)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], DOWN)
         self.assertNotIn("recheck", body)
-        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-op"})
+        self.assertEqual({s["recipient"] for s in self.notifier.sent}, {"a-owner", "a-worker"})
 
     def test_recheck_blip_clears_hint_without_confirming(self):
         self.store.create_org_device("ispA", {
@@ -535,7 +537,7 @@ class ReportEndpointTest(unittest.TestCase):
         tower = self.store.create_org_device("ispA", {
             "name": "Rampur Tower", "ip_address": "10.0.0.1", "device_type": "backhaul",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
-        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_operator="a-op")
+        self.store.set_org("ispA", ntfy_topic_owner="a-owner", ntfy_topic_worker="a-worker")
         for _ in range(3):
             self._report(100.0)
         self.assertEqual(self.store.device_states("ispA")[tower]["state"], DOWN)
@@ -666,7 +668,7 @@ class ReportEndpointTest(unittest.TestCase):
             "name": "Relay", "ip_address": "10.0.0.3", "device_type": None,
             "region": None, "parent_device_id": primary, "assigned_node_id": "edge-1"})
         self.store.create_backup_link("ispA", child, backup)
-        self.store.set_org("ispA", ntfy_topic_operator="a-op")
+        self.store.set_org("ispA", ntfy_topic_worker="a-worker")
 
         def _report_all(primary_loss):
             body = {"v": 1, "org_id": "ispA", "node_id": "edge-1",

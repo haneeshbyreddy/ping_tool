@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
 sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
-from wisp.central import auth
+from wisp.central import auth, totp
 from wisp.central.store import CentralStore
 from wisp.central.server import make_server
 from support import RecordingNotifier
@@ -68,10 +68,77 @@ class CentralAuthUnitTest(unittest.TestCase):
         way_past = time.time() - (self.cfg.session_remember_days + 1) * 86400
         stale = auth.issue_session(uid, self.cfg, remember=True, now=way_past)
         self.assertIsNone(auth.verify_session(stale, cfg=self.cfg, now=time.time()))
-        # A tampered TTL breaks the signature.
-        u, issued, ttl, sig = normal.split(".")
-        forged = f"{u}.{issued}.{ttl}0.{sig}"
-        self.assertIsNone(auth.verify_session(forged, cfg=self.cfg))
+        # A tampered field breaks the signature (token is user.hard.seen.idle.epoch.sig).
+        parts = normal.split(".")
+        self.assertEqual(len(parts), 6)
+        parts[1] = str(int(parts[1]) + 3600)   # push the absolute expiry out an hour
+        self.assertIsNone(auth.verify_session(".".join(parts), cfg=self.cfg))
+
+    def test_idle_session_expires_when_untouched(self):
+        uid = auth.create_user(self.store, None, "root", "supersecret")
+        t0 = time.time()
+        tok = auth.issue_session(uid, self.cfg, now=t0)   # non-remember: idle applies
+        idle_s = self.cfg.session_idle_minutes * 60
+        self.assertEqual(
+            auth.verify_session(tok, cfg=self.cfg, now=t0 + idle_s - 5), uid)
+        # Past the idle window but far inside the absolute cap: still dead.
+        self.assertIsNone(
+            auth.verify_session(tok, cfg=self.cfg, now=t0 + idle_s + 5))
+        # A slide on activity re-arms the idle clock from that moment.
+        slid = auth.slide_session(tok, self.cfg, now=t0 + idle_s - 5)
+        self.assertIsNotNone(slid)
+        fresh, _ = slid
+        self.assertEqual(
+            auth.verify_session(fresh, cfg=self.cfg, now=t0 + 2 * idle_s - 15), uid)
+        # A remember-me session has no idle window and never slides.
+        trusted = auth.issue_session(uid, self.cfg, remember=True, now=t0)
+        self.assertIsNone(auth.slide_session(trusted, self.cfg, now=t0 + 10_000))
+
+    def test_new_login_supersedes_prior_session_via_epoch(self):
+        uid = auth.create_user(self.store, None, "root", "supersecret")
+        epoch = self.store.bump_session_epoch(uid)
+        tok = auth.issue_session(uid, self.cfg, epoch=epoch)
+        self.assertIsNotNone(auth.resolve_session(self.store, tok, cfg=self.cfg))
+        self.store.bump_session_epoch(uid)   # a newer login (or a logout)
+        self.assertIsNone(auth.resolve_session(self.store, tok, cfg=self.cfg))
+
+    def test_scrypt_hash_roundtrip(self):
+        h = auth.hash_password("correcthorse")
+        self.assertTrue(h.startswith("scrypt$"))
+        ok, upgrade = auth.verify_password("correcthorse", h, "")
+        self.assertTrue(ok)
+        self.assertFalse(upgrade)
+        self.assertFalse(auth.verify_password("wrong", h, "")[0])
+
+    def test_legacy_sha256_password_is_upgraded_on_login(self):
+        # A pre-migration account: write a legacy salted-SHA-256 hash directly,
+        # bypassing create_user (which now writes scrypt).
+        salt = "0123456789abcdef"
+        legacy = auth.hash_pw("correcthorse", salt)
+        self.assertEqual(len(legacy), 64)   # bare sha256 hex, no "scrypt$"
+        self.store.add_user(None, "legacyroot", legacy, salt, "owner")
+        self.assertIsNotNone(
+            auth.verify_login(self.store, "legacyroot", "correcthorse"))
+        # The stored hash is now scrypt — upgraded in place on that login.
+        row = self.store.get_user_by_username("legacyroot")
+        self.assertTrue(row["pw_hash"].startswith("scrypt$"))
+        self.assertIsNotNone(
+            auth.verify_login(self.store, "legacyroot", "correcthorse"))
+        self.assertIsNone(auth.verify_login(self.store, "legacyroot", "wrong"))
+
+    def test_login_throttle_keys_independent_and_decay(self):
+        th = auth.LoginThrottle(lock_after=3, base_delay=2.0, cap=300.0, window=900.0)
+        t = 1000.0
+        for _ in range(3):
+            th.fail("ip:1.1.1.1", now=t)
+        self.assertGreater(th.retry_after("ip:1.1.1.1", now=t), 0.0)
+        self.assertEqual(th.retry_after("user:alice", now=t), 0.0)   # untouched key
+        th.reset("ip:1.1.1.1")                                       # a good login
+        self.assertEqual(th.retry_after("ip:1.1.1.1", now=t), 0.0)
+        for _ in range(3):
+            th.fail("ip:2.2.2.2", now=t)
+        self.assertGreater(th.retry_after("ip:2.2.2.2", now=t), 0.0)
+        self.assertEqual(th.retry_after("ip:2.2.2.2", now=t + 901), 0.0)  # decayed
 
 class CentralAuthHttpTest(unittest.TestCase):
     def setUp(self):
@@ -81,7 +148,6 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.store = CentralStore(self.cfg.central_db)
         auth.create_user(self.store, None, "root", "rootpassword")
         auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
-        auth.create_user(self.store, "ispA", "oper", "operpassword", "operator")
         auth.create_user(self.store, "ispA", "wrk", "workerpassword", "worker")
         self.store.touch_node("ispA", "edge-1")
         self.store.touch_node("ispB", "edge-1")
@@ -97,7 +163,8 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.server.server_close()
         self.tmp.cleanup()
 
-    def _req(self, method, path, body=None, cookie=None, token=None):
+    def _req(self, method, path, body=None, cookie=None, token=None,
+             extra_headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         headers = {}
         payload = None
@@ -107,6 +174,8 @@ class CentralAuthHttpTest(unittest.TestCase):
             headers["Cookie"] = cookie
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        if extra_headers:
+            headers.update(extra_headers)
         conn.request(method, path, body=payload, headers=headers)
         resp = conn.getresponse()
         raw = resp.read()
@@ -130,14 +199,27 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(body["user"]["org_id"], "ispA")
         self.assertEqual(body["user"]["role"], "owner")
 
-    def test_remember_me_gets_a_long_lived_cookie(self):
+    def test_remember_me_is_refused_for_owners_but_honored_for_workers(self):
+        # An owner's "remember" is ignored server-side — always the short,
+        # idle-capped session (the account that reconfigures the network).
         _, _, setcookie = self._req("POST", "/api/login",
             {"username": "owner", "password": "ownerpassword", "remember": True})
-        long_age = self.cfg.session_remember_days * 86400
-        self.assertIn(f"Max-Age={long_age}", setcookie)
-        _, _, setcookie = self._req("POST", "/api/login",
-            {"username": "owner", "password": "ownerpassword"})
         self.assertIn(f"Max-Age={self.cfg.session_timeout_h * 3600}", setcookie)
+        # A worker's remember IS honored (long-lived) — the rule is role-scoped,
+        # not a blanket removal.
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "wrk", "password": "workerpassword", "remember": True})
+        self.assertIn(f"Max-Age={self.cfg.session_remember_days * 86400}", setcookie)
+
+    def test_password_change_invalidates_the_old_cookie(self):
+        _, a = self._login("owner", "ownerpassword")
+        self.assertEqual(self._req("GET", "/api/me", cookie=a)[0], 200)
+        s, _, setcookie = self._req("POST", "/api/users/password",
+            {"current_password": "ownerpassword", "new_password": "newpassword1"}, cookie=a)
+        self.assertEqual(s, 200)
+        fresh = setcookie.split(";")[0]   # re-issued so this tab stays signed in
+        self.assertEqual(self._req("GET", "/api/me", cookie=a)[0], 401)     # old cookie dead
+        self.assertEqual(self._req("GET", "/api/me", cookie=fresh)[0], 200)  # re-issued works
 
     def test_bad_login_401_and_me_requires_session(self):
         self.assertEqual(self._login("owner", "nope")[0], 401)
@@ -147,6 +229,130 @@ class CentralAuthHttpTest(unittest.TestCase):
         for _ in range(5):
             self._login("owner", "wrong")
         self.assertEqual(self._login("owner", "wrong")[0], 429)
+
+    def test_throttle_keys_off_the_forwarded_client_ip(self):
+        # Distinct usernames so the per-ACCOUNT key never accumulates — this
+        # isolates the per-IP bucket, which must key off X-Forwarded-For (every
+        # socket peer here is 127.0.0.1, so a broken impl buckets the world).
+        for i in range(5):
+            self._req("POST", "/api/login",
+                      {"username": f"ghost{i}", "password": "nope"},
+                      extra_headers={"X-Forwarded-For": "203.0.113.7"})
+        self.assertEqual(self._req("POST", "/api/login",
+            {"username": "ghostX", "password": "nope"},
+            extra_headers={"X-Forwarded-For": "203.0.113.7"})[0], 429)
+        # A different forwarded IP has its own bucket → 401, not 429.
+        self.assertEqual(self._req("POST", "/api/login",
+            {"username": "ghostX", "password": "nope"},
+            extra_headers={"X-Forwarded-For": "198.51.100.4"})[0], 401)
+
+    def test_second_login_kills_the_first_session(self):
+        _, first = self._login("owner", "ownerpassword")
+        self.assertEqual(self._req("GET", "/api/me", cookie=first)[0], 200)
+        _, second = self._login("owner", "ownerpassword")
+        self.assertEqual(self._req("GET", "/api/me", cookie=first)[0], 401)   # superseded
+        self.assertEqual(self._req("GET", "/api/me", cookie=second)[0], 200)
+        self._req("POST", "/api/logout", cookie=second)
+        self.assertEqual(self._req("GET", "/api/me", cookie=second)[0], 401)  # killed
+
+    def test_session_cookie_is_secure_and_httponly(self):
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword"})
+        self.assertIn("Secure", setcookie)
+        self.assertIn("HttpOnly", setcookie)
+        self.assertIn("SameSite=Lax", setcookie)
+
+    # --- TOTP second factor -------------------------------------------------
+
+    def _totp_code(self, secret, now=None):
+        step = int((time.time() if now is None else now) // 30)
+        return totp._hotp(totp._decode_secret(secret), step)
+
+    def _reset_totp_cursor(self, username):
+        # Simulate the clock advancing to a fresh code window without waiting 30s
+        # (the confirm code claims its step; login with the same step would be a
+        # replay). Reaching into the store is the deterministic stand-in.
+        uid = self.store.get_user_by_username(username)["id"]
+        with self.store._connect() as conn:
+            conn.execute("UPDATE users SET totp_last_step=NULL WHERE id=?", (uid,))
+            conn.commit()
+
+    def _enroll_totp(self, username="owner", password="ownerpassword"):
+        _, cookie = self._login(username, password)
+        _, body, _ = self._req("POST", "/api/users/totp/start", {}, cookie=cookie)
+        secret = body["secret"]
+        _, body, _ = self._req("POST", "/api/users/totp/confirm",
+            {"password": password, "code": self._totp_code(secret)}, cookie=cookie)
+        return cookie, secret, body["recovery_codes"]
+
+    def test_totp_enrollment_then_login_requires_the_code(self):
+        _, cookie = self._login("owner", "ownerpassword")
+        s, body, _ = self._req("POST", "/api/users/totp/start", {}, cookie=cookie)
+        self.assertEqual(s, 200)
+        secret = body["secret"]
+        self.assertTrue(body["otpauth_uri"].startswith("otpauth://totp/"))
+        # Confirm is gated on the password AND a correct code.
+        self.assertEqual(self._req("POST", "/api/users/totp/confirm",
+            {"password": "wrong", "code": self._totp_code(secret)}, cookie=cookie)[0], 422)
+        self.assertEqual(self._req("POST", "/api/users/totp/confirm",
+            {"password": "ownerpassword", "code": "000000"}, cookie=cookie)[0], 422)
+        code = self._totp_code(secret)
+        s, body, _ = self._req("POST", "/api/users/totp/confirm",
+            {"password": "ownerpassword", "code": code}, cookie=cookie)
+        self.assertEqual(s, 200)
+        self.assertEqual(len(body["recovery_codes"]), 10)
+        _, me, _ = self._req("GET", "/api/me", cookie=cookie)
+        self.assertTrue(me["user"]["totp_enabled"])
+        # Password alone no longer logs in.
+        s, b2 = self._login("owner", "ownerpassword")
+        self.assertEqual(s, 401)
+        # The confirm code can't be replayed at login.
+        self.assertEqual(self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword", "totp": code})[0], 401)
+        # A code from the next window logs in.
+        self._reset_totp_cursor("owner")
+        s, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword",
+             "totp": self._totp_code(secret)})
+        self.assertEqual(s, 200)
+        self.assertIn("wisp_central_session=", setcookie)
+
+    def test_totp_required_flag_is_returned_without_burning_the_throttle(self):
+        self._enroll_totp()
+        # Six password-only attempts (each 'totp_required') must NOT throttle —
+        # the password was right, the client is just being asked for the code.
+        # (A wrong-password attempt would 429 by the 6th; these must not.)
+        for _ in range(5):
+            self._req("POST", "/api/login",
+                      {"username": "owner", "password": "ownerpassword"})
+        s, body, _ = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword"})
+        self.assertEqual(s, 401)
+        self.assertTrue(body.get("totp_required"))
+
+    def test_totp_recovery_code_is_single_use(self):
+        _, _, recovery = self._enroll_totp()
+        rc = recovery[0]
+        s, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword", "recovery": rc})
+        self.assertEqual(s, 200)
+        self.assertIn("wisp_central_session=", setcookie)
+        # Same code a second time is refused.
+        self.assertEqual(self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword", "recovery": rc})[0], 401)
+
+    def test_totp_disable_restores_password_only_login(self):
+        cookie, _, _ = self._enroll_totp()
+        self.assertEqual(self._req("POST", "/api/users/totp/disable",
+            {"password": "wrong"}, cookie=cookie)[0], 422)
+        self.assertEqual(self._req("POST", "/api/users/totp/disable",
+            {"password": "ownerpassword"}, cookie=cookie)[0], 200)
+        self.assertEqual(self._login("owner", "ownerpassword")[0], 200)
+
+    def test_worker_cannot_enroll_totp(self):
+        _, wcookie = self._login("wrk", "workerpassword")
+        self.assertEqual(
+            self._req("POST", "/api/users/totp/start", {}, cookie=wcookie)[0], 403)
 
     def _seed_outage_event(self, org, name):
         dev = self.store.create_org_device(org, {
@@ -188,29 +394,6 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(body["orgs"]), 2)
 
-    def test_operator_cannot_write_team_owner_can(self):
-        _, op = self._login("oper", "operpassword")
-        status, _, _ = self._req("POST", "/api/team",
-                                 {"org_id": "ispA", "name": "Bob"}, cookie=op)
-        self.assertEqual(status, 403)
-        _, own = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/team",
-                                    {"org_id": "ispA", "name": "Bob", "role": "operator"}, cookie=own)
-        self.assertEqual(status, 200)
-        status, _, _ = self._req("POST", "/api/team",
-                                 {"org_id": "ispB", "name": "X"}, cookie=own)
-        self.assertEqual(status, 403)
-
-    def test_team_and_attendance_round_trip(self):
-        _, own = self._login("owner", "ownerpassword")
-        self._req("POST", "/api/team", {"org_id": "ispA", "name": "Asha", "role": "operator"}, cookie=own)
-        _, team, _ = self._req("GET", "/api/team", cookie=own)
-        self.assertEqual(team["team"][0]["name"], "Asha")
-        wid = team["team"][0]["id"]
-        self._req("POST", "/api/attendance", {"worker_id": wid, "present": True}, cookie=own)
-        _, att, _ = self._req("GET", "/api/attendance", cookie=own)
-        op = next(o for o in att["operators"] if o["id"] == wid)
-        self.assertTrue(op["present_today"])
 
     def test_superadmin_provisions_org_user(self):
         _, root = self._login("root", "rootpassword")
@@ -233,14 +416,17 @@ class CentralAuthHttpTest(unittest.TestCase):
 
     def test_owner_can_reset_teammate_password_without_current(self):
         _, own = self._login("owner", "ownerpassword")
-        oper_id = self.store.get_user_by_username("oper")["id"]
+        wrk_id = self.store.get_user_by_username("wrk")["id"]
         status, _, _ = self._req("POST", "/api/users/password",
-            {"id": oper_id, "new_password": "resetpassword1"}, cookie=own)
+            {"id": wrk_id, "new_password": "resetpassword1"}, cookie=own)
         self.assertEqual(status, 200)
-        self.assertEqual(self._login("oper", "resetpassword1")[0], 200)
+        self.assertEqual(self._login("wrk", "resetpassword1")[0], 200)
 
-    def test_operator_cannot_reset_teammate_password(self):
-        _, op = self._login("oper", "operpassword")
+    def test_worker_cannot_reset_teammate_password(self):
+        # /api/users/password is ON _WORKER_ROUTES (a worker changes its OWN
+        # password), so the handler's owner-only check is what must refuse this
+        # — the route whitelist never sees it.
+        _, op = self._login("wrk", "workerpassword")
         owner_id = self.store.get_user_by_username("owner")["id"]
         status, _, _ = self._req("POST", "/api/users/password",
             {"id": owner_id, "new_password": "hijacked12"}, cookie=op)
@@ -254,7 +440,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_ingest_uses_bearer_not_session(self):
-        _, op = self._login("oper", "operpassword")
+        _, op = self._login("owner", "ownerpassword")
         env = {"v": 1, "org_id": "ispA", "node_id": "edge-2", "kind": "heartbeat",
                "body": {"fleet_size": 1}}
         self.assertEqual(self._req("POST", "/heartbeat", env, cookie=op)[0], 401)
@@ -314,8 +500,8 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("error", body)
 
-    def test_inventory_operator_cannot_write_owner_can(self):
-        _, op = self._login("oper", "operpassword")
+    def test_inventory_worker_cannot_write_owner_can(self):
+        _, op = self._login("wrk", "workerpassword")
         status, _, _ = self._req("POST", "/api/inventory",
             {"name": "X", "ip_address": "10.0.0.5"}, cookie=op)
         self.assertEqual(status, 403)
@@ -351,12 +537,12 @@ class CentralAuthHttpTest(unittest.TestCase):
     def test_org_role_topics_round_trip(self):
         _, own = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/org",
-            {"ntfy_topic_owner": "a-owner", "ntfy_topic_operator": "a-op"}, cookie=own)
+            {"ntfy_topic_owner": "a-owner", "ntfy_topic_worker": "a-op"}, cookie=own)
         self.assertEqual(status, 200)
         status, body, _ = self._req("GET", "/api/orgs", cookie=own)
         org = body["orgs"][0]
         self.assertEqual(org["ntfy_topic_owner"], "a-owner")
-        self.assertEqual(org["ntfy_topic_operator"], "a-op")
+        self.assertEqual(org["ntfy_topic_worker"], "a-op")
 
     def test_test_alert_sends_via_injected_notifier(self):
         _, own = self._login("owner", "ownerpassword")
@@ -369,14 +555,23 @@ class CentralAuthHttpTest(unittest.TestCase):
 
     def test_test_alert_requires_configured_topic(self):
         _, own = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/test-alert", {"role": "tech"}, cookie=own)
+        status, body, _ = self._req("POST", "/api/test-alert", {"role": "worker"}, cookie=own)
         self.assertEqual(status, 422)
         self.assertEqual(len(self.notifier.sent), 0)
 
-    def test_test_alert_operator_cannot_send(self):
+    def test_test_alert_rejects_a_removed_role(self):
+        # 'operator'/'tech' were removed 2026-07-21; the column may still exist
+        # in an upgraded DB, so the route must refuse the role by NAME rather
+        # than quietly resolving a dead topic.
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("POST", "/api/test-alert", {"role": "operator"}, cookie=own)
+        self.assertEqual(status, 422)
+        self.assertEqual(len(self.notifier.sent), 0)
+
+    def test_test_alert_worker_cannot_send(self):
         _, own = self._login("owner", "ownerpassword")
         self._req("POST", "/api/org", {"ntfy_topic_owner": "a-owner-topic"}, cookie=own)
-        _, op = self._login("oper", "operpassword")
+        _, op = self._login("wrk", "workerpassword")
         status, _, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=op)
         self.assertEqual(status, 403)
 
@@ -455,7 +650,7 @@ class CentralAuthHttpTest(unittest.TestCase):
             "POST", "/api/inventory/links", {"child_id": a, "parent_id": b}, cookie=own)
         self.assertEqual(status, 422)
 
-    def test_operator_cannot_write_backup_links(self):
+    def test_worker_cannot_write_backup_links(self):
         _, own = self._login("owner", "ownerpassword")
         a = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.3.1", "device_type": None,
@@ -463,7 +658,7 @@ class CentralAuthHttpTest(unittest.TestCase):
         b = self.store.create_org_device("ispA", {
             "name": "B", "ip_address": "10.0.3.2", "device_type": None,
             "region": None, "parent_device_id": None})
-        _, op = self._login("oper", "operpassword")
+        _, op = self._login("wrk", "workerpassword")
         status, _, _ = self._req(
             "POST", "/api/inventory/links", {"child_id": a, "parent_id": b}, cookie=op)
         self.assertEqual(status, 403)
@@ -504,14 +699,10 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
         oid = self.store.open_outage_id("ispA", dev)
 
-        _, op = self._login("oper", "operpassword")
-        status, body, _ = self._req("GET", "/api/outages", cookie=op)
+        _, own = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("GET", "/api/outages", cookie=own)
         self.assertEqual(status, 200)
         self.assertEqual(body["outages"][0]["status"], "unassigned")
-        status, _, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=op)
-        self.assertEqual(status, 403)
-
-        _, own = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/outages/acknowledge", {"outage_id": oid}, cookie=own)
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
@@ -577,24 +768,76 @@ class CentralAuthHttpTest(unittest.TestCase):
                                  {"outage_id": oid}, cookie=wrk)
         self.assertEqual(status, 403)
 
-    def test_worker_is_scoped_to_the_triage_surface(self):
-        # The _WORKER_ROUTES whitelist is the invariant: everything a worker
-        # session touches outside it — reads and writes alike — is a 403, so a
-        # newly added dashboard route is worker-blocked by default.
+    def test_worker_reads_the_monitoring_surface_but_writes_nothing(self):
+        # A worker now gets the FULL dashboard, read-only (2026-07-23): every
+        # monitoring GET on _WORKER_GET is allowed, every write and every
+        # sensitive read stays a 403. Deny-by-default is preserved — a NEW route
+        # is worker-blocked until it is placed in _WORKER_GET/_WORKER_POST.
         _, wrk = self._login("wrk", "workerpassword")
         self.assertEqual(self._req("GET", "/api/me", cookie=wrk)[0], 200)
+        # reads the shell renders: allowed
+        for path in ("/api/inventory", "/api/logs", "/api/nodes", "/api/orgs",
+                     "/api/summary", "/api/regions", "/api/analytics"):
+            status, _, _ = self._req("GET", path, cookie=wrk)
+            self.assertEqual(status, 200, f"GET {path} should be worker-readable")
+        # sensitive reads: still owner/superadmin-only
+        for path in ("/api/inventory/credentials?device_id=1", "/api/admin/overview",
+                     "/api/admin/settings", "/api/system", "/api/users",
+                     "/api/snmp-profiles", "/api/proxy/sessions"):
+            status, _, _ = self._req("GET", path, cookie=wrk)
+            self.assertEqual(status, 403, f"GET {path} should be worker-blocked")
+        # writes: only triage + own-password + the "I've paid" ping; everything
+        # else 403s even on a path whose GET the worker may read
         for method, path, body in [
-            ("GET", "/api/inventory", None),
-            ("GET", "/api/team", None),
-            ("GET", "/api/logs", None),
-            ("GET", "/api/nodes", None),
-            ("GET", "/api/orgs", None),
             ("POST", "/api/inventory", {"name": "X", "ip_address": "10.0.0.7"}),
-            ("POST", "/api/team", {"name": "Bob"}),
+            ("POST", "/api/inventory/update", {"id": 1, "name": "X"}),
             ("POST", "/api/users", {"username": "x2", "password": "longenough1"}),
+            ("POST", "/api/regions", {"name": "R"}),
+            ("POST", "/api/nodes", {"node_id": "edge-z"}),
+            ("POST", "/api/inventory/credentials", {"device_id": 1}),
         ]:
             status, _, _ = self._req(method, path, body, cookie=wrk)
             self.assertEqual(status, 403, f"{method} {path} should be worker-blocked")
+
+    def test_worker_orgs_row_hides_paging_topics(self):
+        # The org row a worker reads carries the name and Maps key it needs, but
+        # NOT the ntfy paging topics — those are a capability (subscribe to every
+        # page / POST a spoofed one), so they stay owner/superadmin-only.
+        _, wrk = self._login("wrk", "workerpassword")
+        status, body, _ = self._req("GET", "/api/orgs", cookie=wrk)
+        self.assertEqual(status, 200)
+        row = body["orgs"][0]
+        for k in ("ntfy_topic", "ntfy_topic_owner", "ntfy_topic_worker"):
+            self.assertNotIn(k, row, f"{k} leaked to a worker")
+        # an owner still sees them
+        _, own = self._login("owner", "ownerpassword")
+        _, obody, _ = self._req("GET", "/api/orgs", cookie=own)
+        self.assertIn("ntfy_topic_owner", obody["orgs"][0])
+
+    def test_superadmin_provisioned_bare_is_not_a_worker(self):
+        # `admin create-user` with no --role must never leave the platform admin
+        # on the ORG default ('worker' since the 2026-07-21 collapse) — the SPA's
+        # require-auth serves any worker the stripped field view.
+        auth.create_user(self.store, None, "root3", "root3password")
+        self.assertEqual(self.store.get_user_by_username("root3")["role"], "owner")
+
+    def test_superadmin_is_never_worker_blocked(self):
+        # Defense in depth for a DB an EARLIER build already damaged: force the
+        # hostile row directly, since create_user can no longer produce one.
+        # A superadmin is org_id IS NULL and its role column is meaningless, so
+        # _worker_blocked must gate on identity before role.
+        auth.create_user(self.store, None, "root2", "root2password")
+        with self.store._connect() as conn:
+            conn.execute("UPDATE users SET role='worker' WHERE username='root2'")
+            conn.commit()
+        self.assertEqual(self.store.get_user_by_username("root2")["role"], "worker")
+        _, root2 = self._login("root2", "root2password")
+        self.assertEqual(self._req("GET", "/api/orgs", cookie=root2)[0], 200)
+        # Never 403: an unscoped superadmin may still get a 400 asking which org
+        # it means — that is the route answering, not the whitelist refusing.
+        for path in ("/api/inventory", "/api/nodes", "/api/logs"):
+            status, _, _ = self._req("GET", path, cookie=root2)
+            self.assertNotEqual(status, 403, f"superadmin worker-blocked on {path}")
 
     def test_worker_can_change_own_password(self):
         _, wrk = self._login("wrk", "workerpassword")

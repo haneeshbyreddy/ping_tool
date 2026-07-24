@@ -284,31 +284,24 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertIn("not enabled", body.get("error", ""))
 
-    def test_tech_role_cannot_open_session(self):
-        auth.create_user(self.store, "ispA", "tech1", "techpassword1", "tech")
-        cookie = self._login("tech1", "techpassword1")
-        status, body = self._api("POST", "/api/proxy/session",
-                                 {"device_id": self.device_id, "port": self.dev_port},
-                                 cookie=cookie)
+    def test_worker_role_cannot_open_session(self):
+        # The tunnel stays owner-only. Since roles collapsed to owner+worker
+        # (2026-07-21) `worker` is the only non-owner org role, and it is now
+        # refused TWICE over: server.py's _WORKER_ROUTES whitelist answers
+        # first (a proxy route isn't on it), with _PROXY_ROLES behind it.
+        auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
+        cookie = self._login("w1", "workerpassword1")
+        status, _ = self._api("POST", "/api/proxy/session",
+                              {"device_id": self.device_id, "port": self.dev_port},
+                              cookie=cookie)
         self.assertEqual(status, 403)
-        self.assertIn("owner", body.get("error", ""))
 
-    def test_operator_role_cannot_open_session(self):
-        # operators are locked out of device admin UIs too — owner only.
-        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
-        cookie = self._login("op1", "operatorpassword")
-        status, body = self._api("POST", "/api/proxy/session",
-                                 {"device_id": self.device_id, "port": self.dev_port},
-                                 cookie=cookie)
-        self.assertEqual(status, 403)
-        self.assertIn("owner", body.get("error", ""))
-
-    def test_operator_cannot_drive_owner_session(self):
-        # even a session an owner left live must not be browsable by an operator
+    def test_worker_cannot_drive_owner_session(self):
+        # even a session an owner left live must not be browsable by a worker
         # who can see its sid.
         _, sess = self._open_session()
-        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
-        cookie = self._login("op1", "operatorpassword")
+        auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
+        cookie = self._login("w1", "workerpassword1")
         out = {}
         self._browser("GET", f"/api/proxy/{sess['sid']}/status", out, cookie=cookie)
         self.assertEqual(out["status"], 403)
@@ -362,8 +355,8 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(self.store.proxy_session_row(sess["sid"])["status"], "closed")
 
     def test_audit_view_is_owner_only(self):
-        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
-        cookie = self._login("op1", "operatorpassword")
+        auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
+        cookie = self._login("w1", "workerpassword1")
         status, _ = self._api("GET", "/api/proxy/audit", cookie=cookie)
         self.assertEqual(status, 403)
         status, doc = self._api("GET", "/api/proxy/audit")  # owner

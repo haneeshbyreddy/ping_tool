@@ -3,15 +3,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
-import { ago, durationSince, isFresh } from "@/lib/format"
+import { ago, durationSince, isDownState, isFresh } from "@/lib/format"
+import { useAuth } from "@/hooks/use-auth"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
+import { RxDiagnosis, RxFreshness } from "@/components/rx-diagnosis"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
 type Sev = "ok" | "warn" | "crit" | "offline"
 
-function onuSev(o: OnuOptic): Sev {
+// Structurally typed on the two fields it reads, so the Network page's ONU
+// search results (a slim projection, not a full row) grade with this exact rule
+// rather than a second copy that could drift out of step with the panel.
+export function onuSev(o: Pick<OnuOptic, "state" | "severity">): Sev {
   if (o.state !== "online") return "offline"
   if (o.severity === "crit") return "crit"
   if (o.severity === "warn") return "warn"
@@ -24,7 +29,7 @@ const CELL: Record<Sev, string> = {
   crit: "bg-destructive",
   offline: "bg-muted-foreground/40",
 }
-const DOT: Record<Sev, string> = {
+export const DOT: Record<Sev, string> = {
   ok: "bg-success", warn: "bg-warning", crit: "bg-destructive", offline: "bg-muted-foreground/40",
 }
 
@@ -41,18 +46,6 @@ function fmtOnuKm(m: number | null): string {
 }
 function ackActive(o: OnuOptic): boolean {
   return !!o.ack_until && new Date(o.ack_until).getTime() > Date.now()
-}
-
-function Drift({ o }: { o: OnuOptic }) {
-  if (o.rx_dbm == null || o.rx_ref_dbm == null) return <span className="text-faint-foreground">—</span>
-  const delta = o.rx_dbm - o.rx_ref_dbm
-  if (Math.abs(delta) < 0.2) return <span className="text-muted-foreground">± 0 dB</span>
-  const worse = delta < 0
-  return (
-    <span className={cn("tabular-nums", worse ? "text-warning" : "text-success")}>
-      {worse ? "▼" : "▲"} {Math.abs(delta).toFixed(1)} dB
-    </span>
-  )
 }
 
 interface Pon {
@@ -112,7 +105,12 @@ function CellStrip({ onus }: { onus: OnuOptic[] }) {
   )
 }
 
-function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focused?: boolean }) {
+function OnuRow({ o, deviceId, focused, noRx }: {
+  o: OnuOptic; deviceId: number; focused?: boolean
+  // whole PON has no per-ONU Rx (DBC/C-Data EPON): the Rx-derived columns are
+  // structurally dead here, not merely empty for this row
+  noRx?: boolean
+}) {
   const qc = useQueryClient()
   const acked = ackActive(o)
   const ack = useMutation({
@@ -141,26 +139,26 @@ function OnuRow({ o, deviceId, focused }: { o: OnuOptic; deviceId: number; focus
       <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground @xl:inline">
         {o.serial || o.onu_key}
       </span>
-      {/* the one data column that survives the 380px panel: Rx when the vendor
-          reports it, else ranging distance (online) or time dark — "— dBm" on
-          a no-Rx EPON vendor told the tech nothing */}
-      {o.rx_dbm != null ? (
+      {/* ONE COLUMN PER FACT — no column stands in for another. The Rx cell used
+          to fall back to distance/time-dark so the 380px panel kept a useful
+          number, but the dedicated distance column then printed the same km
+          twice on a no-Rx ONU. Distance and time-dark are their own columns at
+          every width now, so the narrow panel loses nothing and no cell has to
+          be read twice to know what it means. */}
+      {!noRx && (
         <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
           onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
-          {fmtDbm(o.rx_dbm)} dBm
-        </span>
-      ) : o.state === "online" ? (
-        <span className="w-20 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground">
-          {fmtOnuKm(o.distance_m)}
-        </span>
-      ) : (
-        <span className="w-20 shrink-0 truncate text-right text-2xs text-muted-foreground">
-          {o.last_online_at ? `dark ${durationSince(o.last_online_at)}` : "offline"}
+          {o.rx_dbm != null
+            ? `${fmtDbm(o.rx_dbm)} dBm`
+            : <span className="font-normal text-faint-foreground">—</span>}
         </span>
       )}
-      <span className="hidden w-20 shrink-0 text-right text-2xs @md:inline"><Drift o={o} /></span>
-      <span className="hidden w-16 shrink-0 text-right font-mono text-2xs text-muted-foreground @2xl:inline">
+      <span className="w-16 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground">
         {fmtOnuKm(o.distance_m)}
+      </span>
+      <span className="w-20 shrink-0 truncate text-right text-2xs text-muted-foreground">
+        {o.state === "online" ? null
+          : o.last_online_at ? `dark ${durationSince(o.last_online_at)}` : "offline"}
       </span>
       <span className="w-14 shrink-0 text-right">
         {onuSev(o) === "ok" || o.state !== "online" ? null : acked ? (
@@ -231,9 +229,10 @@ function PonRow({ pon, open, onToggle, limit }: {
 
 const WORST_N = 6
 
-function PonDetail({ pon, deviceId, focusOnuId }: {
-  pon: Pon; deviceId: number; focusOnuId?: number | null
+function PonDetail({ pon, device, focusOnuId }: {
+  pon: Pon; device: OrgDevice; focusOnuId?: number | null
 }) {
+  const deviceId = device.id
   const [showAll, setShowAll] = useState(false)
   // A vendor with no per-ONU Rx (the DBC/C-Data EPON fleet) leaves EVERY reading
   // NULL — the worst-Rx filter would render an empty card over a PON full of
@@ -269,15 +268,25 @@ function PonDetail({ pon, deviceId, focusOnuId }: {
       <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
         {rosterOnly ? "By ONU ID" : "Worst first"} · PON {pon.port} · {pon.onus.length} ONUs
       </div>
+      {/* "This OLT doesn't report per-ONU Rx" used to be stated flatly here,
+          which was a GUESS presented as a hardware fact: the same blank column
+          is produced by a vendor with no recipe, an OLT nobody has stored a
+          password for, and a scrape that has been failing for a day. The
+          diagnosis says which — and on the fleet that started this, the honest
+          answer was "we never asked", not "this vendor has none". */}
       {rosterOnly && (
-        <p className="mb-1 text-2xs text-faint-foreground">
-          This OLT doesn't report per-ONU Rx over SNMP, so it shows state, ranging
-          distance and time dark instead.
-        </p>
+        <div className="mb-1">
+          <p className="text-2xs text-faint-foreground">
+            No Rx readings on this PON — showing state, ranging distance and time
+            dark instead.
+          </p>
+          <RxDiagnosis device={device} compact />
+        </div>
       )}
       <div className="divide-y divide-border/60">
         {(showAll ? worst : worst.slice(0, WORST_N)).map((o) => (
-          <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId} />
+          <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId}
+            noRx={rosterOnly} />
         ))}
       </div>
       {worst.length > WORST_N && (
@@ -421,6 +430,7 @@ export function OpticalPanel({ device, focusOnuId }: {
   /** map spoke click-through: open this ONU's PON group and highlight its row */
   focusOnuId?: number | null
 }) {
+  const { canWrite } = useAuth()
   const q = useQuery<OpticsResponse>({
     queryKey: ["optics", device.id],
     queryFn: () => inventoryApi.optics(device.id),
@@ -473,7 +483,7 @@ export function OpticalPanel({ device, focusOnuId }: {
   // A down/unreachable OLT has no reachable subscribers: the last SNMP walk still
   // says these ONUs were "online", but none are right now. Read online as 0 and
   // mute the stale Rx alarms — the readings below stay as a labelled last snapshot.
-  const isDown = device.state === "DOWN" || device.state === "UNREACHABLE"
+  const isDown = isDownState(device.state)
   const online = isDown ? 0 : onus.filter((o) => o.state === "online").length
   const crit = isDown ? 0 : onus.filter((o) => onuSev(o) === "crit").length
   const warn = isDown ? 0 : onus.filter((o) => onuSev(o) === "warn").length
@@ -485,8 +495,20 @@ export function OpticalPanel({ device, focusOnuId }: {
   // no-Rx vendor (DBC) where there are no dBm numbers to look stale.
   const opticsStale = !isFresh(device.optics_updated_at)
 
+  // The banner lives OUTSIDE the frozen card on purpose: it's the reason the card
+  // is gray, so it has to stay at full strength (and a filter can't be undone on
+  // a descendant). Graying the card covers everything the banner is claiming —
+  // the ONU state dots, the dBm figures, the per-PON strips and the fault
+  // verdicts derived from them — in one place, so a reading added later is
+  // frozen by default rather than by remembering to check.
+  // Nothing on this OLT carries an Rx figure at all. That is a claim about
+  // COVERAGE, not about the plant, so it goes outside the frozen card next to
+  // the offline banner rather than being whispered inside a PON drill-down the
+  // operator has to open first. It never renders when readings exist.
+  const noRxAtAll = onus.every((o) => o.rx_dbm == null)
+
   return (
-    <div className="@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3">
+    <div className="flex flex-col gap-2.5">
       {isDown && (
         <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs text-muted-foreground">
           <span className="font-semibold text-foreground">OLT offline.</span>{" "}
@@ -494,6 +516,9 @@ export function OpticalPanel({ device, focusOnuId }: {
           snapshot before it went down.
         </div>
       )}
+      {noRxAtAll && !isDown && <RxDiagnosis device={device} />}
+      <div className={cn("@container flex flex-col gap-3 rounded-lg border bg-muted/40 p-3",
+        isDown && "wisp-frozen")}>
       <FaultSection faults={faultsQ.data?.faults ?? []} />
       <DupMacSection dupMacs={dupMacs} />
       {/* header readout ------------------------------------------------------- */}
@@ -528,6 +553,11 @@ export function OpticalPanel({ device, focusOnuId }: {
           {device.optics_updated_at && (opticsStale
             ? <span className="font-semibold" title="The SNMP optical walk on this OLT has stopped refreshing. These readings are the last good snapshot.">stale · {ago(device.optics_updated_at)}</span>
             : <span className="text-faint-foreground">as of {ago(device.optics_updated_at)}</span>)}
+          {/* The stamp above dates the SNMP roster. On a vendor whose dBm comes
+              from its web page instead, that walk can be seconds old while the
+              optical figures beside it are from yesterday — so the web read
+              gets its own stamp rather than hiding behind the roster's. */}
+          {!isDown && <RxFreshness device={device} canWrite={canWrite} />}
         </div>
       </div>
 
@@ -537,10 +567,11 @@ export function OpticalPanel({ device, focusOnuId }: {
           <div key={pon.port}>
             <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} limit={limit} />
             {pon.port === activePort && (
-              <PonDetail pon={pon} deviceId={device.id} focusOnuId={focusOnuId} />
+              <PonDetail pon={pon} device={device} focusOnuId={focusOnuId} />
             )}
           </div>
         ))}
+      </div>
       </div>
     </div>
   )

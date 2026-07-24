@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query"
 import { tq } from "@/lib/api"
 
 const LIVE_QUERY_KEYS = [
-  "summary", "outages", "inventory", "logs", "team", "attendance", "nodes",
+  "summary", "outages", "inventory", "logs", "nodes",
   "snmp-walks", // a queued walk's result lands on the edge's report cadence
 ]
 

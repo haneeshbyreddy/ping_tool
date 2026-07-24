@@ -32,7 +32,7 @@ class CredentialsTest(unittest.TestCase):
             "name": "OLT", "ip_address": "172.168.107.244", "device_type": "olt",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
         auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
-        auth.create_user(self.store, "ispA", "op1", "operatorpassword", "operator")
+        auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
         auth.create_user(self.store, "ispB", "ownerB", "ownerBpassword", "owner")
 
         self.server = make_server(self.cfg, self.store)
@@ -139,8 +139,8 @@ class CredentialsTest(unittest.TestCase):
         self.assertIsNone(
             self.store.get_device_webui_credentials("ispA", self.device_id))
 
-    def test_operator_cannot_read_or_write(self):
-        op = self._login("op1", "operatorpassword")
+    def test_worker_cannot_read_or_write(self):
+        op = self._login("w1", "workerpassword1")
         status, _ = self._get_creds(cookie=op)
         self.assertEqual(status, 403)
         status, _ = self._api("POST", "/api/inventory/credentials", {

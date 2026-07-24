@@ -172,6 +172,38 @@ class Config:
     optical_crit_dbm: float = field(
         default_factory=lambda: _env_float("WISP_OPTICAL_CRIT_DBM", -27.0))
     optical_alerts: bool = field(default_factory=lambda: _env_bool("WISP_OPTICAL_ALERTS", True))
+    # Web-UI optics scrape (central/weboptics_sweep.py): the ONLY source of
+    # per-ONU Rx on C-Data/DBC EPON, whose firmware exposes it in no SNMP OID.
+    # Central-side, over the existing proxy tunnel — no edge code. The clock is
+    # SLOW on purpose: Rx drifts over days, and the scrape makes a weak OLT
+    # query every ONU over EPON-OAM, so it must never look like polling.
+    web_optics_enabled: bool = field(
+        default_factory=lambda: _env_bool("WISP_WEB_OPTICS_ENABLED", True))
+    web_optics_interval_s: int = field(
+        default_factory=lambda: _env_int("WISP_WEB_OPTICS_INTERVAL_S", 900))
+    # How long a scraped reading stays merge-eligible. Past this the readings
+    # are dropped rather than aged into the roster: a scrape that quietly
+    # stopped working must not keep a week-old dBm alive under a live badge.
+    web_optics_max_age_s: int = field(
+        default_factory=lambda: _env_int("WISP_WEB_OPTICS_MAX_AGE_S", 3600))
+    # Ceiling on ONE OLT's scrape. The per-request timeout bounds a hop; this
+    # bounds the device, which is what matters now the sweep is fleet-wide and
+    # strictly sequential — a slow 8-PON box must not hold the thread while
+    # every other OLT's readings age. A partial scrape merges normally, so
+    # spending the budget costs the PONs already read nothing.
+    web_optics_device_budget_s: int = field(
+        default_factory=lambda: _env_int("WISP_WEB_OPTICS_DEVICE_BUDGET_S", 120))
+    # How recently a web-UI proxy session must have been USED before the sweeper
+    # treats it as "someone is browsing this box" and stands down. The skip is
+    # right — this firmware holds ONE session, so scraping mid-browse logs the
+    # operator out — but keying it on the session merely EXISTING was not: a
+    # session lives for proxy_session_ttl_s (600s) after its last request and
+    # nothing tells central a tab was closed, so one forgotten tab suppressed
+    # the optical read of EVERY OLT on that probe (the gate is per-node).
+    # Someone actually working a device UI clicks inside three minutes; someone
+    # who walked away does not.
+    web_optics_browse_idle_s: int = field(
+        default_factory=lambda: _env_int("WISP_WEB_OPTICS_BROWSE_IDLE_S", 180))
     # PON mass-drop heads-up (central/ponalert.py): page the operator when a
     # PON reads as a fiber cut. State is tracked regardless; only paging gates.
     pon_fault_alerts: bool = field(
@@ -236,6 +268,27 @@ class Config:
         default_factory=lambda: _env_float("WISP_NTFY_RETRY_BACKOFF_S", 0.5)
     )
 
+    # Notification channels (central-side egress only; the edge never builds a
+    # notifier). ntfy stays the default and the authoritative channel — its send
+    # result is what a page's success is judged on and what alert_log records.
+    # WhatsApp (Meta Cloud API) is an ADDITIVE, best-effort second channel: a
+    # MultiNotifier fans out to both and a WhatsApp error can never downgrade a
+    # good ntfy page (egress/notifiers.py). These env vars are only the FALLBACK
+    # defaults — the live config (enable toggle + token + phone-id + template)
+    # is superadmin-managed in the dashboard (app_settings, Settings → Platform)
+    # and read fresh at send time, so it can be changed without a restart and
+    # numbers are per-login-account in the DB (users.whatsapp_number), not env.
+    enable_ntfy: bool = field(default_factory=lambda: _env_bool("WISP_ENABLE_NTFY", True))
+    enable_whatsapp: bool = field(
+        default_factory=lambda: _env_bool("WISP_ENABLE_WHATSAPP", False))
+    whatsapp_token: str = field(default_factory=lambda: _env("WISP_WHATSAPP_TOKEN", ""))
+    whatsapp_phone_id: str = field(default_factory=lambda: _env("WISP_WHATSAPP_PHONE_ID", ""))
+    whatsapp_template: str = field(
+        default_factory=lambda: _env("WISP_WHATSAPP_TEMPLATE", "wisp_alert"))
+    whatsapp_lang: str = field(default_factory=lambda: _env("WISP_WHATSAPP_LANG", "en"))
+    whatsapp_api_version: str = field(
+        default_factory=lambda: _env("WISP_WHATSAPP_API_VERSION", "v20.0"))
+
     central_url: str = field(default_factory=lambda: _env("WISP_CENTRAL_URL", "").rstrip("/"))
     central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
     central_client_cert: str = field(default_factory=lambda: _env("WISP_CENTRAL_CLIENT_CERT", ""))
@@ -297,6 +350,23 @@ class Config:
     # cookie at issue time (auth.issue_session), not re-read per request.
     session_remember_days: int = field(
         default_factory=lambda: _env_int("WISP_SESSION_REMEMBER_DAYS", 30))
+    # IDLE timeout: a normal (non-"remember") session dies this many minutes after
+    # the LAST authenticated request, independent of the absolute session_timeout_h
+    # cap. Slid forward on activity (auth.slide_session), so it only bites when the
+    # operator actually walks away from the desk. 0 disables idle expiry.
+    session_idle_minutes: int = field(
+        default_factory=lambda: _env_int("WISP_SESSION_IDLE_MIN", 30))
+    # Set the Secure flag on the session cookie (a browser then only sends it over
+    # HTTPS). ON by default — prod terminates TLS at Caddy; a plain-http dev box
+    # sets WISP_SESSION_COOKIE_SECURE=0.
+    session_cookie_secure: bool = field(
+        default_factory=lambda: _env_bool("WISP_SESSION_COOKIE_SECURE", True))
+    # Trust X-Forwarded-For, but ONLY when the direct socket peer is loopback (the
+    # request came through the local reverse proxy). Off = always key off the raw
+    # socket peer. Load-bearing for the login throttle: behind Caddy every request's
+    # peer is 127.0.0.1, so without this the whole world shares one throttle bucket.
+    trust_forwarded_for: bool = field(
+        default_factory=lambda: _env_bool("WISP_TRUST_FORWARDED_FOR", True))
 
     def effective_interval(self, device_count: int) -> int:
         if self.poll_interval_adaptive and device_count <= self.small_fleet_max:

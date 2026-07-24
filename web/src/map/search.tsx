@@ -1,24 +1,16 @@
 // Map search: instant device match + OSM Nominatim geocoding (browser-side,
 // debounced 450ms + 3-char floor — stay a polite keyless client; results are
 // boxed to the org's map area).
-import { useEffect, useState } from "react"
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { MapPin, Search } from "lucide-react"
 import type { OrgDevice } from "@/lib/types"
+import { useDebounced } from "@/hooks/use-debounced"
 import { RowTag } from "@/components/device-detail"
 import { StatusDot } from "@/components/status-badge"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { isPlaced, pinTone } from "@/map/pins"
-
-function useDebounced<T>(value: T, ms: number): T {
-  const [v, setV] = useState(value)
-  useEffect(() => {
-    const t = setTimeout(() => setV(value), ms)
-    return () => clearTimeout(t)
-  }, [value, ms])
-  return v
-}
 
 export interface PlaceHit { label: string; lat: number; lng: number }
 

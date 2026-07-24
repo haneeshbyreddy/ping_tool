@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Check, Copy, Download, KeyRound, MoreVertical, Plus, Power, RotateCw, Trash2 } from "lucide-react"
+import { Check, Copy, Download, KeyRound, MoreVertical, Paintbrush, Plus, Power, RotateCw, Trash2 } from "lucide-react"
 import { useNow } from "@/hooks/use-now"
 import { billingApi, nodesApi, orgsApi, ApiError } from "@/lib/api"
 import {
@@ -9,6 +9,8 @@ import {
 } from "@/lib/install"
 import type { NodeToken, OrgRollout } from "@/lib/types"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
+import { ColorSwatches } from "@/components/color-swatches"
+import { paletteVarOf, type PaletteColor } from "@/lib/palette"
 import { StatusDot } from "@/components/status-badge"
 import { UpgradeNotice } from "@/components/upgrade-notice"
 import { ago, fmtBytes, isStale } from "@/lib/format"
@@ -21,7 +23,8 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
+  DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
 const copy = (text: string) => { navigator.clipboard.writeText(text); toast.success("Copied") }
@@ -172,7 +175,7 @@ function CredentialReveal({
 
 function ProbeRow({
   node, org, canWrite, onReveal, latestVersion, rollout,
-  deviceCount, filtered, onFilter, view = "list",
+  deviceCount, filtered, onFilter, view = "list", color,
 }: {
   node: NodeToken
   org: string
@@ -184,6 +187,9 @@ function ProbeRow({
   filtered?: boolean
   onFilter?: () => void
   view?: "list" | "grid"
+  /** operator palette name; the same colour tints the devices this probe
+   *  watches on the Network tree (topology-page.tsx:deviceColor) */
+  color?: string | null
 }) {
   const queryClient = useQueryClient()
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["nodes"] })
@@ -220,6 +226,11 @@ function ProbeRow({
     mutationFn: () => nodesApi.remove(org, node.node_id),
     onSuccess: invalidate,
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Delete failed"),
+  })
+  const setColor = useMutation({
+    mutationFn: (c: PaletteColor | null) => nodesApi.setColor(org, node.node_id, c),
+    onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to save colour"),
   })
 
   const stale = !!node.last_seen && isStale(node.last_seen)
@@ -320,7 +331,9 @@ function ProbeRow({
           <MoreVertical className="size-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      {/* w-auto: the primitive defaults to the TRIGGER's width, and this trigger
+          is a size-6 icon — items wrapped and the swatch row overflowed */}
+      <DropdownMenuContent align="end" className="w-auto min-w-52">
         {updateAvailable && (
           <DropdownMenuItem disabled={update.isPending}
             onClick={() => update.mutate()}>
@@ -346,6 +359,14 @@ function ProbeRow({
         <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
           <Trash2 /> Delete
         </DropdownMenuItem>
+        {/* Colour-code the probe. Not a menu ITEM — picking a swatch must not
+            close the menu mid-decision, so it's a row inside the menu. */}
+        <DropdownMenuSeparator />
+        <div className="flex items-center gap-2 px-2 py-1.5"
+          onClick={(e) => e.stopPropagation()}>
+          <Paintbrush className="size-3.5 shrink-0 text-muted-foreground" />
+          <ColorSwatches value={color} onPick={(c) => setColor.mutate(c)} />
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -364,9 +385,9 @@ function ProbeRow({
   if (grid) {
     return (
       <div className={cn(
-        "group flex flex-col gap-2 rounded-lg border bg-card p-3",
+        "group flex flex-col gap-2 rounded-lg border border-l-[3px] bg-card p-3",
         !node.registered && "bg-muted/20",
-      )}>
+      )} style={{ borderLeftColor: paletteVarOf(color) ?? undefined }}>
         <div className="flex items-center gap-2">
           <StatusDot tone={status.tone} />
           <span className={cn(
@@ -395,9 +416,9 @@ function ProbeRow({
 
   return (
     <div className={cn(
-      "group flex h-11 items-center gap-2.5 border-b px-4 last:border-b-0 hover:bg-foreground/5",
+      "group flex h-11 items-center gap-2.5 border-b border-l-[3px] border-l-transparent px-4 last:border-b-0 hover:bg-foreground/5",
       !node.registered && "bg-muted/20",
-    )}>
+    )} style={{ borderLeftColor: paletteVarOf(color) ?? undefined }}>
       <StatusDot tone={status.tone} />
       <span className={cn(
         "min-w-0 truncate font-mono text-xs font-medium",
@@ -525,7 +546,7 @@ export function ProbesPanel({
       {nodes.length > 0 && (() => {
         const rows = nodes.map((n) => (
           <ProbeRow key={n.node_id} node={n} org={org} canWrite={canWrite} onReveal={setReveal}
-            view={view}
+            view={view} color={data?.node_colors?.[n.node_id]}
             latestVersion={data?.latest_version ?? null} rollout={data?.rollout ?? null}
             deviceCount={deviceCounts?.get(n.node_id)}
             filtered={probeFilter === n.node_id}

@@ -178,16 +178,48 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(org["name"], "ISP A")
         self.assertEqual(org["node_count"], 1)
 
+    def test_role_collapse_spares_and_repairs_superadmins(self):
+        import sqlite3
+        path = Path(self.tmp.name) / "legacy.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id TEXT,"
+            " username TEXT NOT NULL UNIQUE, pw_hash TEXT NOT NULL, pw_salt TEXT NOT NULL,"
+            " role TEXT NOT NULL DEFAULT 'operator', is_active INTEGER NOT NULL DEFAULT 1,"
+            " created_at TEXT NOT NULL);")
+        rows = [(None, "root", "worker"),      # already damaged by an earlier build
+                (None, "root2", "operator"),   # pre-collapse superadmin
+                ("ispA", "boss", "owner"),
+                ("ispA", "op1", "operator"),
+                ("ispA", "t1", "tech")]
+        for org, name, role in rows:
+            conn.execute("INSERT INTO users (org_id, username, pw_hash, pw_salt, role,"
+                         " created_at) VALUES (?,?,?,?,?,?)",
+                         (org, name, "h", "s", role, "2026-01-01"))
+        conn.commit(); conn.close()
+
+        store = CentralStore(path)
+        got = {u["username"]: u["role"] for u in store.list_users()}
+        # superadmins land on the one harmless token, never 'worker'
+        self.assertEqual(got["root"], "owner")
+        self.assertEqual(got["root2"], "owner")
+        # org accounts collapse onto worker
+        self.assertEqual(got["boss"], "owner")
+        self.assertEqual(got["op1"], "worker")
+        self.assertEqual(got["t1"], "worker")
+
     def test_set_org_role_topics(self):
         self.store.set_org("ispA", ntfy_topic_owner="isp-a-owner",
-                           ntfy_topic_operator="isp-a-op", ntfy_topic_tech="isp-a-tech")
+                           ntfy_topic_worker="isp-a-worker")
         self.assertEqual(self.store.org_role_topic("ispA", "owner"), "isp-a-owner")
-        self.assertEqual(self.store.org_role_topic("ispA", "operator"), "isp-a-op")
-        self.assertEqual(self.store.org_role_topic("ispA", "tech"), "isp-a-tech")
+        self.assertEqual(self.store.org_role_topic("ispA", "worker"), "isp-a-worker")
         self.assertIsNone(self.store.org_role_topic("ispA", "bogus"))
+        # the removed roles resolve to nothing, not to a lingering column
+        self.assertIsNone(self.store.org_role_topic("ispA", "operator"))
+        self.assertIsNone(self.store.org_role_topic("ispA", "tech"))
         self.store.set_org("ispA", ntfy_topic_owner="isp-a-owner-2")
         self.assertEqual(self.store.org_role_topic("ispA", "owner"), "isp-a-owner-2")
-        self.assertEqual(self.store.org_role_topic("ispA", "operator"), "isp-a-op")
+        self.assertEqual(self.store.org_role_topic("ispA", "worker"), "isp-a-worker")
 
 class NodeTokenTest(unittest.TestCase):
 
@@ -628,14 +660,11 @@ class RegionsTest(unittest.TestCase):
         self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": "south", "parent_device_id": None})
-        self.store.add_worker("ispA", "Ravi", region="east")
-
         regions = {r["name"]: r for r in self.store.list_regions("ispA")}
-        self.assertEqual(set(regions), {"north", "south", "east"})
+        self.assertEqual(set(regions), {"north", "south"})
         self.assertTrue(regions["north"]["declared"])
         self.assertFalse(regions["south"]["declared"])
         self.assertEqual(regions["south"]["device_count"], 1)
-        self.assertEqual(regions["east"]["worker_count"], 1)
         self.assertEqual(regions["north"]["device_count"], 0)
 
     def test_add_is_idempotent(self):
@@ -643,11 +672,10 @@ class RegionsTest(unittest.TestCase):
         self.assertFalse(self.store.add_region("ispA", "north"))
         self.assertEqual(len(self.store.list_regions("ispA")), 1)
 
-    def test_rename_cascades_devices_and_workers(self):
+    def test_rename_cascades_devices(self):
         d = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": "north-dc", "parent_device_id": None})
-        w = self.store.add_worker("ispA", "Ravi", region="north-dc")
         # a same-name region in another org must not be touched
         other = self.store.create_org_device("ispB", {
             "name": "B", "ip_address": "10.0.1.1", "device_type": None,
@@ -655,8 +683,6 @@ class RegionsTest(unittest.TestCase):
 
         self.store.rename_region("ispA", "north-dc", "north")
         self.assertEqual(self.store.get_org_device("ispA", d)["region"], "north")
-        worker = next(x for x in self.store.list_workers("ispA") if x["id"] == w)
-        self.assertEqual(worker["region"], "north")
         self.assertEqual(self.store.get_org_device("ispB", other)["region"], "north-dc")
         regions = {r["name"]: r for r in self.store.list_regions("ispA")}
         self.assertIn("north", regions)
@@ -1002,6 +1028,41 @@ class DownloadRouteTest(unittest.TestCase):
         self.assertEqual(data, b"APK-BYTES")
         status, _ = self._raw("/download/..%2f..%2f0.13.0/wisp-edge-linux-amd64.deb")
         self.assertEqual(status, 404)
+
+
+class JsonReplySafetyTest(unittest.TestCase):
+    """Central must never serve a body a browser cannot parse.
+
+    json.dumps emits bare NaN/Infinity by default and that is not valid JSON:
+    JSON.parse rejects it and the client loses the ENTIRE reply, not the one bad
+    number. A single ONU reporting Tx = -inf took out an OLT's whole Optical tab
+    this way. Ingest cleans device values, but device-derived floats reach the
+    encoder from many paths, so the guarantee is pinned here as well.
+    """
+
+    def test_non_finite_floats_are_nulled_not_emitted_raw(self):
+        from wisp.central.server import _json_safe
+        body = {"onus": [{"rx_dbm": -21.5, "tx_dbm": float("-inf")},
+                         {"rx_dbm": float("nan"), "tx_dbm": float("inf")}],
+                "count": 2, "name": "PYLON"}
+        raw = json.dumps(_json_safe(body), allow_nan=False)   # must not raise
+        back = json.loads(raw)
+        self.assertEqual(back["onus"][0]["rx_dbm"], -21.5)    # good value kept
+        self.assertIsNone(back["onus"][0]["tx_dbm"])
+        self.assertIsNone(back["onus"][1]["rx_dbm"])
+        self.assertIsNone(back["onus"][1]["tx_dbm"])
+        self.assertEqual(back["count"], 2)
+        self.assertEqual(back["name"], "PYLON")
+
+    def test_a_clean_body_is_returned_unchanged(self):
+        from wisp.central.server import _json_safe
+        body = {"a": [1, 2.5, "x", None, True], "b": {"c": -0.0}}
+        self.assertEqual(_json_safe(body), body)
+
+    def test_nesting_is_walked_all_the_way_down(self):
+        from wisp.central.server import _json_safe
+        body = {"a": [{"b": [{"c": float("inf")}]}]}
+        self.assertIsNone(_json_safe(body)["a"][0]["b"][0]["c"])
 
 
 if __name__ == "__main__":

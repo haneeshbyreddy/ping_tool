@@ -7,8 +7,8 @@ import {
   PLAN_ORDER, addMonths, billingStatusMeta, currentMonthKey, inr, monthLabel, monthShort,
 } from "@/lib/billing"
 import type { BillingInfo, Plan } from "@/lib/types"
-import { OnlinePayWell } from "@/components/billing-lock"
-import { FreePlanButton, PayOnlineButton } from "@/components/pay-online"
+import { FreePlanButton, IvePaidButton } from "@/components/pay-online"
+import { QrImage } from "@/components/qr-image"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -16,16 +16,10 @@ import { Skeleton } from "@/components/ui/skeleton"
 function PlanTier({ plan, billing, org }: { plan: Plan; billing: BillingInfo; org: string }) {
   const spec = billing.plans[plan]
   const current = billing.plan === plan
-  // Plan moves are always on the table: paid plans (up OR down) are entered
-  // by paying their price at checkout, Free needs no payment at all.
-  const action = current ? null
-    : plan === "free"
-      ? <FreePlanButton org={org} className="mt-auto w-full" />
-      : billing.upi_enabled
-        ? <PayOnlineButton org={org} plan={plan} variant="outline"
-            className="mt-auto w-full"
-            label={`${billing.plan === "free" ? "Upgrade" : "Switch"} to ${spec.label} · ${inr(spec.price_inr)}`} />
-        : null
+  // Dropping to Free is self-serve; moving to a paid plan is manual (pay the
+  // admin by GPay/QR, they switch you) so paid tiers show no button here.
+  const action = current || plan !== "free" ? null
+    : <FreePlanButton org={org} className="mt-auto w-full" />
   return (
     <div className={cn(
       "flex flex-col gap-2 rounded-lg border p-4",
@@ -82,7 +76,9 @@ function MonthStrip({ billing }: { billing: BillingInfo }) {
   )
 }
 
-function PayWell({ billing, note }: { billing: BillingInfo; note: string }) {
+function PayWell({ billing, org, note, showPaid }: {
+  billing: BillingInfo; org: string; note: string; showPaid: boolean
+}) {
   const [copied, setCopied] = useState(false)
   const copy = () => {
     navigator.clipboard.writeText(billing.gpay_number)
@@ -90,22 +86,29 @@ function PayWell({ billing, note }: { billing: BillingInfo; note: string }) {
     setTimeout(() => setCopied(false), 1500)
   }
   return (
-    <div className="flex flex-col gap-2 rounded-lg border bg-muted px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">
-            Pay via GPay
-          </p>
-          <p className="font-mono text-base font-semibold tracking-wider tabular-nums">
-            {billing.gpay_number}
-          </p>
+    <div className="flex flex-col gap-2.5 rounded-lg border bg-muted px-4 py-3">
+      <div className="flex items-center gap-4">
+        {billing.qr_image && (
+          <QrImage src={billing.qr_image} className="shrink-0"
+            imgClassName="size-28 rounded-md border object-contain p-1.5" />
+        )}
+        <div className="flex flex-1 items-center justify-between gap-3">
+          <div>
+            <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">
+              {billing.qr_image ? "Scan or pay via GPay" : "Pay via GPay"}
+            </p>
+            <p className="font-mono text-base font-semibold tracking-wider tabular-nums">
+              {billing.gpay_number}
+            </p>
+          </div>
+          <Button variant="outline" size="sm" onClick={copy}>
+            {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
+            {copied ? "Copied" : "Copy"}
+          </Button>
         </div>
-        <Button variant="outline" size="sm" onClick={copy}>
-          {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
-          {copied ? "Copied" : "Copy"}
-        </Button>
       </div>
       <p className="text-xs text-muted-foreground">{note}</p>
+      {showPaid && <IvePaidButton org={org} className="w-fit" />}
     </div>
   )
 }
@@ -185,14 +188,13 @@ export function BillingCard({ org }: { org: string }) {
           </div>
         )}
 
-        {billing.upi_enabled ? (
-          // free orgs upgrade from the tier cards above; paid orgs renew here
-          billing.status !== "free" && <OnlinePayWell billing={billing} org={org} />
+        {billing.status === "free" ? (
+          <PayWell billing={billing} org={org} showPaid={false} note={
+            `Upgrades are manual: pay the first month (${inr(billing.plans.pro.price_inr)} Pro, ${inr(billing.plans.vip.price_inr)} VIP) to this number and the admin switches your plan in a moment.`
+          } />
         ) : (
-          <PayWell billing={billing} note={
-            billing.status === "free"
-              ? `Upgrades are manual by design: pay the first month (${inr(billing.plans.pro.price_inr)} Pro, ${inr(billing.plans.vip.price_inr)} VIP) to this number and the admin will switch your plan in a moment.`
-              : `${inr(spec.price_inr)} per month for the ${spec.label} plan. The admin marks your account paid within moments of payment. Reminders go to the owner alert channel from 3 days before a month runs out.`
+          <PayWell billing={billing} org={org} showPaid note={
+            `${inr(spec.price_inr)} per month for the ${spec.label} plan. Tap "I've paid" after you pay and the admin marks your account. Reminders go to the owner alert channel from 3 days before a month runs out.`
           } />
         )}
       </CardContent>

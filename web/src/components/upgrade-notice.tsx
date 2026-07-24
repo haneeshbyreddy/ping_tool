@@ -43,7 +43,7 @@ export function UpgradeNotice({ billing, resource, note, secondary, onClose }: {
             <Button variant="outline" size="sm" onClick={secondary.onClick}>{secondary.label}</Button>
           )}
           <Button size="sm" asChild>
-            <Link to="/settings">Go to Billing</Link>
+            <Link to="/settings/billing">Go to Billing</Link>
           </Button>
         </div>
       </CardContent>

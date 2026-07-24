@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -142,6 +143,51 @@ class ProxyHubTest(unittest.TestCase):
         self.assertEqual(
             [s["sid"] for s in self.hub.active_sessions_for("o", "OTHER")],
             [other.sid])
+
+    def test_an_idle_window_narrows_active_to_sessions_in_USE(self):
+        """"Is a session open" and "is a human driving it" are different
+        questions, and the web-optics sweeper needs the second one.
+
+        Nothing tells central a browser tab was closed, so an abandoned session
+        stays open for the rest of its TTL — and the sweeper's browse gate is
+        per-NODE, so answering the first question let one forgotten tab suppress
+        the optical read of every OLT behind that probe. The edge path still
+        asks the first (its tunnel should stay up for the whole TTL).
+        """
+        idle = self._open(ttl_s=600)
+        idle.last_used_at = time.time() - 300
+        busy = self.hub.open_session(
+            org_id="o", device_id=2, node_id="n", device_ip="1.2.3.5",
+            device_port=80, scheme="http", created_by=7, ttl_s=600)
+        self.assertEqual(
+            {s["sid"] for s in self.hub.active_sessions_for("o", "n")},
+            {idle.sid, busy.sid})
+        self.assertEqual(
+            [s["sid"] for s in self.hub.active_sessions_for("o", "n", idle_s=180)],
+            [busy.sid])
+
+    def test_activity_marks_the_session_used(self):
+        sess = self._open(ttl_s=600)
+        sess.last_used_at = time.time() - 300
+        self.hub.extend_session(sess, 600)
+        self.assertEqual(
+            [s["sid"] for s in self.hub.active_sessions_for("o", "n", idle_s=180)],
+            [sess.sid])
+
+    def test_has_session_is_expiry_aware(self):
+        # The dashboard's "live" badge and its pulsing globe read this. A plain
+        # membership test kept both claiming a session was open long after it
+        # had timed out — sessions are dropped lazily, and the one thing that
+        # would look this one up (its browser) is what has gone away.
+        live, dead = self._open(ttl_s=60), self._open(ttl_s=-1)
+        self.assertTrue(self.hub.has_session(live.sid))
+        self.assertFalse(self.hub.has_session(dead.sid))
+
+    def test_reap_expired_returns_the_sids_it_dropped(self):
+        live, dead = self._open(ttl_s=60), self._open(ttl_s=-1)
+        self.assertEqual(self.hub.reap_expired(), [dead.sid])
+        self.assertEqual(self.hub.reap_expired(), [])   # nothing left to retire
+        self.assertTrue(self.hub.has_session(live.sid))
 
     def test_submit_extra_merges_but_keeps_base_fields(self):
         # the preflight rides extra=; an old edge must still see a plain fetch

@@ -164,13 +164,38 @@ def pon_summary(h, qs):
                         else default_cap) for d in devs}
     caps = onuroster.capacity_faults(
         live_rows, now, lambda dev_id: limits.get(dev_id, default_cap))
+    # Optical severity, counted over the SAME roster view as everything else on
+    # this strip. Only an ONLINE ONU is graded: a dark one has no light to
+    # measure, so its last reading is a fact about the past, and a down OLT's
+    # whole roster is already excluded above. This is the org-wide sum of the
+    # per-OLT badge (olt_optics.crit_count/warn_count), recomputed here rather
+    # than summed from that table because the badge freezes with its walk while
+    # this strip must not count an OLT central can no longer see.
+    graded = [r for r in roster
+              if str(r.get("state") or "") == "online"
+              and r["device_id"] not in down_olts]
+    onus_crit = sum(1 for r in graded if r.get("severity") == "crit")
+    onus_warn = sum(1 for r in graded if r.get("severity") == "warn")
+    # Rx COVERAGE — how much of the fleet actually reports optical power. A
+    # C-Data/DBC EPON OLT walks a complete roster with every rx_dbm NULL, so
+    # "0 critical ONUs" there means "nothing is measured", not "all healthy".
+    # The strip has to be able to say which, or the two look identical.
+    onus_rx = sum(1 for r in roster if r.get("rx_dbm") is not None)
+    olts_rx = len({r["device_id"] for r in roster if r.get("rx_dbm") is not None})
     h._reply(200, {
         "olts": len({r["device_id"] for r in roster}),
         "onus_total": len(roster),
         "onus_online": online,
         "onus_offline": len(roster) - online,
+        "onus_crit": onus_crit,
+        "onus_warn": onus_warn,
+        "onus_rx": onus_rx,
+        "olts_rx": olts_rx,
         "fiber_cuts": sum(1 for f in faults if f.kind == "fiber"),
         "pons_over_cap": len(caps),
+        # which OLTs to jump to from the KPI tile — a PON is over cap, not a
+        # whole device, but the tile can only drill into the Network tree
+        "over_cap_device_ids": sorted({c.device_id for c in caps}),
         "pon_cap": default_cap,
         "pon_cap_worst": max((c.onus for c in caps), default=0),
         # a MAC on ≥2 slots is "live" only when ≥2 are ONLINE at once — the

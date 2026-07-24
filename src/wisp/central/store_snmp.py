@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+from wisp.central import onuroster
 from wisp.central.store_util import _now_iso, SNMP_WALKS_KEEP, SNMP_SUBSYSTEMS, SNMP_STATUS_STATES
 
 
@@ -15,14 +16,25 @@ class SnmpStoreMixin:
 
     def _bandwidth_alarms(self, org_id: str, *, flag_col: str, limit_col: str,
                           limit_key: str, since_col: str) -> list[dict]:
+        # A device that isn't answering ICMP isn't answering SNMP either, so its
+        # bw_alarm flag and in/out_bps are frozen at the last walk before it
+        # dropped. Reporting that as a live bandwidth alarm points a top-bar chip
+        # and a Home tile at a box whose real problem is the outage — the classic
+        # one-fault-two-alarms split this dashboard keeps closing. DISPLAY ONLY:
+        # this feeds /api/summary and nothing else (ports.py owns the paging and
+        # its own transition state, which stays untouched — a suppressed chip must
+        # never mean a suppressed page).
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT sp.id AS port_id, sp.device_id, d.name AS switch_name,"
                 f" sp.if_index, sp.if_name, sp.if_alias, sp.in_bps, sp.out_bps,"
                 f" sp.{limit_col}, sp.bw_direction, sp.{since_col}"
                 f" FROM switch_ports sp JOIN org_devices d ON d.id = sp.device_id"
+                f" LEFT JOIN device_states ds ON ds.device_id = sp.device_id"
                 f" WHERE sp.org_id=? AND sp.monitored=1 AND sp.{flag_col}=1"
-                f" AND d.is_active=1 ORDER BY sp.{since_col}", (org_id,)).fetchall()
+                f" AND d.is_active=1"
+                f" AND COALESCE(ds.state,'') NOT IN ('DOWN','UNREACHABLE')"
+                f" ORDER BY sp.{since_col}", (org_id,)).fetchall()
         out = []
         for r in rows:
             base = r["if_name"] or f"if{r['if_index']}"
@@ -129,6 +141,33 @@ class SnmpStoreMixin:
             return cur.rowcount > 0
 
 
+    def set_port_uplink(self, org_id: str, port_id: int,
+                        uplink_device_id: int | None) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE switch_ports SET uplink_device_id=? WHERE id=? AND org_id=?",
+                (uplink_device_id, port_id, org_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+    def list_link_ports(self, org_id: str) -> list[dict]:
+        """Every port bound to a link, either side: feeds_device_id names the child a
+        parent-side port cables to, uplink_device_id names the parent a child-side
+        port faces. One org-wide list so the map labels every link in one query."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT p.id, p.device_id, p.if_index, p.if_name, p.if_alias,"
+                " p.admin_status, p.oper_status, p.monitored, p.alarm,"
+                " p.bw_alarm, p.bw_high_alarm, p.in_bps, p.out_bps, p.updated_at,"
+                " p.feeds_device_id, p.uplink_device_id"
+                " FROM switch_ports p JOIN org_devices d ON d.id = p.device_id"
+                " WHERE p.org_id=? AND d.is_active=1"
+                " AND (p.feeds_device_id IS NOT NULL OR p.uplink_device_id IS NOT NULL)"
+                " ORDER BY p.device_id, p.if_index", (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
     def set_port_bandwidth_config(self, org_id: str, port_id: int,
                                   threshold_mbps: float | None, direction: str,
                                   max_mbps: float | None = None) -> bool:
@@ -141,6 +180,22 @@ class SnmpStoreMixin:
             return cur.rowcount > 0
 
 
+    def onu_rx_counts(self, org_id: str, device_id: int) -> dict:
+        """How much of one OLT's roster carries a real Rx figure.
+
+        The two numbers the Rx diagnosis turns into a sentence: "none of 412
+        ONUs report optical power" is a vendor verdict, "3 of 412" is a scrape
+        that half-worked, and they must never render as the same empty column.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total,"
+                " SUM(CASE WHEN rx_dbm IS NOT NULL THEN 1 ELSE 0 END) AS with_rx"
+                " FROM onu_optics WHERE org_id=? AND device_id=?",
+                (org_id, device_id)).fetchone()
+        return {"total": int(row["total"] or 0), "with_rx": int(row["with_rx"] or 0)}
+
+
     def list_onu_optics(self, org_id: str, device_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -150,12 +205,284 @@ class SnmpStoreMixin:
         return [dict(r) for r in rows]
 
 
+    # ----- web-UI scraped optics (central/weboptics.py) -----------------------
+
+    def upsert_web_optics(self, org_id: str, device_id: int, rows: list[dict],
+                          ts: str) -> int:
+        """Store one scrape's readings. UPSERT per row, never delete-then-insert:
+        a scrape is allowed to come back partial (the OLT keeps ONE session slot,
+        so a tech logging in can end ours mid-sweep), and wiping the device's rows
+        first would turn every partial into a blackout of the PONs that didn't get
+        re-read. A row nothing refreshes simply ages past web_optics_max_age_s and
+        stops being merged, which is the honest outcome."""
+        if not rows:
+            return 0
+        with self._write_lock, self._connect() as conn:
+            for r in rows:
+                key = str(r.get("onu_key") or "").strip()
+                if not key:
+                    continue
+                conn.execute(
+                    "INSERT INTO onu_web_optics (org_id, device_id, onu_key, serial,"
+                    " rx_dbm, tx_dbm, distance_m, temp_c, voltage_v, tx_bias_ma,"
+                    " scraped_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(org_id, device_id, onu_key) DO UPDATE SET"
+                    "   serial=excluded.serial, rx_dbm=excluded.rx_dbm,"
+                    "   tx_dbm=excluded.tx_dbm, distance_m=excluded.distance_m,"
+                    "   temp_c=excluded.temp_c, voltage_v=excluded.voltage_v,"
+                    "   tx_bias_ma=excluded.tx_bias_ma, scraped_at=excluded.scraped_at",
+                    (org_id, device_id, key, r.get("serial"), r.get("rx_dbm"),
+                     r.get("tx_dbm"), r.get("distance_m"), r.get("temp_c"),
+                     r.get("voltage_v"), r.get("tx_bias_ma"), ts))
+            conn.commit()
+        return len(rows)
+
+
+    def list_web_optics(self, org_id: str, device_id: int) -> list[dict]:
+        """This OLT's scraped readings, freshest-first. Staleness is judged by the
+        caller (weboptics.merge_scraped) against the report timestamp rather than
+        filtered here — the merge is where the age has meaning, and keeping it
+        there makes it testable without a clock."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT onu_key, serial, rx_dbm, tx_dbm, distance_m, temp_c,"
+                " voltage_v, tx_bias_ma, scraped_at FROM onu_web_optics"
+                " WHERE org_id=? AND device_id=? ORDER BY onu_key",
+                (org_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+
+    def web_optics_targets(self, vendors=("dbc",),
+                           device_id: int | None = None) -> list[dict]:
+        """OLTs the web-optics sweeper should scrape, fleet-wide.
+
+        ``device_id`` narrows the same query to one OLT for the dashboard's
+        manual refresh. It is a FILTER on this query rather than a lookup of its
+        own on purpose: "may this box be scraped, and with what" must have one
+        answer, or a hand-triggered read could reach a device the sweep would
+        have refused (no roster, no credentials, org's tunnel not granted).
+
+        Two ways an OLT qualifies as a scrapable vendor, and the second one is
+        why the subsystem reaches more than one box:
+
+        1. an EXPLICIT ``gpon_vendor`` naming a vendor a web-optics profile
+           covers — the operator named it; or
+        2. the EDGE's own optics sweep matched that vendor's profile from the
+           box's sysObjectID (``device_snmp_status`` subsystem='optics'), with
+           the device's own vendor field left on automatic.
+
+        (2) was written off as impossible — "auto-detection lives on the edge
+        and is never reported to central" — and that was simply out of date:
+        `device_snmp_status` has carried the matched profile name AND the raw
+        sysObjectID up on every report since the SNMP-diagnosis work. It is not
+        a weaker signal than the dropdown, it is a STRONGER one: the dropdown is
+        a human's recollection, this is the box answering with its maker's own
+        PEN arc, which is the exact evidence the human was going on. Requiring
+        `sysobjectid` to be present is what keeps it that: it is only ever
+        stamped on a real auto-detect, so a fleet-wide ``WISP_GPON_VENDOR``
+        default can never launder itself into a detection here.
+
+        A roster is required as well (``onu_optics``). The scrape does not
+        create ONUs — it merges onto slots the SNMP walk already reported — so
+        an OLT with no roster has nothing for a reading to attach to, and
+        scraping it is a login and a page fetch that can only ever be discarded.
+
+        `pon_ports` rides along for the same reason it is needed at all: the
+        scrape is one POST per PON, and the roster is the only honest source of
+        how many an OLT has.
+
+        Also requires stored credentials, an assigned probe (the tunnel's route)
+        and the org's web_proxy grant (without it the edge holds no long-poll,
+        so every request would just eat its timeout).
+
+        WHICH vendors qualify is no longer the literal 'dbc' baked in here: the
+        caller passes the profile set in force (`ProfileSet.names()`), so
+        onboarding an OLT is a dashboard row rather than an edit to this SQL.
+        The vendor token each device resolved to comes back as `vendor`, so the
+        sweeper does not have to re-derive it."""
+        names = {str(n or "").strip().lower() for n in (vendors or ())}
+        names.discard("")
+        if not names:
+            return []
+        marks = ",".join("?" * len(names))
+        args = sorted(names) * 2
+        only = "" if device_id is None else " AND d.id = ?"
+        if device_id is not None:
+            args = args + [int(device_id)]
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.id, d.org_id, d.name, d.ip_address, d.assigned_node_id,"
+                " d.web_ip, d.web_port, d.web_scheme, c.username, c.password_enc,"
+                # The vendor this device resolved AS, and which of the two ways
+                # it got there — an explicit dropdown beats a detection, exactly
+                # as GponPollerPool.resolve orders them.
+                " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
+                "      THEN LOWER(d.gpon_vendor) ELSE LOWER(COALESCE(s.profile,''))"
+                " END AS vendor,"
+                " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
+                "      THEN 'declared' ELSE 'detected' END AS vendor_source,"
+                " (SELECT GROUP_CONCAT(DISTINCT r.pon_port) FROM onu_optics r"
+                "   WHERE r.device_id = d.id) AS pon_ports"
+                " FROM org_devices d"
+                " JOIN device_webui_credentials c ON c.device_id = d.id"
+                " JOIN orgs g ON g.org_id = d.org_id"
+                " LEFT JOIN device_snmp_status s"
+                "   ON s.device_id = d.id AND s.subsystem = 'optics'"
+                " WHERE d.is_active=1 AND d.maintenance=0"
+                f"   AND (LOWER(COALESCE(d.gpon_vendor,'')) IN ({marks})"
+                "        OR (COALESCE(d.gpon_vendor,'') = ''"
+                f"            AND LOWER(COALESCE(s.profile,'')) IN ({marks})"
+                # Only ever stamped on a real auto-detect, so a fleet-wide
+                # WISP_GPON_VENDOR default can't launder itself into one.
+                "            AND COALESCE(s.sysobjectid,'') <> ''))"
+                "   AND EXISTS(SELECT 1 FROM onu_optics r WHERE r.device_id = d.id)"
+                "   AND COALESCE(d.assigned_node_id,'') <> ''"
+                "   AND COALESCE(c.username,'') <> '' AND c.password_enc IS NOT NULL"
+                "   AND g.web_proxy=1" + only +
+                " ORDER BY d.org_id, d.id", args).fetchall()
+        return [dict(r) for r in rows]
+
+
+    # ----- web-optics vendor profiles (central/weboptics_profiles.py) ---------
+
+    @staticmethod
+    def _web_optics_row(row) -> dict:
+        out = dict(row)
+        try:
+            out["spec"] = json.loads(out["spec"])
+        except (TypeError, ValueError):
+            out["spec"] = {}
+        out["enabled"] = bool(out["enabled"])
+        return out
+
+    def list_web_optics_profiles(self, org_id: str | None) -> list[dict]:
+        # An org sees global profiles + its own; superadmin scope (None) sees all.
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM web_optics_profiles"
+                    " ORDER BY org_id IS NOT NULL, name")
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM web_optics_profiles"
+                    " WHERE org_id IS NULL OR org_id=?"
+                    " ORDER BY org_id IS NOT NULL, name", (org_id,))
+            return [self._web_optics_row(r) for r in rows.fetchall()]
+
+    def create_web_optics_profile(self, org_id: str | None, clean: dict) -> int:
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO web_optics_profiles (org_id, name, spec, enabled,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                (org_id, clean["name"], json.dumps(clean["spec"]),
+                 1 if clean["enabled"] else 0, now, now))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def update_web_optics_profile(self, profile_id: int, clean: dict) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE web_optics_profiles SET name=?, spec=?, enabled=?,"
+                " updated_at=? WHERE id=?",
+                (clean["name"], json.dumps(clean["spec"]),
+                 1 if clean["enabled"] else 0, _now_iso(), profile_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def delete_web_optics_profile(self, profile_id: int) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM web_optics_profiles WHERE id=?",
+                               (profile_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_web_optics_profile(self, profile_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM web_optics_profiles WHERE id=?",
+                               (profile_id,)).fetchone()
+        return self._web_optics_row(row) if row else None
+
+
+    # ----- web-optics scrape outcome (central/weboptics_sweep.py) -------------
+
+    def set_web_optics_status(self, org_id: str, device_id: int, profile: str,
+                              state: str, detail: str | None, rows: int) -> None:
+        """Record the last scrape outcome. `last_ok_at` only advances on a state
+        that actually produced readings, so a panel can always say "was working
+        until <ts>" — the same contract device_snmp_status keeps for SNMP."""
+        now = _now_iso()
+        ok = state in ("ok", "partial")
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO web_optics_status (device_id, org_id, profile, state,"
+                " detail, rows, updated_at, last_ok_at) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET org_id=excluded.org_id,"
+                " profile=excluded.profile, state=excluded.state,"
+                " detail=excluded.detail, rows=excluded.rows,"
+                " updated_at=excluded.updated_at,"
+                " last_ok_at=CASE WHEN excluded.last_ok_at IS NOT NULL"
+                "   THEN excluded.last_ok_at ELSE web_optics_status.last_ok_at END",
+                (device_id, org_id, profile or "", state,
+                 (detail[:400] if detail else None), int(rows), now,
+                 now if ok else None))
+            conn.commit()
+
+    def get_web_optics_status(self, org_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM web_optics_status WHERE org_id=? AND device_id=?",
+                (org_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+
+    def onu_search_device_ids(self, org_id: str, needle: str) -> list[int]:
+        """OLTs carrying at least one ONU whose serial/MAC **or name** contains
+        `needle` — a tech looks a subscriber up by whichever they happen to have
+        (the MAC off the sticker, or the name the OLT was provisioned with).
+
+        Narrowing step for the Network-page search: the caller only wants a
+        handful of OLTs to load rosters for, and a fleet's onu_optics is far too
+        big to ship wholesale on every keystroke. `needle` MUST already be
+        `onuroster.search_key`-normalized (alphanumeric, upper) — that is what
+        makes it safe to interpolate as a LIKE pattern, since the normalizer
+        strips `%` and `_` along with everything else non-alphanumeric.
+
+        That same normalizer is registered as a SQL function rather than mirrored
+        as a REPLACE chain, so the two sides cannot drift: the chain only knew
+        the four separators MACs use, which silently failed the underscore in a
+        real provisioned name like "hc_kiran". It costs a full scan of the org's
+        ONU rows, which a function of a column would need anyway — and the
+        3-character floor in the API keeps that off the common keystroke.
+        """
+        if not needle:
+            return []
+        with self._connect() as conn:
+            conn.create_function("wisp_search_key", 1, onuroster.search_key,
+                                 deterministic=True)
+            rows = conn.execute(
+                "SELECT DISTINCT o.device_id FROM onu_optics o"
+                " JOIN org_devices d ON d.id = o.device_id"
+                " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1"
+                " AND (wisp_search_key(o.serial) LIKE ?"
+                "      OR wisp_search_key(o.name) LIKE ?)",
+                (org_id, org_id, f"%{needle}%", f"%{needle}%")).fetchall()
+        return [r["device_id"] for r in rows]
+
+
     def org_onu_rows(self, org_id: str, device_id: int | None = None) -> list[dict]:
         """Slim ONU rows for the PON fault detector (central/ponfault.py) and the
         roster-hygiene checks (central/onuroster.py — serial + onu_id used there,
-        ignored by ponfault)."""
+        ignored by ponfault).
+
+        `rx_dbm`/`severity` ride along for the org-wide optical rollup
+        (`api/outages.py:pon_summary`), which has to count crit/weak ONUs over
+        the SAME freshest-walk view the fault and capacity checks use — reading
+        them from a second query would let the KPI strip and the drill-down
+        disagree about which walk they are describing."""
         q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.onu_id, o.name, o.serial,"
              " o.state, o.distance_m, o.last_online_at, o.updated_at,"
+             " o.rx_dbm, o.severity,"
              " d.name AS device_name"
              " FROM onu_optics o JOIN org_devices d ON d.id = o.device_id"
              " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1")
@@ -476,7 +803,8 @@ class SnmpStoreMixin:
 
     def complete_snmp_walk(self, org_id: str, node_id: str, walk_id: int, *,
                            varbinds: list | None = None,
-                           error: str | None = None) -> bool:
+                           error: str | None = None,
+                           truncated: bool = False) -> bool:
         status = "error" if error else "done"
         result = (json.dumps(varbinds, separators=(",", ":"))
                   if varbinds is not None and not error else None)
@@ -484,9 +812,10 @@ class SnmpStoreMixin:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE snmp_walks SET status=?, error=?, result=?, varbind_count=?,"
-                " completed_at=? WHERE id=? AND org_id=? AND node_id=?"
+                " truncated=?, completed_at=? WHERE id=? AND org_id=? AND node_id=?"
                 " AND status='pending'",
-                (status, error, result, count, _now_iso(), walk_id, org_id, node_id))
+                (status, error, result, count, 1 if truncated and not error else 0,
+                 _now_iso(), walk_id, org_id, node_id))
             conn.commit()
             return cur.rowcount > 0
 
@@ -495,8 +824,8 @@ class SnmpStoreMixin:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, node_id, root_oid, max_varbinds, status, requested_by,"
-                " error, varbind_count, created_at, completed_at FROM snmp_walks"
-                " WHERE org_id=? AND device_id=? ORDER BY id DESC",
+                " error, varbind_count, truncated, created_at, completed_at"
+                " FROM snmp_walks WHERE org_id=? AND device_id=? ORDER BY id DESC",
                 (org_id, device_id)).fetchall()
         return [dict(r) for r in rows]
 

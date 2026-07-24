@@ -33,6 +33,6 @@ def sweep(store, org_id: str, eng, redundancy: dict[int, bool],
 def _page(store, org_id: str, notifier, cfg: Config, device_id: int,
          title: str, body: str, payload: str, ts: str) -> None:
     AlertRouter(store, org_id, notifier, cfg).emit(
-        payload, topic=store.org_role_topic(org_id, "operator"),
+        payload, topic=store.org_role_topic(org_id, "worker"),
         title=title, body=body, priority=3, ts=ts, device_id=device_id,
         gate=cfg.backup_alerts)

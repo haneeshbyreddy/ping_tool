@@ -66,6 +66,16 @@ class ProxySession:
     created_by: int
     created_at: float
     expires_at: float
+    # Last proxied request on this session. `expires_at` already encodes it
+    # (last activity + ttl), but only as long as nothing else ever moves the
+    # expiry — so the fact is stored rather than inferred. It is what tells an
+    # ABANDONED session from a live one: a browser tab that was closed (or a
+    # laptop that was shut) sends no more requests, and there is no close event
+    # to catch server-side, so "when did a human last touch this" is the only
+    # signal there is. The web-optics sweeper defers to a session solely on this
+    # (weboptics_sweep.py) — deferring to a session that merely still EXISTS is
+    # what let one forgotten tab block a probe's whole optical read.
+    last_used_at: float = field(default=0.0, compare=False)
     # last time the DB session record was synced — activity extends the TTL on
     # every asset request, but the row is only touched every ~20s (api/proxy.py)
     db_synced_at: float = field(default=0.0, compare=False)
@@ -117,7 +127,7 @@ class ProxyHub:
             sid=secrets.token_urlsafe(24), org_id=org_id, device_id=device_id,
             node_id=node_id, device_ip=device_ip, device_port=device_port,
             scheme=scheme, created_by=created_by, created_at=now,
-            expires_at=now + ttl_s)
+            expires_at=now + ttl_s, last_used_at=now)
         with self._lock:
             self._sessions[sess.sid] = sess
         return sess
@@ -145,29 +155,60 @@ class ProxyHub:
         return gone
 
     def has_session(self, sid: str) -> bool:
+        """Is this session live RIGHT NOW? Expiry-aware on purpose: the
+        dashboard's "live" badge and its pulsing globe icon are read off this,
+        and a plain membership test kept both claiming a session was open long
+        after it had timed out — sessions are only ever dropped lazily, so an
+        abandoned one sits in the dict until something asks about it."""
+        return self.get_session(sid) is not None
+
+    def reap_expired(self) -> list[str]:
+        """Drop every timed-out session and return their sids so the caller can
+        retire the DB rows. Sessions expire on their own clock but were only
+        ever removed when something happened to look one up — nothing looks up
+        a session whose tab is gone, so they accumulated for the life of the
+        process and went on being advertised as open."""
+        now = time.time()
         with self._lock:
-            return sid in self._sessions
+            gone = [sid for sid, s in self._sessions.items() if s.expires_at <= now]
+            for sid in gone:
+                del self._sessions[sid]
+        return gone
 
     def extend_session(self, sess: ProxySession, ttl_s: float) -> float:
         """Activity keeps a session alive: push expiry to now+ttl (never
         shortens). Returns the new expires_at epoch."""
         with self._lock:
-            sess.expires_at = max(sess.expires_at, time.time() + ttl_s)
+            now = time.time()
+            sess.last_used_at = now
+            sess.expires_at = max(sess.expires_at, now + ttl_s)
             return sess.expires_at
 
-    def active_sessions_for(self, org_id: str, node_id: str) -> list[dict]:
+    def active_sessions_for(self, org_id: str, node_id: str,
+                            idle_s: float | None = None) -> list[dict]:
         """Live sessions this node should serve — rides the /report reply so a
         dormant edge learns to spin its tunnel up (webplan.md §2). TTL is sent
         RELATIVE (seconds remaining), never as a wall-clock timestamp: the edge's
-        clock is not trusted to agree with central's."""
+        clock is not trusted to agree with central's.
+
+        ``idle_s`` narrows the answer from "not expired" to "in USE": only
+        sessions touched within that many seconds count. The edge path passes
+        nothing and keeps holding its tunnel for the session's whole TTL —
+        that is what the tunnel is for. The web-optics sweeper passes a window,
+        because for it the question is not "does a session exist" but "is there
+        a human at the keyboard I would be logging out".
+        """
         now = time.time()
         out = []
         with self._lock:
             for sess in self._sessions.values():
-                if (sess.org_id == org_id and sess.node_id == node_id
+                if not (sess.org_id == org_id and sess.node_id == node_id
                         and sess.expires_at > now):
-                    out.append({"sid": sess.sid,
-                                "ttl_s": round(sess.expires_at - now, 1)})
+                    continue
+                if idle_s is not None and (now - sess.last_used_at) > idle_s:
+                    continue
+                out.append({"sid": sess.sid,
+                            "ttl_s": round(sess.expires_at - now, 1)})
         return out
 
     def inflight(self, sid: str) -> int:

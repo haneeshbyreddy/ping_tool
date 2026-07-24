@@ -68,11 +68,12 @@ class RecordingCentralClient:
             return self._replies.pop(0)
         return {"ok": True}
 
-    def walk_result(self, walk_id: int, *, varbinds=None, error=None) -> dict:
+    def walk_result(self, walk_id: int, *, varbinds=None, error=None,
+                    truncated: bool = False) -> dict:
         if self.fail_walk_result:
             raise CentralClientError("walk upload boom")
         self.walk_results.append({"walk_id": walk_id, "varbinds": varbinds,
-                                  "error": error})
+                                  "error": error, "truncated": truncated})
         return {"ok": True}
 
     def heartbeat(self, body: dict) -> dict:
@@ -389,7 +390,18 @@ class DiagWalkRunnerTest(unittest.TestCase):
         self.assertEqual(walker.calls, [("10.0.0.9", "1.3.6.1", 100)])
         self.assertEqual(client.walk_results, [{
             "walk_id": 7, "varbinds": [["1.3.6.1.2.1.1.5.0", "sw1"]],
-            "error": None}])
+            "error": None, "truncated": False}])
+
+    def test_a_truncated_walk_says_so_in_the_result(self):
+        # The flag has to leave the edge: once it's a dashboard row, a partial
+        # dump and a complete one look identical, and reading "that OID holds
+        # nothing" off a walk that stopped at the budget is a false negative.
+        client = RecordingCentralClient(self.devices)
+        walker = _FakeDiagWalker(result=self.WalkResult(
+            varbinds=[("1.3.6.1.2.1.1.5.0", "sw1")], truncated=True))
+        runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
+        self._run(runner, [_walk_directive()])
+        self.assertTrue(client.walk_results[0]["truncated"])
 
     def test_redelivered_directive_is_deduped(self):
         client = RecordingCentralClient(self.devices)

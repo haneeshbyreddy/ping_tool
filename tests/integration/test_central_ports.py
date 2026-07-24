@@ -35,7 +35,7 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           snmp_down_consecutive=2)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
         self.switch = self.store.create_org_device(ORG, {
             "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
             "region": "Rampur", "parent_device_id": None})
@@ -142,9 +142,9 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.assertEqual(st["status"], "suppressed")
 
     def test_missing_operator_topic_is_soft_noop(self):
-        self.store.set_org(ORG, ntfy_topic_operator=None)
+        self.store.set_org(ORG, ntfy_topic_worker=None)
         with self.store._connect() as conn:
-            conn.execute("UPDATE orgs SET ntfy_topic_operator=NULL WHERE org_id=?", (ORG,))
+            conn.execute("UPDATE orgs SET ntfy_topic_worker=NULL WHERE org_id=?", (ORG,))
             conn.commit()
         self._discover_and_watch(2)
         self.pm.sync_device(self.switch, [_port(2, "down")], TS)
@@ -159,7 +159,7 @@ class BandwidthTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           snmp_down_consecutive=2, snmp_bw_consecutive=2)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
         self.switch = self.store.create_org_device(ORG, {
             "name": "Core Switch", "ip_address": "10.0.0.1", "device_type": "switch",
             "region": "Rampur", "parent_device_id": None})
@@ -366,6 +366,32 @@ class BandwidthTest(unittest.TestCase):
         self.assertEqual(evs, [])
         self.assertEqual(self._row(3)["bw_high_alarm"], 0)
         self.assertEqual(self.notifier.sent, [])
+
+    def test_bandwidth_summary_hides_alarms_on_an_unreachable_device(self):
+        # A device that isn't answering ICMP isn't answering SNMP either, so its
+        # bw flag and in/out_bps are frozen at the last walk before it dropped.
+        # The dashboard summary (top-bar chip + Home tile) must not report that
+        # as a live bandwidth alarm — the ICMP outage owns the device, and one
+        # fault shouldn't light two unrelated alarms.
+        self._watch_bw(3, threshold=10)
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.switch, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        # reachable: the alarm is real and shows
+        self.store.write_device_states(ORG, [(self.switch, "UP", 1.0, 0.0, 0.1)], TS_SEQ[3])
+        self.assertEqual(len(self.store.low_bandwidth_alarms(ORG)), 1)
+        # unreachable, either way it lands: suppressed from the summary...
+        for state in ("DOWN", "UNREACHABLE"):
+            self.store.write_device_states(ORG, [(self.switch, state, None, 100.0, None)], TS_SEQ[4])
+            self.assertEqual(self.store.low_bandwidth_alarms(ORG), [], state)
+        # ...but the underlying alarm STATE is untouched, so ports.py's
+        # transition tracking (and its paging) can't be affected by this.
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        # and it comes back when the device does
+        self.store.write_device_states(ORG, [(self.switch, "UP", 1.0, 0.0, 0.1)], TS_SEQ[5])
+        self.assertEqual(len(self.store.low_bandwidth_alarms(ORG)), 1)
 
 if __name__ == "__main__":
     unittest.main()

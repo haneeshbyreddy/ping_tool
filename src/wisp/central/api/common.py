@@ -2,7 +2,7 @@
 
 Every handler function receives the live request handler instance ``h``
 (see ``server.py``). Services ride on it as class attributes — ``h.cfg``,
-``h.store``, ``h.notifier``, ``h.registry``, ``h.upi`` — and the transport/auth
+``h.store``, ``h.notifier``, ``h.registry`` — and the transport/auth
 plumbing stays on the handler (``h._reply``, ``h._user``, ``h._reader``,
 ``h._scope_org``, ``h._can_write``, ``h._ingest_ok``).
 """
@@ -57,25 +57,21 @@ def olt_liveness(devs: list[dict], now: datetime, node_stale_s: int
 def public_user(user: dict, store) -> dict:
     org_name = store.org_name(user["org_id"]) if user["org_id"] else None
     return {"id": user["id"], "username": user["username"], "org_id": user["org_id"],
-            "org_name": org_name, "role": user["role"], "is_superadmin": user["org_id"] is None}
+            "org_name": org_name, "role": user["role"],
+            "whatsapp_number": user.get("whatsapp_number"),
+            "totp_enabled": bool(user.get("totp_enabled")),
+            "is_superadmin": user["org_id"] is None}
 
 
 def can_triage(user: dict, org: str | None) -> bool:
-    """Acknowledge/post-mortem rights: the org's owner and its field workers
-    (role 'worker' exists for exactly this), superadmin anywhere. Operator and
-    tech stay read-only — same as before the worker role existed."""
+    """Acknowledge/post-mortem rights: everyone in the org, plus superadmin
+    anywhere. Since roles collapsed to owner+worker (2026-07-21) that IS both
+    roles — the read-only operator/tech accounts this used to exclude no longer
+    exist. Kept as its own predicate because write rights (``_can_write``) are
+    still owner-only: a worker triages, it doesn't reconfigure."""
     if user["is_superadmin"]:
         return True
     return user["org_id"] == org and user["role"] in ("owner", "worker")
-
-
-def worker_org(store, worker_id) -> str | None:
-    if worker_id is None:
-        return None
-    with store._connect() as conn:
-        row = conn.execute("SELECT org_id FROM org_workers WHERE id=?",
-                           (int(worker_id),)).fetchone()
-    return row["org_id"] if row else None
 
 
 def reader_or_401(h) -> dict | None:

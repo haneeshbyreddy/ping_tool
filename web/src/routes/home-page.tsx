@@ -37,17 +37,22 @@ function fmtUptime(pct: number): string {
   return pct >= 99.995 ? "100%" : `${pct.toFixed(2)}%`
 }
 
-function Panel({ title, action, children }: {
+function Panel({ title, count, action, children }: {
   title: string
+  count?: string | number
   action?: { label: string; to: string }
   children: React.ReactNode
 }) {
   return (
-    <section className="overflow-hidden rounded-lg border bg-card">
-      <div className="flex items-center justify-between border-b px-5 py-3">
-        <h2 className="text-sm font-semibold">{title}</h2>
+    <section className="wisp-panel">
+      <div className="wisp-panel-head">
+        <h2 className="flex items-baseline gap-2">
+          <span className="text-sm font-semibold text-foreground">{title}</span>
+          {count != null && <span className="text-xs text-faint-foreground">{count}</span>}
+        </h2>
         {action && (
-          <Link to={action.to} className="text-xs text-muted-foreground transition-colors hover:text-foreground">
+          <Link to={action.to}
+            className="shrink-0 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground">
             {action.label} →
           </Link>
         )}
@@ -58,7 +63,21 @@ function Panel({ title, action, children }: {
 }
 
 function PanelEmpty({ children }: { children: React.ReactNode }) {
-  return <p className="px-5 py-8 text-center text-xs text-muted-foreground">{children}</p>
+  return <p className="px-4 py-8 text-center text-xs text-faint-foreground">{children}</p>
+}
+
+// A row is a fixed-height rail so three panels stacked beside each other line up
+// on the same baselines — that alignment is most of why a dense dashboard reads
+// as calm rather than busy.
+const ROW = "flex h-11 items-center gap-3 px-4 wisp-row"
+
+function PanelMore({ to, children }: { to: string; children: React.ReactNode }) {
+  return (
+    <Link to={to}
+      className="block border-t border-border-subtle px-4 py-2.5 text-center text-xs font-medium text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground">
+      {children}
+    </Link>
+  )
 }
 
 type Stat = {
@@ -69,27 +88,48 @@ type Stat = {
   detail: string
   tone?: "destructive" | "warning"
   to?: string
+  /** Present when this stat names a specific set of devices — clicking filters
+   *  the Network page down to just them (a clearable chip there) instead of
+   *  landing on the full unfiltered tree. Absent for a healthy metric, where
+   *  there's nothing to filter to. */
+  filter?: { label: string; ids: number[] }
 }
 
-function StatCard({ s }: { s: Stat }) {
+// undefined (no filter) when there's nothing to show — a healthy metric's
+// tile should still land on the full tree, not a guaranteed-empty list.
+function filterFor(label: string, ids: number[]): Stat["filter"] {
+  return ids.length > 0 ? { label, ids } : undefined
+}
+
+// The whole point of the strip is that a healthy metric costs you NO attention.
+// A quiet tile is plain; only a tile with something wrong picks up a tinted
+// value and edge, so scanning is a search for color, not a read of eight numbers.
+function StatTile({ s }: { s: Stat }) {
   const body = (
     <>
-      <p className="text-2xs font-medium tracking-wide text-muted-foreground uppercase">{s.label}</p>
-      {s.loading ? <Skeleton className="mt-1.5 h-8 w-16" /> : (
-        <p className="mt-1 flex items-baseline gap-2">
-          <span className={cn("text-3xl font-semibold tracking-tight", s.tone === "destructive" && "text-destructive", s.tone === "warning" && "text-warning")}>
-            {s.value}
-          </span>
-          <span className="truncate text-xs text-muted-foreground">{s.detail}</span>
+      <p className="wisp-eyebrow truncate">{s.label}</p>
+      {s.loading ? <Skeleton className="mt-3.5 h-7 w-14" /> : (
+        <p className={cn(
+          "mt-3.5 font-mono text-3xl leading-none font-medium tracking-tight",
+          s.tone === "destructive" ? "text-destructive"
+            : s.tone === "warning" ? "text-warning" : "text-foreground",
+        )}>
+          {s.value}
         </p>
       )}
+      <p className="mt-2 truncate text-xs text-faint-foreground">{s.detail}</p>
     </>
   )
-  return s.to ? (
-    <Link to={s.to} className="bg-card px-6 py-5 transition-colors hover:bg-foreground/5">{body}</Link>
-  ) : (
-    <div className="bg-card px-6 py-5">{body}</div>
+  const shell = cn(
+    "wisp-panel px-5 py-4 transition-colors",
+    s.tone === "destructive" && "border-destructive/35",
+    s.tone === "warning" && "border-warning/35",
+    s.to && "hover:bg-foreground/[0.03]",
   )
+  const state = s.filter ? { statusFilter: s.filter } : undefined
+  return s.to
+    ? <Link to={s.to} state={state} className={cn(shell, "block")}>{body}</Link>
+    : <div className={shell}>{body}</div>
 }
 
 export function HomePage() {
@@ -147,9 +187,12 @@ export function HomePage() {
     (d) => d.assigned_node_id && registeredNodeIds.has(d.assigned_node_id),
   )
 
-  const online = monitored.filter(
-    (d) => d.state === "UP" && !isStale(d.state_updated_at),
-  ).length
+  // Kept as the device list, not just a count: the "Devices online" tile drills
+  // into exactly these devices on click.
+  const notUpDevices = monitored.filter(
+    (d) => !(d.state === "UP" && !isStale(d.state_updated_at)),
+  )
+  const online = monitored.length - notUpDevices.length
   const outageList = outages.data?.outages ?? []
   // urgent cards (open outages) always render; resolved-awaiting-post-mortem is
   // paperwork and folds behind a toggle so a backlog can't bury the emergencies
@@ -157,14 +200,34 @@ export function HomePage() {
   const postmortemList = outageList.filter((o) => o.status === "pending_postmortem")
   const pendingPostmortems = postmortemList.length
   const portsDown = deviceList.reduce((sum, d) => sum + (d.ports_down ?? 0), 0)
-  const lowBw = summary.data?.low_bandwidth.length ?? 0
-  const highBw = summary.data?.high_bandwidth.length ?? 0
+  const portsDownIds = deviceList.filter((d) => (d.ports_down ?? 0) > 0).map((d) => d.id)
+  const lowBwAlarms = summary.data?.low_bandwidth ?? []
+  const highBwAlarms = summary.data?.high_bandwidth ?? []
+  const lowBw = lowBwAlarms.length
+  const highBw = highBwAlarms.length
   const bwAlarms = lowBw + highBw
+  const bwAlarmIds = [...new Set([...lowBwAlarms, ...highBwAlarms].map((a) => a.device_id))]
 
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => n.registered && !n.revoked_at)
   const staleNodes = activeNodes.filter((n) => n.last_seen && isStale(n.last_seen))
+  // Devices behind a dark probe — what the "Stale probes" tile actually drills
+  // into, since a probe id isn't a row on the Network page but its devices are.
+  const staleNodeIds = new Set(staleNodes.map((n) => n.node_id))
+  const staleProbeDeviceIds = deviceList
+    .filter((d) => d.assigned_node_id && staleNodeIds.has(d.assigned_node_id))
+    .map((d) => d.id)
   const triageCount = outageList.length + staleNodes.length
   const triageLoading = outages.isLoading || nodes.isLoading
+
+  // "Live" is only honest if it names the freshest thing that actually reported.
+  // The newest probe heartbeat is that clock — a dashboard claiming live while
+  // every probe is stale is the one lie a NOC tool cannot afford.
+  const lastSeen = activeNodes
+    .map((n) => n.last_seen)
+    .filter((t): t is string => !!t)
+    .sort()
+    .at(-1)
+  const feedStale = !lastSeen || isStale(lastSeen)
 
   // when nothing is on fire, preview a couple of post-mortems instead of an
   // empty queue with a bare button; the rest stay behind the toggle
@@ -200,9 +263,13 @@ export function HomePage() {
       label: "Devices online",
       loading: devices.isLoading,
       value: monitored.length ? `${online}/${monitored.length}` : "—",
-      detail: online < monitored.length ? `${monitored.length - online} not up` : "all up",
+      // "— / all up" reads as a healthy network when it actually means nothing
+      // is being watched at all. Name that case instead of implying health.
+      detail: !monitored.length ? "no probe assigned"
+        : online < monitored.length ? `${notUpDevices.length} not up` : "all up",
       tone: online < monitored.length ? "destructive" : undefined,
       to: "/topology",
+      filter: filterFor("Not up", notUpDevices.map((d) => d.id)),
     },
     {
       key: "ports",
@@ -212,6 +279,7 @@ export function HomePage() {
       detail: portsDown > 0 ? "check switches" : "all up",
       tone: portsDown > 0 ? "destructive" : undefined,
       to: "/topology",
+      filter: filterFor("Ports down", portsDownIds),
     },
     {
       key: "probes",
@@ -221,6 +289,7 @@ export function HomePage() {
       detail: staleNodes.length > 0 ? "not reporting" : "all reporting",
       tone: staleNodes.length > 0 ? "destructive" : undefined,
       to: "/topology",
+      filter: filterFor("Behind a stale probe", staleProbeDeviceIds),
     },
     {
       key: "bw",
@@ -230,6 +299,7 @@ export function HomePage() {
       detail: bwAlarms > 0 ? [lowBw && `${lowBw} low`, highBw && `${highBw} high`].filter(Boolean).join(" · ") : "within limits",
       tone: bwAlarms > 0 ? "warning" : undefined,
       to: "/topology",
+      filter: filterFor("Bandwidth alarm", bwAlarmIds),
     },
   ]
 
@@ -239,7 +309,55 @@ export function HomePage() {
   const pon = ponSummary.data
   const hasOptics = (pon?.olts ?? 0) > 0
   const dupStale = pon ? pon.dup_macs_total - pon.dup_macs_live : 0
+  // Is anything actually MEASURING optical power? A C-Data/DBC OLT walks a full
+  // roster with every Rx NULL, so "0 critical ONUs" on that fleet means "no ONU
+  // is measured", not "every ONU is healthy" — and those two render identically
+  // as a green zero. The dBm tiles below say which, because reading the first
+  // as the second is the whole failure mode the optical plane has to avoid.
+  const rxCount = pon?.onus_rx ?? 0
+  const noRx = hasOptics && rxCount === 0
+  const partialRx = hasOptics && rxCount > 0 && rxCount < (pon?.onus_total ?? 0)
+  // Shown under a dBm tile: never let a count stand alone when only part of the
+  // fleet is measured.
+  const rxCoverage = partialRx
+    ? `${rxCount} of ${pon!.onus_total} ONUs measured`
+    : `${rxCount} ONUs measured`
+  // Per-OLT drill-down sets for the tiles below — sourced from the same rows
+  // list_org_devices already stamps on each device, so they can't disagree with
+  // the row chips (DeviceChips) a tech would land on next. PONs at capacity is
+  // the one exception: that verdict lives per-PON, not per-device, so it rides
+  // pon_summary's own device id list instead.
+  const onusCritIds = deviceList.filter((d) => (d.onus_crit ?? 0) > 0).map((d) => d.id)
+  const onusWarnIds = deviceList.filter((d) => (d.onus_warn ?? 0) > 0).map((d) => d.id)
+  const dupMacIds = deviceList.filter((d) => (d.dup_macs ?? 0) > 0).map((d) => d.id)
+  const fiberCutIds = deviceList.filter((d) => (d.fiber_cuts ?? 0) > 0).map((d) => d.id)
+  const onusOfflineIds = deviceList
+    .filter((d) => (d.onus_total ?? 0) > (d.onus_online ?? 0))
+    .map((d) => d.id)
   const opticalStats: Stat[] = [
+    {
+      key: "onus-crit",
+      label: "Critical ONUs",
+      loading: ponSummary.isLoading,
+      // An em dash, not a 0: nothing was measured, so there is no count to give.
+      value: noRx ? "—" : (pon?.onus_crit ?? 0),
+      detail: noRx ? "no OLT reports dBm"
+        : (pon?.onus_crit ?? 0) > 0 ? "below the Rx floor" : rxCoverage,
+      tone: !noRx && (pon?.onus_crit ?? 0) > 0 ? "destructive" : undefined,
+      to: "/topology",
+      filter: filterFor("Critical ONUs", onusCritIds),
+    },
+    {
+      key: "onus-warn",
+      label: "Warning ONUs",
+      loading: ponSummary.isLoading,
+      value: noRx ? "—" : (pon?.onus_warn ?? 0),
+      detail: noRx ? "check the Optical tab"
+        : (pon?.onus_warn ?? 0) > 0 ? "weak Rx power" : rxCoverage,
+      tone: !noRx && (pon?.onus_warn ?? 0) > 0 ? "warning" : undefined,
+      to: "/topology",
+      filter: filterFor("Warning ONUs", onusWarnIds),
+    },
     {
       key: "dup-macs",
       label: "Duplicate MACs",
@@ -249,6 +367,7 @@ export function HomePage() {
         : dupStale > 0 ? `${dupStale} stale-only` : "none live",
       tone: (pon?.dup_macs_live ?? 0) > 0 ? "destructive" : undefined,
       to: "/topology",
+      filter: filterFor("Duplicate MACs", dupMacIds),
     },
     {
       key: "fiber",
@@ -258,6 +377,7 @@ export function HomePage() {
       detail: (pon?.fiber_cuts ?? 0) > 0 ? "check optical tab" : "none suspected",
       tone: (pon?.fiber_cuts ?? 0) > 0 ? "destructive" : undefined,
       to: "/topology",
+      filter: filterFor("Fiber cuts", fiberCutIds),
     },
     {
       key: "pon-cap",
@@ -269,6 +389,7 @@ export function HomePage() {
         : `all under ${pon?.pon_cap ?? 64}`,
       tone: (pon?.pons_over_cap ?? 0) > 0 ? "warning" : undefined,
       to: "/topology",
+      filter: filterFor("PON at capacity", pon?.over_cap_device_ids ?? []),
     },
     {
       key: "onus",
@@ -277,41 +398,57 @@ export function HomePage() {
       value: pon?.onus_total ? `${pon.onus_online}/${pon.onus_total}` : "—",
       detail: (pon?.onus_offline ?? 0) > 0 ? `${pon!.onus_offline} offline` : "all up",
       to: "/topology",
+      filter: filterFor("ONUs offline", onusOfflineIds),
     },
   ]
 
+  const allStats = hasOptics ? [...stats, ...opticalStats] : stats
+
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6 p-4 md:p-6">
-      <div className="flex flex-col gap-2">
-        <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
-          {stats.map((s) => <StatCard key={s.key} s={s} />)}
+    <div className="wisp-page flex flex-col gap-4 p-4 md:px-8 md:py-6">
+      <div className="flex items-center justify-between gap-4">
+        {/* "Home", not "Overview": the superadmin's /overview platform page owns
+            that word, and both were in the sidebar at once. */}
+        <h1 className="text-lg font-semibold tracking-tight">Home</h1>
+        <div className="flex items-center gap-2 text-xs text-faint-foreground">
+          <StatusDot tone={feedStale ? "destructive" : "success"} />
+          {lastSeen
+            ? <>{feedStale ? "Feed stale" : "Live"} · updated {ago(lastSeen)}</>
+            : "No probe has reported yet"}
         </div>
-        {hasOptics && (
-          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
-            {opticalStats.map((s) => <StatCard key={s.key} s={s} />)}
-          </div>
-        )}
+      </div>
+
+      {/* 10 tiles once the optical plane is live: 5-up on a wide NOC screen
+          leaves two tidy rows rather than a 4/4/2 stub. A no-fiber org keeps
+          its single row of four. */}
+      <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4",
+        hasOptics && "xl:grid-cols-5")}>
+        {allStats.map((s) => <StatTile key={s.key} s={s} />)}
       </div>
 
       {/* Triage only claims screen space when something actually needs triage — a
           healthy network gets one quiet all-clear line, not a large empty box. */}
-      {triageLoading && <Skeleton className="h-12 w-full" />}
+      {triageLoading && <Skeleton className="h-12 w-full rounded-xl" />}
       {!triageLoading && triageCount === 0 && (
-        <div className="flex items-center gap-3 rounded-lg border bg-card px-5 py-4 text-sm text-muted-foreground">
-          <StatusDot tone="success" />
-          All clear. No open outages, every probe reporting.
+        <div className="wisp-panel flex flex-wrap items-center gap-x-3 gap-y-1 px-5 py-3.5">
+          <span className="size-2 shrink-0 rounded-full bg-success ring-4 ring-success/15" />
+          <span className="text-sm font-medium text-foreground">All clear.</span>
+          <span className="text-sm text-muted-foreground">No open outages, every probe reporting.</span>
+          {lastSeen && (
+            <span className="ml-auto text-xs text-faint-foreground">Last check {ago(lastSeen)}</span>
+          )}
         </div>
       )}
       {!triageLoading && triageCount > 0 && (
         <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between">
             <h2 className="flex items-center gap-2 text-sm font-semibold">
-              <TriangleAlert className="size-4 text-muted-foreground" />
+              <TriangleAlert className="size-4 text-destructive" />
               Triage queue
             </h2>
             <div className="flex items-center gap-3">
               <ClearPostmortems org={scopeOrg} count={pendingPostmortems} />
-              <span className="rounded-full border bg-card px-2 py-0.5 text-xs font-semibold">
+              <span className="rounded-4xl border bg-card px-2.5 py-0.5 text-xs font-semibold">
                 {triageCount} open
               </span>
             </div>
@@ -332,70 +469,67 @@ export function HomePage() {
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          <Panel title="Network" action={{ label: "Topology", to: "/topology" }}>
-            {devices.isLoading && <Skeleton className="m-4 h-40" />}
-            {!devices.isLoading && deviceList.length === 0 && (
-              <PanelEmpty>No devices yet. Add them on the Network page.</PanelEmpty>
-            )}
-            {visibleDevices.map((d) => {
-              const uptime = uptimeByDevice.get(d.id)
-              const unassigned = !d.assigned_node_id
-              const stale = !unassigned && !!d.state && isStale(d.state_updated_at)
-              return (
-                <Link key={d.id} to="/topology" state={{ deviceId: d.id }}
-                  className="flex items-center gap-3 border-t px-5 py-2.5 transition-colors first:border-t-0 hover:bg-foreground/5">
-                  <StatusDot tone={unassigned ? "muted" : deviceTone(d.state, d.state_updated_at)} />
-                  <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
-                    unassigned && "text-muted-foreground")}>{d.name}</span>
-                  {d.device_type && (
-                    <span className="hidden shrink-0 text-xs text-muted-foreground md:inline">{d.device_type}</span>
+      <div className="grid items-start gap-4 lg:grid-cols-[1.85fr_1fr]">
+        <Panel title="Network" count={`${rankedDevices.length} devices`}
+          action={{ label: "Topology", to: "/topology" }}>
+          {devices.isLoading && <Skeleton className="m-4 h-32" />}
+          {!devices.isLoading && deviceList.length === 0 && (
+            <PanelEmpty>No devices yet. Add them on the Network page.</PanelEmpty>
+          )}
+          {visibleDevices.map((d) => {
+            const uptime = uptimeByDevice.get(d.id)
+            const unassigned = !d.assigned_node_id
+            const stale = !unassigned && !!d.state && isStale(d.state_updated_at)
+            return (
+              <Link key={d.id} to="/topology" state={{ deviceId: d.id }}
+                className={cn(ROW, "transition-colors hover:bg-foreground/5")}>
+                <StatusDot tone={unassigned ? "muted" : deviceTone(d.state, d.state_updated_at)} />
+                <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
+                  unassigned && "text-muted-foreground")}>{d.name}</span>
+                {d.device_type && (
+                  <span className="hidden shrink-0 text-xs text-faint-foreground md:inline">{d.device_type}</span>
+                )}
+                {d.region && (
+                  <span className="hidden min-w-0 truncate text-xs text-faint-foreground lg:inline">· {d.region}</span>
+                )}
+                <span className="ml-auto flex shrink-0 items-baseline gap-4 text-right">
+                  {unassigned && (
+                    <span className="text-xs text-ghost-foreground">not monitored</span>
                   )}
-                  {d.region && (
-                    <span className="hidden min-w-0 truncate text-xs text-muted-foreground lg:inline">· {d.region}</span>
+                  {!unassigned && d.maintenance === 1 && (
+                    <span className="text-xs text-faint-foreground">maintenance</span>
                   )}
-                  <span className="ml-auto flex shrink-0 items-baseline gap-3 text-right">
-                    {unassigned && (
-                      <span className="text-xs text-faint-foreground">not monitored</span>
-                    )}
-                    {!unassigned && d.maintenance === 1 && (
-                      <span className="text-xs text-muted-foreground">maintenance</span>
-                    )}
-                    {stale && <span className="text-xs text-muted-foreground">stale · {ago(d.state_updated_at)}</span>}
-                    {!unassigned && !stale && d.state && d.state !== "UP" && (
-                      <span className={cn("font-mono text-xs font-semibold",
-                        d.state === "DEGRADED" ? "text-warning" : "text-destructive")}>
-                        {d.state}
-                      </span>
-                    )}
-                    {!unassigned && !stale && d.state === "UP" && d.latency_ms != null && (
-                      <span className="font-mono text-xs text-muted-foreground">{Math.round(d.latency_ms)} ms</span>
-                    )}
-                    {!unassigned && !stale && d.state === "UP" && d.packet_loss != null && d.packet_loss > 0 && (
-                      <span className="font-mono text-xs text-warning">{Math.round(d.packet_loss)}% loss</span>
-                    )}
-                    {uptime != null && (
-                      <span className={cn("hidden font-mono text-xs sm:inline",
-                        uptime < 99 ? "text-warning" : "text-muted-foreground")}>
-                        {fmtUptime(uptime)}
-                      </span>
-                    )}
-                  </span>
-                </Link>
-              )
-            })}
-            {rankedDevices.length > PANEL_ROW_CAP && (
-              <Link to="/topology"
-                className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
-                All {rankedDevices.length} devices →
+                  {stale && <span className="text-xs text-faint-foreground">stale · {ago(d.state_updated_at)}</span>}
+                  {!unassigned && !stale && d.state && d.state !== "UP" && (
+                    <span className={cn("font-mono text-xs font-semibold",
+                      d.state === "DEGRADED" ? "text-warning" : "text-destructive")}>
+                      {d.state}
+                    </span>
+                  )}
+                  {!unassigned && !stale && d.state === "UP" && d.latency_ms != null && (
+                    <span className="w-14 font-mono text-xs text-muted-foreground">{Math.round(d.latency_ms)} ms</span>
+                  )}
+                  {!unassigned && !stale && d.state === "UP" && d.packet_loss != null && d.packet_loss > 0 && (
+                    <span className="font-mono text-xs text-warning">{Math.round(d.packet_loss)}% loss</span>
+                  )}
+                  {uptime != null && (
+                    <span className={cn("hidden w-16 font-mono text-xs sm:inline",
+                      uptime < 99 ? "text-warning" : "text-faint-foreground")}>
+                      {fmtUptime(uptime)}
+                    </span>
+                  )}
+                </span>
               </Link>
-            )}
-          </Panel>
-        </div>
+            )
+          })}
+          {rankedDevices.length > PANEL_ROW_CAP && (
+            <PanelMore to="/topology">All {rankedDevices.length} devices →</PanelMore>
+          )}
+        </Panel>
 
-        <div className="flex flex-col gap-6">
-          <Panel title="Probes" action={{ label: "Manage", to: "/topology" }}>
+        <div className="flex flex-col gap-4">
+          <Panel title="Probes" count={activeNodes.length || undefined}
+            action={{ label: "Manage", to: "/topology" }}>
             {nodes.isLoading && <Skeleton className="m-4 h-16" />}
             {!nodes.isLoading && activeNodes.length === 0 && (
               <PanelEmpty>No probes registered.</PanelEmpty>
@@ -403,21 +537,19 @@ export function HomePage() {
             {visibleNodes.map((n) => {
               const stale = !n.last_seen || isStale(n.last_seen)
               return (
-                <div key={n.node_id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0">
+                <div key={n.node_id} className={ROW}>
                   <StatusDot tone={stale ? "destructive" : "success"} />
                   <span className="min-w-0 truncate font-mono text-xs font-medium">{n.node_id}</span>
-                  {n.version && <span className="shrink-0 font-mono text-xs text-muted-foreground">{n.version}</span>}
-                  <span className={cn("ml-auto shrink-0 text-xs", stale ? "text-destructive" : "text-muted-foreground")}>
+                  {n.version && <span className="shrink-0 font-mono text-2xs text-faint-foreground">{n.version}</span>}
+                  <span className={cn("ml-auto shrink-0 font-mono text-xs",
+                    stale ? "text-destructive" : "text-faint-foreground")}>
                     {n.last_seen ? ago(n.last_seen) : "never seen"}
                   </span>
                 </div>
               )
             })}
             {activeNodes.length > PANEL_ROW_CAP && (
-              <Link to="/topology"
-                className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
-                All {activeNodes.length} probes →
-              </Link>
+              <PanelMore to="/topology">All {activeNodes.length} probes →</PanelMore>
             )}
           </Panel>
 
@@ -427,7 +559,7 @@ export function HomePage() {
               <PanelEmpty>No events yet.</PanelEmpty>
             )}
             {visibleEvents.map((ev) => (
-              <div key={ev.id} className="flex items-center gap-3 border-t px-5 py-2.5 first:border-t-0">
+              <div key={ev.id} className={ROW}>
                 <StatusDot tone={eventTone(ev)} />
                 <span className="min-w-0 shrink-0 truncate font-mono text-xs font-medium">
                   {ev.device_name || "—"}
@@ -435,16 +567,13 @@ export function HomePage() {
                 <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={describeEvent(ev)}>
                   {describeEvent(ev)}
                 </span>
-                <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                <span className="ml-auto shrink-0 font-mono text-xs text-faint-foreground">
                   {ago(ev.occurred_at ?? ev.received_at)}
                 </span>
               </div>
             ))}
             {events.length > PANEL_ROW_CAP && (
-              <Link to="/logs"
-                className="block border-t px-5 py-2.5 text-center text-xs text-muted-foreground transition-colors hover:text-foreground">
-                More in Logs →
-              </Link>
+              <PanelMore to="/logs">More in Logs →</PanelMore>
             )}
           </Panel>
         </div>

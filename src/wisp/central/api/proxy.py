@@ -207,7 +207,7 @@ def _resolve_web_endpoint(h, dev: dict, body: dict) -> tuple[str, int, str, str 
 _PREFLIGHT_TIMEOUT_S = 8.0
 
 
-def _preflight_candidates(h, dev: dict, ip: str, port: int,
+def _preflight_candidates(cfg, dev: dict, ip: str, port: int,
                           scheme: str) -> list[tuple[str, int, str]]:
     """Endpoints worth probing, best-first. Override devices probe the declared
     endpoint (both schemes when the owner didn't pin one); classic devices probe
@@ -216,7 +216,7 @@ def _preflight_candidates(h, dev: dict, ip: str, port: int,
         if (dev.get("web_scheme") or "").strip():
             return [(ip, port, scheme)]
         return [(ip, port, "https"), (ip, port, "http")]
-    allowed = parse_ports(h.cfg.proxy_mgmt_ports)
+    allowed = parse_ports(cfg.proxy_mgmt_ports)
     cands = [(ip, p, s) for p, s in ((443, "https"), (80, "http")) if p in allowed]
     cands.sort(key=lambda c: 0 if c[1] == port else 1)
     return cands or [(ip, port, scheme)]
@@ -237,20 +237,27 @@ def _parse_preflight_reply(resp: dict | None) -> list | None:
     return doc["results"]
 
 
-def _preflight_endpoint(h, org: str, node: str, device_id: int, dev: dict,
-                        ip: str, port: int, scheme: str
-                        ) -> tuple[str, int, str, str | None]:
+def preflight_endpoint(proxy, cfg, org: str, node: str, device_id: int,
+                       dev: dict, ip: str, port: int, scheme: str
+                       ) -> tuple[str, int, str, str | None]:
     """Resolve the heuristic (ip, port, scheme) against reality. Returns the
     (possibly corrected) target, or an error string when the edge POSITIVELY
-    confirmed nothing answers. Any inconclusive outcome keeps the heuristic."""
-    if not h.proxy.polled_recently(org, node, h.cfg.proxy_poll_hold_s + 5.0):
+    confirmed nothing answers. Any inconclusive outcome keeps the heuristic.
+
+    Takes `proxy`/`cfg` rather than the request handler because this is not
+    session-open-specific: the web-optics sweeper resolves its target the same
+    way, and it has no request. Guessing the endpoint instead is exactly the
+    failure this function was written for — and re-learning that lesson cost
+    the sweeper its first live run.
+    """
+    if not proxy.polled_recently(org, node, cfg.proxy_poll_hold_s + 5.0):
         return ip, port, scheme, None  # dormant tunnel / old edge: don't stall
-    cands = _preflight_candidates(h, dev, ip, port, scheme)
+    cands = _preflight_candidates(cfg, dev, ip, port, scheme)
     probe = ProxySession(
         sid="preflight", org_id=org, device_id=device_id, node_id=node,
         device_ip=ip, device_port=port, scheme=scheme, created_by=0,
         created_at=time.time(), expires_at=time.time() + _PREFLIGHT_TIMEOUT_S)
-    resp = h.proxy.submit(
+    resp = proxy.submit(
         probe, method="GET", path="/", headers={}, body=b"",
         timeout=_PREFLIGHT_TIMEOUT_S,
         extra={"kind": "preflight",
@@ -312,8 +319,8 @@ def session_create(h, user, body) -> None:
         return
     # Ask the edge what actually answers before committing the tab to a guess;
     # inconclusive (dormant tunnel, old edge, probe timeout) keeps the heuristic.
-    ip, port, scheme, err = _preflight_endpoint(
-        h, org, node, device_id, dev, ip, port, scheme)
+    ip, port, scheme, err = preflight_endpoint(
+        h.proxy, h.cfg, org, node, device_id, dev, ip, port, scheme)
     if err:
         h._reply(502, {"error": err})
         return

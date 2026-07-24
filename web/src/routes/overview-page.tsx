@@ -168,7 +168,7 @@ export function OverviewPage() {
   ]
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-4 p-4 md:p-6 xl:p-8">
+    <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Overview</h1>
         <p className="text-sm text-muted-foreground">

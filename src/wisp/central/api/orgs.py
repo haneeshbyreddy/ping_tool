@@ -5,15 +5,25 @@ from __future__ import annotations
 import logging
 import re
 
+from wisp.central import auth
 from wisp.central import billing as billing_mod
-from wisp.central import inventory, sysinfo, upigateway
-from wisp.central.api.common import (DENIED, body_org_write, org_or_400,
+from wisp.central import inventory, sysinfo, theme
+from wisp.central.api.common import (DENIED, body_org_write, now_iso, org_or_400,
                                      public_user, reader_or_401,
                                      superadmin_or_403)
 
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+# generous ceiling on the uploaded QR data-URI (~512 KB of base64); a real QR
+# PNG is a few KB, so this only stops someone pasting a photo by mistake.
+_QR_MAX_CHARS = 700_000
 
 log = logging.getLogger("wisp.central.api.orgs")
+
+
+def _admin_payments_topic(h) -> str | None:
+    """Where an org's 'I've paid' ping lands: the dedicated payments channel
+    if the superadmin set one, else the shared central/admin topic."""
+    return h.store.get_setting("billing_paid_topic") or h.cfg.central_ntfy_topic
 
 
 def healthz(h, qs):
@@ -47,15 +57,42 @@ def admin_overview(h, qs):
     h._reply(200, h.store.admin_overview())
 
 
+def _whatsapp_public(h) -> dict:
+    """The superadmin's WhatsApp config for the settings form. The TOKEN is a
+    secret and is NEVER echoed — only whether one is stored (`token_set`). The
+    `enabled` flag falls back to the env default when the dashboard hasn't set
+    it, matching how the notifier resolves it."""
+    wa = h.store.whatsapp_settings()
+    toggle = wa.get("enabled")
+    if toggle in (None, ""):
+        enabled = h.cfg.enable_whatsapp
+    else:
+        enabled = str(toggle).strip().lower() in ("1", "true", "yes", "on")
+    return {"enabled": enabled,
+            "phone_id": wa.get("phone_id") or "",
+            "template": wa.get("template") or "",
+            "lang": wa.get("lang") or "",
+            "api_version": wa.get("api_version") or "",
+            "token_set": bool(wa.get("token"))}
+
+
 def admin_settings(h, qs):
     if not superadmin_or_403(h):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
                    "billing_gpay_number": billing_mod.gpay_number(h.store),
-                   # the key is a secret and never leaves central — the UI
-                   # only learns whether one is configured
-                   "upigateway_key_set":
-                       bool(h.store.get_setting("upigateway_key"))})
+                   # the QR image (a data URI) and the payments channel aren't
+                   # secret — echo them back so the settings page can preview
+                   # and edit them
+                   "billing_qr_image": h.store.get_setting("billing_qr_image"),
+                   "billing_paid_topic":
+                       h.store.get_setting("billing_paid_topic") or "",
+                   # experimental WhatsApp channel — server-wide config (numbers
+                   # are per-account, set in Accounts, not here)
+                   "whatsapp": _whatsapp_public(h),
+                   # sparse colour diff over the shipped palette; `{}` means a
+                   # stock theme, NOT "no colours" (see central/theme.py)
+                   "theme_overrides": theme.load(h.store)})
 
 
 def list_orgs(h, qs):
@@ -71,6 +108,14 @@ def list_orgs(h, qs):
     gkey = h.store.get_setting("google_maps_key")
     for o in orgs:
         o["google_maps_key"] = gkey
+    # A read-only worker reads this row for the org name and the Maps key, but the
+    # ntfy paging topics are a capability (subscribe to every page, POST spoofed
+    # ones), not just data — keep them owner/superadmin-only. Nothing a worker
+    # renders needs them.
+    if user["org_id"] and user["role"] == "worker":
+        for o in orgs:
+            for k in ("ntfy_topic", "ntfy_topic_owner", "ntfy_topic_worker"):
+                o.pop(k, None)
     h._reply(200, {"orgs": orgs})
 
 
@@ -84,6 +129,46 @@ def create(h, user, body):
         return
     h.store.set_org(org, name=body.get("name"))
     h._reply(200, {"org_id": org})
+
+
+def delete(h, user, body):
+    """Erase an org and every row scoped to it. Superadmin-only, irreversible.
+
+    Guarded by an ECHOED org id (`confirm`), not just the role: this is the one
+    dashboard action with no undo and no backup — an org's devices, outage
+    history, billing months and login accounts all go at once. The typed echo
+    is what makes a mis-click impossible; the server enforces it so the check
+    can't be lost to a SPA refactor.
+
+    Deliberately NOT a tombstone: `_ensure_org` on the ingest path is how a new
+    probe bootstraps its org, so an edge still pointed here re-creates the row
+    (empty — devices/topics/plan are gone). Blocking that would break
+    self-enrollment for everyone to tidy one case; the dialog says to uninstall
+    the probe instead. The node's token IS purged here, so any deployment with
+    ingest auth configured rejects it outright.
+    """
+    if not superadmin_or_403(h):
+        return
+    try:
+        org = inventory.clean_org_id(body.get("org_id"))
+    except inventory.InventoryError as exc:
+        h._reply(422, {"error": str(exc)})
+        return
+    if not h.store.org_exists(org):
+        h._reply(404, {"error": f"org {org!r} not found"})
+        return
+    if str(body.get("confirm") or "").strip() != org:
+        h._reply(422, {"error": "type the org id to confirm deletion"})
+        return
+    summary = h.store.org_summary(org)
+    deleted = h.store.delete_org(org)
+    # the live engine is in-memory only and org ids are reusable — a stale one
+    # would hand a later org of the same name this org's FSM state
+    h.registry.forget(org)
+    log.warning("org %s DELETED by %s (%s devices, %s nodes, %s users)",
+                org, user["username"], summary["devices"], summary["nodes"],
+                summary["users"])
+    h._reply(200, {"ok": True, "org_id": org, "deleted": deleted})
 
 
 def update(h, user, body):
@@ -122,8 +207,7 @@ def update(h, user, body):
         h.store.set_org_web_proxy(org, bool(body.get("web_proxy")))
     h.store.set_org(org, name=body.get("name"), ntfy_topic=body.get("ntfy_topic"),
                     ntfy_topic_owner=body.get("ntfy_topic_owner"),
-                    ntfy_topic_operator=body.get("ntfy_topic_operator"),
-                    ntfy_topic_tech=body.get("ntfy_topic_tech"),
+                    ntfy_topic_worker=body.get("ntfy_topic_worker"),
                     map_region=map_region)
     h._reply(200, {"ok": True})
 
@@ -143,12 +227,46 @@ def admin_settings_write(h, user, body):
     if gpay is not None:
         # blank falls back to billing.DEFAULT_GPAY_NUMBER
         h.store.set_setting("billing_gpay_number", str(gpay).strip()[:32])
-    # UPIGateway API key (central/upigateway.py): a SECRET, never echoed back.
-    # Blank clears — the Pay buttons vanish everywhere and billing falls back
-    # to the manual GPay flow.
-    upi_key = body.get("upigateway_key")
-    if upi_key is not None:
-        h.store.set_setting("upigateway_key", str(upi_key).strip()[:64])
+    # QR image the org scans to pay: a data URI ("data:image/png;base64,…").
+    # Blank clears it (the lock screen falls back to just the GPay number).
+    qr = body.get("billing_qr_image")
+    if qr is not None:
+        qr = str(qr).strip()
+        if qr and not qr.startswith("data:image/"):
+            h._reply(422, {"error": "QR must be an uploaded image"})
+            return
+        if len(qr) > _QR_MAX_CHARS:
+            h._reply(422, {"error": "QR image is too large — use a smaller PNG"})
+            return
+        h.store.set_setting("billing_qr_image", qr)
+    # Dedicated ntfy channel for "I've paid" pings; blank falls back to the
+    # central/admin topic (see _admin_payments_topic).
+    paid_topic = body.get("billing_paid_topic")
+    if paid_topic is not None:
+        h.store.set_setting("billing_paid_topic", str(paid_topic).strip()[:128])
+    # Experimental WhatsApp channel config (app_settings, read fresh by the
+    # notifier). The token is write-only: a blank field LEAVES the stored one
+    # alone (so a routine save can't wipe the secret) — the SPA omits it unless
+    # the superadmin typed a new one, and a `token_clear` flag removes it.
+    wa = body.get("whatsapp")
+    if isinstance(wa, dict):
+        if "enabled" in wa:
+            # store "1"/"0" (both non-empty, so a disable persists rather than
+            # deleting the row and falling back to the env default)
+            h.store.set_setting("whatsapp_enabled", "1" if wa.get("enabled") else "0")
+        for key, cap in (("phone_id", 64), ("template", 128), ("lang", 16),
+                         ("api_version", 16)):
+            if key in wa:
+                h.store.set_setting(f"whatsapp_{key}", str(wa.get(key) or "").strip()[:cap])
+        if wa.get("token"):
+            h.store.set_setting("whatsapp_token", str(wa["token"]).strip()[:512])
+        elif wa.get("token_clear"):
+            h.store.set_setting("whatsapp_token", "")
+    # Server-wide colour overrides. Posting `{}` resets every org to the
+    # shipped palette — that IS the reset button, so an empty dict has to be
+    # distinguishable from the key being absent (absent = don't touch colours).
+    if "theme_overrides" in body:
+        theme.save(h.store, body.get("theme_overrides"))
     h._reply(200, {"ok": True})
 
 
@@ -172,83 +290,52 @@ def billing(h, qs):
         "node_count": h.store.active_node_token_count(org),
         "node_cap": billing_mod.node_cap(st["plan"]),
         "gpay_number": billing_mod.gpay_number(h.store),
-        # UPIGateway's key is a secret so the browser only learns the
-        # boolean; the UI falls back to the manual GPay flow when the
-        # gateway isn't configured.
-        "upi_enabled": h.upi.enabled,
+        # optional payment QR (a data URI) the lock screen renders beside the
+        # GPay number; null when the admin hasn't uploaded one
+        "qr_image": h.store.get_setting("billing_qr_image"),
         "plans": billing_mod.PLANS,
     })
 
 
-def billing_order(h, user, body):
-    """Create a UPIGateway order for N months of a paid plan: the browser
-    opens `payment_url` (their hosted QR page) and then polls
-    /api/billing/verify — there is no signed handshake, settlement is
-    central's own status check. Deliberately billing-exempt (server.py) — a
-    LOCKED org pays its way out from the lock screen. Owner-only, like every
-    other org write."""
-    org = body_org_write(h, user, body)
-    if org is DENIED:
+def billing_paid(h, user, body):
+    """"I've paid": the org tells the platform admin a manual GPay/QR payment
+    is on its way. Pings the dedicated payments channel with the org name so
+    the admin can verify and mark the month. Deliberately billing-exempt
+    (server.py) — a LOCKED org taps this from the lock screen. Any signed-in
+    member of the org may send it; there is nothing to authorize, only to
+    notify."""
+    org = org_or_400(h, user, body if isinstance(body, dict) else {})
+    if not org:
         return
-    if not org or not h.store.org_exists(org):
-        h._reply(404, {"error": "unknown org"})
+    topic = _admin_payments_topic(h)
+    if not topic:
+        # no admin channel configured — nothing to notify, but don't error the
+        # user (their payment still stands; the admin reconciles by hand)
+        h._reply(200, {"ok": True, "notified": False})
         return
-    if not h.upi.enabled:
-        h._reply(422, {"error": "online payments are not configured — "
-                                "pay by GPay instead"})
-        return
-    plan = billing_mod.clean_plan(body.get("plan") or h.store.org_plan(org))
-    if plan not in billing_mod.PAID_PLANS:
-        h._reply(422, {"error": "plan must be one of: "
-                                + ", ".join(billing_mod.PAID_PLANS)})
-        return
-    raw_months = body.get("months")
+    name = h.store.org_name(org) or org
+    plan = billing_mod.PLANS.get(h.store.org_plan(org), {})
+    st = billing_mod.org_status(h.store, org)
+    due = st.get("due_month") or st.get("current_month") or ""
+    body_line = f"{plan.get('label', '')} · ₹{plan.get('price_inr', '')}"
+    if due:
+        body_line += f" · {billing_mod.month_label(due)}"
+    body_line += " · verify & mark the month paid"
+    ok = False
     try:
-        count = 1 if raw_months in (None, "") else int(raw_months)
-    except (TypeError, ValueError):
-        h._reply(422, {"error": "months must be a number"})
-        return
-    if not 1 <= count <= 12:
-        h._reply(422, {"error": "months must be between 1 and 12"})
-        return
-    months = billing_mod.months_to_pay(plan, h.store.paid_months(org), count)
-    label = billing_mod.PLANS[plan]["label"]
-    desc = f"{label} plan · {billing_mod.month_label(months[0])}"
-    if len(months) > 1:
-        desc += f" – {billing_mod.month_label(months[-1])} ({len(months)} months)"
-    txn_id = upigateway.new_txn_id()
-    # their payment page redirects here after the payer finishes; the SPA
-    # sends its own origin because central may sit behind a reverse proxy
-    origin = str(body.get("origin") or "").rstrip("/")
-    if not origin.startswith(("http://", "https://")):
-        origin = f"https://{h.headers.get('Host', '')}"
-    amount_inr = billing_mod.PLANS[plan]["price_inr"] * len(months)
-    try:
-        # network call — after this point only fast local writes (dispatch rule)
-        order = h.upi.create_order(
-            txn_id, amount_inr, desc, h.store.org_name(org) or org,
-            f"{origin}/api/billing/upi-return")
-    except upigateway.GatewayError as exc:
-        h._reply(502, {"error": f"payment gateway error: {exc}"})
-        return
-    h.store.create_billing_payment(txn_id, org, plan, months,
-                                   amount_inr * 100,
-                                   created_by=user["username"],
-                                   gateway="upigateway")
-    h._reply(200, {"gateway": "upigateway", "order_id": txn_id,
-                   "amount": amount_inr * 100, "currency": "INR",
-                   "payment_url": order["payment_url"], "plan": plan,
-                   "months": months,
-                   "org_name": h.store.org_name(org) or org,
-                   "description": desc})
+        ok = h.notifier.send(topic, f"💰 {name} says they've paid",
+                             body_line, 4).ok
+    except Exception:
+        log.exception("payment-claim notification failed for %s", org)
+    h._reply(200, {"ok": True, "notified": bool(ok)})
 
 
 def billing_plan(h, user, body):
-    """Self-serve plan change WITHOUT payment: only 'free' — every paid plan
-    is entered by paying for it (billing_order/verify apply the new plan).
-    Billing-exempt: the escape hatch for a locked org that would rather drop
-    to Free than pay. Existing devices keep working; the free caps only stop
-    new creates. Owner-only."""
+    """Self-serve plan change WITHOUT payment: only 'free'. Paid plans are
+    entered by paying (GPay/QR) and the admin marking the month. Billing-exempt:
+    the escape hatch for a locked org that would rather drop to Free than pay.
+    Existing devices keep working; the free caps only stop new creates.
+    Owner-only."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
@@ -258,7 +345,7 @@ def billing_plan(h, user, body):
     plan = billing_mod.clean_plan(body.get("plan"))
     if plan != "free":
         h._reply(422, {"error": "only the free plan can be chosen without "
-                                "payment — upgrades go through checkout"})
+                                "payment — pay the admin to move to a paid plan"})
         return
     prior = h.store.org_plan(org)
     if prior != "free":
@@ -270,9 +357,9 @@ def billing_plan(h, user, body):
 
 
 def _notify_admin_plan_change(h, org: str, prior: str) -> None:
-    # best-effort heads-up, same channel as payment notices — a lost churn
-    # signal must never 500 the downgrade
-    topic = h.cfg.central_ntfy_topic
+    # best-effort heads-up on the payments channel — a lost churn signal must
+    # never 500 the downgrade
+    topic = _admin_payments_topic(h)
     if not topic:
         return
     try:
@@ -281,77 +368,6 @@ def _notify_admin_plan_change(h, org: str, prior: str) -> None:
                         f"was {prior} — self-serve downgrade", 3)
     except Exception:
         log.exception("plan-change notification failed for %s", org)
-
-
-def billing_verify(h, user, body):
-    """Finalize checkout — exactly once per order apply the plan and mark the
-    months paid. Idempotent: re-submitting a settled order just re-reads
-    status. The proof is central's own UPIGateway status check (the SPA polls
-    this while the payment tab is open — 'pending' is a normal reply, not an
-    error)."""
-    org = body_org_write(h, user, body)
-    if org is DENIED:
-        return
-    order_id = str(body.get("order_id") or "")
-    pay = h.store.billing_payment(order_id)
-    if not pay or (org and pay["org_id"] != org):
-        h._reply(404, {"error": "unknown order"})
-        return
-    if pay.get("gateway") != "upigateway":
-        # a ledger row from the removed Razorpay era — nothing can settle it
-        h._reply(422, {"error": "order predates the current payment gateway"})
-        return
-    org = pay["org_id"]  # superadmin verifying without an org scope
-    try:
-        # network call before any store write (dispatch rule)
-        verdict, _ = upigateway.attempt_settle(
-            h.store, h.upi, pay,
-            on_paid=lambda p, txn: _notify_admin_payment(h, org, p, txn))
-    except upigateway.GatewayError as exc:
-        h._reply(502, {"error": f"payment gateway error: {exc}"})
-        return
-    st = billing_mod.org_status(h.store, org)
-    h._reply(200, {"ok": True, "payment_status": verdict, **st,
-                   "paid_months": sorted(h.store.paid_months(org))})
-
-
-def billing_upi_return(h, qs):
-    """UPIGateway's browser redirect target after the payer finishes on their
-    hosted QR page. Sessionless BY DESIGN — the payer may land here in a tab
-    with no dashboard login (mobile UPI app browser). Safe because the query
-    string is never trusted: settlement still runs central's own status check
-    against the gateway. Settle best-effort, then bounce to the SPA (which
-    re-reads /api/billing and repaints)."""
-    txn_id = str((qs.get("client_txn_id") or [""])[0])
-    pay = h.store.billing_payment(txn_id) if txn_id else None
-    if pay and pay.get("gateway") == "upigateway" and h.upi.enabled:
-        try:
-            upigateway.attempt_settle(
-                h.store, h.upi, pay,
-                on_paid=lambda p, txn: _notify_admin_payment(
-                    h, p["org_id"], p, txn))
-        except upigateway.GatewayError:
-            log.exception("upi-return settle failed for %s", txn_id)
-    h.send_response(302)
-    h.send_header("Location", "/app")
-    h.send_header("Content-Length", "0")
-    h.end_headers()
-
-
-def _notify_admin_payment(h, org: str, pay: dict, payment_id: str) -> None:
-    # Heads-up on the platform admin's central channel — the payment is
-    # already settled, so a failed page must never 500 the checkout.
-    topic = h.cfg.central_ntfy_topic
-    if not topic:
-        return
-    try:
-        name = h.store.org_name(org) or org
-        h.notifier.send(
-            topic, f"💰 {name} paid ₹{pay['amount_paise'] // 100:,}",
-            f"{pay['plan']} · {', '.join(pay['months'])} · UPI {payment_id}",
-            3)
-    except Exception:
-        log.exception("payment notification failed for %s", org)
 
 
 def admin_billing_write(h, user, body):
@@ -390,15 +406,24 @@ def test_alert(h, user, body):
     if org is DENIED:
         return
     role = str(body.get("role") or "").strip().lower()
-    if role not in ("owner", "operator", "tech"):
-        h._reply(422, {"error": "role must be one of: owner, operator, tech"})
+    if role not in auth.ROLES:
+        h._reply(422, {"error": "role must be one of: " + ", ".join(auth.ROLES)})
         return
     topic = h.store.org_role_topic(org, role)
-    if not topic:
-        h._reply(422, {"error": f"no {role} channel configured — set it in "
-                                "Settings first"})
+    # WhatsApp fans out to the same role's per-account numbers — so this button
+    # verifies the WhatsApp channel too (Stage B: ntfy off, WhatsApp on).
+    whatsapp = h.store.org_role_whatsapp(org, role)
+    if not topic and not whatsapp:
+        h._reply(422, {"error": f"no {role} channel configured — set an ntfy topic "
+                                "or add WhatsApp numbers to the team's accounts first"})
         return
-    res = h.notifier.send(topic, "✅ WISP Central test alert",
-                          f"This is a test alert for {org}'s {role} channel.", 3)
+    from wisp.egress.notifiers import WhatsAppFacts
+    body_line = f"This is a test alert for {org}'s {role} channel."
+    res = h.notifier.send(
+        topic, "✅ WISP Central test alert", body_line, 3, whatsapp=whatsapp,
+        facts=WhatsAppFacts(subject=f"{org} · {role}", status="TEST",
+                            detail="channel test alert",
+                            timestamp=now_iso()))
     h._reply(200, {"ok": res.ok, "detail": res.detail, "channel": h.notifier.channel,
-                   "recipient": topic, "role": role})
+                   "recipient": topic, "role": role,
+                   "whatsapp_count": len(whatsapp)})

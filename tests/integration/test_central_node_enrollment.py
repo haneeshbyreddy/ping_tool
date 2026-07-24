@@ -22,7 +22,7 @@ class NodeEnrollmentHttpTest(unittest.TestCase):
                           central_bind="127.0.0.1", central_port=0, central_token="tok")
         self.store = CentralStore(self.cfg.central_db)
         auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
-        auth.create_user(self.store, "ispA", "oper", "operpassword", "operator")
+        auth.create_user(self.store, "ispA", "wrk", "workerpassword", "worker")
         auth.create_user(self.store, "ispB", "bowner", "bownerpassword", "owner")
         self.store.create_org_device("ispA", {
             "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
@@ -67,7 +67,7 @@ class NodeEnrollmentHttpTest(unittest.TestCase):
         return status, resp_body
 
     def test_register_requires_owner_or_superadmin(self):
-        _, cookie = self._login("oper", "operpassword")
+        _, cookie = self._login("wrk", "workerpassword")
         status, body, _ = self._req("POST", "/api/nodes",
                                     {"org_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
         self.assertEqual(status, 403)
@@ -143,7 +143,7 @@ class NodeEnrollmentHttpTest(unittest.TestCase):
     def test_delete_requires_owner_or_superadmin(self):
         _, cookie = self._login("owner", "ownerpassword")
         self._req("POST", "/api/nodes", {"org_id": "ispA", "node_id": "edge-a1"}, cookie=cookie)
-        _, oper_cookie = self._login("oper", "operpassword")
+        _, oper_cookie = self._login("wrk", "workerpassword")
         status, _, _ = self._req("POST", "/api/nodes/delete",
                                  {"org_id": "ispA", "node_id": "edge-a1"}, cookie=oper_cookie)
         self.assertEqual(status, 403)

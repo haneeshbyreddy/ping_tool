@@ -2,12 +2,14 @@ import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
-import { Plus, ArrowRight, Building2, Radio } from "lucide-react"
+import { Plus, ArrowRight, Building2, Radio, Trash2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, ApiError } from "@/lib/api"
+import type { Org } from "@/lib/types"
 import { planTone } from "@/lib/billing"
 import { BillingAdminDialog } from "@/components/billing-admin"
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -21,7 +23,7 @@ function orgInitials(o: { name: string | null; org_id: string }): string {
 }
 
 export function OrganizationsPage() {
-  const { user, setScopeOrg } = useAuth()
+  const { user, scopeOrg, setScopeOrg } = useAuth()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
@@ -59,16 +61,31 @@ export function OrganizationsPage() {
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to update"),
   })
 
+  // org deletion — the one action here with no undo: every device, outage,
+  // billing month and login account under it goes at once. Typed confirmation
+  // (server-enforced too), and the scope drops back to all-orgs after, or the
+  // shell would keep querying an org id that no longer exists.
+  const [deleting, setDeleting] = useState<Org | null>(null)
+  const remove = useMutation({
+    mutationFn: (id: string) => orgsApi.remove(id),
+    onSuccess: (_r, id) => {
+      if (scopeOrg === id) setScopeOrg(null)
+      queryClient.clear()
+      toast.success(`Deleted ${id}`)
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to delete org"),
+  })
+
   const manage = (id: string) => { setScopeOrg(id); navigate("/settings") }
 
   if (!user?.is_superadmin) return null
   const orgs = data?.orgs ?? []
 
   return (
-    <div className="mx-auto flex max-w-4xl flex-col gap-4 p-4 md:p-6 xl:p-8">
+    <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Organizations</h1>
-        <p className="text-sm text-muted-foreground">Every org on this platform. Create new ISPs and manage their topology, team, and alert routing.</p>
+        <p className="text-sm text-muted-foreground">Every org on this platform. Create new ISPs and manage their topology, accounts, and alert routing.</p>
       </div>
 
       <Card>
@@ -158,11 +175,35 @@ export function OrganizationsPage() {
                 <Button variant="outline" size="sm" onClick={() => manage(o.org_id)}>
                   Manage <ArrowRight className="size-3.5" />
                 </Button>
+                <Button variant="ghost" size="icon"
+                  className="size-8 text-muted-foreground hover:text-destructive"
+                  title={`Delete ${o.org_id}`} disabled={remove.isPending}
+                  onClick={() => setDeleting(o)}>
+                  <Trash2 className="size-3.5" />
+                </Button>
               </div>
             </div>
           ))}
         </CardContent>
       </Card>
+
+      {deleting && (
+        <ConfirmDialog
+          open onOpenChange={(v) => { if (!v) setDeleting(null) }}
+          title={`Delete ${deleting.name || deleting.org_id}?`}
+          description={
+            `Permanently erases ${deleting.device_count} device${deleting.device_count === 1 ? "" : "s"}, `
+            + `${deleting.node_count} probe${deleting.node_count === 1 ? "" : "s"}, `
+            + `${deleting.user_count} login${deleting.user_count === 1 ? "" : "s"}, and all outage, `
+            + "alert and billing history for this org. Monitoring stops immediately. "
+            + "This cannot be undone. Uninstall any probe still pointed here first — "
+            + "self-enrollment would re-create the org as an empty shell."
+          }
+          requireText={deleting.org_id}
+          confirmLabel="Delete org"
+          onConfirm={() => { remove.mutate(deleting.org_id); setDeleting(null) }}
+        />
+      )}
     </div>
   )
 }

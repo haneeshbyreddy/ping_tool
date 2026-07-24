@@ -5,8 +5,6 @@ schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``)
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 from wisp.central.store_util import _now_iso
 
 
@@ -14,7 +12,7 @@ class OrgStoreMixin:
 
     def set_org(self, org_id: str, name: str | None = None,
                 ntfy_topic: str | None = None, ntfy_topic_owner: str | None = None,
-                ntfy_topic_operator: str | None = None, ntfy_topic_tech: str | None = None,
+                ntfy_topic_worker: str | None = None,
                 map_region: str | None = None) -> None:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
@@ -22,12 +20,38 @@ class OrgStoreMixin:
             conn.execute(
                 "UPDATE orgs SET name=COALESCE(?, name), ntfy_topic=COALESCE(?, ntfy_topic),"
                 " ntfy_topic_owner=COALESCE(?, ntfy_topic_owner),"
-                " ntfy_topic_operator=COALESCE(?, ntfy_topic_operator),"
-                " ntfy_topic_tech=COALESCE(?, ntfy_topic_tech),"
+                " ntfy_topic_worker=COALESCE(?, ntfy_topic_worker),"
                 " map_region=COALESCE(?, map_region)"
                 " WHERE org_id=?",
-                (name, ntfy_topic, ntfy_topic_owner, ntfy_topic_operator, ntfy_topic_tech,
+                (name, ntfy_topic, ntfy_topic_owner, ntfy_topic_worker,
                  map_region, org_id))
+            conn.commit()
+
+
+    def org_colors(self, org_id: str, kind: str) -> dict[str, str]:
+        """Operator colour-coding for one kind ('tag' | 'node'), keyed by name.
+
+        Sparse by design: an uncoloured tag/probe simply has no row, so the
+        default costs nothing and clearing a colour is a DELETE, not a sentinel.
+        """
+        with self._connect() as conn:
+            return {r["key"]: r["color"] for r in conn.execute(
+                "SELECT key, color FROM org_colors WHERE org_id=? AND kind=?",
+                (org_id, kind))}
+
+
+    def set_org_color(self, org_id: str, kind: str, key: str,
+                      color: str | None) -> None:
+        with self._write_lock, self._connect() as conn:
+            if color is None:
+                conn.execute(
+                    "DELETE FROM org_colors WHERE org_id=? AND kind=? AND key=?",
+                    (org_id, kind, key))
+            else:
+                conn.execute(
+                    "INSERT INTO org_colors (org_id, kind, key, color) VALUES (?,?,?,?)"
+                    " ON CONFLICT(org_id, kind, key) DO UPDATE SET color=excluded.color",
+                    (org_id, kind, key, color))
             conn.commit()
 
 
@@ -55,6 +79,19 @@ class OrgStoreMixin:
             else:
                 conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
             conn.commit()
+
+
+    def whatsapp_settings(self) -> dict:
+        """The superadmin's live WhatsApp config as a bare {suffix: value} dict
+        (keys `enabled`/`token`/`phone_id`/`template`/`lang`/`api_version`),
+        read fresh by WhatsAppNotifier on each send so a dashboard change applies
+        with no restart. Only present keys are returned — the notifier fills the
+        rest from the Config env-var fallbacks."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM app_settings WHERE key LIKE 'whatsapp_%'"
+            ).fetchall()
+        return {r["key"][len("whatsapp_"):]: r["value"] for r in rows}
 
 
     def set_org_poll_interval(self, org_id: str, seconds: int | None) -> None:
@@ -127,75 +164,6 @@ class OrgStoreMixin:
             conn.commit()
 
 
-    def create_billing_payment(self, order_id: str, org_id: str, plan: str,
-                               months: list[str], amount_paise: int,
-                               created_by: str | None = None,
-                               gateway: str = "upigateway") -> None:
-        with self._write_lock, self._connect() as conn:
-            conn.execute(
-                "INSERT INTO billing_payments (order_id, org_id, plan, months,"
-                " amount_paise, status, gateway, created_by, created_at)"
-                " VALUES (?,?,?,?,?,'created',?,?,?)",
-                (order_id, org_id, plan, ",".join(months), int(amount_paise),
-                 gateway, created_by, _now_iso()))
-            conn.commit()
-
-
-    def billing_payment(self, order_id: str) -> dict | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM billing_payments WHERE order_id=?",
-                               (order_id,)).fetchone()
-        if not row:
-            return None
-        doc = dict(row)
-        doc["months"] = [m for m in doc["months"].split(",") if m]
-        return doc
-
-
-    def settle_billing_payment(self, order_id: str, payment_id: str) -> bool:
-        """created→paid exactly once — the double-submit guard: only the call
-        that wins this UPDATE applies plan/months (verify is idempotent)."""
-        with self._write_lock, self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE billing_payments SET status='paid', payment_id=?, paid_at=?"
-                " WHERE order_id=? AND status='created'",
-                (payment_id, _now_iso(), order_id))
-            conn.commit()
-            return cur.rowcount > 0
-
-
-    def fail_billing_payment(self, order_id: str) -> None:
-        """created→failed (UPIGateway reported the payment failed) so the
-        sweeper's reconciliation stops re-checking a dead order. Never touches
-        a settled row."""
-        with self._write_lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE billing_payments SET status='failed'"
-                " WHERE order_id=? AND status='created'", (order_id,))
-            conn.commit()
-
-
-    def pending_billing_payments(self, gateway: str,
-                                 max_age_days: int = 7) -> list[dict]:
-        """Unsettled orders young enough to still clear — the sweeper's
-        reconciliation input (a payer who closed every tab before the
-        redirect). The age bound keeps an abandoned checkout from being
-        re-checked forever."""
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(days=max_age_days)).isoformat(timespec="seconds")
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM billing_payments WHERE gateway=?"
-                " AND status='created' AND created_at>=?"
-                " ORDER BY created_at", (gateway, cutoff)).fetchall()
-        out = []
-        for row in rows:
-            doc = dict(row)
-            doc["months"] = [m for m in doc["months"].split(",") if m]
-            out.append(doc)
-        return out
-
-
     def billing_orgs(self) -> list[dict]:
         """Paid-plan orgs + their page targets — the billing sweeper's input."""
         with self._connect() as conn:
@@ -251,8 +219,7 @@ class OrgStoreMixin:
 
 
     def org_role_topic(self, org_id: str, role: str) -> str | None:
-        col = {"owner": "ntfy_topic_owner", "operator": "ntfy_topic_operator",
-               "tech": "ntfy_topic_tech"}.get(role)
+        col = {"owner": "ntfy_topic_owner", "worker": "ntfy_topic_worker"}.get(role)
         if not col:
             return None
         with self._connect() as conn:
@@ -265,9 +232,13 @@ class OrgStoreMixin:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
                 "SELECT o.org_id, o.name, o.ntfy_topic, o.ntfy_topic_owner,"
-                " o.ntfy_topic_operator, o.ntfy_topic_tech, o.map_region,"
+                " o.ntfy_topic_worker, o.map_region,"
                 " o.poll_interval_s, o.plan, o.web_proxy,"
-                " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count"
+                " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count,"
+                # what a delete would take with it — the confirmation states it
+                " (SELECT COUNT(*) FROM org_devices d"
+                "   WHERE d.org_id=o.org_id AND d.is_active=1) AS device_count,"
+                " (SELECT COUNT(*) FROM users u WHERE u.org_id=o.org_id) AS user_count"
                 " FROM orgs o ORDER BY o.org_id")]
 
 
@@ -296,6 +267,59 @@ class OrgStoreMixin:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM orgs WHERE org_id=?", (org_id,)).fetchone()
         return row is not None
+
+
+    def org_summary(self, org_id: str) -> dict:
+        """What a delete would destroy — shown on the confirmation, never guessed."""
+        with self._connect() as conn:
+            def one(sql: str) -> int:
+                return conn.execute(sql, (org_id,)).fetchone()[0]
+            return {
+                "devices": one("SELECT COUNT(*) FROM org_devices"
+                               " WHERE org_id=? AND is_active=1"),
+                "nodes": one("SELECT COUNT(*) FROM nodes WHERE org_id=?"),
+                "users": one("SELECT COUNT(*) FROM users WHERE org_id=?"),
+                "outages": one("SELECT COUNT(*) FROM outages WHERE org_id=?"),
+            }
+
+
+    def delete_org(self, org_id: str) -> dict:
+        """Erase an org and everything scoped to it. Irreversible.
+
+        The org-scoped tables are DISCOVERED (any table carrying an ``org_id``
+        column) rather than listed: this schema grows a table most months, and a
+        hardcoded list silently orphans rows in whatever was added last — an
+        org id is reusable, so those rows would surface inside a LATER org of
+        the same name. Rows with ``org_id IS NULL`` are global by construction
+        (superadmins in `users`, the built-in `snmp_profiles`/`gpon_profiles`)
+        and an equality match already spares them.
+
+        ORDER MATTERS: `_connect` runs with `PRAGMA foreign_keys=ON` and every FK
+        in the schema points at ``org_devices(id)``, so the device table goes
+        LAST — sweeping it alphabetically (before `switch_ports`, `snmp_walks`,
+        …) leaves those rows dangling at statement end and SQLite aborts the
+        whole delete. Constraints stay IMMEDIATE rather than deferred on
+        purpose: a violation surviving this ordering means a row references
+        another org's device, which should fail loudly, not be swept away.
+        """
+        deleted: dict[str, int] = {}
+        with self._write_lock, self._connect() as conn:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            scoped = []
+            for table in tables:
+                if table in ("orgs", "org_devices"):
+                    continue
+                cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if "org_id" in cols:
+                    scoped.append(table)
+            for table in (*scoped, "org_devices", "orgs"):
+                cur = conn.execute(f"DELETE FROM {table} WHERE org_id=?", (org_id,))
+                if cur.rowcount:
+                    deleted[table] = cur.rowcount
+            conn.commit()
+        return deleted
 
 
     def counts(self) -> dict:

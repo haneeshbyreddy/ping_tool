@@ -2,7 +2,7 @@
 paging shell and the notifier.
 
 Central used to fire one ntfy message per finding, immediately, at priority 3,
-straight to the operator topic. On a fleet whose C-Data/DBC EPON agents can't
+straight to the worker topic. On a fleet whose C-Data/DBC EPON agents can't
 report dying-gasp/LOS, an area power cut darkens many PONs across many OLTs at
 once and every one misclassifies as a fiber cut — so a single DISCOM outage
 produced dozens of pages, ntfy's free quota 429'd ~half of them, and the drops
@@ -31,7 +31,7 @@ from collections import defaultdict
 
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
-from wisp.egress.notifiers import NotifyResult
+from wisp.egress.notifiers import NotifyResult, WhatsAppFacts
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,10 @@ _DIGEST_KINDS = frozenset({
 _KIND_LABELS = {
     "PON_FAULT": "🔦 PON faults",
     "PON_RECOVERED": "✅ PON recovered",
+    # PUSH kinds, labelled like PORT_BW_* so that moving optics to the digest
+    # later is a one-line change to _DIGEST_KINDS and not a formatting bug.
+    "OPTICAL_CRIT": "🔻 Optical critical",
+    "OPTICAL_RECOVERED": "✅ Optical recovered",
     "PORT_BW_LOW": "📉 Low bandwidth",
     "PORT_BW_OK": "📈 Bandwidth recovered",
     "PORT_BW_HIGH": "📈 High bandwidth",
@@ -88,7 +92,8 @@ class AlertRouter:
     def emit(self, kind: str, *, topic: str | None, title: str, body: str,
              priority: int, ts: str, outage_id: int | None = None,
              device_id: int | None = None, payload: str | None = None,
-             gate: bool = True, cooldown_min: int | None = None) -> NotifyResult:
+             gate: bool = True, cooldown_min: int | None = None,
+             whatsapp=None, wa_facts: WhatsAppFacts | None = None) -> NotifyResult:
         payload = payload if payload is not None else kind
         channel = self.notifier.channel
 
@@ -113,7 +118,15 @@ class AlertRouter:
             _log("suppressed")
             return NotifyResult(False, "cooldown")
 
-        res = self.notifier.send(topic, title, body, priority)
+        # Best-effort WhatsApp fan-out rides the same PUSH. Every governor caller
+        # pages the WORKER channel (the SNMP-derived stream's audience — see the
+        # module docstring), so worker numbers are the default; resolved here
+        # only on the actual send path (a suppressed/gated alert never queries).
+        numbers = (self.store.org_role_whatsapp(self.org_id, "worker")
+                   if whatsapp is None else whatsapp)
+        facts = wa_facts or WhatsAppFacts.derive(title, body, kind, ts)
+        res = self.notifier.send(topic, title, body, priority,
+                                 whatsapp=numbers, facts=facts)
         _log("sent" if res.ok else "failed")
         return res
 
@@ -150,10 +163,12 @@ def flush_digests(store, org_id: str, notifier, cfg: Config, now_ts: str) -> Non
     if age_s < cfg.digest_interval_min * 60:
         return
 
-    topic = store.org_role_topic(org_id, "operator")
+    topic = store.org_role_topic(org_id, "worker")
+    whatsapp = store.org_role_whatsapp(org_id, "worker")
     title, body = compose_digest(rows)
     if topic:
-        res = notifier.send(topic, title, body, 2)
+        res = notifier.send(topic, title, body, 2, whatsapp=whatsapp,
+                            facts=WhatsAppFacts.derive(title, body, "DIGEST", now_ts))
         status = "sent" if res.ok else "failed"
     else:
         status = "suppressed"

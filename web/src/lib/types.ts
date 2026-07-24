@@ -1,4 +1,4 @@
-export type Role = "owner" | "operator" | "tech" | "worker"
+export type Role = "owner" | "worker"
 
 export interface User {
   id: number
@@ -6,6 +6,10 @@ export interface User {
   org_id: string | null
   org_name: string | null
   role: Role
+  // experimental WhatsApp channel: this account's own page number (E.164)
+  whatsapp_number: string | null
+  // TOTP second factor active on this account (owner/superadmin only)
+  totp_enabled: boolean
   is_superadmin: boolean
 }
 
@@ -19,8 +23,7 @@ export interface Org {
   name: string | null
   ntfy_topic: string | null
   ntfy_topic_owner: string | null
-  ntfy_topic_operator: string | null
-  ntfy_topic_tech: string | null
+  ntfy_topic_worker: string | null
   map_region: string | null
   // the superadmin's server-wide Map Tiles key, injected into every org row
   google_maps_key: string | null
@@ -31,6 +34,9 @@ export interface Org {
   // device web-UI proxy capability (webplan.md §6.7) — superadmin-set only
   web_proxy: number
   node_count: number
+  // stated on the delete confirmation — an org wipe has no undo
+  device_count: number
+  user_count: number
 }
 
 /** One web-UI proxy tunnel session (GET /api/proxy/sessions). `live` means the
@@ -106,9 +112,9 @@ export interface BillingInfo {
   node_count: number
   node_cap: number | null
   gpay_number: string
-  /** UPIGateway configured server-side (its key is a secret — the browser
-      only ever learns the boolean); false = manual GPay fallback */
-  upi_enabled: boolean
+  /** optional payment QR (a data URI) the admin uploaded; null = none, show
+      just the GPay number */
+  qr_image: string | null
   plans: Record<Plan, PlanSpec>
 }
 
@@ -151,6 +157,8 @@ export interface PonSummary {
   fiber_cuts: number
   /** PONs at or over their ONU cap (per-OLT override → default) */
   pons_over_cap: number
+  /** OLTs carrying at least one over-cap PON — for the KPI tile's drill-down */
+  over_cap_device_ids: number[]
   /** the org default ONU-per-PON cap (per-OLT overrides not reflected here) */
   pon_cap: number
   /** ONU count on the busiest over-cap PON, 0 when none */
@@ -159,6 +167,16 @@ export interface PonSummary {
   dup_macs_live: number
   /** every MAC on ≥2 slots, live or reg-table history */
   dup_macs_total: number
+  /** ONLINE ONUs below the critical Rx floor — a subscriber about to lose sync */
+  onus_crit: number
+  /** ONLINE ONUs in the warning Rx band */
+  onus_warn: number
+  /** roster slots carrying a real Rx figure. 0 with a non-zero onus_total means
+      NOTHING is measured on this fleet, which is a very different statement
+      from "0 critical" — the tiles have to be able to tell them apart. */
+  onus_rx: number
+  /** OLTs contributing at least one Rx reading */
+  olts_rx: number
 }
 
 /** Open-outage wave verdict (central/incidents.py): topology × geography.
@@ -174,11 +192,17 @@ export interface IncidentShape {
   root_name: string | null
 }
 
-/** Drawn cable path for one link — intermediate vertices only, parent→child order. */
+/** Map presentation for one link: the drawn cable path (intermediate vertices
+    only, parent→child order) plus the operator's cartography — a palette colour
+    and where the bandwidth chip sits along the line. */
 export interface LinkRoute {
   child_id: number
   parent_id: number
   waypoints: Array<[number, number]>
+  /** LinkColor name; null = the line's own tone */
+  color: string | null
+  /** 0..1 along the rendered path; null = midpoint */
+  label_pos: number | null
   updated_at: string
   updated_by: string | null
 }
@@ -187,7 +211,6 @@ export interface OrgRegion {
   name: string
   declared: boolean
   device_count: number
-  worker_count: number
 }
 
 export interface OrgDevice {
@@ -200,6 +223,9 @@ export interface OrgDevice {
   /** free-form labels for Network-page filtering (≤8, cosmetic only) */
   tags: string[]
   parent_device_id: number | null
+  /** tree presentation only: render at the top level, not inside the parent's
+   *  subtree. The parent link stays real everywhere else (map, suppression). */
+  tree_detached: 0 | 1
   assigned_node_id: string | null
   maintenance: 0 | 1
   snmp_enabled: 0 | 1
@@ -221,6 +247,9 @@ export interface OrgDevice {
   lng: number | null
   child_count: number
   backup_parents: number[]
+  /** switch-to-switch cross-links (undirected, no dependency). Stored once per
+      cable and expanded symmetrically server-side, so BOTH ends list each other. */
+  peer_ids: number[]
 
   ports_down: number
   ports_bw_low: number
@@ -230,6 +259,11 @@ export interface OrgDevice {
   onus_online: number | null
   onus_warn: number | null
   onus_crit: number | null
+  /** roster slots on this OLT carrying a real per-ONU Rx figure. The optics
+      badge alone can't answer "is dBm working here": a C-Data/DBC OLT walks a
+      full roster with every rx_dbm NULL, so optics reads green on a box that
+      reports no optical power at all. */
+  onus_rx: number | null
   /** suspected fiber-cut PON mass-drops on this OLT (row chip → Optical tab) */
   fiber_cuts: number
   /** live duplicate-MAC groups touching this OLT (≥2 slots online at once) */
@@ -280,6 +314,32 @@ export interface SwitchPort {
   bw_high_streak: number
   bw_high_alarm: 0 | 1
   bw_high_alarm_since: string | null
+  /** operator-declared cabling, child side: this port faces that parent device
+      (primary or backup uplink) — the mirror of feeds_device_id */
+  uplink_device_id: number | null
+}
+
+/** One side of a physical link (`/api/inventory/link-ports`): a switch_ports row
+    bound to a link either as the parent's downstream port (feeds_device_id names
+    the child) or the child's uplink port (uplink_device_id names the parent).
+    Feeds the map's per-link bandwidth labels in one org-wide query. */
+export interface LinkPort {
+  id: number
+  device_id: number
+  if_index: number
+  if_name: string | null
+  if_alias: string | null
+  admin_status: string | null
+  oper_status: string | null
+  monitored: 0 | 1
+  alarm: 0 | 1
+  bw_alarm: 0 | 1
+  bw_high_alarm: 0 | 1
+  in_bps: number | null
+  out_bps: number | null
+  updated_at: string | null
+  feeds_device_id: number | null
+  uplink_device_id: number | null
 }
 
 export interface PerfSample {
@@ -351,6 +411,33 @@ export interface DupMac {
   mac: string
   members: DupMacMember[]
 }
+/** one ONU matched by a serial/MAC or name search, with just the fields the
+    Network page's result list renders — a slim projection of OnuOptic. */
+export interface OnuSearchHit {
+  id: number
+  onu_key: string
+  pon_port: string | null
+  onu_id: number | null
+  name: string | null
+  serial: string | null
+  state: OnuOptic["state"]
+  severity: OnuOptic["severity"]
+  rx_dbm: number | null
+  distance_m: number | null
+  last_online_at: string | null
+  updated_at: string
+}
+export interface OnuSearchMatch {
+  device_id: number
+  device_name: string
+  onus: OnuSearchHit[]
+}
+export interface OnuSearchResponse {
+  matches: OnuSearchMatch[]
+  /** hit the server's result cap — the needle is too broad, type more */
+  truncated: boolean
+}
+
 export interface OpticsResponse {
   onus: OnuOptic[]
   olt: OltOptics | null
@@ -424,31 +511,8 @@ export interface NodesResponse {
   latest_version: string | null
   rollout: OrgRollout | null
   auto_update: boolean
-}
-
-export interface Worker {
-  id: number
-  org_id: string
-  name: string
-  role: Role
-  region: string | null
-  is_active: 0 | 1
-  notes: string | null
-}
-
-export interface AttendanceOperator {
-  id: number
-  name: string
-  role: Role
-  region: string | null
-  present_today: boolean
-  days: Record<string, boolean>
-}
-
-export interface AttendanceOverview {
-  today: string
-  days: string[]
-  operators: AttendanceOperator[]
+  /** operator colour per node_id, sparse — see lib/palette.ts */
+  node_colors: Record<string, string>
 }
 
 export interface LogEvent {
@@ -498,7 +562,20 @@ export interface AccountUser {
   username: string
   role: Role
   is_active: 0 | 1
+  // experimental WhatsApp channel: where this account is paged (E.164) or null
+  whatsapp_number: string | null
   created_at: string
+}
+
+// Server-wide WhatsApp channel config (Settings → Platform). The token is never
+// echoed — only whether one is stored.
+export interface WhatsappSettings {
+  enabled: boolean
+  phone_id: string
+  template: string
+  lang: string
+  api_version: string
+  token_set: boolean
 }
 
 export type SnmpWalkStatus = "pending" | "done" | "error"
@@ -512,6 +589,10 @@ export interface SnmpWalk {
   requested_by: string | null
   error: string | null
   varbind_count: number | null
+  /** Walk stopped at the edge's varbind cap or time budget — the subtree is
+   *  only partly dumped, so an absent OID proves nothing. SQLite flag, so
+   *  0 | 1 like tree_detached, not a JSON boolean. */
+  truncated: 0 | 1
   created_at: string
   completed_at: string | null
 }
@@ -600,6 +681,92 @@ export interface DeviceCapability {
 export interface SnmpStatusResponse {
   status: SnmpSubsystemStatus[]
   capability: DeviceCapability[]
+}
+
+/** Outcome of the last web-UI optics scrape for one OLT (central's own clock).
+    `partial` is a real success: a PON that answered carries real readings. */
+export type WebOpticsState =
+  | "ok" | "partial" | "skipped" | "no_profile" | "no_credentials"
+  | "unreachable" | "login" | "error"
+
+export interface WebOpticsStatus {
+  device_id: number
+  profile: string
+  state: WebOpticsState
+  detail: string | null
+  rows: number
+  updated_at: string
+  last_ok_at: string | null
+}
+
+/** WHY an OLT shows no per-ONU dBm (GET /api/inventory/rx-status).
+    FACTS, not a verdict — the SPA composes the sentence, exactly as
+    SnmpDiagnosis does for a blank Ports/Optical panel. */
+export interface RxStatusResponse {
+  /** the vendor this OLT resolved as, dropdown first then edge detection */
+  vendor: string | null
+  vendor_source: "declared" | "detected" | null
+  /** the web-UI optics recipe covering that vendor, or null if none exists */
+  web_profile: string | null
+  /** every vendor a profile covers — "which OLTs can be read at all" */
+  known_vendors: string[]
+  has_credentials: boolean
+  web_proxy: boolean
+  has_node: boolean
+  onus_total: number
+  onus_rx: number
+  scrape: WebOpticsStatus | null
+  /** whether a read can be asked for on demand at all (recipe + login + probe).
+      Decided server-side off the sweep's own eligibility query — the button
+      must never promise a reading nothing will take. */
+  can_refresh: boolean
+  /** a read of this OLT is running right now */
+  refreshing: boolean
+}
+
+/** A web-UI optics vendor recipe (Settings → Monitoring). Closed vocabulary —
+    the whole profile is refused rather than partially applied. */
+export interface WebOpticsProfileSpec {
+  login_page_path: string
+  login_path: string
+  optics_path: string
+  username_field: string
+  password_field: string
+  login_static: Record<string, string>
+  session: string
+  session_key_field: string
+  optics_method: string
+  pon_field: string
+  optics_static: Record<string, string>
+  charset: string
+  onu_id_shape: string
+  pon_label: string
+  columns: Record<string, string>
+  column_order: string[]
+  default_pons: number[]
+  vendor_markers: string[]
+}
+
+export interface WebOpticsProfile {
+  id: number
+  org_id: string | null // null = global (every org)
+  name: string
+  spec: WebOpticsProfileSpec
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface WebOpticsProfilesResponse {
+  profiles: WebOpticsProfile[]
+  /** vendors covered by a profile shipped in code (a same-named row shadows it) */
+  builtins: string[]
+  fields: string[]
+  sessions: string[]
+  methods: string[]
+  charsets: string[]
+  onu_id_shapes: string[]
+  example: Partial<WebOpticsProfileSpec>
 }
 
 export interface SystemStats {

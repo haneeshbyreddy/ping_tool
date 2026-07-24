@@ -82,79 +82,6 @@ class ComputeStatusTest(unittest.TestCase):
         self.assertEqual(st["paid_through"], "2027-01")
 
 
-class MonthsToPayTest(unittest.TestCase):
-    """What one checkout buys: the next N unpaid months."""
-
-    def test_locked_org_starts_at_current_month(self):
-        now = _utc(2026, 7, 16)
-        self.assertEqual(billing.months_to_pay("pro", set(), 3, now),
-                         ["2026-07", "2026-08", "2026-09"])
-
-    def test_active_org_extends_the_runway(self):
-        now = _utc(2026, 7, 16)
-        paid = {"2026-07", "2026-08"}
-        self.assertEqual(billing.months_to_pay("pro", paid, 2, now),
-                         ["2026-09", "2026-10"])
-
-    def test_prepaid_island_is_skipped_not_double_billed(self):
-        now = _utc(2026, 7, 16)
-        paid = {"2026-07", "2026-09"}  # admin pre-marked September
-        self.assertEqual(billing.months_to_pay("pro", paid, 2, now),
-                         ["2026-08", "2026-10"])
-
-    def test_year_rollover(self):
-        now = _utc(2026, 11, 20)
-        paid = {"2026-11", "2026-12"}
-        self.assertEqual(billing.months_to_pay("vip", paid, 2, now),
-                         ["2027-01", "2027-02"])
-
-
-class UpiGatewayUnitTest(unittest.TestCase):
-    """UPIGateway's pure parts: the IST txn-date derivation and
-    attempt_settle's short-circuits. The network calls are exercised via a
-    double in integration/test_central_billing."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.store = CentralStore(Path(self.tmp.name) / "c.db")
-        from wisp.central.upigateway import UpiGateway
-        self.gw = UpiGateway(self.store)
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_enabled_rides_the_key(self):
-        self.assertFalse(self.gw.enabled)
-        self.store.set_setting("upigateway_key", "k")
-        self.assertTrue(self.gw.enabled)
-
-    def test_ist_txn_date_crosses_midnight(self):
-        from wisp.central.upigateway import ist_txn_date
-        # 20:00 UTC = 01:30 IST the NEXT day — their servers key on IST
-        self.assertEqual(ist_txn_date("2026-07-16T20:00:00+00:00"),
-                         "17-07-2026")
-        self.assertEqual(ist_txn_date("2026-07-16T10:00:00+00:00"),
-                         "16-07-2026")
-        # naive timestamps (SQLite datetime('now') style) read as UTC
-        self.assertEqual(ist_txn_date("2026-12-31T19:00:00"), "01-01-2027")
-
-    def test_attempt_settle_never_calls_gateway_on_dead_rows(self):
-        from wisp.central.upigateway import attempt_settle
-
-        class Boom:
-            def order_status(self, *a):  # any call = the guard failed
-                raise AssertionError("gateway asked about a settled row")
-
-        base = {"order_id": "x", "org_id": "ispA", "plan": "pro",
-                "months": ["2026-07"], "created_at": "2026-07-16T10:00:00+00:00"}
-        self.assertEqual(attempt_settle(self.store, Boom(),
-                                        {**base, "status": "paid"}),
-                         ("success", False))
-        self.assertEqual(attempt_settle(self.store, Boom(),
-                                        {**base, "status": "failed"}),
-                         ("failure", False))
-
-
 class SweeperTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -184,7 +111,8 @@ class SweeperTest(unittest.TestCase):
     def test_locked_pages_once_and_mentions_gpay(self):
         now = _utc(2026, 8, 2)
         self.assertEqual(self.sweeper.check(now), [("ispA", "2026-08", "locked")])
-        self.assertIn("locked", self.notifier.sent[0]["title"])
+        # 🔒 marks the lock tier (💳 is the due-soon reminder)
+        self.assertIn("🔒", self.notifier.sent[0]["title"])
         self.assertIn(billing.DEFAULT_GPAY_NUMBER, self.notifier.sent[0]["body"])
         self.assertEqual(self.sweeper.check(now), [])
 

@@ -43,6 +43,6 @@ def record_and_evaluate(store, org_id: str, eng, cycle, results: dict, ts: str,
             title, body, payload = (f"✅ Recovered — {dev.name} ({dev.region})",
                                     "Link performance back to baseline", "PERF_RECOVERED")
         AlertRouter(store, org_id, notifier, cfg).emit(
-            payload, topic=store.org_role_topic(org_id, "operator"),
+            payload, topic=store.org_role_topic(org_id, "worker"),
             title=title, body=body, priority=3, ts=ts, device_id=dev_id,
             gate=cfg.perf_alerts)

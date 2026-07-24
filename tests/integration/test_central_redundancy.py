@@ -24,7 +24,7 @@ class RedundancySweepTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db")
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(ORG, ntfy_topic_operator="op")
+        self.store.set_org(ORG, ntfy_topic_worker="op")
         self.primary = self.store.create_org_device(ORG, {
             "name": "Primary Tower", "ip_address": "10.0.0.2", "device_type": None,
             "region": "Rampur", "parent_device_id": None})

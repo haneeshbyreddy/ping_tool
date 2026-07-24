@@ -23,16 +23,11 @@ class DeviceStoreMixin:
                 "SELECT region, COUNT(*) AS n FROM org_devices"
                 " WHERE org_id=? AND is_active=1 AND region IS NOT NULL AND region!=''"
                 " GROUP BY region", (org_id,))}
-            worker_counts = {r["region"]: r["n"] for r in conn.execute(
-                "SELECT region, COUNT(*) AS n FROM org_workers"
-                " WHERE org_id=? AND is_active=1 AND region IS NOT NULL AND region!=''"
-                " GROUP BY region", (org_id,))}
-        names = sorted(declared | set(dev_counts) | set(worker_counts), key=str.lower)
+        names = sorted(declared | set(dev_counts), key=str.lower)
         return [{
             "name": n,
             "declared": n in declared,
             "device_count": dev_counts.get(n, 0),
-            "worker_count": worker_counts.get(n, 0),
         } for n in names]
 
 
@@ -46,8 +41,8 @@ class DeviceStoreMixin:
 
 
     def rename_region(self, org_id: str, old: str, new: str) -> None:
-        # Cascades to devices and workers so a rename can't fragment the org's
-        # region set; the new name lands declared even if `old` never was.
+        # Cascades to devices so a rename can't fragment the org's region set;
+        # the new name lands declared even if `old` never was.
         with self._write_lock, self._connect() as conn:
             conn.execute("DELETE FROM org_regions WHERE org_id=? AND name=?",
                          (org_id, old))
@@ -56,22 +51,18 @@ class DeviceStoreMixin:
                 " VALUES (?,?,?)", (org_id, new, _now_iso()))
             conn.execute("UPDATE org_devices SET region=? WHERE org_id=? AND region=?",
                          (new, org_id, old))
-            conn.execute("UPDATE org_workers SET region=? WHERE org_id=? AND region=?",
-                         (new, org_id, old))
             conn.commit()
 
 
     def delete_region(self, org_id: str, name: str) -> dict:
         with self._write_lock, self._connect() as conn:
             in_use = conn.execute(
-                "SELECT (SELECT COUNT(*) FROM org_devices"
-                "        WHERE org_id=? AND region=? AND is_active=1)"
-                "     + (SELECT COUNT(*) FROM org_workers"
-                "        WHERE org_id=? AND region=? AND is_active=1)",
-                (org_id, name, org_id, name)).fetchone()[0]
+                "SELECT COUNT(*) FROM org_devices"
+                " WHERE org_id=? AND region=? AND is_active=1",
+                (org_id, name)).fetchone()[0]
             if in_use:
                 return {"ok": False,
-                        "reason": f"region is used by {in_use} device(s)/member(s)"}
+                        "reason": f"region is used by {in_use} device(s)"}
             conn.execute("DELETE FROM org_regions WHERE org_id=? AND name=?",
                          (org_id, name))
             conn.commit()
@@ -85,7 +76,7 @@ class DeviceStoreMixin:
                 " d.tags,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
-                " d.lat, d.lng, d.pon_port, d.onu_pon_limit,"
+                " d.lat, d.lng, d.pon_port, d.onu_pon_limit, d.tree_detached,"
                 " d.web_ip, d.web_port, d.web_scheme,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
@@ -98,6 +89,20 @@ class DeviceStoreMixin:
                 " g.onus_total AS onus_total, g.onus_online AS onus_online,"
                 " g.warn_count AS onus_warn, g.crit_count AS onus_crit,"
                 " g.updated_at AS optics_updated_at,"
+                # How many roster slots carry a real per-ONU Rx figure. The
+                # optics badge alone can't answer "is dBm working here": a
+                # C-Data/DBC OLT walks a full roster with EVERY rx_dbm NULL, so
+                # the optics icon goes green on a box that reports no optical
+                # power at all. Counted off the live table rather than stored on
+                # olt_optics because the web scrape (central/weboptics.py) folds
+                # Rx in on its OWN clock — a count stamped by the SNMP sweep
+                # would read zero for up to 15 minutes after a scrape landed.
+                # Counted over the raw table (zombie slots included, since
+                # onu_optics never deletes) — this is a CAPABILITY signal, "does
+                # a dBm figure exist for this OLT at all", and the reader pairs
+                # it with optics_updated_at for the freshness half.
+                " (SELECT COUNT(*) FROM onu_optics r WHERE r.device_id = d.id"
+                "  AND r.rx_dbm IS NOT NULL) AS onus_rx,"
                 " (SELECT MAX(p.updated_at) FROM switch_ports p"
                 "  WHERE p.device_id = d.id) AS ports_updated_at,"
                 " (SELECT MAX(o.started_at) FROM outages o WHERE o.device_id = d.id"
@@ -117,12 +122,23 @@ class DeviceStoreMixin:
                 "SELECT child_id, parent_id FROM org_device_links"
                 " WHERE org_id=? AND is_active=1 AND kind='backup'",
                 (org_id,)).fetchall()
+            peers = conn.execute(
+                "SELECT child_id, parent_id FROM org_device_links"
+                " WHERE org_id=? AND is_active=1 AND kind='peer'",
+                (org_id,)).fetchall()
         backups: dict[int, list[int]] = {}
         for link in links:
             backups.setdefault(link["child_id"], []).append(link["parent_id"])
+        # ONE canonical row per cross-link (lo, hi) expands SYMMETRICALLY here, so
+        # each end lists the other regardless of which device it was declared from
+        peer_ids: dict[int, list[int]] = {}
+        for link in peers:
+            peer_ids.setdefault(link["child_id"], []).append(link["parent_id"])
+            peer_ids.setdefault(link["parent_id"], []).append(link["child_id"])
         out = [dict(r) for r in rows]
         for d in out:
             d["backup_parents"] = backups.get(d["id"], [])
+            d["peer_ids"] = sorted(peer_ids.get(d["id"], []))
             # stored comma-joined; the wire carries a real list
             d["tags"] = [t for t in (d["tags"] or "").split(",") if t]
         return out
@@ -168,14 +184,20 @@ class DeviceStoreMixin:
     def update_org_device(self, org_id: str, device_id: int, clean: dict) -> bool:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
+                # tree_detached only means something under a parent, and the row
+                # menu offering it hides once there isn't one — so clearing it
+                # here is what keeps the flag reachable (an operator who parents
+                # the device again gets the plain nested row, not a stale lift)
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
                 " tags=?, parent_device_id=?, assigned_node_id=?, gpon_vendor=?,"
-                " pon_port=?"
+                " pon_port=?,"
+                " tree_detached=CASE WHEN ? IS NULL THEN 0 ELSE tree_detached END"
                 " WHERE id=? AND org_id=? AND is_active=1",
                 (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
                  clean.get("tags"),
                  clean["parent_device_id"], clean.get("assigned_node_id"),
-                 clean.get("gpon_vendor"), clean.get("pon_port"), device_id, org_id))
+                 clean.get("gpon_vendor"), clean.get("pon_port"),
+                 clean["parent_device_id"], device_id, org_id))
             if cur.rowcount > 0 and not clean.get("assigned_node_id"):
                 conn.execute("DELETE FROM device_states WHERE org_id=? AND device_id=?",
                              (org_id, device_id))
@@ -202,38 +224,87 @@ class DeviceStoreMixin:
             return cur.rowcount > 0
 
 
+    @staticmethod
+    def _prune_link_route(conn, org_id: str, child_id: int, parent_id: int) -> None:
+        """Drop a row that no longer carries anything.
+
+        The row holds geometry AND styling now, so "empty" is all three fields
+        being empty — clearing the waypoints off a link the operator coloured
+        must not take the colour with it (and vice versa)."""
+        conn.execute(
+            "DELETE FROM link_routes WHERE org_id=? AND child_id=? AND parent_id=?"
+            " AND waypoints IN ('', '[]') AND color IS NULL AND label_pos IS NULL",
+            (org_id, child_id, parent_id))
+
+
     def set_link_route(self, org_id: str, child_id: int, parent_id: int,
                        waypoints: list[list[float]], updated_by: str | None) -> None:
         """Upsert the drawn cable path for one link; an empty list clears it."""
         with self._write_lock, self._connect() as conn:
-            if not waypoints:
-                conn.execute(
-                    "DELETE FROM link_routes WHERE org_id=? AND child_id=? AND parent_id=?",
-                    (org_id, child_id, parent_id))
-            else:
-                conn.execute(
-                    "INSERT INTO link_routes (org_id, child_id, parent_id, waypoints,"
-                    " updated_at, updated_by) VALUES (?,?,?,?,?,?)"
-                    " ON CONFLICT(org_id, child_id, parent_id) DO UPDATE SET"
-                    " waypoints=excluded.waypoints, updated_at=excluded.updated_at,"
-                    " updated_by=excluded.updated_by",
-                    (org_id, child_id, parent_id, json.dumps(waypoints), _now_iso(),
-                     updated_by))
+            conn.execute(
+                "INSERT INTO link_routes (org_id, child_id, parent_id, waypoints,"
+                " updated_at, updated_by) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, child_id, parent_id) DO UPDATE SET"
+                " waypoints=excluded.waypoints, updated_at=excluded.updated_at,"
+                " updated_by=excluded.updated_by",
+                (org_id, child_id, parent_id, json.dumps(waypoints), _now_iso(),
+                 updated_by))
+            self._prune_link_route(conn, org_id, child_id, parent_id)
+            conn.commit()
+
+
+    def set_link_style(self, org_id: str, child_id: int, parent_id: int,
+                       fields: dict, updated_by: str | None) -> None:
+        """Upsert a link's map styling — colour and/or bandwidth-label position.
+
+        A SPARSE update, like the theme overrides: only the keys present in
+        `fields` are written, so moving a label can't clear a colour set from a
+        different panel. Creates the row on a link with no drawn route (styling
+        doesn't require geometry) and prunes it back out when nothing is left."""
+        sets, vals = [], []
+        for col in ("color", "label_pos"):
+            if col in fields:
+                sets.append(f"{col}=?")
+                vals.append(fields[col])
+        if not sets:
+            return
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO link_routes (org_id, child_id, parent_id, waypoints,"
+                " color, label_pos, updated_at, updated_by) VALUES (?,?,?,'[]',?,?,?,?)"
+                " ON CONFLICT(org_id, child_id, parent_id) DO UPDATE SET "
+                + ", ".join(sets) + ", updated_at=?, updated_by=?",
+                (org_id, child_id, parent_id, fields.get("color"),
+                 fields.get("label_pos"), _now_iso(), updated_by,
+                 *vals, _now_iso(), updated_by))
+            self._prune_link_route(conn, org_id, child_id, parent_id)
             conn.commit()
 
 
     def list_link_routes(self, org_id: str) -> list[dict]:
         # Only routes whose link still exists: a re-parented child leaves its old
         # route row dangling — invisible here, overwritten or deleted later.
+        #
+        # The link_routes key runs parent_id → child_id because that is the
+        # WAYPOINT ORDER, and a cross-link has no real parent: the map draws a
+        # peer from the lower device id, so its geometry is keyed (child=higher,
+        # parent=lower) — the opposite of org_device_links' (min, max)
+        # canonicalization. Hence the either-order match on peer rows. Keeping
+        # "waypoints run parent→child" literally true for every link kind is
+        # worth more than key-order agreement between the two tables; the
+        # alternative was reversing peer waypoints at every render.
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT r.child_id, r.parent_id, r.waypoints, r.updated_at, r.updated_by"
+                "SELECT r.child_id, r.parent_id, r.waypoints, r.color, r.label_pos,"
+                " r.updated_at, r.updated_by"
                 " FROM link_routes r JOIN org_devices c ON c.id = r.child_id"
                 " WHERE r.org_id=? AND c.org_id=? AND c.is_active=1"
                 " AND (c.parent_device_id = r.parent_id OR EXISTS ("
                 "   SELECT 1 FROM org_device_links l WHERE l.org_id = r.org_id"
-                "   AND l.child_id = r.child_id AND l.parent_id = r.parent_id"
-                "   AND l.is_active = 1))",
+                "   AND l.is_active = 1 AND ("
+                "     (l.child_id = r.child_id AND l.parent_id = r.parent_id)"
+                "     OR (l.kind = 'peer' AND l.child_id = r.parent_id"
+                "         AND l.parent_id = r.child_id))))",
                 (org_id, org_id)).fetchall()
         out = []
         for r in rows:
@@ -250,6 +321,22 @@ class DeviceStoreMixin:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET maintenance=? WHERE id=? AND org_id=? AND is_active=1",
+                (1 if on else 0, device_id, org_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+    def set_org_device_tree_detached(self, org_id: str, device_id: int, on: bool) -> bool:
+        """Network-tree presentation only — the parent link is NOT touched.
+
+        An aggregation switch with a large subtree buries a device an operator
+        reads often; detaching lifts that row (and its own subtree) to the top
+        level of the tree WITHOUT lying about the plant: parent_device_id stays,
+        so suppression, the map and paging are unchanged.
+        """
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET tree_detached=? WHERE id=? AND org_id=? AND is_active=1",
                 (1 if on else 0, device_id, org_id))
             conn.commit()
             return cur.rowcount > 0
@@ -310,6 +397,9 @@ class DeviceStoreMixin:
             conn.execute(
                 "UPDATE switch_ports SET feeds_device_id=NULL"
                 " WHERE org_id=? AND feeds_device_id=?", (org_id, device_id))
+            conn.execute(
+                "UPDATE switch_ports SET uplink_device_id=NULL"
+                " WHERE org_id=? AND uplink_device_id=?", (org_id, device_id))
             conn.execute("DELETE FROM switch_ports WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute(
@@ -325,6 +415,10 @@ class DeviceStoreMixin:
                         (org_id, device_id))
             conn.execute("DELETE FROM device_perf WHERE device_id=?", (device_id,))
             conn.execute("DELETE FROM onu_optics WHERE org_id=? AND device_id=?",
+                        (org_id, device_id))
+            conn.execute("DELETE FROM onu_web_optics WHERE org_id=? AND device_id=?",
+                        (org_id, device_id))
+            conn.execute("DELETE FROM web_optics_status WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute("DELETE FROM olt_optics WHERE device_id=?", (device_id,))
             conn.execute("DELETE FROM pon_fault_state WHERE org_id=? AND device_id=?",
@@ -462,6 +556,56 @@ class DeviceStoreMixin:
             cur = conn.execute(
                 "DELETE FROM org_device_links WHERE org_id=? AND child_id=?"
                 " AND parent_id=? AND kind='backup'", (org_id, child_id, parent_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+    # ----- peer (cross) links -------------------------------------------------
+    # Switch-to-switch cabling between boxes at the same level. Rides the SAME
+    # table as backup edges under kind='peer', which is what keeps it invisible to
+    # the engine: every dependency read path (org_device_backup_edges/_map, and so
+    # load_device_meta and the rebuild fingerprint) filters kind='backup'. A peer
+    # link therefore CANNOT rebuild an engine or re-page anyone — the property the
+    # whole design rests on, pinned by test_central_peerlinks.
+    #
+    # A peer edge is UNDIRECTED, so the directional (child_id, parent_id) columns
+    # are canonicalized to (lo, hi) = (min, max) of the pair. One cable = one row
+    # no matter which end the operator declared it from; the UNIQUE index then
+    # makes a duplicate declaration a no-op instead of a second line on the map.
+
+    @staticmethod
+    def _peer_pair(a_id: int, b_id: int) -> tuple[int, int]:
+        return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+
+
+    def org_device_peer_map(self, org_id: str) -> dict[int, set[int]]:
+        """Symmetric adjacency: every device → the peers it cross-links to."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT child_id, parent_id FROM org_device_links"
+                " WHERE org_id=? AND is_active=1 AND kind='peer'", (org_id,)).fetchall()
+        out: dict[int, set[int]] = {}
+        for r in rows:
+            out.setdefault(r["child_id"], set()).add(r["parent_id"])
+            out.setdefault(r["parent_id"], set()).add(r["child_id"])
+        return out
+
+
+    def create_peer_link(self, org_id: str, a_id: int, b_id: int) -> None:
+        lo, hi = self._peer_pair(a_id, b_id)
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO org_device_links (org_id, child_id, parent_id,"
+                " kind) VALUES (?,?,?,'peer')", (org_id, lo, hi))
+            conn.commit()
+
+
+    def delete_peer_link(self, org_id: str, a_id: int, b_id: int) -> bool:
+        lo, hi = self._peer_pair(a_id, b_id)
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM org_device_links WHERE org_id=? AND child_id=?"
+                " AND parent_id=? AND kind='peer'", (org_id, lo, hi))
             conn.commit()
             return cur.rowcount > 0
 

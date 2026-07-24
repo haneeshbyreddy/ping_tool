@@ -60,6 +60,21 @@ def _norm_mac(raw: str | None) -> str:
     return (raw or "").strip().upper()
 
 
+def search_key(raw: str | None) -> str:
+    """Punctuation-blind form of a serial/MAC, for SUBSTRING SEARCH only. A tech
+    reads the last few characters off an ONU sticker and types them with
+    whatever separators (or none), so "44:01", "4401" and "44-01" must all
+    reach A4:F2:1B:9C:44:01.
+
+    Deliberately NOT `_norm_mac`, and never a substitute for it: identity there
+    stays separator-exact because two OLTs reporting differently-punctuated
+    strings ARE two different values, and collapsing them would fabricate
+    duplicate-MAC pages. Keeping this alphanumeric-only also means a needle can
+    never carry a LIKE wildcard into SQL (see store_snmp.onu_serial_device_ids).
+    """
+    return "".join(c for c in (raw or "") if c.isalnum()).upper()
+
+
 @dataclass(frozen=True)
 class PonCap:
     device_id: int

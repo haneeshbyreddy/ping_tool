@@ -324,8 +324,13 @@ class _DiagWalkRunner:
                     res = await self._walker.walk(
                         target, w.get("root_oid") or "1.3.6.1",
                         int(w.get("max_varbinds") or 2000))
+                # `truncated` travels with the result: a walk that stopped at the
+                # budget looks EXACTLY like a complete one once it's a row in the
+                # dashboard, and reading "the table isn't there" off a walk that
+                # died halfway is how a vendor onboarding loses an afternoon.
                 self._client.walk_result(
-                    wid, varbinds=[[o, v] for o, v in res.varbinds])
+                    wid, varbinds=[[o, v] for o, v in res.varbinds],
+                    truncated=res.truncated)
                 log.info("diagnostic walk %d of %s done: %d varbinds%s", wid,
                          w["ip_address"], len(res.varbinds),
                          " (truncated)" if res.truncated else "")

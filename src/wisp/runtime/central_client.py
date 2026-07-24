@@ -17,7 +17,7 @@ class CentralBrainClient(Protocol):
               snmp_status: dict | None = None) -> dict: ...
     def heartbeat(self, body: dict) -> dict: ...
     def walk_result(self, walk_id: int, *, varbinds: list | None = None,
-                    error: str | None = None) -> dict: ...
+                    error: str | None = None, truncated: bool = False) -> dict: ...
     def proxy_next(self, hold_s: float) -> dict | None: ...
     def proxy_reply(self, sid: str, req_id: int, status: int, headers: dict,
                     body_b64: str, *, error: str | None = None) -> dict: ...
@@ -108,13 +108,14 @@ class HttpCentralClient:
         return self._post("/heartbeat", env)
 
     def walk_result(self, walk_id: int, *, varbinds: list | None = None,
-                    error: str | None = None) -> dict:
+                    error: str | None = None, truncated: bool = False) -> dict:
         env = {"v": WIRE_V, "org_id": self.org_id, "node_id": self.node_id,
               "walk_id": walk_id}
         if error:
             env["error"] = error
         else:
             env["varbinds"] = varbinds or []
+            env["truncated"] = bool(truncated)
         return self._post("/edge/snmp-walk", env)
 
     def proxy_next(self, hold_s: float) -> dict | None:

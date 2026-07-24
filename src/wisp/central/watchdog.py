@@ -18,7 +18,7 @@ class CentralWatchdog:
     def __init__(self, store, cfg: Config = CONFIG, notifier=None) -> None:
         self.store = store
         self.cfg = cfg
-        self.notifier = notifier or build_notifier(cfg)
+        self.notifier = notifier or build_notifier(cfg, store)
         self._alarm: dict[tuple[str, str], bool] = {}
 
     def _alarmed(self, key: tuple[str, str]) -> bool:
@@ -57,10 +57,14 @@ class CentralWatchdog:
             title = "✅ Edge node back"
             body = f"{org}/{node}"
             priority = 3
+        # A silent edge is an owner concern — fan the page out to owner WhatsApp
+        # too (best-effort; the notifier isolates a WhatsApp failure from ntfy).
+        whatsapp = self.store.org_role_whatsapp(org, "owner")
         ok = False
         if topic:
             try:
-                ok = self.notifier.send(topic, title, body, priority).ok
+                ok = self.notifier.send(topic, title, body, priority,
+                                        whatsapp=whatsapp).ok
             except Exception:
                 log.exception("central watchdog page failed for %s/%s", org, node)
         self.store.record_node_alert(org, node, mark, "sent" if ok else "failed",

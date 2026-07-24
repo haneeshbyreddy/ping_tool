@@ -10,7 +10,6 @@ import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
 import { TopologyPage } from "@/routes/topology-page"
 import { MapPage } from "@/routes/map-page"
-import { TeamPage } from "@/routes/team-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
@@ -44,8 +43,10 @@ function App() {
                     <Route path="map" element={<MapPage />} />
                     {/* Probes merged into the Network page — keep old bookmarks working */}
                     <Route path="nodes" element={<Navigate to="/topology" replace />} />
-                    <Route path="team" element={<TeamPage />} />
                     <Route path="settings" element={<SettingsPage />} />
+                    {/* Sections are addressable so the account menu, the billing
+                        banner and a bookmark can all land on the right one. */}
+                    <Route path="settings/:section" element={<SettingsPage />} />
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />
                     <Route path="overview" element={<OverviewPage />} />

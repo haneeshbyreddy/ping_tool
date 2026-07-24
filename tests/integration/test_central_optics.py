@@ -30,7 +30,7 @@ class CentralOpticsTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           optical_warn_dbm=-24.0, optical_crit_dbm=-27.0)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_operator="op")
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
         self.olt = self.store.create_org_device(ORG, {
             "name": "KEESARA OLT-1", "ip_address": "10.0.0.1", "device_type": "OLT",
             "region": "Keesara", "parent_device_id": None})
@@ -47,6 +47,12 @@ class CentralOpticsTest(unittest.TestCase):
 
     def _pages(self):
         return [s for s in self.notifier.sent]
+
+    def _alert_kinds(self):
+        """Kinds of the alerts actually SENT (suppressed rows are logged too)."""
+        with self.store._connect() as c:
+            return [r["kind"] for r in c.execute(
+                "SELECT kind FROM alert_log WHERE status='sent' ORDER BY id")]
 
     def test_severity_evaluated_against_thresholds(self):
         self._mon().sync_device(self.olt, [
@@ -81,6 +87,35 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(len(self._pages()), 2)
         self.assertIn("recovered", self._pages()[1]["title"].lower())
         self.assertEqual(self.store.get_olt_optics(ORG, self.olt)["alarm"], 0)
+
+    def test_a_flapping_threshold_is_capped_by_the_push_cooldown(self):
+        # An ONU sitting a hundredth of a dB off the crit line re-crosses it
+        # every scrape (PYLON has one at -26.99 against -27.0). Before optics
+        # went through the governor each crossing was its own phone page, which
+        # is the pattern that 429'd the ntfy quota and dropped real ICMP pages.
+        mon = self._mon()
+        t = "2026-01-01T00:0{}:00+00:00"
+        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(0))   # enter
+        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(1))   # leave
+        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(2))   # re-enter
+        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(3))   # leave
+        kinds = self._alert_kinds()
+        # One of each survives the 30-minute per-(device, kind) window; the
+        # repeats are suppressed, not sent.
+        self.assertEqual(kinds.count("OPTICAL_CRIT"), 1)
+        self.assertEqual(kinds.count("OPTICAL_RECOVERED"), 1)
+        self.assertEqual(len(self._pages()), 2)
+
+    def test_the_alert_log_carries_a_clean_kind(self):
+        # This path used to write kind=NULL, so optical alerts were invisible to
+        # the by-type analytics the kind column exists to feed.
+        mon = self._mon()
+        mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
+        mon.sync_device(self.olt, [_onu("C", -20.0)], TS[1])
+        kinds = self._alert_kinds()
+        self.assertIn("OPTICAL_CRIT", kinds)
+        self.assertIn("OPTICAL_RECOVERED", kinds)
+        self.assertNotIn(None, kinds)
 
     def test_per_olt_threshold_override(self):
         self.store.set_olt_optical_thresholds(ORG, self.olt, -22.0, -26.0)

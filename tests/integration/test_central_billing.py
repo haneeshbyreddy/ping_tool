@@ -17,7 +17,6 @@ sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
 from wisp.central import auth, billing
-from wisp.central.upigateway import UpiGateway
 from wisp.central.store import CentralStore
 from wisp.central.server import make_server
 from support import RecordingNotifier
@@ -231,290 +230,73 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
 
 
-class FakeUpi(UpiGateway):
-    """Real key plumbing off the store; only the network calls are canned.
-    Tests drive ``statuses[client_txn_id]`` to walk an order through
-    created → scanning → success/failure, like the real gateway would."""
+class PaidPingAndQrTest(CentralBillingHttpTest):
+    """Manual-payment UX: the QR rides /api/billing, and "I've paid" pings the
+    admin's payments channel with the org name — reachable even while locked."""
 
-    def __init__(self, store):
-        super().__init__(store)
-        self.orders = []
-        self.status_calls = []
-        self.statuses = {}
-
-    def _post(self, path, payload):
-        if path == "/api/create_order":
-            self.orders.append(payload)
-            return {"order_id": len(self.orders),
-                    "payment_url": "https://merchant.upigateway.com/pay/"
-                                   + payload["client_txn_id"]}
-        self.status_calls.append(payload)
-        st = self.statuses.get(payload["client_txn_id"], "created")
-        doc = {"status": st, "client_txn_id": payload["client_txn_id"]}
-        if st == "success":
-            doc["upi_txn_id"] = "UPI" + payload["client_txn_id"][-6:]
-        return doc
-
-
-class UpiCheckoutTest(unittest.TestCase):
-    """UPIGateway self-serve checkout: order → payment_url, verify POLLS
-    (pending is a normal reply), settlement only on the gateway's own
-    'success' — plus the sessionless return redirect and the sweeper's
-    reconciliation safety net."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = Config(central_db=Path(self.tmp.name) / "c.db",
-                          central_bind="127.0.0.1", central_port=0,
-                          central_token="tok")
-        self.store = CentralStore(self.cfg.central_db)
-        auth.create_user(self.store, None, "root", "rootpassword")
-        auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
-        auth.create_user(self.store, "ispB", "otherowner", "otherpassword", "owner")
-        self.store.set_org("ispA", name="Acme")
-        self.store.set_org("ispB", name="Beta")
-        self.store.set_setting("upigateway_key", "upi_test_key")
-        self.notifier = RecordingNotifier()
-        self.gateway = FakeUpi(self.store)
-        self.server = make_server(self.cfg, self.store, notifier=self.notifier,
-                                  upi=self.gateway)
-        self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    tearDown = CentralBillingHttpTest.tearDown
-    _req = CentralBillingHttpTest._req
-    _login = CentralBillingHttpTest._login
-
-    def _order(self, cookie, body=None):
-        status, order, _ = self._req("POST", "/api/billing/order",
-                                     body or {}, cookie=cookie)
-        self.assertEqual(status, 200)
-        return order
-
-    def test_billing_read_carries_upi_enabled(self):
+    def test_billing_read_carries_qr_and_no_gateway_flag(self):
         cookie = self._login("owner", "ownerpassword")
+        status, body, _ = self._req("GET", "/api/billing", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("qr_image", body)
+        self.assertIsNone(body["qr_image"])
+        self.assertNotIn("upi_enabled", body)  # the gateway flag is gone
+        self.store.set_setting("billing_qr_image", "data:image/png;base64,QRQR")
         _, body, _ = self._req("GET", "/api/billing", cookie=cookie)
-        self.assertTrue(body["upi_enabled"])
-        self.store.set_setting("upigateway_key", None)
-        _, body, _ = self._req("GET", "/api/billing", cookie=cookie)
-        self.assertFalse(body["upi_enabled"])
+        self.assertEqual(body["qr_image"], "data:image/png;base64,QRQR")
 
-    def test_locked_org_pays_its_way_out_by_polling(self):
-        self.store.set_org_plan("ispA", "pro")  # current month unpaid → locked
+    def test_ive_paid_prefers_the_dedicated_topic_even_while_locked(self):
+        # pro with no month paid ⇒ LOCKED: proves /api/billing/paid is exempt
+        self.store.set_org_plan("ispA", "pro")
+        self.store.set_setting("billing_paid_topic", "pay-topic")
         cookie = self._login("owner", "ownerpassword")
-        self.assertEqual(self._req("GET", "/api/inventory", cookie=cookie)[0], 402)
-        order = self._order(cookie, {"months": 2,
-                                     "origin": "https://wisp.example"})
-        self.assertEqual(order["gateway"], "upigateway")
-        self.assertEqual(order["amount"], 2 * 2000 * 100)
-        self.assertEqual(order["months"], [THIS_MONTH, NEXT_MONTH])
-        self.assertIn("merchant.upigateway.com", order["payment_url"])
-        # the gateway saw rupees, not paise, and the SPA's origin in the
-        # return redirect
-        sent = self.gateway.orders[0]
-        self.assertEqual(sent["amount"], str(2 * 2000))
-        self.assertEqual(sent["redirect_url"],
-                         "https://wisp.example/api/billing/upi-return")
-        # first poll: not paid yet — a normal 200, nothing marked
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
+        status, body, _ = self._req("POST", "/api/billing/paid", {}, cookie=cookie)
         self.assertEqual(status, 200)
-        self.assertEqual(body["payment_status"], "pending")
-        self.assertTrue(body["locked"])
-        self.assertEqual(self.store.paid_months("ispA"), set())
-        # the status call carried the dd-mm-yyyy txn_date
-        self.assertRegex(self.gateway.status_calls[0]["txn_date"],
-                         r"^\d{2}-\d{2}-\d{4}$")
-        # payment lands on the gateway → next poll settles and unlocks
-        self.gateway.statuses[order["order_id"]] = "success"
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["payment_status"], "success")
-        self.assertFalse(body["locked"])
-        self.assertIn(THIS_MONTH, body["paid_months"])
-        self.assertIn(NEXT_MONTH, body["paid_months"])
-        self.assertEqual(self._req("GET", "/api/inventory", cookie=cookie)[0], 200)
-        self.assertTrue(any("paid" in n["title"] for n in self.notifier.sent))
-        # replay is a no-op 200 with no second status call to the gateway
-        calls_before = len(self.gateway.status_calls)
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["payment_status"], "success")
-        self.assertEqual(len(self.gateway.status_calls), calls_before)
+        self.assertTrue(body["notified"])
+        self.assertEqual(len(self.notifier.sent), 1)
+        page = self.notifier.sent[0]
+        self.assertEqual(page["recipient"], "pay-topic")
+        self.assertIn("Acme", page["title"])
 
-    def test_free_org_upgrades_by_paying(self):
-        cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie, {"plan": "vip", "months": 1})
-        self.assertEqual(order["amount"], 3000 * 100)
-        self.gateway.statuses[order["order_id"]] = "success"
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["plan"], "vip")
-        self.assertEqual(self.store.org_plan("ispA"), "vip")
-
-    def test_failed_payment_marks_nothing_and_sticks(self):
+    def test_ive_paid_falls_back_to_the_central_channel(self):
+        # no dedicated topic ⇒ the shared central/admin channel gets it
         self.store.set_org_plan("ispA", "pro")
         cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie)
-        self.gateway.statuses[order["order_id"]] = "failure"
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
+        status, body, _ = self._req("POST", "/api/billing/paid", {}, cookie=cookie)
         self.assertEqual(status, 200)
-        self.assertEqual(body["payment_status"], "failure")
-        self.assertEqual(self.store.paid_months("ispA"), set())
-        # the row is dead: even a later 'success' can't resurrect it (and the
-        # gateway isn't asked again)
-        self.gateway.statuses[order["order_id"]] = "success"
-        calls_before = len(self.gateway.status_calls)
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
-        self.assertEqual(body["payment_status"], "failure")
-        self.assertEqual(len(self.gateway.status_calls), calls_before)
-        self.assertEqual(self.store.paid_months("ispA"), set())
+        self.assertTrue(body["notified"])
+        self.assertEqual(self.notifier.sent[0]["recipient"],
+                         self.cfg.central_ntfy_topic)
 
-    def test_verify_is_org_scoped(self):
-        self.store.set_org_plan("ispA", "pro")
-        cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie)
-        self.gateway.statuses[order["order_id"]] = "success"
-        other = self._login("otherowner", "otherpassword")
-        self.assertEqual(self._req("POST", "/api/billing/verify",
-                                   {"order_id": order["order_id"]},
-                                   cookie=other)[0], 404)
-
-    def test_return_redirect_settles_without_a_session(self):
-        self.store.set_org_plan("ispA", "pro")
-        cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie)
-        self.gateway.statuses[order["order_id"]] = "success"
-        # the payer lands here from the UPI app's browser: no cookie at all
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", "/api/billing/upi-return?client_txn_id="
-                            + order["order_id"])
-        resp = conn.getresponse()
-        resp.read()
-        self.assertEqual(resp.status, 302)
-        self.assertEqual(resp.getheader("Location"), "/app")
-        conn.close()
-        self.assertIn(THIS_MONTH, self.store.paid_months("ispA"))
-        # garbage txn ids still bounce to the SPA, nothing 500s
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", "/api/billing/upi-return?client_txn_id=nope")
-        resp = conn.getresponse()
-        resp.read()
-        self.assertEqual(resp.status, 302)
-        conn.close()
-
-    def test_sweeper_reconciles_an_abandoned_checkout(self):
-        # payer paid, then closed every tab before redirect/poll could settle
-        self.store.set_org_plan("ispA", "pro")
-        cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie)
-        self.gateway.statuses[order["order_id"]] = "success"
-        sweeper = billing.BillingSweeper(self.store, self.cfg,
-                                         notifier=self.notifier,
-                                         upi=self.gateway)
-        self.assertEqual(sweeper.reconcile_upi(), 1)
-        self.assertIn(THIS_MONTH, self.store.paid_months("ispA"))
-        pay = self.store.billing_payment(order["order_id"])
-        self.assertEqual(pay["status"], "paid")
-        self.assertTrue(pay["payment_id"].startswith("UPI"))
-        # settled rows drop out of the pending set — next sweep is a no-op
-        self.assertEqual(sweeper.reconcile_upi(), 0)
-
-    def test_paid_plan_switch_goes_through_checkout(self):
-        # a pro org moves to vip by paying the vip price; plan flips on settle
-        self.store.set_org_plan("ispA", "pro")
-        self.store.set_billing_month("ispA", THIS_MONTH, True)
-        cookie = self._login("owner", "ownerpassword")
-        order = self._order(cookie, {"plan": "vip"})
-        self.assertEqual(order["amount"], 3000 * 100)
-        # vip's runway starts at the first month vip hasn't covered: next month
-        self.assertEqual(order["months"], [NEXT_MONTH])
-        self.gateway.statuses[order["order_id"]] = "success"
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": order["order_id"]},
-                                    cookie=cookie)
+    def test_admin_settings_qr_and_topic_roundtrip(self):
+        root = self._login("root", "rootpassword")
+        status, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
         self.assertEqual(status, 200)
-        self.assertEqual(body["plan"], "vip")
-        self.assertEqual(self.store.org_plan("ispA"), "vip")
-
-    def test_order_validation_and_owner_only(self):
-        cookie = self._login("owner", "ownerpassword")
-        self.assertEqual(self._req("POST", "/api/billing/order",
-                                   {"plan": "free"}, cookie=cookie)[0], 422)
-        self.assertEqual(self._req("POST", "/api/billing/order",
-                                   {"plan": "pro", "months": 0},
-                                   cookie=cookie)[0], 422)
-        self.assertEqual(self._req("POST", "/api/billing/order",
-                                   {"plan": "pro", "months": 13},
-                                   cookie=cookie)[0], 422)
-        # non-owner roles can't start a checkout
-        auth.create_user(self.store, "ispA", "tech1", "techpassword", "tech")
-        vcookie = self._login("tech1", "techpassword")
-        self.assertEqual(self._req("POST", "/api/billing/order",
-                                   {"plan": "pro"}, cookie=vcookie)[0], 403)
-
-    def test_locked_org_can_escape_to_free(self):
-        self.store.set_org_plan("ispA", "vip")  # unpaid month → locked
-        cookie = self._login("owner", "ownerpassword")
-        self.assertEqual(self._req("GET", "/api/inventory", cookie=cookie)[0], 402)
-        # /api/billing/plan stays reachable through the lock
-        status, body, _ = self._req("POST", "/api/billing/plan",
-                                    {"plan": "free"}, cookie=cookie)
+        self.assertIn("billing_qr_image", body)
+        self.assertIn("billing_paid_topic", body)
+        self.assertNotIn("upigateway_key_set", body)  # the gateway key is gone
+        status, _, _ = self._req("POST", "/api/admin/settings",
+                                 {"billing_qr_image": "data:image/png;base64,AAo",
+                                  "billing_paid_topic": "pay-topic"}, cookie=root)
         self.assertEqual(status, 200)
-        self.assertEqual(body["plan"], "free")
-        self.assertFalse(body["locked"])
-        self.assertEqual(self.store.org_plan("ispA"), "free")
-        self.assertEqual(self._req("GET", "/api/inventory", cookie=cookie)[0], 200)
-        # the churn heads-up rode the central channel
-        self.assertTrue(any("Free" in n["title"] for n in self.notifier.sent))
+        _, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
+        self.assertEqual(body["billing_qr_image"], "data:image/png;base64,AAo")
+        self.assertEqual(body["billing_paid_topic"], "pay-topic")
+        # a non-image paste is refused (no javascript: URI into an <img src>)
+        self.assertEqual(self._req("POST", "/api/admin/settings",
+                                   {"billing_qr_image": "javascript:alert(1)"},
+                                   cookie=root)[0], 422)
 
-    def test_plan_route_never_grants_a_paid_plan(self):
-        cookie = self._login("owner", "ownerpassword")
-        for plan in ("pro", "vip", "gold"):
-            status, _, _ = self._req("POST", "/api/billing/plan",
-                                     {"plan": plan}, cookie=cookie)
-            self.assertEqual(status, 422, plan)
-        self.assertEqual(self.store.org_plan("ispA"), "free")
-        # owner-only, like every org write
-        auth.create_user(self.store, "ispA", "tech2", "techpassword", "tech")
-        vcookie = self._login("tech2", "techpassword")
-        self.assertEqual(self._req("POST", "/api/billing/plan",
-                                   {"plan": "free"}, cookie=vcookie)[0], 403)
-
-    def test_unconfigured_gateway_rejects_orders(self):
-        self.store.set_setting("upigateway_key", None)
-        cookie = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/billing/order",
-                                    {"plan": "pro"}, cookie=cookie)
-        self.assertEqual(status, 422)
-        self.assertIn("not configured", body["error"])
-
-    def test_legacy_gateway_rows_never_settle(self):
-        # a ledger row from the removed Razorpay era: verify refuses outright
-        # and the UPI reconciliation sweep never picks it up
-        self.store.set_org_plan("ispA", "pro")
-        self.store.create_billing_payment("order_legacy1", "ispA", "pro",
-                                          [THIS_MONTH], 2000 * 100,
-                                          gateway="razorpay")
-        cookie = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/billing/verify",
-                                    {"order_id": "order_legacy1"},
-                                    cookie=cookie)
-        self.assertEqual(status, 422)
-        self.assertEqual(self.store.paid_months("ispA"), set())
-        self.assertEqual(self.store.pending_billing_payments("upigateway"), [])
+    def test_admin_settings_accepts_svg_qr(self):
+        # SVG is a first-class QR format (data:image/svg+xml passes the same
+        # data:image/ gate and renders via <img>, so no script runs)
+        root = self._login("root", "rootpassword")
+        svg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
+        status, _, _ = self._req("POST", "/api/admin/settings",
+                                 {"billing_qr_image": svg}, cookie=root)
+        self.assertEqual(status, 200)
+        _, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
+        self.assertEqual(body["billing_qr_image"], svg)
 
 
 if __name__ == "__main__":

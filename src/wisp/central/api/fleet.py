@@ -38,6 +38,7 @@ def nodes(h, qs):
         "latest_version": releases[0]["version"] if releases else None,
         "rollout": h.store.get_rollout(org),
         "auto_update": h.store.org_auto_update(org),
+        "node_colors": h.store.org_colors(org, "node"),
     })
 
 
@@ -91,6 +92,16 @@ def delete(h, user, body):
         h._reply(200, {"ok": True})
     else:
         h._reply(404, {"ok": False, "error": f"{node_id!r} isn't registered"})
+
+
+def color(h, user, body):
+    """Colour-code a probe. Presentation only — nothing reads it but the SPA."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    node_id = inventory.clean_node_id(body.get("node_id"))
+    h.store.set_org_color(org, "node", node_id, inventory.clean_color(body.get("color")))
+    h._reply(200, {"ok": True})
 
 
 def restart(h, user, body):

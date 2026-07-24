@@ -34,11 +34,18 @@ export function loadBasemap(): Basemap {
 
 // The keyless fallback layer, never in the menu: shown while a Google session
 // is being created, when the org has no key, or after a Google failure.
-export function StreetsTiles() {
+//
+// It follows the app theme too (dark_matter / voyager, both keyless on the same
+// CDN). Not cosmetics: this layer is what a no-key org actually looks at all
+// day, and it's what a Google failure drops onto mid-session — snapping to a
+// bright map under a dark dashboard reads as the map breaking.
+export function StreetsTiles({ dark = false }: { dark?: boolean }) {
+  const style = dark ? "dark_all" : "voyager"
   return (
     <TileLayer
-      key="streets"
-      url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+      // the style is in the key: a TileLayer won't re-fetch on a url prop change
+      key={`streets-${style}`}
+      url={`https://{s}.basemaps.cartocdn.com/rastertiles/${style}/{z}/{x}/{y}{r}.png`}
       attribution={CARTO_ATTR}
       subdomains="abcd"
       maxZoom={20}
@@ -90,12 +97,15 @@ function GoogleAttribution({ session, apiKey }: { session: string; apiKey: strin
 // ladder: an expired/revoked session shows up as a burst of tile errors →
 // recreate the session once; if createSession fails or the fresh session still
 // can't load tiles (bad key, quota out), onFail drops the map back to Streets.
-export function GoogleLayer({ apiKey, mapType, onFail }: {
+// `dark` requests the styled (night) roadmap. Satellite ignores it — the Tile
+// API only styles roadmap — so a dark satellite session is simply the normal one.
+export function GoogleLayer({ apiKey, mapType, dark = false, onFail }: {
   apiKey: string
   mapType: GoogleMapType
+  dark?: boolean
   onFail: (why: string) => void
 }) {
-  const [session, setSession] = useState<string | null>(() => loadGoogleSession(mapType))
+  const [session, setSession] = useState<string | null>(() => loadGoogleSession(mapType, dark))
   const [gen, setGen] = useState(0) // bump = force a fresh createSession
   const recreated = useRef(false)
   const errTimes = useRef<number[]>([])
@@ -103,12 +113,15 @@ export function GoogleLayer({ apiKey, mapType, onFail }: {
 
   useEffect(() => {
     let alive = true
-    createGoogleSession(apiKey, mapType).then(
+    // A theme flip needs a DIFFERENT token, so drop the stale one first —
+    // otherwise the old session's tiles keep painting until it resolves.
+    setSession(loadGoogleSession(mapType, dark))
+    createGoogleSession(apiKey, mapType, dark).then(
       (s) => { if (alive) setSession(s) },
       (e) => { if (alive) onFail(e instanceof Error ? e.message : "session request failed") },
     )
     return () => { alive = false }
-  }, [apiKey, mapType, gen, onFail])
+  }, [apiKey, mapType, dark, gen, onFail])
 
   // A stray single 404 (deep-zoom satellite gap, flaky link) must not nuke the
   // basemap: act only on a burst — 3 failed tiles inside 5s — and only once per
@@ -122,15 +135,15 @@ export function GoogleLayer({ apiKey, mapType, onFail }: {
     handledSession.current = session
     if (!recreated.current) {
       recreated.current = true
-      clearGoogleSession(mapType)
+      clearGoogleSession(mapType, dark)
       setSession(null)
       setGen((g) => g + 1)
     } else {
       onFail("tiles failed to load")
     }
-  }, [session, mapType, onFail])
+  }, [session, mapType, dark, onFail])
 
-  if (!session) return <StreetsTiles />
+  if (!session) return <StreetsTiles dark={dark} />
   return (
     <>
       <TileLayer

@@ -1,11 +1,23 @@
 import type {
-  AccountUser, AdminOverview, AttendanceOverview, BillingInfo, GponProfilesResponse, IncidentShape, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
+  AccountUser, AdminOverview, BillingInfo, GponProfilesResponse, IncidentShape, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
-  Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials, Worker,
+  Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials,
+  RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
 } from "./types"
+import type { ThemeOverrides } from "./theme-tokens"
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  status: number
+  // The parsed JSON body, so callers can read fields beyond the message —
+  // e.g. the login flow reads `body.totp_required` off a 401.
+  body: Record<string, unknown>
+  constructor(message: string, status = 0, body: Record<string, unknown> = {}) {
+    super(message)
+    this.status = status
+    this.body = body
+  }
+}
 
 async function request<T>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
   const res = await fetch(path, {
@@ -24,7 +36,7 @@ async function request<T>(path: string, opts: { method?: string; body?: unknown 
   const isJson = res.headers.get("content-type")?.includes("json")
   const data = isJson ? await res.json() : {}
   if (!res.ok) {
-    throw new ApiError(data.error || data.reason || `HTTP ${res.status}`)
+    throw new ApiError(data.error || data.reason || `HTTP ${res.status}`, res.status, data)
   }
   return data as T
 }
@@ -35,8 +47,12 @@ export function tq(org?: string | null): string {
 
 export const authApi = {
   me: () => request<MeResponse>("/api/me"),
-  login: (username: string, password: string, remember = false) =>
-    request<MeResponse>("/api/login", { method: "POST", body: { username, password, remember } }),
+  login: (username: string, password: string, remember = false,
+          second?: { totp?: string; recovery?: string }) =>
+    request<MeResponse>("/api/login", {
+      method: "POST",
+      body: { username, password, remember, ...(second ?? {}) },
+    }),
   logout: () => request<{ ok: true }>("/api/logout", { method: "POST" }),
 }
 
@@ -54,45 +70,47 @@ export const adminApi = {
   settings: () => request<{
     google_maps_key: string | null
     billing_gpay_number: string
-    upigateway_key_set: boolean
+    billing_qr_image: string | null
+    billing_paid_topic: string
+    // experimental WhatsApp channel config (token never echoed — token_set only)
+    whatsapp: WhatsappSettings
+    // sparse colour diff over the shipped palette, per theme mode; `{}` is a
+    // stock theme. See lib/theme-tokens.ts and central/theme.py.
+    theme_overrides: ThemeOverrides
   }>("/api/admin/settings"),
   saveSettings: (body: {
     google_maps_key?: string | null
     billing_gpay_number?: string | null
-    upigateway_key?: string | null
+    billing_qr_image?: string | null
+    billing_paid_topic?: string | null
+    // WhatsApp config. `token` write-only: omit to leave the stored one alone,
+    // send a value to set it, or `token_clear: true` to remove it.
+    whatsapp?: {
+      enabled?: boolean
+      phone_id?: string
+      template?: string
+      lang?: string
+      api_version?: string
+      token?: string
+      token_clear?: boolean
+    }
+    // omit to leave colours alone; `{}` resets every org to the shipped palette
+    theme_overrides?: ThemeOverrides
   }) =>
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
 }
-
-export interface BillingOrder {
-  order_id: string
-  amount: number
-  currency: string
-  /** UPIGateway's hosted QR page the browser opens */
-  payment_url: string
-  plan: Plan
-  months: string[]
-  org_name: string
-  description: string
-}
-
-/** verify replies carry the settle verdict — polling keeps going on "pending" */
-export type BillingVerify = { ok: true; payment_status: "success" | "failure" | "pending" } & BillingInfo
 
 export const billingApi = {
   get: (org?: string | null) => request<BillingInfo>(`/api/billing${tq(org)}`),
   // superadmin: set the plan and/or toggle one paid month
   adminSave: (body: { org_id: string; plan?: Plan; month?: string; paid?: boolean }) =>
     request<{ ok: true } & BillingInfo>("/api/admin/billing", { method: "POST", body }),
-  // self-serve checkout (both routes stay reachable while locked); `origin`
-  // rides along so central can build the UPIGateway return redirect
-  order: (body: { org_id?: string | null; plan?: Plan; months?: number; origin?: string }) =>
-    request<BillingOrder>("/api/billing/order", { method: "POST", body }),
-  // just the order id — central checks the payment status server-side
-  verify: (body: { org_id?: string | null; order_id: string }) =>
-    request<BillingVerify>("/api/billing/verify", { method: "POST", body }),
+  // "I've paid": pings the admin's payments channel with the org name so they
+  // verify and mark the month. Reachable while locked — the lock-screen tap.
+  markPaid: (org?: string | null) =>
+    request<{ ok: true; notified: boolean }>("/api/billing/paid", { method: "POST", body: { org_id: org } }),
   // self-serve, no payment: only "free" is accepted (paid plans are entered
-  // by paying for them); reachable while locked — the escape hatch
+  // by paying the admin); reachable while locked — the escape hatch
   setPlan: (body: { org_id?: string | null; plan: Plan }) =>
     request<{ ok: true } & BillingInfo>("/api/billing/plan", { method: "POST", body }),
 }
@@ -101,17 +119,23 @@ export const orgsApi = {
   list: (org?: string | null) => request<{ orgs: Org[] }>(`/api/orgs${tq(org)}`),
   create: (body: { org_id: string; name?: string | null }) =>
     request<{ org_id: string }>("/api/orgs", { method: "POST", body }),
+  // irreversible: `confirm` must echo the org id — the server enforces it too
+  remove: (org_id: string) =>
+    request<{ ok: true; org_id: string; deleted: Record<string, number> }>(
+      "/api/orgs/delete", { method: "POST", body: { org_id, confirm: org_id } }),
   save: (body: {
     org_id: string; name?: string | null
-    ntfy_topic_owner?: string | null; ntfy_topic_operator?: string | null; ntfy_topic_tech?: string | null
+    ntfy_topic_owner?: string | null; ntfy_topic_worker?: string | null
     map_region?: string | null
     poll_interval_s?: number | null
     web_proxy?: boolean // superadmin-only capability flag
     auto_update?: boolean // fleet auto-update: central arms rollouts itself
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
   testAlert: (org_id: string, role: Role) =>
-    request<{ ok: boolean; detail?: string; channel: string; recipient: string; role: Role }>(
-      "/api/test-alert", { method: "POST", body: { org_id, role } }),
+    request<{
+      ok: boolean; detail?: string; channel: string; recipient: string | null
+      role: Role; whatsapp_count: number
+    }>("/api/test-alert", { method: "POST", body: { org_id, role } }),
 }
 
 export interface DevicePayload {
@@ -128,7 +152,10 @@ export interface DevicePayload {
 }
 
 export const inventoryApi = {
-  list: (org?: string | null) => request<{ devices: OrgDevice[] }>(`/api/inventory${tq(org)}`),
+  list: (org?: string | null) =>
+    request<{ devices: OrgDevice[]; tag_colors: Record<string, string> }>(`/api/inventory${tq(org)}`),
+  setTagColor: (org_id: string, tag: string, color: string | null) =>
+    request<{ ok: boolean }>("/api/inventory/tag-color", { method: "POST", body: { org_id, tag, color } }),
   create: (body: DevicePayload) => request<{ id: number }>("/api/inventory", { method: "POST", body }),
   update: (id: number, body: DevicePayload) =>
     request<{ ok: boolean }>("/api/inventory/update", { method: "POST", body: { id, ...body } }),
@@ -136,6 +163,8 @@ export const inventoryApi = {
     request<{ ok: boolean; reason?: string }>("/api/inventory/delete", { method: "POST", body: { id } }),
   setMaintenance: (id: number, on: boolean) =>
     request<{ ok: boolean }>("/api/inventory/maintenance", { method: "POST", body: { id, on } }),
+  setTreeDetached: (id: number, on: boolean) =>
+    request<{ ok: boolean }>("/api/inventory/tree-detached", { method: "POST", body: { id, on } }),
   setLocation: (id: number, lat: number | null, lng: number | null) =>
     request<{ ok: boolean }>("/api/inventory/location", { method: "POST", body: { id, lat, lng } }),
   setSnmp: (id: number, body: {
@@ -155,6 +184,11 @@ export const inventoryApi = {
     request<{ ok: boolean }>("/api/inventory/ports/monitored", { method: "POST", body: { id, on } }),
   setPortFeeds: (id: number, feeds_device_id: number | null) =>
     request<{ ok: boolean }>("/api/inventory/ports/feeds", { method: "POST", body: { id, feeds_device_id } }),
+  setPortUplink: (id: number, uplink_device_id: number | null) =>
+    request<{ ok: boolean }>("/api/inventory/ports/uplink", { method: "POST", body: { id, uplink_device_id } }),
+  // every port bound to a link (either side), org-wide — the map's bandwidth labels
+  linkPorts: (org?: string | null) =>
+    request<{ ports: LinkPort[] }>(`/api/inventory/link-ports${tq(org)}`),
   setPortBandwidth: (
     id: number, threshold_mbps: number | null, direction: string, max_mbps: number | null,
   ) => request<{ ok: boolean }>("/api/inventory/ports/bandwidth", {
@@ -165,13 +199,30 @@ export const inventoryApi = {
   setRoute: (child_id: number, parent_id: number, waypoints: Array<[number, number]>) =>
     request<{ ok: boolean }>("/api/inventory/route",
       { method: "POST", body: { child_id, parent_id, waypoints } }),
+  // A link's map styling. SPARSE on purpose — omit a key to leave it alone, so
+  // dragging a label can't clear a colour and vice versa.
+  setLinkStyle: (
+    child_id: number, parent_id: number,
+    style: { color?: string | null; label_pos?: number | null },
+  ) => request<{ ok: boolean }>("/api/inventory/link-style",
+    { method: "POST", body: { child_id, parent_id, ...style } }),
   addBackupLink: (child_id: number, parent_id: number) =>
     request<{ ok: true }>("/api/inventory/links", { method: "POST", body: { child_id, parent_id } }),
   removeBackupLink: (child_id: number, parent_id: number) =>
     request<{ ok: boolean }>("/api/inventory/links/delete", { method: "POST", body: { child_id, parent_id } }),
+  // switch-to-switch cross-link; undirected, so either order works
+  addPeerLink: (a_id: number, b_id: number) =>
+    request<{ ok: true }>("/api/inventory/peers", { method: "POST", body: { a_id, b_id } }),
+  removePeerLink: (a_id: number, b_id: number) =>
+    request<{ ok: boolean }>("/api/inventory/peers/delete", { method: "POST", body: { a_id, b_id } }),
 
   optics: (deviceId: number) =>
     request<OpticsResponse>(`/api/inventory/optics?device_id=${deviceId}`),
+  // ONU lookup (serial/MAC or provisioned name) for the Network search box.
+  // Punctuation-blind server side, so the raw needle goes over as typed.
+  onuSearch: (org: string | null | undefined, q: string) =>
+    request<OnuSearchResponse>(
+      `/api/inventory/onu-search?q=${encodeURIComponent(q)}${tq(org).replace(/^\?/, "&")}`),
   ponFaults: (deviceId: number) =>
     request<{ faults: PonFault[] }>(`/api/pon/faults?device_id=${deviceId}`),
   orgPonFaults: (org?: string | null) =>
@@ -251,6 +302,39 @@ export const gponApi = {
     request<{ ok: boolean }>("/api/gpon-profiles/delete", { method: "POST", body: { id } }),
 }
 
+export interface WebOpticsProfilePayload extends WebOpticsProfileSpec {
+  org_id?: string
+  name: string
+  enabled: boolean
+}
+
+// Web-UI optics vendor recipes: the OLTs whose per-ONU Rx exists in no SNMP OID
+// and can only be read off the box's own page. A profile is what turns
+// onboarding one of those from a central deploy into a dashboard row.
+export const webOpticsApi = {
+  profiles: (org?: string | null) =>
+    request<WebOpticsProfilesResponse>(`/api/web-optics-profiles${tq(org)}`),
+  createProfile: (body: WebOpticsProfilePayload) =>
+    request<{ id: number }>("/api/web-optics-profiles", { method: "POST", body }),
+  updateProfile: (id: number, body: WebOpticsProfilePayload) =>
+    request<{ ok: boolean }>("/api/web-optics-profiles/update",
+      { method: "POST", body: { id, ...body } }),
+  removeProfile: (id: number) =>
+    request<{ ok: boolean }>("/api/web-optics-profiles/delete",
+      { method: "POST", body: { id } }),
+  // Why this OLT shows no dBm. Read-side: rendering the diagnosis must never
+  // poke the OLT — the scrape stays on its own slow clock.
+  rxStatus: (deviceId: number) =>
+    request<RxStatusResponse>(`/api/inventory/rx-status?device_id=${deviceId}`),
+  // Read this OLT's optical page NOW rather than at the next sweep — for the
+  // hour someone is at the pole with the fibre in their hand. Answers at once;
+  // the read runs server-side and lands in the scrape status the panel already
+  // watches, so there is one story about what happened either way.
+  refresh: (deviceId: number) =>
+    request<{ started: boolean }>("/api/inventory/rx-refresh",
+      { method: "POST", body: { device_id: deviceId } }),
+}
+
 // Device web-UI proxy tunnel (webplan.md M3). A session is opened against one
 // device; the browser then drives the device's own UI at the returned url.
 export const proxyApi = {
@@ -296,6 +380,8 @@ export const nodesApi = {
     request<{ ok: boolean; target_version: string }>("/api/nodes/update", { method: "POST", body: { org_id, node_id } }),
   restart: (org_id: string, node_id: string) =>
     request<{ ok: boolean }>("/api/nodes/restart", { method: "POST", body: { org_id, node_id } }),
+  setColor: (org_id: string, node_id: string, color: string | null) =>
+    request<{ ok: boolean }>("/api/nodes/color", { method: "POST", body: { org_id, node_id, color } }),
   register: (org_id: string, node_id: string) =>
     request<{ node_id: string; token: string }>("/api/nodes", { method: "POST", body: { org_id, node_id } }),
   rotate: (org_id: string, node_id: string) =>
@@ -316,17 +402,6 @@ export const regionsApi = {
     request<{ ok: boolean; reason?: string }>("/api/regions/delete", { method: "POST", body: { org_id, name } }),
 }
 
-export const teamApi = {
-  list: (org?: string | null) => request<{ team: Worker[] }>(`/api/team${tq(org)}`),
-  add: (body: { org_id: string; name: string; role: Role; region?: string; notes?: string }) =>
-    request<{ id: number }>("/api/team", { method: "POST", body }),
-  update: (id: number, body: { name?: string; role?: Role; region?: string; notes?: string }) =>
-    request<{ ok: true }>("/api/team/update", { method: "POST", body: { id, ...body } }),
-  remove: (id: number) => request<{ ok: true }>("/api/team/delete", { method: "POST", body: { id } }),
-  attendance: (org?: string | null) => request<AttendanceOverview>(`/api/attendance${tq(org)}`),
-  setPresent: (worker_id: number, present: boolean, day?: string) =>
-    request<{ ok: true }>("/api/attendance", { method: "POST", body: { worker_id, present, day } }),
-}
 
 export const logsApi = {
   list: (org: string | null | undefined, limit = 100, before?: number) => {
@@ -348,4 +423,24 @@ export const usersApi = {
 
   changePassword: (body: { id?: number; current_password?: string; new_password: string }) =>
     request<{ ok: true }>("/api/users/password", { method: "POST", body }),
+
+  // Set/clear an account's WhatsApp page number (blank clears). Omit `id` to set
+  // your own — self-service, so a worker can add it too.
+  setWhatsapp: (whatsapp_number: string, id?: number) =>
+    request<{ ok: true; whatsapp_number: string | null }>(
+      "/api/users/whatsapp", { method: "POST", body: { id, whatsapp_number } }),
+
+  // TOTP second factor (self-service, owner/superadmin). start → confirm turns it
+  // on and returns the one-time recovery codes; disable/regenerate need the
+  // password (regenerate also needs a live code).
+  totpStart: () => request<{ secret: string; otpauth_uri: string }>(
+    "/api/users/totp/start", { method: "POST", body: {} }),
+  totpConfirm: (body: { password: string; code: string }) =>
+    request<{ ok: true; recovery_codes: string[] }>(
+      "/api/users/totp/confirm", { method: "POST", body }),
+  totpDisable: (password: string) =>
+    request<{ ok: true }>("/api/users/totp/disable", { method: "POST", body: { password } }),
+  totpRegenerate: (body: { password: string; code: string }) =>
+    request<{ ok: true; recovery_codes: string[] }>(
+      "/api/users/totp/recovery", { method: "POST", body }),
 }

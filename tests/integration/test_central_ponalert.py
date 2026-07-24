@@ -30,7 +30,7 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
-        self.store.set_org("ispA", ntfy_topic_operator="ops-topic")
+        self.store.set_org("ispA", ntfy_topic_worker="ops-topic")
         self.olt = self.store.create_org_device("ispA", {
             "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
@@ -153,7 +153,7 @@ class _FakeHandler:
 
     def _reader(self):
         return {"id": 1, "username": "u", "org_id": self._org,
-                "role": "operator", "is_superadmin": False}
+                "role": "owner", "is_superadmin": False}
 
     def _scope_org(self, user, qs):
         return self._org
@@ -166,7 +166,7 @@ class PonSummaryEndpointTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
-        self.store.set_org("ispA", ntfy_topic_operator="ops-topic")
+        self.store.set_org("ispA", ntfy_topic_worker="ops-topic")
         self.olt = self.store.create_org_device("ispA", {
             "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
@@ -276,6 +276,7 @@ class PonSummaryEndpointTest(unittest.TestCase):
         _, body = h.reply
         self.assertEqual(body["pons_over_cap"], 1)
         self.assertEqual(body["pon_cap_worst"], 3)
+        self.assertEqual(body["over_cap_device_ids"], [self.olt])
 
     def test_summary_zeroes_down_olt(self):
         from wisp.central.api import outages

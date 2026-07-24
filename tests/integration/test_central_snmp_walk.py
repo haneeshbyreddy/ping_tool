@@ -72,6 +72,30 @@ class SnmpWalkStoreTest(unittest.TestCase):
         self.assertEqual(walk["varbind_count"], 1)
         self.assertEqual(walk["result"], [["1.3.6.1.2.1.1.5.0", "sw1"]])
 
+    def test_truncation_survives_the_round_trip_and_defaults_off(self):
+        # A partial dump must not read as a complete one: concluding "this OID
+        # holds nothing" off a walk that stopped at the budget is a false
+        # negative, and the row is all the dashboard has to go on.
+        wid = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
+        self.assertTrue(self.store.complete_snmp_walk(
+            "ispA", "edge-1", wid, varbinds=[["1.3.6.1.2.1.1.5.0", "sw1"]],
+            truncated=True))
+        self.assertEqual(self.store.get_snmp_walk("ispA", wid)["truncated"], 1)
+        self.assertEqual(
+            self.store.list_snmp_walks("ispA", self.dev)[0]["truncated"], 1)
+
+        # An older edge omits the field entirely; that must read as "complete",
+        # which is how those walks were already being treated.
+        plain = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
+        self.store.complete_snmp_walk("ispA", "edge-1", plain, varbinds=[])
+        self.assertEqual(self.store.get_snmp_walk("ispA", plain)["truncated"], 0)
+
+        # A failed walk is never also "partial" — status already says it failed.
+        bad = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
+        self.store.complete_snmp_walk("ispA", "edge-1", bad, error="timeout",
+                                      truncated=True)
+        self.assertEqual(self.store.get_snmp_walk("ispA", bad)["truncated"], 0)
+
     def test_error_completion_stores_no_result(self):
         wid = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
         self.assertTrue(self.store.complete_snmp_walk(
@@ -188,7 +212,7 @@ class SnmpWalkHttpTest(unittest.TestCase):
         status, resp, _ = self._req("POST", "/edge/snmp-walk", {
             "v": 1, "org_id": "ispA", "node_id": "edge-1", "walk_id": wid,
             "varbinds": [["1.3.6.1.2.1.1.5.0", "sw1"], ["1.3.6.1.2.1.1.2.0",
-                         "1.3.6.1.4.1.5651.1"]]}, token="tok")
+                         "1.3.6.1.4.1.5651.1"]], "truncated": True}, token="tok")
         self.assertEqual(status, 200)
         self.assertTrue(resp["ok"])
         status, reply = self._report()
@@ -200,6 +224,7 @@ class SnmpWalkHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["walks"][0]["status"], "done")
         self.assertEqual(body["walks"][0]["varbind_count"], 2)
+        self.assertEqual(body["walks"][0]["truncated"], 1)  # edge said partial
         self.assertNotIn("result", body["walks"][0])  # list is metadata-only
         status, body, _ = self._req(
             "GET", f"/api/inventory/snmp-walk/result?id={wid}", cookie=cookie)

@@ -13,7 +13,7 @@ from wisp.central.store_proxy import ProxyStoreMixin
 from wisp.central.store_snmp import SnmpStoreMixin
 from wisp.central.store_util import (  # noqa: F401 — re-exported
     SNMP_STATUS_STATES, SNMP_SUBSYSTEMS, SNMP_WALKS_KEEP,
-    _now_iso, _recent_days, _today,
+    _now_iso,
 )
 
 _SCHEMA = """
@@ -21,9 +21,13 @@ CREATE TABLE IF NOT EXISTS orgs (
     org_id        TEXT PRIMARY KEY,
     name             TEXT,
     ntfy_topic       TEXT,                 -- per-org page target for the fleet watchdog
-    ntfy_topic_owner    TEXT,              -- Phase A: per-role outage routing (Phase B pages these)
-    ntfy_topic_operator TEXT,
-    ntfy_topic_tech     TEXT,
+    -- Per-role outage routing. TWO channels since 2026-07-21 (roles collapsed to
+    -- owner+worker): the owner gets outage opens, the worker channel carries the
+    -- SNMP-derived stream + escalation. An older DB still has the dead
+    -- ntfy_topic_operator/ntfy_topic_tech columns — operator's VALUE was copied
+    -- into ntfy_topic_worker at migration so no subscribed phone went quiet.
+    ntfy_topic_owner    TEXT,
+    ntfy_topic_worker   TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS nodes (
@@ -90,29 +94,12 @@ CREATE TABLE IF NOT EXISTS users (
     username   TEXT NOT NULL UNIQUE,
     pw_hash    TEXT NOT NULL,
     pw_salt    TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT 'operator',  -- owner|operator|tech within the org
+    role       TEXT NOT NULL DEFAULT 'worker',  -- owner|worker within the org
     is_active  INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
--- Part C — the org-wide team roster + attendance ("who's on duty" is an org fact, so it
--- lives centrally now, not per-edge). Mirrors the edge workers/attendance model.
-CREATE TABLE IF NOT EXISTS org_workers (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id  TEXT NOT NULL,
-    name       TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT 'operator',
-    region     TEXT,
-    is_active  INTEGER NOT NULL DEFAULT 1,
-    notes      TEXT,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS org_attendance (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id TEXT NOT NULL,
-    worker_id INTEGER NOT NULL REFERENCES org_workers(id),
-    day       TEXT NOT NULL,               -- UTC calendar day; presence = a row exists
-    UNIQUE (worker_id, day)
-);
+-- (The credential-less org_workers roster + org_attendance were REMOVED 2026-07-21 —
+-- see the "Removed" note in CLAUDE.md. The tables may linger in an older DB, unread.)
 -- Phase A — the ISP-managed device topology (the management plane an org builds from the
 -- central dashboard, independent of any edge). NOT the same table as `devices` above: that
 -- one is the edge-ingest global id map (Phase B/C will populate live state onto it via
@@ -147,9 +134,21 @@ CREATE TABLE IF NOT EXISTS org_devices (
 );
 CREATE INDEX IF NOT EXISTS idx_org_devices_org ON org_devices(org_id, is_active);
 -- Declared region names per org — feeds the dashboard's region dropdowns.
--- `org_devices.region`/`org_workers.region` stay plain text; list_regions returns
+-- `org_devices.region` stays plain text; list_regions returns
 -- the UNION of declared + in-use names, so pre-table free-text regions surface
 -- without any backfill.
+-- Operator colour-coding, presentation ONLY (central/inventory.py:PALETTE).
+-- A row per coloured tag or probe; absent = uncoloured, which is the default and
+-- the "clear" state. Keyed by TEXT rather than a foreign key on purpose: a tag
+-- is only ever text inside org_devices.tags, and a probe may exist as a
+-- node_tokens row, a nodes row, or both. Nothing here reaches the engine.
+CREATE TABLE IF NOT EXISTS org_colors (
+    org_id  TEXT NOT NULL,
+    kind    TEXT NOT NULL,            -- 'tag' | 'node'
+    key     TEXT NOT NULL,            -- the tag text / node_id
+    color   TEXT NOT NULL,            -- a PALETTE name, never free hex
+    PRIMARY KEY (org_id, kind, key)
+);
 CREATE TABLE IF NOT EXISTS org_regions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id     TEXT NOT NULL,
@@ -320,6 +319,12 @@ CREATE TABLE IF NOT EXISTS switch_ports (
     bw_high_streak    INTEGER NOT NULL DEFAULT 0,
     bw_high_alarm     INTEGER NOT NULL DEFAULT 0,
     bw_high_alarm_since TEXT,
+    -- Operator-declared physical cabling, the child-side mirror of feeds_device_id:
+    -- THIS port on the child faces THAT parent (primary or backup). Together the two
+    -- columns name both ends of a link — switch_ports stays the ONLY port registry,
+    -- so the map's bandwidth labels and ports.py's outage folding can never disagree
+    -- about which port carries a link. Never touched by a walk (upsert omits it).
+    uplink_device_id INTEGER REFERENCES org_devices(id),
     UNIQUE(org_id, device_id, if_index)
 );
 CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(org_id, device_id);
@@ -341,17 +346,26 @@ CREATE TABLE IF NOT EXISTS org_device_links (
 );
 CREATE INDEX IF NOT EXISTS idx_org_device_links_child ON org_device_links(org_id, child_id);
 CREATE INDEX IF NOT EXISTS idx_org_device_links_parent ON org_device_links(org_id, parent_id);
--- Drawn cable path for one link (map view). Keyed by the (child, parent) pair so it
--- covers both the implicit primary link (org_devices.parent_device_id) and backup
--- rows above. Waypoints are the INTERMEDIATE vertices only, ordered parent→child —
--- endpoints stay implicit (the device pins), so moving a pin rubber-bands the route
--- instead of orphaning it. Dashboard-side only; the edge never sees geometry.
+-- Per-link MAP PRESENTATION for one link, geometry and styling both. Keyed by the
+-- (child, parent) pair so it covers the implicit primary link
+-- (org_devices.parent_device_id), the backup rows above and cross-links alike.
+-- Waypoints are the INTERMEDIATE vertices only, ordered parent→child — endpoints
+-- stay implicit (the device pins), so moving a pin rubber-bands the route instead
+-- of orphaning it. Dashboard-side only; the edge never sees geometry.
+--
+-- `color`/`label_pos` are the operator's cartography, NOT state: a colour is a
+-- name from inventory.LINK_COLORS (a closed palette, deliberately no free hex —
+-- see there) and only ever paints a HEALTHY line, and label_pos is a 0..1
+-- fraction along the rendered path. They live here rather than in a second table
+-- because the key is already exactly "one link" — the same reason routes do.
 CREATE TABLE IF NOT EXISTS link_routes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id     TEXT NOT NULL,
     child_id   INTEGER NOT NULL REFERENCES org_devices(id),
     parent_id  INTEGER NOT NULL REFERENCES org_devices(id),
     waypoints  TEXT NOT NULL,            -- JSON [[lat,lng],...]
+    color      TEXT,                     -- LINK_COLORS name; NULL = tone default
+    label_pos  REAL,                     -- 0..1 along the path; NULL = midpoint
     updated_at TEXT NOT NULL,
     updated_by TEXT,
     UNIQUE(org_id, child_id, parent_id)
@@ -448,6 +462,32 @@ CREATE TABLE IF NOT EXISTS onu_optics (
     UNIQUE(org_id, device_id, onu_key)
 );
 CREATE INDEX IF NOT EXISTS idx_onu_optics_device ON onu_optics(org_id, device_id);
+-- Per-ONU optics SCRAPED from the OLT's own web UI (central/weboptics.py), the
+-- only source of Rx on C-Data/DBC EPON. Deliberately its own table rather than
+-- more columns on onu_optics: the scrape rides a slow independent clock while
+-- onu_optics is rewritten by every SNMP walk, so one table would make "which
+-- half of this row is fresh?" unanswerable. These rows are an INPUT that the
+-- optics fold merges by MAC (weboptics.merge_scraped) — onu_optics stays the
+-- one place severity, the badge and PON-fault read from.
+CREATE TABLE IF NOT EXISTS onu_web_optics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT NOT NULL,
+    device_id   INTEGER NOT NULL REFERENCES org_devices(id),   -- the OLT
+    onu_key     TEXT NOT NULL,   -- "<pon>.<onu_id>", same shape the roster uses
+    serial      TEXT,            -- MAC as the page prints it — the merge key
+    rx_dbm      REAL,
+    tx_dbm      REAL,
+    -- REAL METRES, unlike the dbc SNMP profile's distance (EPON time quanta);
+    -- this page is where an honest fibre-cut bracket comes from.
+    distance_m  INTEGER,
+    temp_c      REAL,
+    voltage_v   REAL,
+    tx_bias_ma  REAL,
+    scraped_at  TEXT NOT NULL,
+    UNIQUE(org_id, device_id, onu_key)
+);
+CREATE INDEX IF NOT EXISTS idx_onu_web_optics_device
+    ON onu_web_optics(org_id, device_id);
 -- Per-OLT optical badge — one row per OLT, restart-safe like device_redundancy/
 -- device_perf. Carries the summary counts the OLT row/header render and the
 -- transition-only paging state (page when crit_count crosses 0 -> >0, recover at 0),
@@ -540,6 +580,11 @@ CREATE TABLE IF NOT EXISTS snmp_walks (
     error         TEXT,
     result        TEXT,               -- JSON [[oid, value], ...]
     varbind_count INTEGER,
+    -- The edge stopped at its varbind cap or time budget, so this subtree is
+    -- only PARTIALLY dumped. Load-bearing for vendor onboarding: a truncated
+    -- walk and a complete one are indistinguishable from the row alone, and
+    -- "that OID holds nothing" read off a partial walk is a false negative.
+    truncated     INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL,
     completed_at  TEXT
 );
@@ -578,6 +623,46 @@ CREATE TABLE IF NOT EXISTS gpon_profiles (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
+-- Web-UI optics recipes as data (central/weboptics_profiles.py) — the third
+-- profile table, for the vendors whose per-ONU Rx exists in NO SNMP OID and can
+-- only be read off the OLT's own page (C-Data/DBC EPON, proven exhaustively).
+-- `name` is deliberately the SAME token as gpon_profiles.name /
+-- org_devices.gpon_vendor: that is already how a device is bound to a vendor,
+-- and a second web-only notion of "which vendor is this" could disagree with it
+-- about the same OLT. spec is the whole closed-vocabulary JSON
+-- (clean_web_optics_profile_payload): paths, login/optics form shape, session
+-- strategy, charset, columns BY HEADING. Built-in 'dbc' stays in code as the
+-- fallback; a same-named row shadows it, a disabled row switches it OFF.
+CREATE TABLE IF NOT EXISTS web_optics_profiles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT,                    -- NULL => global
+    name        TEXT NOT NULL,
+    spec        TEXT NOT NULL,           -- JSON, closed vocabulary (see above)
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_web_optics_profiles_scope
+    ON web_optics_profiles(IFNULL(org_id, ''), name);
+-- Outcome of the last web-optics scrape, per OLT (central/weboptics_sweep.py).
+-- The sweep used to leave its verdict in the log only, which meant a blank dBm
+-- column on the dashboard had no explanation anywhere a user could reach: "this
+-- vendor has no Rx", "nobody has typed the OLT's password" and "the scrape has
+-- been failing for a day" all render as the same empty column. Same job
+-- device_snmp_status does for a blank Ports/Optical panel, and the same closed
+-- vocabulary discipline: state is one of ok | partial | skipped | no_profile |
+-- no_credentials | unreachable | login | error. last_ok_at survives a failure so
+-- the panel can say "was working until <ts>".
+CREATE TABLE IF NOT EXISTS web_optics_status (
+    device_id   INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    org_id      TEXT NOT NULL,
+    profile     TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL,
+    detail      TEXT,
+    rows        INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL,
+    last_ok_at  TEXT
+);
 -- Per-device, per-subsystem SNMP sweep diagnosis, reported by the edge on every
 -- SNMP cadence ("snmp_status" on the full report). This is what lets the dashboard
 -- say WHY a panel is blank (agent silent vs subtree empty vs walk timeout vs no
@@ -610,29 +695,6 @@ CREATE TABLE IF NOT EXISTS org_billing_months (
     marked_by TEXT,
     marked_at TEXT NOT NULL,
     PRIMARY KEY (org_id, month)
-);
--- Online-checkout ledger (central/upigateway.py): one row per order created
--- from the dashboard's Pay button. `months` is the comma-joined 'YYYY-MM'
--- list the order buys; verification flips status created→paid exactly once
--- (settle_billing_payment's WHERE status='created' guard) and only then are
--- the months marked in org_billing_months (marked_by
--- 'upigateway:<payment_id>'); a failed payment flips created→failed so the
--- sweeper stops re-checking it. `gateway` DEFAULTS to 'razorpay' as a
--- tombstone: rows from the removed Razorpay era (2026-07-16) keep that value
--- and are excluded from every UPIGateway settle path — new rows are always
--- written with gateway='upigateway' explicitly.
-CREATE TABLE IF NOT EXISTS billing_payments (
-    order_id     TEXT PRIMARY KEY,
-    org_id       TEXT NOT NULL,
-    plan         TEXT NOT NULL,
-    months       TEXT NOT NULL,
-    amount_paise INTEGER NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'created',
-    gateway      TEXT NOT NULL DEFAULT 'razorpay',
-    payment_id   TEXT,
-    created_by   TEXT,
-    created_at   TEXT NOT NULL,
-    paid_at      TEXT
 );
 -- Transition-only billing reminders (central/billing.py, watchdog pattern):
 -- kind = 'due_soon' | 'locked', one row per (org, month, kind). Only
@@ -712,7 +774,7 @@ class CentralStore(
 
     _TENANT_TABLES = (
         "orgs", "nodes", "node_tokens", "devices", "events", "rollups", "node_alerts",
-        "users", "org_workers", "org_attendance", "org_devices", "device_states",
+        "users", "org_devices", "device_states",
         "outages", "device_rollups", "alert_log", "alert_digest", "escalations", "rollouts",
         "switch_ports", "org_device_links", "device_redundancy", "device_perf_samples",
         "device_perf",
@@ -729,8 +791,7 @@ class CentralStore(
             self._migrate_tenant_to_org(conn)
             conn.executescript(_SCHEMA)
             self._ensure_columns(conn, "orgs", (
-                ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_operator", "TEXT"),
-                ("ntfy_topic_tech", "TEXT"),
+                ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_worker", "TEXT"),
                 # Map view viewport lock; a key from the dashboard's region list
                 # (web/src/lib/map-regions.ts), e.g. "telangana". NULL = all-India.
                 # (google_maps_key briefly lived here too — moved to app_settings
@@ -758,10 +819,32 @@ class CentralStore(
                 ("auto_update", "INTEGER NOT NULL DEFAULT 0")))
             self._ensure_columns(conn, "nodes", (
                 ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
-            # rows from the pre-UPIGateway (Razorpay, removed 2026-07-16) era
-            # take the 'razorpay' default and stay quarantined from settling
-            self._ensure_columns(conn, "billing_payments", (
-                ("gateway", "TEXT NOT NULL DEFAULT 'razorpay'"),))
+            # Per-login-account WhatsApp number (E.164), the recipient half of the
+            # experimental WhatsApp channel (2026-07-23). Numbers are per-account,
+            # not per-org — every login adds its own; pages fan out per org+role
+            # via store.org_role_whatsapp, the analog of org_role_topic. Purely
+            # additive: absent = that account gets no WhatsApp, exactly as today.
+            self._ensure_columns(conn, "users", (
+                ("whatsapp_number", "TEXT"),
+                # Session generation for single-active-session enforcement
+                # (2026-07-23). A newer login / a logout bumps it; every cookie
+                # signed with an older value then fails resolve_session. 0 on
+                # rows that predate the column, matching a fresh account.
+                ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                # TOTP second factor (2026-07-23), owner/superadmin only. The
+                # shared secret is secretbox-ENCRYPTED (never plaintext); enabled
+                # flips to 1 only once a code is confirmed (a set secret with
+                # enabled=0 is an abandoned enrollment and is NOT enforced).
+                # last_step is the replay guard (last accepted counter); recovery
+                # holds a JSON list of unused recovery-code SHA-256 hashes.
+                ("totp_secret", "TEXT"),
+                ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("totp_last_step", "INTEGER"),
+                ("totp_recovery", "TEXT"),))
+            # Pre-2026-07-22 walks predate the flag; 0 reads as "not known to be
+            # partial", which is what they were already being treated as.
+            self._ensure_columns(conn, "snmp_walks", (
+                ("truncated", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             # clean classification token for the notification governor + honest
@@ -781,7 +864,11 @@ class CentralStore(
                 ("bw_max_mbps", "REAL"),
                 ("bw_high_streak", "INTEGER NOT NULL DEFAULT 0"),
                 ("bw_high_alarm", "INTEGER NOT NULL DEFAULT 0"),
-                ("bw_high_alarm_since", "TEXT")))
+                ("bw_high_alarm_since", "TEXT"),
+                ("uplink_device_id", "INTEGER")))
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_switch_ports_uplink"
+                " ON switch_ports(org_id, uplink_device_id)")
             self._ensure_columns(conn, "org_devices", (
                 ("assigned_node_id", "TEXT"),
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
@@ -809,7 +896,13 @@ class CentralStore(
                 # editing them never rebuilds/re-pages an engine. (A dev DB may
                 # also carry a dead group_name column from the tags feature's
                 # one-day single-group predecessor — harmless.)
-                ("tags", "TEXT")))
+                ("tags", "TEXT"),
+                # Network TREE presentation only: render this device at the top
+                # level instead of inside its parent's subtree. The parent link
+                # itself is untouched — suppression, the map, and paging all
+                # still see it. Same discipline as tags: read ONLY by
+                # list_org_devices, never by org_device_topology.
+                ("tree_detached", "INTEGER NOT NULL DEFAULT 0")))
             # when this ONU was last seen online — central/ponfault.py reads it to
             # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (
@@ -818,8 +911,55 @@ class CentralStore(
             # that already created it (Phase 1) needs the column backfilled.
             self._ensure_columns(conn, "device_webui_credentials", (
                 ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
+            # Link styling landed after the table shipped as geometry-only.
+            self._ensure_columns(conn, "link_routes", (
+                ("color", "TEXT"), ("label_pos", "REAL")))
             self._seed_google_key(conn)
+            self._collapse_roles(conn)
             conn.commit()
+
+
+    @staticmethod
+    def _collapse_roles(conn) -> None:
+        """Roles collapsed to owner+worker (2026-07-21): the org has owners and
+        field workers, nothing in between.
+
+        Two one-shot moves, both idempotent:
+
+        * **The operator TOPIC becomes the worker topic, value and all.** That
+          column was where nearly every page actually landed (ponalert,
+          onualert, ports, perf, redundancy, the hourly escalation) — dropping
+          it would have silenced a live fleet until every phone re-subscribed.
+          Copying the string across means the same ntfy topic keeps paging the
+          same handsets; only the name central calls it changed. The tech topic
+          is genuinely gone (it only ever took the all-hands resolve
+          broadcast, which the worker channel now carries).
+        * **operator/tech accounts become workers.** Both were read-only bar
+          the owner-gated writes, and `worker` is the closest live role — an
+          account left holding a role outside ROLES would fail every
+          `_can_write`/`can_triage` check and read as a broken login.
+
+        The dead columns stay put: dropping a column rewrites the table, and a
+        lingering unread one is harmless (same call as the razorpay/upigateway
+        leftovers).
+        """
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(orgs)")}
+        if "ntfy_topic_operator" in cols:
+            conn.execute(
+                "UPDATE orgs SET ntfy_topic_worker=ntfy_topic_operator"
+                " WHERE ntfy_topic_worker IS NULL AND ntfy_topic_operator IS NOT NULL")
+        # ORG accounts only. A superadmin is org_id IS NULL and its role column
+        # is meaningless, but it must never READ as 'worker': the SPA's
+        # require-auth hands any worker the stripped field view, so flipping the
+        # platform admin's row locked it out of its own dashboard.
+        conn.execute(
+            "UPDATE users SET role='worker'"
+            " WHERE org_id IS NOT NULL AND role IN ('operator','tech')")
+        # …and normalise every superadmin onto the one harmless token, repairing
+        # rows an earlier build already flipped (create_user's default became
+        # 'worker' with the collapse, so a bare `admin create-user` wrote it too).
+        conn.execute(
+            "UPDATE users SET role='owner' WHERE org_id IS NULL AND role!='owner'")
 
 
     @staticmethod

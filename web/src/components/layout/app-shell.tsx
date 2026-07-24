@@ -1,56 +1,44 @@
 import { useEffect, useRef, useState } from "react"
-import { NavLink, Outlet, useLocation } from "react-router-dom"
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Search } from "lucide-react"
+import { MoreHorizontal, Search } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
-import { billingApi, orgsApi } from "@/lib/api"
+import { billingApi } from "@/lib/api"
 import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
-import { PlanChip } from "@/components/plan-chip"
 import { NAV_ITEMS, MORE_ITEMS } from "./nav-items"
 import { AlarmChips } from "./alarm-chips"
-import { OrgSwitcher } from "./org-switcher"
+import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
+import { AccountMenu } from "./account-menu"
 import { CommandPalette } from "./command-palette"
 import {
-  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarHeader, SidebarInset,
-  SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger,
+  Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarHeader,
+  SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger,
 } from "@/components/ui/sidebar"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
-import { MoreHorizontal } from "lucide-react"
-
-function Brand() {
-  const { user } = useAuth()
-
-  const { data } = useQuery({
-    queryKey: ["orgs", "brand", user?.org_id],
-    queryFn: () => orgsApi.list(),
-    enabled: !!user && !user.is_superadmin,
-    staleTime: 5 * 60 * 1000,
-  })
-  const orgName = !user?.is_superadmin
-    ? data?.orgs[0]?.name || user?.org_id
-    : null
-
-  return (
-    <NavLink to="/" className="flex min-w-0 shrink-0 items-center gap-2 px-1">
-      <span className="truncate whitespace-nowrap text-sm font-semibold tracking-tight text-foreground">
-        {orgName || "WISP Central"}
-      </span>
-    </NavLink>
-  )
-}
 
 export function AppShell() {
   const [searchOpen, setSearchOpen] = useState(false)
   const { user, scopeOrg } = useAuth()
+  // Read-only worker (same shell at every viewport now): no Settings, no billing.
+  const isWorker = !!user && !user.is_superadmin && user.role === "worker"
   const { pathname } = useLocation()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const navItems = NAV_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
-  const moreItems = MORE_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
+  // Settings is owner+ only (a worker hitting it is bounced to Home), so it's
+  // kept out of the worker's mobile "More" sheet just as the sidebar/AccountMenu
+  // keep it off desktop — no dead entry now that workers get the full shell.
+  const moreItems = MORE_ITEMS.filter(
+    (i) => (!i.superadminOnly || user?.is_superadmin) && !(i.account && isWorker),
+  )
+  // Sidebar shows destinations; account-scoped entries move to the AccountMenu
+  // at its foot. The mobile "More" sheet keeps them — there is no sidebar there.
+  const sidebarItems = navItems.filter((i) => !i.account)
 
   const isNavActive = (to: string) => (to === "/" ? pathname === "/" : pathname.startsWith(to))
 
@@ -72,6 +60,24 @@ export function AppShell() {
     return () => window.removeEventListener("wisp:payment-required", handler)
   }, [queryClient])
 
+  // ⌘, / Ctrl+, → Settings. The account menu advertises this shortcut, so it has
+  // to exist; ignore it while the user is typing, or "," in a device-search box
+  // would navigate away mid-word.
+  useEffect(() => {
+    // A worker has no Settings page, so the shortcut it advertises is gone too.
+    if (isWorker) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "," || !(e.metaKey || e.ctrlKey)) return
+      const el = document.activeElement
+      if (el instanceof HTMLElement &&
+        (el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName))) return
+      e.preventDefault()
+      navigate("/settings")
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [navigate, isWorker])
+
   // On unlock, every query that 402'd while locked is stale — refetch the lot.
   const wasLocked = useRef(false)
   useEffect(() => {
@@ -80,31 +86,36 @@ export function AppShell() {
   }, [billing, queryClient])
 
   if (billing?.locked && user && !user.is_superadmin) {
-    return <BillingLock billing={billing} />
+    return <BillingLock billing={billing} org={billingOrg} />
   }
 
   return (
     <SidebarProvider>
       <Sidebar collapsible="icon" className="hidden md:flex">
-        <SidebarHeader>
-          <Brand />
+        <SidebarHeader className="pb-3">
+          <WorkspaceRow />
         </SidebarHeader>
         <SidebarContent>
           <SidebarGroup>
             <SidebarGroupContent>
-              <SidebarMenu>
-                {navItems.map((item) => (
+              <SidebarMenu className="gap-0.5">
+                {sidebarItems.map((item) => (
                   <SidebarMenuItem key={item.to}>
-                    <SidebarMenuButton asChild tooltip={item.label}>
+                    <SidebarMenuButton asChild tooltip={item.label} className="h-9 gap-3 px-3">
                       <NavLink
                         to={item.to}
                         end={item.to === "/"}
                         className={cn(
+                          "text-xs font-medium text-muted-foreground transition-colors",
+                          // Active state is elevation + a 2px inset rail, NOT a
+                          // colored fill: the accent stays reserved for things
+                          // that are actionable, so status colors keep being the
+                          // loudest thing on screen.
                           isNavActive(item.to) &&
-                            "bg-primary-soft text-primary hover:bg-primary-soft hover:text-primary",
+                            "bg-foreground/[0.07] text-foreground shadow-[inset_2px_0_0_var(--foreground)] hover:bg-foreground/[0.07] hover:text-foreground",
                         )}
                       >
-                        <item.icon />
+                        <item.icon className="size-4" />
                         <span>{item.label}</span>
                       </NavLink>
                     </SidebarMenuButton>
@@ -114,36 +125,48 @@ export function AppShell() {
             </SidebarGroupContent>
           </SidebarGroup>
         </SidebarContent>
+        <SidebarFooter>
+          <AccountMenu billing={billing} />
+        </SidebarFooter>
       </Sidebar>
 
       <SidebarInset>
-        <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-2 border-b bg-background px-3 md:px-5">
-          <SidebarTrigger className="hidden md:flex" />
+        <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-3 border-b bg-background px-3 md:px-6">
+          <SidebarTrigger className="hidden text-muted-foreground md:flex" />
+          {/* No sidebar below md, so the workspace row (and, for a superadmin,
+              the switcher it carries) rides the mobile header instead. */}
           <div className="md:hidden">
-            <Brand />
+            <WorkspaceRow variant="topbar" />
           </div>
-          <OrgSwitcher />
-          {billing && <PlanChip billing={billing} />}
           <div className="flex-1" />
           <AlarmChips />
-          {/* input-shaped so the palette is discoverable; icon-only on mobile */}
+          {/* Shaped exactly like the input it stands in for so the palette is
+              discoverable, but kept a BUTTON: a text field you cannot type into
+              is a lie the first keystroke exposes. */}
           <button
-            className="hidden h-8 w-52 items-center gap-2 rounded-lg border bg-muted/30 px-2.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground md:flex"
+            className="hidden h-8 w-52 items-center gap-2 rounded-lg border bg-muted px-2.5 text-xs text-faint-foreground transition-colors hover:border-border-strong hover:text-muted-foreground lg:flex lg:w-72"
             onClick={() => setSearchOpen(true)}>
             <Search className="size-3.5 shrink-0" />
-            <span className="flex-1 text-left">Search…</span>
-            <kbd className="pointer-events-none rounded border bg-muted px-1.5 py-px font-mono text-2xs">
+            <span className="flex-1 text-left">Search devices, logs, IPs…</span>
+            <kbd className="pointer-events-none rounded border bg-accent px-1.5 py-px font-mono text-2xs">
               {navigator.platform.includes("Mac") ? "⌘K" : "Ctrl K"}
             </kbd>
           </button>
-          <Button variant="outline" size="icon" className="size-8 md:hidden" aria-label="Search"
+          <Button variant="ghost" size="icon" className="size-8 lg:hidden" aria-label="Search"
             onClick={() => setSearchOpen(true)}>
             <Search className="size-4" />
           </Button>
-          <UserMenu />
+          {/* Mobile only: the sidebar (and with it the account menu) is hidden
+              below md, so this is the only identity surface there. On desktop it
+              would be a second door to the same three actions. */}
+          <span className="md:hidden">
+            <UserMenu />
+          </span>
         </header>
 
-        {billing && billingOrg && (
+        {/* Billing is owner business — a worker never sees the runway banner
+            (the LOCK screen above still shows for every member, by design). */}
+        {billing && billingOrg && !isWorker && (
           user?.is_superadmin
             ? <BillingLockedNote billing={billing} />
             : <BillingBanner billing={billing} org={billingOrg} />
@@ -153,8 +176,8 @@ export function AppShell() {
           <Outlet />
         </main>
 
-        {/* Mobile bottom tab bar — mirrors the mockup's 5-icon nav (More folds Team/
-            Settings/Logs, which get their own sidebar entries on desktop). */}
+        {/* Mobile bottom tab bar — More folds Settings/Logs, which get their own
+            sidebar entries on desktop. */}
         <nav className="fixed inset-x-0 bottom-0 z-30 flex items-stretch justify-around border-t bg-sidebar px-1 pb-[env(safe-area-inset-bottom)] md:hidden">
           {navItems.filter((i) => i.mobile).map((item) => (
             <NavLink
@@ -164,7 +187,7 @@ export function AppShell() {
               className={({ isActive }) =>
                 cn(
                   "flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium",
-                  isActive ? "text-primary" : "text-muted-foreground",
+                  isActive ? "text-foreground" : "text-faint-foreground",
                 )
               }
             >
@@ -174,7 +197,7 @@ export function AppShell() {
           ))}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium text-muted-foreground">
+              <button className="flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium text-faint-foreground">
                 <MoreHorizontal className="size-5" />
                 More
               </button>

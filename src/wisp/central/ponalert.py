@@ -90,6 +90,6 @@ class PonFaultAlerter:
     def _page(self, title: str, body: str, device_id: int, ts: str,
               kind: str = "PON_FAULT") -> None:
         self.router.emit(
-            kind, topic=self.store.org_role_topic(self.org_id, "operator"),
+            kind, topic=self.store.org_role_topic(self.org_id, "worker"),
             title=title, body=body, priority=3, ts=ts, device_id=device_id,
             gate=self.cfg.pon_fault_alerts)
