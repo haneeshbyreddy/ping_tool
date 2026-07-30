@@ -62,25 +62,23 @@ class PerfSweepTest(unittest.TestCase):
     def _clear_queue(self):
         self.store.mark_digests_sent(ORG, "2026-01-01T00:30:00+00:00")
 
-    def test_sustained_degradation_pages_operator_once(self):
+    def test_sustained_degradation_writes_badge_off(self):
+        # Perf is OFF for now (allowlist): the badge state is written but nothing
+        # pushes or queues to the dormant digest.
         self._feed([(8.0, 0.0, 2.0, UP)] * 15 + [(120.0, 0.0, 2.0, UP)] * 3)
-        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
-        q = self._queued()
-        self.assertEqual(len(q), 1)
-        self.assertEqual(q[0]["kind"], "PERF_DEGRADED")
-        self.assertIn("Slow link", q[0]["title"])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         row = self._perf_row()
         self.assertEqual(row["degraded"], 1)
         self.assertEqual(row["metric"], "latency")
         self.assertEqual(row["since"], "2026-01-01T00:17:00+00:00")
 
-    def test_recovery_sends_one_notice(self):
+    def test_recovery_clears_badge(self):
         self._feed([(8.0, 0.0, 2.0, UP)] * 15 + [(120.0, 0.0, 2.0, UP)] * 3)
         self._clear_queue()
         self._feed([(8.0, 0.0, 2.0, UP)] * 3)
-        q = self._queued()
-        self.assertEqual(len(q), 1)
-        self.assertIn("Recovered", q[0]["title"])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         self.assertEqual(self._perf_row()["degraded"], 0)
 
     def test_down_clears_perf_silently(self):

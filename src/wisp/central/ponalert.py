@@ -42,7 +42,9 @@ class PonFaultAlerter:
             self.store.list_org_devices(self.org_id),
             self.store.list_link_routes(self.org_id))
         faults = ponfault.evaluate_org(rows, datetime.now(timezone.utc),
-                                       passive_dists=dists)
+                                       passive_dists=dists,
+                                       witness_macs=self.store.onu_place_macs(
+                                           self.org_id))
         prior = self.store.pon_fault_states(self.org_id)
 
         current: dict[tuple[int, str], ponfault.PonFault] = {
@@ -59,9 +61,22 @@ class PonFaultAlerter:
                 where = (f"{_fmt_km(f.cut_low_m)} to {_fmt_km(f.cut_high_m)}"
                          if f.cut_high_m is not None else "unknown distance")
                 suspect = f" · suspect {f.suspect}" if f.suspect else ""
+                # A dark reference ONU is testimony, not inference — say so, and
+                # drop "suspected". Whoever reads this at 2am decides whether to
+                # wake a splicing crew, and "we assumed" vs "a UPS-backed
+                # subscriber went dark too" are different decisions.
+                if f.evidence == "witness":
+                    n = f.witness_dark
+                    head = f"✂️ Fiber cut CONFIRMED: {f.device_name} PON {f.pon_port or '?'}"
+                    why = (f" · {n} power-backed reference ONU"
+                           f"{'' if n == 1 else 's'} dark")
+                else:
+                    head = f"✂️ Suspected fiber cut: {f.device_name} PON {f.pon_port or '?'}"
+                    why = ""
                 self._page(
-                    f"✂️ Suspected fiber cut: {f.device_name} PON {f.pon_port or '?'}",
-                    f"{f.dark}/{f.onus_total} ONUs dark · {where} from OLT{suspect}",
+                    head,
+                    f"{f.dark}/{f.onus_total} ONUs dark · {where} from OLT"
+                    f"{suspect}{why}",
                     f.device_id, ts)
 
         # Recovery needs a FRESH walk that actually shows the PON back up.
@@ -90,6 +105,6 @@ class PonFaultAlerter:
     def _page(self, title: str, body: str, device_id: int, ts: str,
               kind: str = "PON_FAULT") -> None:
         self.router.emit(
-            kind, topic=self.store.org_role_topic(self.org_id, "worker"),
+            kind,
             title=title, body=body, priority=3, ts=ts, device_id=device_id,
             gate=self.cfg.pon_fault_alerts)

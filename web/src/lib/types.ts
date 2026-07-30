@@ -15,15 +15,11 @@ export interface User {
 
 export interface MeResponse {
   user: User
-  channels: { central: string | null }
 }
 
 export interface Org {
   org_id: string
   name: string | null
-  ntfy_topic: string | null
-  ntfy_topic_owner: string | null
-  ntfy_topic_worker: string | null
   map_region: string | null
   // the superadmin's server-wide Map Tiles key, injected into every org row
   google_maps_key: string | null
@@ -123,6 +119,11 @@ export const DEVICE_TYPES = [
 ] as const
 /** Passive plant: on the map and in the tree, never probed — no IP, no FSM. */
 export const PASSIVE_DEVICE_TYPES = ["splitter", "fdb", "closure"] as const
+/** How many ways a passive splits the fibre. CLOSED, and matching
+ *  `inventory.SPLIT_RATIOS` on the server — only what an ISP actually stocks,
+ *  because the ratio feeds the load bar and the cumulative split down a
+ *  cascade, and "1:7" would produce arithmetic nobody can act on. */
+export const SPLIT_RATIOS = [2, 4, 8] as const
 export type DeviceType =
   (typeof DEVICE_TYPES)[number] | (typeof PASSIVE_DEVICE_TYPES)[number]
 export const isPassiveType = (t: string | null | undefined): boolean =>
@@ -145,6 +146,15 @@ export interface PonFault {
   cut_high_m: number | null
   /** named passive (splitter/FDB) whose route distance sits in the cut interval */
   suspect: string | null
+  /** How `kind` was decided. `silence` is the honest name for a verdict reached
+   *  with nothing to go on — the C-Data/DBC fleet reports neither dying_gasp
+   *  nor LOS, so a "fiber" call there is an assumption until a placed reference
+   *  ONU (see OnuPlace) makes it a finding. Don't render the three alike. */
+  evidence: "witness" | "dying_gasp" | "silence"
+  /** reference ONUs that went dark SILENTLY — power cannot explain these */
+  witness_dark: number
+  /** reference ONUs on this PON still online */
+  witness_alive: number
 }
 
 /** Org-wide optical/PON rollup for the dashboard KPI strip
@@ -236,6 +246,16 @@ export interface OrgDevice {
   gpon_vendor: string | null
   /** passive plant only: which PON this splitter/FDB serves (e.g. "0/6") */
   pon_port: string | null
+  /** passive plant only: how many ways this box splits (2 | 4 | 8; see
+   *  SPLIT_RATIOS). null = not recorded — which is also the honest value for a
+   *  closure that only splices. Drives the recorded-load bar and the cumulative
+   *  split down a cascade; never an occupancy claim on its own, because a leg
+   *  nobody wrote down is unknown, not free. */
+  split_ratio: number | null
+  /** OLT only: how many ONUs fit on one PON before it reads as full. EPON tops
+   *  out at 1:64 and GPON at 1:128, so one global default false-pages half a
+   *  mixed fleet. null = not set, i.e. the server's global cap applies. */
+  onu_pon_limit: number | null
   /** web-UI proxy address override: where the admin page actually lives when
       it isn't at ip_address:80/443 (port-forwarding / a separate mgmt IP).
       Any set = "Open web UI" targets (web_ip||ip_address):(web_port||default)
@@ -245,11 +265,28 @@ export interface OrgDevice {
   web_scheme: string | null
   lat: number | null
   lng: number | null
+  /** Where the pin came from, and how well it is known. A phone's first fix is a
+   *  cell/wifi estimate at 30–80 m that converges over ~10 s, so a field capture
+   *  and a surveyed desktop placement are different claims about the same two
+   *  numbers — and the map may not render them alike. All null = placed before
+   *  the survey shipped, or dragged on the desktop (which WIPES these on
+   *  purpose: the newer hand-placed claim carries no accuracy). "Unknown", never
+   *  "surveyed". */
+  accuracy_m: number | null
+  place_source: "gps" | "manual" | null
+  placed_by: string | null
+  placed_at: string | null
   child_count: number
   backup_parents: number[]
   /** switch-to-switch cross-links (undirected, no dependency). Stored once per
       cable and expanded symmetrically server-side, so BOTH ends list each other. */
   peer_ids: number[]
+  /** Accounts EXPLICITLY on the hook for paging about this device. A PAGING rule
+      and nothing else — it never decides what a session may see. Responsibility
+      is inherited DOWN the tree, so a device with an empty list here can still be
+      covered from an ancestor; `inheritedAssignees` in lib/assignment.ts is what
+      resolves that, off the parent chain the tree already has. */
+  assignee_ids: number[]
 
   ports_down: number
   ports_bw_low: number
@@ -372,7 +409,14 @@ export interface OnuOptic {
   onu_key: string
   pon_port: string | null
   onu_id: number | null
+  /** what the OLT's walk reports. Rewritten on every SNMP sweep, so nothing an
+   *  operator types may ever be stored here — see `label`. */
   name: string | null
+  /** The OPERATOR's own name for this subscriber (`onu_places.label`), joined
+   *  onto the roster row by the store. Stored UPPERCASE and it WINS over `name`
+   *  everywhere an ONU is titled — use `onuName()`, never `o.name` alone, or a
+   *  name typed in the field renders as "unnamed" on the OLT that carries it. */
+  label: string | null
   serial: string | null
   state: "online" | "offline" | "dying_gasp" | "los" | "unknown" | null
   rx_dbm: number | null
@@ -386,6 +430,141 @@ export interface OnuOptic {
   updated_at: string
   /** frozen at the moment the ONU left `online` (store upsert CASE) */
   last_online_at: string | null
+  /** set when this ONU is a placed REFERENCE point — see OnuPlace */
+  place: { lat: number; lng: number; label: string | null } | null
+  /** the passive box this subscriber's drop comes off (`onu_drops`), or null
+   *  when nobody has recorded one. The id only — the device list already holds
+   *  the name, and a second copy could disagree with it. */
+  drop_passive_id: number | null
+}
+
+/** What one passive box is carrying, from its RECORDED drops (`central/drops.py`).
+ *
+ *  Read every field as "of what the operator has written down". `recorded` is
+ *  never an occupancy claim: a splitter leg nobody recorded is UNKNOWN, not
+ *  spare, so the UI may say "6 recorded of 8" and may not say "2 free". The one
+ *  capacity statement that survives an incomplete record is OVER-subscription —
+ *  more recorded drops than legs is provable either way. */
+export interface SplitterLoad {
+  passive_id: number
+  recorded: number
+  online: number
+  dark: number
+  /** recorded MACs no current roster knows — an RMA'd box or a mistyped sticker */
+  orphans: number
+  crit: number
+  warn: number
+  rx_seen: number
+  rx_median: number | null
+  rx_worst: number | null
+  /** subscribers sitting `outlier_db` or more below THIS box's own median —
+   *  same feeder, same split loss, so the gap is that one drop's own problem */
+  outliers: number
+  olt_id: number | null
+  pon_ports: string[]
+}
+
+/** Every recorded subscriber below one passive is dark while a sibling branch
+ *  is still lit — so the break is in the single span feeding that box.
+ *
+ *  Topology, not distance: PON ranging brackets a cut in metres that run ~39%
+ *  short on the C-Data fleet (its `distance_m` is EPON time quanta), whereas
+ *  two pins and the cable between them are exactly where a crew drives. Derived
+ *  read-side; it never pages and never touches a ponfault verdict. */
+export interface BranchFault {
+  passive_id: number
+  parent_id: number | null
+  olt_id: number | null
+  pon_ports: string[]
+  dark: number
+  lit_siblings: number
+  /** `power` only when the ONUs announced their own loss and no power-backed
+   *  reference ONU in the branch contradicts them — rolling a splicing crew for
+   *  a DISCOM outage is the mistake this cross exists to avoid. */
+  cause: "fiber" | "power"
+  witness_dark: number
+  /** false only when a reference ONU proves it; everything else is a hypothesis
+   *  and is labelled as one */
+  suspected: boolean
+  passives: number[]
+}
+
+/** One recorded subscriber on a passive (GET /api/inventory/drops/subscribers). */
+export interface SubscriberDrop {
+  mac: string
+  olt_id: number | null
+  pon_port: string | null
+  onu_id: number | null
+  name: string | null
+  state: OnuOptic["state"]
+  rx_dbm: number | null
+  severity: OnuOptic["severity"]
+  /** false = recorded here but in no current roster. Reported, never hidden —
+   *  a drop that quietly stopped counting is what this list must not conceal. */
+  matched: boolean
+  /** also a placed reference ONU: its darkness is evidence, not a symptom */
+  witness: boolean
+}
+
+/** An operator-placed REFERENCE ONU (`onu_places`).
+ *
+ *  Placing one IS the operator's claim that this subscriber's power is
+ *  reliable — there is no power field and nothing detects it. A placed ONU
+ *  that goes dark is evidence of a fiber cut; ones that stay up while their
+ *  neighbours drop are evidence of an area power cut. That is the whole
+ *  feature, so every string the UI puts near the action has to say it.
+ *
+ *  Keyed on the MAC, so the point follows the box if the drop is re-homed.
+ *  `matched` false = the MAC is no longer in any current roster (an RMA'd
+ *  box), `ambiguous` = it sits on more than one live slot and the server
+ *  refuses to guess which OLT it belongs to. */
+export interface OnuPlace {
+  mac: string
+  lat: number
+  lng: number
+  label: string | null
+  notes: string | null
+  /** TRUE = a REFERENCE ONU: the operator's claim that this subscriber's power is
+   *  reliable, which nothing detects and which flips a PON mass-drop verdict from
+   *  "fibre cut" to "area power cut". FALSE = a plain location recorded in the
+   *  field. Both live in `onu_places`, and the two must never render alike — a
+   *  witness is evidence, a location is just a coordinate. Only witnesses reach
+   *  `ponfault` (`store.onu_place_macs` filters on it). */
+  witness: boolean
+  /** Provenance of the pin, like OrgDevice's. Null = placed from the desktop
+   *  reference-ONU dialog, which is a click on a map and carries no measurement. */
+  accuracy_m: number | null
+  place_source: "gps" | "manual" | null
+  placed_by: string | null
+  placed_at: string | null
+  created_at: string
+  updated_at: string
+  matched: boolean
+  ambiguous: boolean
+  slots: number
+  /** the passive box this drop comes off (`onu_drops`). The map draws the line
+   *  to THAT, not to the OLT — a straight line to the OLT skips every splitter
+   *  in between, which is the plant a crew actually works on. Null = unrecorded,
+   *  and the map falls back to the OLT while rendering the difference. */
+  drop_passive_id: number | null
+  device_id: number | null
+  device_name: string | null
+  onu_id: number | null
+  pon_port: string | null
+  name: string | null
+  state: OnuOptic["state"]
+  rx_dbm: number | null
+  /** The ONU's OWN ifTable interface on the OLT (C-Data EPON gives each ONU a
+   *  row), so a reference point can carry a real per-subscriber rate. Null on
+   *  vendors whose builds don't name interfaces that way — render "no reading",
+   *  never the PON aggregate, which is shared by up to 64 subscribers. */
+  if_name: string | null
+  /** the interface's oper_status — a SECOND opinion, on the port walk's clock.
+   *  `state` above (the optical roster) still owns whether the ONU is up. */
+  port_state: string | null
+  in_bps: number | null
+  out_bps: number | null
+  port_updated_at: string | null
 }
 
 export interface OltOptics {
@@ -419,6 +598,8 @@ export interface OnuSearchHit {
   pon_port: string | null
   onu_id: number | null
   name: string | null
+  /** the OPERATOR's own name (`onu_places.label`) — see OnuOptic.label */
+  label: string | null
   serial: string | null
   state: OnuOptic["state"]
   severity: OnuOptic["severity"]
@@ -432,6 +613,33 @@ export interface OnuSearchMatch {
   device_name: string
   onus: OnuSearchHit[]
 }
+/** Survey coverage: how many subscribers have a pin, per OLT. The denominator is
+ *  the FRESHEST-walk roster (zombie slots excluded), so it is the number of
+ *  drops a tech can actually go and find. */
+export interface OnuCoverageOlt {
+  device_id: number
+  device_name: string | null
+  total: number
+  placed: number
+}
+export interface OnuCoverageRow {
+  mac: string
+  name: string | null
+  pon_port: string | null
+  onu_id: number | null
+  state: string | null
+  device_id: number
+  device_name: string | null
+}
+export interface OnuCoverageResponse {
+  total: number
+  placed: number
+  olts: OnuCoverageOlt[]
+  /** only populated when ?device_id= names one OLT — the fleet's whole unplaced
+   *  set is thousands of rows and has no business crossing a handset's link. */
+  unplaced: OnuCoverageRow[]
+}
+
 export interface OnuSearchResponse {
   matches: OnuSearchMatch[]
   /** hit the server's result cap — the needle is too broad, type more */
@@ -458,7 +666,48 @@ export interface ReliabilityRow {
   outage_count: number
 }
 
-export type OutageStatus = "unassigned" | "in_progress" | "pending_postmortem"
+/** `assigned` is NAMED BUT UNANSWERED: the owner has sent it to somebody and
+ *  nobody has said yes yet. It renders as down, because it is — an outage only
+ *  reaches `in_progress` when a human accepts (or acknowledges) it. */
+export type OutageStatus =
+  "unassigned" | "assigned" | "in_progress" | "pending_postmortem"
+
+/** The issue vocabulary — mirrors `central/issues.py:KINDS` one for one. Each
+ *  kind is exactly one Home KPI tile's worth of trouble, so a tile can hand its
+ *  own kind over as a filter and the list can't describe a different set. */
+export type IssueKind =
+  | "device_down" | "port_down" | "probe_stale" | "bandwidth"
+  | "onu_crit" | "onu_warn" | "dup_mac" | "pon_fiber" | "pon_power"
+  | "pon_capacity" | "onu_offline"
+
+export type IssueSeverity = "critical" | "warning" | "info"
+
+/** One PROBLEM, not one device: a dark port, a weak ONU, a silent probe. The
+ *  server composes these from the same reads the tiles use — see
+ *  `central/issues.py`. */
+export interface Issue {
+  kind: IssueKind
+  kind_label: string
+  severity: IssueSeverity
+  /** null for a probe: a probe isn't a row in the device tree. */
+  device_id: number | null
+  device_name: string
+  region: string | null
+  subject: string
+  detail: string
+  since: string | null
+}
+
+export interface IssuesResponse {
+  issues: Issue[]
+  /** Per-kind totals over the UNFILTERED list, so a chip can say how many rows
+   *  it would show before it is clicked. */
+  counts: Record<string, number>
+  total: number
+  generated_at: string
+  kinds: IssueKind[]
+  kind_labels: Record<string, string>
+}
 
 export interface Outage {
   id: number
@@ -474,6 +723,17 @@ export interface Outage {
   root_cause: string | null
   resolution_notes: string | null
   status: OutageStatus
+  /** Usernames the owner sent to this outage. Always a real array (the server
+   *  decodes the stored JSON), so `.length === 0` is the whole test for
+   *  "nobody has been named yet". */
+  assigned_to: string[]
+  assigned_at: string | null
+  assigned_by: string | null
+  /** Which of `assigned_to` have said yes — always a subset, always a real
+   *  array. Empty while an assignment is still an unanswered ask. */
+  accepted_by: string[]
+  /** When the FIRST acceptance landed. */
+  accepted_at: string | null
 }
 
 export const ROOT_CAUSES = [
@@ -575,6 +835,8 @@ export interface WhatsappSettings {
   template: string
   lang: string
   api_version: string
+  // superadmin ops recipient (org 'I've paid' / churn / release-sync failing)
+  admin_number: string
   token_set: boolean
 }
 
@@ -815,4 +1077,45 @@ export interface AdminOverview {
   totals: OverviewCounts
   problems_total: number
   orgs: OverviewOrg[]
+}
+
+// ----- paging responsibility (device → field accounts) -----------------------
+// Assignment narrows WHO gets paged about a device; it never changes what any
+// session can see (operator choice 2026-07-26). Server side: central/assignment.py.
+
+/** One row: this account is explicitly responsible for this device. */
+export interface DeviceAssignment {
+  device_id: number
+  user_id: number
+  username: string
+  role: Role
+  /** a deactivated account keeps its row so an operator can see and clear it,
+      but it pages nobody and does NOT count as "somebody is responsible" */
+  is_active: boolean
+  /** whether a page could actually reach them — the number itself never ships */
+  has_whatsapp: boolean
+  assigned_by: string | null
+  assigned_at: string | null
+}
+
+/** One assignable account, with both counts the screen needs: `assigned` is rows
+    ticked, `devices` is the inherited reach. One click on a region head makes
+    those numbers very different, and showing only the first makes it look like
+    nothing happened. */
+export interface AssignableAccount {
+  user_id: number
+  username: string
+  role: Role
+  has_whatsapp: boolean
+  assigned: number
+  devices: number
+}
+
+export interface AssignmentRoster {
+  assignments: DeviceAssignment[]
+  accounts: AssignableAccount[]
+  /** devices no row covers, directly or by inheritance — these still page every
+      worker, which is the safe default, but an operator who thinks assignment is
+      finished needs to see the number rather than infer it */
+  unassigned: number
 }

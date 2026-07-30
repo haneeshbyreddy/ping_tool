@@ -490,6 +490,50 @@ class GponProfileTest(unittest.TestCase):
         self.assertEqual(p.decode_state("1"), "online")
         self.assertEqual(p.format_pon_label("2"), "EPON0/2")
 
+    def test_an_olt_can_be_saved_on_a_profile_vendor(self):
+        # The device form offers DB profiles in its vendor dropdown, but the
+        # validator knew only the edge built-ins — so badri_fiber's two Syrotech
+        # OLTs 422'd on EVERY edit, including ones that never touched the vendor
+        # (the form sends the stored value back). A profile is a real vendor.
+        owner = self._login("owner", "ownerpassword")
+        self._req("POST", "/api/gpon-profiles", self._payload(name="syrotech_gpon"),
+                  cookie=owner)
+        status, body, _ = self._req("POST", "/api/inventory", {
+            "org_id": "ispA", "name": "Gpon_08", "ip_address": "10.0.0.7",
+            "device_type": "OLT", "gpon_vendor": "syrotech_gpon"}, cookie=owner)
+        self.assertEqual(status, 200, body)
+        did = body["id"]
+
+        status, body, _ = self._req("POST", "/api/inventory/update", {
+            "id": did, "name": "Gpon_08", "ip_address": "10.0.0.7",
+            "device_type": "OLT", "gpon_vendor": "syrotech_gpon",
+            "onu_pon_limit": 128}, cookie=owner)
+        self.assertEqual(status, 200, body)
+        row = self.store.get_org_device("ispA", did)
+        self.assertEqual(row["gpon_vendor"], "syrotech_gpon")
+        self.assertEqual(row["onu_pon_limit"], 128)
+
+        # …and a DISABLED profile still validates: switching a profile off must
+        # not lock the operator out of the form that would change the vendor.
+        profiles = self.store.list_gpon_profiles("ispA")
+        pid = next(p["id"] for p in profiles if p["name"] == "syrotech_gpon")
+        payload = self._payload(name="syrotech_gpon", enabled=False)
+        payload["id"] = pid
+        status, body, _ = self._req("POST", "/api/gpon-profiles/update", payload,
+                                    cookie=owner)
+        self.assertEqual(status, 200, body)
+        status, body, _ = self._req("POST", "/api/inventory/update", {
+            "id": did, "name": "Gpon_08 (renamed)", "ip_address": "10.0.0.7",
+            "device_type": "OLT", "gpon_vendor": "syrotech_gpon"}, cookie=owner)
+        self.assertEqual(status, 200, body)
+
+        # a name no profile carries is still refused — a typo'd vendor reads on
+        # screen as "this OLT has no optics", which is the harder bug to find
+        status, _, _ = self._req("POST", "/api/inventory/update", {
+            "id": did, "name": "Gpon_08", "ip_address": "10.0.0.7",
+            "device_type": "OLT", "gpon_vendor": "syrotek"}, cookie=owner)
+        self.assertEqual(status, 422)
+
 
 class PollIntervalTest(unittest.TestCase):
     """Dashboard-set probe cadence, delivered over the topology channel."""

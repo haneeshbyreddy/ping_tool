@@ -64,6 +64,39 @@ class SnmpStoreMixin:
                                       since_col="bw_high_alarm_since")
 
 
+    def down_ports(self, org_id: str) -> list[dict]:
+        """Every monitored port currently in the port-down alarm, org-wide, with
+        its switch's name and ICMP state.
+
+        Counted off `alarm` (the flap-suppressed flag ports.py owns), NOT a raw
+        `oper_status`, so this list and the `ports_down` count on each device row
+        describe the same thing — a drill-down that disagrees with the tile it
+        was opened from is worse than no drill-down.
+
+        A port on a DOWN/UNREACHABLE switch is KEPT (unlike the bandwidth
+        alarms, which are a rate reading and go stale): the flag itself is still
+        the last thing we knew, and the caller says so on the row rather than
+        dropping it and leaving the tile's count unexplained."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT sp.id AS port_id, sp.device_id, sp.if_index, sp.if_name,"
+                " sp.if_alias, sp.admin_status, sp.oper_status, sp.alarm_since,"
+                " sp.updated_at, d.name AS switch_name, d.region,"
+                " ds.state AS device_state"
+                " FROM switch_ports sp JOIN org_devices d ON d.id = sp.device_id"
+                " LEFT JOIN device_states ds ON ds.device_id = sp.device_id"
+                " WHERE sp.org_id=? AND sp.monitored=1 AND sp.alarm=1"
+                " AND d.is_active=1"
+                " ORDER BY d.name, sp.if_index", (org_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            base = r["if_name"] or f"if{r['if_index']}"
+            d["label"] = f"{base} ({r['if_alias']})" if r["if_alias"] else base
+            out.append(d)
+        return out
+
+
     def list_switch_ports(self, org_id: str, device_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -196,11 +229,43 @@ class SnmpStoreMixin:
         return {"total": int(row["total"] or 0), "with_rx": int(row["with_rx"] or 0)}
 
 
+    # The operator's own name for a subscriber lives in `onu_places.label`, keyed
+    # on the MAC — never in `onu_optics.name`, which every SNMP walk overwrites
+    # from the OLT (`name=excluded.name`). So a roster row has to be JOINED to it
+    # to carry the name a human typed.
+    #
+    # Joined in the STORE rather than folded in by each caller, because "each
+    # caller remembers" is exactly what failed: a name captured in the field
+    # reached the DB correctly and then rendered nowhere — not the Optical tab,
+    # not ONU search, not the WhatsApp lookup, not the issue list — all four
+    # naming the ONU off the walked column alone. Every roster read now carries
+    # `label`, and `onuroster.display_name` is the one place the order is decided.
+    #
+    # The join key is `onuroster._norm_mac` REGISTERED as a SQL function, not
+    # mirrored as an UPPER(TRIM(...)) expression, for the reason `wisp_search_key`
+    # already exists: one normalizer, so SQL identity and Python identity cannot
+    # drift apart and silently stop matching a sticker.
+    #
+    # That safety is FREE — measured on a 15,580-row / 19-OLT fleet with 2,000
+    # located subscribers: no join 117ms, this join 156ms, the "native" UPPER(TRIM)
+    # version 195ms. Neither form can use an index on a computed key, so the
+    # callback costs less than the expression it would have replaced. Don't
+    # "optimize" it back into a second spelling of identity.
+    _LABEL_JOIN = (" LEFT JOIN onu_places pl ON pl.org_id = o.org_id"
+                   "   AND pl.mac = wisp_norm_mac(o.serial)")
+
+    def _with_norm_mac(self, conn):
+        conn.create_function("wisp_norm_mac", 1, onuroster._norm_mac,
+                             deterministic=True)
+        return conn
+
     def list_onu_optics(self, org_id: str, device_id: int) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM onu_optics WHERE org_id=? AND device_id=?"
-                " ORDER BY rx_dbm IS NULL, rx_dbm ASC, onu_key",
+            rows = self._with_norm_mac(conn).execute(
+                "SELECT o.*, pl.label AS label FROM onu_optics o"
+                + self._LABEL_JOIN
+                + " WHERE o.org_id=? AND o.device_id=?"
+                " ORDER BY o.rx_dbm IS NULL, o.rx_dbm ASC, o.onu_key",
                 (org_id, device_id)).fetchall()
         return [dict(r) for r in rows]
 
@@ -460,13 +525,22 @@ class SnmpStoreMixin:
         with self._connect() as conn:
             conn.create_function("wisp_search_key", 1, onuroster.search_key,
                                  deterministic=True)
+            self._with_norm_mac(conn)
             rows = conn.execute(
                 "SELECT DISTINCT o.device_id FROM onu_optics o"
                 " JOIN org_devices d ON d.id = o.device_id"
-                " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1"
+                + self._LABEL_JOIN
+                # The OPERATOR's name is searched beside the walked one. A tech
+                # types the name they know, and after a field survey that is the
+                # one they typed themselves — matching only the OLT's string
+                # would answer "no such subscriber" about a drop somebody had
+                # just stood at and named.
+                + " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1"
                 " AND (wisp_search_key(o.serial) LIKE ?"
-                "      OR wisp_search_key(o.name) LIKE ?)",
-                (org_id, org_id, f"%{needle}%", f"%{needle}%")).fetchall()
+                "      OR wisp_search_key(o.name) LIKE ?"
+                "      OR wisp_search_key(pl.label) LIKE ?)",
+                (org_id, org_id, f"%{needle}%", f"%{needle}%",
+                 f"%{needle}%")).fetchall()
         return [r["device_id"] for r in rows]
 
 
@@ -482,18 +556,250 @@ class SnmpStoreMixin:
         disagree about which walk they are describing."""
         q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.onu_id, o.name, o.serial,"
              " o.state, o.distance_m, o.last_online_at, o.updated_at,"
-             " o.rx_dbm, o.severity,"
+             " o.rx_dbm, o.severity, pl.label AS label,"
              " d.name AS device_name"
              " FROM onu_optics o JOIN org_devices d ON d.id = o.device_id"
-             " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1")
+             + self._LABEL_JOIN
+             + " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1")
         args: list = [org_id, org_id]
         if device_id is not None:
             q += " AND o.device_id=?"
             args.append(device_id)
         with self._connect() as conn:
-            rows = conn.execute(q, args).fetchall()
+            rows = self._with_norm_mac(conn).execute(q, args).fetchall()
         return [dict(r) for r in rows]
 
+
+    # ----- reference ONUs (operator-placed witnesses) -------------------------
+
+    def list_onu_places(self, org_id: str) -> list[dict]:
+        """Every ONU this org has put on the map — witnesses AND plain locations.
+
+        No longer small by design: an ISP vouches for a handful of power-backed
+        subscribers, but the field survey records wherever a tech happens to
+        stand, so this can run to the size of the roster. `witness` is what
+        separates the two, and every caller that cares must read it."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mac, lat, lng, label, notes, witness, accuracy_m,"
+                " place_source, placed_by, placed_at, created_at, updated_at"
+                " FROM onu_places WHERE org_id=? ORDER BY label, mac",
+                (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def onu_place_macs(self, org_id: str, *, witness_only: bool = True) -> set[str]:
+        """The WITNESS keys only — what ponfault marks power-backed rows with.
+
+        `witness_only=False` asks the other question — "which subscribers have a
+        pin at all" — for the survey's coverage count. It defaults TRUE so that
+        every existing caller (all of them alerting) keeps the narrow meaning: a
+        paging path that accidentally widened to every located drop is exactly
+        the failure the witness column was added to prevent.
+
+        The `witness=1` filter is the whole safety property of letting the field
+        drop location pins on ordinary subscribers. Without it, geo-tagging a
+        street's worth of ONUs would enrol every one of them as a power-backed
+        witness, and the next dark subscriber would read as PROOF of a fibre cut
+        (`ponfault._witness_verdict`: a witness dark silently ⇒ fiber). Locating
+        is an observation; witnessing is a claim about a power supply that
+        nothing can detect — they must never be the same write.
+
+        Its own query rather than a comprehension over ``list_onu_places``
+        because this one runs on the report cycle, once per optics fold."""
+        q = "SELECT mac FROM onu_places WHERE org_id=?"
+        if witness_only:
+            q += " AND witness=1"
+        with self._connect() as conn:
+            rows = conn.execute(q, (org_id,)).fetchall()
+        return {r["mac"] for r in rows}
+
+    def onu_interfaces(self, org_id: str, device_ids: set[int]) -> dict:
+        """Per-ONU ifTable rows for these OLTs, keyed (device_id, first token of
+        if_name) — the shape `onuroster.onu_if_token` produces.
+
+        Only the reference-ONU list needs this, and that list is a handful of
+        rows, so it takes the device ids it actually wants rather than scanning
+        a fleet's switch_ports. The first token is the key because a described
+        ONU reads `EPON03ONU5 BSNL-238`."""
+        if not device_ids:
+            return {}
+        marks = ",".join("?" * len(device_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT device_id, if_index, if_name, if_alias, oper_status,"
+                f" in_bps, out_bps, updated_at FROM switch_ports"
+                f" WHERE org_id=? AND device_id IN ({marks}) AND if_name IS NOT NULL",
+                (org_id, *sorted(device_ids))).fetchall()
+        out: dict = {}
+        for r in rows:
+            token = (r["if_name"] or "").split()[0] if r["if_name"] else ""
+            if token:
+                out.setdefault((r["device_id"], token), dict(r))
+        return out
+
+    def set_onu_place(self, org_id: str, mac: str, lat: float, lng: float,
+                      label: str | None, notes: str | None,
+                      *, witness: bool = True) -> bool:
+        """Place (or move) an ONU on the map. `mac` must already be in
+        ``onuroster._norm_mac`` form — identity is the caller's to normalize, and
+        exactly once, or two spellings of one sticker become two witnesses.
+
+        `witness` defaults TRUE because that is what every caller predating the
+        field survey meant, and a silent default of False would quietly retire
+        the reference-ONU feature. The field path passes it explicitly.
+
+        A re-place carries the flag it is given, which is deliberate in BOTH
+        directions: a tech recording a location for an ONU somebody had vouched
+        for must not silently strip its witness status, so the field route
+        refuses to downgrade (see `api/devices.field_onu`) rather than relying on
+        the value passed here."""
+        if not mac:
+            return False
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO onu_places (org_id, mac, lat, lng, label, notes,"
+                " witness, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, mac) DO UPDATE SET lat=excluded.lat,"
+                " lng=excluded.lng, label=excluded.label, notes=excluded.notes,"
+                " witness=excluded.witness, updated_at=excluded.updated_at",
+                (org_id, mac, lat, lng, label or None, notes or None,
+                 1 if witness else 0, now, now))
+            conn.commit()
+        return True
+
+    def place_onu_in_field(self, org_id: str, mac: str, lat: float, lng: float,
+                           *, witness: bool, accuracy_m: float | None,
+                           source: str, placed_by: str,
+                           label: str | None = None) -> bool:
+        """A subscriber pin taken standing at the drop.
+
+        Separate from `set_onu_place` for the same reason `place_org_device` is
+        separate from `set_org_device_location`: it cannot clear a row (lat/lng
+        are non-optional), and it always stamps provenance. It also leaves
+        `notes` alone — the operator's notes are desk knowledge about the site,
+        and a location capture has no business overwriting them with nothing."""
+        if not mac:
+            return False
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO onu_places (org_id, mac, lat, lng, label, notes,"
+                " witness, accuracy_m, place_source, placed_by, placed_at,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(org_id, mac) DO UPDATE SET lat=excluded.lat,"
+                " lng=excluded.lng, witness=excluded.witness,"
+                " label=COALESCE(excluded.label, onu_places.label),"
+                " accuracy_m=excluded.accuracy_m,"
+                " place_source=excluded.place_source,"
+                " placed_by=excluded.placed_by, placed_at=excluded.placed_at,"
+                " updated_at=excluded.updated_at",
+                (org_id, mac, lat, lng, label or None, None,
+                 1 if witness else 0, accuracy_m, source, placed_by, now,
+                 now, now))
+            conn.commit()
+        return True
+
+    def set_onu_place_label(self, org_id: str, mac: str,
+                            label: str | None) -> bool:
+        """Rename a located subscriber. Touches the label and NOTHING else.
+
+        Its own method rather than a `place_onu_in_field` call with the old
+        coordinates, because re-placing would restamp `accuracy_m`/`place_source`
+        /`placed_by` — so correcting a typo in somebody's name would quietly
+        downgrade a real 6 m GPS fix to a hand-placed point with no accuracy, and
+        reattribute the placement to whoever fixed the spelling.
+
+        Clearing IS allowed here (unlike a pin): a label is descriptive, so an
+        empty one is a fact about what the operator knows, not the loss of plant
+        record. False = no such placement, which the caller reports as a 404
+        rather than silently creating a pin-less row."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE onu_places SET label=?, updated_at=?"
+                " WHERE org_id=? AND mac=?",
+                (label or None, _now_iso(), org_id, mac))
+            conn.commit()
+        return cur.rowcount > 0
+
+    def onu_place_witness(self, org_id: str, mac: str) -> bool | None:
+        """Is this MAC already placed, and as what? None = not placed at all.
+
+        Exists so the field route can refuse to DOWNGRADE a witness: a tech
+        recording where a box physically is must never quietly cancel the
+        operator's claim that it runs on a UPS, because that claim is invisible
+        on the handset and losing it changes a PON verdict."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT witness FROM onu_places WHERE org_id=? AND mac=?",
+                (org_id, mac)).fetchone()
+        return None if row is None else bool(row["witness"])
+
+    def delete_onu_place(self, org_id: str, mac: str) -> bool:
+        """Clearing a reference point is a DELETE — the table is sparse, so
+        there is no such thing as a placed-but-unplaced row."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM onu_places WHERE org_id=? AND mac=?",
+                               (org_id, mac))
+            conn.commit()
+        return cur.rowcount > 0
+
+
+    # ----- subscriber drops (which passive feeds an ONU) ----------------------
+
+    def list_onu_drops(self, org_id: str) -> list[dict]:
+        """Every recorded drop for this org: MAC -> the passive it comes off.
+
+        Unlike reference points this table is NOT sparse by intent — the goal is
+        one row per subscriber — so callers resolve it against the roster in
+        Python rather than joining in SQL: `_norm_mac` is the one identity
+        normalizer and it does not get a second spelling inside a query."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mac, passive_id, created_at, updated_at FROM onu_drops"
+                " WHERE org_id=? ORDER BY passive_id, mac", (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def onu_drop_map(self, org_id: str) -> dict[str, int]:
+        """Just MAC -> passive_id. The shape every read path actually wants."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mac, passive_id FROM onu_drops WHERE org_id=?",
+                (org_id,)).fetchall()
+        return {r["mac"]: r["passive_id"] for r in rows}
+
+    def set_onu_drops(self, org_id: str, macs: list[str], passive_id: int) -> int:
+        """Attach these ONUs to a passive. `macs` must already be in
+        ``onuroster._norm_mac`` form — identity is the caller's to normalize,
+        exactly once, or one sticker inflates a splitter's recorded load.
+
+        Re-attaching MOVES the drop: a subscriber comes off exactly one box, so
+        there is nothing to merge and the newest statement wins."""
+        if not macs:
+            return 0
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO onu_drops (org_id, mac, passive_id, created_at,"
+                " updated_at) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(org_id, mac) DO UPDATE SET"
+                " passive_id=excluded.passive_id, updated_at=excluded.updated_at",
+                [(org_id, m, passive_id, now, now) for m in macs])
+            conn.commit()
+        return len(macs)
+
+    def clear_onu_drops(self, org_id: str, macs: list[str]) -> int:
+        """Detaching is a DELETE — 'no splitter recorded' is the absence of a
+        row, never a row pointing nowhere."""
+        if not macs:
+            return 0
+        marks = ",".join("?" * len(macs))
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM onu_drops WHERE org_id=? AND mac IN ({marks})",
+                (org_id, *macs))
+            conn.commit()
+        return cur.rowcount
 
     def pon_fault_states(self, org_id: str) -> dict[tuple[int, str], dict]:
         with self._connect() as conn:

@@ -75,5 +75,47 @@ class InjectAutofillTest(unittest.TestCase):
         self.assertLess(out.index(b"wisp-autofill"), out.index(b"</BODY>"))
 
 
+class InjectionPointTest(unittest.TestCase):
+    """Where the bootstrap lands. Splicing it into JavaScript breaks the page's
+    own script — which reads as "the device UI doesn't work through the proxy",
+    with every request still answering 200 (SAGAR-LAN-SW, 2026-07-25)."""
+
+    def test_body_close_inside_a_script_string_is_not_the_injection_point(self):
+        # DCN .asp shape: the frame markup is written from JS, so the LAST
+        # </body> in the file sits inside a string literal
+        page = (b"<html><body><div id='tab'></div></body>\n"
+                b"<script>\n"
+                b"document.write('<html><body>' + rows + '</body></html>');\n"
+                b"</script></html>")
+        out = proxy.inject_autofill("text/html", page, SID)
+        at = out.index(b"wisp-autofill")
+        self.assertLess(at, out.index(b"<script>\ndocument.write"))
+
+    def test_page_whose_only_body_close_is_in_js_appends_at_the_end(self):
+        # nothing to splice before, so it falls back to the end of the document
+        # — outside the (closed) script, which is what makes that safe
+        page = (b"<html><head><script>\n"
+                b"document.write('<body>x</body>');\n"
+                b"</script></head>")
+        out = proxy.inject_autofill("text/html", page, SID)
+        self.assertTrue(out.startswith(page))
+        self.assertIn(b"wisp-autofill", out)
+
+    def test_unterminated_script_at_eof_blocks_the_append_fallback(self):
+        page = b"<html><head><script>\nvar s = '<html>';\n"
+        self.assertEqual(proxy.inject_autofill("text/html", page, SID), page)
+
+    def test_script_file_served_without_a_content_type_is_not_a_document(self):
+        # old firmware ships common.js with no Content-Type; it contains HTML
+        # markers only inside strings, so the doc sniff alone waves it through
+        js = b"function render(){ document.write('<html><body>x</body></html>'); }\n"
+        self.assertEqual(proxy.inject_autofill("", js, SID), js)
+        self.assertEqual(proxy.inject_autofill("text/html", js, SID), js)
+
+    def test_leading_whitespace_and_bom_still_count_as_a_document(self):
+        page = b"\xef\xbb\xbf\n  <html><body>x</body></html>"
+        self.assertIn(b"wisp-autofill", proxy.inject_autofill("text/html", page, SID))
+
+
 if __name__ == "__main__":
     unittest.main()

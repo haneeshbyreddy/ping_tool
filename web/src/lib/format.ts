@@ -94,6 +94,34 @@ export function isFresh(ts: string | null | undefined, withinS = SNMP_FRESH_AFTE
   return (Date.now() - toUtcDate(ts).getTime()) / 1000 <= withinS
 }
 
+/** What to CALL one ONU. Mirrors `central/onuroster.py:display_name` — keep the
+ *  two in step, since a WhatsApp lookup and the Optical tab naming the same
+ *  subscriber differently is a support call.
+ *
+ *  `label` is the operator's own name, typed in the field survey or the
+ *  reference-ONU dialog and stored in `onu_places` (uppercase). It WINS over
+ *  `name`, which is whatever the OLT reports and which every SNMP walk
+ *  overwrites — on the C-Data fleet that column is blank, so the operator's name
+ *  is usually the only one there is. Rendering `o.name` alone is what made a
+ *  freshly-surveyed drop read "unnamed" on the very OLT that carries it. */
+export function onuName(o: {
+  label?: string | null; name?: string | null
+  serial?: string | null; onu_key?: string | null
+}): string {
+  return o.label || o.name || o.serial || o.onu_key || ""
+}
+
+/** How to COMPARE one ONU string against a typed needle. Mirrors
+ *  `central/onuroster.py:search_key` — alphanumerics only, upper — so a client
+ *  filter and the server's `onu-search` agree about what matches: "a4:f2",
+ *  "A4-F2" and "a4f2" are one sticker, and "hc_kiran" is found by "hc kiran".
+ *
+ *  SEARCH ONLY. Identity stays separator-exact (`onuroster._norm_mac`): two
+ *  differently-punctuated strings collapsing into one here is a convenience,
+ *  collapsing them on the write path fabricates duplicate-MAC pages. */
+export const onuSearchKey = (s: string | null | undefined): string =>
+  (s ?? "").replace(/[^a-z0-9]/gi, "").toUpperCase()
+
 export function deviceTone(
   state: DeviceState | string | null | undefined,
   stateUpdatedAt: string | null | undefined,

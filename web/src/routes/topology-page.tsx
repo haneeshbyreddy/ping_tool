@@ -6,12 +6,13 @@ import { ArrowUpFromLine, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, Mo
 import { useAuth } from "@/hooks/use-auth"
 import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
+import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
 import { billingApi, gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
-import { DEVICE_TYPES, PASSIVE_DEVICE_TYPES, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
+import { DEVICE_TYPES, PASSIVE_DEVICE_TYPES, SPLIT_RATIOS, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
 import { DOT as ONU_DOT, onuSev } from "@/components/optical-panel"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import {
-  DeviceDetail, DeviceMetrics, RowTag, deviceTabs, isOpticalOlt,
+  DeviceDetail, DeviceMetrics, DevicePanelHeader, RowTag, deviceTabs, isOpticalOlt,
   VITAL_CPU_CRIT, VITAL_TEMP_CRIT, type DeviceTab,
 } from "@/components/device-detail"
 import { NeedsOrg } from "@/components/needs-org"
@@ -19,12 +20,15 @@ import { RegionSelect } from "@/components/region-select"
 import { runSnmpTest } from "@/components/snmp-test"
 import { TagsInput } from "@/components/tags-input"
 import { ViewToggle, loadView, saveView, type ViewMode } from "@/components/view-toggle"
+import { ProbesPanel } from "@/components/probes-panel"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { UpgradeNotice } from "@/components/upgrade-notice"
 import { WebUiLiveIcon } from "@/components/web-proxy"
 import { StatusDot } from "@/components/status-badge"
 import { ColorSwatches } from "@/components/color-swatches"
-import { ago, deviceTone, durationSince, isDownState, isFresh, isStale } from "@/lib/format"
+import {
+  ago, deviceTone, durationSince, isDownState, isFresh, isStale, onuName, onuSearchKey,
+} from "@/lib/format"
 import { paletteVarOf, type PaletteColor } from "@/lib/palette"
 import { cn } from "@/lib/utils"
 import { Card, CardContent } from "@/components/ui/card"
@@ -44,39 +48,58 @@ import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog"
 
+type TreeRow = OrgDevice & { depth: number; descendantCount: number }
+
+/** The list in two blocks: the monitored GEAR tree, then the PASSIVE PLANT.
+ *  Plant is reference material — it has no state, no probe and nothing that can
+ *  alarm — so mixing splitters in among the boxes that DO makes the operator
+ *  scan past them on the one screen that exists to show trouble. It sorts to the
+ *  bottom under its own divider instead. A splitter CASCADE keeps nesting down
+ *  there (that hierarchy is real and the drop panel reads it); what's dropped is
+ *  only the passive-under-gear step, so a plant row at depth 0 names the box
+ *  that feeds it the same way a `tree_detached` row does. */
 function treeOrder(
   devices: OrgDevice[], collapsed: Set<number>,
   cmp?: (a: OrgDevice, b: OrgDevice) => number,
-): Array<OrgDevice & { depth: number; descendantCount: number }> {
-  const ids = new Set(devices.map((d) => d.id))
-  // A row sits at the TOP LEVEL when it has no parent, when its parent isn't in
-  // the rendered set (filtered out by search), or when the operator lifted it
-  // out with `tree_detached` — a presentation flag only: the parent link is
-  // untouched, so the map, suppression and paging all still see it. That's the
-  // point of it — a device an operator reads often shouldn't be buried inside a
-  // big aggregation switch's subtree just because that's where the cable goes.
-  const isRoot = (d: OrgDevice) =>
-    d.parent_device_id == null || !ids.has(d.parent_device_id) || d.tree_detached === 1
+): { gear: TreeRow[]; plant: TreeRow[] } {
+  const byId = new Map(devices.map((d) => [d.id, d]))
+  const passive = (d: OrgDevice) => isPassiveType(d.device_type)
+  // A row sits at the TOP LEVEL of its block when it has no parent, when its
+  // parent isn't in the rendered set (filtered out by search), when the operator
+  // lifted it out with `tree_detached` — a presentation flag only: the parent
+  // link is untouched, so the map, suppression and paging all still see it, and
+  // a device an operator reads often shouldn't be buried inside a big
+  // aggregation switch's subtree just because that's where the cable goes — or
+  // when it doesn't belong to the same block as its parent (plant under gear).
+  const parentOf = (d: OrgDevice): OrgDevice | undefined => {
+    if (d.parent_device_id == null || d.tree_detached === 1) return undefined
+    const p = byId.get(d.parent_device_id)
+    if (!p || passive(p) !== passive(d)) return undefined
+    return p
+  }
   const children = new Map<number, OrgDevice[]>()
   for (const d of devices) {
-    if (isRoot(d)) continue
-    const key = d.parent_device_id as number
-    if (!children.has(key)) children.set(key, [])
-    children.get(key)!.push(d)
+    const p = parentOf(d)
+    if (!p) continue
+    if (!children.has(p.id)) children.set(p.id, [])
+    children.get(p.id)!.push(d)
   }
   // sibling sort only — the parent-before-child structure never changes
   const sorted = (arr: OrgDevice[]) => (cmp ? [...arr].sort(cmp) : arr)
   const kids = (id: number) => sorted(children.get(id) ?? [])
   const descendantCount = (id: number): number =>
     (children.get(id) ?? []).reduce((sum, k) => sum + 1 + descendantCount(k.id), 0)
-  const out: Array<OrgDevice & { depth: number; descendantCount: number }> = []
-  const emit = (d: OrgDevice, depth: number) => {
+  const gear: TreeRow[] = []
+  const plant: TreeRow[] = []
+  const emit = (d: OrgDevice, depth: number, out: TreeRow[]) => {
     out.push({ ...d, depth, descendantCount: descendantCount(d.id) })
 
-    if (!collapsed.has(d.id)) for (const k of kids(d.id)) emit(k, depth + 1)
+    if (!collapsed.has(d.id)) for (const k of kids(d.id)) emit(k, depth + 1, out)
   }
-  for (const d of sorted(devices.filter(isRoot))) emit(d, 0)
-  return out
+  for (const d of sorted(devices.filter((d) => !parentOf(d)))) {
+    emit(d, 0, passive(d) ? plant : gear)
+  }
+  return { gear, plant }
 }
 
 // Operator colour-coding, resolved per device. Two sources, most specific first:
@@ -223,13 +246,32 @@ interface DeviceFormState {
   snmp_port: string
   gpon_vendor: string
   pon_port: string
+  /** passive plant only, as a string for the Select ("" = not recorded) */
+  split_ratio: string
+  /** OLT only, as a string for the Select ("" = not set → the global cap) */
+  onu_pon_limit: string
 }
+
+// Radix refuses an empty SelectItem value, so "not recorded" needs a sentinel
+const NO_SPLIT = "__none__"
+// …and so does "not set" on the PON-type Select, for the same reason
+const NO_PON_TYPE = "__default__"
+// The two standards, as ONU-per-PON caps: EPON tops out at a 1:64 split, GPON at
+// 1:128. Named rather than typed in as a number because the operator knows the
+// box by its standard, and a cap they can't name is one they can't check. Any
+// other stored value still round-trips (see PON_TYPES' "custom" fallback) —
+// org_devices.onu_pon_limit stays a plain integer, so a 1:16 or 1:32 build set
+// through the API is preserved rather than silently rounded to one of these.
+const PON_TYPES = [
+  { cap: 64, label: "EPON — 1:64" },
+  { cap: 128, label: "GPON — 1:128" },
+]
 
 const EMPTY_FORM: DeviceFormState = {
   name: "", ip_address: "", device_type: "", region: "", tags: [],
   parent_device_id: "",
   assigned_node_id: "", snmp_enabled: false, snmp_community: "", snmp_port: "161",
-  gpon_vendor: "", pon_port: "",
+  gpon_vendor: "", pon_port: "", split_ratio: "", onu_pon_limit: "",
 }
 
 function DeviceForm({
@@ -252,6 +294,8 @@ function DeviceForm({
     snmp_port: String(editing.snmp_port || 161),
     gpon_vendor: editing.gpon_vendor ?? "",
     pon_port: editing.pon_port ?? "",
+    split_ratio: editing.split_ratio ? String(editing.split_ratio) : "",
+    onu_pon_limit: editing.onu_pon_limit ? String(editing.onu_pon_limit) : "",
   } : { ...EMPTY_FORM, device_type: initialType ?? "" })
   const [error, setError] = useState("")
 
@@ -264,6 +308,10 @@ function DeviceForm({
   const gponVendors = [...new Set([
     ...GPON_VENDORS,
     ...(gponProfiles.data?.profiles.filter((p) => p.enabled).map((p) => p.name) ?? []),
+    // …and whatever this OLT already carries, even if that profile has since
+    // been disabled or deleted: a Select with no item for its own value renders
+    // blank, and saving that blank would silently unstamp the vendor.
+    ...(form.gpon_vendor ? [form.gpon_vendor] : []),
   ])].sort()
 
   const cardRef = useRef<HTMLDivElement>(null)
@@ -292,7 +340,16 @@ function DeviceForm({
         assigned_node_id: passive ? null : (form.assigned_node_id || null),
 
         gpon_vendor: form.device_type === "OLT" ? (form.gpon_vendor || null) : null,
+        // Rides the payload for the same reason split_ratio does: the server
+        // reads an absent key as "not set", so leaving it out would drop a
+        // GPON box back to the EPON cap every time somebody renamed it.
+        onu_pon_limit: form.device_type === "OLT" && form.onu_pon_limit
+          ? Number(form.onu_pon_limit) : null,
         pon_port: passive ? (form.pon_port.trim() || null) : null,
+        // MUST ride the payload: clean_device_payload reads an absent key as
+        // "not recorded", so leaving it out would clear a ratio set from the
+        // splitter's own panel every time somebody renamed the box here.
+        split_ratio: passive && form.split_ratio ? Number(form.split_ratio) : null,
       }
       if (editing) {
         await inventoryApi.update(editing.id, payload)
@@ -345,6 +402,21 @@ function DeviceForm({
                 onChange={(e) => setForm({ ...form, ip_address: e.target.value })} />
             )}
           </div>
+          {passive && (
+            <div className="flex flex-col gap-1.5">
+              <Label>Split ratio (optional)</Label>
+              <Select value={form.split_ratio || NO_SPLIT}
+                onValueChange={(v) => setForm({ ...form, split_ratio: v === NO_SPLIT ? "" : v })}>
+                <SelectTrigger><SelectValue placeholder="Not recorded" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_SPLIT}>Not recorded</SelectItem>
+                  {SPLIT_RATIOS.map((r) => (
+                    <SelectItem key={r} value={String(r)}>1:{r}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           <div className="flex flex-col gap-1.5">
             <Label>Type</Label>
             <Select value={form.device_type} onValueChange={(v) => setForm({ ...form, device_type: v })}>
@@ -432,6 +504,35 @@ function DeviceForm({
               </Select>
             </div>
           )}
+          {/* PON type is the ONU-per-PON cap — what "PON at capacity" is judged
+              against (onuroster.capacity_faults). Nothing detects it: the split
+              standard isn't in any MIB we walk, so this is the operator's claim,
+              and leaving it unset keeps the server's global cap rather than
+              guessing EPON for a 1:128 box. */}
+          {form.device_type === "OLT" && (
+            <div className="flex items-center gap-2 text-sm">
+              <Label className="text-muted-foreground">PON type</Label>
+              <Select value={form.onu_pon_limit || NO_PON_TYPE}
+                onValueChange={(v) => setForm({
+                  ...form, onu_pon_limit: v === NO_PON_TYPE ? "" : v })}>
+                <SelectTrigger className="w-44"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_PON_TYPE}>not set (global cap)</SelectItem>
+                  {PON_TYPES.map((p) => (
+                    <SelectItem key={p.cap} value={String(p.cap)}>{p.label}</SelectItem>
+                  ))}
+                  {/* a cap set outside this menu stays selectable, or saving an
+                      unrelated edit would quietly overwrite it */}
+                  {form.onu_pon_limit
+                    && !PON_TYPES.some((p) => String(p.cap) === form.onu_pon_limit) && (
+                    <SelectItem value={form.onu_pon_limit}>
+                      custom — 1:{form.onu_pon_limit}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
 
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -447,11 +548,11 @@ function DeviceForm({
   )
 }
 
-// The drill-in open-state (which device is expanded + which tab) lives on the
-// page, not per row/card — so opening one device auto-closes any other, and the
-// grid can place the panel at the end of the open card's visual row instead of
-// shoving its right-hand neighbours onto a new line. A row/card scrolls itself
-// into view when it becomes the deep-link focus (Home row / command palette).
+// The drill-in open-state (which device is selected + which tab) lives on the
+// page, not per row/card — one device at a time, and the page renders its
+// DeviceDetail once in the side panel rather than each row rendering its own.
+// A row/card scrolls itself into view when it becomes the deep-link focus
+// (Home row, map, WhatsApp deep-link).
 interface DrillIn {
   open: boolean
   tab: DeviceTab
@@ -471,32 +572,14 @@ function useFocusScroll(focus?: boolean) {
   return ref
 }
 
-// Live column count of the device grid — mirrors the `grid-cols-1 sm:grid-cols-2
-// xl:grid-cols-3` classes so the parent can find the last card in the open card's
-// row (Tailwind sm=640px, xl=1280px). Grid only; the list is one device per line.
-function useGridCols(): number {
-  const [cols, setCols] = useState(1)
-  useEffect(() => {
-    const sm = window.matchMedia("(min-width: 640px)")
-    const xl = window.matchMedia("(min-width: 1280px)")
-    const update = () => setCols(xl.matches ? 3 : sm.matches ? 2 : 1)
-    update()
-    sm.addEventListener("change", update)
-    xl.addEventListener("change", update)
-    return () => {
-      sm.removeEventListener("change", update)
-      xl.removeEventListener("change", update)
-    }
-  }, [])
-  return cols
-}
-
 // Server-side floor, mirrored so the client doesn't fire a request it knows
 // will come back empty (central/api/devices.py:ONU_SEARCH_MIN). The key must
 // match `onuroster.search_key` — punctuation is stripped before the length is
 // judged, so "hc_" is 2 characters here and does NOT reach the server.
+// (the key itself lives in lib/format beside onuName — the map's search box
+// judges the same needle, and two spellings of "what counts as a character"
+// would disagree about which searches are worth sending)
 const ONU_SEARCH_MIN = 3
-const onuSearchKey = (s: string) => s.replace(/[^a-z0-9]/gi, "")
 
 // ONU hits for the current search, by serial/MAC or provisioned name. The
 // Network tree can only render devices, and an ONU isn't one — but its MAC and
@@ -539,8 +622,10 @@ function OnuMatchList({ matches, truncated, loading, onOpen }: {
               <span className="shrink-0 font-mono text-xs font-medium">
                 {o.serial || o.onu_key}
               </span>
+              {/* the operator's own name first — after a field survey it is
+                  usually the only name this subscriber has (`onuName`) */}
               <span className="min-w-0 truncate text-xs text-muted-foreground">
-                {o.name || <span className="text-faint-foreground">unnamed</span>}
+                {onuName(o) || <span className="text-faint-foreground">unnamed</span>}
               </span>
               <div className="ml-auto flex shrink-0 items-center gap-3 text-2xs text-muted-foreground">
                 {/* where it is, in the terms the tech will act on: which OLT,
@@ -783,9 +868,14 @@ function DeviceActions({ device, canWrite, onEdit, parentName }: {
                 <ScanSearch /> SNMP walk
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
-              <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
-            </DropdownMenuItem>
+            {/* Maintenance silences a device's alerting. Passive plant has no
+                FSM and no outage of its own, so the toggle would flip a flag
+                nothing reads — and leave a "maint" chip claiming something. */}
+            {!isPassiveType(device.device_type) && (
+              <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
+                <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
+              </DropdownMenuItem>
+            )}
             {/* max-w + truncate: real parent names run long (HALIYA-LOCAL-CH-SW)
                 and wrapped the item over four lines */}
             {device.parent_device_id != null && (
@@ -835,22 +925,24 @@ function DeviceRow({
   parentName?: string
   colors: ColorMaps
 }) {
-  const { open: detailOpen, tab: detailTab, focusOnu, onToggle, onTab: setDetailTab, openTab } = drill
+  const { open: detailOpen, onToggle, openTab } = drill
   const ref = useFocusScroll(focus)
   useNow()
   const hasOptics = isOpticalOlt(device)
   const hasPorts = device.snmp_enabled === 1
   const passive = isPassiveType(device.device_type)
   const unassigned = !device.assigned_node_id && !passive
+  // rendered somewhere other than under its parent — see the parent-name chip
+  const lifted = device.tree_detached === 1 || (passive && device.depth === 0)
 
   return (
-    // Open = the drill-in block: row + panel fuse into one raised surface
-    // (.wisp-drillin in index.css); the row itself goes transparent so the
-    // block carries the elevation, with a hairline between row and panel.
+    // Open = SELECTED, not expanded: the details live in the page's side panel
+    // now, so .wisp-drillin (popover bg + border-strong outline, index.css) marks
+    // which row the panel is showing rather than fusing a row to a panel below it.
     <div ref={ref} className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
-          RAIL, detailOpen && "border-b")}
+          RAIL)}
         style={railStyle(deviceColor(device, colors))}
         onClick={onToggle}
         title={detailOpen ? undefined : "Click for details"}
@@ -878,11 +970,15 @@ function DeviceRow({
         {device.device_type && (
           <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
         )}
-        {/* A lifted row is the one place the tree stops showing where a device
-            actually hangs — so it says so, right on the row. */}
-        {device.tree_detached === 1 && parentName && (
+        {/* A row that renders away from its parent is the one place the tree
+            stops showing where a device actually hangs — so it says so, right on
+            the row. Two ways to get here: the operator lifted it (tree_detached),
+            or it's plant, which lists below the gear it hangs off. */}
+        {lifted && parentName && (
           <span className="hidden min-w-0 shrink items-center gap-1 text-xs text-faint-foreground sm:inline-flex"
-            title={`Hangs off ${parentName} — shown at the top level for readability`}>
+            title={device.tree_detached === 1
+              ? `Hangs off ${parentName} — shown at the top level for readability`
+              : `Fed from ${parentName} — passive plant lists below the gear`}>
             <CornerLeftUp className="size-3 shrink-0" />
             <span className="truncate">{parentName}</span>
           </span>
@@ -896,20 +992,15 @@ function DeviceRow({
           <DeviceActions device={device} canWrite={canWrite} onEdit={onEdit} parentName={parentName} />
         </div>
       </div>
-      {detailOpen && (
-        <div className="px-3 pt-1 pb-3">
-          <DeviceDetail device={device} tab={detailTab} onTab={setDetailTab} focusOnuId={focusOnu} />
-        </div>
-      )}
     </div>
   )
 }
 
 // Grid presentation of a device — the flattened, glanceable counterpart to the
-// tree row. Same drill-in panel: clicking the card expands its DeviceDetail
-// full-width beneath the grid row (col-span-full), so the tabbed panel stays
-// identical across both views. Tree depth/collapse are list affordances and
-// don't apply here; the parent name carries the context an indent would.
+// tree row. Same drill-in: clicking the card selects it and the page's side
+// panel shows its DeviceDetail, so the tabbed panel is literally one instance
+// across both views. Tree depth/collapse are list affordances and don't apply
+// here; the parent name carries the context an indent would.
 function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill, colors }: {
   device: OrgDevice & { depth: number; descendantCount: number }
   canWrite: boolean
@@ -927,9 +1018,7 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill, colors
   const passive = isPassiveType(device.device_type)
   const unassigned = !device.assigned_node_id && !passive
 
-  // The expanded detail is rendered by the grid at the end of this card's visual
-  // row (see TopologyPage) — inserting it right here would push the cards to this
-  // card's right onto the next line. The card itself only reflects open-ness.
+  // The card only reflects open-ness; the details are in the page's side panel.
   return (
     <div
       ref={ref}
@@ -1008,12 +1097,15 @@ export function TopologyPage() {
   const location = useLocation()
   const navState = location.state as
     { deviceId?: number; probeId?: string; tab?: DeviceTab; onuId?: number
+      /** Top-bar search hand-off: carries a nonce, not a flag, so clicking it
+       *  again while already here re-focuses the box instead of no-op'ing. */
+      focusSearch?: number
       /** Home KPI tile deep-link: pre-filters the device list to exactly the
        *  devices that tile counts, labeled for the clearable chip below. */
       statusFilter?: { label: string; ids: number[] } } | null
   const focusId = navState?.deviceId
-  // A deep-link may target a specific tab/ONU (the command palette's ONU hits
-  // open the Optical tab focused on the ONU); read as primitives so the effect
+  // A deep-link may target a specific tab/ONU (an ONU hit opens the Optical tab
+  // focused on that ONU); read as primitives so the effect
   // re-fires when the target changes even if the OLT id repeats.
   const focusTab = navState?.tab
   const focusOnuId = navState?.onuId
@@ -1028,6 +1120,7 @@ export function TopologyPage() {
     navState?.statusFilter ?? null)
   const [view, setView] = useState<ViewMode>(loadView)
   const [search, setSearch] = useState("")
+  const searchRef = useRef<HTMLInputElement>(null)
   const [sortMode, setSortMode] = useState<SortMode>(loadSort)
   // active tag filter — a device must carry EVERY selected tag (narrowing)
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
@@ -1038,7 +1131,6 @@ export function TopologyPage() {
   // Device an ONU search hit asked us to scroll to — kept apart from the
   // router's deep-link focusId so a search jump can't fight a navigation.
   const [jumpId, setJumpId] = useState<number | null>(null)
-  const cols = useGridCols()
   // Fresh-open lands on the device's own first tab (optical, for an OLT) —
   // deviceTabs() is the one place that order is decided.
   const drillFor = (device: OrgDevice): DrillIn => {
@@ -1083,9 +1175,17 @@ export function TopologyPage() {
   useEffect(() => {
     if (navState?.statusFilter) setStatusFilter(navState.statusFilter)
   }, [navState?.statusFilter])
-  // deep-link (Home row / command palette) opens the target's panel — on the
-  // Optical tab focused on an ONU when the palette handed us one, else the
-  // device's own first tab (optical, for an OLT).
+  // arriving from the top bar's search button (or ⌘K): put the cursor in the
+  // box. Selecting any existing text means a second search starts by typing
+  // rather than by clearing — landing here is a new question, not an edit.
+  useEffect(() => {
+    if (!navState?.focusSearch) return
+    searchRef.current?.focus()
+    searchRef.current?.select()
+  }, [navState?.focusSearch])
+  // deep-link (Home row, map, WhatsApp) opens the target's panel — on the
+  // Optical tab focused on an ONU when the caller named one, else the device's
+  // own first tab (optical, for an OLT).
   useEffect(() => {
     if (focusId == null) return
     // Reads the CURRENT device list without depending on it — this must fire
@@ -1164,11 +1264,16 @@ export function TopologyPage() {
     if (focusId == null || !devicesData) return
     const byId = new Map(devicesData.map((d) => [d.id, d]))
     const ancestors: number[] = []
-    // walk the RENDERED chain: a detached device is already at the top level,
-    // so expanding the subtree it was lifted out of would reach nothing
+    // walk the RENDERED chain, the same one treeOrder builds: a detached device
+    // — or a passive, which lists in its own block below the gear — is already at
+    // the top level, so expanding the subtree it renders outside of would reach
+    // nothing (and would silently unfold a branch the operator had closed)
     const up = (id: number) => {
       const d = byId.get(id)
-      return d && d.tree_detached !== 1 ? d.parent_device_id : null
+      if (!d || d.tree_detached === 1 || d.parent_device_id == null) return null
+      const p = byId.get(d.parent_device_id)
+      if (!p || isPassiveType(p.device_type) !== isPassiveType(d.device_type)) return null
+      return d.parent_device_id
     }
     let cur = up(focusId)
     while (cur != null && byId.has(cur) && !ancestors.includes(cur)) {
@@ -1230,10 +1335,29 @@ export function TopologyPage() {
   // tree); grid view has no hierarchy semantics, so an active sort there orders
   // the whole flat list — sort-by-IP reads as one ascending scan.
   const treeOrdered = treeOrder(devices, effectiveCollapsed, cmp)
-  const ordered = gridView && cmp ? [...treeOrdered].sort(cmp) : treeOrdered
+  const flatten = (rows: Ordered[]) => (gridView && cmp ? [...rows].sort(cmp) : rows)
+  const orderedGear = flatten(treeOrdered.gear)
+  const orderedPlant = flatten(treeOrdered.plant)
+  // Resolved against the FILTERED list, not allDevices: a search or tag filter
+  // that hides the selected row takes its panel with it, the way an inline
+  // expansion used to vanish with the row that rendered it. Panel-open state
+  // survives, so clearing the filter brings it back where it was.
+  const openDevice = open ? devices.find((d) => d.id === open.id) ?? null : null
+  // Its own stored width, separate from the Map's: a full page and a panel
+  // floating over tiles have different room to spend.
+  const panel = useResizablePanel({
+    storageKey: "wisp:network:panelw", defaultWidth: 420, min: 340, max: 760,
+    open: !!openDevice,
+  })
   const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
   const nodeIds = activeNodes.map((n) => n.node_id)
+  const deviceCounts = new Map<string, number>()
+  for (const d of allDevices) {
+    if (d.assigned_node_id) {
+      deviceCounts.set(d.assigned_node_id, (deviceCounts.get(d.assigned_node_id) ?? 0) + 1)
+    }
+  }
 
   const fresh = devices.filter((d) => d.assigned_node_id && d.state && !isStale(d.state_updated_at))
   const down = fresh.filter((d) => d.state === "DOWN" || d.state === "UNREACHABLE").length
@@ -1261,50 +1385,46 @@ export function TopologyPage() {
       ))}
     </Card>
   )
-  // Grid drill-in: place the open card's detail after the LAST card in its visual
-  // row, so its right-hand neighbours keep their row instead of jumping a line.
-  const renderGrid = (list: Ordered[]) => {
-    const openIndex = open ? list.findIndex((d) => d.id === open.id) : -1
-    const openRowEnd = openIndex < 0 ? -1
-      : Math.min(Math.floor(openIndex / cols) * cols + cols - 1, list.length - 1)
-    const openDevice = openIndex < 0 ? null : list[openIndex]
-    return (
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-        {list.map((d, i) => (
-          <Fragment key={d.id}>
-            <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit}
-              focus={d.id === (jumpId ?? focusId)}
-              drill={drillFor(d)}
-              parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined}
-              colors={colors} />
-            {formOpen && editing?.id === d.id && (
-              <div className="col-span-full rounded-lg border bg-muted/30 p-3">
-                <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
-              </div>
-            )}
-            {i === openRowEnd && openDevice && (
-              <div className="col-span-full">
-                <div className="wisp-drillin px-3 pt-1 pb-3">
-                  <DeviceDetail device={openDevice} tab={open!.tab} focusOnuId={open!.onu ?? null}
-                    onTab={(t) => setOpen((o) => (o ? { ...o, tab: t } : o))} />
-                </div>
-              </div>
-            )}
-          </Fragment>
-        ))}
-      </div>
-    )
-  }
+  // No drill-in placement to solve here any more: the open card's details render
+  // in the page's side panel, so cards never reflow around an expanded block.
+  const renderGrid = (list: Ordered[]) => (
+    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+      {list.map((d) => (
+        <Fragment key={d.id}>
+          <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit}
+            focus={d.id === (jumpId ?? focusId)}
+            drill={drillFor(d)}
+            parentName={d.parent_device_id != null ? nameById.get(d.parent_device_id) : undefined}
+            colors={colors} />
+          {formOpen && editing?.id === d.id && (
+            <div className="col-span-full rounded-lg border bg-muted/30 p-3">
+              <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
+            </div>
+          )}
+        </Fragment>
+      ))}
+    </div>
+  )
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
-      <div className="flex items-center justify-between">
+    // `panel.vars` carries the LIVE dragged width down to the panel and to
+    // `.wisp-panel-clear`. The panel floats, so the LIST is allowed to run under
+    // it — that was the choice. The CONTROLS are not: view toggle, search, sort,
+    // tags and Add all sit at the page's right edge, and a panel parked on top
+    // of them means you can't find the next device without closing the one
+    // you're reading. Reading the live width is what keeps that gutter honest —
+    // a hardcoded one would gap or overlap the moment the panel is resized.
+    <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6" style={panel.vars}>
+      <div className="wisp-panel-clear flex items-center justify-between">
         <h1 className="text-base font-semibold">Network</h1>
         <ViewToggle view={view} onChange={changeView} />
       </div>
 
+      <ProbesPanel org={scopeOrg} canWrite={canWrite} view={view} deviceCounts={deviceCounts}
+        probeFilter={probeFilter} onProbeFilter={setProbeFilter} />
+
       <section className="flex flex-col gap-2">
-        <div className="flex items-center justify-between">
+        <div className="wisp-panel-clear flex items-center justify-between">
           <div className="flex items-baseline gap-3">
             <h2 className="text-sm font-semibold">
               Devices
@@ -1349,7 +1469,7 @@ export function TopologyPage() {
           <div className="flex flex-wrap items-center gap-2">
             <div className="relative">
               <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input value={search} onChange={(e) => setSearch(e.target.value)}
+              <Input ref={searchRef} value={search} onChange={(e) => setSearch(e.target.value)}
                 placeholder="Find device or ONU…" aria-label="Find device or ONU"
                 title="Device name, IP, type, region or tag — plus any ONU MAC or name, punctuation optional"
                 className="h-8 w-40 pl-7 text-xs md:w-64" />
@@ -1446,8 +1566,77 @@ export function TopologyPage() {
               : "No devices yet. Add one above."}
           </p>
         )}
-        {devices.length > 0 && (gridView ? renderGrid(ordered) : renderList(ordered))}
+        {orderedGear.length > 0 && (gridView ? renderGrid(orderedGear) : renderList(orderedGear))}
+        {/* Plant below the gear, behind a divider that says what it is. Passives
+            have no state and nothing that can alarm, so they'd otherwise be rows
+            to scan past on the screen that exists to show trouble. The label is
+            the honest one: "recorded", not "all" — a splitter nobody has entered
+            simply isn't here. */}
+        {orderedPlant.length > 0 && (
+          <div className="mt-3 flex items-center gap-3">
+            <span className="wisp-eyebrow shrink-0">Passive plant</span>
+            <span className="shrink-0 text-2xs text-faint-foreground">
+              {orderedPlant.length} recorded · splitters, FDBs and closures — never probed
+            </span>
+            <span aria-hidden className="h-px flex-1 bg-border" />
+          </div>
+        )}
+        {orderedPlant.length > 0 && (gridView ? renderGrid(orderedPlant) : renderList(orderedPlant))}
       </section>
+
+      {/* Drill-in side panel. Floats over the list rather than docking beside it,
+          so the tree keeps its full width and reads the same open or closed —
+          the same shape the Map's pin panel uses, so the two surfaces are one
+          habit. Fixed, not sticky: <main> is the scroll container, so the panel
+          holds its place while the list scrolls under it. Below md there is no
+          room beside anything, so it becomes a bottom sheet clear of the mobile
+          tab bar. z-40 sits above the sticky header (z-30) and under Radix
+          portals (z-50), so a dialog or dropdown opened from inside still wins. */}
+      {/* Scrim: the list recedes rather than going away. It stays READABLE (you
+          have to know which row you're clicking) and CLICKABLE (pointer-events
+          -none — switching devices is one click, never close-then-reopen), it
+          just stops competing with the panel for attention.
+          Two things here are load-bearing, both learned by shipping the wrong
+          one first. (1) BLACK, not `bg-background/…`: a canvas tone darkens in
+          dark mode but LIGHTENS an already-near-white light mode, washing the
+          page out instead of pushing it back — so the alpha is mode-split
+          instead, the same total effect from opposite starting points.
+          (2) NO backdrop-blur. The app's dialogs pair a light scrim with
+          `backdrop-blur-xs` and that reads fine under a small centred modal, but
+          over a full device tree it renders far heavier than the name suggests
+          and takes the row names with it — which kills the click-through this
+          panel depends on. Dimming alone is enough. */}
+      {openDevice && (
+        <div aria-hidden
+          className="pointer-events-none fixed inset-0 z-[35] bg-black/25 dark:bg-black/45" />
+      )}
+      {openDevice && (
+        // Opaque, unlike the Map's panel: /95 + backdrop-blur is right over
+        // raster tiles, where sensing what's underneath is the point, and wrong
+        // over a data table, where the row text ghosting through the panel is
+        // just noise on top of the numbers you opened it to read.
+        <Card className="wisp-device-panel fixed inset-x-2 bottom-[4.5rem] z-40 flex max-h-[62%] flex-col gap-0 overflow-hidden border-border-strong bg-popover py-0 md:inset-x-auto md:top-[4.25rem] md:right-3 md:bottom-auto md:max-h-[calc(100vh-5.5rem)]">
+          <PanelResizeGrip grip={panel.grip} />
+          <DevicePanelHeader device={openDevice}
+            tone={!openDevice.assigned_node_id && !isPassiveType(openDevice.device_type)
+              ? "muted" : deviceTone(openDevice.state, openDevice.state_updated_at)}>
+            <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
+              title="Close (Esc)" onClick={() => setOpen(null)}>
+              <X className="size-3.5" />
+            </Button>
+          </DevicePanelHeader>
+          {/* overscroll-contain stops scroll CHAINING: without it, a wheel over
+              the panel falls through to <main> the moment the panel has nothing
+              left to scroll — or nothing to scroll at all — and the tree slides
+              away underneath the thing you're reading. It belongs on the Card
+              too (see .wisp-device-panel), because the header and tab strip sit
+              OUTSIDE this scroller and a wheel over them would chain regardless. */}
+          <div className="overflow-y-auto overscroll-contain p-3">
+            <DeviceDetail device={openDevice} tab={open!.tab} focusOnuId={open!.onu ?? null}
+              onTab={(t) => setOpen((o) => (o ? { ...o, tab: t } : o))} />
+          </div>
+        </Card>
+      )}
     </div>
   )
 }

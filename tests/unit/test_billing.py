@@ -88,6 +88,9 @@ class SweeperTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "c.db")
         self.store.set_org("ispA", name="Acme", ntfy_topic_owner="own-a")
         self.store.set_org_plan("ispA", "pro")
+        # WhatsApp-only: an owner number gives the reminder a recipient.
+        o = self.store.add_user("ispA", "own1", "h", "s", "owner")
+        self.store.set_user_whatsapp(o, "919000000001")
         self.notifier = RecordingNotifier()
         self.sweeper = billing.BillingSweeper(self.store, notifier=self.notifier)
 
@@ -101,7 +104,7 @@ class SweeperTest(unittest.TestCase):
                          [("ispA", "2026-08", "due_soon")])
         self.assertEqual(len(self.notifier.sent), 1)
         page = self.notifier.sent[0]
-        self.assertEqual(page["recipient"], "own-a")
+        self.assertEqual(page["whatsapp"], ["919000000001"])
         self.assertIn("August 2026", page["body"])
         self.assertIn(billing.DEFAULT_GPAY_NUMBER, page["body"])
         # transition-only: a second sweep stays silent
@@ -126,13 +129,13 @@ class SweeperTest(unittest.TestCase):
         sweeper.check(now)
         self.assertEqual(len(failing.sent), 2)
 
-    def test_no_topic_is_skipped_not_retried(self):
-        self.store.set_org("ispB", name="NoTopic")
+    def test_no_recipient_is_skipped_not_retried(self):
+        # ispB has no WhatsApp numbers → its reminder is skipped (recorded, not
+        # sent) and a skip is never retried (unlike a failed send).
+        self.store.set_org("ispB", name="NoNumber")
         self.store.set_org_plan("ispB", "vip")
         now = _utc(2026, 8, 2)
         self.sweeper.check(now)
-        recipients = [p["recipient"] for p in self.notifier.sent]
-        self.assertNotIn(None, recipients)
         sent_before = len(self.notifier.sent)
         self.sweeper.check(now)
         self.assertEqual(len(self.notifier.sent), sent_before)

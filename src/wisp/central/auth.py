@@ -206,10 +206,19 @@ def _decode(token: str | None, *, cfg: Config = CONFIG,
     return s
 
 def issue_session(user_id: int, cfg: Config = CONFIG, *, remember: bool = False,
+                  trusted_admin: bool = False,
                   epoch: int = 0, now: float | None = None) -> str:
     t = int(time.time() if now is None else now)
-    if remember:
-        # Trusted device: long absolute life, and NO idle logout (idle=0).
+    if trusted_admin:
+        # Owner/superadmin "trust this device": a longer absolute cap than the
+        # normal 12h so a privileged operator's own box isn't bounced every shift,
+        # but SHORTER than the worker 30-day tier — and, per operator choice, no
+        # idle logout for the window (idle=0). The server, not this function,
+        # decides a role is eligible (see server.py login handler).
+        hard = t + cfg.session_trusted_admin_hours * 3600
+        idle = 0
+    elif remember:
+        # Trusted device (worker): long absolute life, and NO idle logout (idle=0).
         hard = t + cfg.session_remember_days * 86400
         idle = 0
     else:
@@ -222,10 +231,13 @@ def verify_session(token: str | None, *, cfg: Config = CONFIG,
     s = _decode(token, cfg=cfg, now=now)
     return s.user_id if s else None
 
-def session_cookie_max_age(cfg: Config = CONFIG, *, remember: bool = False) -> int:
+def session_cookie_max_age(cfg: Config = CONFIG, *, remember: bool = False,
+                           trusted_admin: bool = False) -> int:
     """Browser retention hint for a freshly issued cookie. Set to the ABSOLUTE
     cap (not the idle window) so an active session's cookie survives across the
     idle window while the token's own seen+idle enforces idle expiry server-side."""
+    if trusted_admin:
+        return cfg.session_trusted_admin_hours * 3600
     if remember:
         return cfg.session_remember_days * 86400
     return cfg.session_timeout_h * 3600

@@ -285,6 +285,6 @@ class CentralPortMonitor:
         # same switch. All are already streak- and transition-gated, so no
         # cooldown — matters now that bandwidth PUSHes immediately, not via digest.
         self.router.emit(
-            payload, topic=self.store.org_role_topic(self.org_id, "worker"),
+            payload,
             title=title, body=body, priority=3, ts=ts, device_id=device_id,
             outage_id=outage_id, gate=gate, cooldown_min=0)

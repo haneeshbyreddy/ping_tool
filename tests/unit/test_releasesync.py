@@ -172,8 +172,8 @@ class _RecordingNotifier:
     def __init__(self):
         self.sent = []
 
-    def send(self, recipient, title, body, priority):
-        self.sent.append((recipient, title, priority))
+    def send(self, title, body, priority=3, *, whatsapp=(), facts=None):
+        self.sent.append((title, body, priority, list(whatsapp)))
         class R:  # matches NotifyResult's .ok surface
             ok = True
         return R()
@@ -187,7 +187,8 @@ class SyncAndRecordTest(unittest.TestCase):
         root = Path(self.tmp.name)
         self.store = CentralStore(root / "c.db")
         self.cfg = dataclasses.replace(CONFIG, release_cache_dir=root / "releases",
-                                       github_token="", releases_repo="o/r")
+                                       github_token="", releases_repo="o/r",
+                                       whatsapp_admin_number="919999999999")
         self.notifier = _RecordingNotifier()
 
     def tearDown(self):
@@ -211,12 +212,12 @@ class SyncAndRecordTest(unittest.TestCase):
                 self._run(broken)
         self.assertFalse(self.store.release_sync_status()["ok"])
         self.assertEqual(len(self.notifier.sent), 1)
-        self.assertIn("RELEASE SYNC FAILING", self.notifier.sent[0][1])
+        self.assertIn("RELEASE SYNC FAILING", self.notifier.sent[0][0])
 
         self._run(_FakeGh("v0.13.0", _scenario()))
         self.assertTrue(self.store.release_sync_status()["ok"])
         self.assertEqual(len(self.notifier.sent), 2)
-        self.assertIn("recovered", self.notifier.sent[1][1])
+        self.assertIn("recovered", self.notifier.sent[1][0])
 
 
 class AppSyncTest(unittest.TestCase):

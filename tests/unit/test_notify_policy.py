@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from support import RecordingNotifier
 from wisp.config import Config
 from wisp.central.store import CentralStore
-from wisp.central import notify_policy
 from wisp.central.notify_policy import (
     AlertRouter, DIGEST, PUSH, compose_digest, flush_digests, tier_for,
 )
@@ -25,6 +24,8 @@ def _ts(min_offset: float = 0.0) -> str:
 
 
 class TierTest(unittest.TestCase):
+    # tier_for still classifies every kind (the PUSH/DIGEST machinery is intact
+    # but dormant — see _ACTIVE_KINDS); these pin that classification unchanged.
     def test_snmp_kinds_digest(self):
         for k in ("PON_FAULT", "ONU_DUP_MAC", "ONU_LIMIT",
                   "PERF_DEGRADED", "ON_BACKUP", "HOURLY_ESCALATION"):
@@ -36,8 +37,6 @@ class TierTest(unittest.TestCase):
             self.assertEqual(tier_for(k), PUSH, k)
 
     def test_port_bandwidth_kinds_push(self):
-        # bandwidth floor/ceiling crossings + their clears buzz immediately
-        # (operator ask 2026-07-18), not the hourly digest.
         for k in ("PORT_BW_LOW", "PORT_BW_OK", "PORT_BW_HIGH", "PORT_BW_NORMAL"):
             self.assertEqual(tier_for(k), PUSH, k)
 
@@ -51,7 +50,12 @@ class RouterTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
-        self.store.set_org("ispA", ntfy_topic_worker="ops")
+        self.store.set_org("ispA", name="A")
+        # WhatsApp is the only channel; a worker number gives the org an audience
+        # so a PUSH kind has someone to page. (The admin number is deliberately
+        # NOT an org recipient — 2026-07-25 — so it can't stand in here.)
+        self.wkr = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
+        self.store.set_user_whatsapp(self.wkr, "919000000009")
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
 
     def tearDown(self):
@@ -62,54 +66,57 @@ class RouterTest(unittest.TestCase):
             return [dict(r) for r in c.execute(
                 "SELECT status, payload, kind FROM alert_log ORDER BY id")]
 
-    def test_digest_kind_queues_not_sent(self):
-        self.router.emit("PON_FAULT", topic="ops", title="fiber cut", body="x",
+    def test_inactive_kind_suppressed(self):
+        # Everything but port up/down is OFF for now — PON_FAULT neither pushes
+        # nor queues to the (dormant) digest; the shell still wrote its state row.
+        self.router.emit("PON_FAULT", title="fiber cut", body="x",
                          priority=3, ts=_ts(), device_id=7)
-        self.assertEqual(self.notifier.sent, [])            # nothing pushed
-        pending = self.store.pending_digest("ispA")
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["kind"], "PON_FAULT")
-        self.assertEqual(self._log_rows()[0]["status"], "digest")
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.store.pending_digest("ispA"), [])
+        self.assertEqual(self._log_rows()[0]["status"], "suppressed")
 
     def test_push_kind_sends(self):
-        self.router.emit("PORT_DOWN", topic="ops", title="port down", body="x",
+        self.router.emit("PORT_DOWN", title="port down", body="x",
                          priority=3, ts=_ts(), device_id=7, cooldown_min=0)
         self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.notifier.sent[0]["whatsapp"], ["919000000009"])
         self.assertEqual(self._log_rows()[0]["status"], "sent")
-        self.assertEqual(self.store.pending_digest("ispA"), [])
 
     def test_gate_off_suppresses(self):
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(), device_id=7, gate=False)
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._log_rows()[0]["status"], "suppressed")
 
-    def test_no_topic_suppresses(self):
-        self.router.emit("PON_FAULT", topic=None, title="t", body="x",
-                         priority=3, ts=_ts(), device_id=7)
-        self.assertEqual(self.store.pending_digest("ispA"), [])  # not queued
+    def test_no_recipients_suppresses(self):
+        # an org with no owner/worker numbers can't be paged (the admin number is
+        # not an org recipient, so clearing the team's numbers empties the audience)
+        self.store.set_user_whatsapp(self.wkr, None)
+        self.router.emit("PORT_DOWN", title="t", body="x",
+                         priority=3, ts=_ts(), device_id=7, cooldown_min=0)
+        self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._log_rows()[0]["status"], "suppressed")
 
     def test_cooldown_suppresses_repeat(self):
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(0), device_id=7)   # cfg cooldown 30m
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(10), device_id=7)  # within window
         self.assertEqual(len(self.notifier.sent), 1)
         statuses = [r["status"] for r in self._log_rows()]
         self.assertEqual(statuses, ["sent", "suppressed"])
 
     def test_cooldown_scoped_per_device(self):
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(0), device_id=7)
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(1), device_id=8)   # different device
         self.assertEqual(len(self.notifier.sent), 2)
 
     def test_cooldown_expires(self):
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(0), device_id=7)
-        self.router.emit("PORT_DOWN", topic="ops", title="t", body="x",
+        self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(45), device_id=7)  # past 30m window
         self.assertEqual(len(self.notifier.sent), 2)
 
@@ -120,15 +127,18 @@ class DigestFlushTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
-        self.store.set_org("ispA", ntfy_topic_worker="ops")
-        self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
+        self.store.set_org("ispA", name="A")
+        # a worker number gives the org an audience for the flushed digest
+        w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
+        self.store.set_user_whatsapp(w, "919000000009")
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _queue(self, kind, title, at):
-        self.router.emit(kind, topic="ops", title=title, body="", priority=3,
-                         ts=_ts(at), device_id=1)
+        # The digest tier is dormant (emit no longer routes any active kind to
+        # it), so queue directly to exercise flush_digests / compose_digest.
+        self.store.queue_digest("ispA", 1, kind, title, "", _ts(at))
 
     def test_not_flushed_before_interval(self):
         self._queue("PON_FAULT", "cut A", 0)

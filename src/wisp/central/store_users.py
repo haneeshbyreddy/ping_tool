@@ -8,6 +8,7 @@ the Team page (2026-07-21): who works for the org is now just who has a login.
 """
 from __future__ import annotations
 
+import re
 
 from wisp.central.store_util import _now_iso
 
@@ -71,10 +72,10 @@ class UserStoreMixin:
 
 
     def org_role_whatsapp(self, org_id: str, role: str) -> list[str]:
-        """WhatsApp numbers to page for one org+role — the per-account analog of
-        org_role_topic. Every ACTIVE login of that role in the org that has set a
-        number contributes one; an account without a number is simply absent.
-        Deactivated accounts never page (same as a revoked ntfy subscription)."""
+        """WhatsApp numbers to page for one org+role. Every ACTIVE login of that
+        role in the org that has set a number contributes one; an account without
+        a number is simply absent. Deactivated accounts never page. Kept as the
+        building block for `org_alert_recipients` and per-role test alerts."""
         if role not in ("owner", "worker"):
             return []
         with self._connect() as conn:
@@ -83,6 +84,71 @@ class UserStoreMixin:
                 " WHERE org_id=? AND role=? AND is_active=1"
                 "   AND whatsapp_number IS NOT NULL AND TRIM(whatsapp_number) <> ''"
                 " ORDER BY username", (org_id, role))]
+
+    def org_alert_recipients(self, org_id: str) -> list[str]:
+        """Every WhatsApp number paged for an org's alerts. Roles do NOT route
+        separately (operator choice 2026-07-24): owner AND worker accounts both
+        get every alert, all at once. Raw de-dup here; the notifier normalises to
+        digits and de-dups again.
+
+        The superadmin ops number is DELIBERATELY NOT here (2026-07-25): the
+        platform admin can't be buried under every org's device/uplink/port/probe
+        pings. The admin number carries only the platform-level pings that have no
+        org role — 'I've paid', self-downgrade churn, release-sync failing — via
+        the separate `_admin_whatsapp`/`_admin_numbers` resolvers, never this one."""
+        nums: list[str] = []
+        for role in ("owner", "worker"):
+            nums.extend(self.org_role_whatsapp(org_id, role))
+        return list(dict.fromkeys(nums))
+
+    def named_whatsapp(self, org_id: str, usernames: list[str]) -> list[str]:
+        """The WhatsApp numbers of NAMED accounts in one org — the audience for a
+        page that is about a specific person's job, not about the org.
+
+        Assignment is the only such page today: the point of handing an outage to
+        two workers is that exactly those two hear about it, so this deliberately
+        does NOT go through `org_alert_recipients` (which is the whole team, by
+        design). Same discipline otherwise: active accounts only, numberless
+        accounts simply absent — the caller reports how many were reached, since
+        "assigned but unreachable" is a fact the owner needs, not an error."""
+        names = [str(u) for u in (usernames or []) if str(u or "").strip()]
+        if not names:
+            return []
+        marks = ",".join("?" for _ in names)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT whatsapp_number FROM users"
+                f" WHERE org_id=? AND is_active=1 AND username IN ({marks})"
+                f"   AND whatsapp_number IS NOT NULL AND TRIM(whatsapp_number) <> ''"
+                f" ORDER BY username", (org_id, *names)).fetchall()
+        return list(dict.fromkeys(r["whatsapp_number"] for r in rows))
+
+    def whatsapp_user(self, number: str) -> dict | None:
+        """Reverse of `org_alert_recipients`: the single ACTIVE login that owns
+        this WhatsApp number, as {id, username, org_id, role}. This is what the
+        inbound bot uses to scope every lookup to ONE org — the org-scoping
+        invariant, mirroring onu-search's lateral-move caution.
+
+        Numbers match on DIGITS ONLY (the same normalisation the notifier sends
+        with), so a stored '+9190…' matches an inbound '9190…'. Returns None for:
+        an unknown number, an org-less account (a superadmin, whose role/org can't
+        scope a lookup), OR a number shared by two accounts — the bot ignores all
+        three, because guessing which org to scope to is exactly the lateral move
+        we refuse elsewhere."""
+        digits = re.sub(r"\D", "", str(number or ""))
+        if len(digits) < 8:
+            return None
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, username, org_id, role, whatsapp_number FROM users"
+                " WHERE is_active=1 AND org_id IS NOT NULL"
+                "   AND whatsapp_number IS NOT NULL AND TRIM(whatsapp_number) <> ''"
+            ).fetchall()
+        hits = [{"id": r["id"], "username": r["username"], "org_id": r["org_id"],
+                 "role": r["role"]}
+                for r in rows
+                if re.sub(r"\D", "", r["whatsapp_number"] or "") == digits]
+        return hits[0] if len(hits) == 1 else None
 
 
     # --- TOTP second factor -------------------------------------------------

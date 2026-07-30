@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -66,8 +67,14 @@ class CentralStoreTest(unittest.TestCase):
         self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
 
     def test_triage_outages_status_derivation(self):
+        # Timestamps are relative to NOW, not hardcoded: `triage_outages` keeps a
+        # resolved outage only while it is inside the 30-day post-mortem window,
+        # so fixed dates make this pass until they age out and then fail forever.
+        now = datetime.now(timezone.utc)
+        started = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+        ended = (now - timedelta(minutes=55)).isoformat(timespec="seconds")
         dev = self._device()
-        self.store.open_outage_if_absent("ispA", dev, "2026-06-23T08:00:00+00:00", "DOWN")
+        self.store.open_outage_if_absent("ispA", dev, started, "DOWN")
         oid = self.store.open_outage_id("ispA", dev)
         statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
         self.assertEqual(statuses[oid], "unassigned")
@@ -76,7 +83,7 @@ class CentralStoreTest(unittest.TestCase):
         statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
         self.assertEqual(statuses[oid], "in_progress")
 
-        self.store.resolve_outage("ispA", dev, "2026-06-23T08:05:00+00:00")
+        self.store.resolve_outage("ispA", dev, ended)
         statuses = {o["id"]: o["status"] for o in self.store.triage_outages("ispA")}
         self.assertEqual(statuses[oid], "pending_postmortem")
 
@@ -405,6 +412,23 @@ class OrgDevicesTest(unittest.TestCase):
             "name": "OLT-1", "ip_address": "10.0.0.7", "device_type": "OLT",
             "region": None, "parent_device_id": None, "gpon_vendor": None})
         self.assertIsNone(self.store.get_org_device("ispA", olt)["gpon_vendor"])
+
+    def test_onu_pon_limit_round_trips_through_the_device_write_path(self):
+        # The cap the "PON at capacity" page is judged against. It had a column
+        # and every reader, but no write path a form could reach — so a GPON box
+        # could only ever be capped at the EPON 64.
+        olt = self.store.create_org_device("ispA", {
+            "name": "OLT-2", "ip_address": "10.0.0.9", "device_type": "OLT",
+            "region": None, "parent_device_id": None, "onu_pon_limit": 128})
+        row = next(d for d in self.store.list_org_devices("ispA") if d["id"] == olt)
+        # list_org_devices is the read onualert._limits() uses; a cap missing
+        # THERE is a cap that pages nobody differently
+        self.assertEqual(row["onu_pon_limit"], 128)
+
+        self.store.update_org_device("ispA", olt, {
+            "name": "OLT-2", "ip_address": "10.0.0.9", "device_type": "OLT",
+            "region": None, "parent_device_id": None, "onu_pon_limit": None})
+        self.assertIsNone(self.store.get_org_device("ispA", olt)["onu_pon_limit"])
 
     def test_tags_round_trip_but_stay_out_of_topology(self):
         dev = self.store.create_org_device("ispA", {

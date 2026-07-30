@@ -76,7 +76,9 @@ class DeviceStoreMixin:
                 " d.tags,"
                 " d.parent_device_id, d.assigned_node_id, d.maintenance, d.snmp_enabled,"
                 " d.snmp_version, d.snmp_community, d.snmp_port, d.gpon_vendor,"
-                " d.lat, d.lng, d.pon_port, d.onu_pon_limit, d.tree_detached,"
+                " d.lat, d.lng, d.pon_port, d.split_ratio, d.onu_pon_limit,"
+                " d.accuracy_m, d.place_source, d.placed_by, d.placed_at,"
+                " d.tree_detached,"
                 " d.web_ip, d.web_port, d.web_scheme,"
                 " (SELECT COUNT(*) FROM org_devices c"
                 "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
@@ -135,10 +137,17 @@ class DeviceStoreMixin:
         for link in peers:
             peer_ids.setdefault(link["child_id"], []).append(link["parent_id"])
             peer_ids.setdefault(link["parent_id"], []).append(link["child_id"])
+        # Who is EXPLICITLY on the hook for paging about this device (never the
+        # inherited set — see store_assign.device_assignee_ids). Rides the device
+        # list because the panel that edits it already has the row, and because a
+        # separate fetch would let the two disagree about who is responsible.
+        # PAGING only: nothing reads this to decide what a session may see.
+        assignees = self.device_assignee_ids(org_id)
         out = [dict(r) for r in rows]
         for d in out:
             d["backup_parents"] = backups.get(d["id"], [])
             d["peer_ids"] = sorted(peer_ids.get(d["id"], []))
+            d["assignee_ids"] = assignees.get(d["id"], [])
             # stored comma-joined; the wire carries a real list
             d["tags"] = [t for t in (d["tags"] or "").split(",") if t]
         return out
@@ -171,12 +180,13 @@ class DeviceStoreMixin:
             cur = conn.execute(
                 "INSERT INTO org_devices (org_id, name, ip_address, device_type, region,"
                 " tags, parent_device_id, assigned_node_id, gpon_vendor, pon_port,"
-                " created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " split_ratio, onu_pon_limit, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (org_id, clean["name"], clean["ip_address"], clean["device_type"],
                  clean["region"], clean.get("tags"),
                  clean["parent_device_id"], clean.get("assigned_node_id"),
-                 clean.get("gpon_vendor"), clean.get("pon_port"), _now_iso()))
+                 clean.get("gpon_vendor"), clean.get("pon_port"),
+                 clean.get("split_ratio"), clean.get("onu_pon_limit"), _now_iso()))
             conn.commit()
             return int(cur.lastrowid)
 
@@ -190,13 +200,14 @@ class DeviceStoreMixin:
                 # the device again gets the plain nested row, not a stale lift)
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
                 " tags=?, parent_device_id=?, assigned_node_id=?, gpon_vendor=?,"
-                " pon_port=?,"
+                " pon_port=?, split_ratio=?, onu_pon_limit=?,"
                 " tree_detached=CASE WHEN ? IS NULL THEN 0 ELSE tree_detached END"
                 " WHERE id=? AND org_id=? AND is_active=1",
                 (clean["name"], clean["ip_address"], clean["device_type"], clean["region"],
                  clean.get("tags"),
                  clean["parent_device_id"], clean.get("assigned_node_id"),
                  clean.get("gpon_vendor"), clean.get("pon_port"),
+                 clean.get("split_ratio"), clean.get("onu_pon_limit"),
                  clean["parent_device_id"], device_id, org_id))
             if cur.rowcount > 0 and not clean.get("assigned_node_id"):
                 conn.execute("DELETE FROM device_states WHERE org_id=? AND device_id=?",
@@ -216,10 +227,39 @@ class DeviceStoreMixin:
 
     def set_org_device_location(self, org_id: str, device_id: int,
                                 lat: float | None, lng: float | None) -> bool:
+        """The DESKTOP placement path: a click on the map, a pin drag, or a clear.
+
+        Provenance is WIPED, not preserved. A hand-placed pin carries no accuracy
+        and was not taken anywhere near the device, so keeping a field capture's
+        `accuracy_m` here would leave the map claiming a 9 m GPS fix for a point
+        somebody dragged across a village. Losing the stamp is correct: the owner
+        moving a pin IS the newer claim, and "unknown provenance" is the honest
+        reading of it."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
-                "UPDATE org_devices SET lat=?, lng=? WHERE id=? AND org_id=? AND is_active=1",
+                "UPDATE org_devices SET lat=?, lng=?,"
+                " accuracy_m=NULL, place_source=NULL, placed_by=NULL, placed_at=NULL"
+                " WHERE id=? AND org_id=? AND is_active=1",
                 (lat, lng, device_id, org_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+    def place_org_device(self, org_id: str, device_id: int, lat: float, lng: float,
+                         *, accuracy_m: float | None, source: str,
+                         placed_by: str) -> bool:
+        """The FIELD placement path: somebody standing at the device.
+
+        Deliberately cannot clear a pin — lat/lng are non-optional here, so the
+        worker-facing route has no way to reach the both-null delete branch that
+        `clean_location_payload` allows. Provenance is stamped on every write
+        because that is the entire reason this method exists separately."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_devices SET lat=?, lng=?, accuracy_m=?, place_source=?,"
+                " placed_by=?, placed_at=datetime('now')"
+                " WHERE id=? AND org_id=? AND is_active=1",
+                (lat, lng, accuracy_m, source, placed_by, device_id, org_id))
             conn.commit()
             return cur.rowcount > 0
 
@@ -421,6 +461,14 @@ class DeviceStoreMixin:
             conn.execute("DELETE FROM web_optics_status WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute("DELETE FROM olt_optics WHERE device_id=?", (device_id,))
+            # Removing a splitter un-records the drops that came off it, rather
+            # than dangling them: the box is gone, so "which passive feeds this
+            # subscriber" genuinely has no answer any more. The subscribers
+            # themselves are untouched (they live in the SNMP roster) and simply
+            # go back to reading "splitter not recorded" — the honest state, and
+            # the one the operator has to correct anyway once the plant moved.
+            conn.execute("DELETE FROM onu_drops WHERE org_id=? AND passive_id=?",
+                         (org_id, device_id))
             conn.execute("DELETE FROM pon_fault_state WHERE org_id=? AND device_id=?",
                          (org_id, device_id))
             conn.execute("DELETE FROM device_snmp_status WHERE device_id=?",
@@ -434,6 +482,13 @@ class DeviceStoreMixin:
                          (org_id, device_id))
             conn.execute("DELETE FROM snmp_walks WHERE org_id=? AND device_id=?",
                          (org_id, device_id))
+            # Paging responsibility for a device that no longer exists. The
+            # schema says ON DELETE CASCADE, but this is swept explicitly like
+            # every other FK table above: a deferred cascade would leave the
+            # deletion order dependent on a PRAGMA, and the guardrail test
+            # (test_delete_cascade_handles_every_fk_table) reads this source.
+            conn.execute("DELETE FROM org_device_workers WHERE device_id=?",
+                         (device_id,))
             conn.execute("DELETE FROM org_devices WHERE id=? AND org_id=?",
                          (device_id, org_id))
             conn.commit()

@@ -9,11 +9,24 @@ import urllib.request
 from pathlib import Path
 
 from wisp.config import CONFIG, Config
+from wisp.egress.notifiers import WhatsAppFacts
 
 log = logging.getLogger("wisp.central.releasesync")
 
 _UA = "wisp-central-releasesync"
 _API = "https://api.github.com"
+
+
+def _admin_numbers(store, cfg: Config) -> list[str]:
+    """The superadmin ops WhatsApp number for release-mirror health pages: the
+    app_settings admin number, env fallback. Empty → no page (nothing to notify).
+    ntfy was removed 2026-07-24, so there is no topic fallback."""
+    try:
+        num = (store.whatsapp_settings().get("admin_number") or "").strip()
+    except Exception:
+        num = ""
+    num = num or cfg.whatsapp_admin_number
+    return [num] if num else []
 
 class ReleaseSyncError(Exception):
     pass
@@ -213,27 +226,33 @@ def sync_and_record(store, notifier=None, *, cfg: Config = CONFIG,
     """Run sync_release, stamp the outcome in the store, page on transitions only.
 
     The update channel is itself monitored: every attempt writes `release_sync`
-    status (surfaced on /api/system), and `cfg.central_ntfy_topic` gets one page
-    when syncs start failing and one when they recover — never per-run, the timer
-    fires every 15 min. A failed sync still raises so the CLI exits nonzero.
+    status (surfaced on /api/system), and the superadmin's WhatsApp ops number
+    gets one page when syncs start failing and one when they recover — never
+    per-run, the timer fires every 15 min. A failed sync still raises so the CLI
+    exits nonzero.
     """
+    numbers = _admin_numbers(store, cfg)
     try:
         version, n = sync_release(store, cfg=cfg, gh=gh)
     except ReleaseSyncError as exc:
         prev = store.set_release_sync_status(False, str(exc))
-        if notifier and (prev is None or prev.get("ok")) and cfg.central_ntfy_topic:
+        if notifier and (prev is None or prev.get("ok")) and numbers:
             try:
-                notifier.send(cfg.central_ntfy_topic, "🚨 RELEASE SYNC FAILING",
-                              f"central can no longer mirror releases: {exc}\n"
-                              "Fleet self-updates are stalled until this is fixed.", 4)
+                detail = (f"central can no longer mirror releases: {exc} — "
+                          "fleet self-updates are stalled until this is fixed.")
+                notifier.send("🚨 RELEASE SYNC FAILING", detail, 4, whatsapp=numbers,
+                              facts=WhatsAppFacts.derive("Release mirror", detail,
+                                                         "SYNC FAILING"))
             except Exception:
                 log.exception("release-sync failure page could not be sent")
         raise
     prev = store.set_release_sync_status(True, version)
-    if notifier and prev is not None and not prev.get("ok") and cfg.central_ntfy_topic:
+    if notifier and prev is not None and not prev.get("ok") and numbers:
         try:
-            notifier.send(cfg.central_ntfy_topic, "✅ Release sync recovered",
-                          f"release mirror is healthy again; latest mirrored: {version}", 3)
+            detail = f"release mirror is healthy again; latest mirrored: {version}"
+            notifier.send("✅ Release sync recovered", detail, 3, whatsapp=numbers,
+                          facts=WhatsAppFacts.derive("Release mirror", detail,
+                                                     "SYNC OK"))
         except Exception:
             log.exception("release-sync recovery page could not be sent")
     # The field-app APK rides the same timer, best-effort: a broken app mirror

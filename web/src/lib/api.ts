@@ -1,7 +1,8 @@
 import type {
-  AccountUser, AdminOverview, BillingInfo, GponProfilesResponse, IncidentShape, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
-  PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  AccountUser, AdminOverview, AssignmentRoster, BillingInfo, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
+  OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  BranchFault, SplitterLoad, SubscriberDrop,
   Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
 } from "./types"
@@ -71,8 +72,7 @@ export const adminApi = {
     google_maps_key: string | null
     billing_gpay_number: string
     billing_qr_image: string | null
-    billing_paid_topic: string
-    // experimental WhatsApp channel config (token never echoed — token_set only)
+    // WhatsApp channel config (token never echoed — token_set only)
     whatsapp: WhatsappSettings
     // sparse colour diff over the shipped palette, per theme mode; `{}` is a
     // stock theme. See lib/theme-tokens.ts and central/theme.py.
@@ -82,15 +82,16 @@ export const adminApi = {
     google_maps_key?: string | null
     billing_gpay_number?: string | null
     billing_qr_image?: string | null
-    billing_paid_topic?: string | null
     // WhatsApp config. `token` write-only: omit to leave the stored one alone,
-    // send a value to set it, or `token_clear: true` to remove it.
+    // send a value to set it, or `token_clear: true` to remove it. `admin_number`
+    // is the superadmin ops recipient (org 'I've paid' / churn / release-sync).
     whatsapp?: {
       enabled?: boolean
       phone_id?: string
       template?: string
       lang?: string
       api_version?: string
+      admin_number?: string
       token?: string
       token_clear?: boolean
     }
@@ -125,17 +126,15 @@ export const orgsApi = {
       "/api/orgs/delete", { method: "POST", body: { org_id, confirm: org_id } }),
   save: (body: {
     org_id: string; name?: string | null
-    ntfy_topic_owner?: string | null; ntfy_topic_worker?: string | null
     map_region?: string | null
     poll_interval_s?: number | null
     web_proxy?: boolean // superadmin-only capability flag
     auto_update?: boolean // fleet auto-update: central arms rollouts itself
   }) => request<{ ok: true }>("/api/org", { method: "POST", body }),
-  testAlert: (org_id: string, role: Role) =>
+  testAlert: (org_id: string) =>
     request<{
-      ok: boolean; detail?: string; channel: string; recipient: string | null
-      role: Role; whatsapp_count: number
-    }>("/api/test-alert", { method: "POST", body: { org_id, role } }),
+      ok: boolean; detail?: string; channel: string; whatsapp_count: number
+    }>("/api/test-alert", { method: "POST", body: { org_id } }),
 }
 
 export interface DevicePayload {
@@ -149,6 +148,11 @@ export interface DevicePayload {
   assigned_node_id?: string | null
   gpon_vendor?: string | null
   pon_port?: string | null
+  /** passive plant only: 2 | 4 | 8 (see SPLIT_RATIOS), null = not recorded */
+  split_ratio?: number | null
+  /** OLT only: ONUs per PON before "at capacity" (EPON 64 / GPON 128),
+      null = the server's global cap */
+  onu_pon_limit?: number | null
 }
 
 export const inventoryApi = {
@@ -167,6 +171,32 @@ export const inventoryApi = {
     request<{ ok: boolean }>("/api/inventory/tree-detached", { method: "POST", body: { id, on } }),
   setLocation: (id: number, lat: number | null, lng: number | null) =>
     request<{ ok: boolean }>("/api/inventory/location", { method: "POST", body: { id, lat, lng } }),
+  // The field-survey pair — the ONLY inventory writes a worker session may make.
+  // Separate from setLocation because they are different operations, not the
+  // same one with a wider audience: neither can clear a pin, and the passive
+  // create carries no parent, IP or probe (see server.py:_WORKER_POST).
+  placeInField: (body: {
+    id: number; lat: number; lng: number
+    accuracy_m: number | null; source: "gps" | "manual"
+  }) => request<{ ok: boolean }>("/api/inventory/field-location", { method: "POST", body }),
+  createFieldPassive: (body: {
+    name: string; device_type: string; lat: number; lng: number
+    accuracy_m: number | null; source: "gps" | "manual"
+    split_ratio?: string | null; region?: string | null; pon_port?: string | null
+  }) => request<{ id: number }>("/api/inventory/field-passive", { method: "POST", body }),
+  // Locating a subscriber's ONU from the field. Deliberately carries no
+  // `witness` key: placing a REFERENCE ONU is the operator's claim about a power
+  // supply and flips PON mass-drop verdicts, so it stays on setOnuPlace and
+  // owner-only. This one records where the box is, and nothing more.
+  locateOnuInField: (body: {
+    mac: string; lat: number; lng: number
+    accuracy_m: number | null; source: "gps" | "manual"; label?: string | null
+  }) => request<{ ok: boolean }>("/api/inventory/field-onu", { method: "POST", body }),
+  // Rename only. Writes `onu_places.label` — NOT the roster's name, which the
+  // SNMP walk rewrites every sweep. Separate from the placement call so fixing a
+  // spelling can't restamp the pin's accuracy or reattribute who placed it.
+  nameOnuInField: (body: { mac: string; label: string | null }) =>
+    request<{ ok: boolean }>("/api/inventory/field-onu-name", { method: "POST", body }),
   setSnmp: (id: number, body: {
     snmp_enabled: boolean; snmp_community?: string | null; snmp_port?: number | string
   }) => request<{ ok: boolean }>("/api/inventory/snmp", { method: "POST", body: { id, ...body } }),
@@ -194,6 +224,22 @@ export const inventoryApi = {
   ) => request<{ ok: boolean }>("/api/inventory/ports/bandwidth", {
     method: "POST", body: { id, threshold_mbps, max_mbps, direction },
   }),
+  // ----- paging responsibility ------------------------------------------------
+  // Who gets paged about a device. NOT a permission: every account still sees the
+  // whole fleet, so nothing here belongs in a read path.
+  assignments: (org?: string | null) =>
+    request<AssignmentRoster>(`/api/inventory/assignments${tq(org)}`),
+  /** REPLACE one device's assignees. An empty list is meaningful — it hands the
+      device back to "every worker gets paged", the safe default. */
+  setAssignees: (device_id: number, user_ids: number[]) =>
+    request<{ ok: boolean; unreachable: string[] }>("/api/inventory/assign", {
+      method: "POST", body: { device_id, user_ids },
+    }),
+  /** ADD or REMOVE accounts across many devices, leaving other assignees on those
+      devices alone — handing over a region must not strip whoever else was on it. */
+  bulkAssign: (device_ids: number[], user_ids: number[], mode: "add" | "remove") =>
+    request<{ ok: boolean; changed: number; unreachable: string[] }>(
+      "/api/inventory/assign", { method: "POST", body: { device_ids, user_ids, mode } }),
   routes: (org?: string | null) =>
     request<{ routes: LinkRoute[] }>(`/api/inventory/routes${tq(org)}`),
   setRoute: (child_id: number, parent_id: number, waypoints: Array<[number, number]>) =>
@@ -223,6 +269,42 @@ export const inventoryApi = {
   onuSearch: (org: string | null | undefined, q: string) =>
     request<OnuSearchResponse>(
       `/api/inventory/onu-search?q=${encodeURIComponent(q)}${tq(org).replace(/^\?/, "&")}`),
+  // Reference ONUs: the subscribers an operator has vouched for as reliably
+  // powered, placed on the map. Keyed on the MAC (identity), so a re-homed drop
+  // keeps its point. Passing lat/lng null CLEARS it — the table is sparse.
+  // Survey coverage. Without a device_id it is counts only (cheap); with one it
+  // also returns that OLT's unplaced rows — the list a tech works down.
+  onuCoverage: (org: string | null | undefined, deviceId?: number) => {
+    const p = new URLSearchParams()
+    if (org) p.set("org", org)
+    if (deviceId) p.set("device_id", String(deviceId))
+    const q = p.toString()
+    return request<OnuCoverageResponse>(`/api/inventory/onu-coverage${q ? `?${q}` : ""}`)
+  },
+  onuPlaces: (org?: string | null) =>
+    request<{ places: OnuPlace[] }>(`/api/inventory/onu-places${tq(org)}`),
+  setOnuPlace: (body: {
+    mac: string; lat: number | null; lng: number | null
+    label?: string | null; notes?: string | null; org_id?: string | null
+  }) => request<{ ok: boolean }>("/api/inventory/onu-place", { method: "POST", body }),
+  // Subscriber drops: which passive box each ONU hangs off. Map-only like
+  // `routes` — every page lists devices, only the map and a splitter's own
+  // panel need to know what is behind each box.
+  drops: (org?: string | null) =>
+    request<{
+      splitters: SplitterLoad[]; faults: BranchFault[]
+      recorded: number; unrecorded: number; outlier_db: number
+    }>(`/api/inventory/drops${tq(org)}`),
+  splitterDrops: (deviceId: number) =>
+    request<{ drops: SubscriberDrop[]; load: SplitterLoad | null; outlier_db: number }>(
+      `/api/inventory/drops/subscribers?device_id=${deviceId}`),
+  // Bulk by design: the question is "which customers hang off this splitter",
+  // asked once per box. `passive_id: null` DETACHES the listed MACs.
+  setDrops: (body: {
+    macs: string[]; passive_id: number | null; org_id?: string | null
+  }) => request<{ ok: boolean; attached?: number; detached?: number }>(
+    "/api/inventory/drops/set", { method: "POST", body }),
+
   ponFaults: (deviceId: number) =>
     request<{ faults: PonFault[] }>(`/api/pon/faults?device_id=${deviceId}`),
   orgPonFaults: (org?: string | null) =>
@@ -362,10 +444,54 @@ export const analyticsApi = {
       `/api/analytics?days=${days}${org ? `&org=${encodeURIComponent(org)}` : ""}`),
 }
 
+// The ISSUE plane: the same trouble the Home tiles count, listed one row per
+// problem instead of one row per device.
+export const issuesApi = {
+  list: (org: string | null | undefined, kinds: IssueKind[] = []) => {
+    const params = new URLSearchParams()
+    if (org) params.set("org", org)
+    if (kinds.length) params.set("kind", kinds.join(","))
+    return request<IssuesResponse>(`/api/issues?${params.toString()}`)
+  },
+  // Server-rendered PDF (central/pdf.py) or .xlsx (central/xlsx.py) — both pure
+  // stdlib, both filtered by the same `kinds`. Fetched rather than linked so a 401
+  // still runs through the unauthorized handling instead of navigating the tab to
+  // a JSON error, and so the caller can show a real toast.
+  download: async (format: "pdf" | "xlsx", org: string | null | undefined,
+                   kinds: IssueKind[] = []) => {
+    const params = new URLSearchParams()
+    if (org) params.set("org", org)
+    if (kinds.length) params.set("kind", kinds.join(","))
+    const res = await fetch(`/api/issues/${format}?${params.toString()}`)
+    if (res.status === 401) window.dispatchEvent(new CustomEvent("wisp:unauthorized"))
+    if (!res.ok) {
+      const data = res.headers.get("content-type")?.includes("json")
+        ? await res.json() : {}
+      throw new ApiError(data.error || `HTTP ${res.status}`, res.status, data)
+    }
+    const disp = res.headers.get("Content-Disposition") || ""
+    const named = /filename="([^"]+)"/.exec(disp)?.[1]
+    return { blob: await res.blob(), filename: named || `issues.${format}` }
+  },
+}
+
 export const outagesApi = {
   list: (org?: string | null) => request<{ outages: Outage[] }>(`/api/outages${tq(org)}`),
   acknowledge: (outage_id: number) =>
     request<{ ok: boolean }>("/api/outages/acknowledge", { method: "POST", body: { outage_id } }),
+  // Owner-only. Replaces the whole assignee set; the server refuses an empty
+  // list (there is no "assigned to nobody" state) and pages exactly the named
+  // accounts, reporting how many actually had a WhatsApp number.
+  assign: (outage_id: number, usernames: string[]) =>
+    request<{ ok: true; assigned_to: string[]; notified: number }>(
+      "/api/outages/assign", { method: "POST", body: { outage_id, usernames } }),
+  // The assignee answering yes. Any named account may call it (worker included);
+  // the server refuses anyone who isn't on the outage. Idempotent — `already`
+  // means this person had accepted before, which is not an error (the WhatsApp
+  // button and this one press the same thing).
+  accept: (outage_id: number) =>
+    request<{ ok: true; already: boolean; accepted_by: string[] }>(
+      "/api/outages/accept", { method: "POST", body: { outage_id } }),
   postmortem: (outage_id: number, root_cause: string, resolution_notes?: string) =>
     request<{ ok: boolean }>("/api/outages/postmortem",
       { method: "POST", body: { outage_id, root_cause, resolution_notes } }),

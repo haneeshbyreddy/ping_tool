@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api"
 import { SESSION_EXPIRED_KEY } from "@/lib/session"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
@@ -20,6 +21,7 @@ export function LoginPage() {
   const [error, setError] = useState("")
   const [submitting, setSubmitting] = useState(false)
   const [totpRequired, setTotpRequired] = useState(false)
+  const [remember, setRemember] = useState(false)
   const [code, setCode] = useState("")
   const [useRecovery, setUseRecovery] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
@@ -42,9 +44,10 @@ export function LoginPage() {
       const second = totpRequired
         ? (useRecovery ? { recovery: code.trim() } : { totp: code.trim() })
         : undefined
-      // No "remember this device": owners/superadmins are refused a long-lived
-      // session server-side regardless, and we can't tell the role pre-login.
-      await login(username, password, false, second)
+      // "Trust this device" is one checkbox; the server maps it per role once it
+      // knows who logged in — owner/superadmin get a 24h cap, a worker the 30-day
+      // tier. We can't tell the role pre-login, so we just forward the intent.
+      await login(username, password, remember, second)
       navigate(from || "/", { replace: true })
     } catch (err) {
       // A correct password on a 2FA account comes back as a 401 carrying
@@ -134,6 +137,14 @@ export function LoginPage() {
                     <p className="text-xs text-warning">Caps Lock is on.</p>
                   )}
                 </div>
+                <label className="flex items-center gap-2 text-sm text-muted-foreground select-none">
+                  <Checkbox
+                    checked={remember}
+                    onCheckedChange={(v) => setRemember(!!v)}
+                    disabled={submitting}
+                  />
+                  Trust this device (stay signed in longer)
+                </label>
               </>
             ) : (
               <div className="flex flex-col gap-1.5">

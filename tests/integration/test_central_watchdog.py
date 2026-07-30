@@ -24,6 +24,7 @@ class CentralWatchdogTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.cfg = Config(central_node_stale_s=180)
+        self._owned: set[str] = set()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -31,6 +32,13 @@ class CentralWatchdogTest(unittest.TestCase):
     def _seen(self, org_id, node, age_s, **org_kwargs):
         self.store.record_heartbeat(org_id, node, {"fleet_size": 1},
                                     now=_iso(NOW - timedelta(seconds=age_s)))
+        if org_id not in self._owned:
+            # WhatsApp-only: give the org a real owner number so a probe page has
+            # a recipient. The admin number no longer rides org alerts, so it
+            # can't be the audience here anymore.
+            uid = self.store.add_user(org_id, f"own-{org_id}", "h", "s", "owner")
+            self.store.set_user_whatsapp(uid, "919000000001")
+            self._owned.add(org_id)
         if org_kwargs:
             self.store.set_org(org_id, **org_kwargs)
 
@@ -86,14 +94,17 @@ class CentralWatchdogTest(unittest.TestCase):
         acted = wd.check(now=NOW)
         self.assertEqual(acted, [("ispA", "edge-1", "alarm")])
 
-    def test_routes_to_org_topic_else_fallback(self):
-        self._seen("ispA", "edge-1", age_s=600, ntfy_topic="ispA-ops")
-        self._seen("ispB", "edge-2", age_s=600)
+    def test_pages_org_numbers_but_not_the_admin(self):
+        # A stale probe pages the org's own audience (owner/worker numbers). The
+        # platform admin number is DELIBERATELY excluded from org alerts
+        # (2026-07-25) — the admin can't be buried under every org's probe churn.
+        self.store.set_setting("whatsapp_admin_number", "919999999999")
+        self._seen("ispA", "edge-1", age_s=600)   # auto-creates own-ispA @ ...0001
         notifier = RecordingNotifier()
         self._wd(notifier).check(now=NOW)
-        topics = {s["recipient"] for s in notifier.sent}
-        self.assertIn("ispA-ops", topics)
-        self.assertIn(self.cfg.central_ntfy_topic, topics)
+        self.assertEqual(len(notifier.sent), 1)
+        self.assertIn("919000000001", notifier.sent[0]["whatsapp"])
+        self.assertNotIn("919999999999", notifier.sent[0]["whatsapp"])
 
     def test_per_node_isolation(self):
         self._seen("ispA", "edge-1", age_s=600)

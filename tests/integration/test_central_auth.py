@@ -74,6 +74,24 @@ class CentralAuthUnitTest(unittest.TestCase):
         parts[1] = str(int(parts[1]) + 3600)   # push the absolute expiry out an hour
         self.assertIsNone(auth.verify_session(".".join(parts), cfg=self.cfg))
 
+    def test_trusted_admin_session_is_24h_and_has_no_idle_logout(self):
+        uid = auth.create_user(self.store, None, "root", "supersecret")
+        t0 = time.time()
+        tok = auth.issue_session(uid, self.cfg, trusted_admin=True, now=t0)
+        # Outlives the normal 12h absolute cap...
+        self.assertEqual(
+            auth.verify_session(tok, cfg=self.cfg, now=t0 + 13 * 3600), uid)
+        # ...but dies past its own (hours-long, NOT the 30-day worker) window.
+        cap = self.cfg.session_trusted_admin_hours * 3600
+        self.assertIsNone(
+            auth.verify_session(tok, cfg=self.cfg, now=t0 + cap + 5))
+        # Shorter than the worker "remember" tier.
+        self.assertLess(cap, self.cfg.session_remember_days * 86400)
+        # No idle logout for the window: it never slides and survives a long gap.
+        self.assertIsNone(auth.slide_session(tok, self.cfg, now=t0 + 10_000))
+        self.assertEqual(
+            auth.verify_session(tok, cfg=self.cfg, now=t0 + cap - 5), uid)
+
     def test_idle_session_expires_when_untouched(self):
         uid = auth.create_user(self.store, None, "root", "supersecret")
         t0 = time.time()
@@ -199,17 +217,27 @@ class CentralAuthHttpTest(unittest.TestCase):
         self.assertEqual(body["user"]["org_id"], "ispA")
         self.assertEqual(body["user"]["role"], "owner")
 
-    def test_remember_me_is_refused_for_owners_but_honored_for_workers(self):
-        # An owner's "remember" is ignored server-side — always the short,
-        # idle-capped session (the account that reconfigures the network).
+    def test_trust_this_device_maps_to_the_right_tier_per_role(self):
+        # "Trust this device" is one checkbox, three outcomes decided server-side.
+        # An owner is refused the worker 30-day tier but DOES get the shorter
+        # trusted-admin cap (24h) — no idle logout for the window.
+        admin = f"Max-Age={self.cfg.session_trusted_admin_hours * 3600}"
+        worker = f"Max-Age={self.cfg.session_remember_days * 86400}"
         _, _, setcookie = self._req("POST", "/api/login",
             {"username": "owner", "password": "ownerpassword", "remember": True})
-        self.assertIn(f"Max-Age={self.cfg.session_timeout_h * 3600}", setcookie)
-        # A worker's remember IS honored (long-lived) — the rule is role-scoped,
-        # not a blanket removal.
+        self.assertIn(admin, setcookie)
+        # A superadmin (org_id IS NULL) rides the same trusted-admin tier.
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "root", "password": "rootpassword", "remember": True})
+        self.assertIn(admin, setcookie)
+        # A worker's remember stays the long-lived 30-day tier — role-scoped.
         _, _, setcookie = self._req("POST", "/api/login",
             {"username": "wrk", "password": "workerpassword", "remember": True})
-        self.assertIn(f"Max-Age={self.cfg.session_remember_days * 86400}", setcookie)
+        self.assertIn(worker, setcookie)
+        # Without the box, everyone falls back to the short idle-capped session.
+        _, _, setcookie = self._req("POST", "/api/login",
+            {"username": "owner", "password": "ownerpassword"})
+        self.assertIn(f"Max-Age={self.cfg.session_timeout_h * 3600}", setcookie)
 
     def test_password_change_invalidates_the_old_cookie(self):
         _, a = self._login("owner", "ownerpassword")
@@ -546,25 +574,20 @@ class CentralAuthHttpTest(unittest.TestCase):
 
     def test_test_alert_sends_via_injected_notifier(self):
         _, own = self._login("owner", "ownerpassword")
-        self._req("POST", "/api/org", {"ntfy_topic_owner": "a-owner-topic"}, cookie=own)
-        status, body, _ = self._req("POST", "/api/test-alert", {"role": "owner"}, cookie=own)
+        # WhatsApp is the only channel now: the test pages the org audience, so
+        # give the owner account a number.
+        me_id = self.store.get_user_by_username("owner")["id"]
+        self.store.set_user_whatsapp(me_id, "919000000001")
+        status, body, _ = self._req("POST", "/api/test-alert", {}, cookie=own)
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(len(self.notifier.sent), 1)
-        self.assertEqual(self.notifier.sent[0]["recipient"], "a-owner-topic")
+        self.assertEqual(self.notifier.sent[0]["whatsapp"], ["919000000001"])
 
-    def test_test_alert_requires_configured_topic(self):
+    def test_test_alert_requires_a_whatsapp_recipient(self):
+        # no numbers on any account (and no admin number) ⇒ nothing to page ⇒ 422
         _, own = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/test-alert", {"role": "worker"}, cookie=own)
-        self.assertEqual(status, 422)
-        self.assertEqual(len(self.notifier.sent), 0)
-
-    def test_test_alert_rejects_a_removed_role(self):
-        # 'operator'/'tech' were removed 2026-07-21; the column may still exist
-        # in an upgraded DB, so the route must refuse the role by NAME rather
-        # than quietly resolving a dead topic.
-        _, own = self._login("owner", "ownerpassword")
-        status, body, _ = self._req("POST", "/api/test-alert", {"role": "operator"}, cookie=own)
+        status, body, _ = self._req("POST", "/api/test-alert", {}, cookie=own)
         self.assertEqual(status, 422)
         self.assertEqual(len(self.notifier.sent), 0)
 

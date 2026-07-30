@@ -19,6 +19,27 @@ export const BASEMAP_KEY = "wisp:map:basemap"
 export const BASEMAP_LABEL: Record<Basemap, string> = { google: "Google", gsat: "Google Satellite" }
 export const GOOGLE_BASEMAPS: Record<Basemap, GoogleMapType> = { google: "roadmap", gsat: "satellite" }
 
+/** Drops Leaflet's own "Leaflet" courtesy link from the attribution box, leaving
+ *  only the DATA attribution.
+ *
+ *  The distinction is the point: Google's line is REQUIRED by the Map Tiles API
+ *  terms (and CARTO/OSM's by theirs), so it stays on every map. Leaflet's prefix
+ *  is a courtesy to the renderer, not a licence condition — BSD-2-Clause asks for
+ *  the notice in the distributed source, which the bundle keeps, not on screen.
+ *  Naming the renderer beside "Map data ©Google" also just reads as confusion
+ *  about who supplies what.
+ *
+ *  A `useMap()` child rather than a MapContainer prop because react-leaflet
+ *  exposes no prefix option — and it must not run when `attributionControl` is
+ *  false, which is why every map here keeps the control ON. */
+export function AttributionPrefix() {
+  const map = useMap()
+  useEffect(() => {
+    map.attributionControl?.setPrefix(false)
+  }, [map])
+  return null
+}
+
 const CARTO_ATTR =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
 
@@ -97,15 +118,19 @@ function GoogleAttribution({ session, apiKey }: { session: string; apiKey: strin
 // ladder: an expired/revoked session shows up as a burst of tile errors →
 // recreate the session once; if createSession fails or the fresh session still
 // can't load tiles (bad key, quota out), onFail drops the map back to Streets.
-// `dark` requests the styled (night) roadmap. Satellite ignores it — the Tile
-// API only styles roadmap — so a dark satellite session is simply the normal one.
-export function GoogleLayer({ apiKey, mapType, dark = false, onFail }: {
+// `dark` requests the styled (night) roadmap and `labels={false}` the one with
+// Google's own place names and POI markers stripped. Satellite ignores both —
+// the Tile API only styles roadmap — so a satellite session is simply the normal
+// one, and it carries no labels to begin with.
+export function GoogleLayer({ apiKey, mapType, dark = false, labels = true, onFail }: {
   apiKey: string
   mapType: GoogleMapType
   dark?: boolean
+  labels?: boolean
   onFail: (why: string) => void
 }) {
-  const [session, setSession] = useState<string | null>(() => loadGoogleSession(mapType, dark))
+  const [session, setSession] = useState<string | null>(
+    () => loadGoogleSession(mapType, dark, labels))
   const [gen, setGen] = useState(0) // bump = force a fresh createSession
   const recreated = useRef(false)
   const errTimes = useRef<number[]>([])
@@ -113,15 +138,15 @@ export function GoogleLayer({ apiKey, mapType, dark = false, onFail }: {
 
   useEffect(() => {
     let alive = true
-    // A theme flip needs a DIFFERENT token, so drop the stale one first —
-    // otherwise the old session's tiles keep painting until it resolves.
-    setSession(loadGoogleSession(mapType, dark))
-    createGoogleSession(apiKey, mapType, dark).then(
+    // A theme (or label) flip needs a DIFFERENT token, so drop the stale one
+    // first — otherwise the old session's tiles keep painting until it resolves.
+    setSession(loadGoogleSession(mapType, dark, labels))
+    createGoogleSession(apiKey, mapType, dark, labels).then(
       (s) => { if (alive) setSession(s) },
       (e) => { if (alive) onFail(e instanceof Error ? e.message : "session request failed") },
     )
     return () => { alive = false }
-  }, [apiKey, mapType, dark, gen, onFail])
+  }, [apiKey, mapType, dark, labels, gen, onFail])
 
   // A stray single 404 (deep-zoom satellite gap, flaky link) must not nuke the
   // basemap: act only on a burst — 3 failed tiles inside 5s — and only once per
@@ -135,13 +160,13 @@ export function GoogleLayer({ apiKey, mapType, dark = false, onFail }: {
     handledSession.current = session
     if (!recreated.current) {
       recreated.current = true
-      clearGoogleSession(mapType, dark)
+      clearGoogleSession(mapType, dark, labels)
       setSession(null)
       setGen((g) => g + 1)
     } else {
       onFail("tiles failed to load")
     }
-  }, [session, mapType, dark, onFail])
+  }, [session, mapType, dark, labels, onFail])
 
   if (!session) return <StreetsTiles dark={dark} />
   return (

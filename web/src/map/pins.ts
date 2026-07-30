@@ -43,7 +43,16 @@ export function opticRing(d: OrgDevice): "crit" | "warn" | null {
   return null
 }
 
-export function pinIcon(d: OrgDevice, o: { selected: boolean; dim: boolean; impact: boolean }): L.DivIcon {
+export function pinIcon(d: OrgDevice, o: {
+  selected: boolean; dim: boolean; impact: boolean
+  /** Passive plant only: the "1:8 · 6" line under the name, and the tone its
+   *  RECORDED subscribers earn it. Passed in as plain values rather than read
+   *  from a rollup here so this module keeps knowing nothing about drops (and
+   *  so pins.ts and map/drops.ts don't import each other). */
+  sub?: string | null
+  dropTone?: "dark" | "weak" | "quiet"
+  title?: string
+}): L.DivIcon {
   const tone = pinTone(d)
   // first token only ("43m", not "43m 12s") so the hover title churns per minute
   const downFor = isDownState(d) && d.outage_started_at
@@ -57,12 +66,18 @@ export function pinIcon(d: OrgDevice, o: { selected: boolean; dim: boolean; impa
   if (o.impact) cls.push("wisp-pin--impact")
   if (d.maintenance) cls.push("wisp-pin--maint")
   if (optic) cls.push(`wisp-pin--optic-${optic}`)
+  // A passive has no state of its own — nothing pings a splitter. What it can
+  // report is what hangs below it, and only when that is worth interrupting for:
+  // plant stays quiet by default so it never competes with gear.
+  if (o.dropTone && o.dropTone !== "quiet") cls.push(`wisp-pin--drops-${o.dropTone}`)
   const weak = (d.onus_crit ?? 0) + (d.onus_warn ?? 0)
-  const title = esc(downFor ? `${d.name} · down for ${downFor}`
+  const title = esc(o.title ?? (downFor ? `${d.name} · down for ${downFor}`
     : d.maintenance ? `${d.name} · maintenance`
-    : optic ? `${d.name} · ${weak} ONU${weak === 1 ? "" : "s"} weak signal` : d.name)
+    : optic ? `${d.name} · ${weak} ONU${weak === 1 ? "" : "s"} weak signal` : d.name))
+  const sub = o.sub
+    ? `<span class="wisp-pin__sub">${esc(o.sub)}</span>` : ""
   return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}">
-      <span class="wisp-pin__dot"></span><span class="wisp-pin__label">${esc(d.name)}</span>
+      <span class="wisp-pin__dot"></span><span class="wisp-pin__label">${esc(d.name)}${sub}</span>
     </div>`)
 }
 

@@ -7,9 +7,11 @@ import { ChevronRight, Plus, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { analyticsApi, inventoryApi } from "@/lib/api"
 import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
+import { AssignmentPanel } from "@/components/device-assignees"
 import { Meter } from "@/components/meter"
 import { OpticalPanel } from "@/components/optical-panel"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
+import { DistributionPanel } from "@/components/splitter-panel"
 import {
   WebUiButton, WebUiCredentialsButton, canOpenWebUi, useCanManageCreds, useWebProxy,
 } from "@/components/web-proxy"
@@ -143,7 +145,14 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   const isDown = isDownState(device.state)
 
   return (
-    <div className="overflow-hidden rounded-lg border bg-muted/40">
+    // @container, not viewport breakpoints: this table renders inside a ~380–420px
+    // side panel on a wide screen, where every `sm:` guard passes and the row
+    // overflows its own panel (the documented trap — see CLAUDE.md "Viewport
+    // breakpoints are wrong inside the device panel"). The rate column is what
+    // gives way when it's tight: the toggle is the row's action and the limits
+    // button is how you reach the form, while the same throughput is already on
+    // the tree row's bandwidth chip and in this panel's own header counts.
+    <div className="@container overflow-hidden rounded-lg border bg-muted/40">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-2xs text-muted-foreground">
         <span className="font-medium">{ports.length} ports · {watched} watched</span>
         {!isDown && down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
@@ -154,7 +163,7 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
           : portsStale
           ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing. These rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
           : lastWalk && <span className="text-faint-foreground">as of {ago(lastWalk)}</span>}
-        {!isDown && <span className="ml-auto hidden sm:inline">watch a port to alarm on it</span>}
+        {!isDown && <span className="ml-auto hidden @[30rem]:inline">watch a port to alarm on it</span>}
       </div>
       {sorted.map((p) => {
         const limits = [
@@ -174,12 +183,12 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
               {!!p.monitored && p.alarm === 1 && <RowTag tone="destructive">down</RowTag>}
               {p.bw_alarm === 1 && <RowTag tone="warning">low bw</RowTag>}
               {p.bw_high_alarm === 1 && <RowTag tone="warning">high bw</RowTag>}
-              <span className="ml-auto hidden shrink-0 font-mono text-xs text-muted-foreground sm:inline">
+              <span className="ml-auto hidden shrink-0 font-mono text-xs text-muted-foreground @[30rem]:inline">
                 ↓{fmtRate(p.in_bps)}&ensp;↑{fmtRate(p.out_bps)}
               </span>
               {!!p.monitored && (
                 <button
-                  className={cn("hidden shrink-0 rounded px-1.5 py-0.5 font-mono text-2xs sm:inline",
+                  className={cn("shrink-0 rounded px-1.5 py-0.5 font-mono text-2xs",
                     limits ? "text-muted-foreground hover:bg-accent" : "text-faint-foreground hover:bg-accent")}
                   title="Bandwidth limits (Mbps)"
                   onClick={() => setConfigOpen(configOpen === p.id ? null : p.id)}>
@@ -203,7 +212,10 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
 }
 
 export function DeviceMetrics({ device }: { device: OrgDevice }) {
-
+  // Passive plant is never probed BY DESIGN, so "not monitored" reads as a
+  // config gap that isn't one. The row already carries a `passive` chip and the
+  // panel names the type — there is no reading to stand in for.
+  if (isPassiveType(device.device_type)) return null
   if (!device.assigned_node_id) return <span className="text-xs text-faint-foreground">not monitored</span>
   if (!device.state) return <span className="text-xs text-faint-foreground">no data</span>
   if (isStale(device.state_updated_at)) {
@@ -777,6 +789,57 @@ export function RowTag({ tone, children, onClick, title, color }: {
   )
 }
 
+// Identity block for a device side panel — dot, name, address line, live
+// metrics. Shared by the Map's pin panel and the Network page's drill-in panel
+// for the same reason DeviceDetail itself is: two panels naming the same device
+// two different ways is how the surfaces drift. `tone` is a prop because the map
+// mutes a pin under maintenance (pinTone) while the tree shows the real state;
+// `children` are the surface's own header buttons (close, unpin, show-in-tree).
+export function DevicePanelHeader({
+  device, tone, downstream = 0, downstreamDown = 0, children,
+}: {
+  device: OrgDevice
+  tone: "success" | "warning" | "destructive" | "muted"
+  /** devices fed by this one — the map counts them, the tree already shows them */
+  downstream?: number
+  downstreamDown?: number
+  children?: ReactNode
+}) {
+  return (
+    <div className="flex items-start gap-2.5 border-b px-4 py-3">
+      <span className="mt-1"><StatusDot tone={tone} /></span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <p className="min-w-0 truncate font-mono text-sm font-semibold">{device.name}</p>
+          {!!device.maintenance && <RowTag tone="muted">maint</RowTag>}
+        </div>
+        <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+          {device.ip_address && <span className="font-mono">{device.ip_address}</span>}
+          {device.device_type && <span>{device.device_type}</span>}
+          {device.region && <span>{device.region}</span>}
+        </p>
+        <div className="mt-1 flex flex-wrap items-baseline gap-x-2">
+          <DeviceMetrics device={device} />
+          {isDownState(device.state) && device.outage_started_at && (
+            <span className="text-xs font-semibold text-destructive">
+              for {durationSince(device.outage_started_at)}
+            </span>
+          )}
+        </div>
+        {downstream > 0 && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Feeds <span className="font-semibold text-foreground">{downstream}</span> downstream
+            {downstreamDown > 0 && (
+              <span className="font-semibold text-destructive"> · {downstreamDown} down</span>
+            )}
+          </p>
+        )}
+      </div>
+      {children && <div className="flex shrink-0 items-center gap-0.5">{children}</div>}
+    </div>
+  )
+}
+
 export type DeviceTab = "health" | "optical" | "ports"
 export function isOpticalOlt(device: OrgDevice): boolean {
   return (device.device_type ?? "").toUpperCase() === "OLT" && device.snmp_enabled === 1
@@ -793,14 +856,26 @@ export function deviceTabs(device: OrgDevice): DeviceTab[] {
 }
 const TAB_LABEL: Record<DeviceTab, string> = { health: "Health", optical: "Optical", ports: "Ports" }
 
-export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
+export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
   device: OrgDevice; tab: DeviceTab; onTab: (t: DeviceTab) => void
   /** ONU row to reveal in the Optical tab — set when a map PON spoke is clicked */
   focusOnuId?: number | null
+  /** the same, by MAC — how a placed reference ONU is keyed (see OpticalPanel) */
+  focusOnuMac?: string | null
 }) {
   const tabs = deviceTabs(device)
   const webUi = useWebProxy() && canOpenWebUi(device)
   const manageCreds = useCanManageCreds() && canOpenWebUi(device)
+  // Passive plant gets a panel of its own rather than the monitoring one with
+  // every reading blank. A splitter is never probed, has no ports, no vitals, no
+  // uptime and no outage, and it can't page anybody — so latency, the 24 h strip,
+  // the reliability line and the paging roster aren't "no data yet", they're
+  // questions this box will never have an answer to, and rendering them empty is
+  // the same lie as a green badge on an OLT that measures nothing. What it
+  // carries and what feeds it IS the panel.
+  if (isPassiveType(device.device_type)) {
+    return <DistributionPanel device={device} />
+  }
   if (tabs.length === 1) {
     return (
       <>
@@ -814,6 +889,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
           <ConnectionPanel device={device} />
+          <AssignmentPanel device={device} />
         </div>
       </>
     )
@@ -838,10 +914,13 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId }: {
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
           <ConnectionPanel device={device} />
+          <AssignmentPanel device={device} />
         </div>
       </TabsContent>
       {tabs.includes("optical") && (
-        <TabsContent value="optical"><OpticalPanel device={device} focusOnuId={focusOnuId} /></TabsContent>
+        <TabsContent value="optical">
+          <OpticalPanel device={device} focusOnuId={focusOnuId} focusOnuMac={focusOnuMac} />
+        </TabsContent>
       )}
       {tabs.includes("ports") && (
         <TabsContent value="ports"><PortsPanel device={device} /></TabsContent>

@@ -10,6 +10,7 @@ import re
 import shutil
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,7 @@ from wisp.central.auth import LoginThrottle
 from wisp.central.engine import EngineRegistry
 from wisp.central.proxy import ProxyHub
 from wisp.central.store import CentralStore
+from wisp.central.whatsapp_bot import WhatsAppBot
 from wisp.egress.notifiers import build_notifier
 from wisp.runtime.central_client import WIRE_V
 
@@ -74,18 +76,43 @@ _WORKER_GET = {
     "/api/orgs", "/api/nodes", "/api/regions",
     "/api/inventory", "/api/inventory/routes", "/api/inventory/ports",
     "/api/inventory/link-ports", "/api/inventory/optics",
-    "/api/inventory/onu-search", "/api/inventory/snmp-status",
+    "/api/inventory/onu-search", "/api/inventory/onu-places",
+    "/api/inventory/onu-coverage", "/api/inventory/snmp-status",
     "/api/inventory/rx-status", "/api/inventory/perf",
     "/api/inventory/perf/samples", "/api/pon/faults", "/api/pon/summary",
     "/api/incident/shape", "/api/analytics", "/api/analytics/trend",
     "/api/logs",
+    # The issue plane. A worker gets the full shell and the sidebar already
+    # offers Issues on mobile — "the one screen worth carrying to a site visit"
+    # — so leaving it off this list rendered a nav entry that 403'd. Read-side
+    # only: `collect` composes the same store reads the tiles use and writes
+    # nothing. The PDF/XLSX exports are the same rows, filtered by the same
+    # chips, and a field worker filing what it drove out to fix is the point.
+    "/api/issues", "/api/issues/pdf", "/api/issues/xlsx",
 }
-# The ONLY writes a worker may perform: acknowledge/post-mortem (triage), its own
-# password, and the "I've paid" ping (any org member sends it from the lock
-# screen). Every config/topology/credential/proxy/billing-plan write stays owner+.
+# The ONLY writes a worker may perform: acknowledge/accept/post-mortem (triage),
+# its own password, and the "I've paid" ping (any org member sends it from the
+# lock screen). Every config/topology/credential/proxy/billing-plan write stays
+# owner+. Accepting is a worker's answer to an assignment the owner made — a
+# worker that could not accept could never move a job it was given off "down".
 _WORKER_POST = {
-    "/api/outages/acknowledge", "/api/outages/postmortem",
+    "/api/outages/acknowledge", "/api/outages/accept", "/api/outages/postmortem",
     "/api/users/password", "/api/users/whatsapp", "/api/billing/paid",
+    # Field survey. The ONLY inventory writes a worker may make, and they are on
+    # this list rather than folded into /api/inventory/location because they are
+    # different OPERATIONS: `field-location` cannot clear a pin, `field-passive`
+    # cannot set a parent, an IP, or a probe. What makes handing these to the
+    # field acceptable is that neither can reach the engine — a passive is
+    # excluded from org_device_topology, so it joins no FSM, changes no rebuild
+    # fingerprint, and cannot re-page a fleet — and a coordinate has never been
+    # read by anything but the map. The person standing at the pole is the one
+    # who knows where it is; every consequential field about it stays owner-only.
+    "/api/inventory/field-location", "/api/inventory/field-passive",
+    # Locating a subscriber's ONU. Safe to hand to the field only because it
+    # CANNOT set the witness flag: placing a REFERENCE ONU is the operator's
+    # claim about a power supply and flips PON mass-drop verdicts, so it stays
+    # owner-only on /api/inventory/onu-place. See devices.field_onu.
+    "/api/inventory/field-onu", "/api/inventory/field-onu-name",
 }
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
@@ -228,6 +255,123 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return json.loads(self.rfile.read(length))
             except Exception:
                 return None
+
+        def _read_raw(self) -> bytes:
+            # HMAC must run over the EXACT bytes Meta signed — never a re-serialised
+            # json.loads round-trip, which would drop key order / whitespace and
+            # fail every signature. So the webhook reads raw, then parses.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                return b""
+            if length <= 0 or length > _MAX_BODY:
+                return b""
+            return self.rfile.read(length)
+
+        def _send_binary(self, code: int, ctype: str, body: bytes, *,
+                         filename: str | None = None) -> None:
+            # A generated file (today: the issues PDF) — central's OWN bytes, so
+            # unlike _raw_reply it keeps the security headers, and no-store for the
+            # same reason every JSON reply has it: the content is a snapshot of
+            # right now and a cached copy would be a stale report wearing today's
+            # filename. Callers sanitise `filename` — it lands in a header.
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if filename:
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{filename}"')
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, code: int, text: str) -> None:
+            body = text.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        # ----- WhatsApp inbound webhook (public transport special-case, like edge
+        # ingest — NOT a cookie-authed /api route). Meta authenticates by the
+        # verify-token handshake (GET) and the HMAC signature (POST), never a
+        # session. See CLAUDE.md's WhatsApp section.
+        def _whatsapp_verify(self, qs) -> None:
+            """GET handshake: echo hub.challenge as PLAIN TEXT iff hub.verify_token
+            matches the stored whatsapp_verify_token, else 403. Carries no org
+            data — it only proves we own the endpoint."""
+            want = (store.whatsapp_settings().get("verify_token")
+                    or cfg.whatsapp_verify_token or "").strip()
+            mode = (qs.get("hub.mode") or [""])[0]
+            got = (qs.get("hub.verify_token") or [""])[0]
+            challenge = (qs.get("hub.challenge") or [""])[0]
+            if mode == "subscribe" and want and hmac.compare_digest(got, want):
+                self._send_text(200, challenge)
+            else:
+                log.warning("whatsapp webhook verify rejected (mode=%r token_set=%s)",
+                            mode, bool(want))
+                self._send_text(403, "verification failed")
+
+        def _whatsapp_sig_ok(self, raw: bytes) -> bool:
+            """X-Hub-Signature-256 == 'sha256=' + HMAC-SHA256(app_secret, raw).
+            An unset app_secret SKIPS the check (matches the open-ingest
+            convention) but warns loudly — set it before production."""
+            secret = (store.whatsapp_settings().get("app_secret")
+                      or cfg.whatsapp_app_secret or "").strip()
+            if not secret:
+                log.warning("whatsapp webhook: no app_secret set — signature UNVERIFIED")
+                return True
+            sent = self.headers.get("X-Hub-Signature-256", "")
+            if not sent.startswith("sha256="):
+                return False
+            mac = hmac.new(secret.encode(), raw, "sha256").hexdigest()
+            return hmac.compare_digest(sent[len("sha256="):], mac)
+
+        def _whatsapp_inbound(self) -> None:
+            """POST notification: verify the signature over the RAW body, ACK 200
+            IMMEDIATELY (Meta retries on a slow/failed ack → duplicate messages),
+            then hand the parsed payload to the bot dispatcher."""
+            raw = self._read_raw()
+            if not self._whatsapp_sig_ok(raw):
+                self._send_text(403, "bad signature")
+                return
+            self._reply(200, {"ok": True})   # ack FIRST; do the work after
+            try:
+                payload = json.loads(raw or b"{}")
+            except Exception:
+                log.warning("whatsapp webhook: body is not JSON (%d bytes)", len(raw or b""))
+                return
+            # Log the SHAPE of every delivery (never the message text). Without
+            # this, "the bot didn't answer" is indistinguishable from "Meta never
+            # delivered" — the bot's own replies log nothing on the happy path,
+            # and the status callbacks are skipped silently by design.
+            try:
+                msgs = statuses = 0
+                fields = []
+                for e in (payload.get("entry") or []):
+                    for ch in (e.get("changes") or []):
+                        fields.append(ch.get("field"))
+                        v = ch.get("value") or {}
+                        msgs += len(v.get("messages") or [])
+                        statuses += len(v.get("statuses") or [])
+                log.info("whatsapp webhook POST: fields=%s messages=%d statuses=%d",
+                         ",".join(f or "?" for f in fields) or "-", msgs, statuses)
+            except Exception:       # observability must never break the ack path
+                pass
+            # The lookup + reply (and any owner refresh) run OFF this worker
+            # thread: a send is up to notify_retries × 10s and a refresh spawns
+            # its own scrape thread, and Meta has already been acked. The bot is
+            # constructed per delivery; base_url comes from the request Host so
+            # the [On map] dashboard link points back at whatever domain served
+            # this (no separate public-URL config to drift).
+            base = f"https://{self.headers.get('Host', '')}".rstrip("/")
+            bot = WhatsAppBot(store, self.notifier,
+                              getattr(self, "weboptics", None), base_url=base)
+            threading.Thread(target=bot.handle, args=(payload,),
+                             name="wisp-wa-bot", daemon=True).start()
 
         def _presented_bearer(self) -> str:
             got = self.headers.get("Authorization", "")
@@ -529,6 +673,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_GET(self):
             parsed = urlparse(self.path)
             route, qs = parsed.path, parse_qs(parsed.query)
+            if route == "/whatsapp/webhook":
+                self._whatsapp_verify(qs)
+                return
             if route == "/edge/proxy/next":
                 api.proxy.edge_next(self, qs)
                 return
@@ -554,6 +701,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
         def do_POST(self):
             parsed = urlparse(self.path)
             route = parsed.path
+            if route == "/whatsapp/webhook":
+                self._whatsapp_inbound()
+                return
             if route.startswith("/api/proxy/") and route not in _PROXY_EXACT:
                 self._proxy_forward("POST", route, parsed.query)
                 return
@@ -662,20 +812,25 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             throttle.reset(ip)
             throttle.reset(ukey)
             remember = bool(body.get("remember"))
-            # Owners and superadmins NEVER get a long-lived "trusted device"
-            # session — that account reconfigures the whole network, so it
-            # re-authenticates on the normal cadence no matter what the client
-            # asked for (the web form no longer even offers the box, but a
-            # crafted request or another client must not bypass this).
+            # "Trust this device" is ONE checkbox but two tiers, because we can't
+            # know the role before login. Owners and superadmins NEVER get the
+            # worker 30-day "remember" session — that account reconfigures the
+            # whole network — but the box DOES extend their own box to the shorter
+            # trusted-admin cap (24h, still no idle logout for the window). Enforced
+            # server-side so a crafted request can't cross the tiers.
             # org_id IS NULL == superadmin.
+            trusted_admin = False
             if user["org_id"] is None or user["role"] == "owner":
+                trusted_admin = remember
                 remember = False
             # Bump the session generation so THIS login supersedes any other live
             # session for the account (single active session).
             epoch = store.bump_session_epoch(user["id"])
-            tok = auth.issue_session(user["id"], cfg, remember=remember, epoch=epoch)
+            tok = auth.issue_session(user["id"], cfg, remember=remember,
+                                     trusted_admin=trusted_admin, epoch=epoch)
             cookie = auth.session_cookie(
-                tok, max_age=auth.session_cookie_max_age(cfg, remember=remember),
+                tok, max_age=auth.session_cookie_max_age(
+                    cfg, remember=remember, trusted_admin=trusted_admin),
                 secure=cfg.session_cookie_secure)
             self._reply(200, {"user": public_user(user, store)}, cookie=cookie)
 
@@ -706,7 +861,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.notifier = notifier
     Handler.registry = registry
     Handler.secretbox = secret_box
-    Handler.proxy = ProxyHub()
+    Handler.proxy = ProxyHub(device_max_inflight=cfg.proxy_device_max_inflight)
     # The web-optics sweeper is a request service too now: the Optical panel's
     # manual refresh drives the very same object the background sweep does, so
     # its per-OLT lock covers both and a click can't collide with a pass.

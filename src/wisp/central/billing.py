@@ -29,7 +29,7 @@ import time as _time
 from datetime import date, datetime, timezone
 
 from wisp.config import CONFIG, Config
-from wisp.egress.notifiers import build_notifier
+from wisp.egress.notifiers import WhatsAppFacts, build_notifier
 
 log = logging.getLogger("wisp.central.billing")
 
@@ -196,14 +196,18 @@ class BillingSweeper:
             title = f"🔒 {name}: unlock your dashboard"
             body = f"Renew {month_label(month)} and you're back in. {how}"
             priority = 5
-        topic = org.get("ntfy_topic_owner") or org.get("ntfy_topic")
-        whatsapp = self.store.org_role_whatsapp(org["org_id"], "owner")
+        numbers = list(self.store.org_alert_recipients(org["org_id"]))
         status = "skipped"
-        if topic:
+        if numbers:
             ok = False
             try:
-                ok = self.notifier.send(topic, title, body, priority,
-                                        whatsapp=whatsapp).ok
+                ok = self.notifier.send(
+                    title, body, priority, whatsapp=numbers,
+                    facts=WhatsAppFacts(
+                        subject=name,
+                        status="RENEWAL DUE" if kind == "due_soon" else "LOCKED",
+                        detail=body,
+                        timestamp=now.isoformat(timespec="seconds"))).ok
             except Exception:
                 log.exception("billing page failed for %s", org["org_id"])
             status = "sent" if ok else "failed"

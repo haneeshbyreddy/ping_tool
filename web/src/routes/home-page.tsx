@@ -1,11 +1,11 @@
 import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
-import { ChevronDown, ChevronUp, TriangleAlert } from "lucide-react"
+import { ChevronDown, ChevronUp, ListTree, TriangleAlert } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
 import { summaryApi, inventoryApi, outagesApi, nodesApi, logsApi, analyticsApi } from "@/lib/api"
-import type { OrgDevice } from "@/lib/types"
+import type { IssueKind, OrgDevice } from "@/lib/types"
 import { NeedsOrg } from "@/components/needs-org"
 import { OutageCard } from "@/components/outage-card"
 import { ClearPostmortems } from "@/components/clear-postmortems"
@@ -15,6 +15,7 @@ import { describeEvent, eventTone } from "@/lib/events"
 import { ago, deviceTone, isStale } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
 function severityRank(d: OrgDevice): number {
@@ -93,6 +94,12 @@ type Stat = {
    *  landing on the full unfiltered tree. Absent for a healthy metric, where
    *  there's nothing to filter to. */
   filter?: { label: string; ids: number[] }
+  /** The issue kind this tile counts. The tile body drills into the DEVICES
+   *  behind the number; the corner action drills into the PROBLEMS themselves —
+   *  one row per port/ONU/PON/probe on the Issues page. Both are offered because
+   *  they answer different questions ("which boxes" vs "what is wrong"), and a
+   *  switch with four dark ports is one row in the tree and four in the list. */
+  issueKind?: IssueKind
 }
 
 // undefined (no filter) when there's nothing to show — a healthy metric's
@@ -107,7 +114,7 @@ function filterFor(label: string, ids: number[]): Stat["filter"] {
 function StatTile({ s }: { s: Stat }) {
   const body = (
     <>
-      <p className="wisp-eyebrow truncate">{s.label}</p>
+      <p className="wisp-eyebrow truncate pr-7">{s.label}</p>
       {s.loading ? <Skeleton className="mt-3.5 h-7 w-14" /> : (
         <p className={cn(
           "mt-3.5 font-mono text-3xl leading-none font-medium tracking-tight",
@@ -127,9 +134,32 @@ function StatTile({ s }: { s: Stat }) {
     s.to && "hover:bg-foreground/[0.03]",
   )
   const state = s.filter ? { statusFilter: s.filter } : undefined
-  return s.to
-    ? <Link to={s.to} state={state} className={cn(shell, "block")}>{body}</Link>
-    : <div className={shell}>{body}</div>
+  // The list action only appears when there is something to list — `filter` is
+  // already the "this tile names actual trouble" signal, so a healthy tile stays
+  // a plain number with nothing to click twice.
+  const listable = s.issueKind && s.filter
+  if (!s.to) return <div className={shell}>{body}</div>
+  return (
+    // The whole tile stays one click target via a STRETCHED link rather than an
+    // <a> wrapping everything: a second interactive control nested inside an
+    // anchor is invalid, and the corner action has to sit above it.
+    <div className={cn(shell, "relative")}>
+      <Link to={s.to} state={state} aria-label={`${s.label} — filter the network`}
+        className="absolute inset-0 z-0 rounded-[inherit]" />
+      {body}
+      {listable && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Link to={`/issues?kind=${s.issueKind}`}
+              className="absolute top-3 right-3 z-10 flex size-6 items-center justify-center rounded-md border border-border bg-card text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground">
+              <ListTree className="size-3.5" />
+            </Link>
+          </TooltipTrigger>
+          <TooltipContent>List these issues</TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  )
 }
 
 export function HomePage() {
@@ -270,6 +300,7 @@ export function HomePage() {
       tone: online < monitored.length ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Not up", notUpDevices.map((d) => d.id)),
+      issueKind: "device_down",
     },
     {
       key: "ports",
@@ -280,6 +311,7 @@ export function HomePage() {
       tone: portsDown > 0 ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Ports down", portsDownIds),
+      issueKind: "port_down",
     },
     {
       key: "probes",
@@ -290,6 +322,7 @@ export function HomePage() {
       tone: staleNodes.length > 0 ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Behind a stale probe", staleProbeDeviceIds),
+      issueKind: "probe_stale",
     },
     {
       key: "bw",
@@ -300,6 +333,7 @@ export function HomePage() {
       tone: bwAlarms > 0 ? "warning" : undefined,
       to: "/topology",
       filter: filterFor("Bandwidth alarm", bwAlarmIds),
+      issueKind: "bandwidth",
     },
   ]
 
@@ -346,6 +380,7 @@ export function HomePage() {
       tone: !noRx && (pon?.onus_crit ?? 0) > 0 ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Critical ONUs", onusCritIds),
+      issueKind: "onu_crit",
     },
     {
       key: "onus-warn",
@@ -357,6 +392,7 @@ export function HomePage() {
       tone: !noRx && (pon?.onus_warn ?? 0) > 0 ? "warning" : undefined,
       to: "/topology",
       filter: filterFor("Warning ONUs", onusWarnIds),
+      issueKind: "onu_warn",
     },
     {
       key: "dup-macs",
@@ -368,6 +404,7 @@ export function HomePage() {
       tone: (pon?.dup_macs_live ?? 0) > 0 ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Duplicate MACs", dupMacIds),
+      issueKind: "dup_mac",
     },
     {
       key: "fiber",
@@ -378,6 +415,7 @@ export function HomePage() {
       tone: (pon?.fiber_cuts ?? 0) > 0 ? "destructive" : undefined,
       to: "/topology",
       filter: filterFor("Fiber cuts", fiberCutIds),
+      issueKind: "pon_fiber",
     },
     {
       key: "pon-cap",
@@ -390,6 +428,7 @@ export function HomePage() {
       tone: (pon?.pons_over_cap ?? 0) > 0 ? "warning" : undefined,
       to: "/topology",
       filter: filterFor("PON at capacity", pon?.over_cap_device_ids ?? []),
+      issueKind: "pon_capacity",
     },
     {
       key: "onus",
@@ -399,6 +438,7 @@ export function HomePage() {
       detail: (pon?.onus_offline ?? 0) > 0 ? `${pon!.onus_offline} offline` : "all up",
       to: "/topology",
       filter: filterFor("ONUs offline", onusOfflineIds),
+      issueKind: "onu_offline",
     },
   ]
 

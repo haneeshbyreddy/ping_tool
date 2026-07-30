@@ -440,7 +440,7 @@ function ProbeRow({
 }
 
 export function ProbesPanel({
-  org, canWrite, deviceCounts, probeFilter, onProbeFilter, view = "list", showHeading = true,
+  org, canWrite, deviceCounts, probeFilter, onProbeFilter, view = "list",
 }: {
   org: string
   canWrite: boolean
@@ -448,10 +448,6 @@ export function ProbesPanel({
   probeFilter?: string | null
   onProbeFilter?: (nodeId: string | null) => void
   view?: "list" | "grid"
-  // When this panel IS the page (routes/probes-page.tsx), the page already
-  // titles itself "Probes" — drop the internal h2 so the heading isn't doubled,
-  // keeping only the Auto-update / Register controls (right-aligned).
-  showHeading?: boolean
 }) {
   const queryClient = useQueryClient()
   const [addOpen, setAddOpen] = useState(false)
@@ -498,13 +494,11 @@ export function ProbesPanel({
 
   return (
     <section className="flex flex-col gap-2">
-      <div className={cn("flex items-center", showHeading ? "justify-between" : "justify-end")}>
-        {showHeading && (
-          <h2 className="text-sm font-semibold">
-            Probes
-            {nodes.length > 0 && <span className="ml-2 font-normal text-muted-foreground">{nodes.length}</span>}
-          </h2>
-        )}
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">
+          Probes
+          {nodes.length > 0 && <span className="ml-2 font-normal text-muted-foreground">{nodes.length}</span>}
+        </h2>
         <div className="flex items-center gap-3">
           {canWrite && data && (
             <label className="flex items-center gap-2 text-xs text-muted-foreground"

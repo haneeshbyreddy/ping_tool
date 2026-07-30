@@ -7,8 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from wisp.config import Config
 from wisp.egress.notifiers import (
-    MultiNotifier, NotifyResult, NtfyNotifier, WhatsAppFacts, WhatsAppNotifier,
-    build_notifier, _wa_numbers,
+    WhatsAppFacts, WhatsAppNotifier, build_notifier, _wa_numbers, _wa_time,
 )
 
 
@@ -67,6 +66,30 @@ class FactsTest(unittest.TestCase):
         self.assertEqual(f.params(), ["Title", "PORT_DOWN", "—", "t"])
 
 
+class DisplayTimeTest(unittest.TestCase):
+    """"Time Logged" is the one timestamp a human reads with no browser to
+    localise it — it shipped as raw UTC and read 5h30m behind the wall clock."""
+
+    def test_utc_instant_renders_in_the_display_zone(self):
+        self.assertEqual(_wa_time("2026-07-25T09:12:03+00:00"),
+                         "25 Jul 2026, 2:42 PM IST")
+
+    def test_naive_sqlite_stamp_is_treated_as_utc(self):
+        self.assertEqual(_wa_time("2026-07-25 18:45:00"),
+                         "26 Jul 2026, 12:15 AM IST")   # crosses the date line
+
+    def test_zone_is_configurable_and_unknown_zones_fall_back_to_utc(self):
+        self.assertEqual(_wa_time("2026-07-25T09:12:03+00:00", "America/New_York"),
+                         "25 Jul 2026, 5:12 AM EDT")
+        self.assertEqual(_wa_time("2026-07-25T09:12:03+00:00", "Nowhere/Bogus"),
+                         "25 Jul 2026, 9:12 AM UTC")
+
+    def test_a_non_timestamp_passes_through_rather_than_raising(self):
+        self.assertEqual(_wa_time("t"), "t")
+        self.assertEqual(_wa_time(""), "")
+        self.assertEqual(_wa_time(None), "")
+
+
 class WhatsAppNotifierTest(unittest.TestCase):
     def _wa(self, settings=_ENABLED, poster=None, store=True):
         poster = poster or _FakePoster()
@@ -75,9 +98,10 @@ class WhatsAppNotifierTest(unittest.TestCase):
 
     def test_payload_shape(self):
         wa, poster = self._wa()
-        res = wa.send("ntfy-topic", "🔴 DOWN", "10.0.0.1", 4,
+        res = wa.send("🔴 DOWN", "10.0.0.1", 4,
                       whatsapp=["+91 90000 00001"],
-                      facts=WhatsAppFacts("PYLON", "DOWN", "10.0.0.1", "2026-07-23"))
+                      facts=WhatsAppFacts("PYLON", "DOWN", "10.0.0.1",
+                                          "2026-07-23T04:05:00+00:00"))
         self.assertTrue(res.ok)
         self.assertEqual(len(poster.calls), 1)
         call = poster.calls[0]
@@ -87,95 +111,129 @@ class WhatsAppNotifierTest(unittest.TestCase):
         self.assertEqual(body["messaging_product"], "whatsapp")
         self.assertEqual(body["to"], "919000000001")          # digits only, no '+'
         self.assertEqual(body["type"], "template")
-        self.assertEqual(body["template"]["name"], "wisp_alert")
+        # falls back to the cfg default template when the store carries none
+        self.assertEqual(body["template"]["name"], "wisp_alert1")
         self.assertEqual(body["template"]["language"], {"code": "en"})
         params = [p["text"] for p in body["template"]["components"][0]["parameters"]]
-        self.assertEqual(params, ["PYLON", "DOWN", "10.0.0.1", "2026-07-23"])
+        # the stored UTC instant reaches the operator in THEIR zone (IST here)
+        self.assertEqual(params, ["PYLON", "DOWN", "10.0.0.1",
+                                  "23 Jul 2026, 9:35 AM IST"])
 
     def test_one_message_per_number(self):
         wa, poster = self._wa()
-        res = wa.send(None, "t", "b", 3,
-                      whatsapp=["919000000001", "919000000002"])
+        res = wa.send("t", "b", 3, whatsapp=["919000000001", "919000000002"])
         self.assertTrue(res.ok)
         self.assertEqual([c["json"]["to"] for c in poster.calls],
                          ["919000000001", "919000000002"])
 
     def test_disabled_is_a_noop(self):
         wa, poster = self._wa(settings={"enabled": "0", "token": "T", "phone_id": "P"})
-        res = wa.send(None, "t", "b", 3, whatsapp=["919000000001"])
+        res = wa.send("t", "b", 3, whatsapp=["919000000001"])
         self.assertFalse(res.ok)
         self.assertEqual(poster.calls, [])
 
     def test_unconfigured_is_a_noop(self):
         wa, poster = self._wa(settings={"enabled": "1"})  # no token/phone
-        res = wa.send(None, "t", "b", 3, whatsapp=["919000000001"])
+        res = wa.send("t", "b", 3, whatsapp=["919000000001"])
         self.assertFalse(res.ok)
         self.assertEqual(poster.calls, [])
 
     def test_no_numbers_is_a_noop(self):
         wa, poster = self._wa()
-        res = wa.send(None, "t", "b", 3, whatsapp=[])
+        res = wa.send("t", "b", 3, whatsapp=[])
         self.assertFalse(res.ok)
         self.assertEqual(poster.calls, [])
 
-    def test_settings_override_env(self):
-        # env default is enable_whatsapp False; the DB toggle turns it on
+    def test_db_toggle_can_disable(self):
+        # env default is now enable_whatsapp True (WhatsApp is the sole channel);
+        # a DB "0" turns it back OFF, proving the store still overrides env.
         cfg = Config()
-        self.assertFalse(cfg.enable_whatsapp)
-        wa = WhatsAppNotifier(cfg, _FakeStore(_ENABLED), post=_FakePoster())
-        res = wa.send(None, "t", "b", 3, whatsapp=["919000000001"])
-        self.assertTrue(res.ok)
+        self.assertTrue(cfg.enable_whatsapp)
+        wa = WhatsAppNotifier(cfg, _FakeStore({"enabled": "0", "token": "T",
+                                               "phone_id": "P"}), post=_FakePoster())
+        self.assertFalse(wa.send("t", "b", 3, whatsapp=["919000000001"]).ok)
 
     def test_4xx_fails_fast_5xx_retries(self):
         wa4, p4 = self._wa(poster=_FakePoster(status_code=400))
-        self.assertFalse(wa4.send(None, "t", "b", 3, whatsapp=["919000000001"]).ok)
+        self.assertFalse(wa4.send("t", "b", 3, whatsapp=["919000000001"]).ok)
         self.assertEqual(len(p4.calls), 1)                    # no retry on 4xx
 
         wa5, p5 = self._wa(poster=_FakePoster(status_code=503))
-        self.assertFalse(wa5.send(None, "t", "b", 3, whatsapp=["919000000001"]).ok)
+        self.assertFalse(wa5.send("t", "b", 3, whatsapp=["919000000001"]).ok)
         self.assertGreater(len(p5.calls), 1)                  # retried on 5xx
 
     def test_poster_exception_never_raises(self):
         wa, _ = self._wa(poster=_FakePoster(raise_exc=RuntimeError("boom")))
-        res = wa.send(None, "t", "b", 3, whatsapp=["919000000001"])   # must not raise
+        res = wa.send("t", "b", 3, whatsapp=["919000000001"])   # must not raise
         self.assertFalse(res.ok)
 
 
-class MultiNotifierTest(unittest.TestCase):
-    def test_channel_is_the_primary(self):
-        multi = MultiNotifier([NtfyNotifier(_cfg()),
-                               WhatsAppNotifier(_cfg(), _FakeStore(_ENABLED))])
-        self.assertEqual(multi.channel, "ntfy")
+class WhatsAppFreeFormTest(unittest.TestCase):
+    """send_text / send_buttons — the inbound-bot replies (free-form, allowed
+    because the user messaged first). Same config gating + never-raise discipline
+    as the template send."""
+    def _wa(self, settings=_ENABLED):
+        poster = _FakePoster()
+        return WhatsAppNotifier(_cfg(), _FakeStore(settings), post=poster), poster
 
-    def test_bad_whatsapp_never_downgrades_a_good_ntfy_page(self):
-        # ntfy succeeds, whatsapp's poster raises — result stays ok (ntfy's).
-        from tests.support import RecordingNotifier  # type: ignore
-        ntfy = RecordingNotifier(ok=True)
+    def test_send_text_shape_keeps_newlines(self):
+        wa, poster = self._wa()
+        res = wa.send_text("+91 90000 00001", "line1\nline2")
+        self.assertTrue(res.ok)
+        body = poster.calls[0]["json"]
+        self.assertEqual(body["to"], "919000000001")          # digits only
+        self.assertEqual(body["type"], "text")
+        self.assertEqual(body["text"], {"preview_url": False, "body": "line1\nline2"})
+
+    def test_send_buttons_shape_and_caps_at_three(self):
+        wa, poster = self._wa()
+        res = wa.send_buttons("919000000001", "pick one", [
+            ("refresh:1", "Refresh dBm"), ("map:1", "On map"),
+            ("recent:1", "Recent"), ("extra:1", "Dropped")])
+        self.assertTrue(res.ok)
+        body = poster.calls[0]["json"]
+        self.assertEqual(body["type"], "interactive")
+        self.assertEqual(body["interactive"]["type"], "button")
+        self.assertEqual(body["interactive"]["body"]["text"], "pick one")
+        btns = body["interactive"]["action"]["buttons"]
+        self.assertEqual(len(btns), 3)                        # 4th dropped (Meta cap)
+        self.assertEqual(btns[0],
+                         {"type": "reply", "reply": {"id": "refresh:1", "title": "Refresh dBm"}})
+
+    def test_button_title_truncated_to_twenty(self):
+        wa, poster = self._wa()
+        wa.send_buttons("919000000001", "b", [("x", "A" * 30)])
+        btn = poster.calls[0]["json"]["interactive"]["action"]["buttons"][0]
+        self.assertEqual(btn["reply"]["title"], "A" * 20)
+
+    def test_empty_buttons_falls_back_to_text(self):
+        wa, poster = self._wa()
+        wa.send_buttons("919000000001", "just text", [])
+        self.assertEqual(poster.calls[0]["json"]["type"], "text")
+
+    def test_disabled_free_form_is_a_noop(self):
+        wa, poster = self._wa(settings={"enabled": "0", "token": "T", "phone_id": "P"})
+        self.assertFalse(wa.send_text("919000000001", "hi").ok)
+        self.assertEqual(poster.calls, [])
+
+    def test_free_form_never_raises(self):
         wa = WhatsAppNotifier(_cfg(), _FakeStore(_ENABLED),
-                              post=_FakePoster(raise_exc=RuntimeError("bad token")))
-        multi = MultiNotifier([ntfy, wa])
-        res = multi.send("topic", "t", "b", 4, whatsapp=["919000000001"])
-        self.assertTrue(res.ok)
-        self.assertEqual(len(ntfy.sent), 1)                   # ntfy still fired
-
-    def test_whatsapp_fails_but_channel_reports_ntfy(self):
-        from tests.support import RecordingNotifier  # type: ignore
-        ntfy = RecordingNotifier(ok=True)
-        wa = WhatsAppNotifier(_cfg(), _FakeStore({"enabled": "0"}))
-        multi = MultiNotifier([ntfy, wa])
-        res = multi.send("topic", "t", "b", 4, whatsapp=["919000000001"])
-        self.assertTrue(res.ok)
+                              post=_FakePoster(raise_exc=RuntimeError("boom")))
+        self.assertFalse(wa.send_text("919000000001", "hi").ok)   # captured, not raised
 
 
 class BuildNotifierTest(unittest.TestCase):
-    def test_edge_no_store_is_bare_ntfy(self):
-        n = build_notifier(_cfg())                            # no store
-        self.assertIsInstance(n, NtfyNotifier)
+    def test_edge_no_store_is_whatsapp_but_inert(self):
+        # WhatsApp is the only channel; a store-less (edge) notifier is inert —
+        # nothing to read a token/numbers from — but never crashes.
+        n = build_notifier(_cfg())
+        self.assertIsInstance(n, WhatsAppNotifier)
+        self.assertEqual(n.channel, "whatsapp")
 
-    def test_central_with_store_fans_out(self):
+    def test_central_with_store(self):
         n = build_notifier(_cfg(), _FakeStore(_ENABLED))
-        self.assertIsInstance(n, MultiNotifier)
-        self.assertEqual(n.channel, "ntfy")
+        self.assertIsInstance(n, WhatsAppNotifier)
+        self.assertEqual(n.channel, "whatsapp")
 
 
 if __name__ == "__main__":

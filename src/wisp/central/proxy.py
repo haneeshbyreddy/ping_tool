@@ -23,12 +23,325 @@ its own device list before fetching (ingress/webproxy.py). No raw-IP path exists
 from __future__ import annotations
 
 import json
+import logging
+import os
 import queue
 import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+
+log = logging.getLogger("wisp.central")
+
+# ---- per-session static-asset cache ------------------------------------------
+#
+# 44% of every request this tunnel has ever carried was a re-fetch of an
+# UNCHANGING static asset inside ONE session (measured 2026-07-29 across the
+# whole of proxy_audit: jquery-1.7.1.min.js alone is 553 fetches of SRPL-OLT and
+# 1083 of HLY-OLT-1). This firmware ships no usable cache headers and its
+# frameset re-requests the entire script set on every click, so the browser has
+# no validator to revalidate with and simply asks again — down a tunnel where
+# one asset costs a fresh TCP+TLS handshake to a weak embedded server. On the
+# C-Data boxes that measured 1.00s PER ASSET, i.e. a 7-second page.
+#
+# Deliberately NOT an HTTP cache: no revalidation, no Age, no shared store. It
+# is a bounded per-session memo of the handful of scripts and images a device UI
+# re-serves verbatim, which is the whole of the observed waste.
+#
+# Three properties are load-bearing:
+#   * it stores the DEVICE'S RAW REPLY, before rewrite_body/inject_autofill, so
+#     a hit is byte-identical to a miss downstream — there stays exactly ONE
+#     rewriting path and the cache is a stand-in for the device, nothing more;
+#   * it lives ON the session (a field below), so it dies when the session does
+#     and there is no cross-session — let alone cross-org — key to get wrong;
+#   * the QUERY STRING is part of the key, so this firmware's own cache-busting
+#     (`/js/misc.js?rand=52258`, a fresh number per page) keeps missing, exactly
+#     as the vendor intended. Second-guessing a deliberate bust is how a cache
+#     starts serving a stale page nobody can explain.
+
+# Extensions we will serve from memory. A CLOSED vocabulary, like every other
+# one here: the alternative is inferring which paths are safe, and this vendor's
+# DYNAMIC pages are .html (/action/onuauthinfo.html) — precisely the class a
+# wrong inference would start serving stale.
+_CACHEABLE_EXT = frozenset({
+    ".js", ".css", ".png", ".gif", ".jpg", ".jpeg", ".ico", ".svg", ".bmp",
+    ".webp", ".woff", ".woff2", ".ttf", ".eot", ".properties", ".map",
+})
+# `no-store` is the only one that means "do not write this down" — see
+# cache_refusal for why `no-cache`/`private` are deliberately not here.
+_NO_STORE_RE = re.compile(r"(?i)(?:^|[\s,;])no-store(?:$|[\s,;])")
+
+
+# jQuery's OWN cache-buster. `$.ajax({cache:false})` appends `_=<timestamp>` to
+# every request it makes — it is a statement by the CLIENT LIBRARY about the
+# browser's HTTP cache, not by the vendor about the resource. Stripping it from
+# the key is therefore NOT the same act as honouring `?rand=`, which this
+# firmware's own HTML writes per script tag and which stays keyed.
+#
+# It is worth the distinction: 20% of every request the tunnel carries is a
+# static `.properties` translation table wearing one of these
+# (`/i18N/error_en_US.properties?_=1785323171532` — 5,919 fetches fleet-wide of
+# a file that has never changed). Keyed literally, every one of them is a miss
+# forever.
+_JQUERY_BUSTER = "_"
+
+
+def cache_key(path: str) -> str:
+    """The cache key for a request path: itself, minus jQuery's `_=` param.
+    Every other query parameter — including the vendor's `rand=` — is kept, so
+    anything the firmware deliberately busts keeps missing."""
+    base, sep, query = path.partition("?")
+    if not sep:
+        return path
+    kept = [kv for kv in query.split("&")
+            if kv.split("=", 1)[0] != _JQUERY_BUSTER]
+    return base + ("?" + "&".join(kept) if kept else "")
+
+
+def cacheable_path(method: str, path: str) -> bool:
+    """Is this request one we may answer from memory? Method + extension only —
+    the response side is judged separately (``cacheable_reply``), because a
+    request can look static and still come back with a cookie on it."""
+    if (method or "").upper() != "GET":
+        return False
+    base = (path or "").split("?", 1)[0]
+    return os.path.splitext(base)[1].lower() in _CACHEABLE_EXT
+
+
+def cache_refusal(status: int, pairs: list[tuple[str, str]]) -> str | None:
+    """Judge the DEVICE's answer: None if we may remember it, else a short
+    reason (which gets logged, so a blank cache is never a mystery again).
+
+    A static extension is a hint about the URL, never a promise about the
+    response — so state (Set-Cookie), an unkeyed Vary, or an explicit `no-store`
+    each disqualify one.
+
+    **`no-cache` and `private` deliberately do NOT.** That is an override of the
+    device and it is narrow on purpose:
+
+      * `private` is a directive to SHARED caches. This one is per session, in
+        process, and dies with the credential that opened it — it is a private
+        cache by construction, so honouring `private` was simply a misreading.
+      * `no-cache` means "store, but revalidate before reuse" (only `no-store`
+        means don't write it down). This firmware ships neither ETag nor
+        Last-Modified, so there is nothing to revalidate WITH — honouring it
+        literally means the cache can never work on the entire fleet, which is
+        how we ended up re-fetching a 2011 jQuery 553 times in one session over
+        a link where each fetch is a fresh TLS handshake.
+
+    What makes defying it safe is the vendor's own signal: this UI cache-busts
+    the JS it considers volatile (`/js/misc.js?rand=62245`, a fresh number every
+    page load) and leaves the stable files bare. The query string is part of the
+    cache key, so every file the firmware marks as changing keeps missing. We
+    only ever hold back the ones it re-sends byte-identical.
+    """
+    if status != 200:
+        return f"status {status}"
+    for k, v in pairs:
+        lk = k.lower()
+        if lk == "set-cookie":
+            return "carries Set-Cookie"
+        if lk in ("cache-control", "pragma") and _NO_STORE_RE.search(v or ""):
+            return f"{k}: {v}"
+        # Accept-Encoding is already resolved (the edge hands us decoded bytes
+        # and Content-Encoding is dropped), so it is the one Vary we can honour.
+        if lk == "vary" and any(t.strip().lower() not in ("accept-encoding", "")
+                                for t in (v or "").split(",")):
+            return f"Vary: {v}"
+    return None
+
+
+def cacheable_reply(status: int, pairs: list[tuple[str, str]]) -> bool:
+    return cache_refusal(status, pairs) is None
+
+
+class AssetCache:
+    """Bounded, thread-safe, FIFO store of one session's static assets.
+
+    Browser worker threads hit this concurrently, hence the lock. FIFO rather
+    than LRU on purpose: the working set is a device UI's fixed script list,
+    which either fits or doesn't — recency ranking buys nothing and costs a
+    bookkeeping structure to get wrong.
+    """
+
+    __slots__ = ("_lock", "_items", "_bytes", "_max_entries", "_max_bytes",
+                 "_ttl_s", "hits", "misses")
+
+    def __init__(self, *, max_entries: int = 128, max_bytes: int = 4 * 1024 * 1024,
+                 ttl_s: float = 300.0) -> None:
+        self._lock = threading.Lock()
+        # key -> (expires_at, status, header pairs, body)
+        self._items: dict[str, tuple[float, int, list, bytes]] = {}
+        self._bytes = 0
+        self._max_entries = max(0, int(max_entries))
+        self._max_bytes = max(0, int(max_bytes))
+        self._ttl_s = float(ttl_s)
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> tuple[int, list, bytes] | None:
+        with self._lock:
+            row = self._items.get(key)
+            if row is None:
+                self.misses += 1
+                return None
+            expires, status, pairs, body = row
+            if expires <= time.time():
+                del self._items[key]
+                self._bytes -= len(body)
+                self.misses += 1
+                return None
+            self.hits += 1
+            # copy the pair list — the caller filters and rewrites it in place
+            return status, list(pairs), body
+
+    def put(self, key: str, status: int, pairs: list, body: bytes) -> None:
+        size = len(body)
+        if not self._max_entries or size > self._max_bytes:
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old[3])
+            self._items[key] = (time.time() + self._ttl_s, status,
+                                list(pairs), body)
+            self._bytes += size
+            # dict preserves insertion order, so the first key IS the oldest.
+            # Never evict the entry just stored: a body larger than the whole
+            # budget is refused above, so this loop always terminates.
+            while (len(self._items) > self._max_entries
+                   or self._bytes > self._max_bytes) and len(self._items) > 1:
+                oldest = next(iter(self._items))
+                self._bytes -= len(self._items.pop(oldest)[3])
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._items), "bytes": self._bytes,
+                    "hits": self.hits, "misses": self.misses}
+
+
+# ---- per-device concurrency, adaptive -----------------------------------------
+#
+# PROVEN 2026-07-29, not inferred: every one of SRPL-OLT's ~4.3% failures logged
+# `connect timeout to 172.168.99.245:443` — the TCP connect never completed, so
+# this was never a slow page or a slow link. A box silently DROPPING connection
+# attempts (rather than refusing them) is an overrun accept queue, and the
+# client's SYN retransmit timer is why the good requests measured a dead-on
+# 1.00s median: one retransmit each. The ones that lost the race outright burned
+# the whole 5s connect budget and 502'd, whereupon the browser asked again.
+#
+# So the lever is HOW MANY CONNECTIONS AT ONCE the box is asked to accept.
+# `proxy_workers` bounds a NODE's tunnel; this bounds one DEVICE, because the
+# device is what falls over — and it lives on CENTRAL as well as the edge
+# because central sees every failure string and needs no fleet rollout to start
+# helping. The two converge on the same rung; the tighter one wins.
+#
+# NO vendor hardcode and no operator-kept list of weak boxes, same as
+# PysnmpPoller's ladder: start at the ceiling, drop a rung on a CONNECT failure,
+# re-probe one rung faster every few hours so a reboot or a firmware fix heals
+# without anyone noticing it happened.
+
+# Fragments of the edge's own failure sentences (ingress/webproxy.py:
+# _friendly_fetch_error) that mean "we could not get a working connection".
+# Matching on prose is a coupling, so `unit/test_webproxy` drives the real
+# function with real httpx exceptions and fails if the wording drifts.
+#
+# Deliberately EXCLUDED: a TLS-version mismatch and a non-HTTP reply are
+# configuration errors that fail identically at any concurrency, and narrowing
+# for them would slow a device down to punish it for a wrong port.
+_CONNECT_FAILURE_MARKS = (
+    "connect timeout to",
+    "connection refused on",
+    "could not connect to",
+    "accepted the connection but never sent a response",
+)
+
+
+def is_connect_failure(error: str | None) -> bool:
+    low = (error or "").lower()
+    return any(m in low for m in _CONNECT_FAILURE_MARKS)
+
+
+class _DeviceThrottle:
+    """Live-resizable in-flight limit for ONE device.
+
+    A Condition rather than a Semaphore precisely because the capacity moves:
+    a semaphore's value is fixed at construction, so narrowing would mean
+    swapping the object and hoping every in-flight holder releases the one it
+    took. Here the limit is just a number the waiters re-read.
+    """
+
+    _PROMOTE_AFTER_S = 3 * 3600.0
+
+    def __init__(self, levels: list[int]) -> None:
+        self._levels = levels
+        self._level = 0
+        self._active = 0
+        self._cv = threading.Condition()
+        self._promote_at: float | None = None
+
+    @property
+    def limit(self) -> int:
+        return self._levels[self._level]
+
+    def acquire(self, timeout: float) -> bool:
+        with self._cv:
+            self._maybe_promote_locked()
+            end = time.monotonic() + max(0.0, timeout)
+            while self._active >= self._levels[self._level]:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(left)
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._cv:
+            self._active -= 1
+            self._cv.notify()
+
+    def demote(self) -> int | None:
+        """Narrow one rung. Returns the new limit, or None if already at the
+        floor (there is no such thing as half a connection)."""
+        with self._cv:
+            if self._level >= len(self._levels) - 1:
+                self._promote_at = time.monotonic() + self._PROMOTE_AFTER_S
+                return None
+            self._level += 1
+            self._promote_at = time.monotonic() + self._PROMOTE_AFTER_S
+            return self._levels[self._level]
+
+    def _maybe_promote_locked(self) -> None:
+        if self._promote_at is None or time.monotonic() < self._promote_at:
+            return
+        self._promote_at = time.monotonic() + self._PROMOTE_AFTER_S
+        if self._level > 0:
+            self._level -= 1
+            self._cv.notify_all()   # the widened limit may free waiters
+
+
+# The ladder FLOORS AT 2, and that is measured, not cautious (2026-07-29,
+# SRPL-OLT, median in-burst gap between assets):
+#
+#     limit 4 (no throttle)  1.00s   — connections dropped, each costing 5s
+#     limit 2                0.00s   — several assets inside one second
+#     limit 1                1.50s   — WORST of the three
+#
+# One-at-a-time is slowest because the tunnel is a PIPELINE: while the edge is
+# uploading one reply and re-issuing its long-poll, a second request should be
+# in flight covering those WAN legs. Serialise it and every asset pays for that
+# dead air end to end. So the failure this ladder exists to stop is real, but
+# curing it by going to 1 costs more than the failures did — the honest floor is
+# the narrowest rung that still overlaps.
+def _ladder(top: int) -> list[int]:
+    """Closed ladder, widest first. Rungs above the configured ceiling are
+    dropped, not clamped: an operator who set the limit to 1 must not find the
+    ladder handing a box 2."""
+    top = max(1, int(top))
+    return sorted({v for v in (top, 2) if v <= top}, reverse=True) or [top]
+
 
 # Per-session concurrent-request ceiling: a page's asset burst needs a handful,
 # and browsers cap themselves ~6-8 per origin anyway; anything past this reads
@@ -90,12 +403,29 @@ class ProxySession:
     # injected_auth the password reaches the browser here (a form's JS may hash it
     # client-side, so we must fill the real field) — inherent to form login.
     autofill: tuple[str, str] | None = field(default=None, compare=False)
+    # This session's static-asset memo. On the session rather than the hub so
+    # it is collected with the session and can never outlive the credential
+    # that opened it. Replaced by open_session with a config-sized one; the
+    # default keeps a bare ProxySession (the preflight probe builds one) valid.
+    cache: AssetCache = field(default_factory=AssetCache, compare=False, repr=False)
+    # Cache-refusal reasons already logged for this session, so a device that
+    # stamps one header on every asset writes one line and not one per file.
+    cache_refusals: set = field(default_factory=set, compare=False, repr=False)
 
 
 class _Pending:
-    """One in-flight browser request awaiting the edge's reply."""
+    """One in-flight browser request awaiting the edge's reply.
 
-    __slots__ = ("req_id", "org_id", "node_id", "payload", "event", "response")
+    The three stamps split the round trip at the only two points central can
+    see it: when the edge's long-poll CLAIMED the request, and when its reply
+    landed. `queued` (park -> claim) is a tunnel-side cost — no worker was free,
+    or none was polling. `edge` (claim -> reply) is the device fetch plus the
+    reply upload. Without the split, a slow page is just "slow somewhere",
+    which is how this subsystem burned two restarts guessing.
+    """
+
+    __slots__ = ("req_id", "org_id", "node_id", "payload", "event", "response",
+                 "parked_at", "picked_at", "replied_at")
 
     def __init__(self, req_id: int, org_id: str, node_id: str, payload: dict) -> None:
         self.req_id = req_id
@@ -104,15 +434,45 @@ class _Pending:
         self.payload = payload
         self.event = threading.Event()
         self.response: dict | None = None
+        self.parked_at = time.monotonic()
+        self.picked_at: float | None = None
+        self.replied_at: float | None = None
+
+
+# A tunnelled asset that takes longer than this is worth a line. On a healthy
+# device most assets land well inside it, so the log stays quiet until something
+# is actually wrong — and then it says WHERE, which is the whole point.
+_SLOW_REQUEST_S = 1.0
+
+
+def _log_slow(pend: "_Pending", sess: "ProxySession", path: str) -> None:
+    total = time.monotonic() - pend.parked_at
+    if total < _SLOW_REQUEST_S:
+        return
+    if pend.picked_at is None:
+        log.info("proxy slow dev=%d %s total=%.2fs — the edge never claimed it "
+                 "(no worker polling, or the tunnel is dormant)",
+                 sess.device_id, path, total)
+        return
+    queued = pend.picked_at - pend.parked_at
+    edge = ((pend.replied_at or time.monotonic()) - pend.picked_at)
+    log.info("proxy slow dev=%d %s total=%.2fs queued=%.2fs edge=%.2fs%s",
+             sess.device_id, path, total, queued, edge,
+             "" if pend.replied_at else " (no reply)")
 
 
 class ProxyHub:
-    def __init__(self) -> None:
+    def __init__(self, device_max_inflight: int = 4) -> None:
         self._lock = threading.Lock()
         self._sessions: dict[str, ProxySession] = {}
         self._inbox: dict[tuple[str, str], queue.Queue] = {}
         self._pending: dict[int, _Pending] = {}
         self._seq = 0
+        # (org, device) -> its live concurrency rung. Keyed on the DEVICE and
+        # not the session, so a reopened tab inherits what we already learned
+        # about the box rather than starting the ladder over.
+        self._throttles: dict[tuple[str, int], _DeviceThrottle] = {}
+        self._ladder = _ladder(device_max_inflight)
         # last time each node's tunnel long-polled us — the preflight gate:
         # a submit against a node that isn't polling would just eat its timeout
         self._last_poll: dict[tuple[str, str], float] = {}
@@ -121,13 +481,16 @@ class ProxyHub:
 
     def open_session(self, *, org_id: str, device_id: int, node_id: str,
                      device_ip: str, device_port: int, scheme: str,
-                     created_by: int, ttl_s: float) -> ProxySession:
+                     created_by: int, ttl_s: float,
+                     cache: AssetCache | None = None) -> ProxySession:
         now = time.time()
         sess = ProxySession(
             sid=secrets.token_urlsafe(24), org_id=org_id, device_id=device_id,
             node_id=node_id, device_ip=device_ip, device_port=device_port,
             scheme=scheme, created_by=created_by, created_at=now,
             expires_at=now + ttl_s, last_used_at=now)
+        if cache is not None:
+            sess.cache = cache
         with self._lock:
             self._sessions[sess.sid] = sess
         return sess
@@ -225,7 +588,49 @@ class ProxyHub:
         reply dict (``status``/``headers``/``body``), or None on timeout.
         ``extra`` keys are merged into the parked payload (the preflight probe
         rides this); the normal device_ip/port/scheme fields stay present, so an
-        edge that predates a given extra treats it as a plain fetch."""
+        edge that predates a given extra treats it as a plain fetch.
+
+        The per-device concurrency gate is taken HERE rather than in the browser
+        route, so every caller — a tab, the web-optics sweeper, the session-open
+        preflight — is bounded by the same rung. A device is a device whoever is
+        asking, and a gate a new caller can forget to take is not a gate.
+        """
+        import base64
+        deadline = time.monotonic() + timeout
+        throttle = self._throttle(sess.org_id, sess.device_id)
+        if not throttle.acquire(deadline - time.monotonic()):
+            return None   # never got a slot: indistinguishable from a timeout,
+        try:              # and that IS what it is from the browser's side
+            return self._submit_locked_out(
+                sess, method=method, path=path, headers=headers, body=body,
+                timeout=max(0.0, deadline - time.monotonic()), extra=extra)
+        finally:
+            throttle.release()
+
+    def _throttle(self, org_id: str, device_id: int) -> _DeviceThrottle:
+        key = (org_id, device_id)
+        with self._lock:
+            t = self._throttles.get(key)
+            if t is None:
+                t = self._throttles[key] = _DeviceThrottle(self._ladder)
+            return t
+
+    def device_limit(self, org_id: str, device_id: int) -> int:
+        return self._throttle(org_id, device_id).limit
+
+    def note_failure(self, org_id: str, device_id: int,
+                     error: str | None) -> int | None:
+        """A fetch came back failed. Narrow this device's rung if — and only if
+        — we could not get a CONNECTION: a 404 or a slow page says nothing about
+        how many connections the box can take. Returns the new limit when it
+        actually narrowed, so the caller can say so once."""
+        if not is_connect_failure(error):
+            return None
+        return self._throttle(org_id, device_id).demote()
+
+    def _submit_locked_out(self, sess: ProxySession, *, method: str, path: str,
+                           headers: dict, body: bytes, timeout: float,
+                           extra: dict | None = None) -> dict | None:
         import base64
         with self._lock:
             self._seq += 1
@@ -246,6 +651,7 @@ class ProxyHub:
         got = pend.event.wait(timeout)
         with self._lock:
             self._pending.pop(req_id, None)
+        _log_slow(pend, sess, path)
         return pend.response if got else None
 
     # -- edge side -------------------------------------------------------------
@@ -267,6 +673,7 @@ class ProxyHub:
             pend = q.get(timeout=max(0.0, hold_s))
         except queue.Empty:
             return None
+        pend.picked_at = time.monotonic()
         return pend.payload
 
     def deliver(self, req_id: int, org_id: str, node_id: str, response: dict) -> bool:
@@ -278,6 +685,7 @@ class ProxyHub:
             pend = self._pending.get(req_id)
             if pend is None or pend.org_id != org_id or pend.node_id != node_id:
                 return False
+        pend.replied_at = time.monotonic()
         pend.response = response
         pend.event.set()
         return True
@@ -375,6 +783,50 @@ AUTOFILL_PATH = "__wisp_autofill__"
 # partial that gets innerHTML'd somewhere).
 _HTML_DOC_RE = re.compile(rb"(?i)<html[\s>]|<!doctype\s+html|</body\s*>|</head\s*>")
 _BODY_CLOSE_RE = re.compile(rb"(?i)</body\s*>")
+# A closed <script>…</script>, and a bare opening tag (for one left unterminated
+# at EOF). Both are needed to answer "is this offset inside JavaScript?".
+_SCRIPT_BLOCK_RE = re.compile(rb"(?is)<script\b[^>]*>.*?</script\s*>")
+_OPEN_SCRIPT_RE = re.compile(rb"(?is)<script\b[^>]*>")
+_BOM = b"\xef\xbb\xbf"
+
+
+def _script_spans(body: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of the body that are JavaScript, not markup."""
+    spans = [m.span() for m in _SCRIPT_BLOCK_RE.finditer(body)]
+    # An unterminated <script> swallows everything to EOF — the parser is still
+    # inside JS there, so the "just append at the end" fallback is not safe.
+    m = _OPEN_SCRIPT_RE.search(body, spans[-1][1] if spans else 0)
+    if m:
+        spans.append((m.start(), len(body)))
+    return spans
+
+
+def _injection_point(body: bytes) -> int | None:
+    """Offset to splice the bootstrap in at — the last ``</body>`` that is NOT
+    inside a <script>, else the end of the body; None when there is nowhere safe.
+
+    The naive "last ``</body>``" cost this feature a whole switch fleet. DCN's
+    .asp UI builds its frames from JS, so the last ``</body>`` in tabctrl.asp
+    lives INSIDE a ``document.write("…</body>…")`` string — splicing a multi-line
+    <script> there puts a raw newline in a JS string literal ("SyntaxError:
+    string literal contains an unescaped line break"), which kills the page's own
+    script before it navigates the content frame. The tab bar rendered, every
+    request 200'd, and the UI simply never loaded a page: broken by us, and
+    invisible in the audit log. A device whose credentials were never stored
+    (autofill disarmed, nothing injected) browsed fine the whole time — that
+    contrast is what identified this."""
+    spans = _script_spans(body)
+
+    def in_js(i: int) -> bool:
+        return any(start <= i < end for start, end in spans)
+
+    point = None
+    for m in _BODY_CLOSE_RE.finditer(body):
+        if not in_js(m.start()):
+            point = m.start()
+    if point is not None:
+        return point
+    return None if in_js(len(body) - 1) else len(body)
 
 _AUTOFILL_JS = (
     b"<script>/* wisp-autofill */(function(){\n"
@@ -425,11 +877,16 @@ def inject_autofill(content_type: str, body: bytes, sid: str) -> bytes:
         return body
     if not body or not _HTML_DOC_RE.search(body):
         return body
+    # A document opens with markup; a script opens with code. The sniff above
+    # matches any body CONTAINING a document marker, and old firmware serves
+    # .js with no Content-Type at all — so without this, a common.js that
+    # merely document.write()s "</body>" somewhere reads as a page and gets a
+    # <script> tag appended INTO the JavaScript.
+    if not body.lstrip(_BOM).lstrip().startswith(b"<"):
+        return body
+    point = _injection_point(body)
+    if point is None:
+        return body
     url = json.dumps(f"/api/proxy/{sid}/{AUTOFILL_PATH}").replace("<", "\\u003c")
     script = _AUTOFILL_JS.replace(b"%URL%", url.encode("utf-8"))
-    last = None
-    for last in _BODY_CLOSE_RE.finditer(body):
-        pass
-    if last is not None:
-        return body[:last.start()] + script + body[last.start():]
-    return body + script
+    return body[:point] + script + body[point:]

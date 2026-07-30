@@ -5,9 +5,10 @@ import threading
 import time as _time
 from datetime import datetime, timezone
 
+from wisp.central.assignment import PagingAudience
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
-from wisp.egress.notifiers import build_notifier
+from wisp.egress.notifiers import WhatsAppFacts, build_notifier
 
 log = logging.getLogger("wisp.central.watchdog")
 
@@ -47,29 +48,41 @@ class CentralWatchdog:
 
     def _page(self, key: tuple[str, str], mark: str, age: float, now: datetime) -> bool:
         org, node = key
-        topic = self.store.org_topic(org) or self.cfg.central_ntfy_topic
         mins = int(age // 60)
+        ts = now.replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
         if mark == STALE_MARK:
-            title = "🚨 EDGE NODE DOWN"
+            title, status = "🚨 PROBE DOWN", "DOWN"
             body = f"{org}/{node} · silent ~{mins}m"
             priority = 5
         else:
-            title = "✅ Edge node back"
+            title, status = "✅ Probe back", "UP"
             body = f"{org}/{node}"
             priority = 3
-        # A silent edge is an owner concern — fan the page out to owner WhatsApp
-        # too (best-effort; the notifier isolates a WhatsApp failure from ntfy).
-        whatsapp = self.store.org_role_whatsapp(org, "owner")
+        # A silent probe reaches owners plus whoever is responsible for the
+        # devices that probe carries (central/assignment.py) — a probe is not a
+        # device, so its audience is derived from what sits behind it. With
+        # nothing assigned back there it stays the whole org audience: a dark
+        # probe blinds a slice of the fleet and is the last alarm to narrow on a
+        # guess. The superadmin ops number is NOT paged here (2026-07-25): a
+        # probe-down is an org page like any other, and the admin can't be buried
+        # under every org's fleet churn.
+        #
+        # A fresh resolver per page (not per tick): the watchdog thread is
+        # long-lived, and a cached tree would go on paging a stale audience for
+        # as long as central stays up.
+        numbers = PagingAudience(self.store, org).for_node(node)
         ok = False
-        if topic:
+        if numbers:
             try:
-                ok = self.notifier.send(topic, title, body, priority,
-                                        whatsapp=whatsapp).ok
+                ok = self.notifier.send(
+                    title, body, priority, whatsapp=numbers,
+                    facts=WhatsAppFacts(subject=f"Probe {node} ({org})",
+                                        status=status, detail=body,
+                                        timestamp=ts)).ok
             except Exception:
                 log.exception("central watchdog page failed for %s/%s", org, node)
         self.store.record_node_alert(org, node, mark, "sent" if ok else "failed",
-                                     f"age={int(age)}s",
-                                     now.replace(tzinfo=timezone.utc).isoformat(timespec="seconds"))
+                                     f"age={int(age)}s", ts)
         return ok
 
 def start_central_watchdog_thread(cfg: Config = CONFIG, store=None,

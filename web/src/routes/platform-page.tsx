@@ -66,7 +66,8 @@ function GoogleMapsCard() {
 
 // Server-wide, superadmin-only: how subscribers pay. Payment is manual — orgs
 // pay the GPay number or scan the uploaded QR, tap "I've paid", and their name
-// lands on the confirmations channel so the admin marks the month by hand.
+// is sent to the admin WhatsApp number (Platform → WhatsApp) so the admin marks
+// the month by hand.
 function PlatformBillingCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -74,13 +75,11 @@ function PlatformBillingCard() {
     queryFn: adminApi.settings,
   })
   const [gpay, setGpay] = useState("")
-  const [paidTopic, setPaidTopic] = useState("")
   const [qr, setQr] = useState("")   // data URI, or "" for none
   const fileRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
     if (data) {
       setGpay(data.billing_gpay_number || "")
-      setPaidTopic(data.billing_paid_topic || "")
       setQr(data.billing_qr_image || "")
     }
   }, [data])
@@ -101,7 +100,6 @@ function PlatformBillingCard() {
   const save = useMutation({
     mutationFn: () => adminApi.saveSettings({
       billing_gpay_number: gpay.trim(),
-      billing_paid_topic: paidTopic.trim(),
       billing_qr_image: qr,
     }),
     onSuccess: () => {
@@ -160,17 +158,11 @@ function PlatformBillingCard() {
           </p>
         </div>
 
-        <div className="flex flex-col gap-1.5">
-          <Label>Payment confirmations channel</Label>
-          <Input value={paidTopic} placeholder="ntfy topic (e.g. wisp-payments-abc123)"
-            className="max-w-sm font-mono text-xs" spellCheck={false}
-            onChange={(e) => setPaidTopic(e.target.value)} />
-          <p className="max-w-lg text-xs text-muted-foreground">
-            When an org taps "I've paid", their name is pushed to this ntfy topic
-            so you can verify and mark the month. Leave empty to use your central
-            admin channel.
-          </p>
-        </div>
+        <p className="max-w-lg text-xs text-muted-foreground">
+          When an org taps "I've paid", their name is sent to the admin WhatsApp
+          number (set in the WhatsApp card below) so you can verify and mark the
+          month.
+        </p>
 
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
           Save
@@ -182,8 +174,9 @@ function PlatformBillingCard() {
 
 // Server-wide, superadmin-only: the experimental WhatsApp channel. This is the
 // business sender (Meta Cloud API) config only — the per-person page numbers are
-// on each login account (Accounts section), not here. WhatsApp is additive: it
-// rides beside ntfy and can never break a page.
+// on each login account (Accounts section), not here. WhatsApp is the SOLE alert
+// channel (ntfy removed 2026-07-24); the admin number here also receives the
+// superadmin ops pings (org 'I've paid' / churn / release-sync failing).
 function WhatsAppCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -195,6 +188,7 @@ function WhatsAppCard() {
   const [template, setTemplate] = useState("")
   const [lang, setLang] = useState("")
   const [apiVersion, setApiVersion] = useState("")
+  const [adminNumber, setAdminNumber] = useState("")
   const [token, setToken] = useState("")   // write-only; blank leaves the stored one
   // `whatsapp` is absent from an OLD backend that hasn't been restarted with this
   // feature — degrade to empty defaults rather than white-screening the page.
@@ -208,6 +202,7 @@ function WhatsAppCard() {
     setTemplate(wa.template)
     setLang(wa.lang)
     setApiVersion(wa.api_version)
+    setAdminNumber(wa.admin_number)
     setToken("")
   }, [data])
 
@@ -216,6 +211,7 @@ function WhatsAppCard() {
       whatsapp: {
         enabled, phone_id: phoneId.trim(), template: template.trim(),
         lang: lang.trim(), api_version: apiVersion.trim(),
+        admin_number: adminNumber.trim(),
         ...(token.trim() ? { token: token.trim() } : {}),
       },
     }),
@@ -243,14 +239,14 @@ function WhatsAppCard() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-sm">
-          <MessageCircle className="size-4 text-muted-foreground" /> WhatsApp alerts (experimental)
+          <MessageCircle className="size-4 text-muted-foreground" /> WhatsApp alerts
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <label className="flex items-center justify-between gap-3 max-w-sm">
           <span className="flex flex-col">
             <span className="text-sm font-medium">Send alerts over WhatsApp</span>
-            <span className="text-xs text-muted-foreground">Additive — ntfy keeps working either way</span>
+            <span className="text-xs text-muted-foreground">The only alert channel — off means no pages go out</span>
           </span>
           <Switch checked={enabled} onCheckedChange={setEnabled} />
         </label>
@@ -281,7 +277,7 @@ function WhatsAppCard() {
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 max-w-sm">
           <div className="flex flex-col gap-1.5">
             <Label>Template</Label>
-            <Input value={template} placeholder="wisp_alert" className="font-mono text-xs"
+            <Input value={template} placeholder="wisp_alert1" className="font-mono text-xs"
               spellCheck={false} onChange={(e) => setTemplate(e.target.value)} />
           </div>
           <div className="flex flex-col gap-1.5">
@@ -296,11 +292,23 @@ function WhatsAppCard() {
           </div>
         </div>
 
+        <div className="flex flex-col gap-1.5">
+          <Label>Admin ops number</Label>
+          <Input value={adminNumber} placeholder="e.g. +919000000000"
+            className="max-w-sm font-mono text-xs" spellCheck={false}
+            onChange={(e) => setAdminNumber(e.target.value)} />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            The superadmin's WhatsApp number for platform ops pings &mdash; an org tapping
+            "I've paid", a self-downgrade to Free, and release-mirror failures. It also
+            joins every org's alert audience. Leave blank to skip the ops pings.
+          </p>
+        </div>
+
         <p className="max-w-lg text-xs text-muted-foreground">
-          The approved template's body must take 4 parameters:{" "}
-          <code>{"🔻 {{1}} — {{2}} ({{3}}) · {{4}}"}</code> (subject, status, detail,
-          time). Each person is paged on their own number, set on their account in
-          Accounts. Use the "Send test" buttons under an org's alert routing to verify.
+          The approved template's body takes 4 parameters, in order: Device, Status,
+          Detail, Time Logged (<code>{"{{1}}"}</code>&hellip;<code>{"{{4}}"}</code>). Each
+          person is paged on their own number, set on their account in Accounts. Use the
+          "Send test alert" button under an org's Settings &rarr; Organization to verify.
         </p>
 
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>

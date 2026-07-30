@@ -42,8 +42,9 @@ from wisp.runtime.central_client import CentralBrainClient, CentralClientError
 
 log = logging.getLogger("wisp.webproxy")
 
-# (status, headers, body) for one device fetch.
-Fetcher = Callable[[dict, Config], Awaitable[tuple[int, dict, bytes]]]
+# (status, header pairs, body) for one device fetch. Pairs, not a dict —
+# repeated names (multiple Set-Cookie) must survive the wire.
+Fetcher = Callable[[dict, Config], Awaitable[tuple[int, list, bytes]]]
 # One preflight connect probe: (ip, port, scheme, timeout_s) -> error or None.
 Prober = Callable[[str, int, str, float], Awaitable[str | None]]
 
@@ -135,29 +136,248 @@ def _friendly_fetch_error(exc: Exception, ip: str, port: int, scheme: str) -> st
     return str(exc)[:300]
 
 
-async def _default_fetch(req: dict, cfg: Config) -> tuple[int, dict, bytes]:
+class _ClientPool:
+    """One KEPT-ALIVE httpx client per device endpoint.
+
+    Until 2026-07-29 every proxied asset built its own ``AsyncClient`` and
+    closed it — a fresh TCP connection and a full TLS handshake to the device
+    for each of the ~10 files a page pulls. A browser on that LAN opens about
+    two connections and reuses them for the whole session, which is precisely
+    why the same OLT felt instant locally and took five seconds a click through
+    the tunnel: measured over proxy_audit, SRPL-OLT cost 1.00s PER ASSET (a
+    7-second page) against 0.25s for a stronger box on the SAME probe, with a
+    4.3% fetch-failure rate against 0.1%. On these C-Data OLTs — no AES-NI, a
+    few hundred MHz — the handshake IS the page load.
+
+    Clients are keyed on the endpoint, not the session: the same box browsed
+    twice should reuse its connection, and the allow-list gate that decides
+    whether we may talk to an endpoint at all runs per request in _serve(),
+    upstream of here, so pooling widens nothing.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._clients: dict[tuple[str, str, int], tuple[object, float]] = {}
+        self._lock = asyncio.Lock()
+
+    def _build(self, scheme: str, ip: str, port: int):
+        import httpx
+        # Split timeout: a LAN device either accepts the connection within a
+        # few seconds or never will — the long proxy_request_timeout_s is for
+        # slow PAGES, not dead sockets. Without the split, a wrong scheme/port
+        # made the operator wait out the full 30s to learn anything.
+        timeout = httpx.Timeout(self._cfg.proxy_request_timeout_s,
+                                connect=self._cfg.proxy_connect_timeout_s)
+        keep = max(1, int(self._cfg.proxy_device_max_inflight))
+        return httpx.AsyncClient(
+            verify=False, follow_redirects=False, timeout=timeout,
+            limits=httpx.Limits(max_connections=keep,
+                                max_keepalive_connections=keep,
+                                keepalive_expiry=self._cfg.proxy_keepalive_idle_s))
+
+    async def get(self, scheme: str, ip: str, port: int):
+        key = (scheme, ip, port)
+        async with self._lock:
+            await self._reap_locked()
+            row = self._clients.get(key)
+            client = row[0] if row else self._build(scheme, ip, port)
+            self._clients[key] = (client, time.monotonic())
+            return client
+
+    async def drop(self, scheme: str, ip: str, port: int) -> None:
+        """Discard an endpoint's client — used when a pooled connection turns
+        out to be stale, so the retry starts from a genuinely fresh socket."""
+        async with self._lock:
+            row = self._clients.pop((scheme, ip, port), None)
+        if row:
+            await _aclose(row[0])
+
+    async def _reap_locked(self) -> None:
+        """Drop client OBJECTS for endpoints nobody has touched in a long while,
+        so the dict can't grow with the fleet.
+
+        SOCKET hygiene is not this — it is httpx's own ``keepalive_expiry``
+        (``proxy_keepalive_idle_s``), which closes an idle connection without
+        disturbing anything in flight. An embedded box has a handful of sockets
+        and holding one open all day because a tech looked at it this morning is
+        how we become the reason it stops answering, but tearing a client down
+        underneath a live request would be worse. Hence a cutoff comfortably
+        past the longest a single fetch may take.
+        """
+        cutoff = time.monotonic() - max(600.0, self._cfg.proxy_keepalive_idle_s,
+                                        self._cfg.proxy_request_timeout_s * 4)
+        stale = [k for k, (_, seen) in self._clients.items() if seen < cutoff]
+        for k in stale:
+            client, _ = self._clients.pop(k)
+            await _aclose(client)
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            clients = [c for c, _ in self._clients.values()]
+            self._clients.clear()
+        for c in clients:
+            await _aclose(c)
+
+
+async def _aclose(client) -> None:
+    try:
+        await client.aclose()
+    except Exception:
+        pass
+
+
+class _DeviceGate:
+    """Adaptive per-DEVICE concurrency, walked down from ``proxy_device_max_
+    inflight``.
+
+    ``proxy_workers`` bounds what a NODE has in flight; this bounds what one
+    BOX does, because the box is what falls over. Two of twenty devices on this
+    fleet answer ~1 request at a time and refused 4-5% of what we sent while
+    peers on the same probe took 8-9 in parallel and refused 0.1% — a property
+    of the firmware, not of the network (ICMP to both was ~3ms, 0% loss).
+
+    Same shape as PysnmpPoller's ladder and for the same reason: NO vendor
+    hardcode and no operator-maintained list of weak boxes. Start optimistic,
+    drop a rung when a box refuses a CONNECTION (the signature of an overrun
+    accept queue — a 404 or a slow page proves nothing about capacity), and
+    re-probe one rung faster every few hours so a firmware fix or a reboot
+    heals itself.
+    """
+
+    _PROMOTE_AFTER_S = 3 * 3600.0
+
+    def __init__(self, cfg: Config) -> None:
+        top = max(1, int(cfg.proxy_device_max_inflight))
+        # Closed ladder, widest first. Rungs above the configured ceiling are
+        # dropped, not clamped: an operator who set the limit to 1 must not
+        # find the ladder handing a box 2.
+        self._levels = sorted({v for v in (top, 2, 1) if v <= top}, reverse=True)
+        self._sems: dict[tuple[str, int], tuple[int, asyncio.Semaphore]] = {}
+        self._promote_at: dict[tuple[str, int], float] = {}
+
+    def _level(self, key) -> int:
+        row = self._sems.get(key)
+        return row[0] if row else 0
+
+    def semaphore(self, ip: str, port: int) -> asyncio.Semaphore:
+        key = (ip, port)
+        now = time.monotonic()
+        due = self._promote_at.get(key)
+        if due is not None and now >= due:
+            self._set(key, max(0, self._level(key) - 1))
+            self._promote_at[key] = now + self._PROMOTE_AFTER_S
+        row = self._sems.get(key)
+        if row is None:
+            self._set(key, 0)
+            row = self._sems[key]
+        return row[1]
+
+    def demote(self, ip: str, port: int) -> bool:
+        """A connection was refused. Returns True if we actually narrowed."""
+        key = (ip, port)
+        level = self._level(key)
+        if level >= len(self._levels) - 1:
+            return False
+        self._set(key, level + 1)
+        self._promote_at[key] = time.monotonic() + self._PROMOTE_AFTER_S
+        return True
+
+    def _set(self, key, level: int) -> None:
+        level = max(0, min(level, len(self._levels) - 1))
+        # A live holder keeps the semaphore it acquired, so swapping the object
+        # is safe: the old one drains on its own and is then dropped.
+        self._sems[key] = (level, asyncio.Semaphore(self._levels[level]))
+
+    def limit(self, ip: str, port: int) -> int:
+        return self._levels[self._level((ip, port))]
+
+
+class DeviceFetchError(RuntimeError):
+    """A device fetch that failed, carrying WHY in a form the caller can act on.
+
+    The message is the operator-facing sentence and still rides back to the
+    browser unchanged; ``connect_failure`` is the machine-readable half the
+    concurrency ladder reads. Subclasses RuntimeError so every existing
+    ``except Exception``/RuntimeError path is untouched.
+    """
+
+    def __init__(self, message: str, *, connect_failure: bool = False) -> None:
+        super().__init__(message)
+        self.connect_failure = connect_failure
+
+
+def _is_connect_failure(exc: Exception) -> bool:
+    """Did we fail to get a working connection, as opposed to getting a bad
+    answer over a good one? Only the former says anything about how many
+    connections the box can take — a 404 or a slow page proves nothing."""
+    import httpx
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout,
+                            httpx.PoolTimeout))
+
+
+def _is_stale_keepalive(exc: Exception) -> bool:
+    """The device closed a pooled connection while we were reusing it. Normal
+    and expected — embedded servers reap idle sockets aggressively — so it must
+    cost one silent retry, never a 502 the tech sees."""
+    import httpx
+    return isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError,
+                            httpx.WriteError, httpx.ConnectError))
+
+
+async def _fetch_once(client, req: dict) -> tuple[int, list, bytes]:
+    scheme = req.get("scheme") or "http"
+    url = (f"{scheme}://{req['device_ip']}:{int(req.get('device_port') or 80)}"
+           f"{req.get('path') or '/'}")
+    raw = base64.b64decode(req["body_b64"]) if req.get("body_b64") else None
+    resp = await client.request(req.get("method") or "GET", url, content=raw,
+                                headers=req.get("headers") or {})
+    # Pairs, not a dict — repeated names (multiple Set-Cookie) must survive the
+    # wire. httpx already decompressed .content; central drops Content-Encoding.
+    return resp.status_code, resp.headers.multi_items(), resp.content
+
+
+def make_pooled_fetch(pool: _ClientPool) -> Fetcher:
+    async def _fetch(req: dict, cfg: Config) -> tuple[int, list, bytes]:
+        scheme = req.get("scheme") or "http"
+        ip = req["device_ip"]
+        port = int(req.get("device_port") or 80)
+        method = (req.get("method") or "GET").upper()
+        client = await pool.get(scheme, ip, port)
+        try:
+            return await _fetch_once(client, req)
+        except Exception as exc:
+            # A pooled connection the device had already closed is the one
+            # failure worth swallowing, and ONLY for a request it is safe to
+            # repeat: a POST that died without a reply may still have been
+            # applied, and re-submitting a config write is worse than a 502.
+            if method in ("GET", "HEAD") and _is_stale_keepalive(exc):
+                await pool.drop(scheme, ip, port)
+                try:
+                    client = await pool.get(scheme, ip, port)
+                    return await _fetch_once(client, req)
+                except Exception as retry_exc:
+                    exc = retry_exc
+            raise DeviceFetchError(
+                _friendly_fetch_error(exc, ip, port, scheme),
+                connect_failure=_is_connect_failure(exc)) from exc
+    return _fetch
+
+
+async def _default_fetch(req: dict, cfg: Config) -> tuple[int, list, bytes]:
+    """Unpooled single fetch — the seam tests inject around, and the fallback
+    for a tunnel built without a pool."""
     import httpx
     scheme = req.get("scheme") or "http"
     ip = req["device_ip"]
     port = int(req.get("device_port") or 80)
-    url = f"{scheme}://{ip}:{port}{req.get('path') or '/'}"
-    raw = base64.b64decode(req["body_b64"]) if req.get("body_b64") else None
-    # Split timeout: a LAN device either accepts the connection within a few
-    # seconds or never will — the long proxy_request_timeout_s is for slow
-    # PAGES, not dead sockets. Without the split, a wrong scheme/port made the
-    # operator wait out the full 30s to learn anything.
     timeout = httpx.Timeout(cfg.proxy_request_timeout_s,
                             connect=cfg.proxy_connect_timeout_s)
     try:
         async with httpx.AsyncClient(verify=False, follow_redirects=False,
                                      timeout=timeout) as client:
-            resp = await client.request(req.get("method") or "GET", url, content=raw,
-                                        headers=req.get("headers") or {})
+            return await _fetch_once(client, req)
     except Exception as exc:
         raise RuntimeError(_friendly_fetch_error(exc, ip, port, scheme)) from exc
-    # Pairs, not a dict — repeated names (multiple Set-Cookie) must survive the
-    # wire. httpx already decompressed .content; central drops Content-Encoding.
-    return resp.status_code, resp.headers.multi_items(), resp.content
 
 
 class ProxyTunnel:
@@ -175,7 +395,12 @@ class ProxyTunnel:
         self._client = client
         self._cfg = cfg
         self._devices = devices_provider
-        self._fetch = fetcher or _default_fetch
+        # An injected fetcher (tests, and any future transport) stands entirely
+        # on its own — it gets no pool, because a double is not something we
+        # should be holding connections for.
+        self._pool = _ClientPool(cfg) if fetcher is None else None
+        self._fetch = fetcher or make_pooled_fetch(self._pool)
+        self._gate = _DeviceGate(cfg)
         self._probe = prober or _default_probe
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -255,6 +480,8 @@ class ProxyTunnel:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
+        if self._pool is not None:
+            await self._pool.aclose()
 
     def _worker_deadline(self, idx: int) -> float:
         # slot 0 outlives the session pool while standby is armed
@@ -313,9 +540,18 @@ class ProxyTunnel:
             if port not in _allowed_ports(self._cfg):
                 await self._reply_error(sid, req_id, f"port {port} not permitted")
                 return
+        # Bound what this ONE box has in flight. Held across the fetch only —
+        # the reply upload to central must not sit on a device's slot.
         try:
-            status, headers, body = await self._fetch(req, self._cfg)
+            async with self._gate.semaphore(ip, port):
+                status, headers, body = await self._fetch(req, self._cfg)
         except Exception as exc:  # a dead/slow device must not kill the worker
+            if getattr(exc, "connect_failure", False) and self._gate.demote(ip, port):
+                log.info("web-proxy: %s:%d refused a connection — narrowing to "
+                         "%d concurrent request(s)", ip, port,
+                         self._gate.limit(ip, port))
+                if self._pool is not None:
+                    await self._pool.drop(req.get("scheme") or "http", ip, port)
             await self._reply_error(sid, req_id, str(exc)[:300])
             return
         b64 = base64.b64encode(body).decode()

@@ -3,31 +3,36 @@
 // Health/Optical/Ports panel the Network tree uses. Placement is dashboard-side
 // only (lat/lng on org_devices) — the edge never sees coordinates.
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { useNavigate } from "react-router-dom"
+import {
+  useLocation as useNavLocation, useNavigate, useSearchParams,
+} from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import L from "leaflet"
 import { Circle, MapContainer, Marker, Polyline, ZoomControl } from "react-leaflet"
 import "leaflet/dist/leaflet.css"
 import {
-  ArrowDown, ArrowLeftRight, ArrowUp, Check, ChevronRight, Copy, Crosshair, Expand, EyeOff,
-  Layers, ListTree, LocateFixed, MapPin, Maximize2, Navigation, Pencil, Shrink, Slash, Spline,
-  Undo2, X,
+  ArrowDown, ArrowLeftRight, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Crosshair,
+  Expand, EyeOff, Layers, ListTree, LocateFixed, MapPin, Maximize2, Navigation, Pencil,
+  Shrink, Slash, Spline, Undo2, Users, X,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDarkMode } from "@/hooks/use-dark-mode"
 import { useNow } from "@/hooks/use-now"
+import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
 import { inventoryApi, orgsApi, ApiError } from "@/lib/api"
 import { mapRegionOf } from "@/lib/map-regions"
-import { type OrgDevice, type PonFault } from "@/lib/types"
-import { DeviceDetail, DeviceMetrics, RowTag, deviceTabs, type DeviceTab } from "@/components/device-detail"
+import { isPassiveType, type OnuPlace, type OrgDevice, type PonFault } from "@/lib/types"
+import {
+  DeviceDetail, DevicePanelHeader, RowTag, deviceTabs, type DeviceTab,
+} from "@/components/device-detail"
 import { NeedsOrg } from "@/components/needs-org"
 import { StatusDot } from "@/components/status-badge"
 import { durationSince } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
   DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -35,8 +40,8 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 
 import {
-  BASEMAP_KEY, BASEMAP_LABEL, GOOGLE_BASEMAPS, GoogleLayer, StreetsTiles,
-  loadBasemap, type Basemap,
+  AttributionPrefix, BASEMAP_KEY, BASEMAP_LABEL, GOOGLE_BASEMAPS, GoogleLayer,
+  StreetsTiles, loadBasemap, type Basemap,
 } from "@/map/basemaps"
 import { buildClusters, clusterIcon, project, toneRank, type SiteCluster } from "@/map/clusters"
 import { cutIcon, pointAlong, ponPath, subPath } from "@/map/cut"
@@ -47,10 +52,42 @@ import { bindLinkPorts, linkBwIcon, linkKey, linkLabelPos, type LinkBinding } fr
 import {
   isDownState, isPlaced, isTrouble, meIcon, pinIcon, pinTone, vertexIcon, type Placed,
 } from "@/map/pins"
-import { MapSearch, type PlaceHit } from "@/map/search"
+import {
+  REF_DASH, isRefDark, refBwIcon, refHasRate, refLineTone, refOnuIcon, refZIndex,
+} from "@/map/refonu"
+import {
+  DROP_DASH, branchIcon, dropAnchor, dropTone, loadsById, passiveSubLabel,
+  passiveTitle,
+} from "@/map/drops"
+import { MapSearch, type OnuHit, type PlaceHit } from "@/map/search"
 import { FIT_PADDING, MapEvents, ViewController, loadView } from "@/map/view"
 
 const BW_LABELS_KEY = "wisp:map:bw-labels"
+const REF_ONUS_KEY = "wisp:map:ref-onus"
+const GOOGLE_LABELS_KEY = "wisp:map:google-labels"
+
+/** Reference ONUs only render from street zoom in.
+ *
+ *  They are subscriber drops — a dozen of them sit inside one town, so zoomed
+ *  out their marks, dotted OLT lines and rate chips pile onto the same few
+ *  pixels as the plant they are subordinate to, and the map stops showing the
+ *  gear it exists to show. Same argument as the layer being off by default,
+ *  applied to distance rather than to preference: at z<15 the line to the OLT
+ *  is a few pixels long and tells nobody anything. Deliberately NOT a cluster
+ *  fold — these are not plant, and a badge counting subscribers with devices
+ *  would be a count of two different things (`clusters.ts` skips them). */
+const REF_ONU_MIN_ZOOM = 16
+
+/** Which PON bucket a located subscriber falls in, for the focus filter.
+ *
+ *  ONE definition, used by the filter AND by the picker that drives it: a
+ *  subscriber whose `pon_port` the walk never carried is still somebody's drop,
+ *  and if the two sides spelled its bucket differently, ticking a PON would hide
+ *  pins the operator was asking to see. */
+const ponKey = (p: OnuPlace): string => p.pon_port ?? "—"
+
+/** one PON of one OLT, as the focus picker and the status strip count it */
+interface PonRow { pon: string; total: number; dark: number }
 
 /** how much wider the dark casing runs than the link stroke it backs */
 const CASING_OVER = 3
@@ -102,11 +139,31 @@ export function MapPage() {
   // dark_all). Reactive off the <html> class, since the theme has no provider.
   const dark = useDarkMode()
   const navigate = useNavigate()
+  const navLocation = useNavLocation()
+  const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
   const mapRef = useRef<L.Map | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detailTab, setDetailTab] = useState<DeviceTab>("health")
+  // An ONU to open when the Optical tab does, carried WITH the device it belongs
+  // to: the panel is shared by every pin, and a focus left over from another OLT
+  // would highlight an unrelated row. Addressed by MAC — the reference-ONU list
+  // carries the ONU's SLOT number, not its optics row id, and the MAC is what
+  // this whole feature is keyed on anyway.
+  const [detailOnu, setDetailOnu] = useState<{ deviceId: number; mac: string } | null>(null)
   const [placingId, setPlacingId] = useState<number | null>(null)
+  // Placing a REFERENCE ONU (map/refonu.ts) — a second placement target, armed
+  // from the Optical tab's dialog via nav state. Kept separate from placingId
+  // rather than made a union: they write different tables, and a stray click
+  // must never save an ONU's coordinates onto a device row.
+  const [placingOnu, setPlacingOnu] = useState<{ mac: string; label: string } | null>(null)
+  const [selectedOnuMac, setSelectedOnuMac] = useState<string | null>(null)
+  // A subscriber focus whose flight is still in the air. `zoom` state only
+  // lands at zoomend, so for the length of a flyTo the visibility guard below
+  // would judge the pin we are flying TO against the zoom we are flying FROM —
+  // and close its card before it ever drew. Cleared by the first zoom report
+  // after arrival, which is also the first moment the guard can judge fairly.
+  const [focusFlying, setFocusFlying] = useState(false)
   const [placeOpen, setPlaceOpen] = useState(false)
   // drawing a cable path for one link: clicks append vertices, drags adjust
   const [routeEdit, setRouteEdit] = useState<{
@@ -127,6 +184,18 @@ export function MapPage() {
   const [coordsText, setCoordsText] = useState("")
   const [basemap, setBasemap] = useState<Basemap>(loadBasemap)
   const [layersOpen, setLayersOpen] = useState(false)
+  // Reference ONUs are OFF by default and remembered per browser: they are
+  // subordinate detail, and an operator who placed forty of them shouldn't have
+  // the plant buried under subscriber marks on every visit.
+  const [refOnus, setRefOnus] = useState(() => {
+    try { return localStorage.getItem(REF_ONUS_KEY) === "on" } catch { return false }
+  })
+  const toggleRefOnus = () => {
+    setRefOnus((v) => {
+      try { localStorage.setItem(REF_ONUS_KEY, v ? "off" : "on") } catch { /* private mode */ }
+      return !v
+    })
+  }
   // per-link ↓/↑ chips off the bound ports; on unless the operator switched
   // them off (Layers popover) — an org with no bindings simply shows none
   const [bwLabels, setBwLabels] = useState(() => {
@@ -135,6 +204,20 @@ export function MapPage() {
   const toggleBwLabels = () => {
     setBwLabels((v) => {
       try { localStorage.setItem(BW_LABELS_KEY, v ? "off" : "on") } catch { /* private mode */ }
+      return !v
+    })
+  }
+  // Google's OWN place names and POI markers. On by default (a basemap with no
+  // writing on it is disorienting until you ask for it) and remembered per
+  // browser, like every other layer choice here. Roadmap only — a satellite
+  // session carries no labels in the first place, so the menu doesn't offer a
+  // switch that would do nothing.
+  const [googleLabels, setGoogleLabels] = useState(() => {
+    try { return localStorage.getItem(GOOGLE_LABELS_KEY) !== "off" } catch { return true }
+  })
+  const toggleGoogleLabels = () => {
+    setGoogleLabels((v) => {
+      try { localStorage.setItem(GOOGLE_LABELS_KEY, v ? "off" : "on") } catch { /* private mode */ }
       return !v
     })
   }
@@ -193,6 +276,68 @@ export function MapPage() {
     return m
   }, [routesQ.data])
 
+  // Reference ONUs: operator-vouched, reliably-powered subscribers. Fetched
+  // whenever the layer is on OR a placement is armed (the arming navigation can
+  // land before the toggle is flipped, and the banner needs the current set to
+  // tell "move this point" from "add it").
+  // A subscriber the caller asked us to go and show (survey "View on map", ONU
+  // search). Held until the places load, then consumed by the effect below —
+  // arriving before the data is the normal case, not the edge one.
+  const [focusOnuMac, setFocusOnuMac] = useState<string | null>(null)
+  // FOCUS: show the subscribers of ONE OLT, optionally of ONE PON — and nothing
+  // else. The layer's only control used to be all-or-nothing, which does not
+  // match how a fault arrives: "EPON0/4 has five crit ONUs" is a question about
+  // one PON, and answering it by drawing every subscriber in the fleet and
+  // hunting for the right diamonds is not answering it. Scoping is also what
+  // makes the layer usable on a growing fleet at all — thousands of drops is a
+  // texture, not a map.
+  //
+  // Deliberately SEPARATE from the `refOnus` toggle rather than a third value of
+  // it: the toggle is the operator's standing preference (remembered), a scope
+  // is what they are working on right now. Clearing the scope must put the map
+  // back the way they keep it, not decide for them.
+  //
+  // `pons` is a SET, and an EMPTY one means every PON on that OLT — not "no
+  // PONs", which would be a focus that draws nothing. Multi-select was the
+  // operator's explicit call over the original one-PON-at-a-time chips: a
+  // splitter cascade and a feeder often carry two or three PONs of one village,
+  // and answering "is this the whole area or just that PON" meant clicking
+  // between them from memory. The map is the one screen where holding two PONs
+  // side by side is the question.
+  const [onuScope, setOnuScope] = useState<{ deviceId: number; pons: string[] } | null>(null)
+  const placesQ = useQuery({
+    queryKey: ["onu-places", scopeOrg],
+    queryFn: () => inventoryApi.onuPlaces(scopeOrg),
+    // …and whenever a device panel is OPEN, which is not a display need but a
+    // DISCOVERY one: the panel's "N located · Show on map" row is the way into
+    // the focus, and it is drawn from this list. Gating it on the layer already
+    // being on made the entry point appear only for operators who had found the
+    // layer some other way — an affordance you must already know about is not
+    // one. One cached request per map session (staleTime 60s).
+    enabled: !!scopeOrg && (refOnus || onuScope != null || placingOnu != null
+      || focusOnuMac != null || selectedId != null),
+    staleTime: 60_000,
+  })
+  const places = placesQ.data?.places ?? []
+
+  const setOnuPlace = useMutation({
+    // org_id is REQUIRED, not optional: a superadmin's own org_id is NULL, so
+    // the scope it is viewing is the only thing that says which org owns the
+    // point. Same reason setTagColor takes one.
+    mutationFn: ({ mac, lat, lng, label }: {
+      mac: string; lat: number | null; lng: number | null; label?: string | null
+    }) => inventoryApi.setOnuPlace({ mac, lat, lng, label, org_id: scopeOrg }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["onu-places"] })
+      // a reference point is an input to the PON-fault verdict, not decoration
+      queryClient.invalidateQueries({ queryKey: ["pon-faults"] })
+      queryClient.invalidateQueries({ queryKey: ["pon-summary"] })
+      queryClient.invalidateQueries({ queryKey: ["optics"] })
+    },
+    onError: (e) => toast.error(
+      `Couldn't save the reference point${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
   // which port carries each link (device panel → Uplinks) + its live rates —
   // rates move on the SNMP walk cadence, which SSE doesn't cover
   const linkPortsQ = useQuery({
@@ -211,6 +356,23 @@ export function MapPage() {
     enabled: !!scopeOrg,
     refetchInterval: 30_000,
   })
+  // Subscriber drops: what hangs off each splitter, and which span went dark.
+  // Always fetched (not gated on the reference-ONU layer) — this is PLANT, not
+  // a subscriber overlay: it decides how loud a splitter pin is and where the
+  // branch-fault overlay paints, both of which are map furniture rather than an
+  // opt-in extra. The reply is one row per passive, not per subscriber, so it
+  // stays small on a fleet with thousands of ONUs.
+  const dropsQ = useQuery({
+    queryKey: ["drops", scopeOrg],
+    queryFn: () => inventoryApi.drops(scopeOrg),
+    enabled: !!scopeOrg,
+    refetchInterval: 30_000,
+  })
+  const loadByPassive = useMemo(
+    () => loadsById(dropsQ.data?.splitters), [dropsQ.data])
+  const branchFaults = useMemo(
+    () => dropsQ.data?.faults ?? [], [dropsQ.data])
+
   // outage-wave shape (power vs upstream) — annotation only, never a mute
   const incidentsQ = useQuery({
     queryKey: ["incidents", scopeOrg],
@@ -259,6 +421,71 @@ export function MapPage() {
   }, [clusters])
   // the cluster the site card is showing; a 1-member resolution means the
   // cluster split honestly at this zoom, so there's nothing to list
+  const selectedRef = useMemo(
+    () => (selectedOnuMac == null ? null
+      : places.find((p) => p.mac === selectedOnuMac) ?? null),
+    [places, selectedOnuMac])
+
+  // The layer is on AND we're close enough for it to mean anything. Two
+  // exceptions, both cases where the operator has named what they want to see:
+  // while a reference point is being placed the existing ones are what they are
+  // aiming between, and a SCOPED set is bounded and was asked for by name — so
+  // it ignores the zoom floor, which exists to stop a fleet's worth of pins, not
+  // to hide one OLT's dozen.
+  const refVisible = (refOnus && zoom >= REF_ONU_MIN_ZOOM)
+    || onuScope != null || placingOnu != null
+  // What the layer actually draws. A scope NARROWS; it never adds.
+  const shownPlaces = useMemo(() => {
+    if (!onuScope) return places
+    const { deviceId, pons } = onuScope
+    return places.filter((p) => p.device_id === deviceId
+      && (pons.length === 0 || pons.includes(ponKey(p))))
+  }, [places, onuScope])
+  // Located subscribers per OLT — what makes the panel able to say "12 located"
+  // instead of offering a focus that would draw nothing.
+  const placedByOlt = useMemo(() => {
+    const m = new Map<number, number>()
+    for (const p of places)
+      if (p.device_id != null) m.set(p.device_id, (m.get(p.device_id) ?? 0) + 1)
+    return m
+  }, [places])
+  // The PON rows, per OLT. Built from the PLACED subscribers, not from the
+  // OLT's PON list: a row for a PON nobody has surveyed would filter to an empty
+  // map and read as "this PON is dark". The dark count is what makes them worth
+  // having during a cut — it is the PON to open first.
+  //
+  // Computed for EVERY OLT, not just the scoped one, because the device panel's
+  // picker has to offer the choice BEFORE a focus exists.
+  const ponsByOlt = useMemo(() => {
+    const m = new Map<number, Map<string, PonRow>>()
+    for (const p of places) {
+      if (p.device_id == null) continue
+      let pons = m.get(p.device_id)
+      if (!pons) { pons = new Map(); m.set(p.device_id, pons) }
+      const pon = ponKey(p)
+      const row = pons.get(pon) ?? { pon, total: 0, dark: 0 }
+      row.total += 1
+      if (isRefDark(p)) row.dark += 1
+      pons.set(pon, row)
+    }
+    return new Map([...m].map(([id, pons]) => [id, [...pons.values()]
+      .sort((a, b) => a.pon.localeCompare(b.pon, undefined, { numeric: true }))]))
+  }, [places])
+  const scopePons = onuScope ? ponsByOlt.get(onuScope.deviceId) ?? [] : []
+  // Zooming out past the threshold takes the pin off the map, so the card it
+  // opened has to go with it — a detail card floating over nothing is the
+  // "shows a thing that isn't there" failure this layer is careful about. A
+  // scope that filters the selected pin away is the same failure by a different
+  // route, so it is the DRAWN set that decides, not visibility alone.
+  useEffect(() => {
+    if (selectedOnuMac == null) return
+    // A scope (or a vanished row) closes the card at once — that pin is not
+    // being drawn and never will be. The ZOOM half waits out an in-flight
+    // focus: the operator named this subscriber, and the map is on its way.
+    const drawn = shownPlaces.some((p) => p.mac === selectedOnuMac)
+    if (!drawn || (!refVisible && !focusFlying)) setSelectedOnuMac(null)
+  }, [refVisible, shownPlaces, selectedOnuMac, focusFlying])
+
   const siteCluster = useMemo(() => {
     if (siteAnchor == null) return null
     const c = clusters.find((x) => x.members.some((m) => m.id === siteAnchor))
@@ -380,15 +607,138 @@ export function MapPage() {
     const map = mapRef.current
     map?.flyTo([p.lat, p.lng], Math.max(map.getZoom(), 14))
   }
+  // Search picked a SUBSCRIBER (sticker MAC or the customer name a tech typed).
+  // A located one flies to its pin, with the layer switched on — arriving at a
+  // map that isn't drawing the thing you asked for reads as a broken search.
+  //
+  // An unplaced one says so and stops. It deliberately does NOT arm placement
+  // the way an unplaced DEVICE does: dropping a device pin records a
+  // coordinate, but dropping one HERE writes a REFERENCE ONU — the operator's
+  // claim that this subscriber's power is reliable, which flips a dark PON from
+  // "fibre cut, roll a crew" to "area power cut". That claim is made from the
+  // Optical tab's dialog or the field survey, where the contract is stated,
+  // never as the side effect of typing a MAC into a search box.
+  const searchOnu = (hit: OnuHit) => {
+    if (!hit.place) {
+      toast.info(`${hit.who} has no location recorded yet`,
+                 { description: `In the roster on ${hit.where} — record where it stands from Survey.` })
+      return
+    }
+    if (!refOnus) toggleRefOnus()
+    flyToOnu(hit.place)
+  }
 
   // Initial view: last saved per org, else fit every placed pin once they load,
   // else a wide world view a first-time org can zoom from.
   const initialView = useMemo(() => loadView(scopeOrg), [scopeOrg])
 
+  // Arrive from the Optical tab's "Pick on map" with a reference ONU armed.
+  // Consumed once and cleared off the history entry, or a back-navigation (or a
+  // reload) would silently re-arm placement and the next map click would move a
+  // point the operator only meant to look at.
   useEffect(() => {
-    if (placingId == null && routeEdit == null) return
+    const armed = (navLocation.state as { placeOnu?: { mac: string; label: string } } | null)
+      ?.placeOnu
+    if (!armed?.mac) return
+    setPlacingOnu({ mac: armed.mac, label: armed.label ?? "" })
+    setSelectedId(null)
+    setPlaceOpen(false)
+    navigate(navLocation.pathname, { replace: true, state: null })
+  }, [navLocation.state, navLocation.pathname, navigate])
+
+  // "Take me to this subscriber" — `?onu=<mac>`, a QUERY param rather than nav
+  // state because the whole point is that it survives being shared, bookmarked
+  // and reloaded (nav state does not). Placing a pin and then not being able to
+  // find it is what this exists to fix: the subscriber layer is off by default
+  // and only draws from street zoom, so without a way in, a fresh placement is
+  // invisible on both counts.
+  const onuParam = searchParams.get("onu")
+  useEffect(() => {
+    if (!onuParam) return
+    setFocusOnuMac(onuParam.trim().toUpperCase())
+    // Turning the layer ON is part of the ask: arriving at a map that is not
+    // drawing the thing you asked to see reads as a broken link.
+    if (!refOnus) toggleRefOnus()
+    setSearchParams((prev) => {
+      // A FRESH instance — mutating the one useSearchParams returns edits
+      // react-router's memoized object, so the value a render reads moves
+      // without the reference the memo is keyed on changing.
+      const next = new URLSearchParams(prev)
+      next.delete("onu")
+      return next
+    }, { replace: true })
+    // refOnus is read fresh each render; re-running on it would re-arm the focus
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onuParam, setSearchParams])
+
+  // Focus the layer on one OLT (and optionally a chosen set of its PONs), then
+  // FRAME what that leaves on screen. The fit is the half that makes this feel
+  // like a focus rather than a filter: scoping to a PON whose subscribers are
+  // three villages away, and leaving the viewport where it was, shows an empty
+  // map and reads as "nothing here". `maxZoom` keeps a single-subscriber PON
+  // from slamming to street level, where there is no context to place it in.
+  //
+  // An EMPTY `pons` is every PON, never none — un-ticking the last one has to
+  // land on "the whole OLT", not on a focus that draws nothing and reads as a
+  // dark fleet.
+  const scopeOnus = useCallback((deviceId: number, pons: string[]) => {
+    setOnuScope({ deviceId, pons })
+    setSelectedOnuMac(null)
+    const pts = places.filter((p) => p.device_id === deviceId
+      && (pons.length === 0 || pons.includes(ponKey(p))))
+    const olt = byId.get(deviceId)
+    const all: Array<[number, number]> = pts.map((p) => [p.lat, p.lng])
+    // Include the OLT itself so the picture is "these drops, off that box" —
+    // the association line to it is most of what the layer is saying.
+    if (olt && isPlaced(olt)) all.push([olt.lat, olt.lng])
+    if (all.length > 0 && mapRef.current)
+      mapRef.current.flyToBounds(L.latLngBounds(all), { ...FIT_PADDING, maxZoom: 17 })
+  }, [places, byId])
+
+  // Tick one PON on or off. Re-fits every time, so the map keeps answering
+  // "what does this selection look like" while the menu is still open — that
+  // live re-frame is most of why comparing two PONs is worth having.
+  const toggleScopePon = useCallback((deviceId: number, pon: string) => {
+    const cur = onuScope?.deviceId === deviceId ? onuScope.pons : []
+    scopeOnus(deviceId, cur.includes(pon) ? cur.filter((x) => x !== pon) : [...cur, pon])
+  }, [onuScope, scopeOnus])
+
+  // Go to ONE subscriber's pin and open its card. Shared by the `?onu=` deep
+  // link and the search box, so a subscriber found two different ways lands the
+  // same way — a lookup that leaves you somewhere else than the link does is
+  // how an operator stops trusting either.
+  const flyToOnu = useCallback((p: OnuPlace) => {
+    // A focus on some OTHER OLT would filter away the very subscriber that was
+    // asked for — the same "arrived at a map not drawing the thing you asked to
+    // see" failure the layer toggle avoids.
+    setOnuScope(null)
+    // Past REF_ONU_MIN_ZOOM deliberately — the layer's zoom floor would
+    // otherwise leave us hovering over a pin that refuses to draw.
+    const map = mapRef.current
+    map?.flyTo([p.lat, p.lng], Math.max(map.getZoom(), REF_ONU_MIN_ZOOM + 1))
+    setFocusFlying(true)
+    setSelectedId(null)
+    setSelectedOnuMac(p.mac)
+  }, [])
+
+  // Consume the focus once the places are in hand.
+  useEffect(() => {
+    if (!focusOnuMac || places.length === 0) return
+    const hit = places.find((p) => p.mac === focusOnuMac)
+    setFocusOnuMac(null)
+    if (!hit) {
+      toast.info("That subscriber doesn't have a location yet")
+      return
+    }
+    flyToOnu(hit)
+  }, [focusOnuMac, places, flyToOnu])
+
+  useEffect(() => {
+    if (placingId == null && routeEdit == null && placingOnu == null) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setPlacingId(null); setRouteEdit(null); return }
+      if (e.key === "Escape") {
+        setPlacingId(null); setRouteEdit(null); setPlacingOnu(null); return
+      }
       // Ctrl/⌘-Z pops the last waypoint. Nothing focusable is on screen while a
       // route is being drawn (the device panel is hidden), but guard anyway so a
       // field that does get focus keeps its native undo.
@@ -401,20 +751,31 @@ export function MapPage() {
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [placingId, routeEdit])
+  }, [placingId, placingOnu, routeEdit])
 
   const onMapClick = useCallback((ll: L.LatLng) => {
     if (routeEdit != null) {
       setRouteEdit((re) => re && { ...re, points: [...re.points, [ll.lat, ll.lng]] })
+    } else if (placingOnu != null) {
+      setOnuPlace.mutate({ mac: placingOnu.mac, lat: ll.lat, lng: ll.lng,
+                           label: placingOnu.label || null })
+      // switch the layer on, or the point the operator just placed isn't drawn
+      if (!refOnus) toggleRefOnus()
+      setSelectedOnuMac(placingOnu.mac)
+      setPlacingOnu(null)
     } else if (placingId != null) {
       setLocation.mutate({ id: placingId, lat: ll.lat, lng: ll.lng })
       setSelectedId(placingId)
       setPlacingId(null)
     } else {
       setSelectedId(null)
+      setSelectedOnuMac(null)
       setSiteAnchor(null)
     }
-  }, [placingId, routeEdit, setLocation])
+    // toggleRefOnus/setOnuPlace are stable enough for this handler's purpose;
+    // refOnus is read fresh each render so the deps below cover the branch
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [placingId, placingOnu, refOnus, routeEdit, setLocation])
 
   // Drag-snap: existing near-stacks (pins dropped "close enough" by eye) are
   // exactly what made the old fan misleading — dropping a pin within a badge
@@ -480,7 +841,9 @@ export function MapPage() {
     return () => document.removeEventListener("fullscreenchange", onFs)
   }, [])
 
-  const onZoom = useCallback((z: number) => { setZoom(z); setLowZoom(z < 12) }, [])
+  const onZoom = useCallback((z: number) => {
+    setZoom(z); setLowZoom(z < 12); setFocusFlying(false)
+  }, [])
 
   // Click a folded site: members genuinely spread out → zoom to them and let
   // the cluster split on its own; truly co-located (a rack) → the site card.
@@ -658,12 +1021,21 @@ export function MapPage() {
   }
   const editingChild = routeEdit ? byId.get(routeEdit.childId) : null
   const editingParent = routeEdit ? byId.get(routeEdit.parentId) : null
+  // `open` must match when the Card actually RENDERS (route editing replaces it),
+  // or the control column would slide aside for a panel that isn't there. Its own
+  // stored width and a tighter ceiling than the Network page's: this panel floats
+  // over the map it's read against, and past ~halfway it stops being a panel on a
+  // map and becomes a map behind a panel.
+  const panel = useResizablePanel({
+    storageKey: "wisp:map:panelw", defaultWidth: 380, min: 320, max: 620,
+    open: !!selected && !routeEdit,
+  })
 
   return (
     // header is h-14 (3.5rem); the mobile tab bar overlays the bottom ~4rem
-    <div ref={wrapRef} className={cn(
+    <div ref={wrapRef} style={panel.vars} className={cn(
       "wisp-map-wrap relative h-[calc(100svh-3.5rem-4rem)] md:h-[calc(100svh-3.5rem)]",
-      placingId != null && "wisp-map-placing",
+      (placingId != null || placingOnu != null) && "wisp-map-placing",
       lowZoom && "wisp-map-lowzoom",
     )}>
       <MapContainer
@@ -675,15 +1047,18 @@ export function MapPage() {
         className="wisp-map h-full w-full"
         worldCopyJump
       >
+        <AttributionPrefix />
         {googleActive ? (
           <GoogleLayer
-            // dark is in the key as well as the prop: the styled roadmap is a
-            // different SESSION, so a theme flip has to remount the layer, not
-            // just re-render it
-            key={`google-${GOOGLE_BASEMAPS[basemap]}-${dark ? "night" : "day"}`}
+            // dark and labels are in the key as well as the props: each styled
+            // roadmap is a different SESSION, so flipping one has to remount the
+            // layer, not just re-render it
+            key={`google-${GOOGLE_BASEMAPS[basemap]}-${dark ? "night" : "day"}`
+              + `-${googleLabels ? "lbl" : "nolbl"}`}
             apiKey={googleKey!}
             mapType={GOOGLE_BASEMAPS[basemap]}
             dark={dark}
+            labels={googleLabels}
             onFail={onGoogleFail}
           />
         ) : (
@@ -904,15 +1279,37 @@ export function MapPage() {
           const d = c.members[0]
           const dim = troubleOnly && !isTrouble(d) && d.id !== selectedId
           const impact = downstream.has(d.id)
+          // Passive plant carries its own second channel: the split ratio and
+          // what its recorded subscribers are doing. Gear is unchanged — a
+          // switch has a state of its own and doesn't need borrowing one.
+          const passive = isPassiveType(d.device_type)
+          const load = passive ? loadByPassive.get(d.id) : undefined
           return (
             <Marker
               key={d.id}
               position={[d.lat, d.lng]}
-              icon={pinIcon(d, { selected: d.id === selectedId, dim, impact })}
+              icon={pinIcon(d, {
+                selected: d.id === selectedId, dim, impact,
+                sub: passive ? passiveSubLabel(d, load) : null,
+                dropTone: passive ? dropTone(load) : undefined,
+                title: passive ? passiveTitle(d, load) : undefined,
+              })}
               draggable={editPins && canWrite}
               eventHandlers={{
                 click: () => {
                   if (routeEdit != null) return
+                  // Placing a reference ONU onto a device pin means "at that
+                  // site" — the common real case, since the subscriber whose
+                  // power is reliable is often the tower the gear is on.
+                  if (placingOnu != null) {
+                    setOnuPlace.mutate({ mac: placingOnu.mac, lat: d.lat, lng: d.lng,
+                                         label: placingOnu.label || null })
+                    if (!refOnus) toggleRefOnus()
+                    toast.success(`Reference point at ${d.name}`)
+                    setSelectedOnuMac(placingOnu.mac)
+                    setPlacingOnu(null)
+                    return
+                  }
                   // placement mode: a tap on an existing pin means "same spot"
                   // — start the rack deliberately instead of eyeballing it
                   if (placingId != null) {
@@ -944,6 +1341,163 @@ export function MapPage() {
             />
           )
         })}
+        {/* Reference ONUs — a subordinate layer, off by default. Rendered AFTER
+            the device pins so a same-coordinate subscriber can't sit on top of
+            the gear, and deliberately outside the clustering pass: they are not
+            plant, and folding them into a site badge would make a count that
+            mixes infrastructure with subscribers. */}
+        {refVisible && shownPlaces.map((p) => {
+          // The line from a subscriber to the plant it hangs off.
+          //
+          // It ends at the SPLITTER whose drop feeds it — an ISP connects a
+          // customer to the nearest splitter, and there may be a second one
+          // between that and the OLT, so a line drawn straight to the OLT skips
+          // the whole distribution network a crew works on. The splitter's own
+          // chain upward is already on the map as passive plant with drawn
+          // routes, so this hop is the only one missing.
+          //
+          // When no drop has been recorded it still falls back to the OLT, and
+          // renders WEAKER for it: a reference point must not vanish because
+          // its plant is undocumented, but "routed through its splitter" and
+          // "we only know the PON" may not look alike.
+          const anchor = dropAnchor(p.drop_passive_id, p.device_id, byId)
+          if (!anchor) return null
+          const to = anchor.device as Placed
+          const viaSplitter = anchor.kind === "splitter"
+          const pts: Array<[number, number]> = [[to.lat, to.lng], [p.lat, p.lng]]
+          const tone = refLineTone(p)
+          // Sized to the TOPOLOGY lines (a feed is 2.5, a peer 2, a selected
+          // path 3.5) rather than to a rank below them. Twice now this layer has
+          // been drawn subordinate and come back unreadable — the first cut was
+          // weight 1 at 0.3 opacity, the second 1.5 at 0.5 — and a line nobody
+          // can see on satellite imagery ranks below everything by default. The
+          // RANKING that carries meaning is the DASH, not the weight: these stay
+          // dotted, so they still read as "logical association, not traced
+          // fibre" at any width. Ordering within the layer survives too — a dark
+          // span is heaviest, a recorded drop next, the OLT guess lightest.
+          const refWeight = tone === "dark" ? 4.5 : viaSplitter ? 3.5 : 2.5
+          const refDash = viaSplitter ? DROP_DASH : REF_DASH
+          return (
+            <Fragment key={`refline:${p.mac}`}>
+              {/* Casing, the same treatment every topology line gets: satellite
+                  imagery runs from near-white over fields to near-black over
+                  water inside one viewport, and no single stroke colour reads on
+                  both. This layer went without one while it was hairline-thin,
+                  which is most of why it disappeared over bright ground. FINE
+                  overhang — a round dot is mostly overhang already, and the wide
+                  casing would swallow the stroke it exists to protect. */}
+              <Polyline
+                positions={pts}
+                interactive={false}
+                pathOptions={{
+                  color: "#000", weight: refWeight + CASING_OVER_FINE, opacity: 0.3,
+                  dashArray: casingDash(refDash, CASING_OVER_FINE),
+                  lineCap: "round",
+                }}
+              />
+              <Polyline
+                positions={pts}
+                // MUST stay non-interactive: an interactive polyline swallows
+                // placement clicks (the map-wide rule for topology lines).
+                interactive={false}
+                className={`wisp-refline wisp-refline--${tone}`}
+                pathOptions={{
+                  color: tone === "dark" ? "var(--destructive)" : "var(--map-link)",
+                  weight: refWeight,
+                  opacity: tone === "dark" ? 0.95 : viaSplitter ? 0.9 : 0.75,
+                  // a real drop gets the tighter dash; the OLT fallback keeps the
+                  // sparser one so the two spans stay tellable apart
+                  dashArray: refDash,
+                  // Round caps so the dashes render as DOTS rather than stubby
+                  // bars — the line has to keep reading as "logical
+                  // association", never as traced fibre a crew could quote drum
+                  // off. Both dash periods were opened up alongside the weight
+                  // (see REF_DASH / DROP_DASH); a wider stroke on the old gaps
+                  // would have closed them into a solid line.
+                  lineCap: "round",
+                }}
+              />
+              {/* The rate chip rides the midpoint; no saved position, because
+                  this line has no operator-drawn geometry to slide along.
+                  Suppressed when the span is only a few pixels: routing the
+                  line through the SPLITTER made it a real drop rather than a
+                  cross-town line to the OLT, so at most zooms the chip would
+                  land on top of the pin it belongs to and hide the state that
+                  matters more than the rate. Screen space is the right unit —
+                  the same test the drawn-route/chord fallback uses. */}
+              {(() => {
+                const a = project(to.lat, to.lng, zoom)
+                const b = project(p.lat, p.lng, zoom)
+                return Math.hypot(a[0] - b[0], a[1] - b[1]) >= 56
+              })() && (
+                <Marker
+                  position={[(to.lat + p.lat) / 2, (to.lng + p.lng) / 2]}
+                  icon={refBwIcon(p)}
+                  interactive={false}
+                  zIndexOffset={-150}
+                />
+              )}
+            </Fragment>
+          )
+        })}
+        {/* Branch faults: every recorded subscriber below one passive is dark
+            while a sibling branch stays lit, so the break is in the ONE span
+            feeding it. Painted over the cable itself — drawn geometry where the
+            operator traced it, the chord where they didn't — because that span
+            is exactly what a crew drives to. Read-side only: this overlay is
+            derived from plant records and pages nobody. */}
+        {branchFaults.map((f) => {
+          const link = drawnLinks.find(
+            (l) => l.kind === "primary" && l.to.id === f.passive_id
+              && l.from.id === f.parent_id)
+          if (!link) return null
+          const box = byId.get(f.passive_id)
+          const parentBox = f.parent_id != null ? byId.get(f.parent_id) : undefined
+          if (!box || !parentBox) return null
+          // halfway ALONG the cable, not the chord's midpoint — on a traced
+          // route those are different places, and the ✂ should sit on the span
+          const mid = pointAlong(link.pts, (polyKm(link.pts) * 1000) / 2)
+          return (
+            <Fragment key={`branch:${f.passive_id}`}>
+              <Polyline
+                positions={link.pts}
+                interactive={false}
+                className={`wisp-branchspan wisp-branchspan--${f.cause}`}
+                pathOptions={{
+                  color: f.cause === "power" ? "var(--warning)" : "var(--destructive)",
+                  weight: 7, opacity: 0.3, lineCap: "round",
+                  // a power branch is a hypothesis about the grid, not a cut —
+                  // dashed so it never reads as "send the splicing crew here"
+                  dashArray: f.cause === "power" ? "10 8" : undefined,
+                }}
+              />
+              <Marker
+                position={mid}
+                icon={branchIcon(f, box.name, parentBox.name)}
+                interactive={false}
+                zIndexOffset={620}
+              />
+            </Fragment>
+          )
+        })}
+        {refVisible && shownPlaces.map((p) => (
+          <Marker
+            key={`ref:${p.mac}`}
+            position={[p.lat, p.lng]}
+            icon={refOnuIcon(p, {
+              selected: p.mac === selectedOnuMac,
+              dim: troubleOnly && !isRefDark(p),
+            })}
+            zIndexOffset={refZIndex(p, p.mac === selectedOnuMac)}
+            eventHandlers={{
+              click: () => {
+                if (routeEdit != null || placingId != null || placingOnu != null) return
+                setSelectedOnuMac(p.mac === selectedOnuMac ? null : p.mac)
+                setSelectedId(null)
+              },
+            }}
+          />
+        ))}
         {/* "you are here" from the locate button — never a click target, so it
             can't swallow placement clicks; accuracy circle only when the fix is
             tight enough to mean something at street zoom */}
@@ -981,9 +1535,15 @@ export function MapPage() {
       )}
 
       {/* search + status strip -------------------------------------------------- */}
-      <div className="pointer-events-none absolute top-3 left-3 z-[1000] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
-        <MapSearch devices={devices} bounds={region.bounds}
-          onDevice={searchDevice} onPlace={searchPlace} />
+      {/* z-[1002], one rung above every floating card on this map (all z-1000):
+          the unplaced drawer, the site card and the subscriber card all open at
+          `top-14 left-3`, which is exactly where this strip WRAPS to once the
+          focus bar joins it — and a z-index tie is broken by DOM order, so those
+          cards were burying the search results and the PON chips. A transient
+          list covering a status bar is the wrong way round. */}
+      <div className="wisp-panel-strip pointer-events-none absolute top-3 left-3 z-[1002] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
+        <MapSearch devices={devices} org={scopeOrg} bounds={region.bounds}
+          onDevice={searchDevice} onOnu={searchOnu} onPlace={searchPlace} />
         <div className="pointer-events-auto flex h-8 items-center gap-2.5 rounded-lg border border-border-strong bg-popover/95 dark:bg-popover/95 px-3 text-xs backdrop-blur">
           <span className="font-semibold">{placed.length}<span className="font-normal text-muted-foreground"> / {devices.length} on map</span></span>
           {troubles.length > 0 && (
@@ -1012,6 +1572,75 @@ export function MapPage() {
             <span className="rounded bg-muted px-1.5 py-px font-mono text-2xs">{unplaced.length}</span>
           </Button>
         )}
+        {/* subscriber focus bar ---------------------------------------------------
+            What is being shown, and the one control that narrows it further.
+
+            It lives IN the status strip, beside "Trouble only" and the on-map
+            count, rather than in the Layers popover: a map that is deliberately
+            hiding most of its content has to say so ON the map, or the next
+            person to walk up to the wall reads a scoped view as the whole
+            network. It cannot be a floating card either — `top-14 left-3` is
+            already taken by the unplaced drawer and the subscriber card, and
+            clicking a scoped pin would bury the bar under the card it opened.
+
+            Chips MULTI-select (operator's call, 2026-07-29 — they were a single
+            choice first). Two PONs of one village share a feeder and a cascade,
+            so "is the whole area out or just that PON" is a question about a
+            SET, and answering it by clicking between chips from memory is what
+            the map is supposed to spare you. "All PONs" is the empty set, not a
+            member: it CLEARS the ticks rather than being one more of them. */}
+        {onuScope && (() => {
+          const olt = byId.get(onuScope.deviceId)
+          const dark = shownPlaces.filter(isRefDark).length
+          return (
+            <div className="pointer-events-auto flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-lg border border-primary/40 bg-popover/95 dark:bg-popover/95 px-2 py-1 text-xs backdrop-blur">
+              <Users className="size-3.5 shrink-0 text-primary" />
+              <span className="max-w-40 truncate font-mono font-semibold">
+                {olt?.name ?? `OLT ${onuScope.deviceId}`}
+              </span>
+              <span className="shrink-0 text-muted-foreground">
+                {shownPlaces.length} located
+                  {/* the count that matters during a cut, and only when it is not
+                    zero — a permanent "0 dark" is noise on a healthy night */}
+                {dark > 0 && <span className="font-semibold text-destructive"> · {dark} dark</span>}
+              </span>
+              {scopePons.length > 1 && (
+                <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden />
+              )}
+              {scopePons.length > 1 && (
+                <span className="flex min-w-0 flex-wrap items-center gap-1">
+                  <button
+                    className={cn("rounded px-1.5 py-0.5 text-2xs hover:bg-foreground/5",
+                      onuScope.pons.length === 0 ? "bg-accent font-semibold" : "text-muted-foreground")}
+                    title="Every PON on this OLT"
+                    onClick={() => scopeOnus(onuScope.deviceId, [])}>
+                    All PONs
+                  </button>
+                  {scopePons.map((p) => (
+                    <button key={p.pon}
+                      title={`${p.total} located on ${p.pon}${p.dark > 0 ? ` · ${p.dark} dark` : ""}`
+                        + " · click to add or drop it from the view"}
+                      className={cn("rounded px-1.5 py-0.5 font-mono text-2xs hover:bg-foreground/5",
+                        onuScope.pons.includes(p.pon) ? "bg-accent font-semibold" : "text-muted-foreground")}
+                      onClick={() => toggleScopePon(onuScope.deviceId, p.pon)}>
+                      {p.pon}
+                        {/* dark count rides the chip, so the PON to open first is
+                          readable without clicking through every one of them */}
+                      <span className={cn("ml-1",
+                        p.dark > 0 ? "font-semibold text-destructive" : "text-faint-foreground")}>
+                        {p.dark > 0 ? p.dark : p.total}
+                      </span>
+                    </button>
+                  ))}
+                </span>
+              )}
+              <Button variant="ghost" size="icon" className="size-5 shrink-0"
+                title="Stop focusing on this OLT" onClick={() => setOnuScope(null)}>
+                <X className="size-3" />
+              </Button>
+            </div>
+          )
+        })()}
       </div>
 
       {/* power-pattern banner: the verdict a veteran reads off the wall — many
@@ -1044,6 +1673,27 @@ export function MapPage() {
           <span>Click the map to place <span className="font-mono font-semibold">{placing.name}</span></span>
           <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
             onClick={() => setPlacingId(null)}>
+            <X className="size-3" />
+          </Button>
+        </div>
+      )}
+
+      {/* reference-ONU placement banner ----------------------------------------
+          Restates the contract at the moment of the click. The dialog said it
+          too, but a "Pick on map" hop can be minutes and a screen apart from
+          reading it, and a reference point placed casually is what turns an
+          area power cut back into a crew roll. */}
+      {placingOnu && (
+        <div className="absolute top-14 left-1/2 z-[1000] flex max-w-[min(92vw,34rem)] -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+          <Crosshair className="size-3.5 shrink-0 text-primary" />
+          <span className="min-w-0 truncate">
+            Click where{" "}
+            <span className="font-mono font-semibold">{placingOnu.label || placingOnu.mac}</span>
+            {" "}stands
+            <span className="text-muted-foreground"> · only if its power is reliable</span>
+          </span>
+          <Button variant="ghost" size="icon" className="size-5 shrink-0" title="Cancel (Esc)"
+            onClick={() => setPlacingOnu(null)}>
             <X className="size-3" />
           </Button>
         </div>
@@ -1087,9 +1737,11 @@ export function MapPage() {
         </div>
       )}
 
-      {/* controls — slide left of the device panel so they stay clickable ------- */}
-      <div className={cn("absolute top-3 right-3 z-[1000] flex flex-col items-end gap-1.5",
-        selected && !routeEdit && "md:right-[calc(380px+1.5rem)]")}>
+      {/* controls — slide left of the device panel so they stay clickable. The
+          offset rides `--wisp-panel-beside` rather than a literal, because the
+          panel is draggable now and a hardcoded width leaves a gap or an overlap
+          the moment it's resized. ------------------------------------------- */}
+      <div className="wisp-panel-beside absolute top-3 right-3 z-[1000] flex flex-col items-end gap-1.5">
         {/* style choices only with a key (the fallback map is not a style);
             the legend rides here too, so the button now renders for everyone */}
         <div className="relative">
@@ -1110,6 +1762,23 @@ export function MapPage() {
                       {BASEMAP_LABEL[b]}
                     </button>
                   ))}
+                  {/* Google's own writing, off in one switch. Offered ONLY on
+                      the roadmap: a satellite session carries no labels to
+                      begin with (they'd be an explicit layerTypes overlay we
+                      never request), and a toggle that does nothing where it is
+                      shown is worse than one that isn't there. */}
+                  {basemap === "google" && (
+                    <button
+                      className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
+                      title="Google's own place names, road names and POI markers. Off leaves the roads, water and parks — only the writing goes."
+                      onClick={toggleGoogleLabels}>
+                      <span>Google labels</span>
+                      <span className={cn("text-2xs font-medium",
+                        googleLabels ? "text-success" : "text-muted-foreground")}>
+                        {googleLabels ? "on" : "off"}
+                      </span>
+                    </button>
+                  )}
                   <div className="my-1 border-t" />
                 </>
               )}
@@ -1122,6 +1791,33 @@ export function MapPage() {
                   {bwLabels ? "on" : "off"}
                 </span>
               </button>
+              {/* Off by default and remembered: subscribers outnumber plant by
+                  an order of magnitude, so this layer has to be asked for. */}
+              <button
+                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
+                title="Subscriber ONUs with a location — field-survey pins plus the power-backed reference points you've placed. Click an OLT on the map to focus on just its drops."
+                // Leaving the focus armed would make this toggle look broken:
+                // its two states both draw the same scoped set. Dropping the
+                // scope first means one press always changes what is on screen.
+                onClick={() => { setOnuScope(null); toggleRefOnus() }}>
+                {/* Named for what the layer HOLDS, not what it originally held:
+                    since the field survey it carries ordinary located drops as
+                    well as reference points, and "Reference ONUs" would hide the
+                    survey's whole output behind a toggle nobody would think to
+                    look under. The count is what makes it discoverable at all. */}
+                <span>Subscribers{places.length > 0 ? ` · ${places.length}` : ""}</span>
+                {/* "on" while nothing is drawn would read as a broken toggle —
+                    say the layer is waiting on zoom instead. A FOCUS outranks
+                    both: with one OLT scoped, this toggle is not what decides
+                    what is on screen, and reporting "off" while pins are drawn
+                    would be the same lie in reverse. */}
+                <span className={cn("text-2xs font-medium",
+                  onuScope != null || (refOnus && zoom >= REF_ONU_MIN_ZOOM)
+                    ? "text-success" : "text-muted-foreground")}>
+                  {onuScope != null ? "focused"
+                    : !refOnus ? "off" : zoom >= REF_ONU_MIN_ZOOM ? "on" : "on · zoom in"}
+                </span>
+              </button>
               <div className="my-1 border-t" />
               <p className="px-2 pt-1 pb-0.5 text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
                 Links
@@ -1130,6 +1826,7 @@ export function MapPage() {
                 ["", "Feed (parent → child)"],
                 ["4 6", "Backup uplink (ring)"],
                 ["1 4", "Cross-link (same level)"],
+                [DROP_DASH, "Subscriber drop (splitter → ONU)"],
               ] as Array<[string, string]>).map(([dash, label]) => (
                 <div key={label} className="flex items-center gap-2 px-2 py-1 text-xs">
                   <span className="flex w-4 shrink-0 items-center justify-center">
@@ -1162,6 +1859,25 @@ export function MapPage() {
                   <span className="text-muted-foreground">{label}</span>
                 </div>
               ))}
+              {/* How complete the plant record is, stated where somebody asks
+                  "what am I looking at". A splitter's load and every branch
+                  verdict count only RECORDED drops, so this number is how much
+                  weight either deserves — and leaving it to be inferred from
+                  thin-looking splitters is exactly how a partial map gets read
+                  as a complete one. */}
+              {dropsQ.data && (dropsQ.data.recorded + dropsQ.data.unrecorded) > 0 && (
+                <>
+                  <div className="my-1 border-t" />
+                  <p className="px-2 py-1 text-2xs text-muted-foreground">
+                    <span className="font-medium text-foreground">
+                      {dropsQ.data.recorded}
+                    </span>
+                    {" of "}
+                    {dropsQ.data.recorded + dropsQ.data.unrecorded}
+                    {" subscribers mapped to a splitter"}
+                  </p>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -1290,64 +2006,203 @@ export function MapPage() {
         )
       })()}
 
+      {/* reference-ONU card -----------------------------------------------------
+          Deliberately a small card and NOT the device panel: an ONU is not a
+          device, it has no health tab, no ports and no outage of its own. What
+          it has is a claim attached to it, so the card states the claim, where
+          the box currently registers, and the two things you can do to it. */}
+      {selectedRef && (
+        <Card className="absolute top-14 left-3 z-[1000] w-72 gap-0 overflow-hidden border-border-strong bg-popover/95 dark:bg-popover/95 py-0 backdrop-blur">
+          <div className="flex items-start justify-between gap-2 border-b px-3 py-2">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-semibold">
+                {/* refKind, not a fixed word: since the field survey this card
+                    opens for ordinary located drops too, and titling one
+                    "Reference ONU" would tell an operator the fleet has
+                    witnesses it does not have. */}
+                {selectedRef.label || selectedRef.name
+                  || (selectedRef.witness ? "Reference ONU" : "Subscriber")}
+              </p>
+              <p className="truncate font-mono text-2xs text-muted-foreground">
+                {selectedRef.mac}
+              </p>
+            </div>
+            <Button variant="ghost" size="icon" className="size-6 shrink-0"
+              onClick={() => setSelectedOnuMac(null)}>
+              <X className="size-3.5" />
+            </Button>
+          </div>
+          <div className="space-y-1.5 px-3 py-2 text-2xs">
+            {/* The claim this pin makes, and only the one it actually makes.
+                A WITNESS is the operator's statement that this subscriber's
+                power is reliable — `ponfault` reads it to call a dark PON an
+                area power cut instead of rolling a splicing van. A located drop
+                claims nothing but a coordinate, and printing the witness
+                sentence over one would tell an operator the fleet has evidence
+                it does not have (the exact split `onu_places.witness` exists
+                for). */}
+            <p className="text-muted-foreground">
+              {selectedRef.witness
+                ? "Power-backed reference point · used to tell a fibre cut from an area power cut."
+                : "Subscriber location recorded in the field · not a power-backed reference point."}
+            </p>
+            {/* Three states, never collapsed: registered somewhere, on more than
+                one live slot (so we refuse to say where), or in no roster at all
+                — which means it is witnessing nothing and the operator has to
+                know rather than trust a pin that looks fine. */}
+            {!selectedRef.matched ? (
+              <p className="text-warning">
+                Not in any current roster — the ONU was probably swapped. Re-place
+                it under the new MAC.
+              </p>
+            ) : selectedRef.ambiguous ? (
+              <p className="text-warning">
+                On {selectedRef.slots} live slots, so we can't say which OLT it
+                belongs to.
+              </p>
+            ) : (
+              <p>
+                <span className="font-mono">{selectedRef.device_name}</span>
+                {selectedRef.pon_port && <> · PON {selectedRef.pon_port}</>}
+                {selectedRef.onu_id != null && <> · ONU {selectedRef.onu_id}</>}
+              </p>
+            )}
+            {/* Where the drop actually comes from. The line on the map already
+                shows it, but the card is where a name can be read and followed:
+                a subscriber's problem is usually its splitter's problem, and
+                that box is the next thing to open. An unrecorded drop says so
+                plainly rather than leaving the OLT line to imply direct fibre. */}
+            {selectedRef.matched && (
+              selectedRef.drop_passive_id != null
+                && byId.get(selectedRef.drop_passive_id) ? (
+                <p>
+                  <span className="text-faint-foreground">Drop from </span>
+                  <button className="underline-offset-2 hover:underline"
+                    onClick={() => {
+                      setSelectedId(selectedRef.drop_passive_id!)
+                      setSelectedOnuMac(null)
+                    }}>
+                    {byId.get(selectedRef.drop_passive_id)!.name}
+                  </button>
+                </p>
+              ) : (
+                <p className="text-faint-foreground">
+                  Serving splitter not recorded — the line to the OLT stands in
+                  for plant nobody has mapped yet.
+                </p>
+              )
+            )}
+            {selectedRef.matched && (
+              <p className={cn("font-medium",
+                isRefDark(selectedRef) ? "text-destructive" : "text-success")}>
+                {isRefDark(selectedRef)
+                  ? `Dark (${selectedRef.state}) — power can't explain this`
+                  : "Online"}
+                {selectedRef.rx_dbm != null && (
+                  <span className="font-mono font-normal text-muted-foreground">
+                    {" "}· {selectedRef.rx_dbm.toFixed(1)} dBm
+                  </span>
+                )}
+              </p>
+            )}
+            {/* Three different sentences, never collapsed into a blank cell:
+                a live rate, a port whose walk went stale, and a firmware that
+                publishes no per-ONU interface at all. */}
+            {selectedRef.matched && (
+              refHasRate(selectedRef) ? (
+                <p className="font-mono text-muted-foreground">
+                  ↓ {((selectedRef.out_bps ?? 0) / 1e6).toFixed(1)} Mb/s
+                  {" · "}↑ {((selectedRef.in_bps ?? 0) / 1e6).toFixed(1)} Mb/s
+                  {selectedRef.if_name && (
+                    <span className="text-faint-foreground">
+                      {" "}· {selectedRef.if_name.split(" ")[0]}
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <p className="text-faint-foreground">
+                  {selectedRef.if_name
+                    ? "No recent rate — this OLT's port walk is stale."
+                    : "This OLT's firmware doesn't publish a per-ONU interface, so there's no rate to show."}
+                </p>
+              )
+            )}
+          </div>
+          {canWrite && (
+            <div className="flex gap-1 border-t px-2 py-1.5">
+              <Button variant="ghost" size="sm" className="h-7 flex-1 text-2xs"
+                title="Click the map to move this reference point"
+                onClick={() => {
+                  setPlacingOnu({ mac: selectedRef.mac,
+                                  label: selectedRef.label || selectedRef.name || "" })
+                  setSelectedOnuMac(null)
+                }}>
+                <Crosshair className="size-3" /> Move
+              </Button>
+              {selectedRef.device_id != null && (
+                // Stays on the map: the same device panel every pin opens, on the
+                // Optical tab with this ONU's row focused. Leaving for /topology
+                // threw away the map the operator was reading it against.
+                <Button variant="ghost" size="sm" className="h-7 flex-1 text-2xs"
+                  title="Open this ONU's OLT in the device panel"
+                  onClick={() => {
+                    setDetailTab("optical")
+                    setDetailOnu({ deviceId: selectedRef.device_id!, mac: selectedRef.mac })
+                    setSelectedId(selectedRef.device_id)
+                    setSelectedOnuMac(null)
+                  }}>
+                  <ListTree className="size-3" /> Its OLT
+                </Button>
+              )}
+              <Button variant="ghost" size="sm"
+                className="h-7 flex-1 text-2xs text-muted-foreground hover:text-destructive"
+                onClick={() => {
+                  setOnuPlace.mutate({ mac: selectedRef.mac, lat: null, lng: null })
+                  setSelectedOnuMac(null)
+                }}>
+                <EyeOff className="size-3" /> Remove
+              </Button>
+            </div>
+          )}
+        </Card>
+      )}
+
       {/* device panel ----------------------------------------------------------
           Hidden while a route is being drawn: it occupies the right 380px, which
           is map you need to click waypoints onto, and the route being edited
           often runs straight under it. selectedId is KEPT, not cleared — the
           panel comes back on save/cancel with the same device still open. */}
       {selected && !routeEdit && (
-        <Card className="absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover/95 dark:bg-popover/95 py-0 backdrop-blur md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)] md:w-[380px]">
-          <div className="flex items-start gap-2.5 border-b px-4 py-3">
-            <span className="mt-1"><StatusDot tone={pinTone(selected)} /></span>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <p className="min-w-0 truncate font-mono text-sm font-semibold">{selected.name}</p>
-                {!!selected.maintenance && <RowTag tone="muted">maint</RowTag>}
-              </div>
-              <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-                <span className="font-mono">{selected.ip_address}</span>
-                {selected.device_type && <span>{selected.device_type}</span>}
-                {selected.region && <span>{selected.region}</span>}
-              </p>
-              <div className="mt-1 flex flex-wrap items-baseline gap-x-2">
-                <DeviceMetrics device={selected} />
-                {isDownState(selected) && selected.outage_started_at && (
-                  <span className="text-xs font-semibold text-destructive">
-                    for {durationSince(selected.outage_started_at)}
-                  </span>
-                )}
-              </div>
-              {downstream.size > 0 && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Feeds <span className="font-semibold text-foreground">{downstream.size}</span> downstream
-                  {downstreamDown > 0 && (
-                    <span className="font-semibold text-destructive"> · {downstreamDown} down</span>
-                  )}
-                </p>
-              )}
-            </div>
-            <div className="flex shrink-0 items-center gap-0.5">
+        // Opaque, and no longer /95 + backdrop-blur. Seeing the tiles through it
+        // reads as atmosphere on an empty stretch of map and as noise the moment
+        // anything is under it — a label or a satellite frame ghosting up through
+        // a dBm column is exactly the figure/ground problem this panel exists to
+        // avoid. The map stays fully visible AROUND the panel, which is where it
+        // was doing its work.
+        <Card className="wisp-device-panel absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover py-0 md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)]">
+          <PanelResizeGrip grip={panel.grip} />
+          <DevicePanelHeader device={selected} tone={pinTone(selected)}
+            downstream={downstream.size} downstreamDown={downstreamDown}>
+            <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
+              title="Show in the Network tree"
+              onClick={() => navigate("/topology", { state: { deviceId: selected.id } })}>
+              <ListTree className="size-3.5" />
+            </Button>
+            {canWrite && isPlaced(selected) && (
               <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
-                title="Show in the Network tree"
-                onClick={() => navigate("/topology", { state: { deviceId: selected.id } })}>
-                <ListTree className="size-3.5" />
+                title="Remove this pin from the map"
+                onClick={() => {
+                  setLocation.mutate({ id: selected.id, lat: null, lng: null })
+                  setSelectedId(null)
+                }}>
+                <MapPin className="size-3.5" />
               </Button>
-              {canWrite && isPlaced(selected) && (
-                <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
-                  title="Remove this pin from the map"
-                  onClick={() => {
-                    setLocation.mutate({ id: selected.id, lat: null, lng: null })
-                    setSelectedId(null)
-                  }}>
-                  <MapPin className="size-3.5" />
-                </Button>
-              )}
-              <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
-                onClick={() => setSelectedId(null)}>
-                <X className="size-3.5" />
-              </Button>
-            </div>
-          </div>
+            )}
+            <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
+              onClick={() => setSelectedId(null)}>
+              <X className="size-3.5" />
+            </Button>
+          </DevicePanelHeader>
           {/* field-dispatch row: coords + copy + drive-there + typed GPS entry */}
           <div className="flex min-h-9 flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-1.5 text-xs">
             {coordsEdit ? (
@@ -1524,8 +2379,113 @@ export function MapPage() {
               </span>
             </div>
           )}
-          <div className="overflow-y-auto p-3">
-            <DeviceDetail device={selected} tab={detailTab} onTab={setDetailTab} />
+          {/* Focus the subscriber layer on THIS box. The row only renders where
+              it has something to draw — an OLT with located drops — because an
+              action that reveals nothing teaches the operator to stop pressing
+              it, and on most of the fleet that is what it would do.
+
+              It says "located", never "subscribers": a survey is always partial,
+              and a count that reads as the roster would make an OLT with 3 pins
+              and 196 customers look fully mapped (the same rule the splitter
+              panel's "recorded" follows). */}
+          {(placedByOlt.get(selected.id) ?? 0) > 0 && (() => {
+            const pons = ponsByOlt.get(selected.id) ?? []
+            const focused = onuScope?.deviceId === selected.id
+            const picked = focused ? onuScope.pons : []
+            // What the trigger SAYS is the current selection, not the action —
+            // this row is the only place the PON filter is visible while the
+            // panel covers the status strip's copy of it.
+            const label = !focused ? "Show on map"
+              : picked.length === 0 ? "All PONs"
+              : picked.length === 1 ? picked[0]
+              : `${picked.length} PONs`
+            return (
+              <div className="flex min-h-9 items-center gap-2 border-b px-4 py-1.5 text-xs">
+                <Users className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 truncate text-muted-foreground">
+                  <span className="font-semibold text-foreground">
+                    {placedByOlt.get(selected.id)}
+                  </span>
+                  {" located"}
+                  {selected.onus_total ? ` of ${selected.onus_total}` : ""}
+                </span>
+                {/* One PON is no choice at all, so it stays the plain toggle it
+                    was — a menu whose every path does the same thing is worse
+                    than the button it replaced. */}
+                {pons.length < 2 ? (
+                  <Button variant={focused ? "default" : "outline"}
+                    size="sm" className="ml-auto h-7 px-2 text-xs"
+                    title="Draw only this OLT's located subscribers, and frame them"
+                    onClick={() => focused ? setOnuScope(null) : scopeOnus(selected.id, [])}>
+                    {focused ? "Focused" : "Show on map"}
+                  </Button>
+                ) : (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant={focused ? "default" : "outline"}
+                        size="sm" className="ml-auto h-7 max-w-36 px-2 text-xs"
+                        title="Draw this OLT's located subscribers — all of them, or the PONs you pick">
+                        <span className="min-w-0 truncate font-mono">{label}</span>
+                        <ChevronDown className="size-3 shrink-0 opacity-60" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-56">
+                      <DropdownMenuLabel className="text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
+                        Show subscribers on
+                      </DropdownMenuLabel>
+                      {/* "All PONs" CLEARS the ticks rather than being a tick of
+                          its own — the empty set is what every-PON means here,
+                          and a checkbox that fights the others reads as a state
+                          you can be in alongside them. */}
+                      <DropdownMenuCheckboxItem
+                        checked={focused && picked.length === 0}
+                        onSelect={(e) => e.preventDefault()}
+                        onCheckedChange={() => scopeOnus(selected.id, [])}>
+                        All PONs
+                        <span className="ml-auto font-mono text-2xs text-faint-foreground">
+                          {placedByOlt.get(selected.id)}
+                        </span>
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuSeparator />
+                      {/* The menu stays OPEN on each tick (onSelect prevented):
+                          picking a set one item at a time through a menu that
+                          closes each time is how a multi-select stops being one.
+                          The map re-fits underneath as you go. */}
+                      {pons.map((p) => (
+                        <DropdownMenuCheckboxItem key={p.pon}
+                          checked={focused && picked.includes(p.pon)}
+                          onSelect={(e) => e.preventDefault()}
+                          onCheckedChange={() => toggleScopePon(selected.id, p.pon)}>
+                          <span className="min-w-0 truncate font-mono">{p.pon}</span>
+                          {/* dark count wins the cell during a cut — it is the
+                              PON to tick first; otherwise the located count */}
+                          <span className={cn("ml-auto font-mono text-2xs",
+                            p.dark > 0 ? "font-semibold text-destructive" : "text-faint-foreground")}>
+                            {p.dark > 0 ? `${p.dark} dark` : p.total}
+                          </span>
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                      {focused && (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem onSelect={() => setOnuScope(null)}>
+                            <X className="size-3.5" /> Stop focusing
+                          </DropdownMenuItem>
+                        </>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+              </div>
+            )
+          })()}
+          {/* overscroll-contain stops scroll CHAINING out of the panel (the Card
+              carries it too, via .wisp-device-panel, since the header and the
+              coords/cable rows sit outside this scroller). */}
+          <div className="overflow-y-auto overscroll-contain p-3">
+            <DeviceDetail device={selected} tab={detailTab}
+              onTab={(t) => { setDetailTab(t); setDetailOnu(null) }}
+              focusOnuMac={detailOnu?.deviceId === selected.id ? detailOnu.mac : null} />
           </div>
         </Card>
       )}

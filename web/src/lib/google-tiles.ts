@@ -68,8 +68,43 @@ const NIGHT_STYLE = [
   { featureType: "water", elementType: "labels.text.stroke", stylers: [{ color: "#17263c" }] },
 ]
 
-/** Does this map type + theme actually get styled tiles? Satellite never does. */
-const styled = (t: GoogleMapType, dark: boolean) => t === "roadmap" && dark
+// Google's own labels and POI markers, switched off in ONE rule.
+//
+// A dense town's roadmap ships more Google pins than we draw — restaurants,
+// shops, bus stops — each an icon plus its name, and on a wall map they compete
+// directly with the device pins and the cable routes that are the entire point.
+// `elementType: "labels"` with no featureType covers every feature's text AND
+// its icon, which is what makes this one line rather than a per-feature list:
+// a POI marker is a label, not geometry.
+//
+// GEOMETRY IS DELIBERATELY LEFT ALONE. Switching `poi` off wholesale would take
+// park fills and building footprints with it, and those are what a crew
+// navigates by once the names are gone — a blank map is not the ask. Roads,
+// water and parks stay; only the writing goes.
+const LABELS_OFF = [
+  { elementType: "labels", stylers: [{ visibility: "off" }] },
+]
+
+/** The style array for this map type + theme + label choice, or null for an
+ *  unstyled session.
+ *
+ *  SATELLITE NEVER GETS ONE — the Tile API ignores `styles` on photography, so
+ *  there is no dark satellite and no label-stripped satellite. It needs neither:
+ *  a `satellite` session carries no labels in the first place (labels on imagery
+ *  are an explicit `layerTypes: ["layerRoadmap"]` overlay we don't request). The
+ *  Layers menu must not offer a switch that would do nothing there. */
+function styleArray(t: GoogleMapType, dark: boolean, labels: boolean) {
+  if (t !== "roadmap") return null
+  // LABELS_OFF goes LAST: later rules win, so it overrides the night array's
+  // own label colours rather than being overridden by them.
+  const arr = [...(dark ? NIGHT_STYLE : []), ...(labels ? [] : LABELS_OFF)]
+  return arr.length ? arr : null
+}
+
+/** Which styled variant this is, for the cache key. "" = unstyled.
+ *  `n` = night, `p` = plain (labels stripped); both can apply at once. */
+const variantOf = (t: GoogleMapType, dark: boolean, labels: boolean): string =>
+  t !== "roadmap" ? "" : `${dark ? "n" : ""}${labels ? "" : "p"}`
 
 // Fingerprint of the style array, so EDITING the palette busts the cache by
 // itself. A session token bakes in the style it was created with and lives ~2
@@ -79,26 +114,45 @@ const styled = (t: GoogleMapType, dark: boolean) => t === "roadmap" && dark
 // change"). Deriving it beats a hand-bumped version constant for the obvious
 // reason: nobody remembers to bump it. Cheap 32-bit string hash; this guards a
 // cache key, it is not security.
-const styleTag = (() => {
-  const s = JSON.stringify(NIGHT_STYLE)
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
-  return (h >>> 0).toString(36)
-})()
+const _tags = new Map<string, string>()
+function styleTag(t: GoogleMapType, dark: boolean, labels: boolean): string {
+  const v = variantOf(t, dark, labels)
+  if (!v) return ""
+  let tag = _tags.get(v)
+  if (!tag) {
+    const s = JSON.stringify(styleArray(t, dark, labels))
+    let h = 0
+    for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
+    tag = (h >>> 0).toString(36)
+    _tags.set(v, tag)
+  }
+  return tag
+}
 
 // The session token encodes the style and the scale, so the cache key carries
 // BOTH. Miss the theme half and a flip silently reuses the light session for up
 // to two weeks; miss the style half and a palette edit never reaches a browser
-// that already has a token.
-const sessionKey = (t: GoogleMapType, dark: boolean) =>
-  `wisp:map:gsession:${t}:${hiDpi() ? "2x" : "1x"}${styled(t, dark) ? `:night-${styleTag}` : ""}`
+// that already has a token. The VARIANT rides the key beside the hash for the
+// same reason at a coarser grain: night and label-stripped are different
+// sessions, and each has to be able to expire without evicting the other.
+const sessionKey = (t: GoogleMapType, dark: boolean, labels: boolean) => {
+  const v = variantOf(t, dark, labels)
+  return `wisp:map:gsession:${t}:${hiDpi() ? "2x" : "1x"}`
+    + (v ? `:s${v}-${styleTag(t, dark, labels)}` : "")
+}
 
-/** Drop night tokens minted from a SUPERSEDED style, so editing the palette
-    doesn't leave an orphan per revision sitting in localStorage forever. */
-function pruneStaleNightSessions(keep: string): void {
+/** Drop styled tokens minted from a SUPERSEDED revision of the SAME variant, so
+    editing the palette doesn't leave an orphan per revision sitting in
+    localStorage forever. Scoped to the variant on purpose — pruning across
+    variants would make every theme or label flip pay for a fresh createSession.
+    Legacy `:night-` keys (before variants existed) are swept unconditionally;
+    nothing mints them any more. */
+function pruneStaleStyledSessions(keep: string, variant: string): void {
+  const prefix = `:s${variant}-`
   try {
     for (const k of Object.keys(localStorage))
-      if (k.startsWith("wisp:map:gsession:") && k.includes(":night-") && k !== keep)
+      if (k.startsWith("wisp:map:gsession:") && k !== keep
+          && (k.includes(prefix) || k.includes(":night-")))
         localStorage.removeItem(k)
   } catch {
     /* private mode — nothing cached, nothing to prune */
@@ -110,9 +164,11 @@ interface CachedSession {
   expiry: number // unix seconds, from Google's createSession reply
 }
 
-export function loadGoogleSession(mapType: GoogleMapType, dark = false): string | null {
+export function loadGoogleSession(
+  mapType: GoogleMapType, dark = false, labels = true,
+): string | null {
   try {
-    const raw = localStorage.getItem(sessionKey(mapType, dark))
+    const raw = localStorage.getItem(sessionKey(mapType, dark, labels))
     if (!raw) return null
     const v = JSON.parse(raw) as CachedSession
     // 10-minute guard so a token can't expire mid-pan
@@ -122,19 +178,22 @@ export function loadGoogleSession(mapType: GoogleMapType, dark = false): string 
   }
 }
 
-export function clearGoogleSession(mapType: GoogleMapType, dark = false): void {
+export function clearGoogleSession(
+  mapType: GoogleMapType, dark = false, labels = true,
+): void {
   try {
-    localStorage.removeItem(sessionKey(mapType, dark))
+    localStorage.removeItem(sessionKey(mapType, dark, labels))
   } catch {
     /* noop */
   }
 }
 
 export async function createGoogleSession(
-  apiKey: string, mapType: GoogleMapType, dark = false,
+  apiKey: string, mapType: GoogleMapType, dark = false, labels = true,
 ): Promise<string> {
-  const cached = loadGoogleSession(mapType, dark)
+  const cached = loadGoogleSession(mapType, dark, labels)
   if (cached) return cached
+  const styles = styleArray(mapType, dark, labels)
   const res = await fetch(
     `https://tile.googleapis.com/v1/createSession?key=${encodeURIComponent(apiKey)}`,
     {
@@ -144,15 +203,15 @@ export async function createGoogleSession(
       body: JSON.stringify({
         mapType, language: "en-IN", region: "IN",
         ...(hiDpi() ? { scale: "scaleFactor2x", highDpi: true } : {}),
-        ...(styled(mapType, dark) ? { styles: NIGHT_STYLE } : {}),
+        ...(styles ? { styles } : {}),
       }),
     },
   )
   if (!res.ok) throw new Error(`createSession replied ${res.status}`)
   const data = (await res.json()) as { session?: string; expiry?: string }
   if (!data.session) throw new Error("createSession returned no session token")
-  const key = sessionKey(mapType, dark)
-  if (styled(mapType, dark)) pruneStaleNightSessions(key)
+  const key = sessionKey(mapType, dark, labels)
+  if (styles) pruneStaleStyledSessions(key, variantOf(mapType, dark, labels))
   try {
     localStorage.setItem(
       key,

@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from wisp.central.store_assign import AssignmentStoreMixin
 from wisp.central.store_orgs import OrgStoreMixin
 from wisp.central.store_users import UserStoreMixin
 from wisp.central.store_fleet import FleetStoreMixin
@@ -329,6 +330,31 @@ CREATE TABLE IF NOT EXISTS switch_ports (
 );
 CREATE INDEX IF NOT EXISTS idx_switch_ports_device ON switch_ports(org_id, device_id);
 CREATE INDEX IF NOT EXISTS idx_switch_ports_feeds ON switch_ports(org_id, feeds_device_id);
+-- WHO GETS PAGED for a device — a NOTIFICATION rule, nothing else. A field
+-- account named here is responsible for that device and everything BELOW it
+-- (central/assignment.py walks the parent chain), so one row on a region head
+-- covers the region. Deliberately NOT read by any view, list, KPI or export:
+-- every account still sees the whole fleet (operator choice 2026-07-26), which
+-- is why this is not a permission table and carries no read semantics at all.
+--
+-- An UNASSIGNED device keeps paging every worker (assignment.py's fallback), so
+-- turning this on can never silence an alarm — the same instinct as the notify
+-- governor writing state rows regardless of the allowlist.
+--
+-- user_id, not username: an account rename must not silently re-point a page,
+-- and ON DELETE CASCADE means deleting an account can't leave a row that
+-- resolves to nobody (which would read as "assigned" while paging no one).
+CREATE TABLE IF NOT EXISTS org_device_workers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT NOT NULL,
+    device_id   INTEGER NOT NULL REFERENCES org_devices(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    assigned_by TEXT,
+    assigned_at TEXT,
+    UNIQUE(device_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_device_workers_org ON org_device_workers(org_id);
+CREATE INDEX IF NOT EXISTS idx_org_device_workers_user ON org_device_workers(org_id, user_id);
 -- Graph topology backup edges, central-side. Mirrors the old single-box
 -- `device_links` one-for-one, org-scoped: the PRIMARY parent stays the single source
 -- of truth on `org_devices.parent_device_id` (every existing tree/topo query keeps
@@ -518,6 +544,63 @@ CREATE TABLE IF NOT EXISTS pon_fault_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (org_id, device_id, pon_port)
 );
+-- Operator-placed REFERENCE ONUs (central/ponfault.py witness evidence, and the
+-- map's subordinate ONU layer). Sparse by construction — no row means "not a
+-- reference point", and clearing one is a DELETE, so a stock org carries none.
+--
+-- Placing an ONU here IS the operator vouching for its power: the ISP picks the
+-- subscribers it knows run on a UPS, solar or a tower supply. Nothing infers
+-- that, and there is deliberately no power column — the act of placing is the
+-- whole signal, which is why the UI must say so at the point of the click.
+--
+-- Keyed on the MAC/serial (onuroster._norm_mac form), NOT on (device, onu_key):
+-- onu_optics never deletes a removed ONU's row and a re-registered ONU changes
+-- slot, so a slot key would rot. The MAC is the sticker on the box in the
+-- customer's house, so re-homing a drop to another PON — or another OLT — moves
+-- the reference point with it and needs no click. An RMA'd ONU orphans its row,
+-- which is correct: the box really did change.
+CREATE TABLE IF NOT EXISTS onu_places (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    mac        TEXT NOT NULL,      -- onuroster._norm_mac of the serial
+    lat        REAL NOT NULL,      -- both-or-nothing: clearing is a DELETE, so
+    lng        REAL NOT NULL,      -- an unplaced reference point cannot exist
+    label      TEXT,               -- operator's name for the site
+    notes      TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(org_id, mac)
+);
+CREATE INDEX IF NOT EXISTS idx_onu_places_org ON onu_places(org_id);
+-- Which passive box a subscriber's drop actually comes off (`central/drops.py`).
+--
+-- An access network is OLT PON -> feeder -> splitter (1:2/1:4/1:8) -> possibly a
+-- SECOND splitter -> drop -> ONU, and an ISP hangs a customer off whichever
+-- splitter is nearest. Until this table the map drew a subscriber straight to its
+-- OLT, which skips the entire distribution network the field crew works on. The
+-- splitter chain itself already exists (passives are org_devices rows with parent
+-- chains and link_routes geometry) — this is the missing LAST hop.
+--
+-- Keyed on the MAC (onuroster._norm_mac form), NOT (device, onu_key), for the
+-- same reason onu_places is: onu_optics never deletes a vacated slot and a
+-- re-registered ONU moves, so a slot key rots. Re-homing a drop keeps its
+-- splitter; an RMA'd box orphans the row, which is reported, not hidden.
+--
+-- The PON is deliberately NOT stored here — it comes from the ONU's roster row,
+-- which SNMP owns. A second copy could disagree with the walk about which PON a
+-- subscriber is on, and then two screens would tell different stories.
+--
+-- `passive_id` is any PASSIVE_TYPES row (a splitter, or the FDB/closure housing
+-- one), never powered gear: what is recorded is the box the drop comes out of.
+CREATE TABLE IF NOT EXISTS onu_drops (
+    org_id     TEXT NOT NULL,
+    mac        TEXT NOT NULL,      -- onuroster._norm_mac of the serial
+    passive_id INTEGER NOT NULL REFERENCES org_devices(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, mac)
+);
+CREATE INDEX IF NOT EXISTS idx_onu_drops_passive ON onu_drops(org_id, passive_id);
 -- ONU-roster hygiene ladder state (central/onualert.py) — transition-only paging
 -- like pon_fault_state: a re-walk that leaves the condition standing must not
 -- re-page. State written even when the alert gate is off. Never opens an outage.
@@ -770,6 +853,7 @@ class CentralStore(
     OutageStoreMixin,
     SnmpStoreMixin,
     ProxyStoreMixin,
+    AssignmentStoreMixin,
 ):
 
     _TENANT_TABLES = (
@@ -845,6 +929,21 @@ class CentralStore(
             # partial", which is what they were already being treated as.
             self._ensure_columns(conn, "snmp_walks", (
                 ("truncated", "INTEGER NOT NULL DEFAULT 0"),))
+            # Who the owner sent to this outage. A JSON list of usernames rather
+            # than a join table: assignment is one small fact about one outage,
+            # always read whole with it (triage_outages), never queried across
+            # outages. NULL on pre-2026-07-26 rows and on an outage nobody
+            # assigned — distinct from "[]", which never gets written (an empty
+            # assignment is refused, so clearing means naming someone else).
+            # `accepted_by` is the other half: which of those people have said
+            # yes. Same shape and same reason (read whole with the outage), and
+            # it is what separates "the owner asked" from "somebody is going" —
+            # assignment alone leaves the outage DOWN. `accepted_at` is the FIRST
+            # acceptance, so the card can say how long an answer took.
+            self._ensure_columns(conn, "outages", (
+                ("assigned_to", "TEXT"), ("assigned_at", "TEXT"),
+                ("assigned_by", "TEXT"), ("accepted_by", "TEXT"),
+                ("accepted_at", "TEXT")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
             # clean classification token for the notification governor + honest
@@ -876,6 +975,13 @@ class CentralStore(
                 ("lat", "REAL"), ("lng", "REAL"),
                 # passive plant only (splitter/fdb/closure): which PON it serves
                 ("pon_port", "TEXT"),
+                # passive plant only: how many ways this box splits the fibre —
+                # inventory.SPLIT_RATIOS, the 1:2 / 1:4 / 1:8 the field actually
+                # stocks. NULL = not recorded (an FDB or closure that only
+                # splices). Drives the recorded-load bar and the cumulative
+                # split down a cascade; NOT an occupancy claim on its own, since
+                # a leg nobody recorded is unknown, not free.
+                ("split_ratio", "INTEGER"),
                 # OLT only: per-PON ONU cap override (NULL = cfg.onu_pon_limit, the
                 # EPON 1:64 default); a 1:128 GPON box raises it so it never
                 # false-pages "at capacity" (central/onualert.py)
@@ -902,7 +1008,20 @@ class CentralStore(
                 # itself is untouched — suppression, the map, and paging all
                 # still see it. Same discipline as tags: read ONLY by
                 # list_org_devices, never by org_device_topology.
-                ("tree_detached", "INTEGER NOT NULL DEFAULT 0")))
+                ("tree_detached", "INTEGER NOT NULL DEFAULT 0"),
+                # Where the pin CAME FROM. A phone's first fix is a cell/wifi
+                # estimate at 30-80 m that converges over ~10 s, so a field
+                # capture and a surveyed desktop placement are different claims
+                # about the same two numbers — and a splitter pinned 40 m off is
+                # a crew walking the wrong side of a road. Recording provenance
+                # is the same rule as "nothing is wrong" vs "nothing is
+                # measured": the map may not render an estimate and a survey
+                # alike. All NULL = placed before this shipped, or dragged on
+                # the desktop; the UI says "unknown", never "surveyed".
+                ("accuracy_m", "REAL"),
+                ("place_source", "TEXT"),   # 'gps' | 'manual' | NULL
+                ("placed_by", "TEXT"),
+                ("placed_at", "TEXT")))
             # when this ONU was last seen online — central/ponfault.py reads it to
             # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (
@@ -914,10 +1033,48 @@ class CentralStore(
             # Link styling landed after the table shipped as geometry-only.
             self._ensure_columns(conn, "link_routes", (
                 ("color", "TEXT"), ("label_pos", "REAL")))
+            # LOCATING an ONU and VOUCHING for its power supply became two
+            # different claims when the field survey shipped (2026-07-28). Until
+            # then the table held only the latter, so placing WAS the claim and
+            # every existing row means witness — hence DEFAULT 1, which backfills
+            # them correctly. New plain locations write 0 explicitly; the write
+            # path never relies on the default.
+            self._ensure_columns(conn, "onu_places", (
+                ("witness", "INTEGER NOT NULL DEFAULT 1"),
+                # Same provenance the device survey records, for the same reason
+                # — a subscriber pin taken at 60 m and one taken at 8 m are
+                # different claims, and a drop is the finest-grained thing on the
+                # map. NULL = placed from the desktop reference-ONU dialog, which
+                # is a click on a map and carries no measurement.
+                ("accuracy_m", "REAL"),
+                ("place_source", "TEXT"),
+                ("placed_by", "TEXT"),
+                ("placed_at", "TEXT")))
             self._seed_google_key(conn)
             self._collapse_roles(conn)
+            self._upper_onu_labels(conn)
             conn.commit()
 
+
+    @staticmethod
+    def _upper_onu_labels(conn) -> None:
+        """Subscriber names read as CAPS (operator's call, 2026-07-29).
+
+        `inventory._onu_label` uppercases on the way in, which fixes every name
+        typed from now on. This carries the ones already recorded across, so the
+        rule doesn't present as "the survey started shouting halfway through" —
+        a list where the first fifty drops are lower-case and the rest are not
+        looks like a bug in whichever screen is showing it.
+
+        Idempotent by its own WHERE clause and touches nothing else in the table:
+        a pin, its provenance and its witness flag all survive a rename that
+        changes only case. SQLite's UPPER is ASCII-only where Python's `.upper()`
+        is not, so a non-ASCII name written before today keeps its case here and
+        is normalized the next time somebody saves it — harmless, and the
+        alternative (reading and rewriting every row in Python at startup) buys
+        nothing for a field nobody has typed non-ASCII into."""
+        conn.execute("UPDATE onu_places SET label = UPPER(label)"
+                     " WHERE label IS NOT NULL AND label <> UPPER(label)")
 
     @staticmethod
     def _collapse_roles(conn) -> None:

@@ -15,6 +15,23 @@ those two facts over a whole PON and a mass drop classifies itself:
 Ranging is optical path length — slack coils and drop loops inflate it by tens
 of meters — so the answer is always presented as an interval, never a point.
 
+REFERENCE ONUs (witnesses) are the third input, and on most of this fleet the
+only one that works. The C-Data/DBC EPON build reports neither dying_gasp nor
+LOS — every drop arrives as a bare `offline` — so the cross above collapses and
+an area power cut reads as a fiber verdict, which is precisely the crew-roll
+this module exists to prevent. An operator can place a handful of subscribers it
+knows run on a UPS, solar or a tower supply (`onu_places`); placing one IS the
+claim, nothing detects it. Then:
+
+  * a witness that went dark SILENTLY → power cannot explain it → fiber, and
+    now as evidence rather than assumption.
+  * every witness still online while the cohort dropped → light is reaching that
+    area → power, no crew.
+
+A witness that reports `dying_gasp` is NOT evidence of anything: the ONU's own
+testimony is that it lost power, which outranks the operator's label — its
+backup failed, or the label was wrong. Hardware beats paperwork.
+
 Detection is stateless: `onu_optics.last_online_at` freezes when an ONU goes
 dark, so "≥ N ONUs on one PON whose last_online_at is recent" IS the mass-drop
 event, no history table needed. An OLT whose walk went stale is skipped
@@ -31,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 
 from wisp.central.inventory import PASSIVE_TYPES
+from wisp.central.onuroster import _norm_mac
 from wisp.core.analytics import _parse
 
 
@@ -49,6 +67,11 @@ WINDOW_MIN = 30       # cohort = went dark within this many minutes
 STALE_S = 900         # OLT walk older than this → skip the OLT entirely
 SLACK_M = 80          # ranging slack: a passive this far past the interval still binds
 
+# How a verdict was reached, so the UI and the page can say which. "silence" is
+# the honest name for what used to be indistinguishable from evidence: no gasps,
+# no witnesses, so "fiber" is this module's assumption rather than a finding.
+EVIDENCE = ("witness", "dying_gasp", "silence")
+
 
 @dataclass(frozen=True)
 class PonFault:
@@ -63,6 +86,9 @@ class PonFault:
     cut_low_m: int | None  # fiber only: cut is past this ranging distance…
     cut_high_m: int | None  # …and at or before this one
     suspect: str | None = None  # named passive whose route distance sits in the interval
+    evidence: str = "silence"   # one of EVIDENCE — how `kind` was decided
+    witness_dark: int = 0       # reference ONUs in the cohort, silent (not gasping)
+    witness_alive: int = 0      # reference ONUs on this PON still online
 
     def as_dict(self) -> dict:
         return {
@@ -71,6 +97,8 @@ class PonFault:
             "dark": self.dark, "dying_gasp": self.dying_gasp, "since": self.since,
             "kind": self.kind, "cut_low_m": self.cut_low_m,
             "cut_high_m": self.cut_high_m, "suspect": self.suspect,
+            "evidence": self.evidence, "witness_dark": self.witness_dark,
+            "witness_alive": self.witness_alive,
         }
 
 
@@ -147,10 +175,60 @@ def _bind_suspect(device_id: int, port: str | None, cut_low: int | None,
     return max(cands, key=lambda c: c["dist_m"])["name"]
 
 
+def _reaches_past(alive: list[dict], cohort: list[dict]) -> bool:
+    """Is a surviving witness FARTHER out than the nearest dark ONU?
+
+    Light arriving at a reference point beyond the dark set is the strong form
+    of the power argument: the feeder carried it past them, so what stopped at
+    their doors was not the fiber. Closer-in survivors prove much less — a cut
+    in a distribution branch leaves everything short of it lit — so they don't
+    flip the verdict on their own.
+
+    Only ORDER matters, never the unit, which is what makes this safe on the
+    dbc profile whose `distance_m` is really EPON time quanta (~39% short of
+    metres). A comparison is scale-invariant; the cut BRACKET, which prints
+    those numbers, is not — that stays a known-wrong figure fixed elsewhere.
+
+    With no comparable distances on either side there is nothing to order, and a
+    live witness is taken at face value."""
+    dark_d = [r["distance_m"] for r in cohort if r.get("distance_m") is not None]
+    alive_d = [r["distance_m"] for r in alive if r.get("distance_m") is not None]
+    if not dark_d or not alive_d:
+        return bool(alive)
+    return max(alive_d) >= min(dark_d)
+
+
+def _witness_verdict(onus: list[dict], cohort: list[dict],
+                     witness_macs: set[str]) -> tuple[str | None, int, int]:
+    """Operator-placed reference ONUs' say on one PON's mass drop.
+
+    Returns (kind or None when they have nothing to say, witness_dark,
+    witness_alive). A `dying_gasp` witness is counted in NEITHER tally: it
+    testified that it lost power, so it is neither evidence of a cut nor proof
+    the area still has supply."""
+    if not witness_macs:
+        return None, 0, 0
+    witnesses = [r for r in onus if _norm_mac(r.get("serial")) in witness_macs]
+    if not witnesses:
+        return None, 0, 0
+    in_cohort = {r.get("onu_key") for r in cohort}
+    dark = [w for w in witnesses
+            if w.get("onu_key") in in_cohort and w.get("state") != "dying_gasp"]
+    alive = [w for w in witnesses if w.get("state") == "online"]
+    if dark:
+        # A supply the operator vouched for cannot have darkened these, and they
+        # did not announce a power loss. That is a fiber event, not a DISCOM one.
+        return "fiber", len(dark), len(alive)
+    if alive and _reaches_past(alive, cohort):
+        return "power", 0, len(alive)
+    return None, 0, len(alive)
+
+
 def evaluate_olt(rows: list[dict], now: datetime, *,
                  min_dark: int = MIN_DARK,
                  window_min: int = WINDOW_MIN,
-                 passive_dists: dict | None = None) -> list[PonFault]:
+                 passive_dists: dict | None = None,
+                 witness_macs: set[str] | None = None) -> list[PonFault]:
     """Faults for one OLT's ONU rows, grouped per PON port."""
     now = _naive_utc(now)
     horizon = now - timedelta(minutes=window_min)
@@ -169,6 +247,15 @@ def evaluate_olt(rows: list[dict], now: datetime, *,
         gasps = sum(1 for r in cohort if r.get("state") == "dying_gasp")
         # majority dying-gasp = the neighborhood lost power, not the fiber
         kind = "power" if gasps * 2 >= len(cohort) else "fiber"
+        evidence = "dying_gasp" if gasps else "silence"
+
+        # Witnesses OUTRANK the gasp majority, because they answer the question
+        # the gasp count only proxies for. They are also the only signal that
+        # works at all on a build reporting neither gasp nor LOS, which is most
+        # of this fleet — there, `kind` above is "fiber" by pure assumption.
+        w_kind, w_dark, w_alive = _witness_verdict(onus, cohort, witness_macs or set())
+        if w_kind is not None:
+            kind, evidence = w_kind, "witness"
 
         cut_low = cut_high = None
         if kind == "fiber":
@@ -193,7 +280,8 @@ def evaluate_olt(rows: list[dict], now: datetime, *,
             since=(min(since_ts).replace(tzinfo=timezone.utc).isoformat()
                    if since_ts else None),
             kind=kind, cut_low_m=cut_low, cut_high_m=cut_high,
-            suspect=_bind_suspect(dev_id, port, cut_low, cut_high, passive_dists)))
+            suspect=_bind_suspect(dev_id, port, cut_low, cut_high, passive_dists),
+            evidence=evidence, witness_dark=w_dark, witness_alive=w_alive))
     faults.sort(key=lambda f: (-f.dark, f.pon_port or ""))
     return faults
 
@@ -202,7 +290,8 @@ def evaluate_org(rows: list[dict], now: datetime, *,
                  min_dark: int = MIN_DARK,
                  window_min: int = WINDOW_MIN,
                  stale_s: int = STALE_S,
-                 passive_dists: dict | None = None) -> list[PonFault]:
+                 passive_dists: dict | None = None,
+                 witness_macs: set[str] | None = None) -> list[PonFault]:
     """Faults across every OLT with a FRESH optics walk; stale OLTs are skipped
     (a down OLT freezes its rows — the ICMP outage already owns that page)."""
     now = _naive_utc(now)
@@ -218,6 +307,7 @@ def evaluate_org(rows: list[dict], now: datetime, *,
             continue
         out.extend(evaluate_olt(onus, now, min_dark=min_dark,
                                 window_min=window_min,
-                                passive_dists=passive_dists))
+                                passive_dists=passive_dists,
+                                witness_macs=witness_macs))
     out.sort(key=lambda f: (-f.dark, f.device_name, f.pon_port or ""))
     return out

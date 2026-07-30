@@ -3,12 +3,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
-import { ago, durationSince, isDownState, isFresh } from "@/lib/format"
+import { ago, durationSince, isDownState, isFresh, onuName } from "@/lib/format"
 import { useAuth } from "@/hooks/use-auth"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { RxDiagnosis, RxFreshness } from "@/components/rx-diagnosis"
+import { ReferenceOnuButton } from "@/components/reference-onu"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
 type Sev = "ok" | "warn" | "crit" | "offline"
@@ -48,21 +48,30 @@ function ackActive(o: OnuOptic): boolean {
   return !!o.ack_until && new Date(o.ack_until).getTime() > Date.now()
 }
 
+// The ONU's own index on its PON, as the OLT reports it (`onu_id` — the `.2` of
+// slot key "1.2"). It rides as an S.No column because this list is SORTED BY
+// dBm, which throws away the order the OLT lists its ONUs in — and that order is
+// the one a tech reads off the box's own web UI, the one the heat-strip above is
+// drawn in, and the one the "All N ONUs" roster falls back to. Without it there
+// is no way to carry a row from this list back to the OLT.
+//
+// It also REPLACES the bare "1.2" slot chip that used to sit mid-row: the PON
+// half of that key is already printed in the header two lines above, so the chip
+// spent four characters to say one new digit and read as a version number.
+function onuIndex(o: OnuOptic): string {
+  if (o.onu_id != null) return `#${o.onu_id}`
+  const tail = (o.onu_key ?? "").split(/[.:/]/).pop()
+  return tail ? `#${tail}` : "—"
+}
+
 interface Pon {
   port: string
   onus: OnuOptic[]
   online: number
   worstRx: number | null
-  typicalRx: number | null
+  bestRx: number | null
   crit: number
   warn: number
-}
-
-function median(xs: number[]): number | null {
-  if (!xs.length) return null
-  const s = [...xs].sort((a, b) => a - b)
-  const m = Math.floor(s.length / 2)
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
 }
 
 function groupByPon(onus: OnuOptic[]): Pon[] {
@@ -79,7 +88,7 @@ function groupByPon(onus: OnuOptic[]): Pon[] {
       onus: list,
       online: list.filter((o) => o.state === "online").length,
       worstRx: rx.length ? Math.min(...rx) : null,
-      typicalRx: median(rx),
+      bestRx: rx.length ? Math.max(...rx) : null,
       crit: list.filter((o) => onuSev(o) === "crit").length,
       warn: list.filter((o) => onuSev(o) === "warn").length,
     })
@@ -97,7 +106,7 @@ function CellStrip({ onus }: { onus: OnuOptic[] }) {
       {ordered.map((o) => (
         <span
           key={o.id}
-          title={`${o.name || o.serial || `ONU ${o.onu_id ?? ""}`} · ${fmtDbm(o.rx_dbm)} dBm · ${o.state ?? "?"}`}
+          title={`${onuName(o) || `ONU ${o.onu_id ?? ""}`} · ${fmtDbm(o.rx_dbm)} dBm · ${o.state ?? "?"}`}
           className={cn("size-[11px] rounded-[2px]", CELL[onuSev(o)])}
         />
       ))}
@@ -105,11 +114,82 @@ function CellStrip({ onus }: { onus: OnuOptic[] }) {
   )
 }
 
-function OnuRow({ o, deviceId, focused, noRx }: {
+/* The row's cells are components rather than inline spans because the row is
+   TWO LAYOUTS, not one: below the panel's `@2xl` the identity and the secondary
+   readings drop to a second line, above it they sit inline. Rendering the same
+   component in both places is what stops the two layouts drifting into two
+   different sets of facts — which is the failure the PON header row already had
+   to be rebuilt for (see PonRow's note). Only the className differs. */
+
+// The sticker. A worst-first list is a work order and this is what identifies
+// the box a tech drives to, so it must render WHOLE — no truncate, and it is
+// never dropped at a narrow width, it moves to line two.
+function MacCell({ o, className }: { o: OnuOptic; className?: string }) {
+  return (
+    <span className={cn("shrink-0 font-mono text-muted-foreground", className)}
+      title={o.serial && o.onu_key && o.onu_key !== o.serial
+        ? `Slot ${o.onu_key} on this OLT` : undefined}>
+      {o.serial || o.onu_key}
+    </span>
+  )
+}
+
+function DistCell({ o, className }: { o: OnuOptic; className?: string }) {
+  return (
+    <span className={cn("shrink-0 font-mono text-xs tabular-nums text-muted-foreground", className)}
+      title="Ranging distance from the OLT — optical path (slack coils included), not road metres">
+      {fmtOnuKm(o.distance_m)}
+    </span>
+  )
+}
+
+function DarkCell({ o, className }: { o: OnuOptic; className?: string }) {
+  const text = o.state === "online" ? null
+    : o.last_online_at ? `dark ${durationSince(o.last_online_at)}` : "offline"
+  return (
+    <span className={cn("shrink-0 truncate text-xs text-muted-foreground", className)}>
+      {text}
+    </span>
+  )
+}
+
+// Acknowledging an ONU is not cosmetic: `optics.py` counts only UNACKED crits
+// into the OLT's optical alarm, so this is what clears the OLT's red optical
+// badge (and, when the notification governor has optical kinds switched on,
+// what stops it paging) for a drop somebody has already been told about. It is
+// a quiet text button rather than an outline one because it is the rarest thing
+// in the row — it only renders for a crit/warn ONU that is actually online.
+function AckCell({ o, onAck, pending, className }: {
+  o: OnuOptic; onAck: () => void; pending: boolean; className?: string
+}) {
+  const sev = onuSev(o)
+  if (sev === "ok" || o.state !== "online") {
+    return <span className={cn("shrink-0", className)} aria-hidden />
+  }
+  const acked = ackActive(o)
+  return (
+    <button type="button" onClick={onAck} disabled={pending}
+      title={acked
+        ? "Acknowledged — this ONU is excluded from the OLT's optical alarm. Click to un-acknowledge."
+        : "Acknowledge for 24h — keeps this drop out of the OLT's optical alarm badge while it's being worked on."}
+      className={cn("shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium transition-colors disabled:opacity-50",
+        acked
+          ? "text-faint-foreground hover:text-foreground"
+          : "border border-border text-muted-foreground hover:bg-accent hover:text-foreground",
+        className)}>
+      {acked ? "acked" : "Ack"}
+    </button>
+  )
+}
+
+function OnuRow({ o, deviceId, focused, noRx, splitters }: {
   o: OnuOptic; deviceId: number; focused?: boolean
   // whole PON has no per-ONU Rx (DBC/C-Data EPON): the Rx-derived columns are
   // structurally dead here, not merely empty for this row
   noRx?: boolean
+  // passive id → name, for the "fed from" column. Threaded from the panel
+  // rather than queried per row: a PON is up to 64 rows.
+  splitters?: Map<number, string>
 }) {
   const qc = useQueryClient()
   const acked = ackActive(o)
@@ -121,54 +201,104 @@ function OnuRow({ o, deviceId, focused, noRx }: {
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Acknowledge failed"),
   })
+  const onAck = () => ack.mutate()
   // clicked on the map — bring the row into view so the spoke and the numbers meet
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ block: "nearest" })
   }, [focused])
   return (
-    <div ref={ref} className={cn("flex items-center gap-3 py-1.5 text-xs",
-      focused && "-mx-1.5 rounded-md bg-accent/60 px-1.5")}>
-      <span className={cn("size-2 shrink-0 rounded-full", DOT[onuSev(o)])} />
-      <span className="min-w-0 flex-1 truncate">
-        {o.name || <span className="text-muted-foreground">unnamed</span>}
-      </span>
-      {/* extra columns key off the PANEL's width (@container on the panel
-          root), not the viewport — the 380px map panel renders on a wide
-          desktop screen, so sm:/md:/lg: guards all pass and overflow it */}
-      <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-muted-foreground @xl:inline">
-        {o.serial || o.onu_key}
-      </span>
-      {/* ONE COLUMN PER FACT — no column stands in for another. The Rx cell used
-          to fall back to distance/time-dark so the 380px panel kept a useful
-          number, but the dedicated distance column then printed the same km
-          twice on a no-Rx ONU. Distance and time-dark are their own columns at
-          every width now, so the narrow panel loses nothing and no cell has to
-          be read twice to know what it means. */}
-      {!noRx && (
-        <span className={cn("w-20 shrink-0 text-right font-mono font-semibold tabular-nums",
-          onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
-          {o.rx_dbm != null
-            ? `${fmtDbm(o.rx_dbm)} dBm`
-            : <span className="font-normal text-faint-foreground">—</span>}
+    // Sized up from text-xs/py-1.5: this is the row a tech reads a dBm figure off
+    // at a pole, on a phone, and the identifier columns were sitting at the 12px
+    // floor. The focused row also gets an OUTLINE, not just a wash — arriving
+    // here from a map click, "which row did it open?" has to be answerable at a
+    // glance rather than by spotting a slightly lighter background.
+    <div ref={ref} className={cn("py-2 text-sm",
+      focused && "-mx-1.5 rounded-md bg-accent px-1.5 ring-1 ring-border-strong")}>
+      {/* EVERY COLUMN WAS FIXED-WIDTH AND ONLY THE NAME COULD GIVE. Six fixed
+          cells plus a 10.5rem MAC came to ~600px of a panel that opens at 420
+          and is usually dragged to ~630 — so the name column, the one thing on
+          `flex-1`, was squeezed to a single character while a 17-char MAC sat
+          beside it at full width. The budget is now checked at the breakpoints:
+          nothing here is allowed to need more room than the width it renders at.
+          Widths key off the PANEL (@container on the panel root), not the
+          viewport — this panel is 420px on a 2560px screen, so sm:/md:/lg:
+          guards all pass and overflow it. */}
+      <div className="flex items-center gap-2.5">
+        <span className={cn("size-2.5 shrink-0 rounded-full", DOT[onuSev(o)])} />
+        {/* S.No — the OLT's own ONU index, see onuIndex(). It leads the row
+            because that is where a number you're matching against another list
+            has to be, and it is the one column that stays at every width. */}
+        <span className="w-8 shrink-0 text-right font-mono text-2xs tabular-nums text-faint-foreground"
+          title={`ONU ${o.onu_id ?? "?"}${o.pon_port ? ` on PON ${o.pon_port}` : ""}`
+            + (o.onu_key ? ` · slot ${o.onu_key}` : "")}>
+          {onuIndex(o)}
         </span>
-      )}
-      <span className="w-16 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground">
-        {fmtOnuKm(o.distance_m)}
-      </span>
-      <span className="w-20 shrink-0 truncate text-right text-2xs text-muted-foreground">
-        {o.state === "online" ? null
-          : o.last_online_at ? `dark ${durationSince(o.last_online_at)}` : "offline"}
-      </span>
-      <span className="w-14 shrink-0 text-right">
-        {onuSev(o) === "ok" || o.state !== "online" ? null : acked ? (
-          <button className="text-2xs text-muted-foreground hover:text-foreground"
-            onClick={() => ack.mutate()} disabled={ack.isPending}>acked</button>
-        ) : (
-          <Button variant="outline" size="sm" className="h-6 px-2 text-2xs"
-            onClick={() => ack.mutate()} disabled={ack.isPending}>Ack</Button>
+        {/* The OPERATOR's name wins over the walked one (`onuName`). A tech
+            standing at the drop typed it, and on this fleet the OLT's own name
+            column is usually blank — so naming the row off `o.name` alone
+            printed "unnamed" for a subscriber somebody had just been to and
+            named. The walked name is kept in the tooltip rather than dropped:
+            where a box reports one, "what does the OLT call it" is still a real
+            question. */}
+        <span className="min-w-0 flex-1 truncate"
+          title={o.label && o.name && o.label !== o.name
+            ? `${o.label} · the OLT calls it ${o.name}` : undefined}>
+          {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
+        </span>
+        {/* Reference point toggle. It sits next to the NAME rather than out in
+            the action column because it is a fact about the site, not a fact
+            about this reading — and a placed one has to stay legible when the Rx
+            and ack columns are empty, which on a no-Rx vendor is always. */}
+        <ReferenceOnuButton o={o} deviceId={deviceId} />
+        <MacCell o={o} className="hidden w-[8.75rem] text-xs @2xl:block" />
+        {/* Which splitter feeds this drop. Genuinely diagnostic beside an Rx
+            column: several weak ONUs sharing one box is a feeder problem, and
+            the same readings scattered across boxes are separate drops. Wide
+            widths only — this is context rather than a reading. An unrecorded
+            drop renders as a dash, not as blank: "nobody wrote it down" is a
+            fact worth seeing. */}
+        <span className="hidden w-24 shrink-0 truncate text-xs text-muted-foreground @3xl:inline"
+          title={o.drop_passive_id != null
+            ? `Drop from ${splitters?.get(o.drop_passive_id) ?? "a splitter that no longer exists"}`
+            : "No serving splitter recorded — open the splitter's panel on the map to record its subscribers"}>
+          {o.drop_passive_id != null
+            ? splitters?.get(o.drop_passive_id) ?? "—"
+            : <span className="text-faint-foreground">—</span>}
+        </span>
+        {/* ONE COLUMN PER FACT — no column stands in for another. The Rx cell
+            used to fall back to distance/time-dark so the narrow panel kept a
+            useful number, but the dedicated distance column then printed the
+            same km twice on a no-Rx ONU. Rx stays on line one at every width:
+            it is the value this list is sorted on. */}
+        {!noRx && (
+          <span className={cn("w-24 shrink-0 text-right font-mono font-semibold tabular-nums",
+            onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
+            {o.rx_dbm != null
+              ? `${fmtDbm(o.rx_dbm)} dBm`
+              : <span className="font-normal text-faint-foreground">—</span>}
+          </span>
         )}
-      </span>
+        <DistCell o={o} className="hidden w-14 text-right @2xl:block" />
+        <DarkCell o={o} className="hidden w-16 text-right @2xl:block" />
+        <AckCell o={o} onAck={onAck} pending={ack.isPending}
+          className="hidden w-11 text-center @2xl:block" />
+      </div>
+      {/* Narrow layout's second line — the same cells, indented under the name.
+          Padding matches dot + gap + index + gap so the MAC starts where the
+          name does. */}
+      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 pl-[3.875rem] @2xl:hidden">
+        <MacCell o={o} className="text-2xs" />
+        <span className="text-faint-foreground">·</span>
+        <DistCell o={o} />
+        {o.state !== "online" && (
+          <>
+            <span className="text-faint-foreground">·</span>
+            <DarkCell o={o} />
+          </>
+        )}
+        <AckCell o={o} onAck={onAck} pending={ack.isPending} className="ml-auto" />
+      </div>
     </div>
   )
 }
@@ -183,7 +313,7 @@ function PonRow({ pon, open, onToggle, limit }: {
 }) {
 
   const worstTone = pon.crit > 0 ? "text-destructive" : pon.warn > 0 ? "text-warning" : "text-muted-foreground"
-  const hasRx = pon.typicalRx != null || pon.worstRx != null
+  const hasRx = pon.bestRx != null || pon.worstRx != null
   // EPON tops out at a 1:64 split — a PON that reached its cap can take no more
   // subscribers (central/onuroster.py pages this too)
   const atCap = pon.onus.length >= limit
@@ -201,11 +331,13 @@ function PonRow({ pon, open, onToggle, limit }: {
             at capacity {pon.onus.length}/{limit}
           </span>
         )}
-        {/* typical (median) + worst Rx; a vendor with no Rx readings (EPON
-            without an optics profile) says so once instead of two dashes */}
+        {/* best + worst Rx — the PON's span, so a wide gap reads as one bad
+            drop and a low pair as the shared plant; a vendor with no Rx
+            readings (EPON without an optics profile) says so once instead of
+            two dashes */}
         {hasRx ? (
           <span className="ml-auto flex shrink-0 items-baseline gap-3 font-mono text-2xs tabular-nums">
-            <span className="text-muted-foreground">{fmtDbm(pon.typicalRx)}</span>
+            <span className="text-muted-foreground">{fmtDbm(pon.bestRx)}</span>
             <span className={cn("font-semibold", worstTone)}>{fmtDbm(pon.worstRx)}</span>
           </span>
         ) : (
@@ -229,8 +361,9 @@ function PonRow({ pon, open, onToggle, limit }: {
 
 const WORST_N = 6
 
-function PonDetail({ pon, device, focusOnuId }: {
+function PonDetail({ pon, device, focusOnuId, splitters }: {
   pon: Pon; device: OrgDevice; focusOnuId?: number | null
+  splitters?: Map<number, string>
 }) {
   const deviceId = device.id
   const [showAll, setShowAll] = useState(false)
@@ -265,7 +398,7 @@ function PonDetail({ pon, device, focusOnuId }: {
   }
   return (
     <div className="mb-1 ml-2 rounded-md border bg-card/50 px-3 py-2">
-      <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
+      <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {rosterOnly ? "By ONU ID" : "Worst first"} · PON {pon.port} · {pon.onus.length} ONUs
       </div>
       {/* "This OLT doesn't report per-ONU Rx" used to be stated flatly here,
@@ -286,11 +419,11 @@ function PonDetail({ pon, device, focusOnuId }: {
       <div className="divide-y divide-border/60">
         {(showAll ? worst : worst.slice(0, WORST_N)).map((o) => (
           <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId}
-            noRx={rosterOnly} />
+            noRx={rosterOnly} splitters={splitters} />
         ))}
       </div>
       {worst.length > WORST_N && (
-        <button className="mt-1 text-2xs text-muted-foreground hover:text-foreground"
+        <button className="mt-1.5 text-xs text-muted-foreground hover:text-foreground"
           onClick={() => setShowAll(!showAll)}>
           {showAll ? "Show fewer" : `All ${pon.onus.length} ONUs on ${pon.port} →`}
         </button>
@@ -305,6 +438,9 @@ function PonDetail({ pon, device, focusOnuId }: {
 // slack coils included, so it's a stretch of route, never a point.
 function FaultCard({ f }: { f: PonFault }) {
   const fiber = f.kind === "fiber"
+  // a reference ONU that went dark is testimony, not inference — "suspected" is
+  // the wrong word once power has been ruled out by something that stayed up
+  const witnessed = f.evidence === "witness" && f.witness_dark > 0
   const range = fiber && f.cut_high_m != null
     ? (f.cut_low_m ? `${fmtKm(f.cut_low_m)} – ${fmtKm(f.cut_high_m)}` : `within ${fmtKm(f.cut_high_m)}`)
     : null
@@ -314,7 +450,9 @@ function FaultCard({ f }: { f: PonFault }) {
       fiber ? "border-destructive/40 bg-destructive-soft/40" : "border-warning/40 bg-warning-soft/40",
     )}>
       <p className={cn("font-semibold", fiber ? "text-destructive" : "text-warning")}>
-        {fiber ? "Suspected fiber cut" : "Power-outage pattern"} · PON {f.pon_port ?? "?"}
+        {fiber
+          ? (witnessed ? "Fibre cut confirmed" : "Suspected fiber cut")
+          : "Power-outage pattern"} · PON {f.pon_port ?? "?"}
       </p>
       <p className="mt-0.5 text-muted-foreground">
         {f.dark} of {f.onus_total} ONUs dark
@@ -330,10 +468,33 @@ function FaultCard({ f }: { f: PonFault }) {
         </p>
       ) : (
         <p className="mt-0.5">
-          Mostly dying-gasp: customers likely lost mains power. Check the area's
-          supply before dispatching a splicing crew.
+          {f.evidence === "witness"
+            ? <>A power-backed reference ONU on this PON is still online, so light
+                is reaching the area — the ONUs that dropped almost certainly lost
+                mains power. Don't dispatch a splicing crew.</>
+            : <>Mostly dying-gasp: customers likely lost mains power. Check the
+                area's supply before dispatching a splicing crew.</>}
         </p>
       )}
+      {/* Say what the verdict RESTS ON. On the C-Data/DBC fleet no ONU reports a
+          dying gasp or LOS, so "fiber" there is this system's assumption until a
+          reference ONU turns it into a finding — and the reader is deciding
+          whether to wake a crew at 2am. Never render the two alike. */}
+      <p className="mt-1 text-2xs text-faint-foreground">
+        {f.evidence === "witness" ? (
+          f.witness_dark > 0
+            ? <>Confirmed by {f.witness_dark} power-backed reference ONU
+                {f.witness_dark > 1 ? "s" : ""} going dark — power can't explain that.</>
+            : <>Based on {f.witness_alive} power-backed reference ONU
+                {f.witness_alive > 1 ? "s" : ""} still online past the dark ONUs.</>
+        ) : f.evidence === "dying_gasp" ? (
+          <>Based on the ONUs' own dying-gasp reports.</>
+        ) : (
+          <>No dying-gasp or LOS reported on this hardware, so this is an
+            assumption, not a measurement. Placing a power-backed reference ONU on
+            this PON would settle it.</>
+        )}
+      </p>
     </div>
   )
 }
@@ -425,12 +586,18 @@ function DupMacCard({ d }: { d: DupMac }) {
   )
 }
 
-export function OpticalPanel({ device, focusOnuId }: {
+export function OpticalPanel({ device, focusOnuId, focusOnuMac }: {
   device: OrgDevice
   /** map spoke click-through: open this ONU's PON group and highlight its row */
   focusOnuId?: number | null
+  /** Same, addressed by MAC — what a REFERENCE ONU is keyed on (`onu_places`).
+   *  The places API carries the ONU's slot number, not its `onu_optics` row id,
+   *  so focusing by id from there would highlight whatever row happened to
+   *  share the number. Identity is the MAC everywhere else in this feature; it
+   *  is the only key that survives a re-homed drop. */
+  focusOnuMac?: string | null
 }) {
-  const { canWrite } = useAuth()
+  const { canWrite, scopeOrg } = useAuth()
   const q = useQuery<OpticsResponse>({
     queryKey: ["optics", device.id],
     queryFn: () => inventoryApi.optics(device.id),
@@ -442,6 +609,18 @@ export function OpticalPanel({ device, focusOnuId }: {
     refetchInterval: 30_000,
   })
   const pons = useMemo(() => groupByPon(q.data?.onus ?? []), [q.data])
+  // Names for the "fed from" column. Reads the device list every page already
+  // holds (react-query dedupes it) rather than shipping a second copy of the
+  // name in the optics reply, where it could disagree with the tree.
+  const invQ = useQuery({
+    queryKey: ["inventory", scopeOrg],
+    queryFn: () => inventoryApi.list(scopeOrg),
+    enabled: !!scopeOrg,
+    staleTime: 30_000,
+  })
+  const splitterNames = useMemo(
+    () => new Map((invQ.data?.devices ?? []).map((d) => [d.id, d.name])),
+    [invQ.data])
 
   const worstPon = useMemo(() => {
     if (!pons.length) return null
@@ -453,14 +632,25 @@ export function OpticalPanel({ device, focusOnuId }: {
   // than the worst PON springing open every time. A map spoke click-through
   // still auto-opens its ONU's PON (the focusPort effect below).
   const [openPort, setOpenPort] = useState<string | null>(null)
+  // One focus id, resolved from whichever key the caller had. `_norm_mac` is
+  // trim + upper-case and deliberately NOT separator-stripping (central/
+  // onuroster.py) — two differently-punctuated strings really are two values.
+  const focusId = useMemo(() => {
+    if (focusOnuId != null) return focusOnuId
+    const mac = (focusOnuMac ?? "").trim().toUpperCase()
+    if (!mac) return null
+    const o = (q.data?.onus ?? []).find(
+      (x) => (x.serial ?? "").trim().toUpperCase() === mac)
+    return o?.id ?? null
+  }, [focusOnuId, focusOnuMac, q.data])
   const focusPort = useMemo(() => {
-    if (focusOnuId == null) return null
-    const o = (q.data?.onus ?? []).find((x) => x.id === focusOnuId)
+    if (focusId == null) return null
+    const o = (q.data?.onus ?? []).find((x) => x.id === focusId)
     return o ? o.pon_port ?? "—" : null // "—" is groupByPon's null-port bucket
-  }, [focusOnuId, q.data])
+  }, [focusId, q.data])
   useEffect(() => {
     if (focusPort != null) setOpenPort(focusPort)
-  }, [focusPort, focusOnuId])
+  }, [focusPort, focusId])
   const activePort = openPort
   const toggle = (port: string) =>
     setOpenPort((prev) => (prev === port ? null : port))
@@ -567,7 +757,8 @@ export function OpticalPanel({ device, focusOnuId }: {
           <div key={pon.port}>
             <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} limit={limit} />
             {pon.port === activePort && (
-              <PonDetail pon={pon} device={device} focusOnuId={focusOnuId} />
+              <PonDetail pon={pon} device={device} focusOnuId={focusId}
+                splitters={splitterNames} />
             )}
           </div>
         ))}

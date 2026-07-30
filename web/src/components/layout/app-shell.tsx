@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react"
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom"
+import { useEffect, useRef } from "react"
+import { Navigate, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { MoreHorizontal, Search } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
+import { useIsMobile } from "@/hooks/use-mobile"
 import { billingApi } from "@/lib/api"
 import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
 import { NAV_ITEMS, MORE_ITEMS, NAV_GROUPS } from "./nav-items"
@@ -11,7 +12,6 @@ import { AlarmChips } from "./alarm-chips"
 import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
 import { AccountMenu } from "./account-menu"
-import { CommandPalette } from "./command-palette"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
   SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
@@ -23,10 +23,11 @@ import {
 import { Button } from "@/components/ui/button"
 
 export function AppShell() {
-  const [searchOpen, setSearchOpen] = useState(false)
   const { user, scopeOrg } = useAuth()
-  // Read-only worker (same shell at every viewport now): no Settings, no billing.
+  // Read-only worker: no Settings, no billing. On a phone it gets the survey
+  // screen and nothing else (see FieldShell at the foot of this file).
   const isWorker = !!user && !user.is_superadmin && user.role === "worker"
+  const isMobile = useIsMobile()
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -42,6 +43,29 @@ export function AppShell() {
   const sidebarItems = navItems.filter((i) => !i.account)
 
   const isNavActive = (to: string) => (to === "/" ? pathname === "/" : pathname.startsWith(to))
+
+  // The top bar no longer carries a search of its own: it hands off to the
+  // Network page's box, which is the one search in the product (devices AND
+  // ONUs, with the tree right there to land in). A fresh nav state each time so
+  // clicking it while already on /topology still re-focuses the field.
+  const goToSearch = () =>
+    navigate("/topology", { state: { focusSearch: Date.now() } })
+
+  // ⌘K / Ctrl+K does the same thing the button does — the button advertises the
+  // shortcut, so the two must not diverge. Ignored while typing, or the chord
+  // would yank a user out of whatever field they are in.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "k" || !(e.metaKey || e.ctrlKey)) return
+      const el = document.activeElement
+      if (el instanceof HTMLElement &&
+        (el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName))) return
+      e.preventDefault()
+      navigate("/topology", { state: { focusSearch: Date.now() } })
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [navigate])
 
   // Paywall: /api/billing stays reachable while everything else 402s, so this
   // one poll drives the lock screen AND its automatic release after payment.
@@ -88,6 +112,18 @@ export function AppShell() {
 
   if (billing?.locked && user && !user.is_superadmin) {
     return <BillingLock billing={billing} org={billingOrg} />
+  }
+
+  // A WORKER ON A PHONE GETS ONE SCREEN. Operator's call (2026-07-28): the field
+  // handset is a survey tool, not a shrunken NOC, and every other destination on
+  // it was read-only anyway — a tab that can only be looked at is a tab that
+  // costs a thumb-press to find out. Deliberately reintroduces a viewport fork
+  // (retired once because a desktop RESIZE changed the whole app), which is
+  // acceptable here for one reason: nobody resizes a phone, and the same worker
+  // on a laptop still gets the full read-only shell. Placed AFTER the billing
+  // lock so a locked org still shows its lock screen.
+  if (isWorker && isMobile) {
+    return <FieldShell />
   }
 
   return (
@@ -151,20 +187,20 @@ export function AppShell() {
           </div>
           <div className="flex-1" />
           <AlarmChips />
-          {/* Shaped exactly like the input it stands in for so the palette is
-              discoverable, but kept a BUTTON: a text field you cannot type into
-              is a lie the first keystroke exposes. */}
+          {/* Shaped like the input it points at, but kept a BUTTON: a text field
+              you cannot type into is a lie the first keystroke exposes. It does
+              not search — it takes you to the Network page's search box. */}
           <button
             className="hidden h-8 w-52 items-center gap-2 rounded-lg border bg-muted px-2.5 text-xs text-faint-foreground transition-colors hover:border-border-strong hover:text-muted-foreground lg:flex lg:w-72"
-            onClick={() => setSearchOpen(true)}>
+            onClick={goToSearch}>
             <Search className="size-3.5 shrink-0" />
-            <span className="flex-1 text-left">Search devices, logs, IPs…</span>
+            <span className="flex-1 text-left">Search devices and ONUs…</span>
             <kbd className="pointer-events-none rounded border bg-accent px-1.5 py-px font-mono text-2xs">
               {navigator.platform.includes("Mac") ? "⌘K" : "Ctrl K"}
             </kbd>
           </button>
           <Button variant="ghost" size="icon" className="size-8 lg:hidden" aria-label="Search"
-            onClick={() => setSearchOpen(true)}>
+            onClick={goToSearch}>
             <Search className="size-4" />
           </Button>
           {/* Mobile only: the sidebar (and with it the account menu) is hidden
@@ -197,7 +233,11 @@ export function AppShell() {
               end={item.to === "/"}
               className={({ isActive }) =>
                 cn(
-                  "flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium",
+                  // flex-1/min-w-0, not a fixed min-width: the bar carries six
+                  // destinations once Survey is in it, and 6 × 3.5rem overflows
+                  // a 320px handset. Dividing the width keeps the bar correct
+                  // for whatever the next entry brings.
+                  "flex min-w-0 flex-1 flex-col items-center gap-0.5 px-1 py-2 text-2xs font-medium",
                   isActive ? "text-foreground" : "text-faint-foreground",
                 )
               }
@@ -208,7 +248,7 @@ export function AppShell() {
           ))}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex min-w-14 flex-col items-center gap-0.5 px-2 py-2 text-2xs font-medium text-faint-foreground">
+              <button className="flex min-w-0 flex-1 flex-col items-center gap-0.5 px-1 py-2 text-2xs font-medium text-faint-foreground">
                 <MoreHorizontal className="size-5" />
                 More
               </button>
@@ -226,8 +266,36 @@ export function AppShell() {
           </DropdownMenu>
         </nav>
       </SidebarInset>
-
-      <CommandPalette open={searchOpen} onOpenChange={setSearchOpen} />
     </SidebarProvider>
+  )
+}
+
+/** The field handset: one screen, no navigation.
+ *
+ *  Every path a worker can reach on a phone lands on /survey — including a deep
+ *  link out of a WhatsApp page, which is why the redirect is here rather than a
+ *  route guard. There is no bottom bar and no sidebar, so the only chrome is the
+ *  org name and the account menu (logout has to stay reachable).
+ *
+ *  The redirect is `replace` so the back button doesn't walk into the route that
+ *  just bounced. */
+function FieldShell() {
+  const { user } = useAuth()
+  const { pathname } = useLocation()
+
+  if (pathname !== "/survey") return <Navigate to="/survey" replace />
+
+  return (
+    <div className="flex min-h-svh flex-col bg-background">
+      <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center justify-between gap-3 border-b bg-background px-4">
+        <span className="truncate text-sm font-semibold tracking-tight">
+          {user?.org_name || user?.org_id}
+        </span>
+        <UserMenu />
+      </header>
+      <main className="flex flex-1 flex-col overflow-y-auto">
+        <Outlet />
+      </main>
+    </div>
   )
 }

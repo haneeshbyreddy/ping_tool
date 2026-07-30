@@ -474,10 +474,10 @@
   background: color-mix(in oklab, var(--tag) 20%, transparent);
 }
 
-/* Drill-in block (Network tree, routes/topology-page.tsx): the open row and its
-   expanded panel merge into ONE raised surface — popover bg + strong outline; the
-   elevation alone marks the selection (a colored rail was tried and rejected).
-   Light mode doubles the outline (hairlines read weaker on white). */
+/* Drill-in selection (Network tree, routes/topology-page.tsx): the open row gets
+   ONE raised surface — popover bg + strong outline; the elevation alone marks
+   the selection (a colored rail was tried and rejected). Light mode doubles the
+   outline (hairlines read weaker on white). */
 .wisp-drillin {
   background: var(--popover);
   border: 1px solid var(--border-strong);
@@ -487,6 +487,52 @@
 }
 html:not(.dark) .wisp-drillin {
   box-shadow: 0 0 0 1px var(--input);
+}
+
+/* Network device side panel (routes/topology-page.tsx). Its width is DRAGGABLE,
+   so it rides a custom property rather than a Tailwind width class — and it must
+   apply only from `md` up, because below that the panel is a full-width bottom
+   sheet and an inline `width` would override that at every breakpoint. Same
+   reason `.wisp-panel-clear` (the gutter that keeps the page's controls from
+   being parked under the panel) is media-scoped: the rows deliberately run under
+   the panel, the controls deliberately don't, and on a phone there is no panel
+   beside anything to clear. Both default to the closed/unset case, so a page
+   that never sets the properties is unaffected. */
+.wisp-device-panel {
+  /* The panel is an overlay, so a wheel anywhere over it must stay in it — the
+     page underneath scrolling away while you read is disorienting in a way a
+     docked panel never is. `contain` on the inner scroller alone isn't enough:
+     the header and tab strip are outside it, and a scroller whose content fits
+     has nothing to absorb the gesture. The Card is `overflow: hidden`, which is
+     still a scroll container, so it absorbs what its children don't. */
+  overscroll-behavior: contain;
+}
+@media (min-width: 48rem) {
+  .wisp-device-panel {
+    width: var(--wisp-panel-w, 26.25rem);
+  }
+  /* Two ways to keep chrome out from under the panel, off ONE measurement: the
+     Network page reserves a gutter on its toolbar rows, the Map pushes its
+     floating control column left. Both were hardcoded to a fixed panel width
+     until the panel became draggable, at which point a constant gaps or
+     overlaps on every resize. */
+  .wisp-panel-clear {
+    padding-right: var(--wisp-panel-clear, 0px);
+  }
+  /* max() rather than a second custom property: `--wisp-panel-clear` is 0 while
+     the panel is closed, and the control column still wants its normal 0.75rem
+     inset off the edge — so the floor IS the closed position. */
+  .wisp-panel-beside {
+    right: max(0.75rem, var(--wisp-panel-clear, 0px));
+  }
+  /* ...and the top strip has to stop short of that column wherever it now is.
+     It used to reserve a FIXED 96px, which was right only while the column sat
+     at the edge — widen the panel and the layers button lands on top of the
+     strip's last chip. Same measurement, so they can't disagree; the strip wraps
+     to a second line rather than colliding. */
+  .wisp-panel-strip {
+    max-width: calc(100% - max(0.75rem, var(--wisp-panel-clear, 0px)) - 3.75rem);
+  }
 }
 
 /* Map view (routes/map-page.tsx) — pins are divIcons so everything below is
@@ -681,6 +727,67 @@ html:not(.dark) .wisp-drillin {
   animation: wisp-pin-pulse 1.6s ease-out infinite;
 }
 
+/* ---- Splitters: ratio + recorded load, and the span below a break ----------
+   A passive has NO state of its own — nothing pings a splitter, it has no FSM
+   and no outage. What it can report is what hangs below it, so its pin borrows
+   that and nothing else. Plant stays quiet by default (it is reference material
+   and must not compete with gear for the eye); the one exception is the one
+   worth making — a splitter whose recorded customers are dark is the most
+   useful object on the map during a cut, and it is allowed to say so. SIZE
+   never changes, only tone: a louder splitter must not start reading as gear. */
+.wisp-pin__sub {
+  margin-left: 5px;
+  color: var(--faint-foreground);
+  font-weight: 400;
+}
+.wisp-pin--drops-weak .wisp-pin__sub { color: var(--warning); }
+.wisp-pin--drops-dark .wisp-pin__sub { color: var(--destructive); font-weight: 600; }
+/* The dot follows the same rule. It does NOT pulse: the pulse means "this box
+   is down", and a splitter is never down — its subscribers are. */
+.wisp-pin--drops-weak .wisp-pin__dot {
+  box-shadow: 0 0 0 1px var(--border-strong),
+    0 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent);
+}
+.wisp-pin--drops-dark .wisp-pin__dot {
+  box-shadow: 0 0 0 1px var(--border-strong),
+    0 0 0 3px color-mix(in srgb, var(--destructive) 55%, transparent);
+}
+
+/* Branch fault: every recorded subscriber below one passive is dark while a
+   sibling branch is lit, so the break is in the ONE span feeding it.
+   The span itself is a WIDE TRANSLUCENT STROKE under the cable (drawn from
+   map-page's pathOptions, not from here) so the line's own colour, its tone and
+   any bandwidth chip on it all still read through — it marks a LENGTH of route,
+   which is the whole difference from the ranging ✕. This rule is just the badge
+   sitting at its midpoint. */
+.wisp-branchfault {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: var(--destructive);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  border: 2px solid var(--background);
+  cursor: pointer;
+  animation: wisp-pin-pulse 1.6s ease-out infinite;
+}
+/* A power branch is a claim about the grid, not a cut. It must never wear the
+   colour that means "roll the splicing crew", and it does not pulse — nothing
+   about it is urgent to a fibre team. */
+.wisp-branchfault--power {
+  background: var(--warning);
+  color: #0b1920;
+  animation: none;
+}
+
 /* Link bandwidth chip (map/linklabel.ts): live ↓/↑ rates off the port bound to
    the link. Neutral by default so status colors stay loudest; tinted only when
    the bound port itself is down or tripping a bandwidth bound. */
@@ -738,6 +845,22 @@ html:not(.dark) .wisp-drillin {
   padding-left: 4px;
 }
 .wisp-linkbw--tinted .wisp-linkbw__ar { color: var(--wisp-link-tint); opacity: 0.85; }
+/* The reference-ONU variant of the same chip: one subscriber's own rate, off
+   the per-ONU ifTable row. Smaller and lighter than a link chip because the
+   line it rides is subordinate — but the SAME chip, since a rate is a rate and
+   a second visual language for it is how a dashboard stops reading as one
+   product. The --down tone still wins outright (it comes earlier in the
+   cascade only for colour, so re-state it here). */
+.wisp-linkbw--ref {
+  padding: 1px 4px;
+  font-size: 0.6875rem;
+  opacity: 0.9;
+  border-color: var(--border);
+}
+.wisp-linkbw--ref.wisp-linkbw--down {
+  opacity: 1;
+  border-color: color-mix(in oklab, var(--destructive) 70%, var(--border-strong));
+}
 
 /* Hover readout: where the cursor meets a cable, how far that point is from
    each end. Same opaque-fill-over-tiles treatment as the bandwidth chip, but it
@@ -855,6 +978,107 @@ html:not(.dark) .wisp-drillin {
 .wisp-pin--t-closure .wisp-pin__dot {
   width: 9px;
   height: 9px;
+}
+
+/* Reference ONUs (map/refonu.ts): operator-placed subscribers vouched for as
+   reliably powered. Deliberately the SMALLEST mark on the map and quieter than
+   passive plant — they are evidence, not infrastructure, and 90% of what hangs
+   off a fleet's ports is an ONU. A DARK one is the exception the size rule bends
+   for: power cannot darken a backed-up subscriber, so that is a fiber cut with a
+   coordinate. It still ranks below a down device (see refZIndex). */
+.wisp-refonu {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  cursor: pointer;
+}
+/* Sized by INK, not by the number. A diamond covers half the area of the circle
+   that bounds it, so an 11px one carried about a quarter of a 14px device dot's
+   ink and read as a speck — which is how a fleet that had just surveyed
+   thousands of drops ended up unable to see them. These now match a device dot's
+   area rather than sitting a rank below it. SHAPE, tone and stacking order still
+   do the subordination work (diamond vs round, muted vs status, refZIndex below
+   every pin), and those are what stop a subscriber being mistaken for plant —
+   size was only ever the crudest of the four. */
+.wisp-refonu__mark {
+  display: block;
+  width: 14px;
+  height: 14px;
+  transform: rotate(45deg);   /* diamond: devices are round, passives squarer */
+  border-radius: 1px;
+  /* 2px, matching .wisp-pin__dot: the ring of canvas colour is what separates
+     the mark from whatever tile is under it, and 1px of it disappeared over
+     satellite imagery. */
+  border: 2px solid var(--background);
+  background: var(--muted-foreground);
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+.wisp-refonu--live .wisp-refonu__mark {
+  background: color-mix(in srgb, var(--success) 70%, var(--muted-foreground));
+}
+.wisp-refonu--dark .wisp-refonu__mark {
+  width: 17px;
+  height: 17px;
+  background: var(--destructive);
+  box-shadow: 0 0 0 1px var(--border-strong),
+    0 0 0 3px color-mix(in srgb, var(--destructive) 35%, transparent);
+}
+/* An orphaned placement (its MAC left every roster — an RMA'd box) is hollow:
+   the point is still there and still yours to fix, but it is witnessing
+   nothing, and a solid mark would claim otherwise. */
+.wisp-refonu--orphan .wisp-refonu__mark {
+  background: transparent;
+  border: 1px dashed var(--muted-foreground);
+  box-shadow: none;
+}
+/* A LOCATED subscriber (field survey) versus a REFERENCE ONU. Both live in
+   onu_places and both are diamonds, but only the reference point is evidence in
+   a PON verdict — so the plain one stays small and never takes the dark mark's
+   size bump or halo. Once a fleet geo-tags its drops these outnumber witnesses
+   by a hundred to one, and if they looked alike the handful of pins that
+   actually decide "power cut or fibre cut" would be lost among them. Comes
+   AFTER --dark deliberately: the size reset has to win. */
+.wisp-refonu--plain .wisp-refonu__mark {
+  width: 13px;
+  height: 13px;
+  opacity: 0.9;
+  /* The ring is what still separates it from a reference point at a glance —
+     the SIZE gap alone was carrying too much of that job and made a located
+     subscriber hard to find at all, which is the opposite of the problem worth
+     having. Distinction preserved, legibility restored. */
+  box-shadow: none;
+}
+/* The survey's drag-to-adjust pin (components/pin-adjust-map.tsx). Louder than
+   anything on the main map on purpose: it is the ONLY object on that little map
+   and it is being AIMED, not scanned, so it needs a visible grab target and a
+   precise centre. The ring is the handle; the dot is the claim. */
+.wisp-adjust-pin {
+  display: flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--primary) 25%, transparent);
+  box-shadow: 0 0 0 2px var(--primary), 0 1px 6px rgb(0 0 0 / 0.45);
+  cursor: grab;
+}
+.wisp-adjust-pin:active {
+  cursor: grabbing;
+}
+.wisp-adjust-pin > span {
+  display: block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--primary);
+  box-shadow: 0 0 0 2px var(--background);
+}
+
+.wisp-refonu--selected .wisp-refonu__mark {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 55%, transparent);
+}
+.wisp-refonu--dim {
+  opacity: 0.28;
 }
 
 /* Site clusters (routes/map-page.tsx buildClusters): overlapping pins fold

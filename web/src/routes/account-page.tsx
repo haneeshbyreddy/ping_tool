@@ -69,8 +69,8 @@ function MyWhatsappCard() {
       </CardHeader>
       <CardContent className="flex flex-col gap-2.5">
         <p className="text-xs text-muted-foreground">
-          The number your role's alerts are also sent to on WhatsApp, when the platform has the
-          WhatsApp channel enabled. Leave blank to opt out — ntfy still reaches you either way.
+          The number this account is paged on. Alerts go out over WhatsApp — every owner and
+          worker account with a number gets every alert. Leave blank to opt out of alerts.
         </p>
         <div className="flex flex-col gap-1.5">
           <Label>Your WhatsApp number</Label>

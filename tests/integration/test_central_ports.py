@@ -42,6 +42,9 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.tower = self.store.create_org_device(ORG, {
             "name": "Rampur Tower", "ip_address": "10.0.0.2", "device_type": "backhaul",
             "region": "Rampur", "parent_device_id": None})
+        # WhatsApp-only: seed a worker number so port up/down (active kinds) page.
+        w = self.store.add_user(ORG, "wkr1", "h", "s", "worker")
+        self.store.set_user_whatsapp(w, "919000000009")
         self.notifier = RecordingNotifier()
         self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
 
@@ -81,7 +84,7 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.assertEqual([e.kind for e in evs], ["down"])
         self.assertEqual(self._rows()[2]["alarm"], 1)
         self.assertTrue(self.notifier.sent)
-        self.assertEqual(self.notifier.sent[0]["recipient"], "op")
+        self.assertEqual(self.notifier.sent[0]["whatsapp"], ["919000000009"])
 
     def test_single_blip_does_not_alarm(self):
         self._discover_and_watch(2)
@@ -141,11 +144,10 @@ class CentralPortMonitorTest(unittest.TestCase):
             st = conn.execute("SELECT status FROM alert_log ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(st["status"], "suppressed")
 
-    def test_missing_operator_topic_is_soft_noop(self):
-        self.store.set_org(ORG, ntfy_topic_worker=None)
-        with self.store._connect() as conn:
-            conn.execute("UPDATE orgs SET ntfy_topic_worker=NULL WHERE org_id=?", (ORG,))
-            conn.commit()
+    def test_missing_recipient_is_soft_noop(self):
+        # no WhatsApp numbers → nothing to page, but the alarm state still writes
+        self.store.set_user_whatsapp(
+            self.store.get_user_by_username("wkr1")["id"], None)
         self._discover_and_watch(2)
         self.pm.sync_device(self.switch, [_port(2, "down")], TS)
         self.pm.sync_device(self.switch, [_port(2, "down")], TS)
@@ -207,10 +209,9 @@ class BandwidthTest(unittest.TestCase):
             3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_low"])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        self.assertEqual(len(self.notifier.sent), 1)   # PUSH: immediate, not digest
-        self.assertEqual(self.notifier.sent[0]["recipient"], "op")
-        self.assertIn("bandwidth", self.notifier.sent[0]["title"].lower())
-        self.assertEqual(self._queued(), [])           # not buried in the digest
+        # bandwidth alerts are OFF for now (allowlist): alarm state written, no page
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
 
     def test_single_dip_does_not_alarm(self):
         self._watch_bw(3, threshold=10)
@@ -232,8 +233,7 @@ class BandwidthTest(unittest.TestCase):
             3, 60 * _OCT_PER_MBPS_10S, 60 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
         self.assertEqual([e.kind for e in evs], ["bw_ok"])
         self.assertEqual(self._row(3)["bw_alarm"], 0)
-        self.assertEqual(len(self.notifier.sent), 1)
-        self.assertIn("recovered", self.notifier.sent[0]["title"].lower())
+        self.assertEqual(self.notifier.sent, [])       # off for now
 
     def test_direction_out_ignores_low_inbound(self):
         self._watch_bw(3, threshold=10, direction="out")
@@ -250,7 +250,7 @@ class BandwidthTest(unittest.TestCase):
         self.pm.sync_device(self.switch, [_pbw(
             3, 10 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        self.assertTrue(self.notifier.sent)
+        self.assertEqual(self.notifier.sent, [])       # off for now
 
     def test_unmonitored_port_never_bw_alarms(self):
         self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])
@@ -308,10 +308,9 @@ class BandwidthTest(unittest.TestCase):
             3, 100 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_high"])
         self.assertEqual(self._row(3)["bw_high_alarm"], 1)
-        self.assertEqual(len(self.notifier.sent), 1)   # PUSH: immediate, not digest
-        self.assertEqual(self.notifier.sent[0]["recipient"], "op")
-        self.assertIn("high bandwidth", self.notifier.sent[0]["title"].lower())
-        self.assertEqual(self._queued(), [])           # not buried in the digest
+        # bandwidth alerts are OFF for now (allowlist): alarm state written, no page
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
 
     def test_high_bandwidth_recovery_edge_pages_once(self):
         self._watch_bw_max(3, max_mbps=40)
@@ -324,8 +323,7 @@ class BandwidthTest(unittest.TestCase):
             3, 105 * _OCT_PER_MBPS_10S, 105 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
         self.assertEqual([e.kind for e in evs], ["bw_normal"])
         self.assertEqual(self._row(3)["bw_high_alarm"], 0)
-        self.assertEqual(len(self.notifier.sent), 1)
-        self.assertIn("normalized", self.notifier.sent[0]["title"].lower())
+        self.assertEqual(self.notifier.sent, [])       # off for now
 
     def test_low_and_high_alarms_are_independent(self):
         self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])

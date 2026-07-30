@@ -153,7 +153,7 @@ class CentralOpticsMonitor:
         path was writing as NULL.
         """
         AlertRouter(self.store, self.org_id, self.notifier, self.cfg).emit(
-            kind, topic=self.store.org_role_topic(self.org_id, "worker"),
+            kind,
             title=title, body=body, priority=3, ts=ts, device_id=device_id,
             gate=self.cfg.optical_alerts)
 

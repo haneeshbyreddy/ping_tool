@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 
-from wisp.central import auth
 from wisp.central import billing as billing_mod
 from wisp.central import inventory, sysinfo, theme
 from wisp.central.api.common import (DENIED, body_org_write, now_iso, org_or_400,
@@ -20,10 +19,14 @@ _QR_MAX_CHARS = 700_000
 log = logging.getLogger("wisp.central.api.orgs")
 
 
-def _admin_payments_topic(h) -> str | None:
-    """Where an org's 'I've paid' ping lands: the dedicated payments channel
-    if the superadmin set one, else the shared central/admin topic."""
-    return h.store.get_setting("billing_paid_topic") or h.cfg.central_ntfy_topic
+def _admin_whatsapp(h) -> list[str]:
+    """The superadmin ops WhatsApp recipient for org-side pings ('I've paid',
+    self-downgrade to Free): the single admin number from Settings → Platform
+    (app_settings), env fallback. Empty → nothing to notify (skipped, not an
+    error) — ntfy was removed 2026-07-24, so there is no topic fallback."""
+    num = (h.store.whatsapp_settings().get("admin_number")
+           or h.cfg.whatsapp_admin_number or "").strip()
+    return [num] if num else []
 
 
 def healthz(h, qs):
@@ -35,8 +38,7 @@ def me(h, qs):
     if not user:
         h._reply(401, {"error": "unauthorized"})
         return
-    h._reply(200, {"user": public_user(user, h.store),
-                   "channels": {"central": h.cfg.central_ntfy_topic}})
+    h._reply(200, {"user": public_user(user, h.store)})
 
 
 def system(h, qs):
@@ -73,6 +75,8 @@ def _whatsapp_public(h) -> dict:
             "template": wa.get("template") or "",
             "lang": wa.get("lang") or "",
             "api_version": wa.get("api_version") or "",
+            # superadmin ops recipient (org 'I've paid' / churn / release-sync)
+            "admin_number": wa.get("admin_number") or "",
             "token_set": bool(wa.get("token"))}
 
 
@@ -81,14 +85,11 @@ def admin_settings(h, qs):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
                    "billing_gpay_number": billing_mod.gpay_number(h.store),
-                   # the QR image (a data URI) and the payments channel aren't
-                   # secret — echo them back so the settings page can preview
-                   # and edit them
+                   # the QR image (a data URI) isn't secret — echo it back so the
+                   # settings page can preview and edit it
                    "billing_qr_image": h.store.get_setting("billing_qr_image"),
-                   "billing_paid_topic":
-                       h.store.get_setting("billing_paid_topic") or "",
-                   # experimental WhatsApp channel — server-wide config (numbers
-                   # are per-account, set in Accounts, not here)
+                   # WhatsApp channel — server-wide config (per-account recipient
+                   # numbers are set in Accounts; the admin ops number is here)
                    "whatsapp": _whatsapp_public(h),
                    # sparse colour diff over the shipped palette; `{}` means a
                    # stock theme, NOT "no colours" (see central/theme.py)
@@ -239,15 +240,12 @@ def admin_settings_write(h, user, body):
             h._reply(422, {"error": "QR image is too large — use a smaller PNG"})
             return
         h.store.set_setting("billing_qr_image", qr)
-    # Dedicated ntfy channel for "I've paid" pings; blank falls back to the
-    # central/admin topic (see _admin_payments_topic).
-    paid_topic = body.get("billing_paid_topic")
-    if paid_topic is not None:
-        h.store.set_setting("billing_paid_topic", str(paid_topic).strip()[:128])
-    # Experimental WhatsApp channel config (app_settings, read fresh by the
-    # notifier). The token is write-only: a blank field LEAVES the stored one
-    # alone (so a routine save can't wipe the secret) — the SPA omits it unless
-    # the superadmin typed a new one, and a `token_clear` flag removes it.
+    # WhatsApp channel config (app_settings, read fresh by the notifier — the
+    # sole channel since ntfy was removed). The token is write-only: a blank
+    # field LEAVES the stored one alone (so a routine save can't wipe the secret)
+    # — the SPA omits it unless the superadmin typed a new one, and a
+    # `token_clear` flag removes it. `admin_number` is the superadmin's ops
+    # recipient (org 'I've paid' / churn / release-sync failing).
     wa = body.get("whatsapp")
     if isinstance(wa, dict):
         if "enabled" in wa:
@@ -255,7 +253,7 @@ def admin_settings_write(h, user, body):
             # deleting the row and falling back to the env default)
             h.store.set_setting("whatsapp_enabled", "1" if wa.get("enabled") else "0")
         for key, cap in (("phone_id", 64), ("template", 128), ("lang", 16),
-                         ("api_version", 16)):
+                         ("api_version", 16), ("admin_number", 24)):
             if key in wa:
                 h.store.set_setting(f"whatsapp_{key}", str(wa.get(key) or "").strip()[:cap])
         if wa.get("token"):
@@ -299,17 +297,17 @@ def billing(h, qs):
 
 def billing_paid(h, user, body):
     """"I've paid": the org tells the platform admin a manual GPay/QR payment
-    is on its way. Pings the dedicated payments channel with the org name so
-    the admin can verify and mark the month. Deliberately billing-exempt
+    is on its way. Pings the superadmin's WhatsApp ops number with the org name
+    so the admin can verify and mark the month. Deliberately billing-exempt
     (server.py) — a LOCKED org taps this from the lock screen. Any signed-in
     member of the org may send it; there is nothing to authorize, only to
     notify."""
     org = org_or_400(h, user, body if isinstance(body, dict) else {})
     if not org:
         return
-    topic = _admin_payments_topic(h)
-    if not topic:
-        # no admin channel configured — nothing to notify, but don't error the
+    numbers = _admin_whatsapp(h)
+    if not numbers:
+        # no admin number configured — nothing to notify, but don't error the
         # user (their payment still stands; the admin reconciles by hand)
         h._reply(200, {"ok": True, "notified": False})
         return
@@ -323,8 +321,11 @@ def billing_paid(h, user, body):
     body_line += " · verify & mark the month paid"
     ok = False
     try:
-        ok = h.notifier.send(topic, f"💰 {name} says they've paid",
-                             body_line, 4).ok
+        from wisp.egress.notifiers import WhatsAppFacts
+        ok = h.notifier.send(
+            f"💰 {name} says they've paid", body_line, 4, whatsapp=numbers,
+            facts=WhatsAppFacts(subject=name, status="PAID (claim)",
+                                detail=body_line, timestamp=now_iso())).ok
     except Exception:
         log.exception("payment-claim notification failed for %s", org)
     h._reply(200, {"ok": True, "notified": bool(ok)})
@@ -357,15 +358,18 @@ def billing_plan(h, user, body):
 
 
 def _notify_admin_plan_change(h, org: str, prior: str) -> None:
-    # best-effort heads-up on the payments channel — a lost churn signal must
-    # never 500 the downgrade
-    topic = _admin_payments_topic(h)
-    if not topic:
+    # best-effort heads-up to the admin WhatsApp number — a lost churn signal
+    # must never 500 the downgrade
+    numbers = _admin_whatsapp(h)
+    if not numbers:
         return
     try:
         name = h.store.org_name(org) or org
-        h.notifier.send(topic, f"📉 {name} switched to Free",
-                        f"was {prior} — self-serve downgrade", 3)
+        from wisp.egress.notifiers import WhatsAppFacts
+        detail = f"was {prior} — self-serve downgrade"
+        h.notifier.send(f"📉 {name} switched to Free", detail, 3, whatsapp=numbers,
+                        facts=WhatsAppFacts(subject=name, status="CHURN → Free",
+                                            detail=detail, timestamp=now_iso()))
     except Exception:
         log.exception("plan-change notification failed for %s", org)
 
@@ -405,25 +409,20 @@ def test_alert(h, user, body):
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
-    role = str(body.get("role") or "").strip().lower()
-    if role not in auth.ROLES:
-        h._reply(422, {"error": "role must be one of: " + ", ".join(auth.ROLES)})
-        return
-    topic = h.store.org_role_topic(org, role)
-    # WhatsApp fans out to the same role's per-account numbers — so this button
-    # verifies the WhatsApp channel too (Stage B: ntfy off, WhatsApp on).
-    whatsapp = h.store.org_role_whatsapp(org, role)
-    if not topic and not whatsapp:
-        h._reply(422, {"error": f"no {role} channel configured — set an ntfy topic "
-                                "or add WhatsApp numbers to the team's accounts first"})
+    # No role routing (2026-07-24): a real alert reaches the whole org audience
+    # (owner + worker accounts), so the test pages exactly that. The superadmin
+    # ops number is NOT an org recipient (2026-07-25), so the test won't hit it.
+    whatsapp = list(h.store.org_alert_recipients(org))
+    if not whatsapp:
+        h._reply(422, {"error": "no WhatsApp recipients — add WhatsApp numbers to "
+                                "the team's owner/worker accounts first"})
         return
     from wisp.egress.notifiers import WhatsAppFacts
-    body_line = f"This is a test alert for {org}'s {role} channel."
+    body_line = f"This is a test alert for {org}."
     res = h.notifier.send(
-        topic, "✅ WISP Central test alert", body_line, 3, whatsapp=whatsapp,
-        facts=WhatsAppFacts(subject=f"{org} · {role}", status="TEST",
+        "✅ WISP Central test alert", body_line, 3, whatsapp=whatsapp,
+        facts=WhatsAppFacts(subject=f"{org} (test)", status="TEST",
                             detail="channel test alert",
                             timestamp=now_iso()))
     h._reply(200, {"ok": res.ok, "detail": res.detail, "channel": h.notifier.channel,
-                   "recipient": topic, "role": role,
                    "whatsapp_count": len(whatsapp)})

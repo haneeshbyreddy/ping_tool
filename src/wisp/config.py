@@ -96,6 +96,31 @@ class Config:
         default_factory=lambda: _env_float("WISP_PROXY_CONNECT_TIMEOUT_S", 5.0))
     proxy_max_body_bytes: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_MAX_BODY_BYTES", 8 * 1024 * 1024))
+    # Per-session static-asset cache on CENTRAL (2026-07-29). 44% of every
+    # request this tunnel has ever carried was a re-fetch of an unchanging
+    # asset inside ONE session — measured over proxy_audit, jquery-1.7.1.min.js
+    # alone accounting for 553 fetches of a single OLT. Off = every asset pays
+    # a full round trip to the device again. See central/proxy.py:AssetCache.
+    proxy_cache_enabled: bool = field(
+        default_factory=lambda: _env_bool("WISP_PROXY_CACHE", True))
+    proxy_cache_ttl_s: float = field(
+        default_factory=lambda: _env_float("WISP_PROXY_CACHE_TTL_S", 300.0))
+    proxy_cache_max_entries: int = field(
+        default_factory=lambda: _env_int("WISP_PROXY_CACHE_MAX_ENTRIES", 128))
+    proxy_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int("WISP_PROXY_CACHE_MAX_BYTES", 4 * 1024 * 1024))
+    # How many requests the edge may have in flight against ONE device at once.
+    # The ceiling of the adaptive ladder (ingress/webproxy.py:_DeviceGate), which
+    # walks DOWN from here when a box refuses connections. proxy_workers bounds
+    # the node; this bounds the box, because a weak embedded HTTP server is the
+    # thing that actually falls over.
+    proxy_device_max_inflight: int = field(
+        default_factory=lambda: _env_int("WISP_PROXY_DEVICE_MAX_INFLIGHT", 4))
+    # Idle seconds before the edge closes a kept-alive connection to a device.
+    # Long enough to span a tech reading a page, short enough that we are not
+    # holding a socket open on an embedded box that only has a handful.
+    proxy_keepalive_idle_s: float = field(
+        default_factory=lambda: _env_float("WISP_PROXY_KEEPALIVE_IDLE_S", 90.0))
 
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
     # Per-subsystem sweep cadence. These were ONE clock (WISP_SNMP_INTERVAL_S, 90s)
@@ -246,13 +271,14 @@ class Config:
         default_factory=lambda: _env_int("WISP_ESCALATE_EVERY_MIN", 60)
     )
 
-    # Notification governor (central/notify_policy.py). PUSH-tier alerts (ICMP
-    # device/uplink/port down + recoveries) buzz the phone; everything SNMP-
-    # derived plus the hourly escalation queues to `alert_digest` and rolls into
-    # ONE summary per org every `digest_interval_min`. This is what keeps a
-    # C-Data area power cut (many PONs → many false "fiber cut" pages) from
-    # 429'ing ntfy's quota and taking real pages down with it. `alert_cooldown_min`
-    # is a per-(device, kind) backstop on the PUSH path only (0 = off).
+    # Notification governor (central/notify_policy.py). Since ntfy was removed
+    # 2026-07-24 only an ALLOWLIST of kinds pages (device/uplink/port/probe
+    # up+down); the SNMP-derived stream and the hourly escalation are turned OFF
+    # (state still written, nothing sent), so the digest machinery below is
+    # currently DORMANT — kept because re-enabling a kind is a one-line allowlist
+    # edit. `digest_interval_min` still gates a digest send should a kind rejoin
+    # the digest tier; `alert_cooldown_min` is a per-(device, kind) PUSH backstop
+    # (0 = off).
     digest_interval_min: int = field(
         default_factory=lambda: _env_int("WISP_DIGEST_INTERVAL_MIN", 60)
     )
@@ -262,32 +288,53 @@ class Config:
 
     prober: str = field(default_factory=lambda: _env("WISP_PROBER", "icmp").lower())
 
-    ntfy_base_url: str = field(default_factory=lambda: _env("WISP_NTFY_URL", "https://ntfy.sh"))
-    ntfy_retries: int = field(default_factory=lambda: _env_int("WISP_NTFY_RETRIES", 3))
-    ntfy_retry_backoff_s: float = field(
-        default_factory=lambda: _env_float("WISP_NTFY_RETRY_BACKOFF_S", 0.5)
+    # Send-retry policy shared by every notifier: network/timeout/5xx retries
+    # with exponential backoff, 4xx fails fast (egress/notifiers.py). Named
+    # generically since ntfy was removed 2026-07-24; the old WISP_NTFY_RETRIES*
+    # env vars are gone.
+    notify_retries: int = field(default_factory=lambda: _env_int("WISP_NOTIFY_RETRIES", 3))
+    notify_retry_backoff_s: float = field(
+        default_factory=lambda: _env_float("WISP_NOTIFY_RETRY_BACKOFF_S", 0.5)
     )
+    # DISPLAY-only zone for the timestamps a human reads off a notification
+    # ("Time Logged" in the WhatsApp template). Everything central stores stays
+    # UTC — the dashboard localises in the browser, so a page is the one place a
+    # stored timestamp reaches a person with nothing to convert it. Default IST;
+    # an unknown zone name falls back to UTC (egress/notifiers.py:_display_zone).
+    display_tz: str = field(
+        default_factory=lambda: _env("WISP_DISPLAY_TZ", "Asia/Kolkata"))
 
-    # Notification channels (central-side egress only; the edge never builds a
-    # notifier). ntfy stays the default and the authoritative channel — its send
-    # result is what a page's success is judged on and what alert_log records.
-    # WhatsApp (Meta Cloud API) is an ADDITIVE, best-effort second channel: a
-    # MultiNotifier fans out to both and a WhatsApp error can never downgrade a
-    # good ntfy page (egress/notifiers.py). These env vars are only the FALLBACK
-    # defaults — the live config (enable toggle + token + phone-id + template)
-    # is superadmin-managed in the dashboard (app_settings, Settings → Platform)
-    # and read fresh at send time, so it can be changed without a restart and
-    # numbers are per-login-account in the DB (users.whatsapp_number), not env.
-    enable_ntfy: bool = field(default_factory=lambda: _env_bool("WISP_ENABLE_NTFY", True))
+    # WhatsApp (Meta Cloud API) is the SOLE notification channel — ntfy was
+    # removed 2026-07-24. Central-side egress only; the edge never builds a
+    # notifier (all paging is central's). These env vars are FALLBACK defaults
+    # only: the live config (enable toggle + token + phone-id + template + the
+    # superadmin ops number) is superadmin-managed in the dashboard
+    # (app_settings, Settings → Platform) and read FRESH at send time, so it
+    # changes with no restart. Per-account recipient numbers live in the DB
+    # (users.whatsapp_number), resolved per org+role, never here.
     enable_whatsapp: bool = field(
-        default_factory=lambda: _env_bool("WISP_ENABLE_WHATSAPP", False))
+        default_factory=lambda: _env_bool("WISP_ENABLE_WHATSAPP", True))
     whatsapp_token: str = field(default_factory=lambda: _env("WISP_WHATSAPP_TOKEN", ""))
     whatsapp_phone_id: str = field(default_factory=lambda: _env("WISP_WHATSAPP_PHONE_ID", ""))
     whatsapp_template: str = field(
-        default_factory=lambda: _env("WISP_WHATSAPP_TEMPLATE", "wisp_alert"))
+        default_factory=lambda: _env("WISP_WHATSAPP_TEMPLATE", "wisp_alert1"))
     whatsapp_lang: str = field(default_factory=lambda: _env("WISP_WHATSAPP_LANG", "en"))
     whatsapp_api_version: str = field(
         default_factory=lambda: _env("WISP_WHATSAPP_API_VERSION", "v20.0"))
+    # Superadmin ops pings (org 'I've paid' / churn / release-sync failing) have
+    # no org role, so they page this single E.164 number instead of a role's
+    # per-account numbers. Set in Settings → Platform (app_settings); env is the
+    # fallback. Empty = those ops pings are silently skipped.
+    whatsapp_admin_number: str = field(
+        default_factory=lambda: _env("WISP_WHATSAPP_ADMIN_NUMBER", ""))
+    # Inbound webhook (the lookup bot). verify_token is echoed back to Meta at
+    # subscription time (GET handshake); app_secret signs every notification POST
+    # (X-Hub-Signature-256). Both live in app_settings (Settings → Platform), read
+    # fresh per request; these env values are the fallback.
+    whatsapp_verify_token: str = field(
+        default_factory=lambda: _env("WISP_WHATSAPP_VERIFY_TOKEN", ""))
+    whatsapp_app_secret: str = field(
+        default_factory=lambda: _env("WISP_WHATSAPP_APP_SECRET", ""))
 
     central_url: str = field(default_factory=lambda: _env("WISP_CENTRAL_URL", "").rstrip("/"))
     central_token: str = field(default_factory=lambda: _env("WISP_CENTRAL_TOKEN", ""))
@@ -332,8 +379,6 @@ class Config:
         default_factory=lambda: Path(_env("WISP_CENTRAL_PKI_DIR", str(DATA_DIR / "pki"))))
     central_node_stale_s: int = field(
         default_factory=lambda: _env_int("WISP_CENTRAL_NODE_STALE_S", 180))
-    central_ntfy_topic: str = field(
-        default_factory=lambda: _env("WISP_CENTRAL_NTFY_TOPIC", "wisp-central"))
     central_watchdog_interval_s: int = field(
         default_factory=lambda: _env_int("WISP_CENTRAL_WATCHDOG_INTERVAL_S", 0))
     # Public marketing landing (`/`) shows a DB-driven "trusted by" ticker of org
@@ -350,6 +395,13 @@ class Config:
     # cookie at issue time (auth.issue_session), not re-read per request.
     session_remember_days: int = field(
         default_factory=lambda: _env_int("WISP_SESSION_REMEMBER_DAYS", 30))
+    # "Trust this device" for a PRIVILEGED account (owner/superadmin). Those roles
+    # are deliberately refused the worker 30-day tier (they reconfigure the whole
+    # network), but MAY extend their own box's absolute cap from the default
+    # session_timeout_h to this many hours — with no idle logout for the window
+    # (operator choice 2026-07-25). Baked into the signed cookie at issue time.
+    session_trusted_admin_hours: int = field(
+        default_factory=lambda: _env_int("WISP_SESSION_TRUSTED_ADMIN_H", 24))
     # IDLE timeout: a normal (non-"remember") session dies this many minutes after
     # the LAST authenticated request, independent of the absolute session_timeout_h
     # cap. Slid forward on activity (auth.slide_session), so it only bites when the

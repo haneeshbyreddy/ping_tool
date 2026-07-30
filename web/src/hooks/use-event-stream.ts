@@ -5,6 +5,10 @@ import { tq } from "@/lib/api"
 const LIVE_QUERY_KEYS = [
   "summary", "outages", "inventory", "logs", "nodes",
   "snmp-walks", // a queued walk's result lands on the edge's report cadence
+  // The issue list is the same trouble the tiles count, so it has to move on the
+  // same signal — a list of what is wrong that lags a device recovering is the
+  // one thing this page cannot be.
+  "issues",
 ]
 
 export function useEventStream(org: string | null) {

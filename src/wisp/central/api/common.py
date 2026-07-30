@@ -138,6 +138,31 @@ def device_write_org(h, user, device_id: int):
     return org
 
 
+def can_survey(user, org: str | None) -> bool:
+    """Field capture rights: a WORKER in this org, or anyone who can already write.
+
+    Its own predicate for the same reason `can_triage` is: recording where a box
+    physically stands is the one write a person standing at the box is better
+    placed to make than the owner at a desk, but it does not widen anything else
+    — a surveyor still cannot re-parent, rename, or delete. Keeping the check
+    separate is what stops "workers can place pins" drifting into "workers can
+    write inventory" the next time somebody reaches for `_can_write`."""
+    if user["is_superadmin"]:
+        return True
+    if user["org_id"] != org or org is None:
+        return False
+    return user.get("role") in ("owner", "worker")
+
+
+def survey_write_org(h, user, device_id: int):
+    """`device_write_org`'s field twin: org from the DB row, owner OR worker."""
+    org = h.store.device_org(device_id)
+    if not can_survey(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return DENIED
+    return org
+
+
 # Returned by body_org_write when the caller was rejected (403 already sent).
 # A sentinel, not None — a superadmin writing with no org_id legitimately
 # yields org=None and must not read as a denial.

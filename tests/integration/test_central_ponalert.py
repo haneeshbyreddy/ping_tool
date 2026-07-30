@@ -39,10 +39,10 @@ class PonFaultAlerterTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _onu(self, key, state, distance=None, online_min_ago=2.0):
+    def _onu(self, key, state, distance=None, online_min_ago=2.0, serial=None):
         self.store.upsert_onu_optics(
             "ispA", self.olt, key, pon_port="0/6", onu_id=None, name=key,
-            serial=None, state=state, rx_dbm=None, tx_dbm=None, olt_rx_dbm=None,
+            serial=serial, state=state, rx_dbm=None, tx_dbm=None, olt_rx_dbm=None,
             distance_m=distance, rx_ref_dbm=None, rx_ref_at=None, severity="ok",
             ts=_now())
         if state != "online":
@@ -66,26 +66,29 @@ class PonFaultAlerterTest(unittest.TestCase):
         rows = self.store.pending_digest("ispA")
         return [r for r in rows if needle is None or needle in (r["title"] or "")]
 
-    def test_fresh_fiber_fault_pages_once(self):
+    def test_fresh_fiber_fault_tracked_but_off(self):
+        # PON faults are OFF for now (allowlist): the fault is detected and its
+        # state written, but nothing pushes or queues to the dormant digest.
         self._mass_drop()
         self.alerter.sweep(_now())
-        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
-        cuts = self._queued("fiber cut")
-        self.assertEqual(len(cuts), 1)
-        self.assertIn("OLT-1", cuts[0]["title"])
-        self.assertIn("0/6", cuts[0]["title"])
-        self.assertEqual(cuts[0]["kind"], "PON_FAULT")
-        # same fault on the next walk: state stands, no re-page
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
+        state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
+        self.assertEqual(state["active"], 1)
+        self.assertEqual(state["kind"], "fiber")
+        # same fault on the next walk: state stands
         self.alerter.sweep(_now())
-        self.assertEqual(len(self._queued("fiber cut")), 1)
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
 
-    def test_recovery_pages_and_clears_state(self):
+    def test_recovery_clears_state(self):
         self._mass_drop()
         self.alerter.sweep(_now())
         for i in range(3):
             self._onu(f"dark{i}", "online", distance=1800)
         self.alerter.sweep(_now())
-        self.assertTrue(self._queued("recovered"))
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 0)
 
@@ -95,20 +98,73 @@ class PonFaultAlerterTest(unittest.TestCase):
         # 2026-07-14). A stale OLT freezes; recovery needs a fresh walk.
         self._mass_drop()
         self.alerter.sweep(_now())
-        self.assertEqual(len(self._queued("fiber cut")), 1)
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
         # the OLT's walk goes stale: restamp every row 20 min into the past
         with self.store._connect() as conn:
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_recent(20.0),))
             conn.commit()
         self.alerter.sweep(_now())
-        self.assertFalse(self._queued("recovered"))
+        # a stale OLT FREEZES its fault state — it never flips to recovered
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 1)
-        # the walk lands again, fault unchanged: no re-page either
+        # the walk lands again, fault unchanged: state stays, nothing sent
         self._mass_drop()
         self.alerter.sweep(_now())
-        self.assertEqual(len(self._queued("fiber cut")), 1)
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
+        self.assertEqual(self.notifier.sent, [])
+
+    def _silent_drop(self):
+        """The C-Data/DBC shape: no dying_gasp, no LOS, just bare `offline` —
+        so the gasp cross collapses and the drop reads 'fiber' by assumption."""
+        self._onu("survivor", "online", distance=700, serial="AA:00")
+        for i, d in enumerate((1800, 1950, 2300)):
+            self._onu(f"dark{i}", "offline", distance=d, serial=f"MAC:{i}")
+
+    def test_a_surviving_reference_onu_turns_a_crew_roll_into_a_power_verdict(self):
+        # The whole point of the feature. Without the reference point this org
+        # would record a fiber cut for what is really a DISCOM outage — the
+        # crew-roll ponfault exists to prevent, unpreventable on this hardware.
+        self._silent_drop()
+        self._onu("ups", "online", distance=2600, serial="UPS:1")
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
+
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, "Water tank", None)
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "power")
+
+    def test_a_dark_reference_onu_keeps_the_fiber_verdict(self):
+        self._silent_drop()
+        self._onu("ups", "offline", distance=2600, serial="UPS:1")
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None)
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
+
+    def test_clearing_a_placement_restores_the_unwitnessed_verdict(self):
+        self._silent_drop()
+        self._onu("ups", "online", distance=2600, serial="UPS:1")
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None)
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "power")
+        self.store.delete_onu_place("ispA", "UPS:1")
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
+
+    def test_another_orgs_placement_is_not_a_witness_here(self):
+        self._silent_drop()
+        self._onu("ups", "online", distance=2600, serial="UPS:1")
+        self.store.set_onu_place("ispB", "UPS:1", 15.85, 74.5, None, None)
+        self.alerter.sweep(_now())
+        self.assertEqual(
+            self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
 
     def test_power_pattern_writes_state_but_never_pages(self):
         self._onu("survivor", "online", distance=700)
@@ -129,8 +185,10 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
 
-    def test_suspect_named_when_plant_sits_in_the_interval(self):
-        # splitter placed ~1.2 km down the same PON, inside (0.7, 1.8] km
+    def test_fault_detected_with_plant_placed(self):
+        # splitter placed ~1.2 km down the same PON, inside (0.7, 1.8] km. Suspect
+        # naming rides the (now-off) page body, so here we just confirm detection;
+        # suspect-interval naming is covered by unit/test_ponfault.
         self.store.set_org_device_location("ispA", self.olt, 17.000, 78.4)
         splitter = self.store.create_org_device("ispA", {
             "name": "FDB-14", "ip_address": "", "device_type": "splitter",
@@ -138,9 +196,8 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.store.set_org_device_location("ispA", splitter, 17.0108, 78.4)
         self._mass_drop()
         self.alerter.sweep(_now())
-        cuts = self._queued("fiber cut")
-        self.assertEqual(len(cuts), 1)
-        self.assertIn("FDB-14", cuts[0]["body"])
+        state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
+        self.assertEqual(state["active"], 1)
 
 
 class _FakeHandler:

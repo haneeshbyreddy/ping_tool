@@ -75,6 +75,60 @@ def search_key(raw: str | None) -> str:
     return "".join(c for c in (raw or "") if c.isalnum()).upper()
 
 
+def display_name(row: dict) -> str:
+    """What a human should be shown for one ONU row, in ONE place.
+
+    Order is `label` (the operator's own name, `onu_places.label`) → the WALKED
+    name the OLT reports → serial → slot key. The operator's name wins because it
+    is the newer, deliberate statement about the same subscriber: a tech standing
+    at the drop typed it, and on the C-Data fleet the walked name is usually
+    empty anyway.
+
+    It is a FUNCTION rather than a rule each screen re-implements because the
+    first version of the field survey shipped without one: the name a worker
+    typed reached `onu_places` correctly and was then invisible on the OLT's
+    Optical tab, in ONU search, in the WhatsApp lookup and on the issue list —
+    every one of which named the same ONU off `onu_optics.name` alone. A name
+    that is only visible on the screen that captured it is indistinguishable
+    from a name that was never saved.
+
+    The row must therefore CARRY `label` — `store_snmp.list_onu_optics` and
+    `org_onu_rows` join it in, so a consumer cannot forget to look it up."""
+    for key in ("label", "name", "serial", "onu_key"):
+        v = row.get(key)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def onu_if_token(pon_port: str | None, onu_id: int | None) -> str | None:
+    """The ifTable interface name a C-Data EPON OLT gives THIS ONU.
+
+    `('EPON0/1', 3)` -> `'EPON01ONU3'`. C-Data's ifTable carries a row per ONU,
+    not just per PON — which is the only reason a per-subscriber bit rate exists
+    at all on this fleet (`switch_ports.in_bps`/`out_bps`). The PON's own row
+    (`EPON0/1`) is the aggregate for up to 64 ONUs and is NOT this.
+
+    Match on the FIRST TOKEN of `if_name`, never `if_alias`: the alias holds the
+    default `EPON0/1:3` only until somebody types a description, after which it
+    reads `BSNL-149` and the key is gone. `if_name` keeps the interface name and
+    appends the description (`EPON03ONU5 BSNL-238`), so the leading token
+    survives naming.
+
+    VENDOR-SPECIFIC, and measured rather than assumed (2026-07-28, live DB):
+    matches on the C-Data EPON boxes — PYLON 177/177, PDVR 102/102, Epon_8
+    208/209, HLY-OLT-2 313/326 — and yields exactly ZERO on Gpon_04, Gpon_08,
+    TMG/SRPL/NLK, whose builds name interfaces differently. A miss is normal and
+    must degrade to "no reading", never to a guess or to the PON aggregate.
+    """
+    if not pon_port or onu_id is None:
+        return None
+    token = pon_port.replace("/", "").strip()
+    if not token:
+        return None
+    return f"{token}ONU{onu_id}"
+
+
 @dataclass(frozen=True)
 class PonCap:
     device_id: int

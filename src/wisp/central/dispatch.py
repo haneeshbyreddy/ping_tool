@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from wisp.central.assignment import PagingAudience
 from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.state_machine import (
@@ -18,10 +19,6 @@ from wisp.core.state_machine import (
 from wisp.egress.notifiers import NotifyResult, WhatsAppFacts
 
 _DOWN_PRIORITY = 4
-# Every channel a resolve broadcast reaches. Two since roles collapsed to
-# owner+worker (2026-07-21) — the worker channel is the old operator topic,
-# same ntfy string, so nothing that was subscribed went quiet.
-_ROLES = ("owner", "worker")
 
 def _parse(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
@@ -37,51 +34,41 @@ class CentralAlertDispatcher:
         self.engine = engine
         self.notifier = notifier
         self.cfg = cfg
-        self.router = AlertRouter(store, org_id, notifier, cfg)
+        self.audience = PagingAudience(store, org_id)
+        self.router = AlertRouter(store, org_id, notifier, cfg,
+                                  audience=self.audience)
 
-    def _topic(self, role: str) -> str | None:
-        return self.store.org_role_topic(self.org_id, role)
+    def _recipients(self, device_id: int | None = None) -> list[str]:
+        # Owners plus the WORKERS RESPONSIBLE for this device — its own assignees
+        # or those inherited from an ancestor (central/assignment.py). A device
+        # nobody has been assigned reaches every worker, exactly as before that
+        # feature existed, so this can only ever narrow a page deliberately.
+        # No device (an uplink freeze) means the whole org audience.
+        # The superadmin ops number is in neither: it carries only platform-level
+        # pings, not each org's device pages (2026-07-25).
+        return self.audience.for_device(device_id)
 
-    def _wa(self, role: str) -> tuple[str, ...]:
-        return tuple(self.store.org_role_whatsapp(self.org_id, role))
-
-    def _wa_for_topic(self, topic: str) -> tuple[str, ...]:
-        # Numbers of every role that pages this exact topic, de-duped — so a
-        # broadcast reaches each account once even if two roles share a topic.
-        nums: list[str] = []
-        for role in _ROLES:
-            if self._topic(role) == topic:
-                nums.extend(self._wa(role))
-        return tuple(dict.fromkeys(nums))
+    def _label(self, device_id: int | None = None) -> str | None:
+        # What alert_log.recipient records — the numbers actually paged, so the
+        # log shows a narrowed audience rather than the org's full roster.
+        return ",".join(self._recipients(device_id)) or None
 
     def _publish(self, role: str, title: str, body: str, priority: int, *,
+                 device_id: int | None = None,
                  facts: WhatsAppFacts | None = None) -> NotifyResult:
-        # ntfy control flow is UNCHANGED (gates keyed on the topic, exactly as
-        # before) — WhatsApp rides alongside as a best-effort kwarg, so a role's
-        # numbers page wherever its ntfy topic pages.
-        primary = self._topic(role)
-        if not primary:
-            return NotifyResult(False, f"no {role} channel configured")
-        res = self.notifier.send(primary, title, body, priority,
-                                 whatsapp=self._wa(role), facts=facts)
-        worker = self._topic("worker")
-        if role != "worker" and worker and worker != primary:
-            self.notifier.send(worker, title, body, priority,
-                               whatsapp=self._wa("worker"), facts=facts)
-        return res
+        # `role` is kept for call-site clarity but no longer routes — an alert
+        # reaches owners plus whoever is responsible for the device.
+        return self._broadcast(title, body, priority, device_id=device_id,
+                               facts=facts)
 
     def _broadcast(self, title: str, body: str, priority: int, *,
+                   device_id: int | None = None,
                    facts: WhatsAppFacts | None = None) -> NotifyResult:
-        topics = list(dict.fromkeys(t for t in (self._topic(r) for r in _ROLES) if t))
-        if not topics:
-            return NotifyResult(False, "no channel configured")
-        primary = NotifyResult(False, "no channel configured")
-        for i, topic in enumerate(topics):
-            res = self.notifier.send(topic, title, body, priority,
-                                     whatsapp=self._wa_for_topic(topic), facts=facts)
-            if i == 0:
-                primary = res
-        return primary
+        numbers = self._recipients(device_id)
+        if not numbers:
+            return NotifyResult(False, "no recipients")
+        return self.notifier.send(title, body, priority,
+                                  whatsapp=numbers, facts=facts)
 
     def _log(self, outage_id, device_id, recipient, status, payload, ts,
              kind=None) -> None:
@@ -111,14 +98,14 @@ class CentralAlertDispatcher:
     def _on_open(self, ev: OutageOpened, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
         if ev.state == UNREACHABLE:
-            self._record(ev.device_id, self._topic("worker"), "suppressed",
+            self._record(ev.device_id, self._label(ev.device_id), "suppressed",
                          "UNREACHABLE (parent down)", ts, kind="UNREACHABLE")
             return
 
         oid = self.store.open_outage_id(self.org_id, ev.device_id)
         if oid is None:
             return
-        recipient = self._topic("owner")
+        recipient = self._label(ev.device_id)
         if self.store.already_paged(oid):
             self._log(oid, ev.device_id, recipient, "suppressed",
                       "already paged this outage", ts, kind="DEVICE_DOWN")
@@ -128,7 +115,8 @@ class CentralAlertDispatcher:
         body = dev.ip_address
         facts = WhatsAppFacts(subject=f"{dev.name} ({dev.region})", status="DOWN",
                               detail=dev.ip_address, timestamp=ts)
-        res = self._publish("owner", title, body, _DOWN_PRIORITY, facts=facts)
+        res = self._publish("owner", title, body, _DOWN_PRIORITY,
+                            device_id=ev.device_id, facts=facts)
         self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body,
                   ts, kind="DEVICE_DOWN")
         self.store.schedule_escalation(self.org_id, oid, "hourly",
@@ -136,13 +124,16 @@ class CentralAlertDispatcher:
 
     def _on_resolved(self, ev: OutageResolved, ts: str) -> None:
         dev = self.engine.meta[ev.device_id]
-        recipient = self._topic("worker")
+        recipient = self._label(ev.device_id)
         was_suppressed = self.store.last_resolved_state(
             self.org_id, ev.device_id) == UNREACHABLE
 
         if not was_suppressed:
+            # Same audience the DOWN page went to — whoever was told it broke is
+            # who gets told it's back.
             self._broadcast(
                 f"✅ Restored: {dev.name} ({dev.region})", "", 3,
+                device_id=ev.device_id,
                 facts=WhatsAppFacts(subject=f"{dev.name} ({dev.region})",
                                     status="UP", detail=dev.ip_address, timestamp=ts))
 
@@ -155,8 +146,8 @@ class CentralAlertDispatcher:
                     payload: str | None = None, kind: str | None = None) -> None:
         res = self._publish("owner", title, body, priority)
         logged = payload if payload is not None else title
-        self._log(None, None, self._topic("owner"), "sent" if res.ok else "failed",
-                  logged, ts, kind=kind)
+        self._log(None, None, self._label(),
+                  "sent" if res.ok else "failed", logged, ts, kind=kind)
 
     def sweep(self, now_ts: str) -> None:
         for row in self.store.due_escalations(self.org_id, now_ts):
@@ -187,7 +178,7 @@ class CentralAlertDispatcher:
         # into the digest (kept off the push tier by operator choice) so a long
         # outage resurfaces once an hour without buzzing all night.
         self.router.emit(
-            "HOURLY_ESCALATION", topic=self._topic("worker"),
+            "HOURLY_ESCALATION",
             title=f"⏰ STILL DOWN ({elapsed}): {dev.name} ({dev.region})",
             body=f"{dev.ip_address} · {ack}", priority=5, ts=ts,
             outage_id=row["outage_id"], device_id=row["device_id"],

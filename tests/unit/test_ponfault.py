@@ -14,10 +14,11 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 def _onu(key, state="online", distance=None, last_online_min_ago=2,
-         port="0/6", device_id=7, updated_min_ago=1):
+         port="0/6", device_id=7, updated_min_ago=1, serial=None):
     return {
         "device_id": device_id, "device_name": "OLT-1", "onu_key": key,
         "pon_port": port, "name": key, "state": state, "distance_m": distance,
+        "serial": serial if serial is not None else f"MAC-{key}",
         "last_online_at": _iso(NOW - timedelta(minutes=last_online_min_ago)),
         "updated_at": _iso(NOW - timedelta(minutes=updated_min_ago)),
     }
@@ -92,6 +93,110 @@ class EvaluateOltTest(unittest.TestCase):
         faults = evaluate_olt(rows, NOW)
         self.assertEqual(len(faults), 1)
         self.assertEqual(faults[0].pon_port, "0/1")
+
+
+class WitnessTest(unittest.TestCase):
+    """Operator-placed reference ONUs — the only power/fiber discriminator that
+    works on a build reporting neither dying_gasp nor LOS (most of this fleet).
+    Placing one IS the claim that its supply is reliable; nothing detects it."""
+
+    # The DBC shape: everything arrives as a bare `offline`, so the gasp cross
+    # collapses and every mass drop reads "fiber" by assumption.
+    def _silent_drop(self, **kw):
+        return [
+            _onu("near", state="online", distance=400, serial="AA:00"),
+            _onu("d1", state="offline", distance=1000, **kw),
+            _onu("d2", state="offline", distance=1200, **kw),
+            _onu("d3", state="offline", distance=1400, **kw),
+        ]
+
+    def test_without_witnesses_a_silent_drop_is_fiber_by_ASSUMPTION(self):
+        f = evaluate_olt(self._silent_drop(), NOW)[0]
+        self.assertEqual(f.kind, "fiber")
+        # the honest name for "we had nothing to go on"
+        self.assertEqual(f.evidence, "silence")
+        self.assertEqual((f.witness_dark, f.witness_alive), (0, 0))
+
+    def test_a_dark_witness_makes_fiber_EVIDENCE_not_assumption(self):
+        rows = self._silent_drop()
+        rows[2]["serial"] = "UPS:1"
+        f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.kind, "fiber")
+        self.assertEqual(f.evidence, "witness")
+        self.assertEqual(f.witness_dark, 1)
+
+    def test_a_surviving_witness_BEYOND_the_dark_set_calls_it_power(self):
+        # the crew-roll this whole feature exists to prevent: light is reaching
+        # past the dark ONUs, so what stopped at their doors was the DISCOM
+        rows = self._silent_drop()
+        rows.append(_onu("ups", state="online", distance=2000, serial="UPS:1"))
+        f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.kind, "power")
+        self.assertEqual(f.evidence, "witness")
+        self.assertEqual((f.witness_dark, f.witness_alive), (0, 1))
+
+    def test_a_surviving_witness_SHORT_of_the_dark_set_does_not_flip_it(self):
+        # a cut in a distribution branch leaves everything closer in lit, so an
+        # upstream survivor proves nothing about the branch that went dark
+        rows = self._silent_drop()
+        rows.append(_onu("ups", state="online", distance=200, serial="UPS:1"))
+        f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.kind, "fiber")
+        self.assertEqual(f.evidence, "silence")
+        self.assertEqual(f.witness_alive, 1)
+
+    def test_a_GASPING_witness_is_not_evidence_of_anything(self):
+        # the ONU testified that it lost power — hardware outranks the
+        # operator's label, so this is a failed backup, not a cut
+        rows = self._silent_drop()
+        rows[2]["serial"] = "UPS:1"
+        rows[2]["state"] = "dying_gasp"
+        f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.witness_dark, 0)
+        self.assertNotEqual(f.evidence, "witness")
+
+    def test_witness_outranks_a_dying_gasp_majority(self):
+        # most of the cohort lost power, but a backed-up subscriber went dark
+        # SILENTLY alongside them — power cannot explain that one
+        rows = [
+            _onu("a", state="dying_gasp", distance=1000),
+            _onu("b", state="dying_gasp", distance=1100),
+            _onu("ups", state="offline", distance=1200, serial="UPS:1"),
+        ]
+        f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.kind, "fiber")
+        self.assertEqual(f.evidence, "witness")
+
+    def test_ordering_is_scale_invariant(self):
+        # dbc's distance_m is EPON time quanta, ~39% short of metres. Only the
+        # ORDER is read here, so the verdict must not move when the unit does.
+        rows = self._silent_drop()
+        rows.append(_onu("ups", state="online", distance=2000, serial="UPS:1"))
+        scaled = [{**r, "distance_m": (None if r["distance_m"] is None
+                                       else round(r["distance_m"] * 1.6393))}
+                  for r in rows]
+        self.assertEqual(evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0].kind,
+                         evaluate_olt(scaled, NOW, witness_macs={"UPS:1"})[0].kind)
+
+    def test_a_witness_on_ANOTHER_pon_says_nothing_about_this_one(self):
+        rows = self._silent_drop()
+        rows.append(_onu("ups", state="online", distance=2000, port="0/9",
+                         serial="UPS:1"))
+        faults = {f.pon_port: f for f in evaluate_olt(rows, NOW,
+                                                      witness_macs={"UPS:1"})}
+        self.assertEqual(faults["0/6"].kind, "fiber")
+        self.assertEqual(faults["0/6"].witness_alive, 0)
+
+    def test_unplaced_macs_are_never_witnesses(self):
+        f = evaluate_olt(self._silent_drop(), NOW, witness_macs={"SOMEONE:ELSE"})[0]
+        self.assertEqual(f.evidence, "silence")
+
+    def test_witness_macs_ride_through_evaluate_org(self):
+        rows = self._silent_drop()
+        rows[2]["serial"] = "UPS:1"
+        f = evaluate_org(rows, NOW, witness_macs={"UPS:1"})[0]
+        self.assertEqual(f.evidence, "witness")
+        self.assertEqual(f.as_dict()["witness_dark"], 1)
 
 
 class EvaluateOrgTest(unittest.TestCase):

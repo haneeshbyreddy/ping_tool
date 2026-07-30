@@ -76,43 +76,40 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(badge["crit_count"], 0)
         self.assertEqual(self._pages(), [])
 
-    def test_crit_pages_once_on_enter_and_recovers(self):
+    def test_crit_recovers_state_but_does_not_page(self):
+        # Optical crit/recovery is OFF for now (allowlist): the OLT badge state
+        # still transitions crit → clear, but nothing pushes.
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
-        self.assertEqual(len(self._pages()), 1)
-        self.assertIn("critical", self._pages()[0]["title"].lower() + self._pages()[0]["body"].lower())
-        mon.sync_device(self.olt, [_onu("C", -29.9)], TS[1])
-        self.assertEqual(len(self._pages()), 1)
+        self.assertEqual(self._pages(), [])
+        self.assertEqual(self.store.get_olt_optics(ORG, self.olt)["crit_count"], 1)
         mon.sync_device(self.olt, [_onu("C", -20.0)], TS[2])
-        self.assertEqual(len(self._pages()), 2)
-        self.assertIn("recovered", self._pages()[1]["title"].lower())
-        self.assertEqual(self.store.get_olt_optics(ORG, self.olt)["alarm"], 0)
+        self.assertEqual(self._pages(), [])
+        badge = self.store.get_olt_optics(ORG, self.olt)
+        self.assertEqual(badge["crit_count"], 0)
+        self.assertEqual(badge["alarm"], 0)
 
-    def test_a_flapping_threshold_is_capped_by_the_push_cooldown(self):
-        # An ONU sitting a hundredth of a dB off the crit line re-crosses it
-        # every scrape (PYLON has one at -26.99 against -27.0). Before optics
-        # went through the governor each crossing was its own phone page, which
-        # is the pattern that 429'd the ntfy quota and dropped real ICMP pages.
+    def test_optical_alerts_are_off_for_now(self):
+        # Optical crit/recovery was PUSH-tier; it's OFF for now (allowlist), so a
+        # flapping ONU writes state but produces no pages at all.
         mon = self._mon()
         t = "2026-01-01T00:0{}:00+00:00"
         mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(0))   # enter
         mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(1))   # leave
         mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(2))   # re-enter
         mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(3))   # leave
-        kinds = self._alert_kinds()
-        # One of each survives the 30-minute per-(device, kind) window; the
-        # repeats are suppressed, not sent.
-        self.assertEqual(kinds.count("OPTICAL_CRIT"), 1)
-        self.assertEqual(kinds.count("OPTICAL_RECOVERED"), 1)
-        self.assertEqual(len(self._pages()), 2)
+        self.assertEqual(self._pages(), [])
+        self.assertEqual(self._alert_kinds(), [])          # nothing 'sent'
 
     def test_the_alert_log_carries_a_clean_kind(self):
-        # This path used to write kind=NULL, so optical alerts were invisible to
-        # the by-type analytics the kind column exists to feed.
+        # Even suppressed, the alert_log row must carry a clean kind (this path
+        # used to write kind=NULL, hiding optical alerts from by-type analytics).
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
         mon.sync_device(self.olt, [_onu("C", -20.0)], TS[1])
-        kinds = self._alert_kinds()
+        with self.store._connect() as c:
+            kinds = [r["kind"] for r in c.execute(
+                "SELECT kind FROM alert_log ORDER BY id")]
         self.assertIn("OPTICAL_CRIT", kinds)
         self.assertIn("OPTICAL_RECOVERED", kinds)
         self.assertNotIn(None, kinds)
@@ -122,14 +119,16 @@ class CentralOpticsTest(unittest.TestCase):
         self._mon().sync_device(self.olt, [_onu("C", -26.5)], TS[0])
         self.assertEqual(self._rows()["C"]["severity"], "crit")
 
-    def test_ack_suppresses_the_page(self):
+    def test_ack_clears_badge_alarm(self):
+        # Paging is off for optics, but an ack still clears the OLT badge alarm
+        # while the crit reading itself stays visible.
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
-        self.assertEqual(len(self._pages()), 1)
+        self.assertEqual(self._pages(), [])
         onu_id = self._rows()["C"]["id"]
         self.store.set_onu_ack(ORG, onu_id, "2026-12-31T00:00:00+00:00")
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[1])
-        self.assertEqual(len(self._pages()), 1)
+        self.assertEqual(self._pages(), [])
         self.assertEqual(self.store.get_olt_optics(ORG, self.olt)["alarm"], 0)
         self.assertEqual(self.store.get_olt_optics(ORG, self.olt)["crit_count"], 1)
 

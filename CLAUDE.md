@@ -22,7 +22,8 @@ dev-only, the committed build is what deploys). Edge needs a `.venv` (`icmplib`/
 system Python is PEP 668-locked) + `sysctl net.ipv4.ping_group_range="0 2147483647"`.
 
 **Locked decisions (don't relitigate):** brain on central, always; monitor shared infra, not
-end-user routers; ntfy is the primary channel, 2 role topics/org; every read/write
+end-user routers; WhatsApp (Meta Cloud API) is the SOLE notification channel since 2026-07-24
+(ntfy removed), recipients are per-account E.164 numbers; every read/write
 org-scoped; edge dials central, never the reverse; updates pull-based over the report
 channel, staged + health-gated; probers/notifiers behind interfaces, tests inject doubles.
 
@@ -162,52 +163,138 @@ from `central/static/`.
 
 `central/notify_policy.py`. Every paging shell (dispatch / ponalert / onualert / ports / perf
 / redundancy / optics) routes send + status + log through `AlertRouter.emit(kind, …)` rather
-than calling the notifier inline. Two tiers on a clean `kind` token:
+than calling the notifier inline.
 
-- **PUSH** (buzz the phone): ICMP device/uplink/port down **and their recoveries**; port
-  bandwidth floor/ceiling crossings + clears (`PORT_BW_*` — a saturated/dark uplink can't
-  wait for the roll-up); `OPTICAL_CRIT`/`OPTICAL_RECOVERED` (an ONU under the floor is a
-  subscriber about to lose sync — burying it should be an explicit operator decision, not a
-  refactor's side effect).
-- **DIGEST** (`_DIGEST_KINDS`): the rest of the SNMP-derived stream (PON_FAULT, ONU_LIMIT,
-  ONU_DUP_MAC, PERF_*, ON_BACKUP/BACKUP_CLEARED) **plus the hourly escalation**, queued to
-  `alert_digest`, one summary per org every `cfg.digest_interval_min` (60).
-- **Unknown kind ⇒ PUSH** — a new alert type must never be silently buried.
+**Since ntfy was removed (2026-07-24) only an ALLOWLIST of kinds pages** — `_ACTIVE_KINDS =
+{PORT_DOWN, PORT_RESTORED}`. Device/uplink up/down go straight through `dispatch.py` (NOT the
+governor) and probe up/down through the watchdog, so the operator's chosen set is
+**device / uplink / port / probe, each up and down**. EVERYTHING ELSE is turned OFF "for now"
+(optics/PON/ONU/perf/backup/port-bandwidth/hourly-escalation): `emit` logs the kind
+`suppressed` and sends nothing. **Re-enable a kind by adding it to `_ACTIVE_KINDS`** — one line,
+the single knob.
 
-`flush_digests` rides the full `/report` sweep, anchors on the OLDEST pending row (no per-org
-clock), marks-sent only on success. Escalation is OPERATOR-topic only. PUSH cooldown backstop
-= `cfg.alert_cooldown_min` per `(device,kind)` (ports pass 0 — per-if_index, already gated).
-State rows are written by the shells regardless of tier — this governs only the notification.
+The PUSH/DIGEST two-tier machinery (`_DIGEST_KINDS`, `queue_digest`/`flush_digests`,
+`compose_digest`, `cfg.digest_interval_min`) is INTACT but DORMANT — no active kind routes to
+the digest. Kept so re-enabling a digest kind is just the allowlist edit (if it's also in
+`_DIGEST_KINDS` it resumes queuing). PUSH cooldown backstop = `cfg.alert_cooldown_min` per
+`(device,kind)` (ports pass 0 — per-if_index, already gated). **State rows are written by the
+shells regardless of the allowlist** — the dashboard stays fully live; this governs only the
+notification. `tier_for` still classifies every kind.
 
-**Why:** a DBC area power cut darkened many PONs → dozens of false "fiber cut" pages → ntfy
-429s that dropped REAL pages (~497→~76 phone pages/day). Tests: `unit/test_notify_policy`.
+### WhatsApp is the SOLE notification channel
 
-### WhatsApp: an ADDITIVE second channel behind the governor
+ntfy was REMOVED 2026-07-24. `build_notifier(cfg, store)` returns a bare `WhatsAppNotifier`
+(Meta WhatsApp Cloud API) — no more `MultiNotifier`/`NtfyNotifier`; `alert_log.channel` is
+always `whatsapp`.
 
-`build_notifier(cfg, store)` returns a `MultiNotifier` fanning every page to ntfy AND WhatsApp
-(Meta Cloud API). Experimental, 2026-07-23.
+- **`send(title, body, priority=3, *, whatsapp=…, facts=…)`** — the ntfy `recipient` positional
+  is GONE. A page's audience is a list of E.164 numbers; `WhatsAppFacts(subject,status,detail,
+  timestamp)` fills the approved 4-param template (default `wisp_alert1`:
+  Device/Status/Detail/Time Logged, param order == `WhatsAppFacts.params()`). Only `wisp_alert1`
+  is needed — it carries device/port/probe pages, admin pings, and a compacted digest.
+- **A send can never crash the report cycle** — every WhatsApp failure returns
+  `NotifyResult(False,…)` and NOTHING raises (same discipline as when it was secondary); the
+  result now drives the logged sent/failed status. `send_with_retry`: network/5xx retry, 4xx
+  fail-fast, `cfg.notify_retries`/`notify_retry_backoff_s` (RENAMED from the ntfy_* ones).
+- **ONE audience, NO role routing** (operator choice 2026-07-24): every alert reaches
+  `store.org_alert_recipients(org)` = owner + worker per-account numbers
+  (`users.whatsapp_number`), de-duped, in ONE `send` (was a per-role-topic fan-out).
+  dispatch/emit/watchdog/billing all page this same set. **The superadmin ops number is NOT in
+  the org audience** (operator choice 2026-07-25 — the platform admin can't be buried under every
+  org's device/uplink/port/probe/billing pings; probe-down/NODE_STALE is an org page like any
+  other and is excluded too). Instead the ops number
+  (`app_settings.whatsapp_admin_number`, env fallback `WISP_WHATSAPP_ADMIN_NUMBER`) carries ONLY
+  the topic-less pings that have no org role: org "I've paid" (`billing_paid`), self-downgrade
+  churn, and release-sync failing — resolved through the SEPARATE `orgs._admin_whatsapp` /
+  `releasesync._admin_numbers`, never `org_alert_recipients`. Don't re-add it to the org audience.
+- **CENTRAL-ONLY by construction**: built with a `store` (reads live config from
+  `app_settings`); the edge passes none and never calls `send`, so a store-less notifier is
+  inert (nowhere to read a token/numbers from).
+- **Config is the SUPERADMIN's, not env**: enable toggle + token + phone-id + template/lang/
+  version + admin number in `app_settings` (Settings → Platform), read FRESH each send (no
+  restart). `WISP_*` are fallback defaults; `enable_whatsapp` now defaults ON. Token is
+  WRITE-ONLY (`token_set` boolean; blank leaves the stored one). Per-account numbers are set in
+  Users / Your account (`/api/users/whatsapp`, self-service so worker-reachable).
+- **"Time Logged" is rendered in the OPERATOR's zone, at ONE choke point**
+  (`notifiers._wa_time`, called from `WhatsAppFacts.params()`). Central stores UTC
+  everywhere and the dashboard localises in the browser, so a page is the only place a
+  stored timestamp reaches a human with nothing to convert it — it shipped raw and every
+  alert read 5h30m behind the Indian wall clock. Zone is `WISP_DISPLAY_TZ` (`cfg.display_tz`,
+  default `Asia/Kolkata`); an unknown zone or an unparseable value degrades (UTC / pass
+  through), never raises inside a send. Put it in `params()` rather than at the ~8 shells
+  that build facts so a NEW paging shell can't reintroduce the bug. DISPLAY only — nothing
+  stored or compared changes zone. `DisplayTimeTest` in `unit/test_whatsapp`.
+- **Dead ntfy plumbing left IN PLACE** (project convention, like the operator/tech columns):
+  the `orgs.ntfy_topic*` columns and `store.org_role_topic`/`org_topic` methods survive UNUSED —
+  don't wire them back or "clean them up" into a migration.
 
-- **ntfy stays byte-identical** — `send(recipient=topic_str, …)` unchanged; WhatsApp rides a
-  companion `whatsapp=` kwarg plus `WhatsAppFacts(subject,status,detail,timestamp)`. That
-  kwarg is deliberately how "widen the recipient to a value object" was realised, so the
-  `str` recipient a dozen tests assert on survives.
-- **WhatsApp can NEVER break a page** — never primary, fully exception-wrapped; a bad
-  token/timeout/4xx is logged only. `MultiNotifier.send` returns the ntfy result and
-  `.channel`/`alert_log.channel` stay `ntfy`.
-- **CENTRAL-ONLY by construction**: built only when a `store` is passed (it reads live config
-  from `app_settings`); the edge passes none → a bare `NtfyNotifier`.
-- **Recipients are PER-LOGIN-ACCOUNT** (`users.whatsapp_number`, E.164) via
-  `store.org_role_whatsapp(org, role)` — the analog of `org_role_topic` — so WhatsApp rides
-  wherever that role's ntfy topic rides. `emit` resolves WORKER numbers itself on the PUSH
-  path, so the six paging shells needed no change.
-- **Config is the SUPERADMIN's, not env**: toggle + token + phone-id + template/lang/version
-  in `app_settings` (Settings → Platform), read FRESH each send so no restart is needed;
-  `WISP_*` are fallback defaults only. Token is WRITE-ONLY in the API (`token_set` boolean;
-  blank leaves the stored one). Numbers are set per account in Accounts
-  (`/api/users/whatsapp`, self-service like the password route, so worker-reachable).
-  Tests: `unit/test_whatsapp`, `integration/test_central_whatsapp`.
+**Why the governor exists at all:** a DBC area power cut darkened many PONs → dozens of false
+"fiber cut" pages → ntfy 429s that dropped REAL pages (~497→~76/day). The allowlist is the
+current, blunter answer (those SNMP kinds are simply off); the digest machinery is the finer
+one, kept warm. Tests: `unit/test_notify_policy`, `unit/test_whatsapp`,
+`integration/test_central_whatsapp`.
+
+### Paging responsibility: devices → field accounts (2026-07-26)
+
+`central/assignment.py` (pure rules + `PagingAudience` resolver), `store_assign.py`
+(storage), `org_device_workers` (org_id, device_id, user_id). Narrows WHO an alert reaches:
+owners always page for everything, and a device's WORKERS are its assignees.
+
+- **It is a NOTIFICATION rule and NOTHING else.** Deliberately not read by any view, list,
+  KPI, map or export — every account still sees the whole fleet (operator's explicit call:
+  "the only thing we are doing the assigning is for workers to only get notifications for the
+  devices they are responsible for"). So it is not a permission table and a bug here can lose
+  a page but can never leak or withhold data. `test_central_assign:VisibilityTest` fails if a
+  read path ever starts filtering on it.
+- **An UNASSIGNED device pages EVERY worker** — `audience_for` returns `None`, which is NOT
+  the empty set. That distinction is the whole safety property: switching this feature on
+  narrowed nothing until someone was actually assigned, so it cannot silence a fleet. Same
+  instinct as the governor writing state rows regardless of its allowlist. The roster reply
+  carries the count of such devices so the UI states it rather than the operator inferring it
+  from an absence.
+- **Responsibility flows DOWN the tree and UNIONS; it never overrides.** One row on a region
+  head covers the region (the only thing that scales on a fleet growing weekly), and naming a
+  second worker on an OLT below it does NOT un-page whoever owns the head. Nearest-ancestor-
+  wins was rejected for exactly that: a narrow assignment silently dropping a wide one is the
+  failure this subsystem must not introduce. Derived from the LIVE parent chain every time,
+  so re-parenting moves responsibility with the device and adding a splitter needs no click.
+  PRIMARY parents only — a backup parent is a failover path and a peer is a cable, neither a
+  chain of command. Cycle-guarded: validation rejects cycles on the way in, but a page is the
+  last thing that may spin on a bad row.
+- **A DEACTIVATED assignee doesn't count as "somebody is responsible"** (`device_assignment_map`
+  joins `users.is_active`) — otherwise switching an account off would silently narrow its
+  devices to owners only. The row survives so the operator can see and clear it.
+- **An assignee with no `whatsapp_number` is REPORTED, never widened around.** The assign API
+  answers `unreachable: [username]` and the UI warns; the audience stays narrowed (that
+  device pages owners only). Widening back would mean an assignment quietly undone by
+  somebody's empty profile field.
+- **Wiring**: `dispatch._recipients(device_id)` for device up/down (uplink events carry no
+  device → org-wide), `AlertRouter.emit` for everything through the governor (it builds its
+  own resolver when a shell doesn't pass one, so a NEW paging shell narrows by default), and
+  `watchdog` via `for_node` — a probe is not a device, so its audience is whoever owns what it
+  carries, falling back to org-wide because a dark probe blinds a slice of the fleet.
+  `alert_log.recipient` records the NARROWED set, so "who was actually told" stays answerable.
+- **`emit` resolves the audience AFTER the allowlist/gate checks** — most SNMP kinds are
+  suppressed, and resolving a per-device audience for a page that was never going to send put
+  three queries per emit on the report cycle. A suppressed row therefore logs no recipient.
+  `PagingAudience` caches for its own lifetime (one sweep) — the watchdog builds a fresh one
+  per page because that thread is long-lived and would otherwise page a stale audience.
+- UI: Settings → Users → **Device responsibility** (bulk, per account, region-filtered) and the
+  device panel's **"Paged for this device"** fold (per device, naming the ancestor an
+  inherited assignee comes from). Both say "paged", never "sees". Owner-only writes; the
+  roster GET is owner-only too (it enumerates accounts) and ships `has_whatsapp` as a boolean,
+  never the number. The outage-assign dialog marks accounts already responsible for that
+  device and sorts them first — a suggestion, never a filter or an auto-assignment.
+- Tests: `unit/test_assignment` (the rules), `integration/test_central_assign` (device/port/
+  probe pages narrowing, the API, and the visibility guard).
 
 ### Alerting subsystems
+
+> **Paging for these is OFF for now** (the `_ACTIVE_KINDS` allowlist — 2026-07-24). Everything
+> below still DETECTS and WRITES STATE exactly as described (dashboard, badges, folding) — only
+> the WhatsApp page is suppressed. Port UP/DOWN is the one exception that still pages; port
+> BANDWIDTH does not. Re-enabling is a one-line allowlist edit. Read the descriptions as "the
+> state this writes", not "what it pages".
 
 - **Port alarms** (`central/ports.py`): monitored-only, admin-down silent, one alarm not two —
   a port-down folds into the open outage via `stamp_outage_cause` COALESCE (never clobbers a
@@ -250,7 +337,16 @@ State rows are written by the shells regardless of tier — this governs only th
   - **Per-PON cap** — EPON tops out at 1:64, so a PON at its limit pages "at capacity"
     (`cfg.onu_pon_limit` 64; per-OLT `org_devices.onu_pon_limit` override so a 1:128 GPON box
     doesn't false-page). `list_org_devices` MUST carry that column or the override silently
-    no-ops in paging.
+    no-ops in paging. **Set as "PON type" on the OLT's device form** (EPON 1:64 / GPON 1:128,
+    beside the GPON vendor override) — it rode `clean_device_payload`/create/update only from
+    2026-07-30; before that the column existed with every reader wired and no UI, so a mixed
+    fleet had one cap. NOTHING DETECTS the split standard (it is in no MIB we walk), so this is
+    the operator's claim and **UNSET means the global cap, never 64** — writing 64 on save would
+    stop `cfg.onu_pon_limit` from ever reaching a box somebody had edited. The column stays a
+    plain integer (a 1:16/1:32 build set through `optics-thresholds` survives, and the form
+    offers it back as "custom"), and it now rides the device payload like `split_ratio` — an
+    absent key reads as "not set", so any NEW caller of `update_org_device` must carry it
+    forward or it silently drops a GPON box back to the EPON cap.
   - **Redundant MAC** — a serial/MAC on ≥2 slots org-wide is a duplicate, but it PAGES only
     when ≥2 are ONLINE at once: C-Data reg tables keep every slot an ONU ever occupied, so the
     byreddy fleet had 178 "duplicates" of which 2 were live clones. Dead-member dups are
@@ -285,6 +381,459 @@ State rows are written by the shells regardless of tier — this governs only th
   built-in (huawei/dbc stay in edge code as fallbacks for older fleets). `set_profiles` runs
   every cycle and MUST stay a fingerprint-gated no-op on an unchanged payload — rebuilding
   pollers churns SnmpEngines (the leak invariant).
+  **`org_devices.gpon_vendor` validation therefore CANNOT be the built-in list**
+  (`inventory._gpon_vendors(extra)`, fed by `api/devices._gpon_vendor_names`). It was, until
+  2026-07-30, so badri_fiber's two `syrotech_gpon` OLTs 422'd "GPON vendor must be one of: dbc,
+  huawei" on EVERY edit — a rename, a region, a PON type — because the form faithfully sends
+  the stored vendor back; the dropdown had offered the profile all along. Profiles are the
+  vocabulary, built-ins are only its floor. **DISABLED rows count** (a tombstone, not an
+  absence): dropping them would lock the operator out of the one form that could correct the
+  vendor. The SPA likewise keeps the device's CURRENT vendor as a dropdown item even when no
+  profile offers it — a Select with no item for its own value renders blank, and saving that
+  blank silently unstamps the vendor. Still a closed set: a name no profile carries is refused,
+  since a typo'd vendor reads on screen as "this OLT has no optics".
+
+### Reference ONUs: the witness that replaces dying-gasp (2026-07-28)
+
+`onu_places` (sparse), `ponfault._witness_verdict`, `map/refonu.ts`,
+`components/reference-onu.tsx`. An operator places the handful of subscribers it
+knows run on a UPS/solar/tower supply; those become WITNESSES in the PON mass-drop
+verdict. It exists because the C-Data/DBC fleet reports neither `dying_gasp` nor
+`los` — every drop arrives as a bare `offline`, so the power/fiber cross collapses
+and an area power cut pages as a fiber cut. This is the only discriminator that
+works on that hardware, and it needs no rollout.
+
+- **PLACING IS THE CLAIM — there is no power column and nothing detects one.**
+  The operator's explicit call: they select the reliable ones. So the *act* of
+  placing carries the whole meaning, which is why the dialog states the contract
+  in a warning block and the map banner restates it at the click. A pin dropped
+  "to complete the map" silently corrupts verdicts. Never soften that copy to
+  "location" or reduce the dialog to a one-click toggle.
+- **Keyed on the MAC (`onuroster._norm_mac`), never `(device, onu_key)`** —
+  `onu_optics` never deletes a vacated slot and a re-registered ONU moves, so a
+  slot key rots. Re-homing a drop (even to another OLT) carries the point with it.
+  An RMA'd box orphans the row, which is CORRECT and is reported (`matched:false`)
+  rather than hidden — a pin that quietly stopped witnessing is the one failure
+  this list must not conceal. Normalized at exactly ONE place on the write path
+  (`inventory.clean_onu_place_payload`) or one sticker becomes two witnesses.
+- **The rules** (`unit/test_ponfault:WitnessTest`): a witness dark SILENTLY →
+  `fiber`, now evidence rather than assumption. Every witness still online AND
+  reaching past the dark set → `power`, no crew. **A witness reporting
+  `dying_gasp` counts in NEITHER tally** — the ONU testified it lost power, which
+  outranks the operator's label (its backup failed, or the label was wrong).
+  Hardware beats paperwork. Witnesses OUTRANK the gasp majority.
+- **`_reaches_past` compares ORDER only, never the unit** — that is what makes it
+  safe on the dbc profile whose `distance_m` is EPON time quanta (~39% short).
+  A survivor SHORT of the dark set does not flip anything: a cut in a distribution
+  branch leaves everything closer in lit.
+- **`PonFault.evidence` is `witness | dying_gasp | silence`, and the three must
+  never render alike.** `silence` is the honest name for what the DBC fleet used
+  to produce indistinguishably from a finding — the UI says so and invites a
+  reference point; the page drops "suspected" only when `witness_dark > 0`.
+- **Every ponfault caller passes `witness_macs`** (ponalert, `api/outages`
+  faults + pon_summary, `api/devices._stamp_optical_faults`, `issues.collect`) —
+  the count-agreement rule: a tile, a chip and a page disagreeing about the same
+  PON is worse than any of them being absent.
+- **The map layer is OPT-IN and subordinate — by SHAPE, TONE and STACKING, not by
+  size** (2026-07-29). 90% of what hangs off a fleet's ports is an ONU; the layer
+  defaults OFF (localStorage), keeps a mark of its own (a diamond — devices round,
+  passives squarer), stays muted rather than status-toned, sits below every device
+  pin (`refZIndex` is negative) and stays OUT of the clustering pass (a site badge
+  mixing plant with subscribers would count nonsense). A DARK witness is the one
+  thing allowed to get louder — it is a fiber cut with a coordinate.
+  **SIZE is no longer one of the four**: it was drawn "smallest mark on the map"
+  twice and came back unreadable both times (11px, then 9px for a located
+  subscriber). A diamond covers HALF the area of the circle bounding it, so an
+  11px one carried a quarter of a 14px device dot's ink — the marks now match a
+  device dot by AREA (14/13/17px), and a layer nobody can see ranks below
+  everything anyway. Judge these by ink, never by the number.
+- **The line to its OLT is DOTTED, and that is not decoration.** Every other line
+  on the map is a drawn cable route or the chord standing in for one — a claim
+  about plant. This one is a LOGICAL association with no surveyed path, and a
+  splicing crew quotes drum off lines that look traced. Weights match the topology
+  lines and then past them (2.5 / 3.5 / 4.5 by dark-ness, plus the same black casing every other line
+  gets — satellite runs near-white to near-black inside one viewport, and this
+  layer went casing-less while it was hairline-thin, which is most of why it
+  vanished). **The DASH is what carries the ranking, not the weight** — and
+  because SVG dash lengths are absolute px while the stroke widened, both periods
+  had to open up with it or a dotted line silently becomes a solid one, i.e. traced
+  fibre. `REF_DASH` ("1 10", an 11px period) stays sparser than `DROP_DASH` and apart
+  from the backup ("5 8") and cross-link ("1.5 7") dashes so the four stay
+  distinct. Drawn ONLY when the OLT is known (not ambiguous, not orphaned) AND
+  itself placed. `interactive={false}`, like every topology polyline.
+- **The rate on that line is the ONU's OWN ifTable row, NEVER the PON's.**
+  C-Data EPON publishes an interface per ONU (`EPON01ONU3`), which is the only
+  reason a per-subscriber rate exists here at all; the PON's row (`EPON0/1`) is
+  the aggregate of up to 64 subscribers and printing it would put one big number
+  on every reference point (`test_the_PON_AGGREGATE_is_never_reported_as_one_
+  subscribers_rate`). Key on the FIRST TOKEN of `if_name`, never `if_alias` — the
+  alias holds the default `EPON0/1:3` only until somebody types a description,
+  after which it reads `BSNL-149`; `if_name` appends the description and keeps
+  the token. `onuroster.onu_if_token` is vendor-specific and MEASURED, not
+  assumed (2026-07-28: PYLON 177/177, PDVR 102/102, Epon_8 208/209, HLY-OLT-2
+  313/326; **zero** on Gpon_04/Gpon_08/TMG/SRPL/NLK). A miss degrades to "no
+  reading" — never a guess, never the aggregate.
+- **"No rate" and "0 Mb/s" are DIFFERENT sentences, and so is "this firmware has
+  no per-ONU interface".** HILL-OLT-1 is the live proof: 227 interfaces matched,
+  33 carry a counter, because that box's port walk is failing. `refHasRate` gates
+  on `isFresh(port_updated_at)` so a stale walk can't print a weeks-old number as
+  now; the card spells out which of the three states it is in.
+- **The line's tone follows the OPTICAL ROSTER (`isRefDark`), not `port_state`.**
+  The two ride different clocks (they agreed on 1542 of 1557 live rows) and the
+  roster is what the pin and the witness verdict already use — pin and line
+  contradicting each other on a wall map is worse than either being wrong.
+  `port_state` ships as a second opinion and colours nothing.
+- **This is a NOTIFICATION/verdict input, not a registry.** ONUs are deliberately
+  NOT `org_devices` rows (that would wreck the tree, `list_org_devices` and the
+  engine fingerprint), and the map card is deliberately not the device panel — an
+  ONU has no health tab, no ports and no outage of its own.
+- Tests: `unit/test_ponfault:WitnessTest`, `integration/test_central_onuplaces`,
+  the witness cases in `integration/test_central_ponalert`.
+
+### Splitters and subscriber drops: the distribution network (2026-07-28)
+
+`onu_drops` (sparse-ish, one row per recorded subscriber), `org_devices.split_ratio`,
+`central/drops.py` (pure math), `api/devices.py:onu_drops`/`onu_drop_subscribers`/
+`set_onu_drops`, `map/drops.ts`, `components/splitter-panel.tsx`. The map drew a
+subscriber straight to its OLT; ISPs said that isn't the network. Reality is
+`OLT PON → feeder → splitter (1:2/1:4/1:8) → [another splitter] → drop → ONU`, and a
+customer is hung off whichever splitter is NEAREST — so the straight line skipped the
+entire plant a crew works on.
+
+- **The splitter chain was already there; only the LAST hop was missing.** Passives are
+  `org_devices` rows with parent chains, `pon_port` and drawn `link_routes` — so this
+  feature is one table (which passive feeds which MAC) plus one column (how many ways a
+  box splits), NOT a second topology. Don't build one.
+- **Keyed on the MAC (`onuroster._norm_mac`), never `(device, onu_key)`** — same reason
+  `onu_places` is: `onu_optics` never deletes a vacated slot and a re-registered ONU
+  moves, so a slot key rots. Normalized at exactly ONE place on the write path
+  (`inventory.clean_onu_drops_payload`) or one sticker inflates a splitter's load. The
+  PON is deliberately NOT stored — it comes from the roster, and a second copy could
+  disagree with the walk about which PON a subscriber is on.
+- **"Recorded" is NEVER "occupied".** Six drops on a 1:8 does not make two legs free —
+  nobody wrote those down, and unknown is not spare. The bar says "of 8 legs recorded"
+  and the caption says so outright. The ONE capacity claim that survives an incomplete
+  record is OVER-subscription (more recorded drops than legs is provable either way), so
+  it is the only one made. Same instinct as "nothing is wrong" vs "nothing is measured".
+- **`SPLIT_RATIOS` is CLOSED at (2, 4, 8)** — what the ISPs actually stock. The ratio
+  feeds the load bar and the cumulative split down a cascade (`1:4 × 1:8 = 1:32`, which
+  is what says whether a PON has budget left), so "1:7" would produce arithmetic nobody
+  can act on. Widening it is one line in `inventory.py` + `types.ts`. `cumulativeSplit`
+  returns null if ANY box in the chain lacks a ratio — a partial product UNDERSTATES the
+  split, and understating it is how a PON gets over-built.
+- **A branch fault names a SPAN, not a distance.** Every recorded subscriber below one
+  passive dark while a sibling branch stays lit ⇒ the break is in the ONE span feeding
+  it. This beats the ranging bracket outright on the C-Data fleet, whose `distance_m` is
+  EPON time quanta (~39% short) — two pins and the cable between them are where a van
+  drives. Self-limiting by construction: when the fault is higher up, the branches below
+  have no lit sibling and drop out on their own, leaving the topmost dark node. There is
+  no "deepest wins" rule to get backwards.
+- **It DETECTS and RENDERS; it never pages and never touches a `ponfault` verdict.**
+  `drops.py` is imported by no alerting shell — structurally incapable of paging, which
+  is what lets it be as opinionated as it is. Deliberate for a first cut (operator's
+  call): feeding branch darkness into the PON-fault verdict is its own session.
+- **Same refusals `ponfault` keeps, for the same reasons.** A stale/down OLT is SKIPPED
+  (a dead edge makes every branch behind it look dark; the ICMP outage owns that page).
+  A dying-gasp majority reads `power`, not a cut — and a dark power-backed reference ONU
+  in the branch OUTRANKS that majority, while a GASPING witness counts in neither tally
+  (hardware beats paperwork). `MIN_BRANCH_DARK` = 2: one dark subscriber is a subscriber
+  problem.
+- **Unrecorded subscribers are never assumed lit or dark**, so a thin plant record can
+  produce a wrong-looking "all dark". Two mitigations, both required: every string says
+  "recorded", and the layers menu states `N of M subscribers mapped to a splitter` —
+  leaving coverage to be inferred from thin-looking splitters is how a partial map gets
+  read as a complete one (same reason the paging roster ships its unassigned count).
+- **Rx is compared against SIBLINGS, never a modelled budget** (`OUTLIER_DB` = 3.0).
+  ONUs on one splitter share the feeder and the split loss, so they differ only by drop
+  length — at 0.25 dB/km a 3 dB gap would be twelve kilometres of drop cable, i.e. a bad
+  splice, a bend or a dirty connector on THAT drop. An absolute budget would need the
+  OLT's launch power, which no vendor here publishes, so a modelled number would be a
+  guess wearing a decimal point. Corollary that must not be "fixed": a uniformly low
+  splitter is NOT a box full of outliers (each reads normal against its own median) —
+  that case is the feeder, and it surfaces as the median sitting below its siblings'.
+- **Recording is BULK, one dialog per splitter** — the question an operator can answer is
+  "which customers are on this box", asked once while standing at it. Eight dropdowns on
+  eight ONU rows is how a plant record never gets written at all. Candidates come from
+  the OLT ancestor's roster, restricted to the splitter's own `pon_port`. An ONU already
+  recorded elsewhere shows WHICH box, because ticking it MOVES the drop and a silent
+  re-parent would surface later as a wrong load count.
+- **A drop may only hang off `PASSIVE_TYPES`** — pointing one at a switch would put
+  subscribers on a box that has an FSM and an outage of its own. Deleting a passive
+  DELETES its drops (the box is gone, so the question has no answer) rather than
+  dangling them; the subscribers themselves live in the SNMP roster and are untouched.
+  `test_delete_cascade_handles_every_fk_table` catches a forgotten cascade.
+- **A passive stays QUIET until its subscribers aren't.** Plant is reference material and
+  must not compete with gear for the eye (why passives render small and muted). The one
+  exception is worth making — a splitter whose recorded customers are dark is the most
+  useful object on the map during a cut. SIZE never changes, only tone, and the dot does
+  NOT pulse: a pulse means "this box is down", and a splitter is never down.
+- **The drop line is DOTTED and TIGHTER than every other dash** (`DROP_DASH` "1 7", an
+  8px period, vs the ref-ONU "1 10", backup "5 8", cross-link "1.5 7"): it is the least
+  surveyed span on the map. Periods were opened when the strokes widened (2026-07-29) —
+  a dash array is absolute px, so widening a dotted line without opening its gaps closes
+  them into a solid one. A reference ONU with no recorded drop still falls back to its OLT — rendered
+  WEAKER and saying so — because a reference point must not vanish for want of plant
+  records, but "routed through its splitter" and "we only know the PON" may not look
+  alike.
+- Tests: `unit/test_drops` (the rules and every refusal),
+  `integration/test_central_drops` (identity, passive-only, org isolation, bulk/detach,
+  cascade, and the count-agreement between the rollup and the drill-down).
+
+### Field survey: the worker places the plant (2026-07-28)
+
+`/survey` (`routes/survey-page.tsx`), `hooks/use-gps-fix.ts`, `inventory.clean_field_
+location_payload`/`clean_field_passive_payload`, `store_devices.place_org_device`,
+`api/devices.field_location`/`field_passive`, `api/common.can_survey`. ISPs asked for the
+mobile worker view to geo-tag every device, active and passive. Coordinates ONLY — no
+connections; the owner wires topology on the desktop afterwards.
+
+- **It is the FIRST inventory write the worker role has, and it stays two operations
+  wide.** `_WORKER_POST` gains exactly `field-location` and `field-passive`. What makes
+  that safe is not a role check but what the routes CANNOT do: `field-location` cannot
+  clear a pin, `field-passive` cannot set a parent, an IP or a probe. Both are separate
+  functions from the owner's `/api/inventory/location` rather than the same one widened,
+  because `clean_location_payload`'s contract INCLUDES both-null = delete — a
+  worker-facing route must not be one missing UI guard away from erasing a surveyed
+  fleet. `can_survey` is its own predicate beside `can_triage` for the same reason: so
+  "workers can place pins" can't drift into "workers can write inventory" the next time
+  somebody reaches for `_can_write`.
+- **A passive created in the field reaches NO engine**, and that is the whole argument
+  for handing creation to a worker. Passives are excluded from `org_device_topology` —
+  the single choke point the FSMs, the rebuild fingerprint and `/edge/devices` all read —
+  so recording one cannot re-page a fleet, and billing never meters it. Field creation is
+  REQUIRED, not a convenience: most splitters have no row until somebody stands at one,
+  so a tag-only survey would leave the passive plant (what branch-fault localization runs
+  on) permanently unmapped. `test_a_field_passive_never_touches_the_engine_fingerprint`.
+- **PROVENANCE IS THE FEATURE** (`accuracy_m`, `place_source`, `placed_by`, `placed_at`).
+  A phone's first fix is a cell/wifi estimate at 30–80 m that GPS overtakes over ~10 s,
+  so a field capture and a surveyed point are DIFFERENT CLAIMS about the same two
+  numbers, and a splitter pinned 40 m off is a crew walking the wrong side of a road.
+  Same rule as "nothing is wrong" vs "nothing is measured": the map may not render them
+  alike. Unrecoverable if skipped — once 300 pins exist with no stamp, nobody can say
+  which were measured.
+  - **`use-gps-fix` WATCHES and keeps the TIGHTEST fix, never the first or the latest.**
+    `getCurrentPosition` returns whatever is ready, which is the estimate; accuracy also
+    doesn't improve monotonically, so a late loose reading must not undo a good one.
+    Settles early at ≤8 m, gives up at 12 s, and stops the watch on unmount (a live watch
+    drains a phone that spends all day in the field).
+  - **A `gps` claim with no `accuracy` is DOWNGRADED to `manual`, not rejected** — every
+    browser that can produce a fix produces `coords.accuracy` with it, so an absent one
+    means the number came from somewhere else. The coordinates are still worth keeping,
+    just not as a measurement.
+  - **A desktop drag WIPES the stamp** (`set_org_device_location`). Keeping it would
+    leave the map claiming a 9 m GPS fix for a point somebody dragged across a village;
+    "unknown provenance" is the honest reading of a hand-placed pin.
+- **The pin is DRAGGABLE, and that is the only way a handset beats its own chip**
+  (`components/pin-adjust-map.tsx`, 2026-07-28). A GPS fix is a circle, not a point — 25 m
+  of it is a whole compound — and the person standing there can see which rooftop the box
+  is on. SATELLITE by default: a roadmap shows a street name, imagery shows the building
+  and the pole line, and nobody identifies a drop from a road label. Deliberately not the
+  map page in miniature (no clustering, no topology, no device pins) — one marker, one job,
+  or it becomes a second map implementation to keep in step with the first.
+  - **A dragged pin records `manual` with NULL accuracy**, and precedence is nudge >
+    same-spot > GPS. Not because a hand-placed point is worse — it is usually far better —
+    but because `accuracy_m` means "the radius this measurement is good to", and a
+    hand-placed point has no such radius. Carrying the GPS figure over would attach a
+    measurement to something never measured. Same rule `set_org_device_location` follows
+    for a desktop drag.
+  - **The map is FOLDED** (operator's call), like the device panel's Uplinks and "Paged for
+    this device" sections: the common capture is "stand there, press save", and 208px of map
+    ahead of the name field and the button made the routine case pay for the exception. The
+    trigger prints the current coordinates so the fold never hides a decision, and it
+    springs OPEN for a reopened placement — there, seeing where the pin already sits is the
+    reason for coming back.
+  - `FixReadout` must STOP leading with the accuracy chip once nudged, or the sheet prints
+    "±8 m" above a point that number no longer describes. The sheet's action row is STICKY
+    for the same class of reason: a 208px map pushed the save button below the fold of a
+    scrolling container, and a capture flow whose save button must be hunted for is one
+    that gets abandoned halfway up a pole.
+  - **ANY second Leaflet map MUST keep `attributionControl` ON.** `GoogleLayer` mounts
+    `GoogleAttribution`, which swaps its ToS line through `map.attributionControl` — and
+    Leaflet only assigns that property when the control is created (`leaflet-src.js`:
+    `if (this.options.attributionControl)`), so `attributionControl={false}` makes it
+    `undefined` and the map throws "undefined is not an object" on mount. **It fails ONLY
+    for an org that HAS a working Google Maps key**: a keyless org, or any org whose
+    `createGoogleSession` fails, falls back to `StreetsTiles`, whose attribution is a
+    static prop — so it passes every local test against a seeded DB and breaks in
+    production. Showing Google's tiles without attribution is a terms violation anyway,
+    which is why the wordmark overlay is duplicated here too.
+- **A poor fix is NEVER a hard refusal.** Past `GOOD_FIX_M` (25 m) the primary button
+  demotes to "Save anyway at ±N m" and the server keeps the number with its accuracy —
+  blocking the save is how coordinates end up in a WhatsApp message instead of the DB. A
+  worker under canopy still needs to record something; a loose pin that SAYS it is loose
+  beats no pin. The server only rejects the absurd (>10 km).
+- **The map is the VERIFICATION surface, not the capture one.** Pinch-zooming to drop a
+  pin one-handed in the sun is how a splitter lands 200 m into a field, so `/survey` is a
+  list + one big thumb-zone button and coordinates are never typed or dragged there. It
+  is a separate route rather than a mode bolted onto `map-page.tsx`, which is already
+  2,000 lines carrying three placement modes.
+- **"Same spot as…" BORROWS the neighbour's exact coordinates** rather than taking its
+  own fix: boxes in one rack are at ONE point, and independent fixes would scatter them
+  by the accuracy radius and read as several sites (the same instinct as the map's 24 px
+  drag-snap). A borrowed capture is `manual` with NULL accuracy — it inherits a position,
+  not a measurement.
+- **Live write + audit trail, deliberately no approval queue** (operator's call): 200
+  pins × one approval click each is how a survey gets abandoned. "Placed today" with the
+  accuracy chip is the field-side check; the owner reviews in bulk off `placed_by`.
+- **A WORKER ON A PHONE GETS `/survey` AND NOTHING ELSE** (operator's call, 2026-07-28):
+  `app-shell.tsx:FieldShell` — no sidebar, no bottom bar, every other path
+  `<Navigate replace>`s to it, and the only chrome is the org name plus the account menu
+  (logout has to stay reachable). The field handset is a survey tool, not a shrunken NOC,
+  and everything else there was read-only anyway. This deliberately REINTRODUCES a
+  viewport fork, retired once because a desktop resize changed the whole app — acceptable
+  because nobody resizes a phone and the same worker on a laptop still gets the full
+  read-only shell. It sits AFTER the billing-lock check so a locked org still shows its
+  lock screen. `use-mobile.ts` had to start reading the viewport SYNCHRONOUSLY for this:
+  its old `undefined`-then-effect value claimed "desktop" on first paint, which now
+  flashes the entire desktop chrome before collapsing.
+- The mobile tab bar (owners) is now SIX destinations, so its items are `flex-1 min-w-0`
+  — six at a fixed `min-w-14` overflows a 320px handset.
+
+**ONUs: LOCATING IS NOT WITNESSING** (the sharpest edge in this feature). Subscribers are
+locatable too, but they are not `org_devices` rows — they live in the SNMP roster, so the
+survey looks them up through `onu-search` (sticker MAC or provisioned name) and the pin
+lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
+
+- **`onu_places.witness` splits the two claims, and `onu_place_macs` filters on it.**
+  Placing a reference ONU IS the operator's claim that a subscriber's power is reliable —
+  nothing detects it, and `ponfault._witness_verdict` reads it to call a dark PON a power
+  cut (no crew) rather than a fibre cut (roll a van). Without the split, geo-tagging a
+  street would enrol every drop as a power-backed witness and the next dark subscriber
+  would read as PROOF of a cut. The column is `DEFAULT 1` because every row predating the
+  survey WAS a witness — that backfills them correctly; the write paths pass it
+  explicitly and never lean on the default.
+- **The field route can neither create a witness nor destroy one.**
+  `clean_field_onu_payload` has no `witness` key at all (not merely ignored — unsayable),
+  and `field_onu` re-reads the existing flag and preserves it. The second half matters
+  more: that claim is invisible on a handset, so a tech recording where a box sits must
+  never silently cancel it. Reference placement stays owner-only on
+  `/api/inventory/onu-place`. `test_locating_does_NOT_create_a_witness` /
+  `test_locating_a_reference_ONU_does_not_cancel_its_claim`.
+- **The MAC must be in the roster** (404 otherwise). A scrape can never add an ONU and
+  neither can this; a pin on a typo'd sticker renders at a coordinate with nothing behind
+  it. `place_onu_in_field` also leaves `notes` alone — desk knowledge about a site is not
+  a location capture's to erase.
+- **The map renders the two differently or the split is pointless**: `refKind` says
+  "subscriber" vs "reference ONU", `.wisp-refonu--plain` keeps a located drop small and
+  unhaloed, and `refZIndex` lifts a DARK pin only when it is a witness — a dark witness is
+  a fibre cut with a coordinate, a dark subscriber is Tuesday. Once a fleet tags its drops
+  these outnumber witnesses ~100:1.
+- **The subscriber's NAME goes to `onu_places.label`, NEVER `onu_optics.name`.** The
+  roster's name is whatever the OLT reports and the SNMP upsert rewrites it
+  (`name=excluded.name`) every sweep, so a name typed into it would vanish inside ~300s —
+  worse than not offering the field. The label is operator-owned and no walk touches it;
+  `label || walked_name || serial || mac` is the display order everywhere (`refTitle`
+  already used it). The capture sheet shows the walked name as the placeholder so the tech
+  can see what the OLT calls it without being able to edit that.
+  - **That display order is a FUNCTION, `onuroster.display_name` / `format.ts:onuName` —
+    never a rule each screen re-implements** (2026-07-29). The first cut left it to the
+    callers and every one of them named an ONU off `onu_optics.name` ALONE, so a name a
+    worker typed reached the DB correctly and then rendered nowhere: the OLT's Optical tab
+    printed "unnamed", ONU search couldn't find it, the WhatsApp lookup and the issue list
+    both missed it. **A name visible only on the screen that captured it is
+    indistinguishable from a name that was never saved** — which is exactly how it was
+    reported from the field. What makes forgetting impossible now is that the row CARRIES
+    the label: `store_snmp.list_onu_optics` and `org_onu_rows` LEFT JOIN `onu_places` (the
+    join key is `_norm_mac` REGISTERED as a SQL function beside `wisp_search_key`, so SQL
+    identity can't drift from Python identity), and both search paths — the
+    `onu_search_device_ids` prefilter AND the in-Python filter — match `label` too, or an
+    OLT whose only hit is a typed name never gets scanned.
+  - **Customer names are stored UPPERCASE** (operator's call, 2026-07-29), normalized on the
+    WRITE path at `inventory._onu_label`, the one helper all three writers to
+    `onu_places.label` share (field capture, field rename, desktop reference-ONU dialog).
+    Write-side rather than display-side so SEARCH matches what the operator sees and two
+    entry points can't disagree about one sticker; `store._upper_onu_labels` carries existing
+    rows across at startup so the list isn't half shouting. Both inputs uppercase AS TYPED —
+    a field that shows something other than what gets saved is how a name gets re-typed. The
+    **WALKED name is never touched**: that string belongs to the OLT.
+- **RENAMING IS ITS OWN ROUTE** (`/api/inventory/field-onu-name`), not a placement with the
+  old coordinates. Re-placing restamps `accuracy_m`/`place_source`/`placed_by`, so
+  correcting a spelling would downgrade a real 6 m GPS fix to a hand-placed point and
+  reattribute the visit. So: reopening a LOCATED subscriber seeds the map at its stored
+  pin and the sheet becomes "Save name"; dragging the pin (or "Back to GPS") turns it back
+  into a real placement. The SPA tracks `pin` and `moved` separately for exactly this — a
+  seeded pin and a dragged one mean opposite things. A blank label CLEARS (descriptive text
+  can honestly be absent, unlike a pin); a rename on an unplaced MAC is a 404, never an
+  invented pin-less row that would enter the coverage count.
+- **A PLACED SUBSCRIBER HAS TO BE REACHABLE, or the survey looks broken.** The first
+  placement (`hcs_babu`, 2026-07-28) saved correctly and was invisible: the subscriber
+  layer is OFF by default (localStorage) AND only draws from `REF_ONU_MIN_ZOOM` (16), so a
+  fresh pin fails both gates at once. Three fixes, all needed: the Layers entry is now
+  named **Subscribers** with a count (it said "Reference ONUs", which hid the survey's
+  whole output under a toggle nobody would look under); `/map?onu=<MAC>` enables the layer,
+  flies past the zoom floor and selects the pin — a QUERY param, not nav state, so it
+  survives a reload and a shared link; and both the search row and the post-save toast
+  offer it. **Not offered on the field handset** — `FieldShell` redirects `/map` back to
+  `/survey`, so the survey page gates those affordances on the SAME `isWorker && isMobile`
+  the shell uses, or it would render a link that bounces.
+- **…and once a fleet surveys in bulk, REACHABLE stops meaning ALL AT ONCE** (2026-07-29).
+  Thousands of drops drawn together is a texture, not a map, and it does not match how a
+  fault arrives — "EPON0/4 has five crit ONUs" is a question about ONE PON.
+  `map-page.tsx:onuScope` ({deviceId, pons}) focuses the layer on one OLT and any SUBSET of
+  its PONs, entered from the map device panel's **located** row — a dropdown of checkboxes,
+  its trigger reading the current selection ("Show on map" / "All PONs" / the PON / "N PONs")
+  — and toggled just as freely from the PON chips in the status strip. `pons` is a SET and an
+  EMPTY one means EVERY PON: un-ticking the last one has to land on the whole OLT, never on a
+  focus that draws nothing, and "All PONs" therefore CLEARS the ticks rather than being one
+  more of them. Multi-select is the operator's explicit call (2026-07-29, replacing
+  one-PON-at-a-time): a village's feeder and cascade carry two or three PONs, so "is the whole
+  area out or just that PON" is a question about a set, and clicking between chips from memory
+  is what a map is supposed to spare you. The menu STAYS OPEN across ticks (`onSelect`
+  prevented) and the map re-fits under it, so the selection is built and judged in one gesture;
+  an OLT with a single surveyed PON keeps the plain toggle button, since a menu whose every
+  path does the same thing is worse than the button it replaced. Five things it gets right and
+  must keep: it is SEPARATE state from the
+  `refOnus` toggle (that is the operator's remembered preference, a scope is what they're
+  working on now — clearing it must restore their setting, not decide for them); it
+  **bypasses `REF_ONU_MIN_ZOOM`**, because that floor exists to stop a fleet's worth of pins,
+  not to hide one OLT's dozen; it **FITS to what it left on screen** (an unframed filter
+  shows an empty map and reads as "nothing here"); the bar lives IN the status strip, not as
+  a floating card, because `top-14 left-3` already belongs to the unplaced drawer and the
+  subscriber card — and a map hiding most of its content must SAY SO on the map, or the next
+  person at the wall reads a scoped view as the whole network. And PON chips are built from
+  PLACED subscribers with a DARK count, never from the OLT's PON list: a chip for a PON
+  nobody surveyed would filter to an empty map and read as "this PON is dark". The panel row
+  says **"N located"** (of the roster where known), never "N subscribers" — same rule as the
+  splitter panel's "recorded". The strip sits at **z-[1002], one rung above every floating
+  card** (all z-1000): the unplaced drawer, the site card and the subscriber card all open at
+  `top-14 left-3`, exactly where the strip wraps once the focus bar joins it, and a z-index tie
+  breaks on DOM order — so those cards were burying the search results and the PON chips.
+- **The map SEARCH box finds subscribers, not just devices** (2026-07-29, `map/search.tsx`).
+  A tech holds a sticker MAC or the customer name typed in the survey, and neither is an
+  `org_devices` row, so a box that only knew devices answered "nothing found" about a drop
+  surveyed that morning. TWO sources on purpose: the PLACED set (`onu-places`, matched
+  client-side and instantly, sharing map-page's own cache — the answer to "where did my pin
+  go") and the ROSTER (`onu-search`, debounced like the geocoder, cache shared with Network and
+  Survey), because mid-survey nearly every subscriber is unplaced and "no such subscriber"
+  would be the wrong answer. A placed hit flies + selects through the SAME `flyToOnu` the
+  `?onu=` deep link uses; an unplaced one names its OLT and STOPS — it deliberately does not
+  arm placement the way an unplaced DEVICE does, because map placement writes a WITNESS claim,
+  and that is made where the contract is stated, never as a side effect of a search. Rows are
+  two-line (name over "OLT · PON"): on a 288px panel one line truncates the half that answers
+  the question. `focusFlying` guards the selection during the flight — `zoom` state only lands
+  at zoomend, so selecting a pin as a flyTo STARTS had the visibility guard judge it against
+  the zoom being left and close the card before it drew (this hit `?onu=` links too, from any
+  view below zoom 16). The punctuation-blind needle is `format.ts:onuSearchKey`, ONE mirror of
+  `onuroster.search_key` shared with the Network page.
+- **`onu_places.witness` ships as a real BOOLEAN** (`api/devices.py:onu_places` casts it).
+  SQLite hands back 0/1 and `{**p}` shipped that raw against a SPA type declaring `boolean` —
+  which JS reads wrong in both directions: `w === true` is never true (the survey list's
+  "reference" chip could not render, the one warning that stops a witness being re-pinned) and
+  `{w && <Chip/>}` renders a literal "0" beside the name. Cast at the edge, where the type is
+  declared.
+- **Coverage is per-OLT and the denominator is the freshest-walk roster**
+  (`/api/inventory/onu-coverage`). The survey's first cut counted only `org_devices` and so
+  read "0 left" the moment the gear was done, while 2,155 of 2,156 subscribers had no pin —
+  a coverage figure nobody can see is a survey nobody finishes. Equipment and subscribers
+  are counted SEPARATELY (tens of boxes vs thousands of drops; one merged "N left" serves
+  neither), and the unplaced list ships only for a NAMED OLT because the fleet-wide set is
+  thousands of rows and nobody works a list like that — they work an area. Sorted by
+  slot, not by state, so a tech keeps their place between visits. Zombie slots are
+  excluded by `current_roster`, or the denominator would include drops nobody can find.
+  `onu_place_macs(witness_only=False)` is the one caller that asks the wider question —
+  it defaults True so no alerting path can accidentally widen to every located drop.
+- Tests: `integration/test_central_survey` (the gate, the refusals, provenance, the
+  engine-fingerprint guard, and the whole witness split).
 
 ### C-Data / DBC: two hardware truths (don't re-derive)
 
@@ -484,6 +1033,19 @@ HTTP. Shipped 2026-07-16, field-proven; `weboptics` rides it.
   cookies travel, central's `wisp_central_session` is stripped; Referer/Origin rewritten to the
   device origin (firmware CSRF checks); Authorization forwarded only for `Basic` (a bearer
   would be central's own token). Without this, logins bounce.
+- **The autofill bootstrap must never be spliced into JAVASCRIPT** (`proxy._injection_point`).
+  A form-login device gets a multi-line `<script>` appended to every proxied HTML document, and
+  the old "last `</body>` wins" rule put it inside `document.write("…</body>…")` on DCN's .asp
+  UI — a raw newline in a JS string literal ("SyntaxError: string literal contains an unescaped
+  line break") killed the page's OWN script before it navigated the content frame. **The failure
+  is invisible in `proxy_audit`: every request still 200s**, the tab bar renders, and the content
+  page is simply never requested. Two gates now: the insertion point is the last `</body>`
+  OUTSIDE any `<script>` (skipped entirely when the body ends inside an unterminated one), and
+  the payload must START with `<` — old firmware serves `common.js` with no Content-Type, and
+  the doc SNIFF matches any body merely CONTAINING `</body>`, so a JS file was a candidate
+  document. Diagnosis method worth reusing: a device whose credentials were never stored has
+  autofill disarmed and nothing injected, so `proxy_audit` gives a free A/B against an identical
+  firmware. Tests: `unit/test_proxy_autofill:InjectionPointTest`.
 - **Escape rescue** (`server.py:_proxy_rescue`): a JS-built root-absolute URL lands on central
   as an unknown route; if the Referer names a LIVE session it 307s back inside the prefix
   (method+body preserved). Path-prefix rewriting will never fully tame JS-built absolute URLs —
@@ -499,7 +1061,119 @@ HTTP. Shipped 2026-07-16, field-proven; `weboptics` rides it.
   interval. This is a genuine threat-model change for the edge: the allow-list + audit +
   opt-in-session + capability-flag controls are the price of admission, and shipping any subset
   is not acceptable.
-- Tests: `unit/test_webproxy`, `integration/test_central_proxy`.
+
+### Why a tunnelled page was 5s/click (2026-07-29) — don't undo these
+
+The tunnel opened a **fresh TCP connection to the device for every asset**, and the weak boxes
+could not accept them that fast. A browser on that LAN opens ~2 and keeps them alive for the
+whole session, which is exactly why the same OLT felt instant locally and crawled through the
+tunnel. Measured over the whole of `proxy_audit`: SRPL-OLT cost **1.00s per asset** (8 assets =
+a 7-second page) with a 4.3% fetch-failure rate, against **0.25s and 0.1%** for HLY-OLT-1 —
+*same probe, same vendor, same firmware, ICMP 3.8ms/0% vs 3.2ms/0%*. Every shared component
+held constant and it was still 4× slower, so the box is the variable. Diagnose the next one
+this way: hold the infrastructure constant across two devices on ONE probe before touching
+anything.
+
+**The cause is PROVEN, and the proof only existed because failures started being logged.**
+Every 502 reads `connect timeout to 172.168.99.245:443` — the TCP connect never completed, so
+this was never a slow page, a slow link or a slow CPU. A box that silently DROPS connection
+attempts rather than refusing them is an overrun accept queue, and the client's SYN-retransmit
+timer is why the surviving requests measured a dead-on **1.00s** median: one retransmit each.
+The ones that lost the race outright burned the whole 5s connect budget, 502'd, and the browser
+asked again — adding load to a box already at its limit. **The lever is how many connections at
+once the device is asked to accept**, which is why the concurrency ladders below exist and why
+raising `proxy_connect_timeout_s` would be treating the symptom.
+
+- **Central keeps a per-session static-asset cache** (`proxy.py:AssetCache`, on the
+  `ProxySession`). 44% of every request this tunnel had ever carried was a re-fetch of an
+  unchanging asset **inside one session** — `jquery-1.7.1.min.js` alone is 553 fetches of one
+  OLT — because the firmware ships no cache headers and its frameset re-requests the whole
+  script set per click. Four things are load-bearing: it stores the **device's RAW reply**,
+  before `rewrite_body`/`inject_autofill`, so a hit replays the identical pipeline and there
+  stays exactly ONE rewriting path (`_finish` is the single exit for hit and miss); it lives
+  **on the session**, so it dies with the credential and there is no cross-session — let alone
+  cross-org — key to get wrong; the **query string is part of the key**, so the firmware's own
+  `?rand=` busting keeps working (second-guessing a deliberate bust is how a cache serves a
+  stale page nobody can explain); and `_CACHEABLE_EXT` is a **CLOSED extension list** because
+  this vendor's DYNAMIC pages are `.html` (`/action/onuauthinfo.html`) — precisely what a
+  looser rule would start serving stale. `cache_refusal` then refuses anything carrying state
+  (Set-Cookie / `no-store` / a `Vary` beyond Accept-Encoding) — a static extension is a hint
+  about the URL, never a promise about the response. Checked BEFORE the in-flight ceiling: a
+  cached asset consumes no tunnel, so a page's script set must never 429 against a limit it
+  isn't using. **A hit is still audited** — the audit answers "who opened what".
+  - **`no-cache` and `private` are deliberately DEFIED, `no-store` is not.** `private` addresses
+    SHARED caches and this one is per-session and in-process, so honouring it was a misreading;
+    `no-cache` means store-then-revalidate, and this firmware ships neither ETag nor
+    Last-Modified, so honouring it literally means the cache can never work on the entire fleet.
+    What makes that safe is the vendor's OWN signal: this UI cache-busts the JS it considers
+    volatile (`/js/misc.js?rand=62245`, a fresh number per page load) and leaves the stable
+    files bare — and the query is part of the key, so everything it marks as changing keeps
+    missing. Don't "correct" this back to strict HTTP semantics without re-reading that.
+  - **jQuery's OWN `_=` buster is stripped from the key; the vendor's `rand=` is not**
+    (`cache_key`). `$.ajax({cache:false})` appends `_=<ts>` to everything it sends — a CLIENT
+    LIBRARY statement about the browser's cache, not a vendor statement about the resource —
+    whereas `rand=` is written by this firmware's own HTML per script tag. The distinction is
+    worth 20% of all tunnel traffic: static `.properties` translation tables
+    (`/i18N/error_en_US.properties?_=…` alone is 5,919 fetches fleet-wide of a file that has
+    never changed) are otherwise a permanent miss. A param merely STARTING with `_` is somebody
+    else's and is kept.
+  - **A refusal is LOGGED, once per (session, reason).** A working cache and an empty one look
+    identical from outside — the only symptom is that the tunnel stayed slow — so the reason
+    has to be reachable without attaching a debugger to production. Deduped, or a device that
+    stamps one header on every asset turns a useful log into an ignored one.
+- **The edge reuses ONE client per `(scheme, ip, port)`** (`webproxy.py:_ClientPool`). Socket
+  hygiene is httpx's own `keepalive_expiry` (`proxy_keepalive_idle_s`), which can't disturb a
+  live request; the pool's own reap only bounds the dict and uses a cutoff well past the
+  longest fetch, or it would tear a client down under an in-flight request. A device closing a
+  pooled connection is NORMAL and costs **one silent retry — GET/HEAD only**: a POST that died
+  without a reply may still have been applied, and re-submitting a config write is worse than
+  the 502.
+- **Per-DEVICE concurrency is an adaptive ladder on BOTH sides** (`proxy_device_max_inflight`
+  → 2 → 1): `proxy.py:_DeviceThrottle` on central, `webproxy.py:_DeviceGate` on the edge. Not
+  redundant — `proxy_workers` bounds a NODE's tunnel, these bound one BOX, and **central's is
+  the one that ships without a fleet rollout**, which is the whole reason it exists there.
+  They converge on the same rung and the tighter wins. Same shape as `PysnmpPoller`'s and for
+  the same reason — **no vendor hardcode, no operator-kept list of weak boxes**: drop a rung
+  only on a CONNECT failure (a 404 or a slow page proves nothing about capacity), re-probe one
+  rung faster every 3h so a reboot heals silently. Rungs above the configured ceiling are
+  dropped, not clamped.
+  - **The ladder FLOORS AT 2, and that is measured, not cautious.** SRPL-OLT, median in-burst
+    gap between assets: limit 4 → **1.00s** (connections dropped, 5s each), limit 2 → **0.00s**,
+    limit 1 → **1.50s, the worst of the three**. One-at-a-time loses because the tunnel is a
+    PIPELINE — while the edge uploads one reply and re-issues its long-poll, a second request
+    should be in flight covering those WAN legs, and serialising makes every asset pay for that
+    dead air. The failures the ladder exists to stop are real, but curing them by going to 1
+    costs more than the failures did. Don't "finish" the ladder by re-adding a rung at 1.
+  - Central's gate is taken **inside `ProxyHub.submit`**, so a tab, the web-optics sweeper and
+    the session-open preflight are all bounded by it — a device is a device whoever is asking,
+    and a gate a new caller can forget to take is not a gate. It is a **Condition, not a
+    Semaphore**, because the capacity moves: a semaphore's value is fixed at construction, so
+    narrowing would mean swapping the object and hoping every holder released the one it took.
+    Keyed on the DEVICE, so a reopened tab inherits what we learned about the box. Failing to
+    get a slot returns None, i.e. reads as a timeout — which is what it is from the browser.
+  - **Central classifies the EDGE's failure PROSE** (`is_connect_failure` vs
+    `_friendly_fetch_error`), because the fleet cannot be updated in the same breath as
+    central. That is a cross-module coupling on strings, so `ConnectFailureWordingTest` drives
+    the real function with real httpx exceptions and fails if the wording drifts. A TLS-version
+    mismatch and a non-HTTP reply are deliberately NOT capacity signals — they fail identically
+    at any concurrency, and narrowing would slow a device down to punish it for a wrong port.
+  - `DeviceFetchError.connect_failure` carries the same classification on the edge, where the
+    exception is still in hand; it subclasses RuntimeError so every existing handler is
+    untouched.
+- **Every slow asset logs WHERE the time went** (`proxy.py:_log_slow`, over 1.0s).
+  `_Pending` stamps the round trip at the only two points central can see it: when the edge's
+  long-poll CLAIMED the request and when its reply landed. `queued` (park → claim) is tunnel
+  cost — no worker free, or none polling; `edge` (claim → reply) is the device fetch plus the
+  reply upload. Without that split a slow page is only "slow somewhere", which is what cost
+  this subsystem two restarts of guessing. Keep it: the device-side and tunnel-side cures are
+  opposite, and picking the wrong one made things measurably worse once already.
+- **A failed fetch is now LOGGED on central** (`api/proxy.py`). The edge writes one human
+  sentence per failure mode and it used to reach the browser's 502 body and *nothing else*, so
+  a fleet running 4-5% failures had no record of why — this diagnosis could not tell a refused
+  connection from a TLS mismatch after the fact. 504s log too. One line; keep it.
+- Tests: `unit/test_webproxy` (`AssetCacheTest`, `ClientPoolTest`, `DeviceGateTest`,
+  `CentralDeviceThrottleTest`, `ConnectFailureWordingTest`), `integration/test_central_proxy`
+  (the cache's refusals, and that a hit is byte-identical to a miss).
 
 ## Central management plane
 
@@ -720,6 +1394,84 @@ Built output is committed (`cd web && npm install && npm run build`); `./run.sh`
   scannable and `.wisp-page--narrow` (66rem) for form-shaped pages where line length hurts. The
   app had six measures (48–105rem) and visibly changed shape as you navigated. Don't add a third.
 
+### The issue plane (`/issues`, `central/issues.py`, `central/pdf.py`)
+
+A Home KPI tile drills into the Network TREE filtered to the devices behind its number — which
+answers "which boxes", not "what is wrong". `/issues` is the other half: ONE ROW PER PROBLEM
+(port, ONU, PON, probe), because a switch with four dark ports is one tree row and four jobs.
+Both actions stay on the tile: the body links to the tree, a corner button (`ListTree`) links to
+`/issues?kind=<kind>`. Read-side only — it writes nothing and pages nobody.
+
+- **The tile's count and the list's length MUST be the same number** — a drill-down that
+  disagrees with the tile it was opened from is worse than none. So `issues.collect` re-derives
+  NOTHING: it composes the same store reads and the same gates the tiles use (`olt_liveness`,
+  `current_roster`'s freshest-walk-per-OLT view, `low/high_bandwidth_alarms`, `ponfault`,
+  `onuroster`), and "monitored" means what the tile means — assigned to a REGISTERED, unrevoked
+  probe, maintenance excluded. `store.down_ports` counts the flap-suppressed `alarm` flag, the
+  same column `list_org_devices.ports_down` counts, NOT a raw `oper_status`.
+- **`KINDS` is a CLOSED vocabulary, one kind per tile** (`issues.py` ↔ `types.ts:IssueKind`).
+  `pon_fiber` and `pon_power` are SEPARATE kinds although `ponfault` yields one verdict type:
+  the tile counts suspected cuts only (a power drop is recorded and deliberately never paged),
+  and one merged kind would make the chip's count exceed the tile's. Adding a tile = adding a
+  kind on both sides.
+- **An unknown `?kind=` shows the WHOLE list, never an empty one** (`_kinds_arg` intersects with
+  `KINDS` and a request left with none reads as "no filter"): a link written against an older
+  vocabulary must not render as an all-clear. `counts` always ride the UNFILTERED list so a chip
+  can say how many rows it would show before it is clicked.
+- **A port-down on an unreachable switch is KEPT but demoted to `info` and annotated** "reading
+  frozen" — the honesty rule and the count-agreement rule pull opposite ways here, and dropping
+  the row would leave the tile's number unexplained. Bandwidth alarms are the opposite case (a
+  rate reading, already excluded upstream by `_bandwidth_alarms`) — don't "fix" the asymmetry.
+- **The PDF is SERVER-rendered, pure stdlib** (`central/pdf.py`, ~250 lines: three base-14 fonts,
+  no embedding, paginated, no wrapping) rather than a browser print stylesheet — what gets filed
+  after a shift should be the rows the server holds, and "print to PDF" is not a thing on a
+  phone. It is filtered by the chips you can see. Four traps it already survives: an unescaped
+  `)` from a real `if_alias` ends the string operand and corrupts the rest of the page; the
+  xref must record the bytes actually written (offsets are captured as each object is appended,
+  never computed); the fold is **cp1252, NOT latin-1** — the fonts declare `/WinAnsiEncoding`
+  and latin-1 lacks the 0x80–0x9F band, so an em dash printed a report titled "Open issues ?
+  ispA"; and a mono cell measured with the Helvetica table overruns its column. Unencodable
+  glyphs degrade to `?`; nothing may raise inside a download.
+  `_send_binary` in `server.py` is the only non-JSON reply that keeps the security headers.
+- **Column widths are MEASURED from content, never a share of the page** (`_solve_widths`).
+  `Column.weight` only breaks the tie when the content doesn't fit. Proportional sizing got the
+  first cut exactly backwards: Detail sat on ~180pt of white carrying `Rx -28.86 dBm` while Item
+  truncated the 17-char MAC the report exists to communicate. Fits → surplus shared in proportion
+  to need; doesn't fit → water-fill, so small columns are satisfied outright and only genuinely
+  hungry ones absorb the shortfall (one long free-text column can never starve five identifier
+  columns). Same failure had to be fixed on screen: the Issues grid gives Item and Detail
+  FRACTIONAL tracks, not one capped and one greedy `1fr`. Corollary in `issues.py`: the PON-fault
+  detail puts the cut bracket and named passive FIRST — it's the longest string the list
+  produces, so what gets cut off in print should be the ONU count, not what a crew drives to.
+- **Excel export is a REAL .xlsx, hand-written with `zipfile`** (`central/xlsx.py`) — not a CSV
+  wearing the name: someone asking for Excel wants to sort and filter, and a CSV hands them a
+  re-import dialog plus text-typed dates. Bold frozen header, autofilter, content-measured column
+  widths, and `since` as a **real date cell** so sorting orders by time (text stamps put "26 Jul"
+  before "3 Aug"). Severity IS a column here though not in the PDF — it's the first thing anyone
+  autofilters on, and on paper the word couldn't be coloured anyway. Traps: `autoFilter` must come
+  AFTER `sheetData` (schema element order) or Excel reports the file as needing repair; a `count`
+  attribute in styles.xml that disagrees with its children is the same silent repair; the two
+  default fills (none, gray125) are mandatory; the epoch is **1899-12-30**, which is what cancels
+  the format's 1900-leap-year bug; XML-forbidden control characters really do arrive in an
+  `if_alias` and one corrupts the workbook. Inline strings, no sharedStrings — one less index to
+  keep consistent. Output is deterministic (fixed zip timestamps).
+- **Timestamps go through ONE zone conversion**, `notifiers._wa_local` — `_wa_time` renders it as
+  text for a WhatsApp page and the PDF, the spreadsheet renders it as a date cell. Two renderers,
+  one notion of "local", or half an export ends up 5h30m out from the other half. That only works
+  because EVERY stamp lives in the `since` field and none is interpolated into `detail`.
+- **Filter chips are a SINGLE choice** (`setKind`, not a toggle-into-a-set): clicking a kind shows
+  only that kind, matching the Logs page and the one-kind links the tiles emit. A multi-kind URL
+  still renders. Build the next `URLSearchParams` fresh — mutating the instance
+  `useSearchParams` returns edits react-router's own memoized object, so the value a render reads
+  moves without the reference the memo is keyed on changing (presents as a chip that highlights
+  but never filters).
+- **Workers CAN read `/api/issues{,/pdf,/xlsx}`** (2026-07-26). Deny-by-default kept them out at
+  first, but a worker now gets the FULL shell and the sidebar lists Issues as a mobile
+  destination — "the one screen worth carrying to a site visit" — so the entry rendered and
+  403'd. Read-side only (`collect` writes nothing, pages nobody) and still org-pinned by
+  `_scope_org`; the exports are the same rows a worker can already see. Writes stay owner-only.
+  Tests: `unit/test_pdf`, `unit/test_xlsx`, `integration/test_central_issues`.
+
 ### Honesty rules (what the UI may and may not claim)
 
 - **A DOWN device's SNMP readings are FROZEN, and must look it.** Ports/vitals/optics rows
@@ -832,6 +1584,17 @@ Leaflet + raster tiles fetched by the BROWSER (central needs no egress). Helpers
 `search.tsx` — with page composition in `routes/map-page.tsx`. New map logic goes in the
 matching module, not back into map-page.tsx.
 
+**Leaflet is the RENDERER; Google is only the TILE SOURCE — that is the design, not an
+accident.** The Map Tiles API exists precisely to serve Google imagery into a third-party
+renderer, and every overlay this product has (device pins, cable routes, the cut overlay,
+site clusters, link-hover distance, drop lines, reference ONUs) is built on Leaflet
+primitives. Swapping to the Google Maps JS SDK would mean rewriting all of it, re-billing
+per map load, and giving up the keyless CARTO fallback that keeps the map from ever being
+blank. Google's ATTRIBUTION is required and stays; Leaflet's own "Leaflet" prefix is a
+courtesy, not a licence condition (BSD-2-Clause wants the notice in the distributed source,
+which the bundle keeps), so `AttributionPrefix` drops it — naming the renderer beside "Map
+data ©Google" only reads as confusion about who supplies what.
+
 - **Basemaps are Google / Google Satellite ONLY** (the CARTO/Esri/Dim entries were removed at
   the operator's request the same day they shipped) via the Map Tiles API — the sanctioned
   third-party-renderer API, NOT the SDK-only Maps tiles. **The key is SERVER-WIDE,
@@ -843,6 +1606,18 @@ matching module, not back into map-page.tsx.
 - `lib/google-tiles.ts`: session token (~2wk) cached in localStorage per mapType; **dpr>1
   sessions request `scaleFactor2x`+`highDpi`** (512px tiles at 256 CSS px — plain 256 rasters
   are why Google "looked blurry" on scaled displays; the cache key carries the scale).
+- **"Google labels" (Layers menu) strips Google's OWN writing and POI pins** — a dense town
+  ships more Google markers than we draw, each competing with a device pin. ONE styler
+  (`elementType: "labels"`, no featureType) covers every feature's text AND its icon; a POI
+  marker is a label, not geometry. **GEOMETRY IS LEFT ALONE** — switching `poi` off wholesale
+  would take park fills and building footprints with it, and those are what a crew navigates by
+  once the names are gone; a blank map is not the ask. **ROADMAP ONLY** and the menu entry
+  hides on satellite: an imagery session carries no labels in the first place (they would be an
+  explicit `layerTypes: ["layerRoadmap"]` overlay we never request), and a switch that does
+  nothing where it is shown is worse than one that isn't there. Each combination is its OWN
+  SESSION — the cache key carries a `:s<variant>-<hash>` (n = night, p = plain), pruning stays
+  scoped to one variant so a theme or label flip doesn't evict the other's token and pay for a
+  fresh `createSession`, and the layer's React key carries it too so a flip REMOUNTS.
 - **Dark basemaps follow the app theme**: `createSession` takes a `styles` array and we send
   Google's night array with GEOMETRY intact and **LABEL TEXT dimmed**. Stock shipped first and
   came back "too contrasty" within the hour — it put road labels **louder than every status
@@ -1062,6 +1837,47 @@ just where the lock file and supervisor transient files live.
 - Escalation: fresh DOWN pages owner+worker; one `escalations` row (`kind="hourly"`,
   `UNIQUE(outage_id, kind)`) re-broadcasts all-hands every `cfg.escalate_every_min` while open.
   Ack doesn't stop it; recovery does.
+- **Assignment is triage, and its page is NARROW** (`outages.assigned_to/_at/_by`, JSON list of
+  usernames; `POST /api/outages/assign`, 2026-07-26). Three decisions:
+  (1) **OWNER-ONLY** — deciding who goes out is running the org, so it gates on `_can_write`
+  while ack stays `can_triage`; the SPA shows Assign as the owner's primary action and keeps
+  Acknowledge as an outline (an owner handling it alone shouldn't assign itself). A worker sees
+  only Acknowledge.
+  (2) **Assigning is an ASK, and it does NOT stamp the ack** (changed 2026-07-26 — it did at
+  first). Naming somebody is the owner asking; it is not that person answering, and stamping
+  the ack made an untouched outage render "In progress" the instant it was handed over — the
+  one claim a NOC screen must not make falsely. Status stays DOWN (its own `assigned` state,
+  destructive-toned, "Down · awaiting response") until an assignee ACCEPTS. An explicit ack
+  still counts, so assigning on top of one leaves it `in_progress` under that person's name.
+  Escalation is untouched either way.
+  (3) **It pages EXACTLY the assignees** (`store.named_whatsapp`), NEVER
+  `org_alert_recipients` — the point of naming two people is that those two hear about it, and
+  "assigned to you" sent to the whole team means nothing. The reply carries `notified`, because
+  an assignee with no `whatsapp_number` has been given a job nobody told them about; the send is
+  best-effort as always and can't undo a committed assignment.
+  **An empty list is REFUSED** (422): there is no "assigned to nobody" state to interpret, so
+  re-assigning replaces the set. Usernames are re-resolved against the org's ACTIVE accounts —
+  the body's spelling is never trusted. Tests: `integration/test_central_outage_assign`.
+- **Accepting is the other half** (`outages.accepted_by/_at`, `POST /api/outages/accept`,
+  2026-07-26) — the assignee saying yes, and the ONLY thing that moves an assigned outage to
+  `in_progress`. `can_triage`, not `_can_write` (a worker must be able to answer a job it was
+  given), on the whitelist as `/api/outages/accept`; the real gate is the store, which refuses
+  anyone not NAMED on the outage — a yes from whoever else saw the card would make "who
+  accepted" mean nothing. Idempotent (`already`), since the dashboard button and the WhatsApp
+  button press the same thing. The first acceptance also stamps acknowledged_at/_by (COALESCE)
+  — accepting IS acknowledging, and a worker shouldn't press two buttons.
+  **`accepted_by` is a SUBSET of `assigned_to`, and both render**: one yes moves the outage but
+  the card still shows who has not replied. Re-assigning KEEPS the acceptances of anyone still
+  named (adding a second name must not re-ask somebody who already said yes) and drops the rest
+  with the job.
+  **The page carries the button**: `assign` tries an interactive [✅ I'm on it] / [📍 On map]
+  message per recipient FIRST — a worker at a pole answering from the notification is the whole
+  point — and falls back to the `wisp_alert1` template for anyone whose 24h window is shut
+  (Meta only permits free-form inside it). One message each either way; `notified` counts both.
+  `whatsapp_bot.py` handles `acc:<outage_id>` on the SAME store method, and both paths tell
+  whoever assigned it that the answer came in (free-form, template fallback — the assigner's own
+  window is usually shut, since they didn't just message us).
+  Tests: `integration/test_central_outage_assign`, `integration/test_central_whatsapp`.
 - Timestamps: poll/outage are ISO8601 `+00:00`; SQLite `datetime('now')` is space-separated
   naive. `core/analytics._parse` normalizes both — reuse it.
 - Schema: `central/store.py`'s `_SCHEMA` + `_ensure_columns` is the only schema.

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Navigate, useNavigate, useParams } from "react-router-dom"
 import {
-  Building2, Check, Copy, Dices, IndianRupee, KeyRound, MapPin, MessageCircle,
+  Building2, Check, IndianRupee, KeyRound, MapPin, MessageCircle,
   Pencil, Plus, Radio, Trash2, Users, X, type LucideIcon,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils"
 import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import { DEFAULT_MAP_REGION, MAP_REGIONS, mapRegionOf } from "@/lib/map-regions"
 import type { AccountUser, Role } from "@/lib/types"
+import { AssignmentCard } from "@/components/assignment-card"
 import { BillingCard } from "@/components/billing-card"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
@@ -31,20 +32,6 @@ import {
   Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
 } from "@/components/ui/dialog"
 
-const ROLE_TOPICS: Array<{ key: "owner" | "worker"; label: string; hint: string }> = [
-  { key: "owner", label: "Owner", hint: "Device and uplink outages" },
-  { key: "worker", label: "Worker", hint: "Fibre/ONU/port findings, the hourly re-nag and the digest" },
-]
-
-function randomTopic(role: string): string {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-  const bytes = new Uint8Array(16)
-  crypto.getRandomValues(bytes)
-  let suffix = ""
-  for (const b of bytes) suffix += alphabet[b % alphabet.length]
-  return `wisp-${role}-${suffix}`
-}
-
 function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -55,28 +42,20 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   const current = data?.orgs.find((o) => o.org_id === org)
 
   const [name, setName] = useState("")
-  const [topics, setTopics] = useState({ owner: "", worker: "" })
   const [mapRegion, setMapRegion] = useState(DEFAULT_MAP_REGION)
   const [pollInterval, setPollInterval] = useState("")
-  const [testResults, setTestResults] = useState<Record<string, string>>({})
+  const [testResult, setTestResult] = useState("")
 
   useEffect(() => {
     if (!current) return
     setName(current.name || "")
     setMapRegion(mapRegionOf(current.map_region).key)
     setPollInterval(current.poll_interval_s ? String(current.poll_interval_s) : "")
-
-    setTopics({
-      owner: current.ntfy_topic_owner || randomTopic("owner"),
-      worker: current.ntfy_topic_worker || randomTopic("worker"),
-    })
   }, [current])
 
   const save = useMutation({
     mutationFn: () => orgsApi.save({
       org_id: org, name: name.trim() || null,
-      ntfy_topic_owner: topics.owner.trim() || null,
-      ntfy_topic_worker: topics.worker.trim() || null,
       map_region: mapRegion,
       poll_interval_s: pollInterval.trim() ? Number(pollInterval) : null,
     }),
@@ -85,16 +64,16 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
   })
 
   const test = useMutation({
-    mutationFn: (role: "owner" | "worker") => orgsApi.testAlert(org, role),
-    onSuccess: (r, role) => setTestResults((t) => ({ ...t, [role]: r.ok ? "✓ sent" : `Failed: ${r.detail || ""}` })),
-    onError: (e, role) => setTestResults((t) => ({ ...t, [role]: e instanceof ApiError ? e.message : "Failed" })),
+    mutationFn: () => orgsApi.testAlert(org),
+    onSuccess: (r) => setTestResult(r.ok ? "✓ sent" : `Failed: ${r.detail || ""}`),
+    onError: (e) => setTestResult(e instanceof ApiError ? e.message : "Failed"),
   })
 
   if (isLoading) return <Skeleton className="h-48 w-full" />
 
   return (
     <Card>
-      <CardHeader><CardTitle className="text-sm">Organization &amp; alert routing</CardTitle></CardHeader>
+      <CardHeader><CardTitle className="text-sm">Organization &amp; alerts</CardTitle></CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="flex flex-col gap-1.5">
           <Label>Org name</Label>
@@ -136,46 +115,26 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
             faster detection but more ICMP load on your gear.
           </p>
         </div>
-        {ROLE_TOPICS.map(({ key, label, hint }) => (
-          <div key={key} className="flex flex-col gap-1.5">
-            <Label>{label} ntfy topic</Label>
-            <p className="text-xs text-muted-foreground">{hint}</p>
-            <div className="flex flex-wrap items-center gap-2">
-              <Input
-                readOnly
-                className="max-w-sm font-mono text-xs"
-                value={topics[key]}
-                onFocus={(e) => e.target.select()}
-              />
-              <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" title="Copy topic"
-                onClick={() => { navigator.clipboard.writeText(topics[key]); toast.success("Topic copied") }}>
-                <Copy className="size-3.5" />
+        <div className="flex flex-col gap-1.5">
+          <Label className="flex items-center gap-2">
+            <MessageCircle className="size-3.5 text-muted-foreground" /> Alerts (WhatsApp)
+          </Label>
+          <p className="max-w-lg text-xs text-muted-foreground">
+            Alerts go out over WhatsApp. Every owner and worker account with a number gets
+            every alert (device, port and probe up/down) at once, plus the platform admin
+            number &mdash; no per-role routing. Set each person's number under{" "}
+            <span className="font-medium">Users</span> below; the admin number and the Meta
+            API config live in <span className="font-medium">Platform</span> settings.
+          </p>
+          {canWrite && (
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" disabled={test.isPending} onClick={() => test.mutate()}>
+                Send test alert
               </Button>
-              {canWrite && (
-                <Button variant="outline" size="sm" title="Generate a new random topic"
-                  onClick={() => setTopics({ ...topics, [key]: randomTopic(key) })}>
-                  <Dices className="size-3.5" /> Randomize
-                </Button>
-              )}
-              {canWrite && (
-                <Button variant="outline" size="sm" disabled={test.isPending} onClick={() => test.mutate(key)}>
-                  Send test
-                </Button>
-              )}
-              {testResults[key] && <span className="text-xs text-muted-foreground">{testResults[key]}</span>}
+              {testResult && <span className="text-xs text-muted-foreground">{testResult}</span>}
             </div>
-          </div>
-        ))}
-        <p className="max-w-lg text-xs text-muted-foreground">
-          Topics are generated, not chosen. Anyone who knows a topic name can subscribe to it
-          on ntfy, so a random one is the only safe kind. Randomize, save, then re-subscribe
-          the team's phones to the new topic.
-        </p>
-        <p className="max-w-lg text-xs text-muted-foreground">
-          If WhatsApp alerts are enabled (a platform setting), each role is also paged on the
-          WhatsApp numbers of its accounts &mdash; owners on owner accounts, workers on worker
-          accounts. Set those under <span className="font-medium">Accounts</span>.
-        </p>
+          )}
+        </div>
         {canWrite && (
           <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
             Save
@@ -535,7 +494,7 @@ const SECTIONS: Array<{
     visible: (c) => !!c.org,
     panels: [
       {
-        id: "org-routing", label: "Organization & alert routing",
+        id: "org-routing", label: "Organization & alerts",
         render: (c) => <OrgSettingsCard org={c.org!} canWrite={c.canWrite} />,
       },
       { id: "regions", label: "Regions", render: (c) => <RegionsCard org={c.org!} canWrite={c.canWrite} /> },
@@ -582,6 +541,11 @@ const SECTIONS: Array<{
     visible: (c) => !!c.org && c.canWrite,
     panels: [
       { id: "users", label: "Login accounts", render: (c) => <UsersCard org={c.org!} /> },
+      // Which devices each field account is PAGED for. It belongs beside the
+      // accounts rather than under Monitoring because the thing being configured
+      // is a person's beat, not a probe setting — and since the roles collapsed,
+      // "who works here" IS "who has a login".
+      { id: "assignments", label: "Device responsibility", render: (c) => <AssignmentCard org={c.org!} /> },
     ],
   },
 ]

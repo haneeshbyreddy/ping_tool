@@ -9,10 +9,11 @@ import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
 import { TopologyPage } from "@/routes/topology-page"
-import { ProbesPage } from "@/routes/probes-page"
 import { MapPage } from "@/routes/map-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { AccountPage } from "@/routes/account-page"
+import { IssuesPage } from "@/routes/issues-page"
+import { SurveyPage } from "@/routes/survey-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
 import { OverviewPage } from "@/routes/overview-page"
@@ -43,12 +44,9 @@ function App() {
                   <Route element={<AppShell />}>
                     <Route index element={<HomePage />} />
                     <Route path="topology" element={<TopologyPage />} />
-                    <Route path="probes" element={<ProbesPage />} />
                     <Route path="map" element={<MapPage />} />
-                    {/* Probes had their own /nodes page long ago, then rode the
-                        Network page; now they have their own /probes route. Keep
-                        the oldest bookmark working. */}
-                    <Route path="nodes" element={<Navigate to="/probes" replace />} />
+                    {/* Probes merged into the Network page — keep old bookmarks working */}
+                    <Route path="nodes" element={<Navigate to="/topology" replace />} />
                     <Route path="settings" element={<SettingsPage />} />
                     {/* Sections are addressable so the account menu, the billing
                         banner and a bookmark can all land on the right one. */}
@@ -56,6 +54,12 @@ function App() {
                     {/* Personal settings — reachable by every role (workers too),
                         so it lives outside the owner-only Settings page. */}
                     <Route path="account" element={<AccountPage />} />
+                    {/* The issue plane: what is wrong, one row per
+                        problem. Home tiles link here with ?kind=. */}
+                    <Route path="issues" element={<IssuesPage />} />
+                    {/* Field capture: a phone at a pole. Reachable by workers —
+                        the only inventory writes that role has. */}
+                    <Route path="survey" element={<SurveyPage />} />
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />
                     <Route path="overview" element={<OverviewPage />} />

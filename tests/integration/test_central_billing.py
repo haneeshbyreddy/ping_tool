@@ -245,43 +245,43 @@ class PaidPingAndQrTest(CentralBillingHttpTest):
         _, body, _ = self._req("GET", "/api/billing", cookie=cookie)
         self.assertEqual(body["qr_image"], "data:image/png;base64,QRQR")
 
-    def test_ive_paid_prefers_the_dedicated_topic_even_while_locked(self):
+    def test_ive_paid_pings_the_admin_number_even_while_locked(self):
         # pro with no month paid ⇒ LOCKED: proves /api/billing/paid is exempt
         self.store.set_org_plan("ispA", "pro")
-        self.store.set_setting("billing_paid_topic", "pay-topic")
+        self.store.set_setting("whatsapp_admin_number", "919999999999")
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/billing/paid", {}, cookie=cookie)
         self.assertEqual(status, 200)
         self.assertTrue(body["notified"])
         self.assertEqual(len(self.notifier.sent), 1)
         page = self.notifier.sent[0]
-        self.assertEqual(page["recipient"], "pay-topic")
+        self.assertEqual(page["whatsapp"], ["919999999999"])
         self.assertIn("Acme", page["title"])
 
-    def test_ive_paid_falls_back_to_the_central_channel(self):
-        # no dedicated topic ⇒ the shared central/admin channel gets it
+    def test_ive_paid_without_admin_number_is_not_notified(self):
+        # no admin number ⇒ nothing to notify, but the tap still succeeds
         self.store.set_org_plan("ispA", "pro")
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/billing/paid", {}, cookie=cookie)
         self.assertEqual(status, 200)
-        self.assertTrue(body["notified"])
-        self.assertEqual(self.notifier.sent[0]["recipient"],
-                         self.cfg.central_ntfy_topic)
+        self.assertFalse(body["notified"])
+        self.assertEqual(self.notifier.sent, [])
 
-    def test_admin_settings_qr_and_topic_roundtrip(self):
+    def test_admin_settings_qr_and_whatsapp_roundtrip(self):
         root = self._login("root", "rootpassword")
         status, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
         self.assertEqual(status, 200)
         self.assertIn("billing_qr_image", body)
-        self.assertIn("billing_paid_topic", body)
+        self.assertIn("whatsapp", body)
         self.assertNotIn("upigateway_key_set", body)  # the gateway key is gone
         status, _, _ = self._req("POST", "/api/admin/settings",
                                  {"billing_qr_image": "data:image/png;base64,AAo",
-                                  "billing_paid_topic": "pay-topic"}, cookie=root)
+                                  "whatsapp": {"admin_number": "919999999999"}},
+                                 cookie=root)
         self.assertEqual(status, 200)
         _, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
         self.assertEqual(body["billing_qr_image"], "data:image/png;base64,AAo")
-        self.assertEqual(body["billing_paid_topic"], "pay-topic")
+        self.assertEqual(body["whatsapp"]["admin_number"], "919999999999")
         # a non-image paste is refused (no javascript: URI into an <img src>)
         self.assertEqual(self._req("POST", "/api/admin/settings",
                                    {"billing_qr_image": "javascript:alert(1)"},

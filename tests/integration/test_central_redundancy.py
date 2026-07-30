@@ -62,27 +62,25 @@ class RedundancySweepTest(unittest.TestCase):
     def _clear_queue(self):
         self.store.mark_digests_sent(ORG, TS)
 
-    def test_enter_pages_operator_once_and_writes_badge(self):
+    def test_enter_writes_badge_off(self):
+        # On-backup is OFF for now (allowlist): the badge is written, but nothing
+        # pushes or queues to the dormant digest.
         self._sweep({self.child: True}, {self.child: UP})
-        self.assertEqual(self.notifier.sent, [])   # digest-tier, no live push
-        q = self._queued()
-        self.assertEqual(len(q), 1)
-        self.assertEqual(q[0]["kind"], "ON_BACKUP")
-        self.assertIn("On backup", q[0]["title"])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         row = self._row()
         self.assertEqual(row["on_backup"], 1)
         self.assertEqual(row["primary_down_since"], TS)
         self.assertEqual(self._counts(), (0, 0))
         self._sweep({self.child: True}, {self.child: UP})
-        self.assertEqual(len(self._queued()), 1)
+        self.assertEqual(self._row()["on_backup"], 1)
 
-    def test_leave_sends_one_recovered_notice(self):
+    def test_leave_clears_badge(self):
         self._sweep({self.child: True}, {self.child: UP})
         self._clear_queue()
         self._sweep({self.child: False}, {self.child: UP})
-        q = self._queued()
-        self.assertEqual(len(q), 1)
-        self.assertIn("Primary restored", q[0]["title"])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self._queued(), [])
         self.assertEqual(self._row()["on_backup"], 0)
 
     def test_node_down_clears_badge_silently(self):

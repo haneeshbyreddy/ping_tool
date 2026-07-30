@@ -12,6 +12,21 @@ from wisp.central.store_util import _now_iso
 from wisp.core.analytics import _parse
 
 
+def _assignees(raw) -> list[str]:
+    """Decode `outages.assigned_to` or `outages.accepted_by`. Anything that
+    isn't a JSON list of non-empty strings reads as "nobody" — a broken row must
+    not turn into a fabricated name on a triage card."""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(val, list):
+        return []
+    return [str(v) for v in val if str(v or "").strip()]
+
+
 class OutageStoreMixin:
 
     def device_states(self, org_id: str) -> dict[int, dict]:
@@ -68,6 +83,20 @@ class OutageStoreMixin:
                 " AND resolved_at IS NULL ORDER BY id DESC LIMIT 1",
                 (org_id, device_id)).fetchone()
         return row["id"] if row else None
+
+
+    def recent_device_outages(self, org_id: str, device_id: int,
+                              limit: int = 5) -> list[dict]:
+        """The last few outages for one device, newest first — the WhatsApp bot's
+        [Recent] card ("has this box been flapping?"). Org-scoped like every read.
+        Open outages (resolved_at NULL) sort first because id is monotonic."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT started_at, resolved_at, final_state, root_cause"
+                " FROM outages WHERE org_id=? AND device_id=?"
+                " ORDER BY id DESC LIMIT ?",
+                (org_id, device_id, max(1, min(limit, 20)))).fetchall()
+        return [dict(r) for r in rows]
 
 
     def open_outage_if_absent(self, org_id: str, device_id: int, ts: str,
@@ -212,6 +241,101 @@ class OutageStoreMixin:
             return cur.rowcount > 0
 
 
+    def assign_outage(self, org_id: str, outage_id: int, usernames: list[str],
+                      by: str) -> bool:
+        """Hand an OPEN outage to one or more field accounts.
+
+        Assignment does NOT stamp the ack (it did until 2026-07-26). Naming
+        somebody is the owner ASKING; it is not that person answering, and
+        stamping the ack made an untouched outage render "In progress" the
+        instant it was handed over — the one state a NOC screen must not claim
+        falsely. It stays DOWN until an assignee accepts (`accept_outage`), which
+        is what stamps acknowledged_at/_by. Escalation is unaffected either way —
+        only recovery stops the ladder (see CLAUDE.md).
+
+        Re-assigning REPLACES the set (callers refuse an empty list, so there is
+        no "assigned to nobody" state to interpret) and KEEPS the acceptances of
+        anyone still named: dropping them would ask a worker who already said yes
+        to say it again because a second name was added beside theirs. Whoever
+        was removed loses their acceptance with the job."""
+        if not usernames:
+            return False
+        with self._write_lock, self._connect() as conn:
+            now = _now_iso()
+            row = conn.execute(
+                "SELECT accepted_by FROM outages WHERE id=? AND org_id=?",
+                (outage_id, org_id)).fetchone()
+            kept = [u for u in _assignees(row["accepted_by"] if row else None)
+                    if u in set(usernames)]
+            cur = conn.execute(
+                "UPDATE outages SET assigned_to=?, assigned_at=?, assigned_by=?,"
+                " accepted_by=?, accepted_at=CASE WHEN ?='[]' THEN NULL"
+                "                                 ELSE accepted_at END"
+                " WHERE id=? AND org_id=? AND resolved_at IS NULL",
+                (json.dumps(list(usernames)), now, by,
+                 json.dumps(kept), json.dumps(kept), outage_id, org_id))
+            if cur.rowcount > 0:
+                row = conn.execute(
+                    "SELECT o.device_id, o.final_state, d.name, d.region FROM outages o"
+                    " JOIN org_devices d ON d.id = o.device_id WHERE o.id=?",
+                    (outage_id,)).fetchone()
+                if row:
+                    self._insert_org_event(conn, org_id, row["device_id"], row["name"],
+                        row["region"], "OUTAGE_ASSIGNED", row["final_state"], now,
+                        {"to": list(usernames), "by": by})
+            conn.commit()
+            return cur.rowcount > 0
+
+
+    def accept_outage(self, org_id: str, outage_id: int, username: str) -> str:
+        """An assignee answering yes — "I'm on it".
+
+        The half of assignment that turns an ASK into a commitment, and the only
+        thing that may move an assigned outage to `in_progress`: until somebody
+        accepts, the dashboard says the device is down and waiting on a reply.
+        The FIRST acceptance also stamps acknowledged_at/_by (COALESCE, so an
+        earlier explicit ack keeps its own name and clock) — accepting is
+        acknowledging, and a worker shouldn't have to press two buttons.
+
+        Only somebody actually NAMED on the outage can accept: accepting is
+        answering a question that was put to you, and a stray yes from whoever
+        else happened to see the card is not a fact about who is going out.
+        Idempotent — a second yes (the app and the WhatsApp button are two ways to
+        press the same thing) is `already`, never an error.
+
+        Returns one of: ok | already | not_assigned | closed | missing."""
+        who = str(username or "").strip()
+        if not who:
+            return "not_assigned"
+        with self._write_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT o.assigned_to, o.accepted_by, o.resolved_at, o.device_id,"
+                " o.final_state, d.name, d.region FROM outages o"
+                " JOIN org_devices d ON d.id = o.device_id"
+                " WHERE o.id=? AND o.org_id=?", (outage_id, org_id)).fetchone()
+            if row is None:
+                return "missing"
+            if row["resolved_at"] is not None:
+                return "closed"
+            if who not in _assignees(row["assigned_to"]):
+                return "not_assigned"
+            accepted = _assignees(row["accepted_by"])
+            if who in accepted:
+                return "already"
+            accepted.append(who)
+            now = _now_iso()
+            conn.execute(
+                "UPDATE outages SET accepted_by=?, accepted_at=COALESCE(accepted_at, ?),"
+                " acknowledged_at=COALESCE(acknowledged_at, ?),"
+                " acknowledged_by=COALESCE(acknowledged_by, ?) WHERE id=? AND org_id=?",
+                (json.dumps(accepted), now, now, who, outage_id, org_id))
+            self._insert_org_event(conn, org_id, row["device_id"], row["name"],
+                row["region"], "OUTAGE_ACCEPTED", row["final_state"], now,
+                {"by": who, "accepted_by": accepted})
+            conn.commit()
+            return "ok"
+
+
     def outage_org(self, outage_id: int) -> str | None:
         with self._connect() as conn:
             row = conn.execute("SELECT org_id FROM outages WHERE id=?",
@@ -233,10 +357,24 @@ class OutageStoreMixin:
         out = []
         for r in rows:
             d = dict(r)
-            if d["resolved_at"] is None:
-                d["status"] = "in_progress" if d["acknowledged_at"] else "unassigned"
-            else:
+            # stored as JSON lists; the wire always carries real lists, so no
+            # consumer has to know either column was ever NULL (or hand-edited)
+            d["assigned_to"] = _assignees(d.get("assigned_to"))
+            d["accepted_by"] = _assignees(d.get("accepted_by"))
+            if d["resolved_at"] is not None:
                 d["status"] = "pending_postmortem"
+            elif d["acknowledged_at"]:
+                # somebody has said they are on it — either by accepting the
+                # assignment or by acknowledging outright
+                d["status"] = "in_progress"
+            elif d["assigned_to"]:
+                # Named but unanswered: the device is still down and nobody has
+                # confirmed they are going. Deliberately its own state rather
+                # than `in_progress` — an owner sending a message is not a human
+                # taking the job on.
+                d["status"] = "assigned"
+            else:
+                d["status"] = "unassigned"
             out.append(d)
         return out
 

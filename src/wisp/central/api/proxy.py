@@ -334,7 +334,11 @@ def session_create(h, user, body) -> None:
     sess = h.proxy.open_session(
         org_id=org, device_id=device_id, node_id=node, device_ip=ip,
         device_port=port, scheme=scheme, created_by=user["id"],
-        ttl_s=h.cfg.proxy_session_ttl_s)
+        ttl_s=h.cfg.proxy_session_ttl_s,
+        cache=proxy_mod.AssetCache(
+            max_entries=h.cfg.proxy_cache_max_entries,
+            max_bytes=h.cfg.proxy_cache_max_bytes,
+            ttl_s=h.cfg.proxy_cache_ttl_s))
     sess.db_synced_at = sess.created_at
     sess.injected_auth = _resolve_injected_auth(h, org, device_id)
     sess.autofill = _resolve_autofill(h, org, device_id)
@@ -488,15 +492,29 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
         else:
             h._reply(404, {"error": "not found"})
         return
-    if h.proxy.inflight(sid) >= MAX_INFLIGHT_PER_SESSION:
-        h._reply(429, {"error": "too many concurrent requests on this session"})
-        return
-    # activity slides the expiry window; the DB row follows at most every ~20s
+    path = "/" + rest + (("?" + query) if query else "")
+    # activity slides the expiry window; the DB row follows at most every ~20s.
+    # A cache hit counts as activity — the tech is still browsing.
     new_exp = h.proxy.extend_session(sess, h.cfg.proxy_session_ttl_s)
     if time.time() - sess.db_synced_at >= _DB_TOUCH_EVERY_S:
         sess.db_synced_at = time.time()
         h.store.touch_proxy_session(sid, _iso(new_exp))
-    path = "/" + rest + (("?" + query) if query else "")
+    # Served from this session's memo, no tunnel round trip at all. Checked
+    # BEFORE the in-flight ceiling on purpose: a cached asset costs the tunnel
+    # nothing, so a page's whole script set must never 429 against a limit it
+    # is not consuming.
+    cached = None
+    use_cache = h.cfg.proxy_cache_enabled and proxy_mod.cacheable_path(method, path)
+    ckey = proxy_mod.cache_key(path) if use_cache else path
+    if use_cache:
+        cached = sess.cache.get(ckey)
+    if cached is not None:
+        _audit(h, sid, sess, user, method, path, cached[0])
+        _finish(h, sid, sess, cached[0], cached[1], cached[2])
+        return
+    if h.proxy.inflight(sid) >= MAX_INFLIGHT_PER_SESSION:
+        h._reply(429, {"error": "too many concurrent requests on this session"})
+        return
     response = h.proxy.submit(
         sess, method=method, path=path, headers=_forward_headers(h, sid, sess),
         body=body, timeout=h.cfg.proxy_request_timeout_s)
@@ -506,27 +524,82 @@ def browser_request(h, method: str, sid: str, rest: str, query: str,
         audit_status = 502
     else:
         audit_status = int(response.get("status", 502))
-    try:
-        h.store.record_proxy_audit(sid, sess.org_id, sess.device_id, user["id"],
-                                   method, path, audit_status)
-    except Exception:  # the reply still goes out — audit must not eat it
-        log.exception("proxy audit write failed for session %s", sid[:8])
+    _audit(h, sid, sess, user, method, path, audit_status)
     if response is None:
+        # The tunnel gave up. Logged because a 504 body reaches one browser and
+        # nothing else — the same blindness the 502 below had until 2026-07-29.
+        log.warning("proxy %s: %s %s timed out after %.0fs (device=%d %s:%d)",
+                    sid[:8], method, path, h.cfg.proxy_request_timeout_s,
+                    sess.device_id, sess.device_ip, sess.device_port)
         h._reply(504, {"error": "device did not respond in time"})
         return
     if response.get("error"):
+        # The edge writes one human sentence per failure mode
+        # (webproxy._friendly_fetch_error) and it used to go ONLY into this 502
+        # body — so a fleet running 4-5% fetch failures had no record of why,
+        # and the next session diagnosing slowness could not tell a refused
+        # connection from a TLS mismatch from a dead box. It costs one line.
+        log.warning("proxy %s: %s %s failed on device=%d (%s://%s:%d): %s",
+                    sid[:8], method, path, sess.device_id, sess.scheme,
+                    sess.device_ip, sess.device_port, response["error"])
+        narrowed = h.proxy.note_failure(sess.org_id, sess.device_id,
+                                        response["error"])
+        if narrowed is not None:
+            log.info("proxy: %s:%d is dropping connections — narrowing device=%d "
+                     "to %d concurrent request(s)", sess.device_ip,
+                     sess.device_port, sess.device_id, narrowed)
         h._reply(502, {"error": f"edge fetch failed: {response['error']}"})
         return
+    status = int(response.get("status", 502))
     raw = base64.b64decode(response.get("body_b64") or "")
-    autofill = getattr(sess, "autofill", None)
     pairs = [(k, v) for k, v in _norm_header_pairs(response.get("headers"))
-             if k.lower() not in _HOP_BY_HOP
-             # a device CSP would block our inline autofill bootstrap (and its
-             # same-origin creds fetch); drop it only when autofill is armed
-             and not (autofill and k.lower() in _CSP_HEADERS)]
+             if k.lower() not in _HOP_BY_HOP]
+    # Store the DEVICE's raw reply, before any rewriting or injection, so a hit
+    # replays through the identical pipeline below and is byte-identical to a
+    # miss. The cache stands in for the device and for nothing else.
+    if use_cache:
+        refusal = proxy_mod.cache_refusal(status, pairs)
+        if refusal is None:
+            sess.cache.put(ckey, status, pairs, raw)
+        else:
+            _log_cache_refusal(sess, path, refusal)
+    _finish(h, sid, sess, status, pairs, raw)
+
+
+def _log_cache_refusal(sess, path: str, reason: str) -> None:
+    """Say ONCE per session why a cacheable-looking asset wasn't kept.
+
+    An empty cache and a working one look identical from the outside — the only
+    symptom is that the tunnel stayed slow — so the reason has to be reachable
+    without attaching a debugger to production. Deduped per (session, reason)
+    because a device that stamps one header on everything would otherwise write
+    a line per asset, which is how a useful log becomes an ignored one."""
+    if reason in sess.cache_refusals:
+        return
+    sess.cache_refusals.add(reason)
+    log.info("proxy %s: not caching device=%d assets — %s (first seen on %s)",
+             sess.sid[:8], sess.device_id, reason, path)
+
+
+def _audit(h, sid: str, sess, user, method: str, path: str, status: int) -> None:
+    try:
+        h.store.record_proxy_audit(sid, sess.org_id, sess.device_id, user["id"],
+                                   method, path, status)
+    except Exception:  # the reply still goes out — audit must not eat it
+        log.exception("proxy audit write failed for session %s", sid[:8])
+
+
+def _finish(h, sid: str, sess, status: int, pairs: list, raw: bytes) -> None:
+    """Rewrite a device reply into the session prefix and send it. The ONE exit
+    for both a tunnel fetch and a cache hit — they must not be able to drift."""
+    autofill = getattr(sess, "autofill", None)
+    if autofill:
+        # a device CSP would block our inline autofill bootstrap (and its
+        # same-origin creds fetch); drop it only when autofill is armed
+        pairs = [(k, v) for k, v in pairs if k.lower() not in _CSP_HEADERS]
     pairs = proxy_mod.rewrite_headers(sid, sess, pairs)
     ctype = next((v for k, v in pairs if k.lower() == "content-type"), "")
     raw = proxy_mod.rewrite_body(sid, ctype, raw)
     if autofill:  # form-login device: inject the credential-free autofill bootstrap
         raw = proxy_mod.inject_autofill(ctype, raw, sid)
-    h._raw_reply(response.get("status", 502), pairs, raw)
+    h._raw_reply(status, pairs, raw)

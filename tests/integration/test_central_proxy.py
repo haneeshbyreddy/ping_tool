@@ -34,6 +34,20 @@ class _StubDevice(BaseHTTPRequestHandler):
     """Stands in for a switch/OLT web UI: echoes method + path so the test can
     prove the request reached it faithfully."""
 
+    # How many times each path has actually been fetched. The asset-cache tests
+    # assert on this rather than on the reply: "the browser got the bytes" is
+    # true either way, and the whole point is that the DEVICE was not asked.
+    hits: dict = {}
+
+    def _serve(self, body: bytes, ctype: str, extra=()):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _emit(self, note: str):
         body = f"STUB-DEVICE {self.command} {self.path} {note}".encode()
         self.send_response(200)
@@ -43,6 +57,33 @@ class _StubDevice(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        base = self.path.split("?")[0]
+        _StubDevice.hits[base] = _StubDevice.hits.get(base, 0) + 1
+        if base == "/app.js":
+            # the ordinary case: a static script with no cache headers at all,
+            # which is exactly what the C-Data firmware serves
+            self._serve(b"var wisp=1;/* /app.js */", "application/javascript")
+            return
+        if base == "/session.js":
+            self._serve(b"var s=1;", "application/javascript",
+                        [("Set-Cookie", "DEVSID=abc; Path=/")])
+            return
+        if base == "/nostore.js":
+            self._serve(b"var n=1;", "application/javascript",
+                        [("Cache-Control", "no-store")])
+            return
+        if base == "/vary.js":
+            self._serve(b"var v=1;", "application/javascript",
+                        [("Vary", "Cookie")])
+            return
+        if base == "/missing.js":
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if base == "/linked.css":
+            self._serve(b'@import url(/deep/other.css);', "text/css")
+            return
         if self.path == "/headers":
             # echo the request headers the login-flow fix must forward
             lines = [f"{k}: {self.headers.get(k)}"
@@ -326,6 +367,148 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(rows[0]["path"], "/status?vlan=7")
         self.assertEqual(rows[0]["status"], 200)
         self.assertEqual(rows[0]["device_id"], self.device_id)
+
+    # -- per-session static-asset cache (2026-07-29) ----------------------------
+    #
+    # 44% of every request this tunnel had ever carried was a re-fetch of an
+    # unchanging asset inside ONE session, and on a weak embedded HTTPS stack
+    # each of those cost a full TCP+TLS handshake — 1.00s per asset, a
+    # 7-second page. These tests pin what may and may not be remembered.
+
+    def _cached_get(self, sid, path):
+        """A browser request with NO edge serving it — so a 200 here proves the
+        answer came from central's memo and the device was never asked."""
+        out = {}
+        self._browser("GET", f"/api/proxy/{sid}{path}", out)
+        return out
+
+    def test_static_asset_is_served_from_the_session_cache(self):
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        served, first = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/app.js",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(first["status"], 200)
+        second = self._cached_get(sess["sid"], "/app.js")
+        self.assertEqual(second["status"], 200)
+        # byte-identical to the miss: a hit replays the SAME rewriting path
+        self.assertEqual(second["body"], first["body"])
+        self.assertEqual(_StubDevice.hits["/app.js"], 1,
+                         "the device was fetched twice — the cache did nothing")
+
+    def test_a_cache_hit_is_still_audited(self):
+        """The audit answers 'who opened what'. Dropping cached requests would
+        make it stop reflecting what a human actually browsed."""
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        self._cached_get(sess["sid"], "/app.js")
+        rows = [r for r in self.store.list_proxy_audit("ispA")
+                if r["path"] == "/app.js"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["status"] for r in rows}, {200})
+
+    def test_a_dynamic_page_is_never_cached(self):
+        """This vendor's DYNAMIC pages are .html (/action/onuauthinfo.html) —
+        the exact class a looser rule would start serving stale."""
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/page.html",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        served, again = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/page.html",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served, "second .html was answered without the device")
+        self.assertEqual(again["status"], 200)
+        self.assertEqual(_StubDevice.hits["/page.html"], 2)
+
+    def test_a_reply_carrying_session_state_is_never_cached(self):
+        """A static extension is a hint about the URL, never a promise about
+        the response: Set-Cookie, no-store and Vary each disqualify one."""
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        for path in ("/session.js", "/nostore.js", "/vary.js"):
+            with self.subTest(path=path):
+                self._round_trip("GET", f"/api/proxy/{sess['sid']}{path}",
+                                 devices=[{"ip_address": "127.0.0.1"}])
+                served, _ = self._round_trip(
+                    "GET", f"/api/proxy/{sess['sid']}{path}",
+                    devices=[{"ip_address": "127.0.0.1"}])
+                self.assertTrue(served, f"{path} was cached")
+                self.assertEqual(_StubDevice.hits[path], 2)
+
+    def test_a_failed_fetch_is_never_cached(self):
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/missing.js",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        served, again = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/missing.js",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(again["status"], 404)
+        self.assertEqual(_StubDevice.hits["/missing.js"], 2)
+
+    def test_the_firmwares_own_cache_busting_still_reaches_the_device(self):
+        """`/js/misc.js?rand=52258` carries a fresh number per page load. The
+        query is part of the key, so the bust keeps working — second-guessing a
+        deliberate one is how a cache starts serving a page nobody can explain."""
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js?rand=1",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        served, _ = self._round_trip(
+            "GET", f"/api/proxy/{sess['sid']}/app.js?rand=2",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(_StubDevice.hits["/app.js"], 2)
+
+    def test_jquerys_own_cache_buster_does_not_defeat_the_cache(self):
+        """`_=<ts>` is appended by `$.ajax({cache:false})` to everything — the
+        client library talking about the browser cache, not the vendor talking
+        about the resource. 20% of this tunnel's traffic is a static .properties
+        table wearing one, so keying it literally is a permanent miss."""
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js?_=111",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        out = self._cached_get(sess["sid"], "/app.js?_=222")
+        self.assertEqual(out["status"], 200)
+        self.assertEqual(_StubDevice.hits["/app.js"], 1)
+
+    def test_the_cache_does_not_survive_into_a_new_session(self):
+        """It lives ON the session, so it dies with the credential that opened
+        it — there is no cross-session (let alone cross-org) key to get wrong."""
+        _StubDevice.hits.clear()
+        _, first = self._open_session()
+        self._round_trip("GET", f"/api/proxy/{first['sid']}/app.js",
+                         devices=[{"ip_address": "127.0.0.1"}])
+        # the edge has polled by now, so the second open runs a real preflight
+        tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
+                             devices_provider=lambda: [{"ip_address": "127.0.0.1"}])
+        _, second = self._open_with_tunnel(tunnel)
+        self.assertNotEqual(first["sid"], second["sid"])
+        served, _ = self._round_trip(
+            "GET", f"/api/proxy/{second['sid']}/app.js",
+            devices=[{"ip_address": "127.0.0.1"}])
+        self.assertTrue(served)
+        self.assertEqual(_StubDevice.hits["/app.js"], 2)
+
+    def test_a_cached_body_is_still_rewritten_into_the_session_prefix(self):
+        """The cache stores the DEVICE's raw reply, so a hit runs the identical
+        rewrite pipeline. Caching post-rewrite bytes would work today and break
+        the moment anything downstream became session-dependent."""
+        _StubDevice.hits.clear()
+        _, sess = self._open_session()
+        _, first = self._round_trip("GET", f"/api/proxy/{sess['sid']}/linked.css",
+                                    devices=[{"ip_address": "127.0.0.1"}])
+        prefix = f"/api/proxy/{sess['sid']}/deep/other.css".encode()
+        self.assertIn(prefix, first["body"])
+        second = self._cached_get(sess["sid"], "/linked.css")
+        self.assertEqual(second["body"], first["body"])
+        self.assertIn(prefix, second["body"])
+        self.assertEqual(_StubDevice.hits["/linked.css"], 1)
 
     def test_edge_refusal_audits_as_502(self):
         _, sess = self._open_session()

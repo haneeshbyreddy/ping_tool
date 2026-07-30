@@ -1,10 +1,9 @@
 import { List, LayoutGrid } from "lucide-react"
 import { cn } from "@/lib/utils"
 
-// One shared list/grid preference across the Network and Probes pages, persisted
-// org-independently — it's a UI taste, not per-network state. Probes moved to
-// their own /probes route, so the shared key is what keeps the toggle in sync
-// between the two pages that were once one.
+// The Network page's list/grid preference, persisted org-independently — it's a
+// UI taste, not per-network state. Its own small module so the toggle and its
+// storage key live in one place rather than buried in the 1,400-line page.
 export type ViewMode = "list" | "grid"
 const VIEW_KEY = "wisp:network:view"
 

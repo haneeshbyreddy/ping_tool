@@ -16,12 +16,19 @@ digest), kept because re-enabling a kind is a one-line edit to `_ACTIVE_KINDS`.
 
 State rows are still written by the shells regardless of allowlist/gate, so the
 dashboard stays fully live; this module only governs the *notification*.
+
+WHO an active kind reaches is a second, independent narrowing: a device-scoped
+alert goes to owners plus the field accounts responsible for that device
+(``central/assignment.py``), while an unassigned device — and any kind with no
+``device_id`` — still reaches the whole org audience. Allowlist first, then
+audience: a kind that is off pages nobody regardless of assignment.
 """
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
 
+from wisp.central.assignment import PagingAudience
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
 from wisp.egress.notifiers import NotifyResult, WhatsAppFacts
@@ -92,11 +99,19 @@ class AlertRouter:
     """One choke point replacing the `send + status + log_alert` trio every
     paging shell used to run inline. Constructed per sweep (cheap wrapper)."""
 
-    def __init__(self, store, org_id: str, notifier, cfg: Config = CONFIG) -> None:
+    def __init__(self, store, org_id: str, notifier, cfg: Config = CONFIG, *,
+                 audience=None) -> None:
         self.store = store
         self.org_id = org_id
         self.notifier = notifier
         self.cfg = cfg
+        # Resolves who is responsible for a device (central/assignment.py). Built
+        # here when a shell doesn't pass one so EVERY router narrows by
+        # assignment, including a shell added later — the same "a new route is
+        # gated by default" instinct as _WORKER_ROUTES. A caller sharing its own
+        # instance (dispatch does) just saves the tree read.
+        self.audience = audience if audience is not None else PagingAudience(
+            store, org_id)
 
     def emit(self, kind: str, *, title: str, body: str,
              priority: int, ts: str, outage_id: int | None = None,
@@ -106,36 +121,43 @@ class AlertRouter:
         payload = payload if payload is not None else kind
         channel = self.notifier.channel
 
-        # One org audience for every alert (owner + worker + admin number, no
-        # per-role routing — operator choice 2026-07-24). Resolved up front only
-        # for the recipient label; an inactive/gated kind logs it and never sends.
-        numbers = (list(self.store.org_alert_recipients(self.org_id))
-                   if whatsapp is None else list(whatsapp))
-        recipient = ",".join(numbers) or None
-
-        def _log(status: str) -> None:
+        def _log(status: str, recipient: str | None = None) -> None:
             self.store.log_alert(self.org_id, outage_id, device_id, channel,
                                  recipient, status, payload, ts, kind=kind)
 
-        # Since ntfy was removed, only allowlisted kinds page; the rest are OFF
-        # for now (the shell still wrote its state row, so the dashboard is live).
+        # Allowlist and gate BEFORE resolving an audience: since ntfy was removed
+        # only allowlisted kinds page, and the suppressed ones are most of the
+        # SNMP stream — resolving a per-device audience for each would put three
+        # extra queries on the report cycle for a page that was never going to be
+        # sent. A suppressed row logs no recipient because there wasn't one; the
+        # shell still wrote its state row, so the dashboard is live either way.
         if kind not in _ACTIVE_KINDS:
             _log("suppressed")
             return NotifyResult(False, "inactive kind")
 
-        # Gate off — the shell still wrote its state row.
         if not gate:
             _log("suppressed")
             return NotifyResult(False, "gated")
+
+        # Owners plus the workers RESPONSIBLE for this device — its assignees or
+        # ones inherited from an ancestor (central/assignment.py); an unassigned
+        # device still reaches every worker, and an org-level kind (no device_id)
+        # reaches the whole audience. No per-role routing beyond that (operator
+        # choice 2026-07-24); the superadmin ops number is in neither (2026-07-25).
+        numbers = (self.audience.for_device(device_id)
+                   if whatsapp is None else list(whatsapp))
+        recipient = ",".join(numbers) or None
 
         # DORMANT while no active kind is a digest kind; kept so re-enabling a
         # digest kind is just adding it to `_ACTIVE_KINDS`.
         if tier_for(kind) == DIGEST:
             self.store.queue_digest(self.org_id, device_id, kind, title, body, ts)
-            _log("digest")
+            _log("digest", recipient)
             return NotifyResult(True, "queued for digest")
 
-        # PUSH — needs a live recipient.
+        # PUSH — needs a live recipient. Empty here can also mean "assigned to
+        # somebody who never set a WhatsApp number"; the assign API reports that
+        # at assign time rather than this widening back to the whole team.
         if not numbers:
             _log("suppressed")
             return NotifyResult(False, "no whatsapp recipients")
@@ -144,13 +166,13 @@ class AlertRouter:
         cd = self.cfg.alert_cooldown_min if cooldown_min is None else cooldown_min
         if cd > 0 and self.store.recently_pushed(
                 self.org_id, device_id, kind, ts, cd):
-            _log("suppressed")
+            _log("suppressed", recipient)
             return NotifyResult(False, "cooldown")
 
         facts = wa_facts or WhatsAppFacts.derive(title, body, kind, ts)
         res = self.notifier.send(title, body, priority,
                                  whatsapp=numbers, facts=facts)
-        _log("sent" if res.ok else "failed")
+        _log("sent" if res.ok else "failed", recipient)
         return res
 
 

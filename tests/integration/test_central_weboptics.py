@@ -286,7 +286,7 @@ class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
     def _rows(self):
         return {r["onu_key"]: r for r in self.store.list_onu_optics(ORG, self.olt)}
 
-    def test_a_scraped_rx_sets_severity_and_pages_like_any_other(self):
+    def test_a_scraped_rx_sets_severity_like_any_other(self):
         self.store.upsert_web_optics(ORG, self.olt, [
             {"onu_key": "3.8", "serial": MAC, "rx_dbm": -29.4,
              "distance_m": 4531}], RECENT)
@@ -303,7 +303,9 @@ class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
         badge = self.store.get_olt_optics(ORG, self.olt)
         self.assertEqual(badge["crit_count"], 1)
         self.assertTrue(badge["alarm"])
-        self.assertEqual(len(self.notifier.sent), 1)
+        # a scraped reading flows through the SAME optics path as a walked one
+        # (severity + badge); optical PAGING itself is OFF for now (allowlist).
+        self.assertEqual(self.notifier.sent, [])
 
     def test_without_a_scrape_the_vendor_stays_honestly_blank(self):
         # This is the pre-existing DBC behaviour and it must survive untouched:

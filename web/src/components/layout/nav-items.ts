@@ -1,6 +1,7 @@
 import {
   LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
-  RadioTower, type LucideIcon,
+  TriangleAlert, MapPinPlus,
+  type LucideIcon,
 } from "lucide-react"
 
 /** Sidebar sections. The flat list read as one undifferentiated column of six;
@@ -40,13 +41,16 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Home", icon: LayoutDashboard, mobile: true, group: "monitor" },
   { to: "/topology", label: "Network", icon: Network, mobile: true, group: "infrastructure" },
-  // The edge-probe fleet: enrol / rotate / retire. Split out of the Network page
-  // (where it was a panel above the device tree) into its own Infrastructure
-  // destination. mobile:false — probe management is a desktop, few-times-a-month
-  // task, so it rides the mobile "More" sheet, not a bottom-tab slot.
-  { to: "/probes", label: "Probes", icon: RadioTower, mobile: false, group: "infrastructure" },
   { to: "/map", label: "Map", icon: Map, mobile: true, group: "infrastructure" },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false, account: true },
+  // Sits directly under Home: the tiles there link into it, and "what is wrong
+  // right now" is the second thing an operator opens after the overview. Mobile
+  // too — it is the one screen worth carrying to a site visit.
+  { to: "/issues", label: "Issues", icon: TriangleAlert, mobile: true, group: "monitor" },
+  // Field capture. Mobile-first in the strictest sense — it is the only screen
+  // here whose primary user is holding a phone in one hand at a pole, so it
+  // takes a mobile slot and sits under Infrastructure, which is what it edits.
+  { to: "/survey", label: "Survey", icon: MapPinPlus, mobile: true, group: "infrastructure" },
   { to: "/logs", label: "Logs", icon: Terminal, mobile: false, group: "monitor" },
   { to: "/overview", label: "Overview", icon: Gauge, mobile: false, superadminOnly: true, group: "platform" },
   { to: "/orgs", label: "Organizations", icon: Building2, mobile: false, superadminOnly: true, group: "platform" },

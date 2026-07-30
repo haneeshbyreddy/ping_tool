@@ -1,13 +1,17 @@
 """Outage triage, logs, analytics, PON fault verdicts, incident shape, SSE."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from wisp.central import analytics as central_analytics
 from wisp.central import incidents, onuroster, ponfault
+from wisp.central import issues as central_issues
+from wisp.central import pdf as central_pdf
 from wisp.central import rollup as central_rollup
-from wisp.central.api.common import (can_triage, olt_liveness, org_or_400,
-                                     q_int_or, reader_or_401)
+from wisp.central import xlsx as central_xlsx
+from wisp.central.api.common import (can_triage, now_iso, olt_liveness,
+                                     org_or_400, q_int_or, reader_or_401)
 
 
 def summary(h, qs):
@@ -123,7 +127,8 @@ def pon_faults(h, qs):
     skip = down_olts | stale_olts
     rows = [r for r in rows if r["device_id"] not in skip]
     dists = ponfault.passive_distances(devs, h.store.list_link_routes(org))
-    faults = ponfault.evaluate_org(rows, now, passive_dists=dists)
+    faults = ponfault.evaluate_org(rows, now, passive_dists=dists,
+                                   witness_macs=h.store.onu_place_macs(org))
     h._reply(200, {"faults": [f.as_dict() for f in faults]})
 
 
@@ -152,7 +157,8 @@ def pon_summary(h, qs):
     seen_rows = [r for r in rows if r["device_id"] not in stale_olts]
     live_rows = [r for r in seen_rows if r["device_id"] not in down_olts]
     dists = ponfault.passive_distances(devs, h.store.list_link_routes(org))
-    faults = ponfault.evaluate_org(live_rows, now, passive_dists=dists)
+    faults = ponfault.evaluate_org(live_rows, now, passive_dists=dists,
+                                   witness_macs=h.store.onu_place_macs(org))
     dups = onuroster.duplicate_macs(live_rows, now)
     roster = onuroster.current_roster(seen_rows, now)
     online = sum(1 for r in roster
@@ -219,6 +225,153 @@ def incident_shape(h, qs):
     h._reply(200, {"incidents": [i.as_dict() for i in found]})
 
 
+def _kinds_arg(qs) -> list[str] | None:
+    """`?kind=port_down&kind=onu_crit` or one comma-joined value, narrowed to the
+    known vocabulary. Unknown names are DROPPED and a request left with none
+    reads as "no filter": a filter is a view, so a link written against an older
+    vocabulary must show the whole list rather than an empty one that looks like
+    an all-clear."""
+    raw: list[str] = []
+    for key in ("kind", "kinds"):
+        for val in qs.get(key) or []:
+            raw += [part.strip() for part in str(val).split(",")]
+    picked = [k for k in dict.fromkeys(raw) if k in central_issues.KINDS]
+    return picked or None
+
+
+def issues(h, qs):
+    """Every open issue in the org as a FLAT list — one row per port, ONU, PON or
+    probe, not one row per device. The Home tiles drill into the device tree;
+    this is the same trouble counted the way it is actually worked."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    rows = central_issues.collect(h.store, h.cfg, org)
+    kinds = _kinds_arg(qs)
+    shown = ([r for r in rows if r["kind"] in set(kinds)] if kinds else rows)
+    # counts ride the UNFILTERED list so a filter chip can say how many rows it
+    # would show before it is clicked
+    h._reply(200, {"issues": shown, "counts": central_issues.counts(rows),
+                   "total": len(rows), "generated_at": now_iso(),
+                   "kinds": central_issues.KINDS,
+                   "kind_labels": central_issues.KIND_LABELS})
+
+
+_PDF_COLUMNS = (
+    # No severity column: the rows are already ordered most-severe-first, and on
+    # paper a tone word can't be coloured, so it only spends width the Detail
+    # column has better uses for.
+    ("kind_label", "Issue", 1.3, False),
+    ("device_name", "Device", 1.6, True),
+    ("subject", "Item", 2.0, True),
+    ("region", "Region", 1.0, False),
+    # Detail carries the free text, so it is the one column with an unbounded
+    # appetite — the highest weight means it absorbs the shortfall when the page
+    # can't satisfy everyone, rather than starving the identifier columns.
+    ("detail", "Detail", 3.2, False),
+    # NOT mono: a rendered date is prose, not an identifier to align, and Courier
+    # spends ~20pt more on it than Helvetica does — width Detail can use.
+    ("since", "Since", 1.5, False),
+)
+
+
+def issues_pdf(h, qs):
+    """The same list as `issues`, as a PDF the operator can file or hand over.
+
+    Server-rendered (central/pdf.py, pure stdlib) rather than printed from the
+    browser: what gets filed after a shift should be the rows the server actually
+    holds, not whatever a print stylesheet made of the screen — and it has to work
+    from a phone, where "print to PDF" is not a thing."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    rows = central_issues.collect(h.store, h.cfg, org)
+    kinds = _kinds_arg(qs)
+    if kinds:
+        want = set(kinds)
+        rows = [r for r in rows if r["kind"] in want]
+    stamp = now_iso()
+    labels = central_issues.KIND_LABELS
+    which = (", ".join(labels.get(k, k) for k in kinds) if kinds
+             else "all issue types")
+    columns = [central_pdf.Column(key, title, weight, mono=mono)
+               for key, title, weight, mono in _PDF_COLUMNS]
+    # Times are rendered in the OPERATOR's zone through the SAME choke point the
+    # WhatsApp pages use. Central stores UTC and the dashboard localises in the
+    # browser, so a page and a PDF are the only two places a stored timestamp
+    # reaches a human with nothing to convert — and shipping raw is exactly how
+    # every alert read 5h30m behind the Indian wall clock (see CLAUDE.md). A filed
+    # report is read beside a wall clock, never beside a timezone.
+    from wisp.egress.notifiers import _wa_time
+    printed = [{**r, "since": _wa_time(r["since"]) if r["since"] else None}
+               for r in rows]
+    body = central_pdf.table_pdf(
+        title=f"Open issues — {org}",
+        subtitle=(f"{len(rows)} issue(s) · {which} · generated "
+                  f"{_wa_time(stamp)}"),
+        columns=columns, rows=printed,
+        footer=f"WISP Central · {org}")
+    # the org id is a validated token, but a filename lands in a response header —
+    # so it is rebuilt from a safe alphabet here rather than trusted
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", org)[:40]
+    h._send_binary(200, "application/pdf", body,
+                   filename=f"issues-{safe}-{stamp[:10]}.pdf")
+
+
+_XLSX_COLUMNS = (
+    # Severity IS a column here, unlike the PDF: a spreadsheet is filtered and
+    # sorted, and on paper the word couldn't be coloured but here it's the first
+    # thing someone autofilters on.
+    ("severity", "Severity", 12.0),
+    ("kind_label", "Issue", 22.0),
+    ("device_name", "Device", 24.0),
+    ("subject", "Item", 34.0),
+    ("region", "Region", 22.0),
+    ("detail", "Detail", 70.0),
+    ("since", "Since", 24.0),
+)
+
+
+def issues_xlsx(h, qs):
+    """The same list as `issues`, as a real .xlsx (central/xlsx.py, pure stdlib).
+
+    Not a CSV wearing the name: an operator asking for Excel wants to sort and
+    filter, so the header freezes, the table carries an autofilter, and `since` is
+    a real DATE cell — sorted by time rather than alphabetically, which text
+    stamps get wrong the moment the month rolls over."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    rows = central_issues.collect(h.store, h.cfg, org)
+    kinds = _kinds_arg(qs)
+    if kinds:
+        want = set(kinds)
+        rows = [r for r in rows if r["kind"] in want]
+    # `since` becomes a datetime in the operator's zone through the SAME
+    # conversion the WhatsApp pages and the PDF use — one notion of "local".
+    from wisp.egress.notifiers import _wa_local
+    sheet_rows = [{**r, "since": _wa_local(r["since"])} for r in rows]
+    body = central_xlsx.table_xlsx(
+        sheet_name=f"Issues {org}",
+        columns=[central_xlsx.Column(key, title, width_cap=cap)
+                 for key, title, cap in _XLSX_COLUMNS],
+        rows=sheet_rows)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", org)[:40]
+    h._send_binary(
+        200,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        body, filename=f"issues-{safe}-{now_iso()[:10]}.xlsx")
+
+
 def acknowledge(h, user, body):
     oid = int(body.get("outage_id") or 0)
     org = h.store.outage_org(oid)
@@ -227,6 +380,155 @@ def acknowledge(h, user, body):
         return
     ok = h.store.acknowledge_outage(org, oid, user["username"])
     h._reply(200 if ok else 404, {"ok": ok})
+
+
+def assign(h, user, body):
+    """Hand an open outage to one or more of the org's field accounts.
+
+    OWNER-ONLY (`_can_write`), unlike acknowledge: deciding who goes out is
+    running the org, and a worker re-pointing its own jobs is a different feature
+    with its own conversation behind it. Assignment is an ASK, not an answer — it
+    does NOT stamp the ack, so the outage keeps rendering as down until an
+    assignee accepts (`accept`).
+
+    The page goes to exactly the assignees (`named_whatsapp`), NOT the org
+    audience: the point of naming two workers is that those two hear about it.
+    The send is best-effort like every other — the assignment is already
+    committed, so a WhatsApp failure reports `notified: 0` and never undoes it."""
+    oid = int(body.get("outage_id") or 0)
+    org = h.store.outage_org(oid)
+    if org is None:
+        h._reply(404, {"error": "no such outage"})
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    raw = body.get("usernames")
+    wanted = [str(u).strip() for u in raw if str(u or "").strip()] \
+        if isinstance(raw, list) else []
+    if not wanted:
+        # No "assigned to nobody" state: re-assigning replaces the set, so an
+        # empty list would be an ambiguous half-clear.
+        h._reply(422, {"error": "name at least one account to assign to"})
+        return
+    # Only ACTIVE accounts of this org, resolved from the DB — never the body's
+    # spelling, so an outage can't be handed to a username from another org.
+    live = {u["username"] for u in h.store.list_users(org)
+            if u["org_id"] == org and u["is_active"]}
+    names = [u for u in dict.fromkeys(wanted) if u in live]
+    if not names:
+        h._reply(422, {"error": "no active account in this org matches those names"})
+        return
+    if not h.store.assign_outage(org, oid, names, user["username"]):
+        h._reply(409, {"error": "outage is already resolved"})
+        return
+
+    numbers = h.store.named_whatsapp(org, names)
+    detail = f"assigned to {', '.join(names)} by {user['username']}"
+    row = next((o for o in h.store.triage_outages(org) if o["id"] == oid), None)
+    device = (row or {}).get("device_name") or f"outage #{oid}"
+    reached = _page_assignees(h, org, oid, device, detail, numbers, row)
+    h._reply(200, {"ok": True, "assigned_to": names, "notified": reached})
+
+
+def _page_assignees(h, org, oid, device, detail, numbers, row) -> int:
+    """Tell each assignee, with an [I'm on it] button where WhatsApp allows one.
+
+    Two shapes for the same page, per recipient, because Meta only permits a
+    free-form (and therefore buttoned) message inside the 24h window opened by
+    that person's last inbound message. So: try the interactive one FIRST — a
+    worker who can accept from the notification never has to open the dashboard,
+    which is the whole point of naming them — and fall back to the approved
+    `wisp_alert1` template for anyone whose window is shut. One message each
+    either way; the template's own body already says what to do.
+
+    Best-effort throughout: the assignment is committed before this runs, so
+    every failure only lowers the `notified` count the owner is shown."""
+    if not numbers:
+        return 0
+    from wisp.egress.notifiers import WhatsAppFacts
+    body = (f"🔧 You have been assigned to the outage on *{device}*.\n"
+            f"{detail}.\n\nTap *I'm on it* so the team knows you're going.")
+    buttons = [(f"acc:{oid}", "✅ I'm on it")]
+    if (row or {}).get("device_id"):
+        # "where is it" is the assignee's next question — but only offer the
+        # button when there is a device id behind it; a button that answers
+        # "that isn't in your network" is worse than no button.
+        buttons.append((f"map:{row['device_id']}", "📍 On map"))
+    cold: list[str] = []
+    reached = 0
+    for number in numbers:
+        if h.notifier.send_buttons(number, body, buttons).ok:
+            reached += 1
+        else:
+            cold.append(number)
+    if cold:
+        res = h.notifier.send(
+            f"🔧 Assigned: {device}",
+            f"You have been assigned to the outage on {device}. {detail}.",
+            4, whatsapp=cold,
+            facts=WhatsAppFacts(subject=device, status="ASSIGNED",
+                                detail=detail,
+                                timestamp=(row or {}).get("started_at") or now_iso()))
+        if res.ok:
+            reached += len(cold)
+    return reached
+
+
+def accept(h, user, body):
+    """An assignee answering yes — the other half of `assign`.
+
+    `can_triage`, not `_can_write`: accepting is exactly the triage right a
+    worker already has (the store refuses anyone not named on the outage, which
+    is the real gate). This is what moves the card to "in progress"; until it
+    happens the outage renders as down and waiting, however many people were
+    named.
+
+    The owner who assigned it is told, on the same one-message-each discipline —
+    they asked a question and the answer is the thing they are waiting for."""
+    oid = int(body.get("outage_id") or 0)
+    org = h.store.outage_org(oid)
+    if org is None:
+        h._reply(404, {"error": "no such outage"})
+        return
+    if not can_triage(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    outcome = h.store.accept_outage(org, oid, user["username"])
+    if outcome in ("missing", "closed"):
+        h._reply(409 if outcome == "closed" else 404,
+                 {"error": "this outage is already resolved" if outcome == "closed"
+                           else "no such outage"})
+        return
+    if outcome == "not_assigned":
+        h._reply(403, {"error": "you are not assigned to this outage"})
+        return
+    row = next((o for o in h.store.triage_outages(org) if o["id"] == oid), None)
+    if outcome == "ok":
+        _tell_assigner(h, org, row, user["username"])
+    h._reply(200, {"ok": True, "already": outcome == "already",
+                   "accepted_by": (row or {}).get("accepted_by", [])})
+
+
+def _tell_assigner(h, org, row, who: str) -> None:
+    """Best-effort "X accepted" back to whoever assigned it. Never the org
+    audience: this answers one person's question."""
+    by = (row or {}).get("assigned_by")
+    if not by:
+        return
+    numbers = h.store.named_whatsapp(org, [by])
+    if not numbers:
+        return
+    device = (row or {}).get("device_name") or "the outage"
+    detail = f"{who} accepted the assignment on {device}"
+    from wisp.egress.notifiers import WhatsAppFacts
+    text = f"✅ {detail}."
+    cold = [n for n in numbers if not h.notifier.send_text(n, text).ok]
+    if cold:
+        h.notifier.send(
+            f"✅ Accepted: {device}", text, 3, whatsapp=cold,
+            facts=WhatsAppFacts(subject=device, status="ACCEPTED", detail=detail,
+                                timestamp=(row or {}).get("accepted_at") or now_iso()))
 
 
 def postmortem(h, user, body):

@@ -3,6 +3,11 @@ from __future__ import annotations
 import ipaddress
 import re
 
+# The ONE identity normalizer for a serial/MAC (see onuroster's own docstring on
+# why it is not search_key). Imported rather than mirrored: a second spelling
+# rule here would let one sticker become two reference points.
+from wisp.central.onuroster import _norm_mac
+
 DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
 # Passive plant: splitters, fiber distribution boxes, splice closures. They live in
 # org_devices (parent chains, map pins, routes — all shared machinery), but they
@@ -10,11 +15,27 @@ DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "back
 # from the monitoring path — org_device_topology (engine + /edge/devices),
 # node_expected_ips (no assignment), device_reliability (no uptime math).
 PASSIVE_TYPES = ("splitter", "fdb", "closure")
+# How many ways a passive splits the fibre. A CLOSED vocabulary, and deliberately
+# only the three an ISP actually stocks: the ratio is not decoration, it is what
+# the recorded-load bar and the cumulative split down a cascade are computed
+# from, so a free-form number would let "1:7" or "1:100" produce arithmetic
+# nobody can act on. Widening this is a one-line edit when a real box turns up.
+SPLIT_RATIOS = (2, 4, 8)
 SNMP_VERSIONS = ("2c",)
 
-def _gpon_vendors() -> frozenset[str]:
+def _gpon_vendors(extra: set[str] | None = None) -> frozenset[str]:
+    """Vendor names an OLT may be stamped with: the edge's BUILT-IN profiles plus
+    whatever `gpon_profiles` rows the caller found for this org.
+
+    The built-ins alone are not the vocabulary — profiles are DATA, and a row
+    shadows a same-named built-in — so validating against them only made every
+    device on a DB profile unsavable: badri_fiber's two Syrotech OLTs 422'd on
+    ANY edit (a rename, a region, a PON type) because the form faithfully sends
+    back the vendor already stored. Extras are passed in rather than read here:
+    this module is pure validation and never touches the store."""
     from wisp.ingress.gpon import PROFILES
-    return frozenset(PROFILES)
+    return frozenset(PROFILES) | frozenset(
+        v.lower() for v in (extra or ()) if v)
 
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -31,7 +52,8 @@ def _str(data: dict, key: str, *, required: bool = False, default=None):
 def clean_device_payload(data: dict, *, parents: dict[int, int | None],
                          device_id: int | None,
                          registered_nodes: set[str] | None = None,
-                         passive_ids: set[int] | None = None) -> dict:
+                         passive_ids: set[int] | None = None,
+                         gpon_vendors: set[str] | None = None) -> dict:
     name = _str(data, "name", required=True)
     device_type = _str(data, "device_type")
     if device_type and device_type not in DEVICE_TYPES + PASSIVE_TYPES:
@@ -115,9 +137,10 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
         gpon_vendor = gpon_vendor.lower()
         if device_type != "OLT":
             raise InventoryError("GPON vendor only applies to an OLT")
-        if gpon_vendor not in _gpon_vendors():
+        known = _gpon_vendors(gpon_vendors)
+        if gpon_vendor not in known:
             raise InventoryError(
-                f"GPON vendor must be one of: {', '.join(sorted(_gpon_vendors()))}")
+                f"GPON vendor must be one of: {', '.join(sorted(known))}")
 
     # which PON a splitter/FDB serves — the fault localizer binds passives to
     # onu_optics rows through it (Phase D3); free-form, e.g. "0/6"
@@ -125,11 +148,45 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
     if pon_port and len(pon_port) > 32:
         raise InventoryError("PON port must be 32 characters or fewer")
 
+    # how many ways this box splits (1:2 / 1:4 / 1:8). Passive-only: powered gear
+    # doesn't split fibre, and a ratio there would feed the load bar nonsense.
+    split_ratio = _split_ratio(data) if passive else None
+
+    # How many ONUs fit on one of this OLT's PONs before it reads as full. EPON
+    # tops out at 1:64 and GPON at 1:128, so ONE global default can only be right
+    # for half a mixed fleet — a 1:128 box false-pages "at capacity" at 64.
+    # OLT-only: the cap is judged per PON, and nothing else has PONs. NULL = the
+    # global cfg.onu_pon_limit, which is why an unset box is not silently 64.
+    onu_pon_limit = (_clean_onu_limit(data, "onu_pon_limit")
+                     if device_type == "OLT" else None)
+
     return {"name": name, "ip_address": ip_address, "device_type": device_type,
             "region": region, "tags": ",".join(tags) or None,
             "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor,
-            "pon_port": pon_port}
+            "pon_port": pon_port, "split_ratio": split_ratio,
+            "onu_pon_limit": onu_pon_limit}
+
+
+def _split_ratio(data: dict) -> int | None:
+    """The split ratio as a bare denominator (8 for a 1:8), or None when the
+    operator hasn't recorded one. Absent and "not a splitter" both read as None:
+    a closure that only splices has no ratio, and that is a fact, not a gap."""
+    raw = data.get("split_ratio")
+    if raw in (None, "", "null"):
+        return None
+    if isinstance(raw, str):
+        # tolerate the way it is actually written down: "1:8", "1/8", "8"
+        raw = raw.strip().replace("1:", "").replace("1/", "") or "0"
+    try:
+        ratio = int(raw)
+    except (TypeError, ValueError):
+        raise InventoryError("split ratio is invalid")
+    if ratio not in SPLIT_RATIOS:
+        raise InventoryError(
+            "split ratio must be one of: "
+            + ", ".join(f"1:{r}" for r in SPLIT_RATIOS))
+    return ratio
 
 def clean_location_payload(data: dict) -> dict:
     """Map pin for a device: both coordinates, or both null (= remove the pin)."""
@@ -146,6 +203,230 @@ def clean_location_payload(data: dict) -> dict:
         raise InventoryError("lng must be between -180 and 180")
     # ~1e-6° ≈ 0.1 m — anything longer is float noise from a drag event
     return {"lat": round(lat, 6), "lng": round(lng, 6)}
+
+# How a field capture claims to know where it is. CLOSED, like every other
+# vocabulary here: 'gps' is a fix the phone took while standing at the device,
+# 'manual' is a point somebody nudged on the map because the fix was hopeless
+# (dense canopy, indoor rack). The two must never render alike — a `manual`
+# pin's accuracy is unknowable, which is different from bad.
+PLACE_SOURCES = ("gps", "manual")
+
+# Above this a fix is a cell-tower/wifi estimate, not a position. It is NOT a
+# refusal — a worker under canopy still needs to record something, and blocking
+# the save is how coordinates end up in a WhatsApp message instead of the DB.
+# The UI demotes the primary button past it; the server only rejects the absurd.
+GPS_ACCURACY_HINT_M = 25.0
+_MAX_ACCURACY_M = 10_000.0
+
+
+def clean_field_location_payload(data: dict) -> dict:
+    """A placement taken in the field, with its provenance.
+
+    Deliberately NOT `clean_location_payload` with extra keys: that function's
+    contract includes both-null = DELETE THE PIN, and this payload arrives from
+    the one role that may not remove plant from the map. Coordinates are
+    REQUIRED here, so the delete branch is unreachable rather than merely
+    unused — a worker-facing route should not be one missing UI guard away from
+    clearing a surveyed fleet."""
+    lat_raw, lng_raw = data.get("lat"), data.get("lng")
+    if lat_raw in (None, "", "null") or lng_raw in (None, "", "null"):
+        raise InventoryError("a field placement needs both lat and lng")
+    loc = clean_location_payload(data)
+
+    source = _str(data, "source") or "gps"
+    if source not in PLACE_SOURCES:
+        raise InventoryError("source must be one of: " + ", ".join(PLACE_SOURCES))
+
+    acc_raw = data.get("accuracy_m")
+    accuracy = None
+    if acc_raw not in (None, "", "null"):
+        try:
+            accuracy = float(acc_raw)
+        except (TypeError, ValueError):
+            raise InventoryError("accuracy_m must be a number")
+        if accuracy < 0 or accuracy > _MAX_ACCURACY_M:
+            raise InventoryError("accuracy_m is out of range")
+        accuracy = round(accuracy, 1)
+    # A 'gps' claim with no accuracy figure is not a GPS claim — every browser
+    # that can produce a fix produces `coords.accuracy` alongside it, so an
+    # absent one means the number came from somewhere else. Downgrade rather
+    # than reject: the coordinates are still worth keeping, just not as a
+    # measurement.
+    if source == "gps" and accuracy is None:
+        source = "manual"
+
+    return {"lat": loc["lat"], "lng": loc["lng"],
+            "accuracy_m": accuracy, "source": source}
+
+
+def clean_field_passive_payload(data: dict) -> dict:
+    """Passive plant discovered in the field: a splitter/FDB/closure at a fix.
+
+    A worker may create this and nothing else. What makes that safe is what is
+    ABSENT rather than any check here: no IP, no probe, no parent, no SNMP. A
+    passive is excluded from `org_device_topology`, so it joins no engine,
+    rebuilds no fingerprint, and cannot re-page a fleet; billing skips it too.
+    The parent link — the one field that would give it consequences — is the
+    owner's job on the desktop, exactly as the plant record is meant to work."""
+    name = _str(data, "name", required=True)
+    if len(name) > 120:
+        raise InventoryError("name is too long")
+
+    device_type = _str(data, "device_type", required=True)
+    if device_type not in PASSIVE_TYPES:
+        raise InventoryError(
+            "field-created plant must be one of: " + ", ".join(PASSIVE_TYPES))
+
+    loc = clean_field_location_payload(data)
+
+    region = _str(data, "region")
+    if region and len(region) > 120:
+        raise InventoryError("region is too long")
+    pon_port = _str(data, "pon_port")
+    if pon_port and len(pon_port) > 60:
+        raise InventoryError("PON label is too long")
+
+    return {"name": name, "device_type": device_type,
+            "ip_address": "", "parent_device_id": None,
+            "assigned_node_id": None, "region": region,
+            "pon_port": pon_port or None,
+            "split_ratio": _split_ratio(data),
+            "lat": loc["lat"], "lng": loc["lng"],
+            "accuracy_m": loc["accuracy_m"], "source": loc["source"]}
+
+
+def _onu_label(data: dict) -> str | None:
+    """A subscriber's operator-given name, UPPERCASED. None when blank.
+
+    Operator's call (2026-07-29): an ONU's customer name always reads as caps,
+    whatever case it was typed in. It is normalized on the WRITE path — here, the
+    one function all three writers to `onu_places.label` share — rather than at
+    render time, because the field survey, the reference-ONU dialog and the
+    rename route are three entry points and a display-time `.toUpperCase()` would
+    have to be remembered at every screen that ever names an ONU (the same
+    forgetting that made a typed name invisible on the OLT page to begin with).
+    Storing the canonical form also means SEARCH matches what the operator sees.
+
+    Consequence worth stating: case typed in the field is discarded, which is
+    what was asked for. The WALKED name (`onu_optics.name`) is NOT touched — that
+    string belongs to the OLT, and restyling somebody else's data is how a
+    dashboard starts disagreeing with the box a tech is logged into."""
+    label = _str(data, "label")
+    if label and len(label) > 120:
+        raise InventoryError("label is too long")
+    return label.upper() if label else None
+
+
+def clean_field_onu_payload(data: dict) -> dict:
+    """A subscriber's ONU located in the field, keyed on the sticker MAC.
+
+    LOCATING IS NOT WITNESSING, and this payload carries no way to say otherwise
+    — there is no `witness` key to set. Placing a reference ONU is the operator's
+    claim that a subscriber's power is reliable, which nothing detects and which
+    flips a PON mass-drop verdict from "fibre cut" to "area power cut"; a tech
+    recording where a box physically sits is making no such claim. Letting one
+    write express both is how a street's worth of geo-tags silently becomes a
+    street's worth of witnesses.
+
+    Identity normalization is `onuroster._norm_mac` — the same one
+    `clean_onu_place_payload` uses, deliberately, since both write the same
+    table and two spellings of one sticker must not become two rows."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if not mac:
+        raise InventoryError("a MAC is required")
+    if len(mac) > 64:
+        raise InventoryError("MAC is too long")
+    loc = clean_field_location_payload(data)
+    return {"mac": mac, "lat": loc["lat"], "lng": loc["lng"],
+            "accuracy_m": loc["accuracy_m"], "source": loc["source"],
+            "label": _onu_label(data)}
+
+
+def clean_field_onu_name_payload(data: dict) -> dict:
+    """The operator's own name for a located subscriber. Label only, no geometry.
+
+    A BLANK label is allowed and means "clear it" — descriptive text, unlike a
+    pin, can honestly be absent. Same `_norm_mac` identity as every other write
+    to this table."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if not mac:
+        raise InventoryError("a MAC is required")
+    if len(mac) > 64:
+        raise InventoryError("MAC is too long")
+    return {"mac": mac, "label": _onu_label(data)}
+
+
+def clean_onu_place_payload(data: dict) -> dict:
+    """A reference ONU's map placement, keyed on the MAC off its sticker.
+
+    Identity is normalized HERE and nowhere else on the write path, so two
+    spellings of one sticker can never become two witnesses. `onuroster._norm_mac`
+    is the right normalizer of the three: identity, not the punctuation-blind
+    search key (which would collapse genuinely different serials) and not the
+    weboptics match key.
+
+    Both coordinates null means REMOVE — the table is sparse, so an unplaced
+    reference point is the absence of a row, never a row with empty columns."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if len(mac) > 64:
+        raise InventoryError("MAC is too long")
+    loc = clean_location_payload(data)
+    notes = _str(data, "notes")
+    if notes and len(notes) > 500:
+        raise InventoryError("notes are too long")
+    # Same uppercase rule as the field paths — one table, one spelling of a name,
+    # or the desktop dialog and the handset would disagree about the same drop.
+    return {"mac": mac, "lat": loc["lat"], "lng": loc["lng"],
+            "label": _onu_label(data), "notes": notes}
+
+
+MAX_DROPS_PER_WRITE = 512
+
+
+def clean_onu_drops_payload(data: dict) -> dict:
+    """Which passive box a set of subscriber ONUs takes its drop from.
+
+    A BULK write by design: the question an operator answers is "which customers
+    hang off this splitter", asked once per box, not once per subscriber. So the
+    payload is {passive_id, macs[]} and `passive_id` null means DETACH the listed
+    MACs — the table is sparse like onu_places, so "no splitter recorded" is the
+    absence of a row rather than a row pointing nowhere.
+
+    Identity is normalized HERE and nowhere else on this write path (the same
+    single-choke-point rule reference points follow), or one sticker becomes two
+    drops and a splitter over-counts its own load."""
+    raw = data.get("macs")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        raise InventoryError("macs must be a list")
+    macs: list[str] = []
+    seen: set[str] = set()
+    for m in raw:
+        mac = _norm_mac(str(m))
+        if not mac or mac in seen:
+            continue
+        if len(mac) > 64:
+            raise InventoryError("MAC is too long")
+        seen.add(mac)
+        macs.append(mac)
+    if not macs:
+        raise InventoryError("no ONUs given")
+    # A cap so one request can't rewrite a fleet's plant record in a single
+    # mis-clicked "select all"; a PON tops out at 64 ONUs, so this is generous.
+    if len(macs) > MAX_DROPS_PER_WRITE:
+        raise InventoryError(
+            f"at most {MAX_DROPS_PER_WRITE} ONUs per request")
+
+    passive_raw = data.get("passive_id")
+    passive_id: int | None = None
+    if passive_raw not in (None, "", "null"):
+        try:
+            passive_id = int(passive_raw)
+        except (TypeError, ValueError):
+            raise InventoryError("serving splitter is invalid")
+    return {"macs": macs, "passive_id": passive_id}
+
 
 def clean_web_access_payload(data: dict) -> dict:
     """Web-UI proxy address override for a device. All three fields are optional
