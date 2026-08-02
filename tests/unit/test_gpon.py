@@ -55,32 +55,53 @@ class ParseTest(unittest.TestCase):
                + _vb(HUAWEI, "10.2", rx=-2980, state=1, serial="HWTC2", distance=4100))
         onus = {o.onu_key: o for o in parse_onu_table(vbs, HUAWEI)}
         self.assertEqual(len(onus), 2)
-        a = onus["HWTC1"]
+        a = onus["10.1"]
+        self.assertEqual(a.serial, "HWTC1")
         self.assertEqual(a.rx_dbm, -19.2)
         self.assertEqual(a.state, STATE_ONLINE)
         self.assertEqual(a.distance_m, 3820)
         self.assertEqual(a.name, "Ravi")
         self.assertEqual(a.onu_id, 1)
         self.assertEqual(a.pon_port, "10")
-        self.assertEqual(onus["HWTC2"].rx_dbm, -29.8)
+        self.assertEqual(onus["10.2"].rx_dbm, -29.8)
 
-    def test_serial_is_the_onu_key_else_index(self):
-        onus = parse_onu_table(_vb(HUAWEI, "12.5", rx=-2000, state=1), HUAWEI)
+    def test_the_slot_index_is_the_onu_key_even_when_a_serial_is_walked(self):
+        # The metric path keys on the table index, exactly as the registration
+        # path keys on pon.onu — the serial is reported, never used as identity.
+        onus = parse_onu_table(_vb(HUAWEI, "12.5", rx=-2000, state=1, serial="HWTC5"),
+                               HUAWEI)
         self.assertEqual(onus[0].onu_key, "12.5")
+        self.assertEqual(onus[0].serial, "HWTC5")
+
+    def test_one_serial_on_two_slots_stays_two_rows(self):
+        # THE reason the key is the slot. These OLTs never drop a vacated
+        # registration, so a re-registered ONU is reported twice — live on the new
+        # slot, dark on the old. Real shape from badri_fiber's Gpon_08, where 9 of
+        # 194 serials sit on 2-3 slots: keying on the serial collapsed the pair and
+        # the last write won, storing a LIVE ONU as offline at 0.00 dBm.
+        vbs = (_vb(HUAWEI, "6.34", rx=-2210, state=1, serial="ALCLb3fa1294")
+               + _vb(HUAWEI, "7.64", rx=0, state=2, serial="ALCLb3fa1294"))
+        onus = {o.onu_key: o for o in parse_onu_table(vbs, HUAWEI)}
+        self.assertEqual(set(onus), {"6.34", "7.64"})
+        self.assertEqual(onus["6.34"].state, STATE_ONLINE)
+        self.assertEqual(onus["6.34"].rx_dbm, -22.1)
+        self.assertEqual(onus["7.64"].state, STATE_OFFLINE)
+        # ...and both still report the serial a tech reads off the sticker.
+        self.assertEqual({o.serial for o in onus.values()}, {"ALCLb3fa1294"})
 
     def test_state_decode_and_offline_without_rx(self):
         onus = {o.onu_key: o for o in parse_onu_table(
             _vb(HUAWEI, "10.9", state=2, serial="OFF"), HUAWEI)}
-        self.assertEqual(onus["OFF"].state, STATE_OFFLINE)
-        self.assertIsNone(onus["OFF"].rx_dbm)
+        self.assertEqual(onus["10.9"].state, STATE_OFFLINE)
+        self.assertIsNone(onus["10.9"].rx_dbm)
 
-    def test_dbc_decimal_rx_and_mac_key(self):
+    def test_dbc_decimal_rx_and_slot_key_carrying_the_mac(self):
         idx = "12"
         vbs = _vb(DBC_RX, idx, rx="-14.62", serial="00:11:22:33:44:55")
         onus = parse_onu_table(vbs, DBC_RX)
         self.assertEqual(len(onus), 1)
         o = onus[0]
-        self.assertEqual(o.onu_key, "00:11:22:33:44:55")
+        self.assertEqual(o.onu_key, "12")
         self.assertEqual(o.serial, "00:11:22:33:44:55")
         self.assertEqual(o.rx_dbm, -14.62)
         self.assertEqual(o.state, STATE_ONLINE)

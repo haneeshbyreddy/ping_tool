@@ -309,9 +309,19 @@ def _clean_name(raw) -> str | None:
     return None if s.upper() in ("", "NULL", "N/A", "NONE") else s
 
 def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
+    # Identity is the ONU's physical SLOT — the metric table's own OID index —
+    # never its serial, the same rule the registration path below already states.
+    # A serial that re-registers on a second slot leaves the vacated one behind
+    # (these OLTs never drop a reg row), so a serial key collapses two distinct
+    # roster slots into one and the LAST WRITE WINS. Field-proven on badri_fiber's
+    # Syrotech GPON pair: 9 serials of 194 sit on 2-3 slots each, and keying on
+    # them stored live ONUs as offline at 0.00 dBm wherever a dark duplicate
+    # landed after the online one. That is why mapping `oids.serial` on a
+    # metric-only profile was unsafe until now — the serial is a FACT ABOUT the
+    # ONU to report, not the name of the row it goes in.
     serial = (cells.get("serial") or "").strip() or None
     return OnuOptic(
-        onu_key=serial or idx,
+        onu_key=idx or serial or "?",
         pon_port=profile.format_pon(idx),
         onu_id=_derive_onu_id(idx),
         name=_clean_name(cells.get("name")),

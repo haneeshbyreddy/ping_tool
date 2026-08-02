@@ -374,6 +374,18 @@ owners always page for everything, and a device's WORKERS are its assignees.
   `gpon_vendor` override > `WISP_GPON_VENDOR` > sysObjectID longest-prefix > None. Detection
   cached per device (1h ok / 15min on silence — catches a hardware swap), inside the SNMP
   semaphore, one lazy engine. Tests: `unit/test_gpon`.
+- **An ONU's identity is its SLOT, never its serial — on BOTH parse paths** (`gpon.py`).
+  The registration path always keyed on `pon.onu`; the metric path used `serial or idx` until
+  2026-08-02, and that asymmetry is why `syrotech_gpon` shipped with its serial column
+  deliberately UNMAPPED (so the GPON boxes showed no sticker ID at all). These OLTs never drop
+  a vacated registration, so a re-registered ONU is reported on both its old and new slot: on
+  Gpon_08 today, 9 serials of 194 sit on 2–3 slots, and a serial key stored **184 rows for 194
+  slots with 5 LIVE ONUs written as dark** wherever a zombie landed last. The serial is a fact
+  to REPORT about a row, never the name of the row. Corollary: mapping `oids.serial` on a
+  metric-only profile is safe only once every probe serving it runs a slot-keying build —
+  `tools/gpon_enable_serial.py` gates on the reported version rather than trusting the order,
+  because the damage (collapsed rows + phantom keys `onu_optics` never deletes) needs a manual
+  sweep. `unit/test_gpon:test_one_serial_on_two_slots_stays_two_rows`.
 - **GPON profiles are DATA** (`gpon_profiles`), served in the `/edge/devices` reply. Built-in
   callables travel as a CLOSED vocabulary (`state_map`+`state_default`, `pon_index`
   `as_is|first_segment`, `pon_label` template); `gpon_profile_from_dict` rejects the WHOLE
