@@ -96,3 +96,63 @@ export function HourStrip({ buckets, hours = 24 }: { buckets: TrendBucket[]; hou
     </div>
   )
 }
+
+/** The SHAPE of the last 24 hours' latency, drawn on the same epoch-hour grid
+ *  `HourStrip` uses so the two stack into one reading.
+ *
+ *  WHY BOTH, rather than one or the other: an OTDR shows a TRACE and an EVENT
+ *  TABLE together, because the graph finds the anomaly and the table says what
+ *  it was. `HourStrip` is the event table — which hours were rough — and it
+ *  cannot show that a link has been climbing all afternoon while never once
+ *  crossing a threshold. This is the trace. A number with no trend behind it is
+ *  half a number.
+ *
+ *  THE GRID IS SHARED AND THAT IS LOAD-BEARING. Both floor on EPOCH hours, not
+ *  local ones — CLAUDE.md's documented trap, because a half-hour zone like IST
+ *  shifts every cell — so column N here is the same hour as cell N below it.
+ *  Drawn across all 24 slots even where a bucket is missing, so a gap in the
+ *  history is a gap in the LINE rather than a line that quietly closes over it.
+ *
+ *  It takes NO status tone. A latency trend is reference material: the strip
+ *  beneath already carries red and amber for the hours that were actually bad,
+ *  and a second red channel repeating that louder is exactly what the rank
+ *  audit found wrong everywhere else on this product. */
+export function TrendSpark({ buckets, hours = 24, height = 22 }: {
+  buckets: TrendBucket[]; hours?: number; height?: number
+}) {
+  const HOUR = 3_600_000
+  const byTime = new Map(buckets.map((b) => [toUtcDate(b.bucket).getTime(), b]))
+  const top = Math.floor(Date.now() / HOUR) * HOUR
+  const slots = Array.from({ length: hours }, (_, i) =>
+    byTime.get(top - (hours - 1 - i) * HOUR)?.avg_latency_ms ?? null)
+
+  const seen = slots.filter((v): v is number => v != null)
+  if (seen.length < 2) return null
+
+  const W = 240, pad = 2
+  const max = Math.max(...seen), min = Math.min(...seen)
+  // a flat line is a REAL answer — pin it mid-height rather than letting a
+  // zero-range divide blow a steady link up into noise
+  const range = max - min < 0.05 ? 1 : max - min
+  const x = (i: number) => pad + (i * (W - pad * 2)) / (hours - 1)
+  const y = (v: number) => height - pad - ((v - min) / range) * (height - pad * 2)
+
+  const runs: string[] = []
+  let run: string[] = []
+  slots.forEach((v, i) => {
+    if (v == null) { if (run.length > 1) runs.push(run.join(" ")); run = [] }
+    else run.push(`${x(i).toFixed(1)},${y(v).toFixed(1)}`)
+  })
+  if (run.length > 1) runs.push(run.join(" "))
+
+  return (
+    <svg viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none" style={{ height }}
+      className="w-full text-muted-foreground" role="img"
+      aria-label={`latency over the last ${hours} hours, ${min.toFixed(1)} to ${max.toFixed(1)} ms`}>
+      {runs.map((pts, i) => (
+        <polyline key={i} points={pts} fill="none" stroke="currentColor" strokeWidth="1.25"
+          vectorEffect="non-scaling-stroke" strokeLinejoin="round" strokeLinecap="round" />
+      ))}
+    </svg>
+  )
+}

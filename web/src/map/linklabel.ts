@@ -45,14 +45,38 @@ export function bindLinkPorts(rows: LinkPort[]): Map<string, LinkBinding> {
 
 export const portLabel = (p: LinkPort) => p.if_name || `if${p.if_index}`
 
-const fmtShort = (bps: number): string => {
+/** Below this a link is carrying nothing an operator would act on.
+ *
+ *  This threshold exists because of what an idle link used to print: "↓29 ↑171"
+ *  — twenty-nine BITS per second — rendered at the same weight, in the same
+ *  chip, as "↓3.7M ↑82k". Two chips a centimetre apart, one of them a busy
+ *  gigabit-class trunk and one of them doing nothing, and the only way to tell
+ *  which was which was to read every digit of both. A viewport of those is why
+ *  the map stopped being scannable: nothing could be dismissed at a glance, so
+ *  everything had to be read. */
+export const IDLE_BPS = 1000
+
+/** Is this link doing nothing in BOTH directions? Collapsing that case to one
+ *  word is the whole point — an idle link should cost the eye a shape, not a
+ *  number. */
+export const bwIsIdle = (down: number | null, up: number | null) =>
+  (down ?? 0) < IDLE_BPS && (up ?? 0) < IDLE_BPS
+
+/** Chip text, KILOBIT-FLOORED on purpose.
+ *
+ *  k/M/G is the resolution an operator actually works at, so a sub-kilobit
+ *  reading renders "0" rather than a three-digit number that LOOKS large beside
+ *  "8k" — magnitude has to survive being skimmed, and raw b/s inverts it. The
+ *  precise figure is not lost: the tooltip still carries full b/s, and the
+ *  both-idle case never reaches here at all. */
+export const fmtShort = (bps: number): string => {
   if (bps >= 1e9) return `${(bps / 1e9).toFixed(1)}G`
   if (bps >= 1e6) return `${bps >= 1e7 ? Math.round(bps / 1e6) : (bps / 1e6).toFixed(1)}M`
-  if (bps >= 1e3) return `${Math.round(bps / 1e3)}k`
-  return `${Math.round(bps)}`
+  if (bps >= IDLE_BPS) return `${Math.round(bps / 1e3)}k`
+  return "0"
 }
 
-const fmtFull = (bps: number | null): string => {
+export const fmtFull = (bps: number | null): string => {
   if (bps == null) return "—"
   if (bps >= 1e9) return `${(bps / 1e9).toFixed(2)} Gb/s`
   if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} Mb/s`
@@ -73,6 +97,23 @@ export function linkRates(b: LinkBinding | undefined, fromId: number, toId: numb
   return from
     ? { down: from.out_bps, up: from.in_bps }
     : { down: to!.in_bps, up: to!.out_bps }
+}
+
+/** How hard this chip fights for its pixels when two of them collide.
+ *
+ *  TROUBLE OUTRANKS EVERYTHING and by a margin no rate can close — a toned chip
+ *  is the only one making a claim about state rather than reporting reference
+ *  data, so it must never be the one suppressed. Below that the busiest link
+ *  wins, and an idle one loses to everything: if exactly one of two overlapping
+ *  chips can be read, it should be the one with something to say. */
+export function bwRank(
+  b: LinkBinding, fromId: number, toId: number,
+): number {
+  const tone = linkTone(b)
+  if (tone === "down") return Number.MAX_SAFE_INTEGER
+  if (tone === "warn") return Number.MAX_SAFE_INTEGER - 1
+  const { down, up } = linkRates(b, fromId, toId)
+  return Math.max(down ?? 0, up ?? 0)
 }
 
 export function linkTone(b: LinkBinding): "down" | "warn" | null {
@@ -112,11 +153,17 @@ export function linkBwIcon(
   // ↓↑ is only which way it flows. fmtShort output is number-derived, so the
   // port name is the one branch that needs escaping.
   const ar = (g: string) => `<span class="wisp-linkbw__ar">${g}</span>`
-  const body = hasRates
-    ? `${ar("↓")}${fmtShort(down ?? 0)}${ar("↑")}${fmtShort(up ?? 0)}`
-    : `<span class="wisp-linkbw__port">${esc(portLabel([...b.values()][0]))}</span>`
+  const idle = hasRates && bwIsIdle(down, up)
+  const body = !hasRates
+    ? `<span class="wisp-linkbw__port">${esc(portLabel([...b.values()][0]))}</span>`
+    : idle
+      // One word, not two zeroes: "↓0 ↑0" is still four glyphs of arithmetic to
+      // dismiss, and the chip's job here is to be recognised and skipped.
+      ? `<span class="wisp-linkbw__idle">idle</span>`
+      : `${ar("↓")}${fmtShort(down ?? 0)}${ar("↑")}${fmtShort(up ?? 0)}`
   const tone = linkTone(b)
   const cls = ["wisp-linkbw"]
+  if (idle && !tone) cls.push("wisp-linkbw--idle")
   if (tone) cls.push(`wisp-linkbw--${tone}`)
   // The chip borrows its line's colour so a stack of labels over parallel
   // cables is readable — but only when the line HAS a custom colour and nothing

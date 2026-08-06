@@ -32,13 +32,21 @@ function saveView(org: string | null, map: L.Map): void {
   }
 }
 
-export function MapEvents({ org, onMapClick, onZoom }: {
+export function MapEvents({ org, onMapClick, onMapContext, onZoom, onMoved }: {
   org: string | null
   onMapClick: (ll: L.LatLng) => void
+  /** Right-click (and long-press, which Leaflet simulates as the same event).
+   *  Registering it at all is what suppresses the BROWSER menu: Leaflet only
+   *  calls preventDefault on contextmenu when something is listening for it. */
+  onMapContext?: (ll: L.LatLng, point: L.Point) => void
   onZoom: (z: number) => void
+  /** the view moved — anything anchored to a screen position has to go */
+  onMoved?: () => void
 }) {
   const map = useMapEvents({
     click: (e) => onMapClick(e.latlng),
+    contextmenu: (e) => onMapContext?.(e.latlng, e.containerPoint),
+    movestart: () => onMoved?.(),
     moveend: () => saveView(org, map),
     zoomend: () => onZoom(map.getZoom()),
   })

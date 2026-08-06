@@ -102,6 +102,38 @@ from `central/static/`.
   one FD forever (transport stays registered with the loop), and FD exhaustion reads as a
   fake mass outage. `PysnmpPoller`/`PysnmpGponPoller` lazily reuse `self._engine` (concurrent
   walks are safe — request-id demux). `EngineReuseTest` in `unit/test_snmp` + `unit/test_gpon`.
+- **These agents QUIT a GETBULK mid-table and pysnmp reports a clean finish** (2026-08-03).
+  Proven over every diagnostic walk against badri_fiber: EVERY early stop landed on an exact
+  multiple of the 25 max-repetitions (400/800/2275/2475/5550/5700), EVERY genuine end did not
+  (194/180/8/3). The generator just ends, so nothing raises and `truncated` stayed 0 — a walk
+  missing whole columns stored as complete. That is why a whole-PEN walk "proved" there was no
+  ONU roster in July. The budget is per-RESPONSE, not a fixed count (same root: 2275 on one OLT,
+  2475 on the other; the slow DDM table dies far sooner than the static ones), so **no cap value
+  makes a broad walk safe** — `walker.py` RESUMES from the last OID until the agent proves it is
+  done. **`lexicographicMode` MUST be True to resume**: with it False pysnmp bounds the walk to
+  the SUBTREE OF THE START OID, so resuming from a leaf returns nothing — which reads as proof
+  the agent had no more data. The subtree bound is enforced by our own prefix test instead; the
+  varbind cap still bounds a resumed walk. `unit/test_walker`.
+- **An ABSENT state cell is `unknown`, never `state_default`** (`gpon._metric_state`).
+  `parse_onu_table` builds rows from whichever columns arrive (`_place` does `setdefault`), so a
+  truncated STATE column left the tail ONUs with no state → the default → **`offline`**: live
+  subscribers rendered dark and `ponfault` counting them as a mass-drop cohort, i.e. a fabricated
+  fibre cut with nothing reporting an error. `ponfault.DARK_STATES` ALREADY excluded `unknown`
+  ("a vendor decode gap must not read as an outage cohort") — the contract existed, the edge
+  never produced it. A profile mapping NO state OID still gets its default: an absent column is a
+  fact about the firmware, a missing value in a column that EXISTS is a fact about the row. Only
+  bites profiles whose default is `offline` (the HUAWEI built-in already defaulted to unknown).
+- **The DDM sensor-rail guard covers SNMP too, and lives in `optics.py`** — `sane_rx`/`sane_tx`,
+  imported BY `weboptics` so there is ONE definition on the one path every reading crosses
+  whatever transport carried it. The Syrotech GPON build reports `0.00` across the whole DDM
+  block for a dark ONU, so 114 of badri_fiber's 378 ONUs stored 0.0 dBm and counted as MEASURED
+  in `onus_rx` — "nothing is wrong" and "nothing is measured" rendering alike. Keyed on PHYSICS,
+  not state: blanking whenever an ONU is offline would throw away the last good reading the panel
+  legitimately shows, and would miss the ONLINE ONU also reading 0.0 (a dead sensor grading `ok`).
+  **Rx and Tx are asymmetric ON PURPOSE** — 0.0 dBm RECEIVED is impossible, 0.0 dBm TRANSMITTED is
+  an ordinary launch power. `sane_tx` is deliberately weak and says so: it does NOT catch the
+  +8.16 dBm high rail, which needs the supply-VOLTAGE column no SNMP profile maps yet.
+  `DdmRailOnTheSnmpPathTest`.
 - **pysnmp 7 walk commands take exactly ONE varbind** — passing ten ifTable columns to
   `bulk_walk_cmd` positionally is a TypeError swallowed as "walk failed" (froze every fleet
   port table for 30h in v0.15.3; only `bulk_cmd` takes `*varBinds`). The combined walk is
@@ -473,6 +505,42 @@ works on that hardware, and it needs no rollout.
   from the backup ("5 8") and cross-link ("1.5 7") dashes so the four stay
   distinct. Drawn ONLY when the OLT is known (not ambiguous, not orphaned) AND
   itself placed. `interactive={false}`, like every topology polyline.
+- **…EXCEPT under the cursor, where it goes SOLID — bounded, and don't "fix" it back**
+  (`refonu.ts:REF_HOVER_BOOST`, 2026-08-03, operator's ask). Hovering a subscriber
+  lights its drop line solid at +1.5 weight and full opacity, and opens a card beside
+  the pin (`map/refhover.tsx`). What the dash protects against is a RESTING map that
+  looks surveyed — a line read across the room, screenshotted, or quoted drum off. A
+  hover is none of those: pointer-bound, exactly one line solid at a time, and
+  NARRATED, because the card names the span in words ("Drop · SPL-4" / "Drop · not
+  recorded"). The resting map says "unsurveyed" silently; the hovered one says it out
+  loud. **The line still may never be MEASURED**: `linkhover` probes drawn topology
+  only and is suppressed outright while a subscriber is hovered (they also collide —
+  a drop runs within a fingertip of its splitter's feeder). Tone is untouched by
+  hover — it may make a line findable, never make it look healthy.
+  - Hover is **React state, not `:hover`**, because the line and the card are outside
+    the mark — but it must NEVER enter `refOnuIcon`'s html (cached by string, so a
+    hover class there remounts the diamond and replays its fade-in on every pointer
+    crossing). Same reason the card keeps its OWN one-entry icon cache instead of the
+    shared `cachedDivIcon`: MapPage re-renders every second off `useNow()`, and a
+    fresh divIcon per tick swaps the DOM node and replays the card's animation.
+  - **The card is the one surface with room to obey the blank-reading rules
+    PROPERLY.** A map label must silently omit a dBm it can't stand behind; this can
+    say WHICH of the reasons it is (`not measured on this OLT` / `last reading is
+    stale` / `frozen — its OLT is down`). Frozen is said ONCE under a "Readings" key
+    and the Traffic row stands down — "port walk stale" beside a DOWN box is true and
+    useless, and points at an SNMP fault that isn't there. The verdict row is graded
+    on what is PRINTABLE, so a crit severity with no printable reading can't paint the
+    band red with nothing to explain it. The WORD carries the tone's meaning
+    ("Online · critical signal"), or a red band reading "Online" gets read as "down".
+  - **Its width is REM and the clamp maths reads the live root font-size.** A fixed
+    236px card looked right at 1440px and truncated "NDN-OLT · PON EPON0/5" at 1600px,
+    where the root scales up and the type grew but the card didn't — the PDF column
+    solver's lesson, in CSS: never let a fixed width starve the identifier column.
+  - Card ABOVE by default (the name plate is below the diamond), flipping below only
+    near the top edge; a tail at `calc(50% - var(--sx))` cancels the edge clamp so it
+    aims at the pin either way (measured: 0.0px off, clamped or not). `refZIndex`
+    lifts the hovered mark — marks are out of the clustering pass and a real pair sits
+    10.8px apart, so without it a pixel of jitter flickers between two customers.
 - **The rate on that line is the ONU's OWN ifTable row, NEVER the PON's.**
   C-Data EPON publishes an interface per ONU (`EPON01ONU3`), which is the only
   reason a per-subscriber rate exists here at all; the PON's row (`EPON0/1`) is
@@ -490,6 +558,16 @@ works on that hardware, and it needs no rollout.
   33 carry a counter, because that box's port walk is failing. `refHasRate` gates
   on `isFresh(port_updated_at)` so a stale walk can't print a weeks-old number as
   now; the card spells out which of the three states it is in.
+  **The CHIP no longer attempts it at all** (`refHasChip`, 2026-08-05, operator's
+  ask): a drop with no reading now draws NOTHING, where it used to draw a badge
+  reading "no rate". That was the common case, not an edge — `onu_if_token`
+  matches zero rows on every GPON build (Gpon_04/Gpon_08/TMG/SRPL/NLK), so a
+  surveyed street drew one chip per drop line to announce an absence, and a badge
+  has room for none of the three sentences above. **The budget reads the same
+  predicate as the render**, or an absence goes on reserving pixels away from a
+  live reading and a customer name that would have drawn. `refBwIcon` returns
+  `null` past the gate, so an ungated future caller is a type error rather than a
+  blank pill on a line. `dark` and `idle` are untouched.
 - **The line's tone follows the OPTICAL ROSTER (`isRefDark`), not `port_state`.**
   The two ride different clocks (they agreed on 1542 of 1557 live rows) and the
   roster is what the pin and the witness verdict already use — pin and line
@@ -579,6 +657,38 @@ entire plant a crew works on.
   exception is worth making — a splitter whose recorded customers are dark is the most
   useful object on the map during a cut. SIZE never changes, only tone, and the dot does
   NOT pulse: a pulse means "this box is down", and a splitter is never down.
+- **Its pin runs on BOTH colour axes: identity for the ordinary states, status only for an
+  alarm** (`index.css:--map-plant`, 2026-08-06, operator: "change the colour of splitter's
+  pin"). A splitter used to be painted entirely out of the STATUS vocabulary — grey with no
+  record, GREEN when its recorded drops were all online — and green is this app's "healthy",
+  which a box with no state, no FSM and no outage cannot claim; it also put plant in the same
+  colour as the located subscribers hanging off it. So `quiet`/`ok` leave Axis A for
+  `--plane-plant` (299°, the "physical, surveyed" identity hue `--chart-4` already mirrors)
+  and `weak`/`dark` still take `--warning`/`--destructive` outright: identity says what a
+  thing IS, an alarm outranks it. **Measured, not chosen by eye** — plant sits 90–145° from
+  every status hue, its chroma is 51–56% of theirs (the documented identity cap), and it
+  contrasts 3.89:1 dark / 3.22:1 light against the canvas versus 4.6–9.5:1 for the status
+  tones, so it can neither be mistaken for an alarm nor outshout one. **TWO violet steps, and
+  the step is CHROMA at fixed hue** (never a mix toward the grey — see QUIETING A STATUS
+  COLOUR): full for `ok`, drained for `quiet`, because "nobody recorded a drop here" and
+  "every recorded drop is up" are different sentences this map may not paint alike. The hover
+  card still grades a healthy box `success` in words and green, and that is NOT the
+  pin-vs-card disagreement the 2026-08-05 note fixed: a mark and its card may never grade one
+  box two ways ON THE STATUS AXIS, and the pin has left that axis precisely where it was
+  making a health claim it has no standing for. Judged on real satellite tiles in both themes.
+- **Its plate carries the SPLIT RATIO and nothing else — not even its name**
+  (`drops.passivePinLabel`, 2026-08-05, operator's ask). It read `medha · 1:8 · 6 · 2 dark`;
+  it reads `1:8`. A splitter is not looked at for what somebody called it — the ratio is
+  what says whether a PON has budget left, and it is three characters against fifteen on a
+  fleet whose plant is named `manjulapur`/`collectorate`/`IK REDDY`. Nothing is lost: the
+  recorded count and the dark count are still the MARK's tone (`dropTone`), the hover card's
+  rows, the panel's bar and `passiveTitle`'s full sentence — this drops ink, not facts, which
+  is why the tone rules moved from the old `.wisp-pin__sub` span onto `.wisp-pin__label`
+  rather than going away. **A box with no recorded ratio keeps its NAME**, and that is not a
+  hedge: since plant left the clustering pass the plate is one of only two channels (with the
+  hole in the mark) telling a splitter from a customer, both being teardrop pins at nearly
+  equal ink, so a blank plate would spend one of the two. FDB/closure have no ratio by nature;
+  every splitter on the live fleet has one.
 - **The drop line is DOTTED and TIGHTER than every other dash** (`DROP_DASH` "1 7", an
   8px period, vs the ref-ONU "1 10", backup "5 8", cross-link "1.5 7"): it is the least
   surveyed span on the map. Periods were opened when the strokes widened (2026-07-29) —
@@ -764,20 +874,212 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   reattribute the visit. So: reopening a LOCATED subscriber seeds the map at its stored
   pin and the sheet becomes "Save name"; dragging the pin (or "Back to GPS") turns it back
   into a real placement. The SPA tracks `pin` and `moved` separately for exactly this — a
-  seeded pin and a dragged one mean opposite things. A blank label CLEARS (descriptive text
-  can honestly be absent, unlike a pin); a rename on an unplaced MAC is a 404, never an
-  invented pin-less row that would enter the coverage count.
+  seeded pin and a dragged one mean opposite things. A rename on an unplaced MAC is a 404,
+  never an invented pin-less row that would enter the coverage count. It carries the NUMBER
+  too (below) — the route is contact details, not a label.
+- **NAME + NUMBER + LOCATION are captured together or not at all** (operator's call,
+  2026-07-31; `onu_places.phone`). Two of the three don't make a row a crew can act on: a
+  coordinate with nobody's name is a house you can't ask for, a name with no number is a
+  visit you can't arrange. Enforced on the SERVER (`clean_field_onu_payload`), not in the
+  sheet alone, so a SPA that forgets one can't write a row the field has to re-walk. **The
+  correction route enforces the SAME three** — blanking a label used to be allowed there
+  ("descriptive text can honestly be absent"), and once the field may not RECORD a nameless
+  subscriber, leaving that door open would produce the same unusable row from the other
+  side. Three consequences: `phone` is NULLABLE in the schema (every pin placed before this
+  has no number, and a tech reopening one fills it in — that IS the backfill); the rule is
+  deliberately looser than `api/users._WA_RE` (that one is a WhatsApp recipient and Meta
+  demands international format; this is a number a human dials, so separators are stripped
+  rather than refused and a bare 10-digit local number is valid); and the DESKTOP
+  reference-ONU dialog keeps both OPTIONAL, because what that write means is the
+  power-supply claim a PON verdict reads — refusing it for a missing customer record would
+  trade a fibre-cut/power-cut discrimination for paperwork. A blank there never erases what
+  the field captured (`COALESCE` on both columns, same discipline as the label).
+- **The handset offers NEITHER the per-OLT customer expand NOR "New splitter / closure
+  here"** (operator's call, 2026-07-31; both gated on the same `isWorker && isMobile` the
+  shell uses). The OLT rows STAY — progress per OLT is the only thing that says how much of
+  the job is left — but they report rather than open, so they render as a `div`, not an
+  inert `<button>` that still depresses under the thumb, and the drill query is disabled
+  rather than merely hidden. The way in is the search box: a tech at a drop is holding one
+  sticker, not browsing somebody else's customer list. This narrows the SCREEN, not the
+  permission — `field-passive` stays worker-reachable and unchanged, and an owner surveying
+  on a desktop still gets the button.
 - **A PLACED SUBSCRIBER HAS TO BE REACHABLE, or the survey looks broken.** The first
   placement (`hcs_babu`, 2026-07-28) saved correctly and was invisible: the subscriber
-  layer is OFF by default (localStorage) AND only draws from `REF_ONU_MIN_ZOOM` (16), so a
-  fresh pin fails both gates at once. Three fixes, all needed: the Layers entry is now
-  named **Subscribers** with a count (it said "Reference ONUs", which hid the survey's
+  layer is OFF by default (localStorage) AND only draws from a zoom floor (then a hardcoded 16,
+  now an operator setting defaulting to 14 — `map/detail.ts`), so a fresh pin fails both gates
+  at once. Three fixes, all needed: the Layers entry is
+  now named **Subscribers** with a count (it said "Reference ONUs", which hid the survey's
   whole output under a toggle nobody would look under); `/map?onu=<MAC>` enables the layer,
   flies past the zoom floor and selects the pin — a QUERY param, not nav state, so it
   survives a reload and a shared link; and both the search row and the post-save toast
   offer it. **Not offered on the field handset** — `FieldShell` redirects `/map` back to
   `/survey`, so the survey page gates those affordances on the SAME `isWorker && isMobile`
   the shell uses, or it would render a link that bounces.
+- **The zoom floor is SPLIT: marks at 14, their LINES and CHIPS at 16** (2026-08-02, operator
+  asked for subscribers to survive zooming out longer). One floor at 16 was set on the
+  assumption the layer arrives all together, and it made a surveyed area vanish at exactly the
+  zoom where "where are the dark customers" gets asked. **What forced 16 was never the marks —
+  it was the dotted drop lines**: below ~16 the whole span is a handful of pixels, it can't be
+  traced, and a few dozen of them with their black casings smear into a smudge around every
+  splitter, burying the plant the layer is subordinate to. Marks alone are safe two levels lower
+  because a live located drop is already the quietest fill on the map (`--success` 32%), so a
+  town's worth reads as texture while a dark one still shouts. **Chips gate on the LINE, not the
+  mark** — a chip rides the line, and one that outlived it would also reserve pixels in the
+  shared budget away from a link chip that really is drawn. `flyToOnu` (the `?onu=` deep link
+  and the search box) lands past the LINE floor: a lookup naming one subscriber should arrive
+  where everything about that subscriber draws, not where its pin merely starts existing.
+- **The CUSTOMER NAME draws beside the mark, on its own floor (17)** (`refonu.ts:refNameIcon`,
+  2026-08-02). The name a worker types while standing at the drop reached the DB correctly and
+  then lived only in the hover title and the subscriber card — so a surveyed street rendered as a
+  field of anonymous diamonds and "which of these is the complaint" meant clicking them one at a
+  time. Four things it must keep:
+  - **It is a SEPARATE MARKER, never a span inside `refOnuIcon`.** Icons are cached by their html
+    string, so folding in a name the collision budget can turn on and off would swap the
+    diamond's DOM node every time panning changed the budget — remounting every pin and replaying
+    `wisp-mark-in`, i.e. a layer that flickers while it is being read. The rate chip is a separate
+    marker for the same class of reason. The device pin's label can live INSIDE its icon only
+    because it is gated by zoom alone, through a class on the wrapper, and never per pin.
+  - **It joins the EXISTING screen-space budget, ranked last** (`chipShown.names`) — the
+    documented rule that a new chip family joins rather than starting a third. A name and a rate
+    chip collide with each other just as readably as two names do, and two budgets would each
+    report themselves clear while the screen showed a smear. Going last is what makes the layer
+    safe to leave on: in a dense area names thin out on their own instead of burying the readings
+    and the plant. Ranked DARK-first within itself, like the rate chips. It reserves pixels at
+    `REF_NAME_DY` BELOW the mark — where the text lands, not where the diamond does — so that
+    constant and the CSS translate must stay in step.
+  - **A dark WITNESS is named at every zoom the marks draw at**, the same exemption
+    `.wisp-map-lowzoom` makes for a device pin in trouble: it is the name somebody is about to
+    phone. Bounded by `refVisible`, or a name would float over a mark that isn't drawn. An
+    ordinary offline customer waits for the floor — see the "only the dot" rule below.
+  - **Quieter than a device label in ink, not in legibility** — `--muted-foreground` on an
+    88% card plate, vs `--foreground` on 96%; only the dark one reaches full weight. **The plate
+    is REQUIRED**: this sits over raster tiles running near-white to near-black inside one
+    viewport, and the twice-paid lesson of this layer is that anything uncased vanishes over
+    satellite. Judge it on real tiles in both themes.
+  - **The label carries the Rx dBm, and its THREE REFUSALS are the feature** (`refHasRx`,
+    operator's ask 2026-08-02). Each is a documented way this product has rendered a lie: a NULL
+    reading prints NOTHING, never a dash (most of the C-Data/DBC fleet walks a complete roster
+    with every `rx_dbm` NULL — "nothing is wrong" and "nothing is measured" must not render
+    alike, and a map chip has nowhere to explain a dash); a STALE walk prints nothing (a dBm on
+    screen carries no date, which is why `RxFreshness` exists on the panel — there is nowhere to
+    put a date on a map label, so the gate replaces it); and a DARK ONU prints nothing (its
+    stored Rx is whatever the last good walk saw, i.e. not now). A FOURTH, `frozen`, is passed in
+    by map-page: a DOWN OLT freezes every reading behind it up to 15 min before staleness would
+    notice, so the label drops the number and the HOVER CARD says why — the frozen rule's
+    "always pair it with a live reason". (That reason used to be documented as living in the
+    label's `title`, which was never reachable: `.wisp-refonu-name` is `pointer-events: none`,
+    because a name plate that swallowed clicks would make a subscriber harder to open than
+    before it was labelled. The card is where it actually gets said.) Gated on
+    `optics_updated_at`, the OPTICS walk's own
+    stamp shipped for this, **never `port_updated_at`** — different sweeps, and a fresh port
+    table says nothing about the age of the light reading beside it.
+  - **Graded by the SHARED `onuSev`, and TINTED ONLY WHEN WRONG.** `onuSev` moved from
+    `optical-panel.tsx` to `lib/format.ts` for this — four screens now grade the same subscriber
+    and a pure map helper importing a panel to get one rule is how a module graph knots. Never
+    re-derive a verdict from `rx_dbm`: thresholds are per-OLT, so a second rule would call one
+    drop healthy while the Optical tab calls it critical. `ok` stays the label's own muted ink
+    (a healthy Rx is the overwhelming majority and none of it is news, so scanning stays a search
+    for colour); warn/crit take the status tones at full strength — the one thing in this layer
+    allowed to outrank its own quiet.
+- **AN OFFLINE CUSTOMER GETS THE RED DOT AND NOTHING ELSE** (`refonu.ts:isRefEvidence`,
+  operator's call 2026-08-02: "for offline customers i don't want anything special treatment,
+  only dot should be red thats it"). **Dark emphasis is for WITNESSES**, and `isRefEvidence`
+  (`witness && isRefDark`) is the ONE predicate all of it gates on: the drop line's tone and
+  weight (`refLineTone`), the name's ink and weight, the name's exemption from the zoom floor,
+  first claim in both chip budgets, the rate chip's alarm tone, and `refZIndex`'s lift. The mark
+  itself needs no gate — `.wisp-refonu--plain` already resets the size bump and halo after
+  `--dark`, which is why that source ordering is load-bearing twice over.
+  - **Why it is not just taste**: power cannot darken a subscriber the operator vouched for, so
+    a dark witness IS a fibre cut with a coordinate — but thousands of ordinary drops go offline
+    every evening, and drawing each one as an alarm is a wall of red nobody can act on. Same
+    sentence CLAUDE.md already carried for `refZIndex` ("a dark subscriber is Tuesday"), now
+    applied to every channel instead of just stacking order.
+  - **`isRefDark` still answers "is this ONU down"** for counts, PON chips, the subscriber card
+    and the search panel's dot. `isRefEvidence` answers only "may the map raise its voice", and
+    nothing outside display may ask it. The one deliberate exception is `troubleOnly`, which
+    reads bare `isRefDark`: that switch is the operator asking to SEE problems, and an offline
+    customer is one — it decides what is drawn, never how loud.
+- **…and those floors are a SUPERADMIN SETTING, not constants** (`central/mapdetail.py` +
+  `map/detail.ts`, 2026-08-02). Hand-tuning a threshold every time somebody says the map is too
+  busy or too empty is the same shape of ask as "make the palette warmer", and gets the same
+  answer the theme panel already gives: **a density ask is a dashboard control, not a code
+  edit** — check this before editing a number. Five rows (device NAMES / PASSIVE PLANT + the
+  cable into it / subscriber marks / subscriber NAMES / drop lines + their chips), in
+  **Settings → Platform → Map detail**, stored
+  in `app_settings.map_detail`. The card is driven off `DETAIL_ROWS`, so a new layer is a row in
+  that table plus a key in both defaults — never JSX (`test_mapdetail:
+  test_every_field_is_OFFERED_a_row_in_the_settings_card` fails if the two drift, because a
+  field central validates but the form never shows is a knob nobody can reach).
+  - **ONE configuration for the whole install** (operator's call). It shipped first as a
+    per-browser localStorage preference in the map's Layers popover and was pulled back the same
+    day: density is a judgement about how this product should read, made by the person who looks
+    at the fleet all day, and handing it to every account buys a support surface ("my map looks
+    different from yours") in exchange for a choice nobody else asked to make. If a per-user
+    override is ever wanted again it goes ON TOP of these values, never instead of them.
+  - **It rides the `/api/orgs` reply, exactly like `google_maps_key`** — the map already reads
+    that row for the key, so a server-wide map setting costs no extra fetch and shares its
+    invalidation (the Platform card invalidates `["orgs"]` as well as `["admin-settings"]`).
+    It is NOT org data: every row carries the identical object. Workers read it too — a map
+    drawing on different rules for them is the same problem in miniature.
+  - **ONE ordering invariant — nothing draws at a zoom where its own MARK doesn't**, **and it is
+    not cosmetic**: `refLinesVisible` and `refNamesVisible` are both `refVisible && …`, and a
+    drop line is suppressed with the splitter it runs to, so a floor set below its mark's doesn't
+    draw it earlier, it does nothing — and a setting that silently no-ops is worse than one
+    that refuses. `subscriber_names` floors at `subscribers`; `drop_lines` floors at BOTH
+    `subscribers` and `passives`, because a drop line is the one row with a mark at EACH END and
+    a dotted line running to a point where nothing is drawn reads as a rendering fault. The two
+    dependents are INDEPENDENT OF EACH OTHER (a name rides the mark, a
+    rate chip rides the line), so naming subscribers without drawing their drop lines is a
+    legitimate setting and must not be "repaired" — and `passives` is likewise independent of
+    `subscribers` in both directions (the shipped default draws plant one level EARLIER).
+    `detailMin` is EXPORTED and `normalizeDetail`
+    is written in terms of it, so the stepper's disabled state and the value stored can't
+    disagree about where the floor is; `mapdetail.clean` repairs it AGAIN server-side, on the
+    write AND on the read, so a hand-edited SQLite row can't reach the map broken either. One
+    repair covers every way of breaking it, so no "which knob moved" state is needed.
+  - **`passives` hides the PIN AND THE CABLE INTO IT, and it is the one row with an ALARM
+    EXEMPTION** (2026-08-05, operator: "i want splitters to disappear as well at certain
+    configurable zoom level when zooming out"). It is the other half of taking plant out of the
+    clustering pass the same day: the accepted cost there was that dense plant OVERLAPS at low
+    zoom instead of folding, exactly what subscribers do — so plant gets the answer subscribers
+    already had, a zoom floor. Four things it must keep:
+    (1) the pin and its cable stand down TOGETHER — `map-page.tsx:drawnDevices` feeds BOTH
+    `buildClusters` and the `links` memo, so the hover probe, the rate chips and the branch-fault
+    overlay all inherit one decision instead of re-deriving what is visible, and no line can end
+    in empty ground;
+    (2) a passive whose recorded subscribers are DARK is exempt at every zoom **and so is the
+    plant ABOVE it** — a branch fault names the SPAN between two pins, which is the whole output
+    of that feature and where a van drives, so dropping either end takes an alarm off the map;
+    the ancestor walk is also what keeps that overlay's own link in `drawnLinks`. `frozen` is
+    computed exactly as the pin computes it, so the exemption can never disagree with the tone it
+    is drawn from;
+    (3) the SELECTED passive is exempt — its panel is open, and a panel floating over nothing is
+    the failure this map is careful about — as is every input surface where plant is what the
+    cursor is aiming at (`plantPinned`);
+    (4) it filters `drawnDevices`, **never `placed`** — the "N / M on map" census, Fit-all,
+    search and the drag-snap still reach every placed box, because hiding a reference layer must
+    not make the fleet look smaller than it is.
+  - **An untouched install stores NOTHING** (`mapdetail.save` clears the row at defaults, which
+    is also what Reset posts), so a future change to the shipped numbers still reaches everyone
+    who never expressed an opinion — the same sparse-storage rule as the theme overrides.
+  - **Defaults are MIRRORED in Python and TS on purpose** — the SPA must draw before
+    `/api/orgs` resolves and central must validate without asking a browser. `test_mapdetail.py:
+    SpaAgreementTest` reads the TS source to pin them together, the same way the theme allowlist
+    test does; a drift would have the map render one thing and the settings form report another.
+  - Coercion is **per field, never per object**, on both sides: a row written before a field
+    existed must not discard the fields it does carry, and junk must degrade to the shipped
+    number rather than to NaN/None — those make every `zoom >= n` false and read as "the layer
+    is broken" rather than as a bad setting.
+  - **`lowZoom` is now DERIVED** (`zoom < detail.labels`) rather than a second state set beside
+    `setZoom`. That pairing is fine while the threshold is a constant and a stale closure the
+    moment it becomes a setting the callback would have to close over.
+  - Nothing outside display reads any of it — no alarm, count, verdict or page — which is what
+    makes it safe to hand to a form. Device pin DOTS, their status tone and the down-pulse ignore
+    `labels` entirely, and trouble/selected keep their names at every zoom, so even the extreme
+    setting cannot hide a device that is down.
+  - Tests: `unit/test_mapdetail`, `integration/test_central_mapdetail` (superadmin-only write,
+    owner/worker read off the org row, the invariant repaired server-side, and that saving some
+    other platform setting doesn't reset the map).
 - **…and once a fleet surveys in bulk, REACHABLE stops meaning ALL AT ONCE** (2026-07-29).
   Thousands of drops drawn together is a texture, not a map, and it does not match how a
   fault arrives — "EPON0/4 has five crit ONUs" is a question about ONE PON.
@@ -797,9 +1099,9 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   must keep: it is SEPARATE state from the
   `refOnus` toggle (that is the operator's remembered preference, a scope is what they're
   working on now — clearing it must restore their setting, not decide for them); it
-  **bypasses `REF_ONU_MIN_ZOOM`**, because that floor exists to stop a fleet's worth of pins,
-  not to hide one OLT's dozen; it **FITS to what it left on screen** (an unframed filter
-  shows an empty map and reads as "nothing here"); the bar lives IN the status strip, not as
+  **bypasses BOTH zoom floors**, because they exist to stop a fleet's worth of pins,
+  not to hide one OLT's dozen; it **NEVER TOUCHES THE ZOOM** (below); the bar lives IN the
+  status strip, not as
   a floating card, because `top-14 left-3` already belongs to the unplaced drawer and the
   subscriber card — and a map hiding most of its content must SAY SO on the map, or the next
   person at the wall reads a scoped view as the whole network. And PON chips are built from
@@ -810,6 +1112,47 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   card** (all z-1000): the unplaced drawer, the site card and the subscriber card all open at
   `top-14 left-3`, exactly where the strip wraps once the focus bar joins it, and a z-index tie
   breaks on DOM order — so those cards were burying the search results and the PON chips.
+  - **…and the focus narrows PASSIVE PLANT with the drops** (`plant.ts:plantInScope`,
+    2026-08-06, operator: "only customers are being filtered, i also want splitters filtered as
+    well"). It used to PIN plant instead — `onuScope` was one of `plantPinned`'s clauses — so
+    focusing one OLT during a cut still drew every splitter in the org. A focus is not "show me
+    everything"; it is the operator naming one OLT, so plant now follows the subscribers.
+    Measured on badri_fiber: 19 placed splitters → 8 / 5 / 6 under the three OLTs, which
+    partitions them exactly. Four rules:
+    - **A box a DRAWN subscriber hangs off is kept whatever the topology says.** That drop line
+      has to have both ends — the same reason `drop_lines` may never floor below `passives` —
+      so a mis-recorded drop pointing at another OLT's splitter keeps that splitter drawn.
+      Fed `shownPlaces`, not `places`, so a PON pick narrows the net with the drops.
+    - **Otherwise it is the FEED CHAIN**: `feedChain(d).head` is the scoped OLT, on a picked
+      PON (`ponFor` walks the chain, since a cascade leaves `pon_port` blank below the first
+      hop). The chain is what holds for a splitter nobody has recorded a drop on yet, which on
+      a fresh survey is most of them. Plus the chain ABOVE anything kept, or a cable ends in
+      empty ground.
+    - **A box the record can't place on a PON STAYS under a PON pick.** `pon_port` is
+      operator-entered and gets filled in out of order — on the live fleet 20 of 22 splitters
+      carry none — so a blank column says nobody wrote it down, never "on some other PON". A
+      stricter rule empties the map. Same instinct as "recorded is never occupied".
+    - **GEAR IS NEVER NARROWED, and `plantPinned` still wins outright**: a switch has a state
+      and an outage of its own, and picking a parent for a new splitter means reaching boxes
+      outside the focus. The narrowing deliberately does NOT carry the dark-splitter zoom-floor
+      exemption across — it is announced on the map and one click to leave, and it already
+      hides the dark SUBSCRIBERS under another OLT's plant, so keeping their branch-fault span
+      drawn over customers that aren't would be the louder lie.
+  - **THE FOCUS MAY NOT MOVE THE ZOOM** (2026-08-06, operator: "if I were to add a filter on
+    OLT, zoom is being adjusted — I don't want that"). It used to `flyToBounds` the scoped set,
+    documented above as one of the five things it "gets right and must keep". That was
+    backwards: an operator picks the zoom that suits the street they are looking at, and a
+    FILTER is supposed to thin what is drawn there, not re-frame the map underneath. Adding
+    plant to the fit the same day made it obvious — one splitter across town pulled the frame
+    out to the whole district. What the old fit was right about survives as a floor: the map
+    **PANS, at the current zoom, and only when nothing the focus reveals is on screen at all**,
+    so a filter can still never leave you staring at an empty map. A `panTo`, never a `flyTo`,
+    which arcs through other zooms on the way. The on-screen test EXCLUDES the OLT — the focus
+    is entered from its own panel, so counting it would make "reveals nothing" unreachable.
+    Ticking PONs therefore never moves anything, which is the case that matters: comparing two
+    PONs means watching ONE patch of ground gain and lose drops, and a re-frame per tick
+    destroys exactly that. Measured: apply = 0 zoom / 0 m, PON tick = 0 / 0, a focus dragged
+    off screen = 0 zoom / 8.4 km pan.
 - **The map SEARCH box finds subscribers, not just devices** (2026-07-29, `map/search.tsx`).
   A tech holds a sticker MAC or the customer name typed in the survey, and neither is an
   `org_devices` row, so a box that only knew devices answered "nothing found" about a drop
@@ -844,8 +1187,126 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   excluded by `current_roster`, or the denominator would include drops nobody can find.
   `onu_place_macs(witness_only=False)` is the one caller that asks the wider question —
   it defaults True so no alerting path can accidentally widen to every located drop.
+- **An opened OLT lists the LOCATED half too, first, under a green wash** (2026-08-01). It
+  used to show only what was left, so the expanded list contradicted the `placed/total` on
+  the row that opened it, and a tech back on a street they had half-surveyed could not see
+  which drops were already recorded. Four things it must keep: (1) both halves come off ONE
+  roster pass and one placement set in `onu_coverage`, so `len(located)` IS that counter
+  rather than a second derivation — deriving it client-side from `onu-places` was rejected
+  because an AMBIGUOUS MAC resolves to no `device_id` there and would silently shorten the
+  list below the count. (2) A done row CARRIES its label, phone and pin, because the only
+  reason to tap one is to correct something and the sheet defaults to a RENAME — arriving
+  without the pin would re-place the subscriber and restamp a real GPS fix as hand-placed
+  (`field_onu_name` exists for exactly that split). (3) Done rows are their own BLOCK, not
+  interleaved into slot order: HLY-OLT-2 carries 219 subscribers of which 5 are located, so
+  in walk order the green sits three screens down — a "done" mark nobody can see. Slot order
+  still holds within each block. (4) The green is measured PER MODE
+  (`bg-success/[0.18] dark:bg-success/[0.11]`) — the two `--success` tones sit at opposite
+  luminances by design, and the alpha that reads as a clear tint on near-black lands at
+  #E7EEEB on white, a grey nobody would call green. Judge it on screen in both themes, never
+  by matching the two numbers.
 - Tests: `integration/test_central_survey` (the gate, the refusals, provenance, the
-  engine-fingerprint guard, and the whole witness split).
+  engine-fingerprint guard, the whole witness split, and the located half's count agreement).
+
+### Worker location tracking: an off-the-shelf tracker, not an APK (2026-08-01)
+
+`central/field.py` (ingest rules + prune), `store_field.py`, `api/field.py`, the public
+`GET|POST /field/track` in `server.py`, `map/workers.ts`, `components/field-tracking-card.tsx`.
+Workers run **Traccar Client** — free, open source, Android AND iOS — which POSTs OsmAnd
+fixes; the owner sees the crew on `/map` under Layers → Workers. **No APK work at all**: the
+`wisp-field-app` Capacitor shell stays a pure webview and this feature never touches it.
+
+- **Off-the-shelf, not ours** (operator's call). Location was the last reason to write native
+  code — push was declined, because the WhatsApp bot already delivers an assignment with a
+  working [✅ I'm on it] button. Traccar brings years of Doze/OEM-battery tuning we would not
+  match, and iOS for free. Don't re-propose a tracking APK.
+- **ON-SHIFT ONLY, and the tracker's own ON/OFF switch is the real toggle.** When it is off
+  the phone transmits nothing. "Always transmit, discard off-shift server-side" was
+  deliberately NOT built: receiving a worker's evening and choosing not to store it is a much
+  worse promise than not receiving it. The **Start/End shift button** (`/survey`, worker's
+  only mobile screen) is a SECOND, explicit declaration and the two-tap cost is the point —
+  **when somebody marks on-shift and no fixes arrive, that gap IS the "the OEM battery
+  manager killed the service" alarm**, which no server-side code could otherwise detect. It
+  is a feature, not redundancy, so nothing may infer a shift from the fixes.
+- **Auth is a per-worker token in Traccar's `id` field**, the node-token pattern verbatim
+  (SHA-256 hash only, shown once, rotatable, never recoverable — the panel says so). That
+  placement is what keeps the **server URL identical for every worker**: one string on
+  screen, in a QR, and readable down a phone line, while identity stays per-person. Resolves
+  to `(org_id, user_id)`; a revoked token or a DEACTIVATED account resolves to nothing.
+- **BOTH VERBS, query string OR form body.** Client builds differ and a fix silently dropped
+  because we handled one shape is the worst failure here — it is invisible from every screen.
+- **A REFUSAL THAT IS OURS ANSWERS 200, NOT 4xx.** Traccar re-sends anything it did not get a
+  2xx for, IN ORDER, so a 4xx on a fix we will never accept WEDGES the offline buffer behind
+  it and the newer positions never arrive. So: too vague (accuracy > `field_track_max_accuracy_m`,
+  500 m) and too old/future → `200 {"stored": false, "reason": …}`; only a MALFORMED request
+  (no/out-of-range coordinates) 400s; a bad token is a flat 401 (right to wedge — fix the
+  handset and the backlog delivers itself); the rate cap 429s. The past window is
+  deliberately generous (24h): offline buffering is a setting we RECOMMEND, so a morning
+  replaying at once is the feature working.
+- **The rate cap is a token BUCKET, never a minimum gap** — a gap would throw away exactly
+  that buffered burst. `UNIQUE(org_id, user_id, ts)` + INSERT OR IGNORE makes a replay
+  idempotent, or a flaky link renders as a stutter in the trail.
+- **Speed arrives in KNOTS** (the OsmAnd protocol's unit; Traccar Client converts m/s before
+  sending) and is converted ONCE at ingest. Same class of trap as the dbc profile's
+  `distance_m` in time quanta.
+- **7-day retention, pruned daily** (`field.start_field_prune_thread`, the `rollup.py` shape).
+  Not housekeeping: the window is the whole answer to what this keeps about staff. A crew at
+  the designed 90 s cadence is ~6 MB/month, so this was never a volume problem.
+- **Ungated by billing**, consistent with edge ingest — a lapsed bill must not silently stop
+  recording where staff are. Not an `/api/*` route, so it is out of `api/__init__`'s tables
+  and out of the worker allowlists by construction, beside `/whatsapp/webhook` and `/report`.
+  **Nothing logs the request line** — the token rides in the query string and `log_message` is
+  `log.debug` for exactly that reason.
+- **FOUR STATES, never collapsed** (`map/workers.ts:workerState`) — the specific lie this
+  prevents is always the same one, "last known 40 minutes ago" drawn as "here now":
+  `live` (on shift, fix fresh) · `quiet` (on shift, gone quiet — THE alarm) · `off` (shift
+  ended, not a fault) · `never` (set up but never reported). `never` has no coordinates, so
+  it is not a mark but a COUNT on the layer toggle — without it a crew whose phones were
+  never provisioned renders identically to one that has all gone home (same rule as the
+  splitter layer's "N of M mapped"). **Classified in the SPA, not shipped**: freshness ticks
+  with the clock, and a state stamped at response time keeps claiming "here now" for as long
+  as the tab is open. The THRESHOLD is server-owned (`fresh_s`) so it still has one source,
+  and `field-tracking-card.tsx` reads the SAME `workerState` — the panel and the map
+  disagreeing about whose phone is working would be worse than either being absent.
+- **The layer keeps the Subscribers layer's discipline**: opt-in + remembered
+  (`wisp:map:workers`), out of the clustering pass, every element `interactive={false}`, and
+  stacked BELOW every device pin AND below the subscriber layer (`workerZIndex`, -250/-300).
+  Its mark is a **rounded square carrying INITIALS** — the only mark here with text in it,
+  which is what stops a person reading as plant, and it answers the question three vans
+  actually raise ("which one"). It takes **no status tone**: success/warning/destructive here
+  are claims about the NETWORK. The one exception is `quiet`, which really is an alarm.
+- **Two things were fixed only because they were checked on real satellite tiles** — the
+  ref-ONU lesson, twice over. A hollow dashed `off` mark and an uncased trail BOTH vanished
+  outright over imagery. The three states now differ by HUE (grey / steel / amber), which
+  survives any backdrop, and the trail carries the same dark casing every other line does.
+  Judge these on tiles in both themes, never on a swatch. The trail is **SOLID**, unlike every
+  other subordinate line: a dash here means "not a surveyed path", and a GPS trail is the one
+  line on the map that IS measured.
+- **"Today" is the OPERATOR'S day** (`field.trail_since` → `notifiers._display_zone`,
+  `WISP_DISPLAY_TZ`). A UTC-midnight boundary cuts an IST trail at 05:30 and drops the
+  morning's driving while the van is still out. Same zone choke point WhatsApp times use.
+- **`/api/field/shift` is the ONLY worker-writable route this adds** (and its GET the only
+  worker-readable one): a statement about themselves, with `org_id`/`user_id` from the
+  SESSION, writing no location and naming no device. Both start and end are IDEMPOTENT — the
+  button and a stale tab press the same thing, and two overlapping shifts would make "when did
+  he start" unanswerable. `/api/field/workers` and `/api/field/tokens` are owner-only: where
+  the crew is, is the owner's view of the org.
+- **The setup panel is Settings → Users → Location tracking**, written as STEPS AN OWNER READS
+  OUT, because that is literally how it gets used. It carries the constant server URL, the
+  one-time token + QR (generated CLIENT-side with the `qrcode` dep the 2FA card already uses —
+  central stays pure stdlib), the duty cycle we designed (**90 s / 30 m / High / offline
+  buffering ON** — the app's defaults are not it), and the **OEM warning**, prominently:
+  Xiaomi/Realme/Vivo/Oppo autostart managers kill background services silently and **no
+  server-side code can fix it**. That warning is the single most likely reason tracking will
+  look broken; an owner who doesn't know it concludes the feature is broken.
+- The roster is driven off `users`, not off issued credentials — a list of only the people
+  already set up can never show you who is missing.
+- **Before rolling out to a fleet:** run one Xiaomi or Realme handset for a full working day.
+  If it survives that it will survive the rest, and if it does not, no amount of server work
+  fixes it.
+- Tests: `integration/test_central_field` (both verbs and both param shapes, every refusal and
+  which status it answers, token/deactivation/rotation, org scoping, the worker allowlist,
+  shift idempotence, the prune, and the org/account delete cascades).
 
 ### C-Data / DBC: two hardware truths (don't re-derive)
 
@@ -863,6 +1324,18 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   `.31.1.3` CSV. Parsing a packed CSV is outside the profile vocabulary, so the
   exact fix needs edge code; `scales.distance = 1.6393` is the zero-rollout approximation
   (157 m high). Don't "fix" this by widening the scale vocabulary alone.
+- **The SYROTECH GPON build publishes NO ranging distance at all** (2026-08-03, narrow probes
+  256–261 — the whole ONU MIB under `…1.1.6` is now mapped and the hunt is CLOSED). T1 has 5
+  columns, T2 6, T3 7 (`.3.1.8` returns zero varbinds), T4 8+ whose cols 6–8 read `0` on all 195
+  slots, T5 is 3 scalars. Those zeros are unpopulated counters, NOT distance: mapping one prints
+  "0 m" for every ONU, which the Optical tab renders as *unranged*. Same class of verdict as "no
+  per-ONU Rx in the EPON firmware" — a hardware fact, not a gap to code around, and the web-UI
+  route is the only way in (that build 404s on `OPM_PATH`, so it needs a real `proxy_audit`
+  capture, never a guessed page). Cost is low: branch-fault localization off splitter/drop
+  records already beats the ranging bracket on this fleet. Also settled — `col2` **is** the row
+  index in both T1 and T2 across all 374 slots, so `onu_id` is correct; an older note claiming it
+  hid a separate ONU id was wrong. T4.col5 is a second, WORSE serial column (122 unique with
+  blanks vs T2.col5's 184 at full coverage).
 
 ### Per-ONU Rx from the OLT's web UI
 
@@ -1204,7 +1677,7 @@ raising `proxy_connect_timeout_s` would be treating the symptom.
   follow this for anything central sends.
 - **Routes live in `central/api/` route tables**, not `server.py` if/elif chains:
   `api/__init__.py` maps exact paths to handlers in `api/{edge,orgs,users,fleet,devices,
-  outages}.py`. GET handlers are `fn(h, qs)`, dashboard POSTs `fn(h, user, body)`; `h` carries
+  outages,field}.py`. GET handlers are `fn(h, qs)`, dashboard POSTs `fn(h, user, body)`; `h` carries
   `cfg/store/notifier/registry` plus `_reply`/`_reader`/`_scope_org`/`_can_write`. `server.py`
   keeps only transport, auth helpers, static/SSE/download serving, login, and edge-ingest
   special cases. Adding an endpoint = a function + a table row. `api/common.py:DENIED` is the
@@ -1368,10 +1841,162 @@ Built output is committed (`cd web && npm install && npm run build`); `./run.sh`
 - **Surface ladder**: `--muted` sits BELOW its surface (wells recess), `--popover` is THE
   raised/focus surface (drill-in, map chrome, menus), `--accent` is the interaction fill on
   raised surfaces — so a fill meaning "hover/selected/skeleton" must use accent, never muted.
-  Row hover is `hover:bg-foreground/5` (works on every surface); selection is `.wisp-drillin`
-  (popover bg + `--border-strong` outline; NO colored rail — tried, rejected). Hover ≠
-  selected; keep adjacent surfaces ≥ ~3 ΔL* (they were 1.017:1 once). Faint text =
+  Row hover is `hover:bg-foreground/5` (works on every surface). Hover ≠ selected. Faint text =
   `text-faint-foreground`, not opacity hacks; maint/stale chips render neutral, never amber.
+  **The ≥3 ΔL\* floor is measured on ADJACENCY — what shares an edge on screen — not on a
+  sorted list of the tokens** (2026-08-05): `--secondary` is used TWICE in the whole SPA, both
+  as a button fill, and `--sidebar` never touches `--muted`, so ranking them by lightness
+  invents steps that do not exist and hides the ones that do. The six real pairs are card-on-
+  background, muted-well-in-card, popover-on-card, accent-on-popover, sidebar-vs-background and
+  sidebar-vs-card.
+
+### THE TWO COLOUR AXES (2026-08-05) — the cure for "too bland"
+
+The operator's report was *"too bland, things blend into the background"*, and it was a
+measurement, not a mood. **6 of 98 elements on a healthy Home carried any chroma at all** — and
+two of those six were a 30-day uptime rollup mis-toned as a warning. The cause is structural:
+this product had ONE colour channel and it is correctly reserved for failure, so *being fine had
+no visual form* and rendered as absence.
+
+**Axis A — STATUS: "is this broken?"** Red/amber/green/info. Reserved, supreme, UNCHANGED by
+this work.
+
+**Axis B — IDENTITY: "what KIND of fact is this?"** Five MEASUREMENT PLANES (`lib/planes.ts`,
+`--plane-*` in index.css): **optical 200° · traffic 247° · vitals 273° · plant 299° ·
+fleet 325°**. Constant, always present, never alarming.
+
+- **The planes are not invented for the palette — the SCHEMA already models them.** One
+  `org_devices` row carries FOUR separate freshness stamps (`optics_`/`ports_`/`health_`/
+  `state_updated_at`), the SNMP layer runs THREE separate walk clocks with three separate
+  timeout caps, and the device panel's tabs are literally Optical | Health | Ports. All of it
+  rendered in the same grey until now. Cloudscape's design system independently ships **5**
+  primary categorical hues; the schema and the reference agree on the number.
+- **REACHABILITY GETS NO HUE, and that is what makes five fit.** A plane earns a hue only if it
+  produces facts that survive the thing being healthy. Optical has an Rx, plant has a split
+  ratio, fleet has a version. Reachability has latency, loss and up/down — every one a STATE.
+  There is no constant reachability fact: it IS Axis A. Six hues do not fit the 200–330° band at
+  a readable separation; five do, at 26°.
+- **Hue is fenced MECHANICALLY**: inside 200–330°, NEVER inside 20–140° (red/amber/green), and
+  every plane ≥18° clear of `--primary` (229°) so identity can never read as interaction. Solved
+  by allowing a GAP across the reserved accent rather than spacing evenly — that buys 26° where
+  even spacing gave 20.
+- **Chroma is capped at 55% of the QUIETEST status tone on the same screen** (not the loudest —
+  "must not exceed the status tones" means all of them), contrast in **[3.0, 80% of that tone]**:
+  a floor from Cloudscape's data-vis minimum, a ceiling from the alarm channel. Measured: warning
+  is the quiet one at C=0.1208 dark.
+- **AN IDENTITY HUE IS A MARK COLOUR AND NEVER A TEXT COLOUR**, and that fell out of the
+  arithmetic rather than taste: in LIGHT mode the ceiling lands at **3.72:1**, below the 4.5:1 AA
+  floor for body text, because light's quietest status tone is only 4.65:1. A hue that cannot
+  legally be read as text can still be a mark. So a **status chip is COLOURED TEXT** and an
+  **identity chip is NEUTRAL TEXT beside a coloured DOT** — identical structural weight,
+  impossible to confuse, and the accessibility constraint and the never-confuse-them requirement
+  turn out to be the same fact.
+- **NOT operator-settable**, same reason `--map-line-*` isn't: they are an ENCODING solved
+  against a budget derived from the status tones, and a hand-typed value could breach the ceiling
+  that keeps identity from reading as an alarm. `--chart-1..5` MIRROR them and ARE settable
+  (`ADVANCED_TOKENS`), because a chart series is decoration over data rather than a claim about
+  it.
+- **Identity does NOT go on the left rail.** That rail already carries the operator's tag/probe
+  colour, and two meanings on one rail is the failure Datadog documents by name: *"if multiple
+  groupers are used with the semantic palette, the colors no longer correspond to a specific
+  meaning — red no longer necessarily indicates bad."* It goes on the chip's dot.
+
+**`--chart-1..5` WERE THE STATUS TONES, derived from the status SEEDS.** `toneFamily()` built
+`--chart-1` inside the primary family, `-2` success, `-3` warning, `-4` destructive — so every
+chart in this product would have drawn its series in ALARM colours, and recolouring "Down" in
+Settings → Appearance silently recoloured chart series 4. The live install's stored overrides are
+the proof: they carry `--chart-1` and `--chart-4` and not `-2/-3/-5`, exactly the two seeds that
+were moved. `toneFamily` no longer takes a `chart` key at all, so it cannot be reattached by
+accident.
+### The separation pass (2026-08-05) — what the ladder, the borders and selection now are
+
+Measured before and after, on RENDERED PIXELS, in both modes. Every adjacency now clears the
+≥3 ΔL\* floor; **four did not**.
+
+| adjacency | dark before → after | light before → after |
+|---|---|---|
+| card on background | 4.70 → **9.19** | 3.04 → **4.94** |
+| muted well inside card | **2.52** → 3.96 | 5.96 → 3.18 |
+| popover on card | 3.95 → 4.77 | **0.00** → **3.19** |
+| sidebar vs card | **0.50** → 5.47 | **0.94** → **8.13** |
+
+- **`--popover` WAS `--card` IN LIGHT MODE — both `#ffffff`, 0.00 ΔL\*.** The documented
+  "raised/focus surface" had no surface signal at all there, so every drill-in, menu, map card
+  and dropdown floated over something identical to itself and rode entirely on its outline.
+  Nobody had measured light mode. Four levels needing 3 ΔL\* each do not fit under a hard white
+  ceiling, so the whole light ladder steps DOWN to make room and the light **sidebar is now
+  DARKER than the canvas** — which also makes the two themes structurally the same (the sidebar
+  is the recessed rail in both, instead of recessed in dark and raised in light).
+- **THE CANVAS DOES NOT MOVE** (3.94 → 3.87 ΔL\*). The halation note says a third darkening must
+  raise card with it; card, popover and accent rose instead.
+- **The border alphas DID change** (`--border` .10 → .17, taking a panel edge from **1.343 →
+  1.731:1**) against a note saying they must not. That note protects the ALPHA FORM — one token
+  holding a constant relationship on canvas, card, popover and raster tiles — which is intact.
+  Its justification for the VALUE ("resolves to exactly the palette's `#31353d` on the card")
+  stops being true the moment the card moves. 1.343 was also exactly the ceiling CLAUDE.md sets
+  for basemap ROAD GEOMETRY: roads were dulled until they were as quiet as a panel edge, and
+  nobody checked whether the panel edge was loud enough to be one.
+- **SELECTION IS A STATE OF THE ROW, NOT ANOTHER LAYER.** `.wisp-drillin` was popover-bg + a
+  strong outline, i.e. exactly ONE ELEVATION STEP — the same distance that means "this is a menu
+  floating above you". Linear ships the rule and states the reason: a selected row's delta
+  must EXCEED the elevation step and it must have NO EDGE LIGHTING, because an outline is what
+  makes a highlight read as a separate z-plane. Now: no outline (transparent border keeps the
+  geometry), no inset top edge (it is excluded from the `.wisp-panel` highlight rule for this
+  reason), and a fill clearing the step — 6.88 vs 4.77 dark, 5.44 vs 3.19 light.
+  It is a **CHROMATIC lift, not a brightness one**, which is what lets it coexist with hover:
+  `--accent` is the achromatic hover wash, `--selected` sits at similar LIGHTNESS carrying the
+  accent HUE at 2.1× (dark) / 5.0× (light) the chroma. A first attempt separated them by
+  brightness and put the selected row 15 ΔL\* above the card — brighter than `--accent`, i.e.
+  straight back to looking like a new surface. Derived from `--primary` via `oklch(from …)` with
+  the documented `@supports` fallback, so recolouring the accent carries through.
+- **THE ACCENT HAS EXACTLY THREE JOBS**: focus ring, selected row, active nav — plus the
+  pre-existing `info` tone and the map's own "you are here"/impact rings. The active-nav rail
+  moved from `--foreground` to `--primary`, REVERSING an earlier call ("accent stays reserved…
+  so status colors keep being the loudest thing on screen") on a measurement that says the
+  opposite: `--foreground` on the sidebar is 14.16:1 dark / 13.38:1 light and `--primary` is
+  7.40 / 3.95, so the rail this replaced was TWICE as loud as the accent.
+- **The lit top edge is `inset 0 1px 0 rgb(255 255 255 / 0.06)`, DARK ONLY.** 0.04 was specified
+  and measures 1.123:1 on the raised card — faint enough to do nothing; 0.06 lands at 1.190:1,
+  clearly under the panel's own border at 1.731. In LIGHT a white inset measures **exactly
+  1.0000:1** — no effect, because the card is already the lightest surface in the room. No drop
+  shadows: on a near-black canvas a cast shadow has nothing to darken.
+
+### The instrument grammar (2026-08-05)
+
+- **`<Reading>` (`components/reading.tsx`) is ONE FORM for every number that can be uncertain.**
+  The honesty rules existed in prose and every screen re-implemented them, which is how "nothing
+  is measured" kept escaping as a green zero. Five states, each with a **non-colour channel** so
+  the grammar survives greyscale and a screenshot pasted into WhatsApp: `current` · `stale`
+  (dotted underline) · `frozen` (desaturated + pause glyph + reason) · `absent` (the dead zone)
+  · `suppressed` (struck bell — a suppressed ALERT must never look like a suppressed FACT).
+  - **THE DEAD ZONE comes from the domain, not from taste.** An OTDR has had a first-class
+    visual concept for "the instrument cannot measure here" for forty years, and it is a marked
+    REGION on the scale rather than an absence of trace. So `absent` is a dash on a hairline
+    track occupying the box a real reading would, holding its column. A blank cell says "nobody
+    looked"; a dead zone says "we looked and this instrument cannot answer". Most of the
+    C-Data/DBC fleet is in exactly this state.
+  - **`at` DERIVES the state and does not PRINT.** A list shares one walk, so dating each figure
+    repeats the same four characters down the column — the first wiring put "7h ago" beside all
+    fourteen PON readings in a panel whose header already said it once. `showAge` opts in, for a
+    solitary reading with nothing else to date it.
+  - **FROZEN is the only state that surrenders its status tone**, mirroring `.wisp-frozen`, which
+    greys on DOWN and not on merely stale. An unreachable box's stored "crit" is not a claim
+    anyone can stand behind; a stale one's still is.
+- **`RxScale` is a POWER METER, not a progress bar** — fixed marks you are on one side of, not a
+  fill showing how far along you are. **The domain is the DECISION BOUNDARY, `[crit-3, warn+3]`,
+  not the optical range**: readings span ~-7 to -30 dBm while warn and crit sit 3 dB apart, so a
+  linear track over the real span would spend two thirds of its width where nothing is decided.
+  Anything comfortably healthy **PEGS**, which is what a meter in pass/fail mode does. `ok` gets
+  NO band. Thresholds are threaded per-OLT from the optics reply, never a global default, because
+  `optics.py:_severity` grades per box. **NO UPPER BOUND, deliberately**: an over-driven ONU is a
+  real fault (PYLON has one at -2.87) but this product models no upper threshold, and a scale
+  that disagrees with what pages is worse than one that is merely incomplete.
+- **`OnuBar` is the PON heat strip's grammar at aggregate resolution.** The real strip draws one
+  cell per ONU from `pon.onus[]`; a tree row or an Issues group header carries only counts, so
+  this is proportional segments in the same tones and the same order. A PROPORTION is the point:
+  "26 ONUs crit" reads identically on a 30-ONU box and a 600-ONU box, and those are opposite
+  situations. Offline takes the MUTED step, never destructive — hundreds go dark every evening.
+
 - **Status tone is ONE formula** (`components/status-badge.tsx`): tone color for text, same hue
   at 13% fill, 30% edge — shared by `Chip`, `StateBadge`/`TonePill` and `StatusDot`. `info` is
   a real tone: an ACKED outage means a human owns a still-live incident, which muted hid. On
@@ -1653,6 +2278,321 @@ data ©Google" only reads as confusion about who supplies what.
   Failure ladder: tile-error BURST (3 in 5s, once per token — a stray rural-z20 404 must not
   nuke the basemap) → recreate session once → toast + fallback tiles, WITHOUT overwriting the
   user's saved pick.
+
+### The map must rank what it draws (2026-08-01) — the "can't tell what matters" pass
+
+Operators reported the map as hard to read. It wasn't any one element; it was that REFERENCE
+material was drawn as loud as STATE, so nothing could be dismissed at a glance. Every fix below
+is the same rule — *status tones are the loudest thing on this map* — applied to something that
+had quietly opted out of it.
+
+- **THE GROUND TONE was the biggest one, and it is the operator's own diagnosis.** Dark ran on
+  Google's night navy `#242f3e`, which measures LIGHTER than `--popover` (`#24272e`) — the
+  basemap, the thing everything else sits on, was brighter than the highest surface in the
+  product, and blue inside a warm-slate app. Light sent **no style array at all** and got stock
+  beige + gold landuse + cyan water. Both now sit where a backdrop belongs: dark `#15181d`
+  (between `--background` and `--card`), light `#eaeaef` (just under `--muted`, so plain white
+  roads keep separation — `#f2f2f4` put them at 1.12:1 and the network read as a ghost).
+  **Every geometry and label value moved WITH the ground**, re-solved to hold its original ratio
+  within 0.05, because darkening alone raises the labels too. Payoff: destructive 4.66 → 6.13:1,
+  warning 6.64 → 8.73, success 5.92 → 7.78. And the rule was closer to broken than anyone knew —
+  the loudest basemap label sat at 4.55:1 against destructive's 4.66, a **2% gap**; it went to 33%.
+  Light was worse still and had never been measured: its stock locality text ran 7.37:1 against
+  destructive's 5.36 — *the basemap's writing outranked every alarm.*
+- **TWO CEILINGS, NOT THE STATUS TONES** (2026-08-02 — dulled three times in one day at the
+  operator's request; the last ask was "even more dull, just slightly visible enough to grasp
+  it"). Geometry and writing fail differently, so one flat number cannot serve both:
+  - **GEOMETRY ≤ `--border`**, the app's own hairline (**1.35:1 dark, 1.28:1 light**). A road is
+    at most as loud as the edge of a panel: structure you can trace when you follow it, never
+    something that competes.
+  - **LABELS ≤ ~2.05:1 dark / ~1.75:1 light.** A LEGIBILITY FLOOR, not taste — below it place
+    names stop resolving as text, and an unreadable name is worse than none because it still
+    costs ink and attention. **If the map must be quieter than this the control is the EXISTING
+    Layers → "Google labels" switch**, which removes the writing outright. Don't chase it with
+    colour past this point.
+
+  Now **2.06:1 dark / 1.74:1 light** for labels and **1.30 / 1.18** for geometry — ~65% under
+  `--destructive`, where the loudest label began at 4.60 / 3.81. The previous rule
+  (`--ghost-foreground`, the app's quietest text step, 3.42 / 2.63) is now satisfied rather than
+  binding, and the original one ("rank under the status tones") was never the real constraint:
+  what exposed it was `--map-link`, the colour EVERY cable on this map is drawn in, sitting at
+  4.75:1 while a road NAME sat at 4.60 — a **3% gap between Google's writing and our own network
+  drawing**, which is not a hierarchy.
+  Every ladder was re-solved by scaling in **LINEAR RGB** (preserves hue and saturation exactly,
+  moves only the level), never clipped at the top, so the internal ordering survives each pass —
+  flatter and lower each time, with the TOP compressed hardest: dark highway labels went
+  4.60 → 3.04 → 2.06 while road labels went 3.41 → 2.60 → 1.84, because a route number is not
+  more important than a town name and was being drawn as though it were.
+  **Road geometry is dulled AGAINST THE GROUND, never against its own casing** — that fill/casing
+  pair is what actually draws a road. Dulling road-vs-ground makes the network recede;
+  road-vs-casing makes it DISSOLVE, and light mode has already proved once that a dissolved
+  network reads as a broken map rather than a quiet one. So light's brightest object, the
+  pure-`#ffffff` road fill, stops at `#f9f9fc` and only its hard highway casing came down again
+  (1.37 → 1.24 → 1.18, now under `--border`): on a light ground the ribbon IS the road. Dark
+  holds its road casing at 1.06 for the same reason. **Dulling runs the OPPOSITE direction per
+  mode** and is easy to get backwards: on a light ground quieter means LIGHTER.
+  These are SOLVED SETS. Do not nudge one value; re-run the whole ratio table against BOTH
+  ceilings, then `--destructive`/`--warning`/`--success`.
+- **`ICONS_OFF` is unconditional on roadmap and is NOT the Layers toggle.** Google's POI
+  markers are white discs with a dark ring — the exact grammar of a device pin — and a rural
+  viewport renders five of them against one OLT; its highway shields are YELLOW, i.e. sitting
+  on `--warning`, and stamp the same route number five times along one road. `labels.icon`
+  strips both while KEEPING the place-name text a crew navigates by; the Layers switch is
+  all-or-nothing (`elementType: "labels"` covers text AND icon deliberately), so it could only
+  ever have traded the discs for a nameless map. **Geometry still untouched** — parks, water
+  and footprints survive. Route numbers are the one real loss; restoring them is one line.
+- **`road.highway` geometry was stock tan (`#746855`) the whole time** although the night-style
+  comment claimed "deliberately NEUTRAL now, not tan" — only the label FILLS were ever changed.
+  It ran 2.49:1 against ordinary road's 1.31:1, warm, at the scale of a river. Neutralised to
+  `#3b414b` (1.73:1), then 1.44, now `#292e36` (**1.30:1**, just under `--border`): still a clear
+  step above ordinary road (1.18:1), cool, so nothing on the basemap can be mistaken for
+  `--warning`. This is the ONE ratio in the array deliberately not preserved. **A comment
+  claiming a colour was fixed is not evidence that it was** — that one was wrong for months.
+- **`variantOf` may never return `""` for roadmap.** A light+labelled roadmap used to be the
+  one UNSTYLED variant and so keyed with no `:s…` suffix — now that ICONS_OFF and DAY_STYLE
+  always apply, leaving it that way would let every browser holding such a token serve stock
+  tiles for the ~2 weeks until it expired, invisibly to whoever shipped the change. Hence the
+  `|| "b"` fallback. (The style HASH already in the key covers subsequent palette edits.)
+- **Rate chips are kilobit-floored and collapse to one word when idle**
+  (`linklabel.ts:IDLE_BPS`/`bwIsIdle`/`fmtShort`, shared with `refonu.ts` — ONE copy, or a
+  trunk's chip and a drop's chip teach two readings of the same badge). `↓29 ↑171` is
+  twenty-nine BITS per second rendered at the weight of `↓3.7M`; a viewport of those can only
+  be read, never skimmed. Chrome dropped to a hairline border + weight 500 to match: a rate is
+  reference data and was outranking the one red pin that was the reason to look.
+- **ONE screen-space budget reserves pixels for BOTH chip families**
+  (`map-page.tsx:chipShown`). Link chips sit at the midpoint and links CONVERGE on devices, so
+  they landed on top of each other — and a subscriber chip collides with a link chip just as
+  readably, so two independent budgets would each report themselves clear. Greedy, ranked by
+  `bwRank` (trouble outranks every rate, then the busiest link; subscriber chips are offered
+  pixels last, dark ones first). A suppressed chip is not lost — zoom spreads the midpoints and
+  it returns. **A NEW chip family must join this budget, not start a third one.**
+- **A LIVE located subscriber is the quietest fill on the map** (`--success 32%`, vs the
+  witness's 70%). It is the single most common mark on a surveyed fleet and not one of them is
+  news. Quieted by SATURATION only — **not size**, which was tried twice and came back
+  unreadable both times; the dark mark keeps full destructive tone, so the gap between "fine"
+  and "not fine" widens rather than narrows.
+
+**Stroke weight is SCALED TO ZOOM** (`map/stroke.ts`, 2026-08-02 — operator: "when i zoom out
+lines look thick enough but while zooming in they become too much thin"). Every line here is a
+fixed PIXEL width, which is not fixed in the sense that matters: each zoom level doubles the
+ground scale, so the same 2.5px stroke has to span twice the screen and a cable that read as a
+link across a town becomes a hairline crossing the viewport.
+
+- **The curve is linear in the ZOOM LEVEL, i.e. logarithmic in scale** (`1 + 0.135·(z − 13)`,
+  clamped to [1, 1.85]). Holding stroke-to-span ratio constant would mean DOUBLING the weight
+  per level — 2.5px would reach 160px by z19. What is wanted is a constant addition per
+  doubling. A feed goes 2.5 → 3.85px at z17, → 4.53 at z19.
+- **It FLOORS at 1.0** and so changes nothing at or below z13. The zoomed-out end was reported
+  as already right, so this may only thicken, never thin — which also keeps fleet altitude, the
+  zoom every weight in this app was originally judged at, byte-identical.
+- **ONE multiplier for every line, and that is the load-bearing part.** The relative weights
+  carry meaning that was tuned by eye: a feed (2.5) outranks a peer (2), a selected path (3.5)
+  outranks both, a dark drop (4.5) is heaviest in its layer, a hover adds half what emphasis
+  adds. A uniform factor preserves every ratio by construction; a per-kind curve would silently
+  re-rank them at some zoom nobody tested.
+- **The dash MUST scale with the weight, and `strokeAt`/`casingAt` take both together so a
+  caller cannot do one and forget the other.** This is the documented trap: SVG dash lengths are
+  absolute px, so widening a dotted line without opening its gaps closes it into a SOLID one —
+  and on this map solid means traced fibre a crew quotes drum off. Scaling both is exactly
+  zoom-invariant rather than approximately so: with round caps a dash paints `on + w` separated
+  by `off − w`, and `(on·k + w·k)/(off·k − w·k)` cancels k. Verified — the ref-ONU line reads
+  1.00 dot-to-gap at z13, z16 and z19 alike. `casingAt` applies the phase correction BEFORE
+  scaling, so casing and stroke periods stay equal at every zoom (8.5 → 15.39 together).
+- Applied to every geographic stroke: topology links + casings, ref/drop lines + casings, the
+  cut overlay, the branch-fault span, the power hull, the route editor, the worker trail + its
+  casing, the locate accuracy circle. Screen-space quantities are deliberately NOT scaled — the
+  chip collision boxes, the chip min-span tests and `CLUSTER_PX` are facts about the screen, not
+  about the ground.
+- **`ROUTE_FOLD_SLACK_PX` used to be on that list, did not belong there, and is now GONE
+  ENTIRELY** (2026-08-05) — see the next entry. Half the lesson still stands on its own: *a
+  constant in screen px is a bug wherever the other operand is a fact about the ground.* That one
+  was compared against a pin's displacement from its cluster centroid, which doubles per zoom
+  level, so it passed zoomed out and failed zoomed in.
+
+**A TRACED ROUTE IS DRAWN UNLESS IT HAS NOWHERE TO GO** (`map-page.tsx:foldedTogether`,
+2026-08-05). A cluster fold moves a pin to its site's centroid, so a route anchored on it starts
+slightly off where it was surveyed. **Three rules in a row tried to answer "how far is too far",
+and all three were wrong** — the third was found by the operator in one afternoon on
+badri_fiber's `Gpon_08→Gpon_04`, at exactly z17 and nowhere else.
+
+- The attempts: exact equality (racked gear never drew a route at all); then 10 screen px (the
+  ground-vs-screen unit bug above, permanent past z20); then 10px OR 8% of the anchored segment
+  — which still failed wherever the anchored segment is itself short. At z17 that OLT folds in
+  with SPL-1/SPL-5, the centroid sits **11.9px** off and the last segment is **24px**, so neither
+  clause could pass. z16 and z18 were fine, which is what "at specific zoom levels" means.
+- **Three attempts is the tell that the QUESTION is wrong**, because the outcomes are not
+  commensurable: a fold nudges the FIRST OR LAST SEGMENT by at most a cluster radius, leaves
+  every waypoint between untouched, and self-heals when the cluster splits — while a chord
+  replaces the whole surveyed path with a straight line **indistinguishable from a real one**,
+  which crews order drum off. Bounded cosmetic artifact versus unbounded false claim. There is no
+  distance at which the second wins, so the rule stops measuring and asks only whether the route
+  can be drawn at all: it can, unless BOTH ends landed on one point (every device in one badge,
+  where the route would be a scribble looping from a dot back to itself and a zero-length chord
+  is correct). Verified across z10–22 on every traced route both orgs have: the only folds left
+  are z10–11 on a fully collapsed org.
+- **`drawnLinks` no longer depends on `zoom`, and that is a property worth keeping** — the old
+  rule could change its mind per zoom level, and a map that draws surveyed cable at z16, a
+  straight line at z17 and cable again at z18 teaches an operator not to trust any of it.
+- Fixed alongside: an empty waypoint list (a `link_routes` row kept alive by a colour or a label
+  position) was setting `drawn: true`, which suppressed `linkhover`'s "straight-line" note on
+  what is geometrically a chord.
+
+**PASSIVE PLANT IS OUT OF THE CLUSTERING PASS** (`clusters.ts:buildClusters`, 2026-08-05 —
+operator: "passive devices should not combine with active devices, they should be treated like
+customer locations"). **A site badge is a claim about GEAR**: a count, a status ring and a card
+of boxes that each have a state and an outage. A splitter has none of those, so folding one in
+makes the count answer a question nobody asked ("4 devices, 1 down" where two are plastic) and
+hides the box a crew drives to behind a number. It is the same argument that already kept
+subscribers out of this pass — plant was simply on the wrong side of that line.
+
+- Each passive comes back as its OWN single-member cluster rather than being dropped. The render
+  walks this list, so a passive missing from it would vanish from the map, lose its `pinPos`
+  entry and orphan its drop lines.
+- It was not a corner case: badri_fiber's **Gpon_04 was buried inside a badge with up to four
+  splitters from z12 through z17** — that is the OLT an operator opens.
+- **This independently kills the z17 straight-line fold above**, since Gpon_04 was folding with
+  SPL-5 exactly there. The `foldedTogether` rule and this one are separate fixes for one report
+  and both are worth keeping: one stops plant hiding gear, the other stops any fold discarding
+  surveyed geometry.
+- Cost, accepted: dense plant now OVERLAPS at low zoom rather than folding — what subscribers
+  already do. Plant is far sparser than drops, and a splitter you can see beats a badge that
+  counts it. Consequence to keep in step: the clustering pass is no longer one of the things
+  telling a splitter from a subscriber, so the hole, the ratio plate and the plant-vs-drop rank
+  carry that alone.
+
+**MARK SIZE IS A LADDER, NOT A NUMBER** (`index.css:THE MARK SCALE`, 2026-08-05 — operator:
+"every time I add a new type like splitter they are again small size; make the sizing a proper
+standard so this won't happen"). Same shape of fix as the stroke multiplier, for the same
+failure: every new kind got a hand-picked px, every hand-picked px came in under the last, and
+the kind arrived unreadable. Splitter 40px² against an FDB's 81px²; a located subscriber drawn
+"the smallest mark on the map" TWICE (11px, then 9px), illegible both times; CPE at 10px, less
+than half the router beside it, with no comment saying why.
+
+- **A mark picks a RANK and a SHAPE FACTOR. It never types a px** — that is the whole rule, and
+  a new kind's only question is what it CLAIMS. Four ranks: `--mark-evidence` (a DARK reference
+  ONU, the one mark allowed to outrank gear, gated on `isRefEvidence` and nothing looser) >
+  `--mark-gear` (has a state and an outage) > `--mark-plant` (a passive box a crew drives to)
+  > `--mark-drop` (one subscriber).
+- **Ranks are stated as INK, so a rank is one number and every silhouette in it matches.** A
+  shape's area is not its width: at one width a square carries 0.97·W², a rounded square 0.89,
+  a teardrop 0.84, a circle 0.785, a diamond stated by its BOUNDING BOX 0.5 — which is exactly
+  how two kinds both reading "9px" in the source became a 2× ink difference on screen. A rank
+  is therefore the diameter of the equivalent CIRCLE and `--markshape-*` converts. Measured on
+  the OUTER silhouette: a hole (the core donut, the splitter) is how a kind is TOLD APART,
+  never how it is sized. Rotation is free — a rotated square is a `--markshape-square`.
+- **`--mark-gear` is the calibration and the OLT is what it was solved from** (the operator's
+  own reference: the OLT is "the right size, visible properly and easy to grasp"). 15.6px ×
+  `--markshape-square` = the 14px square it has always been, so the anchor is byte-identical to
+  the one mark already judged right on real tiles. The other ranks are RATIOS of it. **A "make
+  the marks bigger" ask is now ONE number** and no kind can be left behind by it. Measured after
+  the pass: within-rank ink agrees to ~1.5%.
+- **The steps between the three lower ranks are SMALL (1.10 / 1.00 / 0.98 / 0.96), and that is
+  the point, not a fudge: ink encodes ORDER here, never EMPHASIS.** Emphasis is tone (a live drop
+  is the quietest fill on the map, plant is always muted, only gear takes a status colour),
+  stacking (`refZIndex`/`workerZIndex` are negative), the clustering pass only GEAR joins, and
+  the Map-detail zoom floors. Ink's only other job is to clear a
+  LEGIBILITY floor. The first cut of this ladder still gave drop a 15% step down from plant and
+  the operator called it small AGAIN, an hour later and having been shown the ladder — the third
+  such report in three weeks, against an invariant ("shrinking is not a subordination channel")
+  that had been written down since 2026-07-29 and quoted rather than applied. A customer pin's
+  round head is now 14.50px against the OLT square's 14.01. **If a surveyed street ever reads as
+  too busy the levers are the zoom floor, the layer toggle, the PON scope and the fill
+  saturation; this number has been tried three times.**
+- **Corner radii, holes and the teardrop's tip offset are PROPORTIONS** (`%`, `--mark-tip`), not
+  px. A fixed px there makes a shape's factor drift with its rank, i.e. reintroduces the bug one
+  level down — and the subscriber pin's tip now lands ON its coordinate at every rank instead of
+  within ~1px at the one rank somebody measured.
+- What changed with it, all in the same direction: subscriber 101 → **176px²** of ink (the
+  actual complaint), dark witness 164 → 231, splitter 142 → 184, CPE 79 → 191, FDB/closure
+  ~79 → ~181, gear circles 154 → 191, OLT and backhaul UNCHANGED. **The witness/plain size gap
+  is retired**
+  — it was 1px, too small to be a distinction, and it was the reason a located subscriber was
+  hard to find; the RING (`--plain` drops it) and the tone carry that job now.
+- Subordination did NOT move: plant is still under gear and muted, a live drop is still the
+  quietest fill on the map, subscribers still stay out of the clustering pass and under every
+  device pin. Those are TONE, STACKING and CLUSTERING — **shrinking is not one of the channels**,
+  and it is the one that failed twice.
+
+**QUIETING A STATUS COLOUR MEANS CHROMA AT FIXED HUE, NEVER A MIX TOWARD THE GREY**
+(`index.css:--map-live`/`--map-live-quiet`, 2026-08-05 — operator: "use proper green for the
+pins because its blueish right now and its similar to dotted line"). `color-mix(… var(--success)
+N%, var(--muted-foreground))` does not desaturate green: this palette's greys lean COOL, so the
+mix drags HUE as it drops chroma, and the less chroma is left the more the cast is all there is.
+
+- **Measured, because it is invisible in a swatch and in review.** Dark: `--success` is hue 154°
+  chroma 0.126; the located-subscriber fill at 32% came out **hue 167° chroma 0.040**, light mode
+  **175°** (cyan) and 0.04 of lightness lower than anything asked for. `--map-link`, the DOTTED
+  DROP LINE the operator compared it to, carries chroma 0.057 — **the line was more colourful
+  than the pin on the end of it.** Now hue 155° at 0.085/0.072, 74–79° off the line.
+- The two tokens are `oklch(from var(--success) l calc(c * K) h)` — **derived from the token, not
+  a hex**, so a superadmin recolouring `--success` in Settings → Appearance carries through. They
+  are deliberately NOT in `theme.py:_TOKENS`, same as `--map-line-*`: cartography, not branding.
+- **The `@supports` pair is load-bearing, not ceremony.** A custom property holding an
+  unparseable value fails INVALID AT COMPUTED-VALUE TIME where it is USED, so `background` would
+  resolve to `unset` and the mark would vanish — the earlier-declaration fallback does not rescue
+  a `var()` indirection. (Lightning CSS then adds its own `color-mix` tier below ours; the built
+  chain is `var(--success)` → mix → oklch, in that cascade order.)
+- Fixed in all three places that had it: the live reference ONU, the located subscriber, and a
+  splitter whose drops are healthy. **If any of these needs to be quieter again, move the chroma
+  ratio and nothing else** — the moment it is mixed toward a grey it bends back toward the line.
+
+**Hover and zoom** (same pass): hovering a pin lights the CABLES INTO IT (`hoverId`, direct
+links only, +0.75 weight — selection still owns the whole downstream PATH, and if the two
+looked alike sweeping a dense site would read as the selection jumping). Mark hover affordance
+is **pure CSS on `transform`** — icons are cached by html string precisely so a re-render can't
+swap every marker's DOM node, and `useNow()` ticks this component every second, so a hover
+routed through React state would restart the down-pulse on mouseover; `width`/`height` are out
+because the dot anchors the optical ring, the impact ring and the pulse. `zoomSnap={0.25}` +
+`wheelPxPerZoomLevel={120}` because one wheel notch was a 2x scale jump and the level you want
+is usually between two of them — every threshold here is a `>=` and both chip budgets are in
+projected pixels, so fractional zoom is safe. The subscriber layer fades in (`wisp-mark-in`,
+opacity only, **no `to` keyframe** so a `--dim` mark still lands at 0.28). **A mount animation
+may ONLY go on a mark whose html string is stable** — Leaflet swaps the DOM node whenever
+`cachedDivIcon` returns a new icon, which REPLAYS the animation: rate chips rebuild on every
+reading, and worker marks embed `ago(last_fix.ts)` in their title so they rebuild about once a
+minute. Both are deliberately excluded; `refTitle()` carries no relative time, so diamonds are
+safe.
+
+Verified in a real browser, both themes, on live Google tiles against a copy of prod's DB —
+which is how the POI discs were found at all; they are invisible in a code review and were
+never in a screenshot anybody had cropped.
+
+**Hovering a BOX opens the same card a subscriber does** (2026-08-05, operator's ask). One
+frame, `map/hovercard.tsx` (`.wisp-mapcard*`, renamed from `wisp-refcard` when it stopped being
+subscriber-only): surface, tail, edge clamp, tinted verdict row, label/value rows, the
+two-entry icon cache. `map/refhover.tsx` and `map/devhover.tsx` supply only a MODEL of what
+each may claim — a second card grammar for the second thing that opens one is how a dashboard
+stops reading as one product.
+
+- **Gear is toned by `pinTone`, plant by `dropTone`** — the very functions that fill the two
+  marks, called (not re-derived) so a card can never grade a box differently from the pin that
+  opened it. Gear's hero number is its round trip, plant's is its recorded drops' MEDIAN Rx
+  (always `quiet`: it is reference, not a verdict, and it is measured on the drops still up).
+- **Every frozen rule carries over.** A DOWN box drops its ONU/port/vitals rows for one
+  `Readings: frozen while it is down`; a splitter whose OLT is down reads `N recorded · state
+  unknown` and names that OLT, because "6 of 6 dark" there is the OLT's outage restated on a
+  box that has no outage. That last one also FIXED THE PIN: `dropTone`, `passiveSubLabel` and
+  `passiveTitle` now take `frozen` and stand down together, or the tooltip contradicts the mark
+  it is attached to. Detection is untouched — `drops.branch_faults` already skips a down OLT.
+- **Rows are content-measured in a BROWSER, not estimated.** Three shipped truncated and were
+  caught only on screen: RAM pushed the vitals row past the value column (dropped — nobody acts
+  on a switch's memory), median+worst shared one row (split, median to the hero), and "below
+  this box's own median" ellipsised away the word `median`. `.wisp-mapcard__k` is 3rem and does
+  NOT ellipsize; "Readings" (~52px) is the longest key that fits, overhanging into the gap.
+- **The link-distance readout stands down near a pin** (`linkhover.tsx:PIN_KEEPOUT_PX`, the
+  operator's actual complaint). Within a box's reach every cable into it is inside
+  `HOVER_SLACK_PX`, so the readout has nothing to say — ~0 to one end, the whole span to the
+  other — and it fought the card. 32px, and the number is set by WHERE THE RING IS CENTRED:
+  `.wisp-pin` is a dot-over-label column translated -50%, so the coordinate the lines converge
+  on sits ~12px BELOW the visible dot. A ring sized to the dot's own radius left the readout
+  alive to within 18px of it (measured). Suppressed outright while any card is open, same rule
+  as selection and subscriber hover.
+- **Passive marks are sized by INK and were left out of the subscriber pass.** All three read
+  "9px" and were three different marks — a rotated square covers half its bounding box, a circle
+  ~79% — so the SPLITTER, the box a crew drives to, carried 40px² against the FDB's 81px². Now
+  ~72–81px² each (splitter 12px, closure 10px, FDB 9px): half a device dot (154px²), level with
+  a located subscriber's diamond (13px, 84px²). Checked on real tiles at 9/12/13/14 — 14 read as
+  competing with the dark-subscriber mark, the one thing on that layer allowed to shout.
 - **Chrome-over-tiles trap**: shadcn outline Buttons carry `dark:bg-input/30`, which BEATS a
   plain `bg-popover/95` override in dark mode — map chrome needs
   `bg-popover/95 dark:bg-popover/95`.
@@ -1737,8 +2677,14 @@ data ©Google" only reads as confusion about who supplies what.
   reads out ground distance to each end (`map/linkhover.tsx`), but polylines must stay
   non-interactive, so the probe projects the cursor and walks pre-projected geometry. Distances
   are walked segment-by-segment in METRES (`geometry.alongKm`), not a projected fraction —
-  Mercator stretches with latitude and a splicing crew orders drum off this; the readout labels
-  itself "along cable" vs "straight-line" for the same reason. Two perf invariants: the readout
+  Mercator stretches with latitude and a splicing crew orders drum off this. **Only the CHORD
+  case is labelled** — "straight-line" stays for exactly that reason, while "along cable" was
+  dropped as obvious (operator's call, 2026-07-31: the traced line already shows what was
+  measured, so the words captioned the picture; a chord looks identical to a cable and doesn't).
+  **The readout is also suppressed while anything is SELECTED** (device panel, site card,
+  subscriber card): a card open means the operator is reading one object, and measuring every
+  cable the cursor crosses on the way to it is noise — closing the card re-arms it. Two perf
+  invariants: the readout
   icon must NOT go through `cachedDivIcon` (its text changes per pixel, and a cache overflow
   `clear()`s the pin icons, restarting every down-pulse), and the probe calls `setHover` only
   when the rounded readout CHANGES (mousemove fires per pixel and the common case is "nowhere
@@ -1894,7 +2840,7 @@ just where the lock file and supervisor transient files live.
   naive. `core/analytics._parse` normalizes both — reuse it.
 - Schema: `central/store.py`'s `_SCHEMA` + `_ensure_columns` is the only schema.
 - **`CentralStore` is split into domain mixins** (`store_orgs/users/fleet/devices/outages/
-  snmp.py`, helpers in `store_util.py`) composed in `store.py`, which keeps `_SCHEMA`,
+  snmp/field.py`, helpers in `store_util.py`) composed in `store.py`, which keeps `_SCHEMA`,
   `__init__`, `_connect`/`_scope` and the class attrs. New store methods go in the matching mixin
   file; import `CentralStore` from `wisp.central.store` as before — the mixins are not a public
   API.

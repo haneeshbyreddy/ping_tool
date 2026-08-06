@@ -225,7 +225,7 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
                 ? "No matching devices. Type 3+ letters to search subscribers and places too."
                 : (places.isFetching || rosterQ.isFetching) ? "Searching…"
                 : places.isError ? "No device or subscriber matches; place search is unreachable."
-                : "Nothing found — no device, subscriber or place matches."}
+                : "Nothing found. No device, subscriber or place matches."}
             </p>
           )}
         </Card>

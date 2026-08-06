@@ -27,18 +27,35 @@ import type L from "leaflet"
 import { cachedDivIcon, esc } from "@/map/pins"
 import type { BranchFault, OrgDevice, SplitterLoad } from "@/lib/types"
 
-export type DropTone = "dark" | "weak" | "quiet"
+export type DropTone = "dark" | "weak" | "ok" | "quiet"
 
 /** Tone for a passive pin, from what its RECORDED subscribers are doing.
  *
  *  Deliberately not the device's own state: a splitter has no state — it has no
  *  power, no FSM and nothing to ping. What it can report is the health of what
- *  hangs below it, which is the only thing a splitter on a map can honestly say. */
-export function dropTone(load: SplitterLoad | undefined): DropTone {
+ *  hangs below it, which is the only thing a splitter on a map can honestly say.
+ *
+ *  `ok` and `quiet` are different sentences and were one for a while (operator's
+ *  call, 2026-08-05: plant takes a full status colour now). "Every recorded drop
+ *  on this box is online" is a MEASUREMENT; "nobody has recorded a drop here" is
+ *  an empty record, and a map that paints them alike is the "nothing is wrong"
+ *  vs "nothing is measured" confusion on a splitter. The hover card had already
+ *  drawn the line — `plantVerdict` grades a healthy box `success` — so the pin
+ *  was the half that disagreed with the card it opens. */
+export function dropTone(load: SplitterLoad | undefined, frozen = false): DropTone {
+  // A DOWN OLT darkens every ONU behind it, so "all six recorded subscribers
+  // are dark" stops being a fact about this branch and becomes that outage
+  // reported a second time — on a box that has no outage of its own. Same rule
+  // the tree row keeps for its SNMP chips and the bandwidth summary for its
+  // alarms: a mark is a claim about NOW, and behind an unreachable box there is
+  // nothing current to claim. The hover card says so in words; the pin simply
+  // stands down. (Its DETECTION is untouched — `drops.branch_faults` already
+  // skips a down OLT server-side, so nothing that pages changes here.)
+  if (frozen) return "quiet"
   if (!load || load.recorded === 0) return "quiet"
   if (load.dark > 0) return "dark"
   if (load.crit > 0 || load.warn > 0 || load.outliers > 0) return "weak"
-  return "quiet"
+  return "ok"
 }
 
 export const ratioLabel = (r: number | null | undefined): string | null =>
@@ -53,32 +70,42 @@ export const ratioLabel = (r: number | null | undefined): string | null =>
 export const isOversubscribed = (d: OrgDevice, load?: SplitterLoad): boolean =>
   !!d.split_ratio && !!load && load.recorded > d.split_ratio
 
-/** The second line under a passive's name on the map: ratio and recorded load.
+/** What a passive writes on its plate: its SPLIT RATIO, and nothing else.
  *
- *  Returns null when there is nothing to say — an unrecorded closure adds no
- *  glyph, because a map that annotates every box teaches the eye to skip
- *  annotations. */
-export function passiveSubLabel(d: OrgDevice, load?: SplitterLoad): string | null {
-  const ratio = ratioLabel(d.split_ratio)
-  if (!ratio && !load?.recorded) return null
-  const parts: string[] = []
-  if (ratio) parts.push(ratio)
-  if (load?.recorded) {
-    // "6" alone next to "1:8" would read as occupancy; the bullet keeps them two
-    // facts. The full sentence lives in the title and the panel.
-    parts.push(`${load.recorded}`)
-  }
-  if (load?.dark) parts.push(`${load.dark} dark`)
-  return parts.join(" · ")
+ *  It REPLACES the name rather than sitting beside it (operator's call,
+ *  2026-08-05). Plant names on a real fleet run long and arbitrary — `medha`,
+ *  `manjulapur`, `collectorate`, `IK REDDY` — and a splitter is not read for its
+ *  name: the ratio is what says whether a PON has budget left, and it is three
+ *  characters against fifteen. The recorded count and the dark count went with
+ *  the name: both are still carried by the tone the MARK takes (`dropTone`),
+ *  spelled out in the hover card, counted in the panel, and written in full in
+ *  `passiveTitle` below — so the map loses ink here, not facts.
+ *
+ *  A box with NO recorded ratio keeps its name. That is not a hedge against the
+ *  instruction: it is the only other thing the plate can say, and the plate is
+ *  load-bearing — since plant left the clustering pass it is one of the two
+ *  channels (with the hole in the mark) telling a splitter from a customer, both
+ *  of which are teardrop pins at nearly the same ink. A blank plate would spend
+ *  one of the two. FDB and closure have no ratio by nature and so always name
+ *  themselves; every splitter on the live fleet has one. */
+export function passivePinLabel(d: OrgDevice): string {
+  return ratioLabel(d.split_ratio) ?? d.name
 }
 
-export function passiveTitle(d: OrgDevice, load?: SplitterLoad): string {
+export function passiveTitle(d: OrgDevice, load?: SplitterLoad,
+                             frozen = false): string {
   const bits: string[] = [d.name]
   const ratio = ratioLabel(d.split_ratio)
   if (ratio) bits.push(`${ratio} splitter`)
   if (d.pon_port) bits.push(`PON ${d.pon_port}`)
   if (!load || load.recorded === 0) {
     bits.push("no subscribers recorded")
+  } else if (frozen) {
+    // Third place the same claim would otherwise be made: tone, sub-label and
+    // this. All three stand down together behind a down OLT, or the tooltip
+    // contradicts the pin it is attached to.
+    bits.push(`${load.recorded} recorded subscriber${load.recorded === 1 ? "" : "s"}`)
+    bits.push("readings frozen while its OLT is down")
   } else {
     // "recorded", every time. The map may not imply it knows the rest.
     bits.push(`${load.recorded} recorded subscriber${load.recorded === 1 ? "" : "s"}`)
@@ -145,7 +172,7 @@ export function branchTitle(f: BranchFault, name: string, parentName: string): s
   return `${what}${pon} · all ${f.dark} recorded subscriber`
     + `${f.dark === 1 ? "" : "s"} below ${name} are dark`
     + ` while ${f.lit_siblings} on sibling branches stay lit`
-    + ` — suspect the span ${parentName} → ${name}`
+    + ` · suspect the span ${parentName} → ${name}`
     + (f.witness_dark
       ? ` · ${f.witness_dark} power-backed reference ONU dark, so power can't explain it`
       : "")

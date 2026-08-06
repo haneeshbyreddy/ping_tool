@@ -164,12 +164,12 @@ def totp_confirm(h, user, body):
     try:
         secret = h.secretbox.decrypt(target["totp_secret"])
     except Exception:
-        h._reply(422, {"error": "two-factor setup expired — start again"})
+        h._reply(422, {"error": "two-factor setup expired. Start again."})
         return
     step = totp.verify(secret, body.get("code", ""))
     if step is None:
-        h._reply(422, {"error": "that code didn't match — check your phone's "
-                                "clock and try again"})
+        h._reply(422, {"error": "that code didn't match. Check your phone's "
+                                "clock and try again."})
         return
     codes = totp.new_recovery_codes()
     h.store.activate_totp(user["id"], json.dumps([totp.recovery_hash(c) for c in codes]))

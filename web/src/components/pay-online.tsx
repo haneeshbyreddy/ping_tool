@@ -28,14 +28,14 @@ export function IvePaidButton({
     try {
       await billingApi.markPaid(org)
       setPhase("sent")
-      toast.success("Thanks — we've let the team know. Your dashboard unlocks "
+      toast.success("Thanks, we've let the team know. Your dashboard unlocks "
         + "the moment your payment is confirmed.")
       // billing itself doesn't change yet (the admin marks the month), but a
       // refetch keeps the card honest if they already did
       queryClient.invalidateQueries({ queryKey: ["billing"] })
     } catch (e) {
       setPhase("idle")
-      toast.error(e instanceof ApiError ? e.message : "Couldn't send that — try again")
+      toast.error(e instanceof ApiError ? e.message : "Couldn't send that. Try again.")
     }
   }
 

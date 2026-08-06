@@ -278,7 +278,7 @@ def preflight_endpoint(proxy, cfg, org: str, node: str, device_id: int,
         return ip, port, scheme, None  # edge answered but probed nothing we know
     tried = ", ".join(f"{s}://{i}:{p}" for i, p, s in cands)
     return ip, port, scheme, (
-        "device web UI unreachable from the probe — nothing answered at "
+        "device web UI unreachable from the probe. Nothing answered at "
         f"{tried}. Check that the web UI is enabled and the address/port is "
         "right (Web UI settings on the device row).")
 

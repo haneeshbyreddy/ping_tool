@@ -21,8 +21,8 @@ function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => void 
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm text-muted-foreground">
-        Save these somewhere safe. Each one works once, and they are the only way
-        back in if you lose your phone — they won't be shown again.
+        Save these somewhere safe. Each works once, they are the only way back in
+        if you lose your phone, and they won't be shown again.
       </p>
       <div className="grid grid-cols-2 gap-x-6 gap-y-1 rounded-lg border bg-muted p-3 font-mono text-sm">
         {codes.map((c) => <span key={c}>{c}</span>)}
@@ -192,7 +192,7 @@ function RegenerateDialog() {
         ) : (
           <div className="flex flex-col gap-3">
             <p className="text-sm text-muted-foreground">
-              This replaces your old codes — any you haven't used stop working.
+              This replaces your old codes. Any you haven't used stop working.
               Confirm your password and a current authenticator code.
             </p>
             <div className="flex flex-col gap-1.5">
@@ -236,7 +236,7 @@ export function TwoFactorCard() {
         <p className="text-sm text-muted-foreground">
           {enabled
             ? "On. A code from your authenticator app is required each time you sign in."
-            : "Off. Add a second step at sign-in with an authenticator app — strongly recommended for the account that configures your network."}
+            : "Off. Add a second step at sign-in with an authenticator app. Strongly recommended for the account that configures your network."}
         </p>
         {enabled
           ? <div className="flex gap-2"><RegenerateDialog /><DisableDialog /></div>

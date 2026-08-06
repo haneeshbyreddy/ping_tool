@@ -65,7 +65,7 @@ export function AssignOutage({ outage }: { outage: Outage }) {
       toast.success(
         `Assigned to ${res.assigned_to.join(", ")}`,
         missed > 0
-          ? { description: `${missed} of them has no WhatsApp number — tell them another way.` }
+          ? { description: `${missed} of them has no WhatsApp number. Tell them another way.` }
           : undefined)
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Could not assign"),

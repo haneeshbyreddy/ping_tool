@@ -308,6 +308,34 @@ def _clean_name(raw) -> str | None:
     s = (raw or "").strip()
     return None if s.upper() in ("", "NULL", "N/A", "NONE") else s
 
+def _metric_state(cells: dict, profile: GponProfile) -> str:
+    """An ABSENT state cell is `unknown`; only a state VALUE gets the default.
+
+    Rows here are assembled from whichever columns happened to arrive (`_place`
+    creates one per OID index), so an ONU can exist with no state cell at all —
+    and this is not hypothetical: these C-Data/Syrotech agents silently end a
+    GETBULK walk at a batch boundary, returning an incomplete column while
+    pysnmp reports a clean finish. Walk 187 of Gpon_04 stopped 65 rows into a
+    column that has 180.
+
+    Folding that into `state_default` made the tail of a truncated column read
+    as OFFLINE — live subscribers rendered dark, and `ponfault` counting them
+    as a mass-drop cohort, i.e. a fabricated fibre cut with nothing anywhere
+    reporting an error. `ponfault.DARK_STATES` already excludes `unknown` for
+    exactly this ("a vendor decode gap must not read as an outage cohort"); the
+    edge simply never produced it.
+
+    The distinction is the same one `_sane_optics` draws: an absent column is a
+    fact about the firmware, a missing value in a column that EXISTS is a fact
+    about this row. So a profile that maps no state OID still gets its default
+    (it is telling us it cannot know), while a profile that maps one and comes
+    back short says `unknown` rather than guessing dark.
+    """
+    raw = cells.get("state")
+    if profile.oid_state and raw is None:
+        return STATE_UNKNOWN
+    return profile.decode_state(raw if raw is not None else "")
+
 def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
     # Identity is the ONU's physical SLOT — the metric table's own OID index —
     # never its serial, the same rule the registration path below already states.
@@ -326,7 +354,7 @@ def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
         onu_id=_derive_onu_id(idx),
         name=_clean_name(cells.get("name")),
         serial=serial,
-        state=profile.decode_state(cells.get("state", "")),
+        state=_metric_state(cells, profile),
         rx_dbm=_to_float(cells.get("rx"), profile.rx_scale),
         tx_dbm=_to_float(cells.get("tx"), profile.tx_scale),
         distance_m=_to_int(cells.get("distance"), profile.distance_scale),

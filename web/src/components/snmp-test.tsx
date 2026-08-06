@@ -36,7 +36,7 @@ export async function runSnmpTest(
   try {
     toast.loading(`Testing SNMP on ${device.name}…`, {
       id: tid, duration: Infinity,
-      description: "The probe runs a tiny system walk on its next report — usually under 2 minutes.",
+      description: "The probe runs a tiny system walk on its next report, usually under 2 minutes.",
     })
     let walkId: number
     try {
@@ -62,7 +62,7 @@ export async function runSnmpTest(
         if (Date.now() - started > MAX_WAIT_MS) {
           toast.error(`SNMP test on ${device.name} never ran`, {
             id: tid,
-            description: "The probe hasn't picked it up — is it online and reporting?",
+            description: "The probe hasn't picked it up. Is it online and reporting?",
           })
           return
         }
@@ -79,7 +79,7 @@ export async function runSnmpTest(
         } else {
           toast.warning(`SNMP answered on ${device.name}, but with nothing`, {
             id: tid, duration: 10_000,
-            description: "The agent responded yet its system table is empty — unusual firmware; try a full walk.",
+            description: "The agent responded but its system table is empty. Unusual firmware; try a full walk.",
           })
         }
         return
@@ -91,7 +91,7 @@ export async function runSnmpTest(
         id: tid, duration: 15_000,
         description: noAnswer
           ? `No response from ${target}. Check that UDP ${device.snmp_port || 161} reaches the device ` +
-            "(port-forward?) and the community string is right — in SNMP v2c a wrong " +
+            "(port-forward?) and the community string is right. In SNMP v2c a wrong " +
             "community looks identical to no response."
           : err,
       })

@@ -69,8 +69,8 @@ function MyWhatsappCard() {
       </CardHeader>
       <CardContent className="flex flex-col gap-2.5">
         <p className="text-xs text-muted-foreground">
-          The number this account is paged on. Alerts go out over WhatsApp — every owner and
-          worker account with a number gets every alert. Leave blank to opt out of alerts.
+          The number this account is paged on. Every owner and worker account with a
+          number gets every WhatsApp alert. Leave blank to opt out.
         </p>
         <div className="flex flex-col gap-1.5">
           <Label>Your WhatsApp number</Label>

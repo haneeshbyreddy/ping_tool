@@ -183,9 +183,9 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
       </CardHeader>
       <CardContent className="flex flex-col gap-0 p-0">
         <p className="px-4 pb-3 text-xs text-muted-foreground">
-          Teach the edge a new vendor's CPU/RAM/temperature OIDs as data. No code change or
-          rollout. The edge matches a profile to a device by its sysObjectID and fills any
-          reading the standard MIBs don't expose. {isSuperadmin && "Profiles you add here are global (every org's edges receive them)."}
+          Teach the edge a new vendor's CPU/RAM/temperature OIDs as data. No rollout.
+          Matched to a device by its sysObjectID, filling any reading the standard MIBs
+          don't expose. {isSuperadmin && "Profiles you add here are global (every org's edges receive them)."}
         </p>
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}
         {!isLoading && profiles.length === 0 && !adding && (

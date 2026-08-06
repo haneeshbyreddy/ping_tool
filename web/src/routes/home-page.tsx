@@ -114,7 +114,17 @@ function filterFor(label: string, ids: number[]): Stat["filter"] {
 function StatTile({ s }: { s: Stat }) {
   const body = (
     <>
-      <p className="wisp-eyebrow truncate pr-7">{s.label}</p>
+      {/* NOT `.wisp-eyebrow`. An eyebrow is a micro-label above a GROUP, and
+          that is still what the other 13 uses of it are. This one names the
+          number directly under it — it is the half of the tile you read to know
+          what the figure means — and it was set as the quietest thing on the
+          card: 12px, uppercase, letterspaced, --faint-foreground at 4.80:1
+          against a 30px figure. That is the giant-number-over-tiny-label
+          pattern, and it makes a wall of ten tiles unreadable without leaning
+          in. Now 13px, sentence case, --muted-foreground at 7.27:1. It stays
+          BELOW the figure in rank (the number is the live state, the label is
+          reference) — readable, not loud. */}
+      <p className="truncate pr-7 text-xs font-medium text-muted-foreground">{s.label}</p>
       {s.loading ? <Skeleton className="mt-3.5 h-7 w-14" /> : (
         <p className={cn(
           "mt-3.5 font-mono text-3xl leading-none font-medium tracking-tight",
@@ -144,7 +154,7 @@ function StatTile({ s }: { s: Stat }) {
     // <a> wrapping everything: a second interactive control nested inside an
     // anchor is invalid, and the corner action has to sit above it.
     <div className={cn(shell, "relative")}>
-      <Link to={s.to} state={state} aria-label={`${s.label} — filter the network`}
+      <Link to={s.to} state={state} aria-label={`${s.label} · filter the network`}
         className="absolute inset-0 z-0 rounded-[inherit]" />
       {body}
       {listable && (
@@ -444,6 +454,47 @@ export function HomePage() {
 
   const allStats = hasOptics ? [...stats, ...opticalStats] : stats
 
+  // A tile reading ZERO is the absence of news, and ten equal cards is what you
+  // get when nobody has decided what matters. Split them: anything with a
+  // non-zero count or a status tone keeps a card, the rest collapse into one
+  // strip. `24/24` and `1007/1579` are NOT zero — they are the fleet's two
+  // denominators and stay loud — so the test is on the leading number, not on
+  // the tone.
+  const isZero = (s: Stat) =>
+    !s.tone && (s.value === 0 || s.value === "0") && !s.loading
+  const loudStats = allStats.filter((s) => !isZero(s))
+  const quietStats = allStats.filter(isZero)
+
+  // THE VERDICT HAS TO COVER THE WHOLE PAGE, or it must not use the words "all
+  // clear". It used to read "All clear. No open outages, every probe reporting."
+  // directly BELOW tiles saying 85 critical ONUs and 128 warning — true
+  // sentence, false impression, and the one claim a NOC screen may never make
+  // wrongly. `triageCount` only ever counted outages and stale probes, i.e. the
+  // REACHABILITY plane; the optical plane was never in it.
+  // So the verdict now grades on everything the page shows, and the middle case
+  // gets its own words: nothing is DOWN, and that is not the same as nothing
+  // being WRONG.
+  const troubled = allStats.filter((s) => s.tone && !s.loading)
+  const verdict = triageCount > 0
+    ? null                                  // the triage queue speaks for itself
+    : troubled.length === 0
+      ? { tone: "success" as const, head: "All clear.",
+          rest: "No open outages, every probe reporting." }
+      : { tone: "warning" as const,
+          head: "Nothing is down.",
+          // Names the two worst and COUNTS the rest. Listing all four produced a
+          // sentence that ran the width of the page, and lower-casing the labels
+          // to make it read as prose turned "Critical ONUs" into "critical onus"
+          // — the acronyms in this domain are most of the nouns, so they are left
+          // exactly as the tiles spell them.
+          rest: `Every device is up and every probe reporting, but ${
+            [...troubled]
+              .sort((a, b) => (a.tone === "destructive" ? 0 : 1) - (b.tone === "destructive" ? 0 : 1))
+              .slice(0, 2)
+              .map((t) => `${t.value} ${t.label}`)
+              .join(", ")
+          }${troubled.length > 2 ? `, and ${troubled.length - 2} more` : ""} need attention.` }
+
   return (
     <div className="wisp-page flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div className="flex items-center justify-between gap-4">
@@ -458,27 +509,50 @@ export function HomePage() {
         </div>
       </div>
 
-      {/* 10 tiles once the optical plane is live: 5-up on a wide NOC screen
-          leaves two tidy rows rather than a 4/4/2 stub. A no-fiber org keeps
-          its single row of four. */}
-      <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4",
-        hasOptics && "xl:grid-cols-5")}>
-        {allStats.map((s) => <StatTile key={s.key} s={s} />)}
-      </div>
-
-      {/* Triage only claims screen space when something actually needs triage — a
-          healthy network gets one quiet all-clear line, not a large empty box. */}
       {triageLoading && <Skeleton className="h-12 w-full rounded-xl" />}
-      {!triageLoading && triageCount === 0 && (
+      {!triageLoading && verdict && (
         <div className="wisp-panel flex flex-wrap items-center gap-x-3 gap-y-1 px-5 py-3.5">
-          <span className="size-2 shrink-0 rounded-full bg-success ring-4 ring-success/15" />
-          <span className="text-sm font-medium text-foreground">All clear.</span>
-          <span className="text-sm text-muted-foreground">No open outages, every probe reporting.</span>
+          <span className={cn("size-2 shrink-0 rounded-full",
+            verdict.tone === "success" ? "bg-success ring-4 ring-success/15"
+              : "bg-warning ring-4 ring-warning/15")} />
+          <span className="text-sm font-medium text-foreground">{verdict.head}</span>
+          <span className="text-sm text-muted-foreground">{verdict.rest}</span>
           {lastSeen && (
             <span className="ml-auto text-xs text-faint-foreground">Last check {ago(lastSeen)}</span>
           )}
         </div>
       )}
+
+      {/* BAND 2 — only the tiles that are SAYING something.
+          Ten equal tiles is what you produce when you have not decided what
+          matters: on a healthy fleet four of them read 0 and still spend a full
+          card each, so the two that are shouting have to compete with eight that
+          are not. A tile reading zero is not news — it is the ABSENCE of news —
+          so it collapses into one quiet strip below, where it remains readable
+          and clickable but costs no attention. */}
+      {loudStats.length > 0 && (
+        <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4",
+          loudStats.length >= 5 && "xl:grid-cols-5")}>
+          {loudStats.map((s) => <StatTile key={s.key} s={s} />)}
+        </div>
+      )}
+
+      {/* BAND 3 — the all-clear strip. Every one of these reads zero, and a zero
+          is worth SEEING (it is the difference between "no fiber cuts" and "we
+          are not looking for fiber cuts") but not worth a card. */}
+      {quietStats.length > 0 && (
+        <div className="wisp-panel flex flex-wrap items-center gap-x-5 gap-y-2 px-5 py-3">
+          {quietStats.map((s) => (
+            <span key={s.key} className="flex items-baseline gap-1.5 text-xs">
+              <span className="font-mono font-medium text-muted-foreground">{s.value}</span>
+              <span className="text-faint-foreground">{s.label.toLowerCase()}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Triage only claims screen space when something actually needs triage — a
+          healthy network gets one quiet all-clear line, not a large empty box. */}
       {!triageLoading && triageCount > 0 && (
         <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between">
@@ -552,9 +626,18 @@ export function HomePage() {
                   {!unassigned && !stale && d.state === "UP" && d.packet_loss != null && d.packet_loss > 0 && (
                     <span className="font-mono text-xs text-warning">{Math.round(d.packet_loss)}% loss</span>
                   )}
+                  {/* A 30-DAY ROLLUP IS REFERENCE, NOT STATE. This was drawn in
+                      --warning below 99%, which made it one of only six
+                      chromatic elements on a healthy Home — a historical
+                      average wearing an alarm tone while the device's LIVE
+                      verdict was a 6px dot beside its name. Reference outranking
+                      state is the inversion this pass exists to remove. It stays
+                      readable and still sorts the panel; it just stops
+                      shouting. A device that is actually in trouble says so
+                      through the dot, the state word, and the loss figure. */}
                   {uptime != null && (
-                    <span className={cn("hidden w-16 font-mono text-xs sm:inline",
-                      uptime < 99 ? "text-warning" : "text-faint-foreground")}>
+                    <span className="hidden w-16 font-mono text-xs text-faint-foreground sm:inline"
+                      title={`${fmtUptime(uptime)} uptime over the last 7 days`}>
                       {fmtUptime(uptime)}
                     </span>
                   )}

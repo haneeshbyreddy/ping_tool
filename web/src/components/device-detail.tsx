@@ -3,7 +3,7 @@
 import { useEffect, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, Plus, X } from "lucide-react"
+import { ChevronRight, Plus, X, type LucideIcon } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { analyticsApi, inventoryApi } from "@/lib/api"
 import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
@@ -15,9 +15,10 @@ import { DistributionPanel } from "@/components/splitter-panel"
 import {
   WebUiButton, WebUiCredentialsButton, canOpenWebUi, useCanManageCreds, useWebProxy,
 } from "@/components/web-proxy"
-import { bucketTrouble, HourStrip } from "@/components/sparkline"
-import { StatusDot } from "@/components/status-badge"
-import { ago, durationSince, fmtBytes, fmtDur, isDownState, isFresh, isStale } from "@/lib/format"
+import { bucketTrouble, HourStrip, TrendSpark } from "@/components/sparkline"
+import { CHIP_BOX, PlaneDot, StatusDot, TONE_CLASS } from "@/components/status-badge"
+import type { Plane } from "@/lib/planes"
+import { ago, durationSince, fmtBytes, fmtDur, fmtMs, isDownState, isFresh, isStale } from "@/lib/format"
 import { paletteVarOf } from "@/lib/palette"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -224,8 +225,7 @@ export function DeviceMetrics({ device }: { device: OrgDevice }) {
   if (device.state === "DOWN" || device.state === "UNREACHABLE") {
     return <span className="text-xs font-semibold text-destructive">{device.state}</span>
   }
-  const latency = device.latency_ms == null ? "—"
-    : `${device.latency_ms < 10 ? device.latency_ms.toFixed(1) : Math.round(device.latency_ms)} ms`
+  const latency = device.latency_ms == null ? "—" : `${fmtMs(device.latency_ms)} ms`
   const loss = device.packet_loss ? ` · ${Math.round(device.packet_loss)}% loss` : ""
   if (device.state === "DEGRADED") {
     return (
@@ -344,8 +344,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
   const roughHours = buckets.filter((b) => bucketTrouble(b)).length
   const isDown = isDownState(device.state)
 
-  const fmtMs = (v: number) => v < 10 ? v.toFixed(1) : String(Math.round(v))
-
   return (
     <div className="flex flex-col gap-2.5 rounded-lg border bg-muted/40 p-3">
       {/* now + verdict --------------------------------------------------------- */}
@@ -392,6 +390,9 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
               : roughHours > 0 ? `${roughHours} rough hour${roughHours === 1 ? "" : "s"}` : "clean"}
           </span>
         </div>
+        {/* the SHAPE, then the VERDICT — same grid, same 24 slots, so a rising
+            line and the hour it finally went rough line up vertically */}
+        <TrendSpark buckets={buckets} />
         <HourStrip buckets={buckets} />
         <div className="mt-0.5 flex justify-between text-2xs text-muted-foreground">
           <span>24 h ago</span><span>now</span>
@@ -611,7 +612,7 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
   const addBackup = useMutation({
     mutationFn: (parentId: number) => inventoryApi.addBackupLink(device.id, parentId),
     onSuccess: () => {
-      toast.success("Backup uplink added — the ring closes here")
+      toast.success("Backup uplink added. The ring closes here.")
       queryClient.invalidateQueries({ queryKey: ["inventory"] })
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to add the backup link"),
@@ -688,13 +689,13 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
             {!showPeers && canWrite && candidates.length > 0 && (
               <Button variant="ghost" size="sm"
                 className="-mt-1 h-6 self-start px-1.5 text-2xs text-faint-foreground hover:text-foreground"
-                title="Add a cross-link — a cable to a device at the same level (documents the plant; does not affect alerting)"
+                title="Add a cross-link: a cable to a device at the same level. Documents the plant; does not affect alerting."
                 onClick={() => setAddingPeer(true)}>
                 <Plus className="size-3" /> cross-link
               </Button>
             )}
             {!parent && backups.length === 0 && (
-              <p className="text-xs text-faint-foreground">No uplink — root device.</p>
+              <p className="text-xs text-faint-foreground">No uplink · root device.</p>
             )}
             {parent && <LinkRow near={self} far={parent} kind="primary" />}
             {backups.map((b) => <LinkRow key={b.id} near={self} far={b} kind="backup" />)}
@@ -724,7 +725,7 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
             <div className="flex flex-col gap-1 border-t pt-2.5">
               <div className="flex items-center gap-2">
                 <span className="text-2xs font-medium text-muted-foreground"
-                  title="Switch-to-switch cabling at the same level. Records the plant and shows live bandwidth; it does not affect alerting — declare a backup uplink if a path should actually fail over.">
+                  title="Switch-to-switch cabling at the same level. Records the plant and shows live bandwidth. It does not affect alerting: declare a backup uplink if a path should actually fail over.">
                   Cross-links
                 </span>
                 {peers.length === 0 && (
@@ -760,7 +761,20 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
   )
 }
 
-export function RowTag({ tone, children, onClick, title, color }: {
+/** The inline chip carried by a Network tree row, an ONU row and a map search
+ *  hit. It IS `Chip` (status-badge.tsx) — same box, same tone formula — with
+ *  two additions that only a row needs: a click target that deep-links into the
+ *  panel tab telling its story, and the operator-palette paint path.
+ *
+ *  IT USED TO BE ITS OWN GRAMMAR and that was the whole reason the Network page
+ *  read as noise: UPPERCASE + `tracking-wide` + `font-semibold` with a fill and
+ *  NO edge. That is the loudest type in this system, and it was spent equally
+ *  on "7 FIBER CUTS" and on "MAINT" — so the loud style stopped meaning
+ *  anything, and a busy OLT row was four shouting blocks with no rank between
+ *  them. Sentence case with a 30% edge is the documented formula and the one
+ *  Home and /issues already use; the Network page was the screen that never
+ *  got it. Severity is carried by TONE, which is the only channel that ranks. */
+export function RowTag({ tone, children, onClick, title, color, icon: Icon }: {
   tone: "warning" | "success" | "muted" | "destructive"
   children: ReactNode
   onClick?: (e: MouseEvent) => void
@@ -769,21 +783,20 @@ export function RowTag({ tone, children, onClick, title, color }: {
    *  carries no status meaning (today: tags). It renders at the SAME weight the
    *  tone classes do, so a coloured tag can't outshout a real alarm chip. */
   color?: string | null
+  /** A mark for the one chip worth identifying BEFORE it is read. Deliberately
+   *  rare: an icon on every chip is the uppercase problem in another channel. */
+  icon?: LucideIcon
 }) {
   const painted = paletteVarOf(color)
-  const cls = {
-    warning: "bg-warning-soft text-warning",
-    success: "bg-success-soft text-success",
-    muted: "bg-muted text-muted-foreground",
-    destructive: "bg-destructive-soft text-destructive",
-  }[tone]
   return (
     <span title={title} onClick={onClick}
       // the tone is DATA, so it rides a custom property into .wisp-tag, which
       // owns the light/dark readability correction (index.css)
       style={painted ? ({ "--tag": painted } as CSSProperties) : undefined}
-      className={cn("shrink-0 rounded px-1.5 py-px text-2xs font-semibold tracking-wide uppercase",
-        onClick && "cursor-pointer hover:brightness-125", painted ? "wisp-tag" : cls)}>
+      className={cn(CHIP_BOX, "gap-1 px-1.5",
+        onClick && "cursor-pointer hover:brightness-125",
+        painted ? "wisp-tag" : TONE_CLASS[tone])}>
+      {Icon && <Icon className="size-3 shrink-0" aria-hidden />}
       {children}
     </span>
   )
@@ -855,6 +868,10 @@ export function deviceTabs(device: OrgDevice): DeviceTab[] {
   return tabs
 }
 const TAB_LABEL: Record<DeviceTab, string> = { health: "Health", optical: "Optical", ports: "Ports" }
+/** Which measurement plane each tab reads from. "Health" is the vitals plane —
+ *  the tab is named for what an operator calls it, the plane for what produces
+ *  it, and those do not have to be the same word. */
+const TAB_PLANE: Record<DeviceTab, Plane> = { health: "vitals", optical: "optical", ports: "traffic" }
 
 export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
   device: OrgDevice; tab: DeviceTab; onTab: (t: DeviceTab) => void
@@ -902,7 +919,18 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
           button rides INSIDE it, right after the last tab — a flex sibling
           outside would always end up at the far edge */}
       <TabsList variant="line" className="mb-2">
-        {tabs.map((t) => <TabsTrigger key={t} value={t}>{TAB_LABEL[t]}</TabsTrigger>)}
+        {/* The tab strip IS the identity axis, and has been since before there
+            was one: Optical / Health / Ports are three MEASUREMENT PLANES, on
+            three separate SNMP clocks, with three separate freshness stamps on
+            the same device row — told apart by nothing but a word. The dot is
+            the plane's own hue (lib/planes.ts), so the same three colours mean
+            the same three things wherever they appear next. */}
+        {tabs.map((t) => (
+          <TabsTrigger key={t} value={t}>
+            <PlaneDot plane={TAB_PLANE[t]} />
+            {TAB_LABEL[t]}
+          </TabsTrigger>
+        ))}
         {(webUi || manageCreds) && (
           <span className="ml-1 flex items-center gap-1.5 pb-1">
             {webUi && <WebUiButton device={device} />}

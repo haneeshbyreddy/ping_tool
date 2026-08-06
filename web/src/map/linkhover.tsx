@@ -24,6 +24,25 @@ import { esc } from "@/map/pins"
     whole point of colouring them). */
 const HOVER_SLACK_PX = 12
 
+/** How close to a PIN the readout stands down, in screen px.
+ *
+ *  Every cable ends at a box, so within a pin's own reach several of them run
+ *  inside `HOVER_SLACK_PX` of each other and the readout has nothing left to
+ *  say: one end reads ~0 and the other reads the whole span, which is the
+ *  number the device panel already quotes. What it does instead is pop a
+ *  measurement of some arbitrary one of them over the box you were reaching
+ *  for, and fight the card that box opens on hover.
+ *
+ *  32px, and the size is set by WHERE THE RING IS CENTRED, which is not where
+ *  the dot is drawn: `.wisp-pin` is a dot-over-label column translated -50%, so
+ *  the coordinate the lines converge on sits ~12px BELOW the visible dot, about
+ *  halfway between it and the name plate. A ring that only cleared the dot's own
+ *  radius would therefore leave the dot's top edge exposed — measured in the
+ *  browser, the readout survived to within 18px of the dot. 32 clears the dot
+ *  (19px up) with a fingertip to spare and covers the label below it. Past ~40
+ *  it would start blanking genuinely readable cable between two close sites. */
+const PIN_KEEPOUT_PX = 32
+
 export interface HoverLink {
   key: string
   pts: Array<[number, number]>
@@ -60,10 +79,13 @@ export function projectLinks(links: HoverLink[], zoom: number) {
 const hoverSig = (h: LinkHover | null) =>
   h ? `${h.key}|${h.fromKm.toFixed(3)}|${h.toKm.toFixed(3)}` : ""
 
-export function LinkHoverProbe({ projected, enabled, onHover, zoom }: {
+export function LinkHoverProbe({ projected, enabled, onHover, zoom, keepOut }: {
   projected: ReturnType<typeof projectLinks>
   enabled: boolean
   zoom: number
+  /** Projected pin positions the readout keeps clear of — the same points the
+      marks are drawn at, one per site (a folded cluster counts as one). */
+  keepOut: Array<[number, number]>
   onHover: (h: LinkHover | null) => void
 }) {
   const last = useRef("")
@@ -77,6 +99,12 @@ export function LinkHoverProbe({ projected, enabled, onHover, zoom }: {
     mousemove: (e: L.LeafletMouseEvent) => {
       if (!enabled) return
       const [x, y] = project(e.latlng.lat, e.latlng.lng, zoom)
+      // Near a box, say nothing. Checked before the walk rather than after, so
+      // approaching a pin goes quiet on the way IN — the mark's own mouseover
+      // only fires once the cursor is on the 14px dot, and the readout was
+      // still measuring for the last fingertip of the approach.
+      if (keepOut.some(([kx, ky]) => Math.hypot(kx - x, ky - y) < PIN_KEEPOUT_PX))
+        return emit(null)
       let best: LinkHover | null = null
       let bestDist = HOVER_SLACK_PX
       for (const { link, px } of projected) {
@@ -126,9 +154,13 @@ export function hoverIcon(h: LinkHover): L.DivIcon {
     + `<span class="wisp-linkhover__end">`
     + `<span class="wisp-linkhover__km">${esc(fmtKm(h.toKm))}</span>`
     + `<span class="wisp-linkhover__name">${esc(h.toName)}</span></span>`
-    // honesty label: a chord is not cable length, and this readout is exactly
-    // where someone would otherwise assume it was
-    + `<span class="wisp-linkhover__note">${h.drawn ? "along cable" : "straight-line"}</span>`
+    // Honesty label, on the ONE case that needs it: a chord is not cable length,
+    // and this readout is exactly where someone would otherwise assume it was.
+    // The drawn case captioned itself "along cable" and was dropped as obvious —
+    // the line on screen visibly follows the traced path the number is measured
+    // along, so the words only restated the picture. The chord looks identical
+    // to a cable and must keep saying that it isn't one.
+    + (h.drawn ? "" : `<span class="wisp-linkhover__note">straight-line</span>`)
     + `</div></div>`
   return L.divIcon({ className: "wisp-pin-anchor", iconSize: [0, 0], html })
 }

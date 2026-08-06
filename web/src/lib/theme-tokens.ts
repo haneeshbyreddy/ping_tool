@@ -213,8 +213,19 @@ function surfaceFamily(card: string, mode: ThemeMode): TokenMap {
  *  (tests/unit/test_theme.py), which scans this file's token strings to prove
  *  the Python-side allowlist has not drifted. A template literal is invisible
  *  to both. */
+/** A status seed and everything derived from it.
+ *
+ *  It used to also drive a `chart` token, which quietly made every chart
+ *  series in the product a STATUS COLOUR — so a perfectly healthy series
+ *  rendered in --destructive, and an operator who recoloured "Down" in this
+ *  panel recoloured chart series 4 along with it. The live install's stored
+ *  overrides prove it: they carry --chart-1 and --chart-4 (derived from the
+ *  two seeds that were moved) and not --chart-2/3/5.
+ *
+ *  The chart ramp is now Axis B — identity, not severity — and is offered raw
+ *  in ADVANCED_TOKENS instead. Do not re-attach it to a tone. */
 function toneFamily(
-  tokens: { tone: string; foreground: string; soft: string; chart: string },
+  tokens: { tone: string; foreground: string; soft: string },
   tone: string,
   mode: ThemeMode,
 ): TokenMap {
@@ -222,7 +233,6 @@ function toneFamily(
     [tokens.tone]: tone,
     [tokens.foreground]: readableInk(tone),
     [tokens.soft]: softFill(tone, SOFT_ALPHA[mode]),
-    [tokens.chart]: tone,
   }
 }
 
@@ -241,7 +251,7 @@ export const SEEDS: Seed[] = [
   {
     id: "panel",
     label: "Panels",
-    hint: "Cards, menus, wells and hover fills — the whole surface ladder steps off this.",
+    hint: "Cards, menus, wells and hover fills. The whole surface ladder steps off this.",
     token: "--card",
     base: { dark: "#1c1f24", light: "#ffffff" },
     derive: surfaceFamily,
@@ -269,13 +279,13 @@ export const SEEDS: Seed[] = [
   {
     id: "primary",
     label: "Accent",
-    hint: "Buttons, links, focus rings and healthy map lines — the brand colour.",
+    hint: "Buttons, links, focus rings and healthy map lines. The brand colour.",
     token: "--primary",
     base: { dark: "#74aec9", light: "#2e7391" },
     derive: (v, mode) => ({
       ...toneFamily({
         tone: "--primary", foreground: "--primary-foreground",
-        soft: "--primary-soft", chart: "--chart-1",
+        soft: "--primary-soft",
       }, v, mode),
       "--ring": v,
       "--sidebar-primary": v,
@@ -292,7 +302,7 @@ export const SEEDS: Seed[] = [
     base: { dark: "#5fbe83", light: "#2f7d4f" },
     derive: (v, mode) => toneFamily({
       tone: "--success", foreground: "--success-foreground",
-      soft: "--success-soft", chart: "--chart-2",
+      soft: "--success-soft",
     }, v, mode),
   },
   {
@@ -303,7 +313,7 @@ export const SEEDS: Seed[] = [
     base: { dark: "#e3ac57", light: "#8a6410" },
     derive: (v, mode) => toneFamily({
       tone: "--warning", foreground: "--warning-foreground",
-      soft: "--warning-soft", chart: "--chart-3",
+      soft: "--warning-soft",
     }, v, mode),
   },
   {
@@ -314,7 +324,7 @@ export const SEEDS: Seed[] = [
     base: { dark: "#e27a6b", light: "#a8432e" },
     derive: (v, mode) => toneFamily({
       tone: "--destructive", foreground: "--destructive-foreground",
-      soft: "--destructive-soft", chart: "--chart-4",
+      soft: "--destructive-soft",
     }, v, mode),
   },
 ]
@@ -329,7 +339,20 @@ export const ADVANCED_TOKENS: Array<{ token: string; label: string; base: Record
   { token: "--border-subtle", label: "Border (internal)", base: { dark: "rgba(255,255,255,0.055)", light: "rgba(0,0,0,0.065)" } },
   { token: "--input", label: "Border (raised)", base: { dark: "rgba(255,255,255,0.14)", light: "rgba(0,0,0,0.17)" } },
   { token: "--sidebar-border", label: "Sidebar border", base: { dark: "rgba(255,255,255,0.07)", light: "rgba(0,0,0,0.09)" } },
-  { token: "--chart-5", label: "Chart (neutral)", base: { dark: "#8b8f98", light: "#71717c" } },
+  /* The chart ramp is Axis B — one categorical colour per MEASUREMENT PLANE
+   *  (index.css: --plane-*), not the status tones it used to be derived from.
+   *  Offered raw here rather than from a seed, because there is no seed to
+   *  derive them from and re-attaching them to a tone is the bug this pass
+   *  fixed. The --plane-* tokens themselves are deliberately NOT settable: they
+   *  are an encoding solved against a chroma/contrast budget taken from the
+   *  status tones, and a hand-typed value could breach the ceiling that keeps
+   *  identity from ever reading as an alarm. A chart series is decoration over
+   *  data rather than a claim about it, so these stay editable. */
+  { token: "--chart-1", label: "Chart 1 (optical)", base: { dark: "#47878b", light: "#52878a" } },
+  { token: "--chart-2", label: "Chart 2 (traffic)", base: { dark: "#4f7495", light: "#6c8ca9" } },
+  { token: "--chart-3", label: "Chart 3 (vitals)", base: { dark: "#717ca7", light: "#747da2" } },
+  { token: "--chart-4", label: "Chart 4 (plant)", base: { dark: "#776994", light: "#8f83a8" } },
+  { token: "--chart-5", label: "Chart 5 (fleet)", base: { dark: "#957296", light: "#937594" } },
   { token: "--map-link", label: "Map link", base: { dark: "#5e8a9e", light: "#35789a" } },
 ]
 

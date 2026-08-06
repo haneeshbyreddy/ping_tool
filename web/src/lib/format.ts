@@ -50,6 +50,17 @@ export function fmtPct(n: number | null | undefined): string {
   return n == null ? "—" : `${Number(n).toFixed(1)}%`
 }
 
+/** A round trip, WITHOUT its unit — callers place "ms" themselves (the map's
+ *  hover card renders it as a separate faint span).
+ *
+ *  A tenth of a millisecond is meaningful on a LAN hop and noise on a 40 ms
+ *  backhaul, so the precision follows the magnitude. Shared rather than
+ *  re-derived per screen: the device panel and a map card printing the same
+ *  round trip to different precision reads as two different measurements. */
+export function fmtMs(v: number): string {
+  return v < 10 ? v.toFixed(1) : String(Math.round(v))
+}
+
 export function fmtBytes(n: number | null | undefined): string {
   if (n == null) return "—"
   const units = ["B", "KB", "MB", "GB", "TB"]
@@ -109,6 +120,27 @@ export function onuName(o: {
   serial?: string | null; onu_key?: string | null
 }): string {
   return o.label || o.name || o.serial || o.onu_key || ""
+}
+
+/** How BAD one ONU's light is. Lives here rather than in the Optical panel that
+ *  first needed it, because four screens now grade the same subscriber — the
+ *  panel, the Network page's ONU search, the topology tree and the map — and a
+ *  second copy of this rule is how one of them ends up calling a drop healthy
+ *  while another calls it critical.
+ *
+ *  STRUCTURALLY typed on the two fields it reads, so a slim projection (a search
+ *  hit, an `OnuPlace`) grades by the same rule as a full roster row. `severity`
+ *  is the OLT's own threshold verdict computed by the optics monitor — never
+ *  re-derive one from `rx_dbm` here, since the thresholds are per-OLT. */
+export type OnuSev = "ok" | "warn" | "crit" | "offline"
+
+export function onuSev(
+  o: { state?: string | null; severity?: string | null },
+): OnuSev {
+  if (o.state !== "online") return "offline"
+  if (o.severity === "crit") return "crit"
+  if (o.severity === "warn") return "warn"
+  return "ok"
 }
 
 /** How to COMPARE one ONU string against a typed needle. Mirrors

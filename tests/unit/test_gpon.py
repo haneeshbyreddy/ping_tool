@@ -95,6 +95,53 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(onus["10.9"].state, STATE_OFFLINE)
         self.assertIsNone(onus["10.9"].rx_dbm)
 
+    # The live badri_fiber profile, verbatim from gpon_profiles id 1 — these
+    # cases only bite on a profile whose state_default is `offline` (the HUAWEI
+    # built-in already defaults to unknown), and that is the shape in the field.
+    SYROTECH = gpon_profile_from_dict({
+        "name": "syrotech_gpon",
+        "oids": {"state": "1.3.6.1.4.1.37950.1.1.6.1.1.1.1.5",
+                 "tx": "1.3.6.1.4.1.37950.1.1.6.1.1.3.1.6",
+                 "rx": "1.3.6.1.4.1.37950.1.1.6.1.1.3.1.7",
+                 "serial": "1.3.6.1.4.1.37950.1.1.6.1.1.2.1.5"},
+        "scales": {"rx": 1.0, "tx": 1.0},
+        "state_map": {"3": "online"}, "state_default": "offline",
+        "pon_index": "first_segment",
+    })
+
+    def test_a_row_with_NO_state_cell_is_unknown_never_offline(self):
+        # A truncated state column is the live failure mode on the C-Data /
+        # Syrotech agents: they end a GETBULK mid-table while pysnmp reports a
+        # clean finish, so the tail ONUs arrive carrying rx and serial but no
+        # state. Folding that into state_default rendered LIVE subscribers dark
+        # and handed ponfault a fabricated mass-drop cohort — with nothing
+        # anywhere reporting an error. ponfault.DARK_STATES already excludes
+        # `unknown` for exactly this reason; the edge just never produced it.
+        p = self.SYROTECH
+        vbs = _vb(p, "7.41", rx="-21.00", serial="ZTEGcbd6530f")  # no state cell
+        onus = {o.onu_key: o for o in parse_onu_table(vbs, p)}
+        self.assertEqual(onus["7.41"].state, "unknown")
+        # the readings it DID send are still reported — this is not a drop
+        self.assertEqual(onus["7.41"].rx_dbm, -21.0)
+        self.assertEqual(onus["7.41"].serial, "ZTEGcbd6530f")
+
+    def test_an_UNRECOGNISED_state_value_still_takes_the_profile_default(self):
+        # The other half of the distinction: a column that ANSWERED with a code
+        # we have not mapped is a fact about the ONU, and the profile's default
+        # is the operator's stated reading of it. Syrotech's 4/6/7/8 are all
+        # dereg reasons and all mean offline.
+        onus = {o.onu_key: o for o in parse_onu_table(
+            _vb(self.SYROTECH, "7.42", state=7, serial="X"), self.SYROTECH)}
+        self.assertEqual(onus["7.42"].state, STATE_OFFLINE)
+
+    def test_a_profile_mapping_NO_state_column_keeps_its_default(self):
+        # An ABSENT column is a fact about the firmware, so a profile that never
+        # asks for state must not have every ONU turn `unknown` — that would
+        # silently blank a working vendor.
+        stateless = dataclasses.replace(self.SYROTECH, oid_state="")
+        onus = parse_onu_table([(f"{stateless.oid_rx}.3.1", "-20.00")], stateless)
+        self.assertEqual(onus[0].state, STATE_OFFLINE)
+
     def test_dbc_decimal_rx_and_slot_key_carrying_the_mac(self):
         idx = "12"
         vbs = _vb(DBC_RX, idx, rx="-14.62", serial="00:11:22:33:44:55")

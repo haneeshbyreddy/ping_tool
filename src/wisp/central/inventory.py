@@ -66,7 +66,7 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
         ip_address = _str(data, "ip_address") or ""
         if ip_address:
             raise InventoryError(
-                f"a {device_type} is passive plant — it has no IP address")
+                f"a {device_type} is passive plant: it has no IP address")
     else:
         ip_address = _str(data, "ip_address", required=True)
         try:
@@ -122,12 +122,12 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
         # monitored gear may not hang below plant (plant hangs below gear)
         if (not passive and passive_ids is not None and parent_id in passive_ids):
             raise InventoryError(
-                "a monitored device can't sit under passive plant — "
-                "parent it to the powered device above instead")
+                "a monitored device can't sit under passive plant. "
+                "Parent it to the powered device above instead.")
 
     assigned_node_id = _str(data, "assigned_node_id")
     if passive and assigned_node_id:
-        raise InventoryError(f"a {device_type} is passive plant — nothing probes it")
+        raise InventoryError(f"a {device_type} is passive plant: nothing probes it")
     if (assigned_node_id and registered_nodes is not None
             and assigned_node_id not in registered_nodes):
         raise InventoryError("assigned wisp client does not exist")
@@ -295,7 +295,7 @@ def clean_field_passive_payload(data: dict) -> dict:
             "accuracy_m": loc["accuracy_m"], "source": loc["source"]}
 
 
-def _onu_label(data: dict) -> str | None:
+def _onu_label(data: dict, *, required: bool = False) -> str | None:
     """A subscriber's operator-given name, UPPERCASED. None when blank.
 
     Operator's call (2026-07-29): an ONU's customer name always reads as caps,
@@ -310,11 +310,40 @@ def _onu_label(data: dict) -> str | None:
     Consequence worth stating: case typed in the field is discarded, which is
     what was asked for. The WALKED name (`onu_optics.name`) is NOT touched — that
     string belongs to the OLT, and restyling somebody else's data is how a
-    dashboard starts disagreeing with the box a tech is logged into."""
-    label = _str(data, "label")
+    dashboard starts disagreeing with the box a tech is logged into.
+
+    `required` is the FIELD survey's rule (operator's call, 2026-07-31): a
+    subscriber pin with no name is a coordinate nobody can act on — a crew sent
+    to a dark drop needs somebody to ask for at the gate. The desktop
+    reference-ONU dialog stays optional, because THAT write's meaning is the
+    power-supply claim and blocking it on a missing name would cost a PON
+    verdict for a paperwork gap."""
+    label = _str(data, "label", required=required)
     if label and len(label) > 120:
         raise InventoryError("label is too long")
     return label.upper() if label else None
+
+
+# A number a human dials, NOT a WhatsApp recipient — deliberately looser than
+# `api/users._WA_RE`, which demands international format because Meta's API
+# does. A tech standing at a drop writes down the ten digits the customer gave
+# them, and refusing that until somebody prefixes +91 is how the field stops
+# recording numbers at all. Separators are the operator's habit, not data, so
+# they are stripped rather than rejected; what is stored is one canonical
+# spelling, or the same customer reads as two.
+_ONU_PHONE_RE = re.compile(r"^\+?\d{7,15}$")
+
+
+def _onu_phone(data: dict, *, required: bool = False) -> str | None:
+    """A subscriber's contact number, compacted. None when blank."""
+    raw = _str(data, "phone", required=required)
+    if not raw:
+        return None
+    compact = re.sub(r"[\s\-().]", "", raw)
+    if not _ONU_PHONE_RE.match(compact):
+        raise InventoryError("enter a contact number of 7-15 digits, "
+                             "e.g. 9876543210")
+    return compact
 
 
 def clean_field_onu_payload(data: dict) -> dict:
@@ -330,30 +359,86 @@ def clean_field_onu_payload(data: dict) -> dict:
 
     Identity normalization is `onuroster._norm_mac` — the same one
     `clean_onu_place_payload` uses, deliberately, since both write the same
-    table and two spellings of one sticker must not become two rows."""
+    table and two spellings of one sticker must not become two rows.
+
+    NAME, NUMBER and LOCATION are all REQUIRED here (operator's call,
+    2026-07-31). A survey row is worth having only if a crew can act on it, and
+    two of the three on their own can't: a coordinate with no name is a house
+    nobody can ask for, a name with no number is a visit that can't be arranged.
+    Enforced on the SERVER rather than in the sheet alone, so the rule survives
+    a SPA that forgets it."""
     mac = _norm_mac(_str(data, "mac", required=True))
     if not mac:
         raise InventoryError("a MAC is required")
     if len(mac) > 64:
         raise InventoryError("MAC is too long")
+    # Location is mandatory by construction, not by a check: this payload has no
+    # spelling for "no coordinates" (unlike `clean_location_payload`, whose
+    # both-null means DELETE — which is exactly why the field route was given
+    # its own cleaner rather than the owner's).
     loc = clean_field_location_payload(data)
     return {"mac": mac, "lat": loc["lat"], "lng": loc["lng"],
             "accuracy_m": loc["accuracy_m"], "source": loc["source"],
-            "label": _onu_label(data)}
+            "label": _onu_label(data, required=True),
+            "phone": _onu_phone(data, required=True)}
 
 
 def clean_field_onu_name_payload(data: dict) -> dict:
-    """The operator's own name for a located subscriber. Label only, no geometry.
+    """A located subscriber's NAME and NUMBER. Contact details only, no geometry.
 
-    A BLANK label is allowed and means "clear it" — descriptive text, unlike a
-    pin, can honestly be absent. Same `_norm_mac` identity as every other write
-    to this table."""
+    Both are REQUIRED, the same rule the placement carries: this route exists so
+    a spelling can be fixed without restamping the pin's provenance, not so the
+    details can be emptied. Clearing a name used to be allowed here — descriptive
+    text, unlike a pin, can honestly be absent — but once the field may not
+    RECORD a nameless subscriber, letting it blank one afterwards would leave the
+    same unusable row by a second door.
+
+    Same `_norm_mac` identity as every other write to this table."""
     mac = _norm_mac(_str(data, "mac", required=True))
     if not mac:
         raise InventoryError("a MAC is required")
     if len(mac) > 64:
         raise InventoryError("MAC is too long")
-    return {"mac": mac, "label": _onu_label(data)}
+    return {"mac": mac, "label": _onu_label(data, required=True),
+            "phone": _onu_phone(data, required=True)}
+
+
+def clean_onu_contact_payload(data: dict) -> dict:
+    """Who a subscriber is — name, number, notes — with NO coordinate at all.
+
+    The desk counterpart of the field capture, and the write this product could
+    not express until 2026-08-03: every path into `onu_places` demanded lat/lng,
+    so an operator who knows a customer's name but has never stood at their house
+    had nowhere to put it. On a fleet with 2,156 subscribers and a handful of
+    pins that is 2,150 names with no home, which is most of the reason customer
+    data reads as scattered — it was not scattered, it was unenterable.
+
+    NOTHING IS REQUIRED, unlike the field capture. That rule ("name, number and
+    location together or not at all") exists because a survey ROW is only worth
+    the walk if a crew can act on it. This is not a survey row: it is a desk
+    filling in what it happens to know, one column at a time, and refusing a name
+    because nobody has the number yet is how the other 2,150 stay unrecorded. The
+    same reasoning the reference-ONU dialog already uses for its optional phone.
+
+    A blank field is written as NULL, not skipped — the form shows what is
+    stored, so emptying one is the operator deleting a wrong number deliberately,
+    and quietly keeping it would repeat the lie the map card's Remove button told
+    in the other direction. There is deliberately no `witness` key: vouching for
+    a power supply is a claim made where the UI states the contract, never a side
+    effect of typing somebody's name (the same rule `clean_field_onu_payload`
+    keeps, for the same reason).
+
+    Same `_norm_mac` identity as every other write to this table."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if not mac:
+        raise InventoryError("a MAC is required")
+    if len(mac) > 64:
+        raise InventoryError("MAC is too long")
+    notes = _str(data, "notes")
+    if notes and len(notes) > 500:
+        raise InventoryError("notes are too long")
+    return {"mac": mac, "label": _onu_label(data), "phone": _onu_phone(data),
+            "notes": notes or None}
 
 
 def clean_onu_place_payload(data: dict) -> dict:
@@ -365,8 +450,32 @@ def clean_onu_place_payload(data: dict) -> dict:
     search key (which would collapse genuinely different serials) and not the
     weboptics match key.
 
-    Both coordinates null means REMOVE — the table is sparse, so an unplaced
-    reference point is the absence of a row, never a row with empty columns."""
+    Both coordinates null means CLEAR THE PIN — and, since 2026-08-03, nothing
+    more. It used to mean delete the row, back when the row WAS a pin; then the
+    field survey hung the subscriber's name and number on it, and "remove this
+    pin from the map" silently became "forget who lives there". The store clears
+    the coordinates and their provenance, keeps the record, and prunes the row
+    only if that leaves it entirely empty (`_prune_onu_place`). Un-pinning DOES
+    retract the witness claim — placing is what makes that claim, so unplacing is
+    what takes it back — which is why a bare reference point still disappears
+    completely and no alerting behaviour changes.
+
+    **THIS PAYLOAD HAS NO `witness` KEY, and that is the point** (2026-08-04).
+    Not "ignored" — unsayable, the same way `clean_field_onu_payload` has never
+    been able to spell the claim. Putting a customer on the map is a LOCATION,
+    from the desk exactly as much as from the handset; the power claim is its own
+    verb on `/api/inventory/onu-witness` and is made nowhere else.
+
+    What it cost to learn: this route passed no flag and took `set_onu_place`'s
+    default of True, so an owner who moved a surveyed pin a few metres, or
+    reopened the dialog to add somebody's phone number, silently promoted an
+    ordinary customer into a power-backed witness — and a dark witness makes
+    `ponfault` call a fibre cut and roll a splicing crew. On badri_fiber it
+    turned 30 of one morning's field captures into witnesses inside a minute of
+    each being placed. Preserving the existing flag here was the first fix and
+    was still too clever: a route that CAN carry the claim is a route somebody
+    wires the claim into again. The handler resolves it from the stored record
+    and nothing else."""
     mac = _norm_mac(_str(data, "mac", required=True))
     if len(mac) > 64:
         raise InventoryError("MAC is too long")
@@ -376,8 +485,38 @@ def clean_onu_place_payload(data: dict) -> dict:
         raise InventoryError("notes are too long")
     # Same uppercase rule as the field paths — one table, one spelling of a name,
     # or the desktop dialog and the handset would disagree about the same drop.
+    #
+    # Name and number stay OPTIONAL here, unlike the field capture. What this
+    # write MEANS is "this subscriber's power is reliable", and that claim is
+    # what a PON mass-drop verdict reads; refusing it because nobody has the
+    # customer's number would trade a fibre-cut/power-cut discrimination for a
+    # paperwork field. The survey is where the contact record is enforced.
     return {"mac": mac, "lat": loc["lat"], "lng": loc["lng"],
-            "label": _onu_label(data), "notes": notes}
+            "label": _onu_label(data), "notes": notes,
+            "phone": _onu_phone(data)}
+
+
+def clean_onu_witness_payload(data: dict) -> dict:
+    """Make — or withdraw — the power-supply claim on ONE subscriber. No pin.
+
+    Its own route for the same reason `field-onu-name` is separate from
+    `field-onu`: re-placing to change one flag would restamp the coordinates and
+    their provenance, so withdrawing a claim would downgrade a real GPS fix to a
+    hand-placed point. Here nothing moves but the claim.
+
+    `witness` is REQUIRED and must be a real boolean — this is the one write
+    whose entire content is that flag, so a missing or fuzzy value has no
+    sensible reading. Deliberately carries no coordinates at all: the claim is
+    independent of the pin (`ponfault._witness_verdict` matches by MAC and never
+    reads lat/lng), which is what lets an operator vouch for a subscriber nobody
+    has stood at yet."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if len(mac) > 64:
+        raise InventoryError("MAC is too long")
+    witness = data.get("witness")
+    if not isinstance(witness, bool):
+        raise InventoryError("witness must be true or false")
+    return {"mac": mac, "witness": witness}
 
 
 MAX_DROPS_PER_WRITE = 512
@@ -613,7 +752,7 @@ def clean_link_style_payload(data: dict) -> dict:
             # it keeps the row byte-stable so an idle drag isn't a write.
             fields["label_pos"] = round(pos, 4)
     if not fields:
-        raise InventoryError("nothing to set — pass color and/or label_pos")
+        raise InventoryError("nothing to set: pass color and/or label_pos")
     return {"child_id": child_id, "parent_id": parent_id, "fields": fields}
 
 def clean_region_name(raw) -> str:
@@ -843,7 +982,7 @@ def clean_profile_payload(data: dict) -> dict:
     for key, spec in raw_metrics.items():
         if key not in PROFILE_METRICS:
             raise InventoryError(
-                f"unknown metric {key!r} — must be one of: {', '.join(PROFILE_METRICS)}")
+                f"unknown metric {key!r}: must be one of {', '.join(PROFILE_METRICS)}")
         if not isinstance(spec, dict):
             raise InventoryError(f"metric {key!r} must be an object with an oid")
         oid = clean_oid(spec.get("oid"), field=f"{key}.oid")
@@ -883,7 +1022,7 @@ def clean_gpon_profile_payload(data: dict) -> dict:
     for key, val in raw_oids.items():
         if key not in GPON_PROFILE_OIDS:
             raise InventoryError(
-                f"unknown oid field {key!r} — must be one of: {', '.join(GPON_PROFILE_OIDS)}")
+                f"unknown oid field {key!r}: must be one of {', '.join(GPON_PROFILE_OIDS)}")
         if str(val or "").strip():
             oids[key] = clean_oid(val, field=f"oids.{key}")
     if not oids:

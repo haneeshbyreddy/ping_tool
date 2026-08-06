@@ -16,6 +16,67 @@ SEV_CRIT = "crit"
 
 _REF_MAX_AGE_DAYS = 7
 
+# --- Physical bounds on an optical reading --------------------------------
+#
+# These live HERE, not in weboptics, because `sync_device` below is the ONE
+# place every reading passes through whatever transport carried it — an SNMP
+# walk on the edge or a web scrape folded in by `_merge_web_optics`. Optics
+# stay one path that never learns where a number came from, so the guard that
+# decides "is this a measurement at all" has to sit on that path rather than on
+# one of its feeders. weboptics imports these for its own richer check.
+#
+# An ONU cannot RECEIVE more power than the OLT emits (~+2..+5 dBm at the port,
+# before any fibre or splitter loss), so a non-negative Rx is not a reading.
+RX_MAX_DBM = 0.0
+# The DDM log-floor sentinel. Real ONU sensitivity bottoms out around -28 dBm —
+# nothing stays ranged and online at -40, so this is "unreadable", not "dying".
+RX_FLOOR_DBM = -40.0
+# An ONU TRANSMITS at roughly 0..+5 dBm, so a 0.0 Tx is an ordinary launch power
+# and must NOT be rejected the way a 0.0 Rx is. The asymmetry is physics, not an
+# oversight: only the high rail is unambiguous for a transmitter. Catching a
+# dark ONU's railed Tx needs the supply-voltage column (see weboptics
+# `_sane_optics`), which no SNMP profile maps yet.
+TX_MAX_DBM = RX_MAX_DBM + 10.0
+
+
+def sane_rx(rx: float | None) -> float | None:
+    """None out an Rx that is a sensor RAIL rather than a measurement.
+
+    Same rule `_sane_optics` has always applied to scraped readings, now on the
+    shared path so an SNMP-fed vendor gets it too. It was missing there, and the
+    Syrotech GPON fleet is what exposed it: that firmware reports `0.00` across
+    the whole DDM block for a dark ONU, so 114 of badri_fiber's 378 ONUs were
+    storing 0.0 dBm — read by `list_org_devices.onus_rx` (which counts
+    `rx_dbm IS NOT NULL`) as a MEASURED drop. That makes "nothing is wrong" and
+    "nothing is measured" render alike, which is the one thing the optics
+    surfaces may not do.
+
+    Deliberately keyed on PHYSICS, not on state. Blanking whenever an ONU is
+    offline would also throw away the last good reading the panel legitimately
+    shows for a dark drop, and it would miss the real fault this catches: one
+    ONLINE ONU on Gpon_08 also reports 0.0, which is not a healthy drop but a
+    dead sensor, and it grades `ok` — a false negative nobody goes looking for.
+    """
+    if rx is None:
+        return None
+    return None if (rx >= RX_MAX_DBM or rx <= RX_FLOOR_DBM) else rx
+
+
+def sane_tx(tx: float | None) -> float | None:
+    """None out a Tx above any real ONU launch power.
+
+    Weak on purpose, and worth knowing HOW weak: the 0xFFFF rail reads +8.16 dBm
+    and this does NOT catch it — `_sane_optics` catches that one on the supply
+    VOLTAGE (6.55 V), then blanks the whole block. With no voltage column on the
+    SNMP path there is nothing here to discriminate a railed Tx from a hot one,
+    so this only rejects the physically impossible. Mapping a voltage column
+    into the GPON profile vocabulary is what would close the gap.
+    """
+    if tx is None:
+        return None
+    return None if tx >= TX_MAX_DBM else tx
+
+
 def _severity(rx_dbm: float | None, state: str | None,
               warn_dbm: float, crit_dbm: float) -> str:
     if state != "online" or rx_dbm is None:
@@ -74,7 +135,7 @@ class CentralOpticsMonitor:
             if not onu_key:
                 continue
             total += 1
-            rx = _to_float(raw.get("rx_dbm"))
+            rx = sane_rx(_to_float(raw.get("rx_dbm")))
             state = str(raw.get("state") or "unknown")
             if state == "online":
                 online += 1
@@ -96,7 +157,7 @@ class CentralOpticsMonitor:
                 self.org_id, device_id, onu_key,
                 pon_port=raw.get("pon_port"), onu_id=_to_int(raw.get("onu_id")),
                 name=(raw.get("name") or None), serial=(raw.get("serial") or None),
-                state=state, rx_dbm=rx, tx_dbm=_to_float(raw.get("tx_dbm")),
+                state=state, rx_dbm=rx, tx_dbm=sane_tx(_to_float(raw.get("tx_dbm"))),
                 olt_rx_dbm=_to_float(raw.get("olt_rx_dbm")),
                 distance_m=_to_int(raw.get("distance_m")),
                 rx_ref_dbm=ref, rx_ref_at=ref_at, severity=sev, ts=ts)
@@ -117,13 +178,13 @@ class CentralOpticsMonitor:
             alarm_since=since, ts=ts)
         if alarm and not was_alarm:
             self._page(device_id, "OPTICAL_CRIT",
-                       f"\U0001f53b Optical critical — {self._name(device_id)}",
+                       f"\U0001f53b Optical critical · {self._name(device_id)}",
                        f"{self._name(device_id)}: {crit_unacked} ONU(s) below the "
                        f"critical Rx-power floor. Subscribers on those drops are at risk "
-                       f"of losing sync — check the ODN / splitters.", ts)
+                       f"of losing sync. Check the ODN / splitters.", ts)
         elif was_alarm and not alarm and crit_count == 0:
             self._page(device_id, "OPTICAL_RECOVERED",
-                       f"✅ Optical recovered — {self._name(device_id)}",
+                       f"✅ Optical recovered · {self._name(device_id)}",
                        f"{self._name(device_id)}: no ONUs remain below the critical "
                        f"Rx-power floor.", ts)
 

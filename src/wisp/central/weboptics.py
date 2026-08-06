@@ -277,7 +277,7 @@ def diagnose_login(html: str, profile=None) -> str:
         # pre-session placeholder: the page rendered, we are simply not logged
         # in to it.
         if re.search(rf"{re.escape(key_field)}\.value\s*=\s*(''|\"\")", html):
-            return (f"the page ships an EMPTY {key_field} — this firmware "
+            return (f"the page ships an EMPTY {key_field}. This firmware "
                     "blanks the token until a session exists, so we are not "
                     "logged in. Either the stored password was refused, or "
                     "someone else holds this OLT's single web session "
@@ -287,7 +287,7 @@ def diagnose_login(html: str, profile=None) -> str:
         # the markup shape, which is demonstrably the one we understand.
         if "js-single-quote" in seen:
             return (f"the page carries {key_field} in the expected form but no "
-                    "value could be read out of it — the token is blank or "
+                    "value could be read out of it: the token is blank or "
                     f"malformed, so the session never started ({page_shape(html)})")
         # Report BOTH facts rather than picking one. This branch used to win
         # outright over the login-page check and say only "markup differs",
@@ -302,14 +302,14 @@ def diagnose_login(html: str, profile=None) -> str:
                 f"[js-single-quote], which is the only form read{why} "
                 f"({page_shape(html)})")
     if looks_like_login:
-        return "the device served its login page again — the password was refused"
+        return "the device served its login page again, so the password was refused"
     # The vendor's own words, from the profile. An empty marker list means the
     # operator gave us nothing to recognise the box by, so we say nothing about
     # it rather than inventing a verdict.
     if prof.vendor_markers and not any(m in low for m in prof.vendor_markers):
-        return ("the reply does not look like this OLT's web UI at all — check "
-                "the address really reaches the OLT and not a router in front")
-    return f"unrecognised reply — {page_shape(html)}"
+        return ("the reply does not look like this OLT's web UI at all. Check "
+                "the address really reaches the OLT and not a router in front.")
+    return f"unrecognised reply · {page_shape(html)}"
 
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.{0,80}?)</title>", re.I | re.S)
@@ -486,12 +486,15 @@ def parse_opm_diag(html: str, profile=None, pon: int | None = None) -> list[dict
 # canary for "is this DDM block a measurement at all". Generous bounds: we are
 # rejecting rails, not judging a marginal PSU.
 _VOLT_MIN_V, _VOLT_MAX_V = 2.0, 5.0
-# An ONU cannot receive more power than the OLT emits (~+2..+5 dBm at the port,
-# before any fibre or splitter loss), so a non-negative Rx is not a reading.
-_RX_MAX_DBM = 0.0
-# The DDM log-floor sentinel. Real ONU sensitivity bottoms out around -28 dBm —
-# nothing stays ranged and online at -40, so this is "unreadable", not "dying".
-_RX_FLOOR_DBM = -40.0
+# The Rx/Tx rails moved to `optics.py` when the SNMP path needed the same check:
+# that module owns the one path every reading crosses, so the bounds live beside
+# it and both feeders share ONE definition. Imported rather than re-stated —
+# two copies of a physical constant is how the scrape and the walk end up
+# disagreeing about whether the same ONU was measured.
+from wisp.central.optics import (  # noqa: E402  (kept beside the rule it serves)
+    RX_FLOOR_DBM as _RX_FLOOR_DBM,
+    RX_MAX_DBM as _RX_MAX_DBM,
+)
 
 
 def _sane_optics(row: dict, expect_voltage: bool = True) -> dict:
@@ -660,7 +663,7 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
     # and an admin credential should not be the way we find that out.
     if not entry.ok:
         return [], (f"no login page at {prof.login_page_path} "
-                    f"({entry.error or entry.status}) — credentials NOT sent; "
+                    f"({entry.error or entry.status}), so credentials NOT sent; "
                     "check the address really reaches the OLT's web UI")
 
     login = http.post_form(prof.login_path, prof.login_form(username, password))
@@ -683,7 +686,7 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
         # page is somewhere else under another name. Guessing at that name is
         # how a fabricated dBm gets shipped; onboarding it means a capture (and
         # then a profile row, which is what this vocabulary is for).
-        return [], (f"this OLT's firmware has no {prof.optics_path} (404) — it "
+        return [], (f"this OLT's firmware has no {prof.optics_path} (404). It "
                     "answers on the vendor's web UI but does not carry that "
                     "optical page; it needs its own capture and profile")
     if not opened.ok:
@@ -702,7 +705,7 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
             # Partial, and said so. The PONs already read are real readings and
             # merge normally; the rest keep whatever the SNMP walk last said.
             return rows, (f"time budget spent after {done} of {len(pons)} "
-                          "PON(s) — this OLT is answering slowly")
+                          "PON(s); this OLT is answering slowly")
         form = prof.optics_form(pon, key)
         if prof.optics_method == "GET":
             from urllib.parse import urlencode

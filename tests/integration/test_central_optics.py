@@ -186,5 +186,78 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(self.store.list_onu_optics(ORG, self.olt), [])
         self.assertIsNone(self.store.get_olt_optics(ORG, self.olt))
 
+
+class DdmRailOnTheSnmpPathTest(unittest.TestCase):
+    """A railed DDM register must not reach the table as a reading.
+
+    The scrape path has refused these since HILL-OLT-1 (`weboptics._sane_optics`);
+    the SNMP path did not, and the Syrotech GPON fleet is what exposed it — that
+    firmware reports `0.00` across the whole DDM block for a dark ONU, so 114 of
+    badri_fiber's 378 ONUs stored 0.0 dBm and counted as MEASURED in `onus_rx`.
+
+    Its own fixture rather than a subclass of CentralOpticsTest: inheriting the
+    case would re-run all 12 of its tests under this name, which reads as
+    coverage that isn't there.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          optical_warn_dbm=-24.0, optical_crit_dbm=-27.0)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
+        self.olt = self.store.create_org_device(ORG, {
+            "name": "Gpon_08", "ip_address": "10.62.62.11", "device_type": "OLT",
+            "region": "Badri", "parent_device_id": None})
+        self.notifier = RecordingNotifier()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _mon(self):
+        return CentralOpticsMonitor(self.store, ORG, self.notifier, self.cfg)
+
+    def _rows(self):
+        return {r["onu_key"]: r for r in self.store.list_onu_optics(ORG, self.olt)}
+
+    def test_a_zero_rx_is_not_a_reading(self):
+        # 0.0 dBm received is physically impossible — the OLT emits ~+2..+5 dBm
+        # and every metre of fibre and every splitter only takes power away.
+        self._mon().sync_device(self.olt, [_onu("A", 0.0, state="offline")], TS[0])
+        self.assertIsNone(self._rows()["A"]["rx_dbm"])
+
+    def test_the_floor_sentinel_is_not_a_dying_onu(self):
+        self._mon().sync_device(self.olt, [_onu("A", -40.0)], TS[0])
+        self.assertIsNone(self._rows()["A"]["rx_dbm"])
+
+    def test_a_real_reading_survives_including_a_bad_one(self):
+        # The guard rejects RAILS, never merely-bad optics: a crit must still page.
+        self._mon().sync_device(self.olt, [
+            _onu("A", -23.47), _onu("B", -29.8), _onu("C", -39.9),
+        ], TS[0])
+        rows = self._rows()
+        self.assertEqual(rows["A"]["rx_dbm"], -23.47)
+        self.assertEqual(rows["B"]["rx_dbm"], -29.8)
+        self.assertEqual(rows["C"]["rx_dbm"], -39.9)
+        self.assertEqual(rows["B"]["severity"], "crit")
+
+    def test_an_ONLINE_onu_on_the_rail_stops_grading_healthy(self):
+        # The false negative nobody goes looking for: 0.0 grades comfortably `ok`
+        # while the drop is actually unmeasured. One such ONU is live on Gpon_08.
+        self._mon().sync_device(self.olt, [_onu("A", 0.0, state="online")], TS[0])
+        row = self._rows()["A"]
+        self.assertIsNone(row["rx_dbm"])
+        self.assertEqual(row["severity"], "ok")   # unmeasured, not healthy
+        # and it must not be counted as a measured drop
+        dev = {d["id"]: d for d in self.store.list_org_devices(ORG)}[self.olt]
+        self.assertEqual(dev["onus_rx"], 0)
+
+    def test_an_ordinary_launch_power_of_zero_dBm_is_kept(self):
+        # The Rx/Tx asymmetry is physics: an ONU TRANSMITS at roughly 0..+5 dBm,
+        # so 0.0 Tx is normal where 0.0 Rx is impossible.
+        self._mon().sync_device(self.olt, [dict(_onu("A", -20.0), tx_dbm=0.0)], TS[0])
+        self.assertEqual(self._rows()["A"]["tx_dbm"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

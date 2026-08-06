@@ -3,25 +3,25 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
-import { ago, durationSince, isDownState, isFresh, onuName } from "@/lib/format"
+import {
+  ago, durationSince, isDownState, isFresh, onuName, onuSev, type OnuSev,
+} from "@/lib/format"
 import { useAuth } from "@/hooks/use-auth"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { RxDiagnosis, RxFreshness } from "@/components/rx-diagnosis"
 import { ReferenceOnuButton } from "@/components/reference-onu"
+import { SubscriberDialog } from "@/components/subscriber-detail"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
+import { Reading, readingState } from "@/components/reading"
+import { RxScale } from "@/components/rx-scale"
 
-type Sev = "ok" | "warn" | "crit" | "offline"
-
-// Structurally typed on the two fields it reads, so the Network page's ONU
-// search results (a slim projection, not a full row) grade with this exact rule
-// rather than a second copy that could drift out of step with the panel.
-export function onuSev(o: Pick<OnuOptic, "state" | "severity">): Sev {
-  if (o.state !== "online") return "offline"
-  if (o.severity === "crit") return "crit"
-  if (o.severity === "warn") return "warn"
-  return "ok"
-}
+// `onuSev` MOVED to lib/format.ts — the map's subscriber labels grade with it
+// too now, and a pure map helper importing this panel to get one rule is how a
+// module graph turns into a knot. Re-exported so the two files that already
+// imported it from here keep working; the definition is single.
+export { onuSev } from "@/lib/format"
+type Sev = OnuSev
 
 const CELL: Record<Sev, string> = {
   ok: "bg-success/70",
@@ -137,7 +137,7 @@ function MacCell({ o, className }: { o: OnuOptic; className?: string }) {
 function DistCell({ o, className }: { o: OnuOptic; className?: string }) {
   return (
     <span className={cn("shrink-0 font-mono text-xs tabular-nums text-muted-foreground", className)}
-      title="Ranging distance from the OLT — optical path (slack coils included), not road metres">
+      title="Ranging distance from the OLT. Optical path with slack coils, not road metres.">
       {fmtOnuKm(o.distance_m)}
     </span>
   )
@@ -170,8 +170,8 @@ function AckCell({ o, onAck, pending, className }: {
   return (
     <button type="button" onClick={onAck} disabled={pending}
       title={acked
-        ? "Acknowledged — this ONU is excluded from the OLT's optical alarm. Click to un-acknowledge."
-        : "Acknowledge for 24h — keeps this drop out of the OLT's optical alarm badge while it's being worked on."}
+        ? "Excluded from the OLT's optical alarm. Click to un-acknowledge."
+        : "Acknowledge for 24h. Keeps this drop out of the OLT's optical alarm badge."}
       className={cn("shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium transition-colors disabled:opacity-50",
         acked
           ? "text-faint-foreground hover:text-foreground"
@@ -182,8 +182,12 @@ function AckCell({ o, onAck, pending, className }: {
   )
 }
 
-function OnuRow({ o, deviceId, focused, noRx, splitters }: {
+function OnuRow({ o, deviceId, focused, noRx, splitters, warnDbm, critDbm }: {
   o: OnuOptic; deviceId: number; focused?: boolean
+  /** THIS OLT's thresholds, threaded from the optics reply rather than a global
+   *  default: two boxes may legitimately grade the same dBm differently, and a
+   *  scale drawn against the wrong pair would disagree with the dot beside it. */
+  warnDbm?: number | null; critDbm?: number | null
   // whole PON has no per-ONU Rx (DBC/C-Data EPON): the Rx-derived columns are
   // structurally dead here, not merely empty for this row
   noRx?: boolean
@@ -202,6 +206,7 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Acknowledge failed"),
   })
   const onAck = () => ack.mutate()
+  const [openSub, setOpenSub] = useState(false)
   // clicked on the map — bring the row into view so the spoke and the numbers meet
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -241,11 +246,26 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
             named. The walked name is kept in the tooltip rather than dropped:
             where a box reports one, "what does the OLT call it" is still a real
             question. */}
-        <span className="min-w-0 flex-1 truncate"
-          title={o.label && o.name && o.label !== o.name
-            ? `${o.label} · the OLT calls it ${o.name}` : undefined}>
-          {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
-        </span>
+        {/* …and the name is the way IN to the subscriber. A row in this list is
+            a reading; the person behind it — their number, which splitter feeds
+            them, whether the drop has ever been located — lived on four other
+            screens, and the tech reading a bad dBm here is exactly who needs
+            them. `subscriber-detail.tsx` is that one place; this is one of the
+            five doors into it. Gated on a serial because identity is the MAC:
+            with no sticker there is no key to look anything up by. */}
+        {o.serial ? (
+          <button type="button"
+            className="min-w-0 flex-1 truncate text-left underline-offset-2 hover:underline"
+            title={o.label && o.name && o.label !== o.name
+              ? `${o.label} · the OLT calls it ${o.name}` : "Open this subscriber"}
+            onClick={() => setOpenSub(true)}>
+            {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate">
+            {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
+          </span>
+        )}
         {/* Reference point toggle. It sits next to the NAME rather than out in
             the action column because it is a fact about the site, not a fact
             about this reading — and a placed one has to stay legible when the Rx
@@ -261,7 +281,7 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
         <span className="hidden w-24 shrink-0 truncate text-xs text-muted-foreground @3xl:inline"
           title={o.drop_passive_id != null
             ? `Drop from ${splitters?.get(o.drop_passive_id) ?? "a splitter that no longer exists"}`
-            : "No serving splitter recorded — open the splitter's panel on the map to record its subscribers"}>
+            : "No serving splitter recorded. Add it on the splitter's panel on the map."}>
           {o.drop_passive_id != null
             ? splitters?.get(o.drop_passive_id) ?? "—"
             : <span className="text-faint-foreground">—</span>}
@@ -272,11 +292,21 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
             same km twice on a no-Rx ONU. Rx stays on line one at every width:
             it is the value this list is sorted on. */}
         {!noRx && (
-          <span className={cn("w-24 shrink-0 text-right font-mono font-semibold tabular-nums",
-            onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
-            {o.rx_dbm != null
-              ? `${fmtDbm(o.rx_dbm)} dBm`
-              : <span className="font-normal text-faint-foreground">—</span>}
+          <span className="flex w-36 shrink-0 items-center justify-end gap-2">
+            {/* The scale sits BEFORE the figure, so the eye meets the verdict
+                and then the number — which is the order a tech reads a power
+                meter in. It draws only for an ONLINE ONU: a dark one's stored
+                Rx is whatever the last good walk saw, and placing that on a
+                live scale would claim it is the reading now. */}
+            {o.state === "online" && (
+              <RxScale rx={o.rx_dbm} warn={warnDbm} crit={critDbm} />
+            )}
+            <span className={cn("text-right font-mono font-semibold tabular-nums",
+              onuSev(o) === "crit" ? "text-destructive" : onuSev(o) === "warn" ? "text-warning" : "")}>
+              {o.rx_dbm != null
+                ? `${fmtDbm(o.rx_dbm)} dBm`
+                : <span className="font-normal text-faint-foreground">—</span>}
+            </span>
           </span>
         )}
         <DistCell o={o} className="hidden w-14 text-right @2xl:block" />
@@ -299,6 +329,9 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
         )}
         <AckCell o={o} onAck={onAck} pending={ack.isPending} className="ml-auto" />
       </div>
+      {openSub && o.serial && (
+        <SubscriberDialog mac={o.serial} onClose={() => setOpenSub(false)} />
+      )}
     </div>
   )
 }
@@ -308,12 +341,18 @@ function OnuRow({ o, deviceId, focused, noRx, splitters }: {
 // flex-1 slot between ~275px of fixed columns; inside the 380px device panel
 // that slot collapsed to zero and the strip wrapped one 11px cell per line —
 // a PON row as tall as its ONU count with nothing visible in it.
-function PonRow({ pon, open, onToggle, limit }: {
+function PonRow({ pon, open, onToggle, limit, opticsAt }: {
   pon: Pon; open: boolean; onToggle: () => void; limit: number
+  /** the OPTICS walk's own stamp — never the port walk's, which rides a
+   *  different clock and says nothing about the age of a light reading */
+  opticsAt?: string | null
 }) {
 
-  const worstTone = pon.crit > 0 ? "text-destructive" : pon.warn > 0 ? "text-warning" : "text-muted-foreground"
   const hasRx = pon.bestRx != null || pon.worstRx != null
+  // A reading's state is a fact about the WALK that produced it. The card as a
+  // whole already greys when the OLT is down (.wisp-frozen), so what is left
+  // for the figure itself to say is whether the walk behind it is current.
+  const rxState = readingState({ value: hasRx ? 1 : null, at: opticsAt })
   // EPON tops out at a 1:64 split — a PON that reached its cap can take no more
   // subscribers (central/onuroster.py pages this too)
   const atCap = pon.onus.length >= limit
@@ -336,12 +375,25 @@ function PonRow({ pon, open, onToggle, limit }: {
             readings (EPON without an optics profile) says so once instead of
             two dashes */}
         {hasRx ? (
-          <span className="ml-auto flex shrink-0 items-baseline gap-3 font-mono text-2xs tabular-nums">
-            <span className="text-muted-foreground">{fmtDbm(pon.bestRx)}</span>
-            <span className={cn("font-semibold", worstTone)}>{fmtDbm(pon.worstRx)}</span>
+          <span className="ml-auto flex shrink-0 items-baseline gap-3 text-2xs">
+            <Reading value={fmtDbm(pon.bestRx)} state={rxState} at={opticsAt}
+              className="text-muted-foreground" />
+            <Reading value={fmtDbm(pon.worstRx)} state={rxState} at={opticsAt}
+              tone={pon.crit > 0 ? "destructive" : pon.warn > 0 ? "warning" : undefined}
+              className={cn("font-semibold", pon.crit === 0 && pon.warn === 0 && "text-muted-foreground")} />
           </span>
         ) : (
-          <span className="ml-auto shrink-0 text-2xs text-faint-foreground">no Rx data</span>
+          /* THE DEAD ZONE. This used to read "no Rx data" — true, but a
+             SENTENCE where every sibling row shows a NUMBER, so it neither
+             held the column nor looked like the same kind of thing. Most of
+             the C-Data/DBC fleet is in exactly this state, so it is the common
+             case, not an edge one. */
+          <span className="ml-auto shrink-0">
+            <Reading value={null} state="absent"
+              reason="This OLT reports no per-ONU Rx. Its firmware has no optical
+                      column to read, so nothing was measured here — this is not a
+                      reading of zero." />
+          </span>
         )}
         {(pon.crit > 0 || pon.warn > 0) && (
           <span className="shrink-0 text-right text-2xs font-semibold">
@@ -361,9 +413,10 @@ function PonRow({ pon, open, onToggle, limit }: {
 
 const WORST_N = 6
 
-function PonDetail({ pon, device, focusOnuId, splitters }: {
+function PonDetail({ pon, device, focusOnuId, splitters, warnDbm, critDbm }: {
   pon: Pon; device: OrgDevice; focusOnuId?: number | null
   splitters?: Map<number, string>
+  warnDbm?: number | null; critDbm?: number | null
 }) {
   const deviceId = device.id
   const [showAll, setShowAll] = useState(false)
@@ -410,8 +463,7 @@ function PonDetail({ pon, device, focusOnuId, splitters }: {
       {rosterOnly && (
         <div className="mb-1">
           <p className="text-2xs text-faint-foreground">
-            No Rx readings on this PON — showing state, ranging distance and time
-            dark instead.
+            No Rx readings on this PON. Showing state, distance and time dark.
           </p>
           <RxDiagnosis device={device} compact />
         </div>
@@ -419,7 +471,7 @@ function PonDetail({ pon, device, focusOnuId, splitters }: {
       <div className="divide-y divide-border/60">
         {(showAll ? worst : worst.slice(0, WORST_N)).map((o) => (
           <OnuRow key={o.id} o={o} deviceId={deviceId} focused={o.id === focusOnuId}
-            noRx={rosterOnly} splitters={splitters} />
+            noRx={rosterOnly} splitters={splitters} warnDbm={warnDbm} critDbm={critDbm} />
         ))}
       </div>
       {worst.length > WORST_N && (
@@ -469,11 +521,11 @@ function FaultCard({ f }: { f: PonFault }) {
       ) : (
         <p className="mt-0.5">
           {f.evidence === "witness"
-            ? <>A power-backed reference ONU on this PON is still online, so light
-                is reaching the area — the ONUs that dropped almost certainly lost
-                mains power. Don't dispatch a splicing crew.</>
+            ? <>A power-backed reference ONU here is still online, so light is
+                reaching the area. The ONUs that dropped almost certainly lost
+                mains power. Don't send a splicing crew.</>
             : <>Mostly dying-gasp: customers likely lost mains power. Check the
-                area's supply before dispatching a splicing crew.</>}
+                area's supply before sending a splicing crew.</>}
         </p>
       )}
       {/* Say what the verdict RESTS ON. On the C-Data/DBC fleet no ONU reports a
@@ -484,7 +536,7 @@ function FaultCard({ f }: { f: PonFault }) {
         {f.evidence === "witness" ? (
           f.witness_dark > 0
             ? <>Confirmed by {f.witness_dark} power-backed reference ONU
-                {f.witness_dark > 1 ? "s" : ""} going dark — power can't explain that.</>
+                {f.witness_dark > 1 ? "s" : ""} going dark. Power can't explain that.</>
             : <>Based on {f.witness_alive} power-backed reference ONU
                 {f.witness_alive > 1 ? "s" : ""} still online past the dark ONUs.</>
         ) : f.evidence === "dying_gasp" ? (
@@ -702,8 +754,8 @@ export function OpticalPanel({ device, focusOnuId, focusOnuMac }: {
       {isDown && (
         <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs text-muted-foreground">
           <span className="font-semibold text-foreground">OLT offline.</span>{" "}
-          All {onus.length} ONUs are unreachable — the readings below are the last
-          snapshot before it went down.
+          All {onus.length} ONUs unreachable. Readings below are the last snapshot
+          before it went down.
         </div>
       )}
       {noRxAtAll && !isDown && <RxDiagnosis device={device} />}
@@ -755,10 +807,12 @@ export function OpticalPanel({ device, focusOnuId, focusOnuMac }: {
       <div className="flex flex-col">
         {pons.map((pon) => (
           <div key={pon.port}>
-            <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)} limit={limit} />
+            <PonRow pon={pon} open={pon.port === activePort} onToggle={() => toggle(pon.port)}
+              limit={limit} opticsAt={device.optics_updated_at} />
             {pon.port === activePort && (
               <PonDetail pon={pon} device={device} focusOnuId={focusId}
-                splitters={splitterNames} />
+                splitters={splitterNames}
+                warnDbm={q.data?.warn_dbm} critDbm={q.data?.crit_dbm} />
             )}
           </div>
         ))}

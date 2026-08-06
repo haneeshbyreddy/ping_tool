@@ -116,7 +116,7 @@ def _devices(devs: list[dict], cutoff: datetime,
             # A silent probe is its own issue row (probe_stale); here it means
             # this device's state is a memory, so say that instead of asserting
             # the remembered state as current.
-            detail = f"no recent report — last known {state.lower()}"
+            detail = f"no recent report, last known {state.lower()}"
             severity, sev_state = "warning", "STALE"
         else:
             sev_state = state
@@ -128,7 +128,7 @@ def _devices(devs: list[dict], cutoff: datetime,
             "device_down", severity, device_id=d["id"],
             device_name=d["name"], region=d.get("region"),
             subject=f"{d['name']} ({d.get('ip_address') or 'no IP'})",
-            detail=f"{sev_state} — {detail}",
+            detail=f"{sev_state} · {detail}",
             since=d.get("outage_started_at") or d.get("state_updated_at")))
     return out
 
@@ -142,7 +142,7 @@ def _ports(store, org: str, down_ids: set[int]) -> list[dict]:
             # The honesty rule from CLAUDE.md: readings on an unreachable box are
             # frozen. The row stays (the tile counts it) but must not be read as
             # a live, separate fault.
-            detail += " — switch unreachable, reading frozen"
+            detail += " · switch unreachable, reading frozen"
         out.append(_row(
             "port_down", "info" if frozen else "critical",
             device_id=p["device_id"], device_name=p["switch_name"],

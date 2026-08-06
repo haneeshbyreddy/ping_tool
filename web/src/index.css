@@ -109,9 +109,19 @@
    raster map tile — instead of being a hex tuned for exactly one surface and
    drifting on the other four. */
 :root {
-    --background: #f4f4f6;
+    /* 2026-08-05, THE SEPARATION PASS — and light needed it more than dark,
+       which nobody had measured. `--popover` and `--card` were BOTH #ffffff:
+       0.00 dL* between the "raised/focus surface" and the resting one, so every
+       drill-in, menu, map card and dropdown in light mode floated over a
+       surface identical to itself and rode entirely on its outline. The sidebar
+       sat 0.94 dL* from a card. Four levels needing >=3 dL* each do not fit
+       under a hard white ceiling, so the whole ladder steps DOWN to make room:
+       popover keeps the top, card drops off pure white, and the canvas follows.
+       Where a step still cannot reach 3 (popover on card lands at 2.94), the
+       BORDER carries it — which is what `.wisp-drillin` already does here. */
+    --background: #e5e8ec;
     --foreground: #16171c;
-    --card: #ffffff;
+    --card: #f4f6f9;
     --card-foreground: #16171c;
     --popover: #ffffff;
     --popover-foreground: #16171c;
@@ -123,13 +133,13 @@
     --primary: #2e7391;
     --primary-foreground: #ffffff;
     --primary-soft: rgba(46,115,145,0.10);
-    --secondary: #ededf0;
+    --secondary: #e2e5ea;
     --secondary-foreground: #16171c;
-    --muted: #eeeef2;
+    --muted: #eaedf1;
     --muted-foreground: #585d66;
     --faint-foreground: #797f88;
     --ghost-foreground: #9ba0a8;
-    --accent: #e8e8ee;
+    --accent: #e7eaef;
     --accent-foreground: #16171c;
     --destructive: #a8432e;
     --destructive-foreground: #ffffff;
@@ -140,9 +150,12 @@
     --warning: #8a6410;
     --warning-foreground: #ffffff;
     --warning-soft: rgba(138,100,16,0.10);
-    --border: rgba(0,0,0,0.11);
-    --border-subtle: rgba(0,0,0,0.065);
-    --input: rgba(0,0,0,0.17);
+    /* Same argument as the dark block: the panel edge was 1.283:1 and had to
+       become an edge. Light leans on these harder than dark does, because the
+       white ceiling costs it one full surface step. */
+    --border: rgba(0,0,0,0.17);
+    --border-subtle: rgba(0,0,0,0.08);
+    --input: rgba(0,0,0,0.25);
     --border-strong: var(--input);
     --ring: #2e7391;
     /* Healthy topology line on the map. Deliberately a DESATURATED blue and not
@@ -172,22 +185,80 @@
     --map-line-lime: #b0c95f;
     --map-line-indigo: #8093f0;
     --map-line-chalk: #d3d7df;
-    --chart-1: #2e7391;
-    --chart-2: #2f7d4f;
-    --chart-3: #8a6410;
-    --chart-4: #a8432e;
-    --chart-5: #71717c;
+    /* ── AXIS B: IDENTITY ────────────────────────────────────────────────
+       "What KIND of thing is this?", which is a different question from "is
+       it broken?" and needs its own channel. Five MEASUREMENT PLANES, and
+       they are not invented for this palette — the schema already models
+       them: one org_devices row carries four separate freshness stamps
+       (optics_/ports_/health_/state_updated_at), the SNMP layer runs three
+       separate walk clocks with three separate timeout caps, and the device
+       panel's tabs are literally Optical | Health | Ports. All of it
+       rendered in the same grey until now.
+
+       WHY THIS IS SAFE, mechanically rather than by taste:
+
+       · HUE is confined to 200-330deg and may NEVER enter 20-140deg, where
+         red/amber/green live. Minimum pairwise separation is 26deg, and every
+         one stays >=18deg clear of --primary (229deg) so identity can never be
+         mistaken for interaction.
+       · CHROMA is capped at 55% of the QUIETEST status tone on the same
+         screen (not the loudest — "must not exceed the status tones" means
+         all of them). Measured: warning is the quiet one at C=0.1208 dark.
+       · CONTRAST sits in [3.0, 80% of that quietest tone]: a floor from
+         Cloudscape's data-vis minimum, a ceiling from non-negotiable 1.
+       · Lightness ZIGZAGS across the ramp rather than staying flat, because
+         adjacent members are what actually sit beside each other and 26deg of
+         hue at this chroma is not enough separation on its own.
+
+       IT IS A MARK COLOUR, NEVER A TEXT COLOUR, and that fell out of the
+       arithmetic rather than being a preference: in light mode the ceiling
+       lands at 3.72:1, BELOW the 4.5:1 AA floor for body text. So an identity
+       hue rides a dot, a rail, a track or a chart series, and the chip's own
+       text stays neutral ink. That is also what makes an identity chip and a
+       status chip impossible to confuse at identical structural weight — a
+       status chip IS coloured text.
+
+       NOT OPERATOR-SETTABLE, deliberately, and for the same reason
+       --map-line-* isn't: these are an ENCODING whose values are solved
+       against a budget derived from the status tones. A hand-typed override
+       could breach the ceiling that makes the whole two-axis system safe.
+       --chart-1..5 mirror them and ARE settable (see ADVANCED_TOKENS), because
+       a chart series is decoration over data rather than a claim about it. */
+    --plane-optical: #52878a;   /* 200deg — light itself, and the biggest plane */
+    --plane-traffic: #6c8ca9;   /* 247deg — flow, clear of the reserved accent */
+    --plane-vitals: #747da2;    /* 273deg — the box's own body                  */
+    --plane-plant: #8f83a8;     /* 299deg — physical, surveyed                  */
+    --plane-fleet: #937594;     /* 325deg — the probes, farthest from optical   */
+
+    /* The chart ramp IS the identity ramp. It used to be
+       primary/success/warning/destructive/grey, i.e. every series in this
+       product would have been drawn in ALARM COLOURS — a healthy series
+       rendered in --destructive is a false alarm with a legend on it. Worse,
+       the Appearance panel DERIVED them from the status seeds, so recolouring
+       "Down" recoloured chart series 4; the live install's stored overrides
+       carry --chart-1 and --chart-4 and not 2/3/5 for exactly that reason.
+       Unbound in lib/theme-tokens.ts. */
+    --chart-1: var(--plane-optical);
+    --chart-2: var(--plane-traffic);
+    --chart-3: var(--plane-vitals);
+    --chart-4: var(--plane-plant);
+    --chart-5: var(--plane-fleet);
     /* 7px: rounded-lg = 7 (buttons, inputs, nav rows), rounded-xl = 9.8 ≈ 10
        (cards, panels), rounded-md = 5.6 ≈ 6 (chips). One number, three shapes
        the design actually uses — don't hand-tune radii at the callsite. */
     --radius: 0.4375rem;
-    --sidebar: #fafafb;
+    /* The rail is now DARKER than the canvas, not lighter. It read as a
+       near-white strip 0.94 dL* from a card, so the two halves of the screen
+       were one surface. This also makes the two themes structurally the same —
+       the sidebar is the recessed rail in both, rather than recessed in dark
+       and raised in light. */
+    --sidebar: #dbdfe5;
     --sidebar-foreground: #16171c;
     --sidebar-primary: #2e7391;
     --sidebar-primary-foreground: #ffffff;
-    --sidebar-accent: #e8e8ee;
+    --sidebar-accent: #e7eaef;
     --sidebar-accent-foreground: #16171c;
-    --sidebar-border: rgba(0,0,0,0.09);
+    --sidebar-border: rgba(0,0,0,0.14);
     --sidebar-ring: #2e7391;
 }
 
@@ -246,11 +317,17 @@
    argument for keeping borders alpha rather than hex — one token, right on
    every surface including raster map tiles. */
 .dark {
-    --background: #0c0e12;
+    /* 2026-08-05, THE SEPARATION PASS. Measured, not nudged — see the ladder
+       note above the light block. Every adjacency that actually shares an edge
+       on screen now clears the documented >=3 dL* floor; two did not before.
+       The CANVAS DELIBERATELY DOES NOT MOVE (3.94 -> 3.87 dL*): the halation
+       argument above says a third darkening must raise card with it instead,
+       so card/popover/accent rise and the floor stays where it is. */
+    --background: #0b0e12;
     --foreground: #e6e4e0;
-    --card: #1c1f24;
+    --card: #1d222a;
     --card-foreground: #e6e4e0;
-    --popover: #24272e;
+    --popover: #262c36;
     --popover-foreground: #e6e4e0;
     --primary: #74aec9;
     /* Dark ink, NOT white: at L*≈68 the steel blue only reaches 2.5:1 against
@@ -258,14 +335,18 @@
        dark tone already inks dark for the same reason. */
     --primary-foreground: #0b1920;
     --primary-soft: rgba(116,174,201,0.14);
-    --secondary: #202329;
+    --secondary: #222730;
     --secondary-foreground: #e6e4e0;
-    --muted: #171a1e;
+    /* The WELL, and the one dark adjacency that was under the floor: a
+       `.wisp-thead` strip or an input inside a panel measured 2.54 dL* against
+       the card containing it (1.056:1), which is the same sub-perceptual step
+       the note above says not to compress again. Now 3.96. */
+    --muted: #161a20;
 
     --muted-foreground: #a8abb2;
     --faint-foreground: #868a93;
     --ghost-foreground: #6e727a;
-    --accent: #2c3038;
+    --accent: #2d3440;
     --accent-foreground: #e6e4e0;
     --destructive: #e27a6b;
     --destructive-foreground: #2b120e;
@@ -277,24 +358,42 @@
     --warning-foreground: #1e1405;
     --warning-soft: rgba(227,172,87,0.13);
 
-    --border: rgba(255,255,255,0.10);
-    --border-subtle: rgba(255,255,255,0.055);
-    --input: rgba(255,255,255,0.14);
+    /* A PANEL EDGE HAS TO BE AN EDGE. At .10 this composited to #33353a on the
+       card — 1.346:1, which is EXACTLY the ceiling CLAUDE.md sets for basemap
+       ROAD GEOMETRY ("<= --border"). Roads were deliberately dulled until they
+       were as quiet as a panel edge; nobody checked whether the panel edge was
+       loud enough to be one. Now 1.731:1.
+       The ALPHA FORM is what the note above protects and it is unchanged — one
+       token still holding a constant relationship on canvas, card, popover and
+       raster tiles. Only the value moved, and the old value's own justification
+       ("resolves to exactly the palette's #31353d on the card") stops being
+       true the moment the card does. */
+    --border: rgba(255,255,255,0.17);
+    --border-subtle: rgba(255,255,255,0.09);
+    --input: rgba(255,255,255,0.23);
     --border-strong: var(--input);
     --ring: #74aec9;
     --map-link: #5e8a9e;
-    --chart-1: #74aec9;
-    --chart-2: #5fbe83;
-    --chart-3: #e3ac57;
-    --chart-4: #e27a6b;
-    --chart-5: #8b8f98;
-    --sidebar: #14171a;
+    /* Axis B — see the long note in the light block. Solved separately per
+       mode against that mode's own card and its own quietest status tone;
+       these are not the light values lightened. */
+    --plane-optical: #47878b;
+    --plane-traffic: #4f7495;
+    --plane-vitals: #717ca7;
+    --plane-plant: #776994;
+    --plane-fleet: #957296;
+    --chart-1: var(--plane-optical);
+    --chart-2: var(--plane-traffic);
+    --chart-3: var(--plane-vitals);
+    --chart-4: var(--plane-plant);
+    --chart-5: var(--plane-fleet);
+    --sidebar: #13171d;
     --sidebar-foreground: #e6e4e0;
     --sidebar-primary: #74aec9;
     --sidebar-primary-foreground: #0b1920;
-    --sidebar-accent: #2c3038;
+    --sidebar-accent: #2d3440;
     --sidebar-accent-foreground: #e6e4e0;
-    --sidebar-border: rgba(255,255,255,0.07);
+    --sidebar-border: rgba(255,255,255,0.12);
     --sidebar-ring: #74aec9;
 }
 
@@ -324,13 +423,41 @@
 
   /* Every number in a NOC is read in a COLUMN — latencies against latencies,
      counts against counts. Proportional digits make those columns ragged and
-     force the eye to re-measure each row, so all mono text tabulates. */
+     force the eye to re-measure each row.
+     This used to be scoped to `.font-mono, code, kbd, samp, pre`, which left
+     47 DISTINCT rendered elements carrying digits in proportional figures —
+     ONU counts, probe ages, disk sizes, the "12 dup MACs" chips, the ONU
+     totals in the device panel. All of them change on their own, and a figure
+     that changes width as it ticks is the specific thing tabular figures exist
+     to stop. Scoping it by FONT was the wrong axis: what matters is whether a
+     number moves, not which face it is set in.
+     Global, therefore, and deliberately so — a rule on `body` cannot be
+     forgotten by a component added later, where a list of 47 selectors would
+     drift on the first new screen. There is no long-form prose in this app to
+     pay the cost; every number in it is a count, a rate, a measurement or an
+     age. Same reasoning dense financial terminals apply. */
+  body {
+    font-variant-numeric: tabular-nums;
+    }
   .font-mono, code, kbd, samp, pre {
     font-variant-numeric: tabular-nums;
     }
 
   ::selection {
     background: color-mix(in srgb, var(--primary) 30%, transparent);
+    }
+
+  /* THE THIRD AND LAST JOB OF THE ACCENT: keyboard focus. `outline-ring/50` in
+     the base layer only set the outline COLOUR and left the width to the user
+     agent, so focus looked different per browser and was invisible on anything
+     that painted its own background. One accent ring, offset so it reads on a
+     filled control as well as a bare one. `:focus-visible`, never `:focus` —
+     a mouse click on a row must not leave a ring behind it.
+     Components that define their own ring still win on specificity; this is
+     the floor, so nothing focusable can end up with no visible focus at all. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
     }
 
   /* The scrollbar is chrome, not content: it recedes into the canvas and only
@@ -372,6 +499,33 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-xl);
   overflow: hidden;
+}
+
+/* THE LIT TOP EDGE. A raised surface in the physical world catches light on the
+   face that points at it, and one inset hairline is the whole of that effect —
+   it is what makes a dark panel read as an object with a top rather than as a
+   lighter rectangle. Linear builds its elevation the same way (borders plus a
+   subtle inner shadow) and so does every dark UI that looks made rather than
+   filled in.
+   NO DROP SHADOWS, still: on a near-black canvas a cast shadow has nothing to
+   darken, so it reads as a smudge. Surface step + border + this. Rings, never
+   blurs — the same rule the map chrome already follows.
+   0.06, MEASURED, not the 0.04 this was first specified at: that number was
+   written against the old #1b1b1b card, and on the raised #1d222a it composites
+   to 1.123:1, faint enough to do nothing. 0.06 lands at 1.190:1 — clearly
+   present, and clearly subtler than the panel's own border at 1.731:1, which is
+   the relationship that matters. An edge that competes with the outline stops
+   reading as light and starts reading as a second border.
+   DARK ONLY, and that is arithmetic rather than laziness: on the light card a
+   white inset measures 1.0000:1 — exactly no effect, because the card is
+   already the lightest surface in the room and "lit from above" has nowhere to
+   go. Light carries its elevation on the border (1.483:1) and on the card
+   sitting above the canvas, which is what those were strengthened for.
+   `.wisp-drillin` is DELIBERATELY NOT IN THIS RULE. It is a SELECTED ROW, not
+   a raised surface, and edge lighting is exactly what would make it read as
+   one — see the selection block below. */
+.dark .wisp-panel {
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06);
 }
 .wisp-panel-head {
   display: flex;
@@ -456,6 +610,115 @@
   opacity: 0.7;
 }
 
+/* ── THE DEAD ZONE (components/reading.tsx) ─────────────────────────────────
+   An OTDR marks the stretch of fibre where it CANNOT measure — the dead zone —
+   rather than leaving the trace blank there, because "no data" and "no fault"
+   are opposite findings and a technician has to tell them apart at a glance.
+   This is that, for a number.
+
+   Most of the C-Data/DBC fleet walks a complete ONU roster with every rx_dbm
+   NULL. Rendered as a blank cell that reads as "not loaded"; rendered as 0 it
+   reads as a measurement; rendered green it reads as healthy. All three are
+   lies. So an unmeasurable field gets a SHAPE: a dash sitting on a hairline
+   track, occupying the same box a real reading would, which says the question
+   was asked and this instrument cannot answer it.
+
+   The track is what makes it a statement rather than an absence, and the fixed
+   width is what keeps a column of readings aligned when some of them cannot be
+   taken — the same argument tabular figures make one level up. */
+.wisp-deadzone {
+  position: relative;
+  display: inline-block;
+  width: 2.25rem;
+  height: 0.85em;
+  border-bottom: 1px solid var(--border);
+  vertical-align: baseline;
+}
+.wisp-deadzone::after {
+  content: "—";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-2xs);
+  line-height: 1;
+  color: var(--ghost-foreground);
+}
+
+/* ── THE Rx SCALE (components/rx-scale.tsx) ─────────────────────────────────
+   A power meter, not a progress bar. The difference is not decoration: a
+   progress bar fills from one end and means "how much of the way there", while
+   this has FIXED MARKS on it and means "which side of the line are you". The
+   bands are drawn and the pointer floats over them.
+
+   The bands take the status tones because they ARE the status thresholds —
+   this is one of the few places Axis A legitimately appears as a fill rather
+   than as text. They stay under the tone's own text contrast (a band is a
+   region, and a region at full strength would out-shout the number beside it),
+   which is what the alpha does.
+
+   `ok` GETS NO BAND. A healthy reading is the overwhelming majority and none of
+   it is news — the same rule the map applies to a live subscriber and Home
+   applies to a tile reading zero. The track's own quiet background is the ok
+   region, so a scan down a PON is a search for colour rather than a read of
+   sixty little charts. */
+.wisp-rxscale {
+  position: relative;
+  display: inline-block;
+  /* wide enough that 3 dB of warn band is still a few px, narrow enough to sit
+     in a table cell beside the figure it explains */
+  width: 3.25rem;
+  height: 0.5rem;
+  border-radius: 2px;
+  background: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.wisp-rxscale__band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.wisp-rxscale__band--crit { left: 0; background: color-mix(in oklab, var(--destructive) 42%, transparent); }
+.wisp-rxscale__band--warn { background: color-mix(in oklab, var(--warning) 38%, transparent); }
+
+/* The pointer. A NEEDLE, not a dot: it has to read as "the reading is HERE on
+   this scale" rather than as one more status dot in a row that already has
+   several. Cased in the track's own background so it stays visible crossing a
+   band edge. */
+.wisp-rxscale__mark {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--foreground);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--muted) 70%, transparent);
+}
+/* PEGGED — comfortably clear of warn, so the needle parks at the top of the
+   scale. Hollow rather than solid: a pegged needle is saying "off this scale",
+   and drawing it identically to a real position would claim a precision the
+   track does not have up there. */
+.wisp-rxscale__mark--peg {
+  background: var(--muted-foreground);
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+}
+
+/* STALE: the value still shows — it is the last known truth, and it is exactly
+   what a tech reads while driving to the site — but a dBm on screen carries no
+   date, so the number is underlined the way a spell-checker marks something to
+   look at again. A DOTTED underline rather than a colour: the status tones are
+   spoken for, and "old" is not a severity. */
+.wisp-reading--stale .wisp-reading__v {
+  text-decoration: underline dotted var(--faint-foreground);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+
 /* A chip painted in an OPERATOR colour (tag colours; lib/palette.ts). The tone
    arrives as --tag from the component, because the value is data — which is
    exactly why this is a class and not an inline style: the palette's members
@@ -465,28 +728,79 @@
    mixed toward black until they read. Same relationship as a status chip
    (full-strength ink, ~15% fill), so a coloured tag never outweighs a real
    alarm sitting beside it. */
+/* The painted variant of the one chip formula: text at full strength, fill at
+   15%, EDGE AT 30% — the same three steps `TONE_CLASS` uses, so an operator
+   colour and a status tone are the same object wearing a different hue. The
+   border-colour is stated because `CHIP_BOX` only sets the WIDTH, and Tailwind
+   defaults an unstated border to `currentColor` — which on a painted tag would
+   be a full-strength edge, i.e. the one chip on the row shouting loudest being
+   the one with no status meaning at all. */
 .wisp-tag {
   color: var(--tag);
   background: color-mix(in oklab, var(--tag) 15%, transparent);
+  border-color: color-mix(in oklab, var(--tag) 30%, transparent);
 }
 :root:not(.dark) .wisp-tag {
   color: color-mix(in oklab, var(--tag) 62%, black);
   background: color-mix(in oklab, var(--tag) 20%, transparent);
+  border-color: color-mix(in oklab, var(--tag) 38%, transparent);
 }
 
-/* Drill-in selection (Network tree, routes/topology-page.tsx): the open row gets
-   ONE raised surface — popover bg + strong outline; the elevation alone marks
-   the selection (a colored rail was tried and rejected). Light mode doubles the
-   outline (hairlines read weaker on white). */
+/* ── SELECTION IS A STATE OF THE ROW, NOT ANOTHER LAYER ─────────────────────
+   Drill-in selection (Network tree, routes/topology-page.tsx). It used to be
+   popover bg + a --border-strong outline, doubled in light mode, and the
+   elevation alone was meant to mark it. Two things were wrong with that:
+
+   1. IT DID NOT EXIST IN LIGHT MODE. --popover and --card were both #ffffff
+      until 2026-08-05, so the "raised surface" was 0.00 dL* from the row it
+      was raised above and the whole signal was the outline.
+   2. EVEN IN DARK IT WAS BACKWARDS. The selection delta was popover-on-card,
+      i.e. exactly ONE ELEVATION STEP — the same distance that means "this is a
+      menu floating above you". So the selected row said "I am a new surface"
+      when what it means is "this is the one you picked".
+
+   The rule now (Linear ships this and states the reason): a selected row's
+   delta against its background must be LARGER than the elevation step, AND it
+   must have NO EDGE LIGHTING — the outline is what makes a highlight read as a
+   separate layer on its own z-plane, and this is not one.
+
+   So: no outline (a transparent border keeps the geometry identical), no inset
+   top edge (it is excluded from the .wisp-panel highlight rule above for this
+   exact reason), and a fill that clears the elevation step — 6.88 dL* against
+   4.77 in dark, 5.44 against 3.19 in light.
+
+   IT IS A CHROMATIC LIFT, NOT A BRIGHTNESS ONE, and that distinction is the
+   whole reason it can coexist with hover. --accent is the achromatic hover
+   wash; this sits at a similar LIGHTNESS but carries the accent HUE at 2.1x
+   (dark) / 5.0x (light) the chroma. They separate on colour, so "hovered" and
+   "selected" stay tellable apart without either one shouting. A first attempt
+   separated them by brightness instead and put the selected row 15 dL* above
+   the card — brighter than --accent, i.e. straight back to looking like a new
+   surface.
+
+   DERIVED from --primary, like --map-live is from --success: the accent is
+   superadmin-settable, and a hardcoded hex would silently stop matching it.
+   The @supports pair is load-bearing for the reason documented at --map-live —
+   an unparseable custom property fails at the point of USE, so the row would
+   lose its background entirely rather than fall back. */
+:root {
+  --selected: color-mix(in oklab, var(--primary) 10%, var(--card));
+}
+.dark {
+  --selected: color-mix(in oklab, var(--primary) 26%, var(--background));
+}
+@supports (color: oklch(from white l c h)) {
+  :root { --selected: oklch(from var(--primary) 0.923 0.038 h); }
+  .dark { --selected: oklch(from var(--primary) 0.307 0.050 h); }
+}
 .wisp-drillin {
-  background: var(--popover);
-  border: 1px solid var(--border-strong);
+  background: var(--selected);
+  /* transparent rather than absent: the 1px still occupies its box, so
+     selecting a row cannot shift the list by 2px. */
+  border: 1px solid transparent;
   border-radius: var(--radius);
   margin-block: 2px;
   overflow: hidden;
-}
-html:not(.dark) .wisp-drillin {
-  box-shadow: 0 0 0 1px var(--input);
 }
 
 /* Network device side panel (routes/topology-page.tsx). Its width is DRAGGABLE,
@@ -511,27 +825,22 @@ html:not(.dark) .wisp-drillin {
   .wisp-device-panel {
     width: var(--wisp-panel-w, 26.25rem);
   }
-  /* Two ways to keep chrome out from under the panel, off ONE measurement: the
-     Network page reserves a gutter on its toolbar rows, the Map pushes its
-     floating control column left. Both were hardcoded to a fixed panel width
-     until the panel became draggable, at which point a constant gaps or
-     overlaps on every resize. */
+  /* Chrome that must not end up under the panel, off ONE measurement: the
+     Network page reserves a gutter on its toolbar rows, the Map's top strip caps
+     its width. Both were hardcoded to a fixed panel width until the panel became
+     draggable, at which point a constant gaps or overlaps on every resize. */
   .wisp-panel-clear {
     padding-right: var(--wisp-panel-clear, 0px);
   }
-  /* max() rather than a second custom property: `--wisp-panel-clear` is 0 while
-     the panel is closed, and the control column still wants its normal 0.75rem
-     inset off the edge — so the floor IS the closed position. */
-  .wisp-panel-beside {
-    right: max(0.75rem, var(--wisp-panel-clear, 0px));
-  }
-  /* ...and the top strip has to stop short of that column wherever it now is.
-     It used to reserve a FIXED 96px, which was right only while the column sat
-     at the edge — widen the panel and the layers button lands on top of the
-     strip's last chip. Same measurement, so they can't disagree; the strip wraps
-     to a second line rather than colliding. */
+  /* The map's top strip stops short of the floating controls at the other end of
+     the same band. Which reserve binds depends on what is open, hence max():
+     with nothing open the controls are a 2rem column on a 0.75rem inset, so the
+     floor is 4.5rem; with a panel open they lay out as a ROW above it, narrower
+     than the panel they align to, so the panel's own gutter already covers them.
+     Reserving BOTH (the old `clear + 3.75rem`) cost the strip 60px it could
+     have, which showed as chips wrapping to a second line for no reason. */
   .wisp-panel-strip {
-    max-width: calc(100% - max(0.75rem, var(--wisp-panel-clear, 0px)) - 3.75rem);
+    max-width: calc(100% - max(4.5rem, var(--wisp-panel-clear, 0px)));
   }
 }
 
@@ -572,6 +881,172 @@ html:not(.dark) .wisp-drillin {
   color: var(--muted-foreground);
 }
 
+/* ── THE MARK SCALE ─────────────────────────────────────────────────────────
+   ONE ladder for every mark on this map, because the alternative failed the
+   same way every time: each new kind was given a fresh px number, every fresh
+   number came in under the last, and the kind arrived unreadable. The splitter
+   shipped at 40px² of ink against an FDB's 81px² and a device dot's 154px²; a
+   located subscriber was drawn "the smallest mark on the map" TWICE (11px, then
+   9px) and came back illegible both times; a CPE sat at 10px, less than half
+   the ink of the router beside it, for no recorded reason at all.
+
+   THE RULE: a mark picks a RANK and a SHAPE FACTOR. It never types a px.
+
+   RANK is what the mark CLAIMS, so a new kind has exactly one question to
+   answer, and every mark of one rank carries the same INK whatever silhouette
+   it takes:
+
+     --mark-evidence  a DARK reference ONU. Power cannot darken a subscriber
+                      the operator vouched for, so this is a fibre cut with a
+                      coordinate: the one mark allowed to outrank gear, gated
+                      on `refonu.ts:isRefEvidence` and nothing looser.
+     --mark-gear      anything with a state and an outage of its own.
+     --mark-plant     a passive box a crew drives to. Under gear because plant
+                      is reference material, and muted as well as smaller.
+     --mark-drop      one subscriber. The commonest mark on a surveyed fleet
+                      and the quietest, but quieted by SATURATION and by
+                      staying out of the clustering pass. NOT by shrinking:
+                      that is the specific thing that failed twice.
+
+   INK, NEVER THE NUMBER. A silhouette's area is not its width: at one width a
+   square carries 0.97·W², a rounded square 0.89, a teardrop 0.84, a circle
+   0.785, and a diamond stated by its BOUNDING BOX only 0.5. Two kinds both
+   reading "9px" were therefore two different marks, which is how the splitter
+   ended up the faintest thing on the map while looking, in the source, exactly
+   the size of an FDB. So a rank is stated as the diameter of the equivalent
+   CIRCLE and each shape converts below. Two corollaries worth keeping:
+   rotation is FREE (it moves ink, it never removes it), which is why
+   `--t-backhaul` is a --markshape-square and not a special case; and ink is
+   measured on the OUTER silhouette, so a hole (the core donut's, the
+   splitter's) is how a kind is TOLD APART, never how it is sized.
+
+   --mark-gear IS THE CALIBRATION, and the OLT is what it was solved from
+   (operator, 2026-08-05: the OLT is "the right size, visible properly and easy
+   to grasp"). 15.6px × --markshape-square lands on the 14px square that mark
+   has always been, so the anchor is byte-identical to the one mark already
+   judged correct on real tiles, in a real browser, in both themes. The point of
+   stating the others as RATIOS of it is that "make the marks bigger" is one
+   number and no kind can be left behind by it. Change --mark-gear, re-check on
+   satellite tiles, done.
+
+   THE STEPS BETWEEN THE THREE LOWER RANKS ARE SMALL, AND DELIBERATELY SO. Ink
+   here encodes ORDER, not EMPHASIS. Emphasis on this map is carried by TONE (a
+   live drop is the quietest fill on it, plant is always muted, only gear takes
+   a status colour), by STACKING (`refZIndex`/`workerZIndex` are negative), by
+   the CLUSTERING pass that plant and gear join and subscribers don't, and by
+   the zoom floors in Settings → Platform → Map detail. Ink's only other job is
+   to clear a LEGIBILITY floor, and every mark a person clicks has to clear it.
+
+   That is not a preference, it is the record: this layer was drawn "the
+   smallest mark on the map" at 11px, then 9px, then given a 15% step down from
+   plant, and the operator called it too small ALL THREE TIMES — the third time
+   after being shown the ladder. Meanwhile the invariant that shrinking is not a
+   subordination channel has been in CLAUDE.md since 2026-07-29, written after
+   the first two failures. The ratios below are what that invariant looks like
+   when it is actually applied instead of quoted. If a surveyed street ever does
+   read as too busy, the levers are the zoom floor, the layer toggle, the PON
+   scope and the fill saturation. NOT this number: it has been tried. */
+:root {
+  --mark-gear: 15.6px;
+  --mark-evidence: calc(var(--mark-gear) * 1.10);
+  --mark-plant: calc(var(--mark-gear) * 0.98);
+  --mark-drop: calc(var(--mark-gear) * 0.96);
+
+  /* Width per unit of nominal diameter = sqrt(circle area ÷ this shape's area).
+     Add a silhouette by adding its factor here WITH the arithmetic, never by
+     eyeballing a width. Corner radii are percentages at the point of use for
+     the same reason: a fixed px radius makes a shape's factor drift with its
+     rank, so the one below would stop being true. */
+  --markshape-circle: 1;        /* π/4·W²                                  */
+  --markshape-teardrop: 0.968;  /* a circle plus one square corner: 0.839  */
+  --markshape-square: 0.898;    /* corners ≤ ~1/5 W: 0.973                 */
+  --markshape-rounded: 0.933;   /* the switch's ~1/3 W corners: 0.900      */
+
+  /* How far a teardrop's point hangs below its own box: half the diagonal less
+     half the side, = (√2−1)/2. Marks that STAND on their coordinate subtract it
+     so the tip lands on the latlng at every rank, rather than at the one rank
+     somebody measured. */
+  --mark-tip: 0.2071;
+}
+
+/* ── QUIETING A STATUS COLOUR WITHOUT BENDING IT ────────────────────────────
+   A quiet green for map marks, in two steps. It exists because the obvious way
+   to quiet a colour here is WRONG, and had shipped in three places (operator,
+   2026-08-05: "use proper green for the pins because its blueish right now and
+   its similar to dotted line").
+
+   `color-mix(… var(--success) N%, var(--muted-foreground))` does NOT desaturate
+   green. `--muted-foreground` is a cool blue-grey (this is a warm-slate app,
+   but its GREYS lean cool), so mixing toward it drags the HUE as it drops the
+   chroma. Measured in OKLCH, dark mode: --success is hue 154° at chroma 0.126;
+   the located-subscriber fill at 32% came out hue 167° at chroma 0.040, and
+   light mode's landed at 175° — cyan — while also losing 0.04 of lightness that
+   nothing asked it to lose. At that little chroma the residual cast is all
+   there is, so the mark reads as a cool grey. And `--map-link`, the DOTTED DROP
+   LINE the operator compared it to, carries chroma 0.057: the line was more
+   colourful than the pin it belongs to. That is the whole complaint, and it was
+   a measurement, not a taste.
+
+   So: scale CHROMA at fixed hue and lightness. Hue stays pinned at 154–155°,
+   the mark keeps --success's own lightness in both themes, and the numbers
+   below are the only thing that says how loud it is.
+
+   DERIVED from --success on purpose — it is a superadmin-settable token
+   (Settings → Appearance), so an operator who recolours the status green gets
+   these in family for free, which a hardcoded hex would silently break. Not in
+   `theme.py:_TOKENS` for the same reason `--map-line-*` isn't: cartography,
+   not brand theming.
+
+   The @supports pair is not ceremony. A custom property holding an unparseable
+   value fails INVALID AT COMPUTED-VALUE TIME at the point of use, so `background`
+   would resolve to `unset` and the mark would vanish rather than fall back —
+   the earlier-declaration trick does not rescue a var() indirection. The plain
+   mix is the fallback: hue-dragged, but green and visible. */
+:root {
+  --map-live: color-mix(in srgb, var(--success) 88%, var(--muted-foreground));
+  --map-live-quiet: color-mix(in srgb, var(--success) 66%, var(--muted-foreground));
+}
+@supports (color: oklch(from white l c h)) {
+  :root {
+    --map-live: oklch(from var(--success) l calc(c * 0.92) h);
+    --map-live-quiet: oklch(from var(--success) l calc(c * 0.68) h);
+  }
+}
+
+/* PLANT'S OWN COLOUR (2026-08-06, operator: "change the colour of splitter's
+   pin"). A splitter used to be painted entirely out of the STATUS vocabulary —
+   grey when nothing was recorded on it, green when its recorded drops were all
+   online — and green is the app's "this is healthy", which a box with no state,
+   no FSM and no outage cannot claim. So the non-alarm states leave Axis A
+   altogether for `--plane-plant`, the IDENTITY hue the palette work already
+   assigns to "physical, surveyed" (299°, the same token `--chart-4` mirrors).
+
+   It cannot be mistaken for an alarm, and that is measured rather than hoped:
+   299° sits 137° from --warning, 141° from --success and 85° from --destructive,
+   and its chroma (0.056 dark / 0.068 light) is 42% of --destructive's and 61%
+   of --warning's — so plant reads as a KIND on this map while every status tone
+   stays louder than it. Amber and red still take the mark outright when the
+   recorded subscribers are weak or dark: identity is what a thing IS, and an
+   alarm outranks it.
+
+   TWO STEPS, because "nobody has recorded a drop here" and "every recorded drop
+   is online" are different sentences and this map may not paint them alike (the
+   same "nothing is wrong" vs "nothing is measured" rule the optics tiles keep).
+   The step is CHROMA at fixed hue — never a mix toward the grey, for the reason
+   spelled out directly above this — so an empty box is the same violet, drained.
+
+   Derived from the token and paired with a @supports fallback for the reasons
+   given above. */
+:root {
+  --map-plant: var(--plane-plant);
+  --map-plant-quiet: color-mix(in srgb, var(--plane-plant) 55%, var(--muted-foreground));
+}
+@supports (color: oklch(from white l c h)) {
+  :root {
+    --map-plant-quiet: oklch(from var(--plane-plant) l calc(c * 0.42) h);
+  }
+}
+
 .wisp-pin-anchor {
   background: none;
   border: none;
@@ -587,8 +1062,11 @@ html:not(.dark) .wisp-drillin {
 }
 .wisp-pin__dot {
   position: relative; /* hosts the ::after optical ring */
-  width: 14px;
-  height: 14px;
+  /* Gear rank, circle: the default silhouette for a device with no shape rule
+     of its own (router, AP). See THE MARK SCALE above before touching a size. */
+  --mark-w: calc(var(--mark-gear) * var(--markshape-circle));
+  width: var(--mark-w);
+  height: var(--mark-w);
   border-radius: 9999px;
   border: 2px solid var(--background);
   box-shadow: 0 0 0 1px var(--border-strong);
@@ -727,28 +1205,77 @@ html:not(.dark) .wisp-drillin {
   animation: wisp-pin-pulse 1.6s ease-out infinite;
 }
 
-/* ---- Splitters: ratio + recorded load, and the span below a break ----------
+/* ---- Splitters: the ratio, and the span below a break ---------------------
    A passive has NO state of its own — nothing pings a splitter, it has no FSM
    and no outage. What it can report is what hangs below it, so its pin borrows
-   that and nothing else. Plant stays quiet by default (it is reference material
-   and must not compete with gear for the eye); the one exception is the one
-   worth making — a splitter whose recorded customers are dark is the most
-   useful object on the map during a cut, and it is allowed to say so. SIZE
-   never changes, only tone: a louder splitter must not start reading as gear. */
-.wisp-pin__sub {
-  margin-left: 5px;
-  color: var(--faint-foreground);
-  font-weight: 400;
+   that and nothing else.
+
+   Since 2026-08-06 it borrows it on TWO AXES rather than one (operator: "change
+   the colour of splitter's pin"). Plant's ordinary states are its IDENTITY hue,
+   `--map-plant` — see PLANT'S OWN COLOUR above for the measurement — and only
+   an alarm reaches into the status vocabulary:
+
+     quiet  nothing recorded here      --map-plant-quiet   (violet, drained)
+     ok     every recorded drop up     --map-plant         (violet, full)
+     weak   recorded drops on weak Rx  --warning + halo
+     dark   recorded drops are dark    --destructive + halo
+
+   That REPLACES the 2026-08-05 rule ("a splitter whose recorded drops are all
+   online reads GREEN"), which was itself a fix for the pin disagreeing with the
+   card that opens on it — `plantVerdict` grades such a box `success`. The card
+   still does, and it still says "6 of 6 recorded online" in green. That is not
+   the same disagreement: a mark and its card may never grade one box two ways
+   ON THE STATUS AXIS, and the pin has left that axis for exactly the states
+   where it was making a health claim it has no standing to make. It re-enters
+   it for weak and dark, where the card agrees with it tone for tone.
+
+   The two violet steps are a chroma difference at one hue, and they carry the
+   rule the old grey/green pair carried: an EMPTY RECORD is not a healthy one,
+   and painting them alike is "nothing is wrong" rendering as "nothing is
+   measured" on the box a crew drives to.
+
+   SIZE never changes with tone — a louder splitter must not start reading as
+   gear, and only the FILL moves.
+
+   The plate is now the RATIO ALONE — the name and the "· 6 · 2 dark" tail went
+   on 2026-08-05, so these tone rules moved off the old `.wisp-pin__sub` span
+   and onto the plate itself. The `--drops-*` classes are only ever set for a
+   passive (map-page passes `dropTone` only there), so this stays plant-scoped
+   without saying so; a passive is always `--muted` besides, since nothing pings
+   it, so the state-tone plate rules further up can never collide with these. */
+/* The plant BASE, and it has to sit HERE — after the state-tone fills further
+   up (a passive is always `--muted`, so `.wisp-pin--muted .wisp-pin__dot` would
+   otherwise win on source order) and BEFORE the `--drops-*` rules below, which
+   are the alarms and must keep winning over it. All three are equal specificity,
+   so this block's ORDER is the whole cascade; don't move these apart.
+   FDB and closure take it too: they are the same PLANT rank, and what tells the
+   three apart is the silhouette, never the colour. */
+.wisp-pin--t-splitter .wisp-pin__dot,
+.wisp-pin--t-fdb .wisp-pin__dot,
+.wisp-pin--t-closure .wisp-pin__dot { background: var(--map-plant-quiet); }
+.wisp-pin--drops-weak .wisp-pin__label { color: var(--warning); }
+.wisp-pin--drops-dark .wisp-pin__label { color: var(--destructive); font-weight: 600; }
+/* …but the plate stays plain ink for `ok`. The MARK carries the colour; text is
+   heavier ink than a dot of the same tone, and a green "1:8" on every healthy
+   splitter is the wall of colour this layer is otherwise careful about. Only a
+   problem is worth saying twice. */
+.wisp-pin--drops-ok .wisp-pin__dot {
+  /* The full identity hue: this box has a record and everything in it is up.
+     Its neighbour above (`--map-plant-quiet`) is the same hue drained, which is
+     the whole distance between "measured healthy" and "never measured". */
+  background: var(--map-plant);
 }
-.wisp-pin--drops-weak .wisp-pin__sub { color: var(--warning); }
-.wisp-pin--drops-dark .wisp-pin__sub { color: var(--destructive); font-weight: 600; }
 /* The dot follows the same rule. It does NOT pulse: the pulse means "this box
-   is down", and a splitter is never down — its subscribers are. */
+   is down", and a splitter is never down — its subscribers are. The halo is
+   what makes a splitter in trouble findable across a viewport, so it stays on
+   top of the fill rather than being replaced by it. */
 .wisp-pin--drops-weak .wisp-pin__dot {
+  background: var(--warning);
   box-shadow: 0 0 0 1px var(--border-strong),
     0 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent);
 }
 .wisp-pin--drops-dark .wisp-pin__dot {
+  background: var(--destructive);
   box-shadow: 0 0 0 1px var(--border-strong),
     0 0 0 3px color-mix(in srgb, var(--destructive) 55%, transparent);
 }
@@ -804,13 +1331,20 @@ html:not(.dark) .wisp-drillin {
   padding: 2px 6px;
   border-radius: 4px;
   background: var(--popover);
-  border: 1px solid var(--border-strong);
+  /* HAIRLINE, not --border-strong (2026-08-01). The strong border plus a 600
+     weight made a rate — pure reference data, never an alarm — the loudest
+     object in a viewport, above the device names and above the one red pin that
+     was the reason to look. This map's rule is that status tones are loudest;
+     the chips were breaking it, four at a time. The opaque fill and the outer
+     ring STAY: those are what carry it over satellite, and legibility was never
+     the problem. Only the shouting was. */
+  border: 1px solid var(--border);
   box-shadow: 0 0 0 1px color-mix(in oklab, var(--background) 55%, transparent);
   color: var(--foreground);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   /* token, not a px literal — a 10px literal opted out of the ≥1600px scaling */
   font-size: var(--text-2xs);
-  font-weight: 600;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   line-height: 1.4;
   white-space: nowrap;
@@ -821,6 +1355,17 @@ html:not(.dark) .wisp-drillin {
 .wisp-linkbw__ar + .wisp-linkbw__ar { margin-left: 5px; }
 /* no live reading: the port name is context, so it stays quiet */
 .wisp-linkbw__port { color: var(--muted-foreground); font-weight: 400; }
+/* IDLE — the most common chip on a real fleet, so it is the quietest.
+   A link doing nothing is reference data about reference data: it should be
+   recognised by SHAPE and skipped, never read. Deliberately still a chip and
+   not a hidden one — "this link is bound and carrying nothing" and "no port is
+   bound here" are different sentences, and the second one has its own body. */
+.wisp-linkbw--idle {
+  color: var(--muted-foreground);
+  font-weight: 400;
+  border-color: var(--border-subtle);
+}
+.wisp-linkbw__idle { letter-spacing: 0.02em; }
 .wisp-linkbw:hover { border-color: var(--ring); }
 .wisp-linkbw--warn {
   color: var(--warning);
@@ -913,8 +1458,10 @@ html:not(.dark) .wisp-drillin {
   font-variant-numeric: tabular-nums;
 }
 .wisp-linkhover__name { color: var(--muted-foreground); font-weight: 400; }
-/* whether this is drum metres or a chord — the one thing that must not be
-   guessed off a number a splicing crew is about to order cable against */
+/* Renders ONLY on an undrawn link, to say the number is a chord and not drum
+   metres — the one thing that must not be guessed off a figure a splicing crew
+   is about to order cable against. The drawn case carries no note: the traced
+   line already shows what was measured. */
 .wisp-linkhover__note {
   color: var(--faint-foreground);
   font-weight: 400;
@@ -940,11 +1487,27 @@ html:not(.dark) .wisp-drillin {
    SILHOUETTE — fill stays health, the ::after ring stays optics. Shapes are
    border-radius/rotation/::before only: clip-path would clip the selection
    box-shadow and the down-pulse, so it's off the table. Diamond rotation is
-   safe — the optic ring is a circle and circles don't rotate visibly. */
-.wisp-pin--t-olt .wisp-pin__dot { border-radius: 2.5px; }
-.wisp-pin--t-switch .wisp-pin__dot { border-radius: 5px; }
+   safe — the optic ring is a circle and circles don't rotate visibly.
+
+   All of these are GEAR rank: a device has a state and an outage of its own,
+   and which KIND of device it is may change the silhouette but never the size.
+   Only the width differs below, and only because the shapes carry different ink
+   at one width — --markshape-square on 15.6px is the 14px OLT square this scale
+   was calibrated from. */
+.wisp-pin--t-olt .wisp-pin__dot {
+  --mark-w: calc(var(--mark-gear) * var(--markshape-square));
+  border-radius: 18%;
+}
+.wisp-pin--t-switch .wisp-pin__dot {
+  --mark-w: calc(var(--mark-gear) * var(--markshape-rounded));
+  border-radius: 36%;
+}
+/* Rotation is free: a rotated square has the ink of a square, so this takes the
+   square factor. A mark whose stated size is its BOUNDING BOX would be the
+   0.5·W² case in the scale above and needs its own factor. */
 .wisp-pin--t-backhaul .wisp-pin__dot {
-  border-radius: 2.5px;
+  --mark-w: calc(var(--mark-gear) * var(--markshape-square));
+  border-radius: 18%;
   transform: rotate(45deg);
 }
 /* core/gateway: donut — a ::before hole survives the box-shadow overrides
@@ -953,31 +1516,93 @@ html:not(.dark) .wisp-drillin {
 .wisp-pin--t-gateway .wisp-pin__dot::before {
   content: "";
   position: absolute;
-  inset: 2.5px;
+  /* A PROPORTION of the padding box, not 2.5px: a hole is how this kind is told
+     apart, and the scale sizes marks on the outer silhouette, so the hole has to
+     ride the rank rather than staying a fixed width that would eat a different
+     share of the dot at every size. 25% each side leaves half the dot open,
+     which is what it has always been. */
+  inset: 25%;
   border-radius: 9999px;
   background: var(--background);
   pointer-events: none;
 }
-.wisp-pin--t-cpe .wisp-pin__dot {
-  width: 10px;
-  height: 10px;
-}
-/* Passive plant: deliberately subordinate — small, always-muted (no FSM), the
-   silhouette still tells splitter from FDB from closure at a glance. */
+/* CPE takes the gear circle like every other device, and used to sit at 10px:
+   79px² against the 154px² of the router beside it, undocumented, and the
+   clearest instance of the drift THE MARK SCALE exists to stop. A kind that
+   wants to be distinguishable gets a SILHOUETTE (see the shapes above); it does
+   not get to be small, because small is what this map reads as unimportant. */
+/* Passive plant: deliberately subordinate — the silhouette still telling
+   splitter from FDB from closure at a glance.
+
+   SIZED BY INK, not by the number — the same lesson the subscriber mark was
+   redrawn twice to learn, and this layer was left out of that pass. All three
+   read "9px" and were therefore three different marks: a rotated square covers
+   HALF the area of the square bounding it and a circle about 79%, so the
+   SPLITTER — the box a crew actually drives to — carried 40px² against the
+   FDB's 81px², a quarter of a device dot and under half a subscriber mark.
+   The most useful mark in a cut was the faintest thing on the map.
+
+   THE SPLITTER IS A LOCATION PIN (operator's ask, 2026-08-05: "instead of dots
+   let's use location pin marks with colour to make it more intuitive"). A
+   teardrop is the one silhouette every person on earth already reads as "a
+   thing is HERE", which is what a splitter is — a box at a coordinate a van
+   drives to — and it is the mark that most needed to be found quickly. The
+   recipe is the standard one: a square with three round corners and a square
+   bottom-left, rotated -45° so the sharp corner points DOWN.
+
+   Not clip-path, for the documented reason: the selection ring, the impact ring
+   and the drop halo are all box-shadows measured off this box, and a clip would
+   cut every one of them off. border-radius keeps them, and a shadow follows the
+   teardrop exactly.
+
+   All three are PLANT rank, and all three therefore carry the SAME ink: what
+   tells a splitter from an FDB from a closure is the silhouette, and what tells
+   any of them from gear is the rank plus the always-muted tone. Sizing them
+   apart is what produced the 40 / 78 / 81px² spread in the first place. What
+   tells a splitter from a SUBSCRIBER is not size either — both are pins now —
+   it is the HOLE and the always-drawn name plate carrying the ratio. (It used
+   to be the clustering pass too; plant left that pass on 2026-08-05, so those
+   two channels carry it alone now — see `clusters.ts:buildClusters`.) FDB and closure
+   keep their old silhouettes: they are no longer offered when recording plant
+   (map/plant.ts:PLANT_KINDS), so any that exist are old rows, and giving them
+   the pin would spend the one shape that now means "splitter". */
 .wisp-pin--t-splitter .wisp-pin__dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  transform: rotate(45deg);
+  --mark-w: calc(var(--mark-plant) * var(--markshape-teardrop));
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  /* The tip hangs --mark-tip BELOW the box (the corner is at half the diagonal,
+     the box edge at half the side), and the column's own 3px gap is all that
+     stands between the dot and the name plate. Without this the point would land
+     on the plate's top edge and the two would read as one collided object.
+     Derived rather than the old flat 3px, so growing the rank can't quietly
+     re-collide them. */
+  margin-bottom: calc(var(--mark-w) * var(--mark-tip));
 }
+/* The hole. A pin with a hole is the other half of the convention, and here it
+   does real work: it is what still tells a splitter from a customer at a glance
+   now that both are teardrops. A ::before rather than an inset shadow, exactly
+   like the core/gateway donut, because the selection ring and the drop halo
+   overwrite box-shadow wholesale. */
+.wisp-pin--t-splitter .wisp-pin__dot::before {
+  content: "";
+  position: absolute;
+  /* A PROPORTION of the padding box, like the core/gateway donut's: a third of
+     the head open inside a two-thirds ring of colour, which is the classic pin
+     and stays the classic pin at any rank. A fixed 3px would have been a third
+     of the head at exactly one size and something else at every other. */
+  inset: 33%;
+  border-radius: 9999px;
+  background: var(--background);
+  pointer-events: none;
+}
+/* Plant rank, square: the ~0.9% ink error from its slightly softer corners is
+   under a tenth of a pixel of width and not worth a fourth shape factor. */
 .wisp-pin--t-fdb .wisp-pin__dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
+  --mark-w: calc(var(--mark-plant) * var(--markshape-square));
+  border-radius: 22%;
 }
 .wisp-pin--t-closure .wisp-pin__dot {
-  width: 9px;
-  height: 9px;
+  --mark-w: calc(var(--mark-plant) * var(--markshape-circle));
 }
 
 /* Reference ONUs (map/refonu.ts): operator-placed subscribers vouched for as
@@ -988,23 +1613,92 @@ html:not(.dark) .wisp-drillin {
    coordinate. It still ranks below a down device (see refZIndex). */
 .wisp-refonu {
   position: absolute;
-  transform: translate(-50%, -50%);
+  /* DROP rank (see THE MARK SCALE). Set on the WRAPPER, not the mark, because
+     the tip subtraction below has to read the same width the mark draws at, and
+     a custom property only travels downward. The two modifier rules that move
+     it (--dark up to evidence rank, --plain back down) live further below and
+     their ORDER is load-bearing; it is called out where they are. */
+  --mark-w: calc(var(--mark-drop) * var(--markshape-teardrop));
+  /* BOTTOM-anchored, not centred, and that is what makes it a location pin
+     rather than a shape that happens to be pointed: the tip stands ON the
+     coordinate. Everything else about a subscriber converges there — the drop
+     line ends at this lat/lng, and it now meets the point of the pin instead of
+     passing through the middle of a diamond.
+     The tip hangs --mark-tip·W below the mark's box (half the diagonal, less
+     half the side), so the padding below it is exactly that and the point lands
+     ON the coordinate at every rank. It used to be a flat 2px, true to within
+     ~1px at the rank somebody measured and drifting at every other — the same
+     class of thing as the fixed-px corner radii and holes this pass replaced. */
+  transform: translate(-50%, -100%);
   cursor: pointer;
+  /* Hit area only — the MARK is unchanged. The pin is its own target, and since
+     hovering one opens a card there is a real cost to missing it. The padding
+     grows the box while the transform keeps the mark on its coordinate, so
+     nothing moves and nothing gets louder.
+
+     2px, not more, and the ceiling is measured: subscriber marks are deliberately
+     out of the clustering pass, so on a surveyed street they genuinely overlap —
+     a real pair on NDN-OLT sits 10.8px apart at z17. Every extra px trades an
+     easier hit on a lone drop (most of them) for one more ambiguous hit in a
+     cluster. Ties break on stacking order, and refZIndex lifts whatever the
+     pointer is already on, so a tie can't flicker between two customers — and
+     the card NAMES who it opened for, which is what makes a mis-hit
+     self-announcing rather than silent.
+
+     It also stays 2px because the pin is TALLER than the diamond it replaced
+     while being narrower: the marks stand on their coordinates, so two drops
+     10.8px apart now overlap along the row of TIPS rather than through their
+     middles, which is the easier of the two to aim between. */
+  padding: 2px 2px calc(var(--mark-w) * var(--mark-tip));
 }
-/* Sized by INK, not by the number. A diamond covers half the area of the circle
-   that bounds it, so an 11px one carried about a quarter of a 14px device dot's
-   ink and read as a speck — which is how a fleet that had just surveyed
-   thousands of drops ended up unable to see them. These now match a device dot's
-   area rather than sitting a rank below it. SHAPE, tone and stacking order still
-   do the subordination work (diamond vs round, muted vs status, refZIndex below
-   every pin), and those are what stop a subscriber being mistaken for plant —
-   size was only ever the crudest of the four. */
+/* A LOCATION PIN (operator's ask, 2026-08-05: "instead of dots let's use
+   location pin marks with colour to make it more intuitive"). The teardrop is
+   the one silhouette everybody already reads as "a thing is HERE", and a
+   surveyed street is exactly a field of heres — the diamond it replaces had to
+   be learned, and on a wall map at a glance it was learned as "some small
+   marker".
+
+   The recipe is the standard one: a square with three round corners and a
+   square bottom-left, rotated -45° so the sharp corner points straight down.
+   NOT clip-path, for the reason the device dot documents — the dark witness's
+   halo and the selection ring are box-shadows measured off this box, and a clip
+   would cut them off. A shadow follows the teardrop exactly.
+
+   Sized by INK, not by the number, off THE MARK SCALE, and this is the mark the
+   scale was written for: the operator's report (2026-08-05) was that the
+   customer pin is "way small" while the OLT is right, which is the THIRD time
+   this layer has been drawn too small and the first time the cause was the
+   PROCESS rather than the number. Every subscriber is DROP rank now, one ratio
+   off the OLT's own calibration instead of a hand-picked width.
+
+   And DROP RANK SITS JUST UNDER GEAR, which is the correction that followed
+   immediately: shipping the ladder with a 15% step down from plant still drew
+   this "on smaller size", i.e. the process was right and the ratio was not. The
+   round head is 14.50px against the OLT square's 14.01 — the operator's own
+   benchmark, matched, because that is what was actually being asked for both
+   times. Why that is safe rather than a regression is argued at the ranks
+   themselves: ink is ORDER here, never emphasis.
+
+   Witness and plain therefore take the SAME size, which retires a 1px gap that
+   was never a distinction: what tells a reference ONU from a located drop is
+   the RING (--plain drops it) and the tone, exactly as the --plain rule below
+   already argued when it restored legibility at that end. The dark WITNESS
+   keeps the one exemption this layer has always had, now stated as its own rank
+   (--mark-evidence, the only mark permitted to outrank gear).
+
+   SHAPE no longer subordinates this layer, so the other three channels carry
+   it alone and matter more than they did: TONE (the quietest fill on the map
+   for a live drop), STACKING (refZIndex, below every device pin) and the
+   CLUSTERING pass, which only GEAR takes part in (plant left it on 2026-08-05 —
+   a site badge is a claim about boxes that have a state). What tells a
+   subscriber from a splitter, now both are pins and neither folds, is the
+   splitter's HOLE, its always-drawn name plate, and its rank. */
 .wisp-refonu__mark {
   display: block;
-  width: 14px;
-  height: 14px;
-  transform: rotate(45deg);   /* diamond: devices are round, passives squarer */
-  border-radius: 1px;
+  width: var(--mark-w);
+  height: var(--mark-w);
+  transform: rotate(-45deg);
+  border-radius: 50% 50% 50% 0;
   /* 2px, matching .wisp-pin__dot: the ring of canvas colour is what separates
      the mark from whatever tile is under it, and 1px of it disappeared over
      satellite imagery. */
@@ -1013,11 +1707,18 @@ html:not(.dark) .wisp-drillin {
   box-shadow: 0 0 0 1px var(--border-strong);
 }
 .wisp-refonu--live .wisp-refonu__mark {
-  background: color-mix(in srgb, var(--success) 70%, var(--muted-foreground));
+  background: var(--map-live);
+}
+/* EVIDENCE rank, on the wrapper so the tip subtraction moves with it. This is
+   the scale's one exemption and it is deliberately not a tone-only rule: power
+   cannot darken a subscriber the operator vouched for, so a dark witness is a
+   fibre cut with a coordinate and the loudest mark on the map. The --plain rule
+   below takes it straight back off an ordinary offline customer, and must stay
+   AFTER this one to do so. */
+.wisp-refonu--dark {
+  --mark-w: calc(var(--mark-evidence) * var(--markshape-teardrop));
 }
 .wisp-refonu--dark .wisp-refonu__mark {
-  width: 17px;
-  height: 17px;
   background: var(--destructive);
   box-shadow: 0 0 0 1px var(--border-strong),
     0 0 0 3px color-mix(in srgb, var(--destructive) 35%, transparent);
@@ -1031,21 +1732,54 @@ html:not(.dark) .wisp-drillin {
   box-shadow: none;
 }
 /* A LOCATED subscriber (field survey) versus a REFERENCE ONU. Both live in
-   onu_places and both are diamonds, but only the reference point is evidence in
-   a PON verdict — so the plain one stays small and never takes the dark mark's
-   size bump or halo. Once a fleet geo-tags its drops these outnumber witnesses
-   by a hundred to one, and if they looked alike the handful of pins that
-   actually decide "power cut or fibre cut" would be lost among them. Comes
-   AFTER --dark deliberately: the size reset has to win. */
+   onu_places, both are pins and both are DROP rank — but only the reference
+   point is evidence in a PON verdict, so the plain one never takes the dark
+   mark's rank bump or halo. Once a fleet geo-tags its drops these outnumber
+   witnesses by a hundred to one, and if they looked alike the handful of pins
+   that actually decide "power cut or fibre cut" would be lost among them. Comes
+   AFTER --dark deliberately: the rank reset has to win, and both selectors are
+   one class on the same element, so SOURCE ORDER is the only thing deciding it.
+
+   That reset is LOAD-BEARING for a rule of its own (operator, 2026-08-02): an
+   offline CUSTOMER gets the red fill and nothing else — no rank bump, no halo —
+   because thousands go offline every evening and drawing each as an alarm turns
+   a surveyed map into a wall of red nobody can act on. The rest of that rule
+   lives in `refonu.ts:isRefEvidence`, which gates the line tone, the name
+   weight, the zoom exemption and the chip budget the same way. Keep the two in
+   step: this file owns the MARK, that predicate owns everything else. */
+.wisp-refonu--plain {
+  --mark-w: calc(var(--mark-drop) * var(--markshape-teardrop));
+}
 .wisp-refonu--plain .wisp-refonu__mark {
-  width: 13px;
-  height: 13px;
   opacity: 0.9;
-  /* The ring is what still separates it from a reference point at a glance —
-     the SIZE gap alone was carrying too much of that job and made a located
-     subscriber hard to find at all, which is the opposite of the problem worth
-     having. Distinction preserved, legibility restored. */
+  /* The ring is now the WHOLE of what separates it from a live reference point:
+     the size gap was carrying that job, it was down to 1px, and it was the
+     reason a located subscriber was hard to find at all. Carrying a distinction
+     on a difference too small to see cost legibility and bought nothing. */
   box-shadow: none;
+}
+/* …and a LIVE located subscriber is the single most common mark on a surveyed
+   fleet, so it gets the quietest fill on the map (2026-08-01).
+   A working subscriber is the boring case by definition — there are thousands
+   of them and not one is news — but it was rendering at `--success 70%`, the
+   same near-full green a healthy DEVICE pin carries. Half a dozen of those in
+   a viewport read as six important healthy things and pulled the eye off the
+   plant, which is the opposite of what this layer is for.
+   Quieted by SATURATION only. Not size: that was tried twice, came back
+   unreadable both times, and the ink argument above still stands. Not the DARK
+   mark either — a dark subscriber keeps its full destructive tone, so the
+   contrast between "fine" and "not fine" in this layer actually WIDENS.
+
+   …and "by saturation" has to mean CHROMA AT FIXED HUE, which is the whole
+   point of `--map-live-quiet` and was the bug here (operator, 2026-08-05:
+   "blueish… similar to dotted line"). Mixing 32% green into a cool grey left
+   this at hue 167° / chroma 0.040 dark and 175° / 0.035 light — LESS chroma
+   than the dotted drop line it sits on the end of, so the two read alike and
+   neither read green. Same quiet INTENT, kept; the hue no longer pays for it.
+   If this ever needs to be quieter again, move the chroma ratio and nothing
+   else — the moment it is mixed toward a grey it bends back toward the line. */
+.wisp-refonu--plain.wisp-refonu--live .wisp-refonu__mark {
+  background: var(--map-live-quiet);
 }
 /* The survey's drag-to-adjust pin (components/pin-adjust-map.tsx). Louder than
    anything on the main map on purpose: it is the ONLY object on that little map
@@ -1080,6 +1814,415 @@ html:not(.dark) .wisp-drillin {
 .wisp-refonu--dim {
   opacity: 0.28;
 }
+
+/* The customer name beside a located subscriber (map/refonu.ts:refNameIcon).
+   A SEPARATE marker from the diamond, so it is centred under it by transform
+   rather than by flow.
+
+   Quieter than a device pin's label in all three of the ways that matter, and
+   deliberately so: there is one of these per CUSTOMER, so on a surveyed fleet
+   they outnumber device names a hundred to one, and reference material may
+   never be drawn as loud as state. Muted ink instead of --foreground, no
+   border, and a plate rather than a card — but a PLATE IS STILL REQUIRED. This
+   sits over raster tiles that run near-white to near-black inside one viewport;
+   the lesson this layer already paid for twice is that anything without a
+   backing (or a casing, for a line) simply vanishes over satellite imagery.
+   Judge it on real tiles in both themes, never on a swatch. */
+.wisp-refonu-name {
+  position: absolute;
+  /* Below the mark, centred on it. The offset shrank from 12px to 3px when the
+     mark became a pin: the diamond straddled the coordinate, the pin STANDS on
+     it, so there is no longer half a mark to clear — 12px would have left the
+     name floating in space below the tip. REF_NAME_DY in refonu.ts mirrors this
+     so the collision budget reserves pixels where the TEXT lands; keep the two
+     in step or names collide in a viewport the budget reports as clear. */
+  transform: translate(-50%, 3px);
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 0.3125rem;
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  padding: 0 4px;
+  font-size: var(--text-2xs);
+  line-height: 1.15rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  pointer-events: none;
+}
+/* The one exception, and the same one the mark itself makes: power cannot
+   explain a dark reference ONU, and on any subscriber it is the name somebody
+   is about to phone. Full ink and weight — it is allowed to be findable across
+   a viewport, which is exactly what the quiet default is not. */
+.wisp-refonu-name--dark {
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+  color: var(--foreground);
+  font-weight: 600;
+}
+/* Its MAC left every roster (an RMA'd box). The pin is hollow for this; the
+   name matches rather than claiming a live subscriber. */
+.wisp-refonu-name--orphan {
+  color: var(--faint-foreground);
+  font-style: italic;
+}
+/* The Rx reading riding the same label. Printed ONLY when there is a fresh one
+   for an ONLINE ONU whose OLT is up (refonu.ts:refHasRx) — a blank column here
+   means "not measured", never "fine", and there is nowhere on a map label to
+   say which. Tabular figures so a column of drops down one street compares
+   digit-for-digit instead of shimmying. */
+.wisp-refonu-name__rx {
+  margin-left: 5px;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+/* TINTED ONLY WHEN SOMETHING IS WRONG — the same rule Home's stat tiles follow.
+   A healthy Rx is the overwhelming majority and none of it is news, so `ok`
+   stays the label's own muted ink and scanning is a search for colour rather
+   than a read of every number. warn/crit are the status tones at full strength:
+   this is the one thing in the subscriber layer that outranks its own quiet. */
+.wisp-refonu-name__rx--warn {
+  color: var(--warning);
+  font-weight: 600;
+}
+.wisp-refonu-name__rx--crit {
+  color: var(--destructive);
+  font-weight: 600;
+}
+
+/* The map's hover card (map/hovercard.tsx). ONE frame, whatever is under the
+   cursor: a subscriber's diamond (map/refhover.tsx, with that customer's drop
+   line lit solid beneath it) or a device pin (map/devhover.tsx). A second card
+   grammar for the second thing that opens one is how a dashboard stops reading
+   as one product, so the frame lives in one place and each caller supplies only
+   what it may claim.
+
+   Sized and toned like the app's own panels — the same surface ladder, the same
+   status formula, the same 2xs/eyebrow type. What it may NOT borrow is the
+   translucent-popover treatment: this floats over raster tiles running
+   near-white to near-black inside one viewport, so it takes an OPAQUE fill and a
+   hairline ring, the same treatment the rate chip and the distance readout
+   already use. Rings, never shadows.
+
+   Non-interactive throughout (pointer-events on the anchor): it is a readout,
+   and an overlay this size eating clicks would make a pin HARDER to open than it
+   was before the card existed. */
+.wisp-mapcard {
+  position: absolute;
+  pointer-events: none;
+}
+.wisp-mapcard__box {
+  position: absolute;
+  /* REM, mirrored by REF_CARD_REM in map/refhover.tsx (which reads the live root
+     font-size so its edge-clamp arithmetic stays in px). This started as a fixed
+     236px and clipped "NDN-OLT · PON EPON0/5" on a 1600px screen: the root scales
+     up at ≥1600px, so the type inside grew and the card didn't. Truncating the
+     OLT and the PON is the one thing this card must not do — they are what a crew
+     drives to. */
+  width: 15.5rem;
+  /* --sx slides the card back inside the viewport near the left/right edge; the
+     tail cancels it below so it keeps pointing at the pin. */
+  transform: translateX(calc(-50% + var(--sx, 0px)));
+  border: 1px solid var(--border-strong);
+  border-radius: 0.5rem;
+  background: var(--popover);
+  /* the outer ring is what separates the card from whatever tile is under it —
+     a border alone disappears against mid-grey imagery */
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--background) 55%, transparent);
+  animation: wisp-mapcard-in 120ms ease-out;
+}
+/* ABOVE by default: every mark on this map wears its NAME PLATE below itself —
+   the device pin's label and the subscriber's alike — so a card below would land
+   on the one piece of text already answering "which one is this". Flipped only
+   when there isn't room above (map/hovercard.tsx).
+
+   The gap is measured against the BIGGEST mark either layer draws, plus the
+   tail's own 8px reach. At 15px the tail landed ON the halo, so the card and the
+   pin read as one collided object and the caret stopped looking like it was
+   pointing at anything.
+
+   It went 24 → 32px when the subscriber mark became a location pin: a diamond
+   straddled its coordinate and reached ~15px above it, while a pin STANDS on the
+   coordinate, so its whole height is above — and a ROTATED square's bounding box
+   is its side × √2, which is the part easy to get wrong. Measured in a browser:
+   a 14px dark reference point reaches 19.8px above the anchor, 22.8px with its
+   halo. The tail's own reach is ~8px, so 32px puts its point ~1px clear, which
+   is the relationship the original 24px was tuned to give. The device pin gains
+   from the same change: its dot's top sits ~20px above the coordinate (the pin
+   is a dot-over-label column, centred), so the old tail overlapped that too. */
+.wisp-mapcard--above .wisp-mapcard__box { bottom: 32px; }
+/* Flipped, the card lands over the name plate, and that is fine: the card's own
+   header carries the same name, so nothing is hidden that isn't repeated. It
+   keeps the ORIGINAL 24px rather than following the change above, because below
+   a mark there is nothing to clear — the pin, the diamond and the dot all sit
+   above their coordinate — and 30px there would just push the caret off. */
+.wisp-mapcard--below .wisp-mapcard__box { top: 24px; }
+
+/* The tail. A rotated square with two borders rather than a border-triangle:
+   this card has a 1px edge and a ring, and a triangle can carry neither. It
+   sits at the pin's own x — `calc(50% - var(--sx))` undoes the card's slide —
+   so an edge-clamped card still points at the mark it describes.
+
+   11px, i.e. ~8px of visible reach. This layer's twice-paid lesson is that small
+   uncased marks vanish over tiles, and the tail is the whole reason the card is
+   unambiguous in a cluster of eight diamonds — at 9px it was a smudge. */
+.wisp-mapcard__tail {
+  position: absolute;
+  left: calc(50% - var(--sx, 0px));
+  width: 11px;
+  height: 11px;
+  transform: translateX(-50%) rotate(45deg);
+  background: var(--popover);
+  border: 1px solid var(--border-strong);
+}
+.wisp-mapcard--above .wisp-mapcard__tail {
+  bottom: -6px;
+  border-top: 0;
+  border-left: 0;
+}
+.wisp-mapcard--below .wisp-mapcard__tail {
+  top: -6px;
+  border-bottom: 0;
+  border-right: 0;
+}
+
+.wisp-mapcard__head {
+  padding: 0.4375rem 0.5625rem 0.375rem;
+}
+.wisp-mapcard__who {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.wisp-mapcard__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--foreground);
+}
+/* Reserved for a CLAIM, never for restating what a mark already is. A reference
+   point is evidence in a PON verdict where a located drop is just a coordinate
+   somebody recorded; a splitter carrying more drops than it has legs is a record
+   that cannot be right. An unchipped card is the common case and claims nothing
+   — which is what keeps a chip worth noticing. */
+.wisp-mapcard__chip {
+  flex-shrink: 0;
+  border: 1px solid color-mix(in oklab, var(--primary) 30%, transparent);
+  border-radius: 0.25rem;
+  background: color-mix(in oklab, var(--primary) 13%, transparent);
+  padding: 0 0.25rem;
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  line-height: 1.05rem;
+  color: var(--primary);
+}
+.wisp-mapcard__mac {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-2xs);
+  color: var(--faint-foreground);
+}
+
+/* The verdict row — the hero of the card, and the one thing read at a glance.
+   Tinted by the SHARED status formula (tone text, 13% fill, 30% edge), the same
+   one Chip/StateBadge/StatusDot use, so a subscriber grades on screen exactly
+   like it does everywhere else in the product. */
+.wisp-mapcard__state {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in oklab, var(--wisp-card-tone) 13%, transparent);
+  padding: 0.3125rem 0.5625rem;
+  font-size: var(--text-2xs);
+}
+.wisp-mapcard__dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--wisp-card-tone);
+}
+.wisp-mapcard__word {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--wisp-card-tone);
+}
+/* The tone seed. Set per card rather than by a class per row so the dot, the
+   word and the wash can never disagree about what state the thing is in. */
+.wisp-mapcard--success { --wisp-card-tone: var(--success); }
+.wisp-mapcard--warning { --wisp-card-tone: var(--warning); }
+.wisp-mapcard--destructive { --wisp-card-tone: var(--destructive); }
+.wisp-mapcard--muted { --wisp-card-tone: var(--muted-foreground); }
+
+/* The ONE number riding the verdict row — a subscriber's dBm, a device's
+   latency. Printed only when the card may stand behind it (refonu.ts:refHasRx
+   for the dBm, a fresh non-frozen poll for the latency); when it can't, the row
+   below says WHICH of the reasons rather than printing a dash, which is the one
+   thing a map label has no room to do and this card does. */
+.wisp-mapcard__hero {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  font-weight: 600;
+  color: var(--wisp-card-tone);
+}
+/* The healthy case opts OUT of the row's tone and stays muted: a good Rx (or a
+   3 ms round trip) is the overwhelming majority and none of it is news, so a
+   green number would be colour spent on the boring case. warn/crit inherit. */
+.wisp-mapcard__hero--quiet { color: var(--muted-foreground); font-weight: 500; }
+.wisp-mapcard__unit {
+  margin-left: 2px;
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+/* The detail rows: a label column and a value column, aligned so five facts
+   scan as a list rather than five sentences. */
+.wisp-mapcard__rows {
+  padding: 0.375rem 0.5625rem 0.4375rem;
+  font-size: var(--text-2xs);
+}
+.wisp-mapcard__row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  line-height: 1.05rem;
+}
+.wisp-mapcard__row + .wisp-mapcard__row { margin-top: 1px; }
+/* The same step the subscriber card already labels its rows with — a hover card
+   and the card it precedes must not use two different greys for one job. */
+.wisp-mapcard__k {
+  flex-shrink: 0;
+  /* Sized to the content: "Readings" is the longest key either card prints and
+     measures ~52px, which fits because `__k` does not shrink and may overhang
+     into the 8px gap. The rest is width the VALUE column needs, and the value is
+     what carries the OLT, the PON, the splitter and the uplink names. Content
+     sizes the label; the identifier gets the surplus. A longer key has to be
+     SHORTENED rather than widening this — `__k` never ellipsizes, so one that
+     overflows past the gap lands on its own value. */
+  width: 3rem;
+  color: var(--faint-foreground);
+}
+.wisp-mapcard__v {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--foreground);
+}
+/* An absence, a reason, or an idle link — every one of them a fact worth
+   stating and none of them worth reading twice. */
+.wisp-mapcard__v--soft { color: var(--muted-foreground); }
+.wisp-mapcard__v--num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+/* Arrows are orientation, not data. Spacing copied from `.wisp-linkbw__ar`
+   rather than re-tuned: a subscriber's rate here and the same subscriber's rate
+   on the chip riding its line are the same fact, and two spacings would read as
+   two different badges. (`+` skips text nodes, so this does reach the ↑.) */
+.wisp-mapcard__ar {
+  color: var(--faint-foreground);
+  font-weight: 400;
+}
+.wisp-mapcard__ar + .wisp-mapcard__ar { margin-left: 5px; }
+
+/* Arriving. A short lift toward the pin so the card reads as coming FROM the
+   diamond rather than appearing over it — direction follows the flip, or a card
+   below would slide the wrong way and look like it belonged to something above.
+   On the __box, never the wrapper: the wrapper's transform carries --sx, and
+   animating it would fight the edge clamp. */
+@keyframes wisp-mapcard-in { from { opacity: 0; } }
+.wisp-mapcard--above .wisp-mapcard__box {
+  animation-name: wisp-mapcard-in-above;
+}
+.wisp-mapcard--below .wisp-mapcard__box {
+  animation-name: wisp-mapcard-in-below;
+}
+@keyframes wisp-mapcard-in-above {
+  from { opacity: 0; transform: translate(calc(-50% + var(--sx, 0px)), 3px); }
+}
+@keyframes wisp-mapcard-in-below {
+  from { opacity: 0; transform: translate(calc(-50% + var(--sx, 0px)), -3px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wisp-mapcard__box { animation: none; }
+}
+
+/* Field workers (map/workers.ts). A ROUNDED-SQUARE BADGE CARRYING INITIALS —
+   nothing else on this map has text inside the mark, which is what makes a
+   person unmistakably not a device, and with three vans out the question is
+   never "is somebody there" but "which one".
+
+   It takes NO status tone. success/warning/destructive on this map are claims
+   about the NETWORK, and a person is not a network state — the one exception is
+   --quiet below, which really is an alarm. Stacking (map/workers.ts:
+   workerZIndex) keeps every one of these under every device pin. */
+.wisp-worker {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: none;   /* subordinate layer: never a placement-click target */
+}
+.wisp-worker__mark {
+  display: flex;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;   /* devices are round or diamond; this is neither */
+  border: 2px solid var(--background);
+  background: var(--muted-foreground);
+  color: var(--background);
+  /* The one place a literal px size is right: this is a 2-character glyph
+     inside a 20px badge, not body copy — it does not scale with the type
+     scale, it fits the mark or it doesn't. */
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+/* HERE NOW. --primary is the neutral "this is a thing" accent, deliberately not
+   --success: a worker being present is not good news about the network. */
+.wisp-worker--live .wisp-worker__mark {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+/* ON SHIFT, GONE QUIET — the alarm this feature exists to produce. Warning-toned
+   because that is what it is, and still ranked under every device pin and under
+   destructive: a tracker that stopped is never louder than plant that is down. */
+.wisp-worker--quiet .wisp-worker__mark {
+  background: var(--warning);
+  color: var(--background);
+  box-shadow: 0 0 0 1px var(--border-strong),
+    0 0 0 3px color-mix(in srgb, var(--warning) 30%, transparent);
+}
+/* WENT HOME is the BASE style above — a solid mark in --muted-foreground, which
+   is precisely what "muted" means here: present, and making no claim.
+
+   A hollow dashed mark was tried first and REVERTED after one satellite pass:
+   over imagery it disappeared outright, marks and trail both. That is the
+   ref-ONU line's lesson a second time — the 2px ring of canvas colour is what
+   separates ANY mark from the tile under it, and a treatment that reads
+   perfectly against a flat card can be invisible against raster ground. So the
+   three states differ by HUE (grey / steel / amber), which survives any
+   backdrop, and not by presence. Judge these on real tiles, never on the
+   swatch. */
 
 /* Site clusters (routes/map-page.tsx buildClusters): overlapping pins fold
    into one badge — the number is the member count, the element's background
@@ -1118,8 +2261,105 @@ html:not(.dark) .wisp-drillin {
     0 0 0 4px color-mix(in srgb, var(--ring) 55%, transparent);
 }
 .wisp-cluster--dim { opacity: 0.28; }
+
+/* ---------------------------------------------------------------------------
+   HOVER, and appearing on ZOOM. Two things this map never acknowledged.
+
+   Every mark here is a click target — a pin opens a panel, a cluster opens a
+   site card, a diamond opens a subscriber — and the only feedback any of them
+   gave was the cursor turning into an arrow. On a screen where marks sit a few
+   pixels apart that means you aim, click, and find out afterwards whether you
+   hit the one you meant.
+
+   PURE CSS, deliberately. These icons are cached by their HTML string
+   (map/pins.ts:cachedDivIcon) precisely so a re-render can't swap every
+   marker's DOM node — useNow() ticks this component every second, and a
+   hover routed through React state would rebuild the markers on mouseover and
+   restart the down-pulse mid-cycle. :hover never touches React at all.
+
+   TRANSFORM, never width/height: the dot is the anchor for the optical ring
+   (::after), the impact ring and the pulse, all measured from its box — growing
+   the box would move them. Scaling paints over the same geometry.
+   --------------------------------------------------------------------------- */
+.wisp-pin__dot,
+.wisp-refonu__mark,
+.wisp-cluster {
+  transition: transform 120ms ease-out;
+}
+.wisp-pin:hover .wisp-pin__dot { transform: scale(1.25); }
+/* A ROTATED silhouette has to restate its rotation, or `transform` replaces it
+   wholesale and the mark spins back square under the cursor — a teardrop
+   flipping to a rounded box, a backhaul diamond to a square, on mouseover. This
+   was already true of the two rotated device shapes and simply never showed up
+   as a bug report; a pin snapping upright is far more obvious. These need the
+   type in the selector to outrank the plain `.wisp-pin:hover` rule above. */
+.wisp-pin--t-splitter:hover .wisp-pin__dot { transform: rotate(-45deg) scale(1.25); }
+.wisp-pin--t-backhaul:hover .wisp-pin__dot { transform: rotate(45deg) scale(1.25); }
+.wisp-refonu:hover .wisp-refonu__mark { transform: rotate(-45deg) scale(1.25); }
+/* the badge carries the -50% centring, so it has to be restated or it jumps */
+.wisp-cluster:hover { transform: translate(-50%, -50%) scale(1.08); }
+.wisp-pin:hover .wisp-pin__label { border-color: var(--border-strong); }
+
+/* Layers that appear when you cross a zoom threshold (subscribers at
+   REF_ONU_MIN_ZOOM) or flip a switch used to POP into existence — a few hundred
+   marks materialising in one frame reads as a glitch, and it gives no sense
+   that they arrived because of what you just did. A short fade makes the map
+   feel like it is responding rather than redrawing.
+
+   Opacity ONLY, and with no `to` keyframe: the implicit end is the element's
+   own computed value, so a --dim mark still lands at 0.28 instead of being
+   animated to 1 and snapping back.
+
+   SCOPED TO .wisp-refonu, and the exclusions are the interesting part. An icon
+   is rebuilt whenever its HTML STRING changes (cachedDivIcon), and Leaflet
+   swaps the DOM node when it does — which REPLAYS a mount animation. So this
+   may only go on marks whose html is stable:
+     · rate chips (.wisp-linkbw) change with every new reading — a fade there
+       would flicker on every poll;
+     · worker marks embed `ago(last_fix.ts)` in their title, so they rebuild
+       roughly once a minute per worker — a mark that blinks for no visible
+       reason is exactly the noise this pass exists to remove.
+   refTitle() carries no relative time, so a subscriber diamond is stable and
+   fades only when the layer actually appears. */
+@keyframes wisp-mark-in { from { opacity: 0; } }
+.wisp-refonu {
+  animation: wisp-mark-in 160ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .wisp-pin__dot,
+  .wisp-refonu__mark,
+  .wisp-cluster { transition: none; }
+  .wisp-refonu { animation: none; }
+}
+
 @keyframes wisp-cluster-pulse {
   0% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 color-mix(in srgb, var(--destructive) 55%, transparent); }
   70% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 12px transparent; }
   100% { box-shadow: 0 0 0 1px var(--border-strong), 0 0 0 0 transparent; }
 }
+
+/* ── OnuBar (components/onu-bar.tsx) ────────────────────────────────────────
+   The PON heat strip's grammar, at the resolution a summary row has: the same
+   tones in the same order, as proportions rather than per-ONU cells.
+   Segments BUTT together with no gaps — it is one population being divided, not
+   four separate readings, and a gapped bar reads as a set of bars. The `ok`
+   share is the quiet one and the offline share quieter still, so the eye lands
+   on the fraction that is actually in trouble. */
+.wisp-onubar {
+  display: inline-flex;
+  width: 3.25rem;
+  height: 0.375rem;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  vertical-align: middle;
+}
+.wisp-onubar__seg { display: block; height: 100%; }
+.wisp-onubar__seg--crit { background: var(--destructive); }
+.wisp-onubar__seg--warn { background: var(--warning); }
+/* healthy is NOT loud: it is the majority share on every healthy OLT, and a
+   full green bar on twenty rows is the wall of colour this product spends its
+   whole map section avoiding */
+.wisp-onubar__seg--ok { background: color-mix(in oklab, var(--success) 40%, transparent); }
+.wisp-onubar__seg--off { background: color-mix(in oklab, var(--muted-foreground) 30%, transparent); }

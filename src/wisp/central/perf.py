@@ -37,10 +37,10 @@ def record_and_evaluate(store, org_id: str, eng, cycle, results: dict, ts: str,
         if not v.changed:
             continue
         if v.degraded:
-            title, body, payload = (f"\U0001f40c Slow link — {dev.name} ({dev.region})",
+            title, body, payload = (f"\U0001f40c Slow link · {dev.name} ({dev.region})",
                                     v.reason, "PERF_DEGRADED")
         else:
-            title, body, payload = (f"✅ Recovered — {dev.name} ({dev.region})",
+            title, body, payload = (f"✅ Recovered · {dev.name} ({dev.region})",
                                     "Link performance back to baseline", "PERF_RECOVERED")
         AlertRouter(store, org_id, notifier, cfg).emit(
             payload,

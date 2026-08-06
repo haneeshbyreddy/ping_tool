@@ -45,12 +45,16 @@ export function opticRing(d: OrgDevice): "crit" | "warn" | null {
 
 export function pinIcon(d: OrgDevice, o: {
   selected: boolean; dim: boolean; impact: boolean
-  /** Passive plant only: the "1:8 · 6" line under the name, and the tone its
-   *  RECORDED subscribers earn it. Passed in as plain values rather than read
-   *  from a rollup here so this module keeps knowing nothing about drops (and
-   *  so pins.ts and map/drops.ts don't import each other). */
-  sub?: string | null
-  dropTone?: "dark" | "weak" | "quiet"
+  /** What to write on the plate INSTEAD of the device name. Passive plant only,
+   *  where it carries the split ratio (`drops.passivePinLabel`) — a splitter is
+   *  read for how many ways it splits, not for what somebody called it. Absent
+   *  means the device name, which is every piece of gear.
+   *
+   *  Passed in as a plain value, like `dropTone`, rather than read from a rollup
+   *  here, so this module keeps knowing nothing about drops (and so pins.ts and
+   *  map/drops.ts don't import each other). */
+  label?: string
+  dropTone?: "dark" | "weak" | "ok" | "quiet"
   title?: string
 }): L.DivIcon {
   const tone = pinTone(d)
@@ -67,17 +71,18 @@ export function pinIcon(d: OrgDevice, o: {
   if (d.maintenance) cls.push("wisp-pin--maint")
   if (optic) cls.push(`wisp-pin--optic-${optic}`)
   // A passive has no state of its own — nothing pings a splitter. What it can
-  // report is what hangs below it, and only when that is worth interrupting for:
-  // plant stays quiet by default so it never competes with gear.
+  // report is what hangs below it, and since 2026-08-05 it reports all of it:
+  // `ok` paints too, so a splitter whose recorded drops are all online reads
+  // green rather than sharing the grey of a box nobody has recorded anything on.
+  // `quiet` is still the empty record and still takes no colour — an absent
+  // measurement may not render as a healthy one.
   if (o.dropTone && o.dropTone !== "quiet") cls.push(`wisp-pin--drops-${o.dropTone}`)
   const weak = (d.onus_crit ?? 0) + (d.onus_warn ?? 0)
   const title = esc(o.title ?? (downFor ? `${d.name} · down for ${downFor}`
     : d.maintenance ? `${d.name} · maintenance`
     : optic ? `${d.name} · ${weak} ONU${weak === 1 ? "" : "s"} weak signal` : d.name))
-  const sub = o.sub
-    ? `<span class="wisp-pin__sub">${esc(o.sub)}</span>` : ""
   return cachedDivIcon(`<div class="${cls.join(" ")}" title="${title}">
-      <span class="wisp-pin__dot"></span><span class="wisp-pin__label">${esc(d.name)}${sub}</span>
+      <span class="wisp-pin__dot"></span><span class="wisp-pin__label">${esc(o.label ?? d.name)}</span>
     </div>`)
 }
 

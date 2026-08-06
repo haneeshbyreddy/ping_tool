@@ -41,7 +41,7 @@ function StatusPill({ w }: { w: SnmpWalk }) {
   if (w.truncated) {
     return (
       <span className="inline-flex items-center gap-1 text-2xs font-semibold text-warning"
-        title="The walk stopped at the edge's row cap or time budget. This subtree is only partly dumped — narrow the root OID and re-run before concluding an OID is absent.">
+        title="The walk stopped at the edge's row cap or time budget. This subtree is only partly dumped. Narrow the root OID and re-run before concluding an OID is absent.">
         <AlertTriangle className="size-3" /> {w.varbind_count} rows · partial
       </span>
     )

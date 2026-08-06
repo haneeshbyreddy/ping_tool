@@ -191,7 +191,7 @@ def compose_digest(rows: list[dict]) -> tuple[str, str]:
             lines.append(f"  • {it.get('title') or ''}")
         if len(items) > 3:
             lines.append(f"  … +{len(items) - 3} more")
-    title = f"📥 Summary — {total} event{'s' if total != 1 else ''}"
+    title = f"📥 Summary · {total} event{'s' if total != 1 else ''}"
     return title, "\n".join(lines)
 
 

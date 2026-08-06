@@ -147,9 +147,9 @@ function ProfileForm({
           <Plus className="size-3.5" /> Add column
         </Button>
         <p className="text-2xs text-muted-foreground">
-          ident_* columns come from a registration/roster table (every ONU, online or not);
-          the plain columns from an optical table indexed pon.onu. Map only what the vendor
-          actually exposes. A column you leave out renders honestly blank, never guessed.
+          ident_* columns come from the roster table (every ONU, online or not); the
+          plain ones from the optical table indexed pon.onu. Map only what the vendor
+          exposes. A column left out renders blank, never guessed.
         </p>
       </div>
 
@@ -282,9 +282,8 @@ export function GponProfilesCard({ org, isSuperadmin }: {
       </CardHeader>
       <CardContent className="flex flex-col gap-0 p-0">
         <p className="px-4 pb-3 text-xs text-muted-foreground">
-          Teach the edge a new OLT vendor's ONU-table OIDs as data. No code change or rollout.
-          Edges pick these up within a minute. Built-in huawei/dbc profiles keep working;
-          a profile with the same name replaces the built-in.
+          Teach the edge a new OLT vendor's ONU-table OIDs as data. No rollout; edges
+          pick these up within a minute. A profile named after a built-in replaces it.
           {isSuperadmin && " Profiles you add here are global (every org's edges receive them)."}
         </p>
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}

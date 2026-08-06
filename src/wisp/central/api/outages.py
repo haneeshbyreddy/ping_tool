@@ -312,7 +312,7 @@ def issues_pdf(h, qs):
     printed = [{**r, "since": _wa_time(r["since"]) if r["since"] else None}
                for r in rows]
     body = central_pdf.table_pdf(
-        title=f"Open issues — {org}",
+        title=f"Open issues · {org}",
         subtitle=(f"{len(rows)} issue(s) · {which} · generated "
                   f"{_wa_time(stamp)}"),
         columns=columns, rows=printed,
@@ -555,6 +555,6 @@ def clear_postmortems(h, user, body):
         h._reply(403, {"error": "forbidden"})
         return
     cause = (str(body.get("root_cause") or "").strip()
-             or "Bulk cleared — no post-mortem recorded")
+             or "Bulk cleared, no post-mortem recorded")
     n = h.store.clear_pending_postmortems(org, cause)
     h._reply(200, {"ok": True, "cleared": n})

@@ -8,9 +8,11 @@ import { useNow } from "@/hooks/use-now"
 import { issuesApi, ApiError } from "@/lib/api"
 import type { Issue, IssueKind, IssueSeverity } from "@/lib/types"
 import { NeedsOrg } from "@/components/needs-org"
-import { Chip, StatusDot, type Tone } from "@/components/status-badge"
+import { Chip, PlaneChip, PlaneDot, StatusDot, type Tone } from "@/components/status-badge"
 import { ago, fmtDateTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
+import { KIND_PLANE } from "@/lib/planes"
+import { OnuBar } from "@/components/onu-bar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
@@ -38,7 +40,7 @@ const TONE: Record<IssueSeverity, Tone> = {
 // hundreds of unused pixels. Item leads slightly (mono runs wider per character)
 // and Detail takes the rest; at any width the two shrink together instead of one
 // starving.
-const COLS = "grid grid-cols-[0.5rem_7.5rem_minmax(0,9rem)_minmax(0,1.15fr)_minmax(0,1.35fr)_5rem] items-center gap-3.5 px-4"
+const COLS = "grid grid-cols-[0.5rem_7.5rem_minmax(0,1.15fr)_minmax(0,1.35fr)_5rem] items-center gap-3.5 px-4"
 
 /** `?kind=a,b` — the tiles link here with their own kind, and the chips keep the
  *  URL in step so a filtered list is shareable and survives a reload. */
@@ -173,18 +175,31 @@ export function IssuesPage() {
                 : "border-border bg-card text-muted-foreground hover:text-foreground")}>
             All {all.length}
           </button>
-          {chips.map((k) => (
-            <button key={k} type="button" aria-pressed={picked.has(k)}
-              onClick={() => setKind(picked.has(k) && picked.size === 1 ? null : k)}
-              className={cn(
-                "h-7 rounded-md border px-2.5 text-xs font-medium transition-colors",
-                picked.has(k)
-                  ? "border-border-strong bg-popover text-foreground"
-                  : "border-border bg-card text-muted-foreground hover:text-foreground")}>
-              {labels[k] ?? k}
-              <span className="ml-1.5 font-mono text-2xs text-faint-foreground">{counts[k]}</span>
-            </button>
-          ))}
+          {/* The plane dot answers a question the counts never could: how much
+              of this list is ONE subsystem talking. Seven of the eleven issue
+              kinds are optical, so a fleet with a real spread of problems and
+              a fleet whose entire backlog is ONUs looked identical here — a row
+              of neutral chips with numbers on them. The dot makes that visible
+              before anything is clicked, and it costs no ink that was carrying
+              information. Reachability (device_down) has no plane by
+              construction and simply gets no dot: it is the alarm itself, not a
+              category of one. */}
+          {chips.map((k) => {
+            const plane = KIND_PLANE[k] ?? null
+            return (
+              <button key={k} type="button" aria-pressed={picked.has(k)}
+                onClick={() => setKind(picked.has(k) && picked.size === 1 ? null : k)}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors",
+                  picked.has(k)
+                    ? "border-border-strong bg-popover text-foreground"
+                    : "border-border bg-card text-muted-foreground hover:text-foreground")}>
+                {plane && <PlaneDot plane={plane} />}
+                {labels[k] ?? k}
+                <span className="font-mono text-2xs text-faint-foreground">{counts[k]}</span>
+              </button>
+            )
+          })}
         </div>
       )}
 
@@ -192,7 +207,6 @@ export function IssuesPage() {
         <div className={cn(COLS, "wisp-thead h-9")}>
           <span />
           <span>Issue</span>
-          <span>Device</span>
           <span>Item</span>
           <span>Detail</span>
           <span className="text-right">Since</span>
@@ -210,35 +224,139 @@ export function IssuesPage() {
               : "Nothing matches the current filter."}
           </p>
         )}
-        {rows.map((i, idx) => <Row key={`${i.kind}:${i.device_id ?? "n"}:${i.subject}:${idx}`} issue={i} />)}
+        {groupIssues(rows).map((g) => (
+          <div key={g.key}>
+            <GroupHead g={g} />
+            {/* The chip appears when the KIND CHANGES, not on every row. Rows
+                come back severity-then-kind ordered, so a group reads as runs —
+                six Critical ONU, six Warning ONU, then the offline tail — and
+                naming each run once turns a column of identical chips into a
+                set of headings you can count down. A single-kind group states it
+                in the header instead and the column disappears entirely. */}
+            {g.issues.map((i, idx) => (
+              <Row key={`${i.kind}:${i.subject}:${idx}`} issue={i}
+                hideKind={!!g.oneKind || (idx > 0 && g.issues[idx - 1].kind === i.kind)} />
+            ))}
+          </div>
+        ))}
       </div>
     </div>
   )
 }
 
-function Row({ issue }: { issue: Issue }) {
-  const tone = TONE[issue.severity]
-  // A probe has no row in the device tree, so only a device-backed issue links
-  // out — a link that lands nowhere is worse than plain text.
-  const label = (
-    <span className="truncate font-mono text-xs font-medium">{issue.device_name}</span>
+
+/** ONE ROW PER PROBLEM was the right call and stays — but 25 critical ONUs on
+ *  one OLT is 25 problems and ONE JOB. Ungrouped, the device column repeated
+ *  the same six OLT names down the page, the region repeated on every detail
+ *  cell, and the kind chip repeated identically in a filtered view: three
+ *  columns of constants around one varying number.
+ *
+ *  Grouping by DEVICE lifts all three into a header that says them once, and
+ *  makes the shape of the backlog visible — "ANGPT-OLT: 6" and "HILL-OLT-1: 7"
+ *  is a dispatch list, where sixty undifferentiated rows is not.
+ *
+ *  Order is preserved from the server, which already ranks by severity then
+ *  kind — so the first group is the one with the worst thing in it, and rows
+ *  inside a group keep the ranking the API chose. */
+type IssueGroup = {
+  key: string
+  device: string
+  deviceId: number | null
+  region: string | null
+  issues: Issue[]
+  critical: number
+  warning: number
+  /** every row in this group is the same kind — so the chip belongs up here */
+  oneKind: string | null
+}
+
+function groupIssues(rows: Issue[]): IssueGroup[] {
+  const out: IssueGroup[] = []
+  const byKey = new Map<string, IssueGroup>()
+  for (const i of rows) {
+    const key = `${i.device_id ?? "probe"}·${i.device_name}`
+    let g = byKey.get(key)
+    if (!g) {
+      g = { key, device: i.device_name, deviceId: i.device_id, region: i.region,
+            issues: [], critical: 0, warning: 0, oneKind: i.kind }
+      byKey.set(key, g)
+      out.push(g)
+    }
+    g.issues.push(i)
+    if (i.severity === "critical") g.critical++
+    if (i.severity === "warning") g.warning++
+    if (g.oneKind !== i.kind) g.oneKind = null
+    if (g.region !== i.region) g.region = null
+  }
+  return out
+}
+
+
+/** The aggregate header. Says the three constants ONCE — which box, where it is,
+ *  and what kind of thing the rows below are — plus the counts, which is the
+ *  fact the ungrouped list could never show: how much of the backlog is THIS
+ *  box. The counts are the only toned thing here, and they are counts of a
+ *  status, so they earn it. */
+function GroupHead({ g }: { g: IssueGroup }) {
+  return (
+    <div className="flex items-center gap-3 border-t border-border-subtle bg-muted px-4 py-1.5">
+      {g.deviceId != null
+        ? <Link to="/topology" state={{ deviceId: g.deviceId }}
+            className="shrink-0 font-mono text-xs font-semibold text-foreground hover:underline">
+            {g.device}
+          </Link>
+        : <span className="shrink-0 font-mono text-xs font-semibold text-foreground">{g.device}</span>}
+      {g.region && <span className="shrink-0 text-2xs text-faint-foreground">{g.region}</span>}
+      {g.oneKind && KIND_PLANE[g.oneKind] && (
+        <PlaneChip plane={KIND_PLANE[g.oneKind]!} label={g.issues[0].kind_label} />
+      )}
+      <OnuBar total={g.issues.length} crit={g.critical} warn={g.warning}
+        online={g.issues.length} className="ml-auto" />
+      <span className="flex shrink-0 items-baseline gap-2 font-mono text-2xs">
+        {g.critical > 0 && <span className="font-semibold text-destructive">{g.critical} critical</span>}
+        {g.warning > 0 && <span className="font-semibold text-warning">{g.warning} warning</span>}
+        <span className="text-faint-foreground">{g.issues.length} total</span>
+      </span>
+    </div>
   )
+}
+
+function Row({ issue, hideKind }: { issue: Issue; hideKind?: boolean }) {
+  const tone = TONE[issue.severity]
+  // No device cell: the group header above says which box these belong to, once,
+  // and links out. Repeating it per row is what made three of the five columns
+  // constants.
   return (
     <div className={cn(COLS, "h-10 wisp-row transition-colors hover:bg-foreground/5")}>
       <StatusDot tone={tone} />
       <span className="min-w-0">
-        <Chip tone={tone}>{issue.kind_label}</Chip>
+        {/* TWO FACTS, ONE EACH. The dot to the left is severity (Axis A); this
+            chip is what KIND of thing the row is about (Axis B). They used to
+            be the same fact twice — a toned StatusDot beside a toned Chip — and
+            since a filtered view repeats one kind down the whole list, the
+            result measured as 19 of 19 chromatic elements on this page being
+            the identical red "Critical ONU" badge. That is 100% of the screen's
+            colour spent on the value that never varies, and none on the Rx that
+            does.
+            An identity chip is NEUTRAL TEXT beside a coloured dot, so it sits at
+            the same structural weight as a status chip and still cannot be
+            mistaken for one. `device_down` has no plane by construction —
+            reachability IS the alarm — so it keeps a plain chip. */}
+        {hideKind ? null : KIND_PLANE[issue.kind]
+          ? <PlaneChip plane={KIND_PLANE[issue.kind]!} label={issue.kind_label} />
+          : <Chip tone="muted">{issue.kind_label}</Chip>}
       </span>
-      {issue.device_id != null
-        ? <Link to="/topology" state={{ deviceId: issue.device_id }}
-            className="min-w-0 truncate hover:underline">{label}</Link>
-        : <span className="min-w-0">{label}</span>}
       <span className="truncate font-mono text-xs text-muted-foreground" title={issue.subject}>
         {issue.subject}
       </span>
-      <span className="min-w-0 truncate text-xs text-muted-foreground" title={issue.detail}>
+      {/* The region is gone from here — it repeated on every row of a group and
+          now sits once in the group header. What is left is the only thing in
+          the row that VARIES, so it is also the only thing allowed a tone. */}
+      <span className={cn("min-w-0 truncate text-xs",
+        tone === "destructive" ? "text-destructive"
+          : tone === "warning" ? "text-warning" : "text-muted-foreground")}
+        title={issue.detail}>
         {issue.detail}
-        {issue.region && <span className="text-ghost-foreground"> · {issue.region}</span>}
       </span>
       <span className="text-right font-mono text-xs text-faint-foreground"
         title={issue.since ? fmtDateTime(issue.since) : undefined}>

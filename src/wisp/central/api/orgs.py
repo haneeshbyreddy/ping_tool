@@ -6,7 +6,7 @@ import logging
 import re
 
 from wisp.central import billing as billing_mod
-from wisp.central import inventory, sysinfo, theme
+from wisp.central import inventory, mapdetail, sysinfo, theme
 from wisp.central.api.common import (DENIED, body_org_write, now_iso, org_or_400,
                                      public_user, reader_or_401,
                                      superadmin_or_403)
@@ -93,7 +93,11 @@ def admin_settings(h, qs):
                    "whatsapp": _whatsapp_public(h),
                    # sparse colour diff over the shipped palette; `{}` means a
                    # stock theme, NOT "no colours" (see central/theme.py)
-                   "theme_overrides": theme.load(h.store)})
+                   "theme_overrides": theme.load(h.store),
+                   # EFFECTIVE zoom floors (defaults filled in) — the form has
+                   # three number fields and needs concrete values, unlike the
+                   # sparse theme diff above
+                   "map_detail": mapdetail.load(h.store)})
 
 
 def list_orgs(h, qs):
@@ -107,8 +111,14 @@ def list_orgs(h, qs):
     # the ONE superadmin-pasted Google Maps key rides every org
     # row, so each org's Map view lights up without its own key
     gkey = h.store.get_setting("google_maps_key")
+    # …and the ONE server-wide set of map zoom floors rides it the same way, for
+    # the same reason: the map already reads this row for the key, so a
+    # server-wide map setting costs no extra fetch and shares its invalidation.
+    # Neither is org data — every row carries the identical value.
+    detail = mapdetail.load(h.store)
     for o in orgs:
         o["google_maps_key"] = gkey
+        o["map_detail"] = detail
     # A read-only worker reads this row for the org name and the Maps key, but the
     # ntfy paging topics are a capability (subscribe to every page, POST spoofed
     # ones), not just data — keep them owner/superadmin-only. Nothing a worker
@@ -237,7 +247,7 @@ def admin_settings_write(h, user, body):
             h._reply(422, {"error": "QR must be an uploaded image"})
             return
         if len(qr) > _QR_MAX_CHARS:
-            h._reply(422, {"error": "QR image is too large — use a smaller PNG"})
+            h._reply(422, {"error": "QR image is too large. Use a smaller PNG."})
             return
         h.store.set_setting("billing_qr_image", qr)
     # WhatsApp channel config (app_settings, read fresh by the notifier — the
@@ -265,6 +275,10 @@ def admin_settings_write(h, user, body):
     # distinguishable from the key being absent (absent = don't touch colours).
     if "theme_overrides" in body:
         theme.save(h.store, body.get("theme_overrides"))
+    # Server-wide map zoom floors. Absent = leave them alone; posting the
+    # shipped defaults clears the row (that IS Reset — see central/mapdetail.py).
+    if "map_detail" in body:
+        mapdetail.save(h.store, body.get("map_detail"))
     h._reply(200, {"ok": True})
 
 
@@ -346,7 +360,7 @@ def billing_plan(h, user, body):
     plan = billing_mod.clean_plan(body.get("plan"))
     if plan != "free":
         h._reply(422, {"error": "only the free plan can be chosen without "
-                                "payment — pay the admin to move to a paid plan"})
+                                "payment. Pay the admin to move to a paid plan."})
         return
     prior = h.store.org_plan(org)
     if prior != "free":
@@ -366,7 +380,7 @@ def _notify_admin_plan_change(h, org: str, prior: str) -> None:
     try:
         name = h.store.org_name(org) or org
         from wisp.egress.notifiers import WhatsAppFacts
-        detail = f"was {prior} — self-serve downgrade"
+        detail = f"was {prior} · self-serve downgrade"
         h.notifier.send(f"📉 {name} switched to Free", detail, 3, whatsapp=numbers,
                         facts=WhatsAppFacts(subject=name, status="CHURN → Free",
                                             detail=detail, timestamp=now_iso()))
@@ -414,8 +428,8 @@ def test_alert(h, user, body):
     # ops number is NOT an org recipient (2026-07-25), so the test won't hit it.
     whatsapp = list(h.store.org_alert_recipients(org))
     if not whatsapp:
-        h._reply(422, {"error": "no WhatsApp recipients — add WhatsApp numbers to "
-                                "the team's owner/worker accounts first"})
+        h._reply(422, {"error": "no WhatsApp recipients. Add WhatsApp numbers to "
+                                "the team's owner/worker accounts first."})
         return
     from wisp.egress.notifiers import WhatsAppFacts
     body_line = f"This is a test alert for {org}."

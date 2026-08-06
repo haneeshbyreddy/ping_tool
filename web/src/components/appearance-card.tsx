@@ -96,7 +96,7 @@ function ContrastNote({ tone, panel }: { tone: string; panel: string }) {
   const ok = onPanel >= 4.5
   return (
     <span className={ok ? "text-faint-foreground" : "text-warning"}>
-      {onPanel.toFixed(1)}:1 on panels{ok ? "" : " — too low to read as text"}
+      {onPanel.toFixed(1)}:1 on panels{ok ? "" : " · too low to read as text"}
       <span className="ml-2 text-ghost-foreground">
         ink {ink === "#ffffff" ? "white" : "dark"}
       </span>
@@ -244,10 +244,8 @@ export function AppearanceCard() {
         </div>
 
         <p className="max-w-xl text-xs text-muted-foreground">
-          Each colour re-derives the tokens that hang off it — panels set the whole
-          surface ladder, text sets its muted and faint steps, and every tone gets a
-          readable ink and badge fill computed for it. Anything you leave alone keeps
-          following the built-in palette, so future design updates still reach it.
+          Each colour re-derives the tokens that hang off it. Anything you leave
+          alone keeps following the built-in palette.
         </p>
 
         <div className="flex flex-col gap-3 border-t pt-3">
@@ -261,9 +259,9 @@ export function AppearanceCard() {
           {showAdvanced && (
             <div className="flex flex-col gap-2.5">
               <p className="max-w-xl text-2xs text-faint-foreground">
-                Borders are translucent on purpose — one value then sits correctly on
-                the canvas, on panels and over map tiles. Replacing them with solid
-                colours will look right on one surface and wrong on the others.
+                Borders are translucent on purpose, so one value sits correctly on
+                the canvas, on panels and over map tiles. A solid colour here will
+                look right on one surface and wrong on the others.
               </p>
               {ADVANCED_TOKENS.map(({ token, label, base }) => (
                 <div key={token} className="flex flex-wrap items-center gap-x-4 gap-y-1">

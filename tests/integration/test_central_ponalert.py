@@ -133,7 +133,7 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
 
-        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, "Water tank", None)
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, "Water tank", None, witness=True)
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "power")
@@ -141,7 +141,7 @@ class PonFaultAlerterTest(unittest.TestCase):
     def test_a_dark_reference_onu_keeps_the_fiber_verdict(self):
         self._silent_drop()
         self._onu("ups", "offline", distance=2600, serial="UPS:1")
-        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None)
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None, witness=True)
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")
@@ -149,7 +149,7 @@ class PonFaultAlerterTest(unittest.TestCase):
     def test_clearing_a_placement_restores_the_unwitnessed_verdict(self):
         self._silent_drop()
         self._onu("ups", "online", distance=2600, serial="UPS:1")
-        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None)
+        self.store.set_onu_place("ispA", "UPS:1", 15.85, 74.5, None, None, witness=True)
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "power")
@@ -161,7 +161,7 @@ class PonFaultAlerterTest(unittest.TestCase):
     def test_another_orgs_placement_is_not_a_witness_here(self):
         self._silent_drop()
         self._onu("ups", "online", distance=2600, serial="UPS:1")
-        self.store.set_onu_place("ispB", "UPS:1", 15.85, 74.5, None, None)
+        self.store.set_onu_place("ispB", "UPS:1", 15.85, 74.5, None, None, witness=True)
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["kind"], "fiber")

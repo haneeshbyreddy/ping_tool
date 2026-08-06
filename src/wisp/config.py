@@ -229,6 +229,50 @@ class Config:
     # who walked away does not.
     web_optics_browse_idle_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_BROWSE_IDLE_S", 180))
+    # Worker location tracking (central/field.py). Workers run the off-the-shelf
+    # Traccar Client, which POSTs OsmAnd fixes to the public /field/track ingest;
+    # central stores a live position plus a short trail. CENTRAL-ONLY — no edge
+    # code, no APK.
+    #
+    # RETENTION IS THE POLICY, not a size limit: a full crew at the designed 90 s
+    # cadence is ~6 MB/month, so this is never a volume problem. Seven days
+    # answers "did he reach the site" and "what route did the van take today"
+    # without accumulating a movement archive of staff, which is a different and
+    # much worse thing to hold.
+    field_track_retention_days: int = field(
+        default_factory=lambda: _env_int("WISP_FIELD_TRACK_RETENTION_DAYS", 7))
+    # Above this a "fix" is a cell-tower estimate covering half a town, and
+    # storing it would put a pin on the map that means nothing. Unlike the survey
+    # (where a loose pin that SAYS it is loose beats no pin, because a human
+    # chose to record it) nobody is standing there deciding — the phone is
+    # transmitting on a timer, so the honest thing is to drop the noise.
+    field_track_max_accuracy_m: float = field(
+        default_factory=lambda: _env_float("WISP_FIELD_TRACK_MAX_ACCURACY_M", 500.0))
+    # How far back a fix may be stamped and still be stored. GENEROUS on purpose:
+    # offline buffering is a recommended Traccar setting precisely because the
+    # crew drives through dead zones, so a whole morning replaying at once is the
+    # feature working. Past the retention window it would land in a trail nobody
+    # will ever see.
+    field_track_max_age_s: int = field(
+        default_factory=lambda: _env_int("WISP_FIELD_TRACK_MAX_AGE_S", 86400))
+    # …and how far into the future. A fix from ahead of now is a broken phone
+    # clock, and it would sort to the head of the trail and read as "here now".
+    field_track_max_skew_s: int = field(
+        default_factory=lambda: _env_int("WISP_FIELD_TRACK_MAX_SKEW_S", 300))
+    # Per-token ceiling, as a token bucket rather than a minimum gap: a minimum
+    # gap would throw away exactly the buffered burst we asked the client to
+    # keep. At the designed 90 s cadence a device spends ~0.7/min, so an hour of
+    # buffer flushes well inside one minute's allowance while a looping client
+    # still hits the wall.
+    field_track_rate_per_min: int = field(
+        default_factory=lambda: _env_int("WISP_FIELD_TRACK_RATE_PER_MIN", 60))
+    # When a worker on shift stops counting as "here now". Three missed reports
+    # at the 90 s cadence — enough that one dead zone isn't an alarm, short
+    # enough that "last known 40 minutes ago" can never render as a live
+    # position. The dashboard reads this off the API so the threshold has ONE
+    # source; the classification itself is the SPA's (it ticks with the clock).
+    field_track_fresh_s: int = field(
+        default_factory=lambda: _env_int("WISP_FIELD_TRACK_FRESH_S", 300))
     # PON mass-drop heads-up (central/ponalert.py): page the operator when a
     # PON reads as a fiber cut. State is tracked regardless; only paging gates.
     pon_fault_alerts: bool = field(

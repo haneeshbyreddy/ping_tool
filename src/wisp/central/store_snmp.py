@@ -572,29 +572,49 @@ class SnmpStoreMixin:
 
     # ----- reference ONUs (operator-placed witnesses) -------------------------
 
-    def list_onu_places(self, org_id: str) -> list[dict]:
-        """Every ONU this org has put on the map — witnesses AND plain locations.
+    _PLACE_COLS = ("mac, lat, lng, label, phone, notes, witness, accuracy_m,"
+                   " place_source, placed_by, placed_at, created_at, updated_at")
+
+    def list_onu_places(self, org_id: str, *,
+                        located_only: bool = False) -> list[dict]:
+        """Every subscriber this org has written anything down about.
 
         No longer small by design: an ISP vouches for a handful of power-backed
         subscribers, but the field survey records wherever a tech happens to
         stand, so this can run to the size of the roster. `witness` is what
-        separates the two, and every caller that cares must read it."""
+        separates a power claim from a plain location, and every caller that
+        cares must read it.
+
+        Since a record no longer needs a coordinate, a row here may carry a name
+        and a number and NO pin. `located_only=True` is how a caller drawing the
+        MAP asks its narrower question — a row with NULL lat/lng has nothing to
+        draw, and shipping it would put a marker at (null, null)."""
+        q = f"SELECT {self._PLACE_COLS} FROM onu_places WHERE org_id=?"
+        if located_only:
+            q += " AND lat IS NOT NULL AND lng IS NOT NULL"
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT mac, lat, lng, label, notes, witness, accuracy_m,"
-                " place_source, placed_by, placed_at, created_at, updated_at"
-                " FROM onu_places WHERE org_id=? ORDER BY label, mac",
-                (org_id,)).fetchall()
+            rows = conn.execute(q + " ORDER BY label, mac", (org_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    def onu_place_macs(self, org_id: str, *, witness_only: bool = True) -> set[str]:
+    def get_onu_place(self, org_id: str, mac: str) -> dict | None:
+        """One subscriber's record. `mac` is already `_norm_mac`'d by the caller."""
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._PLACE_COLS} FROM onu_places"
+                " WHERE org_id=? AND mac=?", (org_id, mac)).fetchone()
+        return dict(row) if row else None
+
+    def onu_place_macs(self, org_id: str, *, witness_only: bool = True,
+                       located_only: bool = False) -> set[str]:
         """The WITNESS keys only — what ponfault marks power-backed rows with.
 
-        `witness_only=False` asks the other question — "which subscribers have a
-        pin at all" — for the survey's coverage count. It defaults TRUE so that
-        every existing caller (all of them alerting) keeps the narrow meaning: a
-        paging path that accidentally widened to every located drop is exactly
-        the failure the witness column was added to prevent.
+        `witness_only=False` asks the other question — "which subscribers do we
+        have a record for" — and with `located_only=True` the narrower "which
+        have a PIN", which is the survey's coverage count. `witness_only`
+        defaults TRUE so that every existing caller (all of them alerting) keeps
+        the narrow meaning: a paging path that accidentally widened to every
+        located drop is exactly the failure the witness column was added to
+        prevent.
 
         The `witness=1` filter is the whole safety property of letting the field
         drop location pins on ordinary subscribers. Without it, geo-tagging a
@@ -604,11 +624,19 @@ class SnmpStoreMixin:
         is an observation; witnessing is a claim about a power supply that
         nothing can detect — they must never be the same write.
 
+        The witness question deliberately does NOT filter on coordinates: the
+        claim is about a power supply, and a witness whose pin was cleared is
+        still running on the same UPS. `_witness_verdict` matches by MAC inside a
+        PON and never reads lat/lng, so this keeps the verdict identical either
+        way. Coverage is the opposite case and says `located_only` out loud.
+
         Its own query rather than a comprehension over ``list_onu_places``
         because this one runs on the report cycle, once per optics fold."""
         q = "SELECT mac FROM onu_places WHERE org_id=?"
         if witness_only:
             q += " AND witness=1"
+        if located_only:
+            q += " AND lat IS NOT NULL AND lng IS NOT NULL"
         with self._connect() as conn:
             rows = conn.execute(q, (org_id,)).fetchall()
         return {r["mac"] for r in rows}
@@ -639,14 +667,18 @@ class SnmpStoreMixin:
 
     def set_onu_place(self, org_id: str, mac: str, lat: float, lng: float,
                       label: str | None, notes: str | None,
-                      *, witness: bool = True) -> bool:
+                      *, witness: bool, phone: str | None = None) -> bool:
         """Place (or move) an ONU on the map. `mac` must already be in
         ``onuroster._norm_mac`` form — identity is the caller's to normalize, and
         exactly once, or two spellings of one sticker become two witnesses.
 
-        `witness` defaults TRUE because that is what every caller predating the
-        field survey meant, and a silent default of False would quietly retire
-        the reference-ONU feature. The field path passes it explicitly.
+        `witness` is REQUIRED — it used to default True, and that default is
+        exactly how ordinary customers became witnesses: every desktop write
+        (moving a pin, editing a phone number) asserted a power-supply claim
+        nobody had made. The routes now resolve it explicitly, preserving
+        whatever the record already says unless the caller means to change it.
+        Leave it unsayable-by-omission; a default here is a claim made by
+        forgetting.
 
         A re-place carries the flag it is given, which is deliberate in BOTH
         directions: a tech recording a location for an ONU somebody had vouched
@@ -658,20 +690,27 @@ class SnmpStoreMixin:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO onu_places (org_id, mac, lat, lng, label, notes,"
-                " witness, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO onu_places (org_id, mac, lat, lng, label, phone,"
+                " notes, witness, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET lat=excluded.lat,"
                 " lng=excluded.lng, label=excluded.label, notes=excluded.notes,"
+                # The desktop dialog's number is OPTIONAL, so a blank one there
+                # must not erase a number the field recorded — same COALESCE
+                # discipline `place_onu_in_field` keeps for the label. Clearing
+                # a contact detail is nobody's accident to have.
+                " phone=COALESCE(excluded.phone, onu_places.phone),"
                 " witness=excluded.witness, updated_at=excluded.updated_at",
-                (org_id, mac, lat, lng, label or None, notes or None,
-                 1 if witness else 0, now, now))
+                (org_id, mac, lat, lng, label or None, phone or None,
+                 notes or None, 1 if witness else 0, now, now))
             conn.commit()
         return True
 
     def place_onu_in_field(self, org_id: str, mac: str, lat: float, lng: float,
                            *, witness: bool, accuracy_m: float | None,
                            source: str, placed_by: str,
-                           label: str | None = None) -> bool:
+                           label: str | None = None,
+                           phone: str | None = None) -> bool:
         """A subscriber pin taken standing at the drop.
 
         Separate from `set_onu_place` for the same reason `place_org_device` is
@@ -684,25 +723,27 @@ class SnmpStoreMixin:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO onu_places (org_id, mac, lat, lng, label, notes,"
-                " witness, accuracy_m, place_source, placed_by, placed_at,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO onu_places (org_id, mac, lat, lng, label, phone,"
+                " notes, witness, accuracy_m, place_source, placed_by,"
+                " placed_at, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET lat=excluded.lat,"
                 " lng=excluded.lng, witness=excluded.witness,"
                 " label=COALESCE(excluded.label, onu_places.label),"
+                " phone=COALESCE(excluded.phone, onu_places.phone),"
                 " accuracy_m=excluded.accuracy_m,"
                 " place_source=excluded.place_source,"
                 " placed_by=excluded.placed_by, placed_at=excluded.placed_at,"
                 " updated_at=excluded.updated_at",
-                (org_id, mac, lat, lng, label or None, None,
+                (org_id, mac, lat, lng, label or None, phone or None, None,
                  1 if witness else 0, accuracy_m, source, placed_by, now,
                  now, now))
             conn.commit()
         return True
 
-    def set_onu_place_label(self, org_id: str, mac: str,
-                            label: str | None) -> bool:
-        """Rename a located subscriber. Touches the label and NOTHING else.
+    def set_onu_place_contact(self, org_id: str, mac: str, label: str | None,
+                              phone: str | None = None) -> bool:
+        """Correct a located subscriber's NAME and NUMBER. Nothing else moves.
 
         Its own method rather than a `place_onu_in_field` call with the old
         coordinates, because re-placing would restamp `accuracy_m`/`place_source`
@@ -710,15 +751,16 @@ class SnmpStoreMixin:
         downgrade a real 6 m GPS fix to a hand-placed point with no accuracy, and
         reattribute the placement to whoever fixed the spelling.
 
-        Clearing IS allowed here (unlike a pin): a label is descriptive, so an
-        empty one is a fact about what the operator knows, not the loss of plant
-        record. False = no such placement, which the caller reports as a 404
-        rather than silently creating a pin-less row."""
+        Both details are written together because they are captured together and
+        the caller (`clean_field_onu_name_payload`) requires both — a partial
+        update spelling would let one door blank what the other door insists on.
+        False = no such placement, which the caller reports as a 404 rather than
+        silently creating a pin-less row."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
-                "UPDATE onu_places SET label=?, updated_at=?"
+                "UPDATE onu_places SET label=?, phone=?, updated_at=?"
                 " WHERE org_id=? AND mac=?",
-                (label or None, _now_iso(), org_id, mac))
+                (label or None, phone or None, _now_iso(), org_id, mac))
             conn.commit()
         return cur.rowcount > 0
 
@@ -735,9 +777,141 @@ class SnmpStoreMixin:
                 (org_id, mac)).fetchone()
         return None if row is None else bool(row["witness"])
 
+    def set_onu_contact(self, org_id: str, mac: str, label: str | None,
+                        phone: str | None, notes: str | None) -> bool:
+        """Record who a subscriber is, from the desk, with no coordinate.
+
+        The write that used to be impossible. Every other path into this table
+        demands lat/lng, so on a fleet with 2,156 subscribers and a handful of
+        pins there was nowhere to put 2,150 names — which is most of why
+        customer data felt scattered: it could not be entered at all. This is
+        also the ONLY writer that may CREATE a pin-less row; the field's
+        `set_onu_place_contact` still refuses to (its caller reports a 404),
+        because a rename arriving for an unlocated MAC is a bug, not a new
+        record.
+
+        `witness` is untouched on an update and 0 on a create: naming somebody is
+        not vouching for their power supply, and that claim is only ever made
+        where the UI states the contract. Blank fields are written as NULL rather
+        than COALESCE'd — this form SHOWS what is stored, so clearing a field is
+        the operator deleting a wrong number on purpose, and silently keeping it
+        would be the same lie the map card's Remove button used to tell. The
+        row is pruned if that empties it."""
+        if not mac:
+            return False
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO onu_places (org_id, mac, lat, lng, label, phone,"
+                " notes, witness, created_at, updated_at)"
+                " VALUES (?,?,NULL,NULL,?,?,?,0,?,?)"
+                " ON CONFLICT(org_id, mac) DO UPDATE SET label=excluded.label,"
+                " phone=excluded.phone, notes=excluded.notes,"
+                " updated_at=excluded.updated_at",
+                (org_id, mac, label or None, phone or None, notes or None,
+                 now, now))
+            self._prune_onu_place(conn, org_id, mac)
+            conn.commit()
+        return True
+
+    def set_onu_witness(self, org_id: str, mac: str, witness: bool) -> bool:
+        """Make or withdraw the power-supply claim. NOTHING else moves.
+
+        The missing half of this table's write surface, and the reason ordinary
+        customers kept becoming witnesses: until 2026-08-04 the only way to make
+        the claim was to place a pin and the only way to withdraw it was to
+        REMOVE that pin, so an operator who wanted "on the map but not vouched
+        for" had no move — and every desktop pin write asserted the claim by
+        default. Now the claim is its own verb.
+
+        Deliberately UPDATE-only. A claim about a subscriber nobody has written
+        down is not a record worth inventing, and the caller reports the miss as
+        a 404 — same discipline as `set_onu_place_contact`. Withdrawing prunes
+        the row if the flag was the only thing on it (a bare reference point with
+        no pin, name or number is exactly the husk `_prune_onu_place` exists to
+        clear).
+
+        Independent of the coordinates ON PURPOSE: `ponfault._witness_verdict`
+        matches by MAC and never reads lat/lng, so a subscriber can be vouched
+        for before anyone has stood at the drop. Note the asymmetry with
+        `clear_onu_place_coords`, which still retracts the claim along with the
+        pin — placing WAS the claim, so unplacing stays its retraction; this
+        route adds a way to say so without touching the map."""
+        if not mac:
+            return False
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE onu_places SET witness=?, updated_at=?"
+                " WHERE org_id=? AND mac=?",
+                (1 if witness else 0, _now_iso(), org_id, mac))
+            if cur.rowcount:
+                self._prune_onu_place(conn, org_id, mac)
+            conn.commit()
+        return cur.rowcount > 0
+
+    def clear_onu_place_coords(self, org_id: str, mac: str) -> bool:
+        """Take a subscriber off the map WITHOUT forgetting who they are.
+
+        What "Remove" on the map card means, and what it did NOT mean until
+        2026-08-03: it ran `delete_onu_place`, so an eye-off icon that reads as
+        "hide this pin" destroyed the name and the phone number too, with no
+        confirmation. The coordinates and their PROVENANCE go together — an
+        accuracy figure describes a measurement that no longer exists — and
+        everything the operator KNOWS about the subscriber stays.
+
+        THE WITNESS CLAIM IS RETRACTED WITH THE PIN, and that is not an
+        oversight. Everywhere else in this subsystem the claim is deliberately
+        independent of the coordinate — `ponfault._witness_verdict` matches by
+        MAC and never reads lat/lng — so keeping it here looks tempting and is
+        wrong: PLACING IS THE CLAIM, which makes unplacing the retraction. A
+        witness that survived with no pin would be a live input to a fibre-cut
+        verdict that has vanished from the only screen that lists witnesses —
+        the exact inverse of the failure this feature already guards ("a pin
+        that quietly stopped witnessing is the one failure this list must not
+        conceal"). Retracting also keeps alerting BYTE-IDENTICAL to the old
+        delete-everything behaviour, so the honest reading and the conservative
+        one agree.
+
+        Consequence worth stating: a bare reference point — vouched for, never
+        named — prunes away entirely, exactly as it used to. Only what an
+        operator TYPED survives, which is the whole point of the change."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE onu_places SET lat=NULL, lng=NULL, accuracy_m=NULL,"
+                " place_source=NULL, placed_by=NULL, placed_at=NULL, witness=0,"
+                " updated_at=? WHERE org_id=? AND mac=?",
+                (_now_iso(), org_id, mac))
+            self._prune_onu_place(conn, org_id, mac)
+            conn.commit()
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _prune_onu_place(conn, org_id: str, mac: str) -> None:
+        """Drop a record that has become entirely empty.
+
+        The table stays SPARSE now that a row can outlive its pin — "no row" has
+        to keep meaning "nobody wrote anything down", or a cleared pin would
+        leave a husk that the survey counts, the search finds and the operator
+        cannot get rid of. Same rule `_prune_link_route` follows for link
+        styling: delete only when every column the operator can write is empty.
+
+        `witness` counts as content — it is the claim `ponfault` reads, so a
+        power-backed subscriber whose pin was cleared keeps its row and keeps
+        working. Runs inside the caller's transaction; the caller commits."""
+        conn.execute(
+            "DELETE FROM onu_places WHERE org_id=? AND mac=?"
+            " AND lat IS NULL AND lng IS NULL AND witness=0"
+            " AND (label IS NULL OR label='')"
+            " AND (phone IS NULL OR phone='')"
+            " AND (notes IS NULL OR notes='')", (org_id, mac))
+
     def delete_onu_place(self, org_id: str, mac: str) -> bool:
-        """Clearing a reference point is a DELETE — the table is sparse, so
-        there is no such thing as a placed-but-unplaced row."""
+        """Forget a subscriber outright — pin, name, number and power claim.
+
+        Distinct from `clear_onu_place_coords`, which only unpins. Nothing in the
+        dashboard calls this: the panel offers "remove pin", and the record then
+        prunes itself if it was holding nothing else. Kept for the org/device
+        delete cascades, which really do mean forget."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute("DELETE FROM onu_places WHERE org_id=? AND mac=?",
                                (org_id, mac))
@@ -1374,7 +1548,7 @@ class SnmpStoreMixin:
                     o["snmp"]["working"] += 1
                 elif last is None:
                     problem = ("snmp", "never", "SNMP enabled but no data has "
-                               "ever arrived — device silent or edge not walking it")
+                               "ever arrived: device silent or edge not walking it")
                 else:
                     problem = ("snmp", "stale", "SNMP data stopped arriving")
             if is_olt and snmp_on and (r["id"], "optics") not in unsupported:
@@ -1390,7 +1564,7 @@ class SnmpStoreMixin:
                 elif snmp_ok:
                     problem = (("optics", "stale", "optics stopped arriving")
                                if r["optics_at"] is not None else
-                               ("optics", "never", "no optics reported — vendor "
+                               ("optics", "never", "no optics reported: vendor "
                                 "unmatched (check sysObjectID) or ONU table empty"))
             if r["ports_discovered"]:
                 o["ports"]["switches"] += 1

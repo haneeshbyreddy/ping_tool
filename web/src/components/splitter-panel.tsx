@@ -22,12 +22,17 @@
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, MapPin, Search, Split, TriangleAlert } from "lucide-react"
+import { ChevronRight, MapPin, MapPinned, Search, Split, TriangleAlert } from "lucide-react"
 import { inventoryApi, ApiError } from "@/lib/api"
 import { SPLIT_RATIOS, isPassiveType, type OnuOptic, type OrgDevice, type SubscriberDrop } from "@/lib/types"
 import { useAuth } from "@/hooks/use-auth"
 import { onuName } from "@/lib/format"
 import { fmtKm, distanceKm, polyKm } from "@/map/geometry"
+// Moved out of this file when the map started authoring plant: a pure map
+// helper importing a panel component to get one rule is how a module graph
+// knots, and both surfaces have to agree about what feeds what.
+import { cumulativeSplit, feedChain } from "@/map/plant"
+import { SubscriberDialog } from "@/components/subscriber-detail"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -40,41 +45,6 @@ import {
 import { cn } from "@/lib/utils"
 
 const NONE = "__none__"
-
-/** The chain of passives from a box up to the powered gear feeding it, nearest
- *  first. Walks the LIVE parent links, so re-parenting a splitter moves its
- *  whole story with it and nothing needs re-entering. Cycle-guarded: a bad row
- *  must not spin a render. */
-export function feedChain(device: OrgDevice, byId: Map<number, OrgDevice>) {
-  const passives: OrgDevice[] = []
-  let head: OrgDevice | null = null
-  let cur = device.parent_device_id != null ? byId.get(device.parent_device_id) : undefined
-  const seen = new Set<number>([device.id])
-  while (cur && !seen.has(cur.id)) {
-    seen.add(cur.id)
-    if (!isPassiveType(cur.device_type)) { head = cur; break }
-    passives.push(cur)
-    cur = cur.parent_device_id != null ? byId.get(cur.parent_device_id) : undefined
-  }
-  return { passives, head }
-}
-
-/** Total split from the OLT down to this box: 1:4 feeding a 1:8 is 1:32.
- *
- *  The number that decides whether a PON has any budget left, and it is not
- *  something a single box can answer — which is why it lives here and not on a
- *  device row. Null when any box in the chain has no recorded ratio: a partial
- *  product would understate the split, and understating it is how a PON ends up
- *  over-built. */
-export function cumulativeSplit(device: OrgDevice, byId: Map<number, OrgDevice>): number | null {
-  const { passives } = feedChain(device, byId)
-  let total = 1
-  for (const d of [device, ...passives]) {
-    if (!d.split_ratio) return null
-    total *= d.split_ratio
-  }
-  return total
-}
 
 /** Cable metres from the powered head down to this box, following drawn routes
  *  where the operator traced them and the straight chord where they didn't.
@@ -124,7 +94,11 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(true)
   const [attaching, setAttaching] = useState(false)
-  useEffect(() => { setAttaching(false) }, [device.id])
+  // Which recorded drop is open as a subscriber. The rows here answer "how is
+  // this box loaded"; the person on one of them is a different question, and
+  // it now has one answer everywhere instead of four partial ones.
+  const [openSub, setOpenSub] = useState<string | null>(null)
+  useEffect(() => { setAttaching(false); setOpenSub(null) }, [device.id])
 
   const invQ = useQuery({
     queryKey: ["inventory", scopeOrg],
@@ -245,17 +219,17 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
               </div>
             ) : (
               <span className="text-xs text-muted-foreground">
-                No powered device above this — parent it to the OLT or the splitter feeding it.
+                No powered device above this. Parent it to the OLT or the splitter feeding it.
               </span>
             )}
             <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-2xs text-muted-foreground">
               {totalSplit != null && (
-                <span title="Every split between the OLT and this box, multiplied — the number that says whether the PON has budget left">
+                <span title="Every split between the OLT and this box, multiplied. Says whether the PON has budget left.">
                   Total split <span className="font-mono text-foreground">1:{totalSplit}</span>
                 </span>
               )}
               {totalSplit == null && passives.length > 0 && (
-                <span>Total split unknown — a box in this chain has no ratio recorded</span>
+                <span>Total split unknown · a box in this chain has no ratio recorded</span>
               )}
               {length && (
                 <span title={length.traced
@@ -343,9 +317,9 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
               <p className="text-xs text-muted-foreground">
                 No subscribers recorded on this box yet.{" "}
                 {olt
-                  ? "Record them and this splitter starts reporting its own load, and a break below it can be pinned to one span."
+                  ? "Record them and a break below this box can be pinned to one span."
                   : head
-                    ? `${head.name} isn't an OLT, so there's no ONU roster to pick from — check this box's parent chain.`
+                    ? `${head.name} isn't an OLT, so there's no ONU roster to pick from. Check this box's parent chain.`
                     : "Parent this box to the OLT (or the splitter) feeding it first."}
               </p>
             )}
@@ -361,7 +335,7 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
                   <span className="text-warning" title={
                     `These sit ${outlierDb} dB or more below this splitter's own median. `
                     + "Same feeder and same split loss as their neighbours, so the "
-                    + "difference is in that drop — a bend, a dirty connector or a bad splice."}>
+                    + "difference is in that drop: a bend, a dirty connector or a bad splice."}>
                     {load.outliers} below this box's own median
                   </span>
                 )}
@@ -379,12 +353,15 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
                     <div key={d.mac}
                       className="flex items-center gap-2 border-b px-2 py-1 text-2xs last:border-b-0">
                       <span className={cn("size-1.5 shrink-0 rounded-full", DOT[tone])} />
-                      <span className="min-w-0 flex-1 truncate">
+                      <button type="button"
+                        className="min-w-0 flex-1 truncate text-left underline-offset-2 hover:underline"
+                        title="Open this subscriber"
+                        onClick={() => setOpenSub(d.mac)}>
                         {d.name || <span className="font-mono">{d.mac}</span>}
-                      </span>
+                      </button>
                       {d.witness && (
-                        <MapPin className="size-3 shrink-0 fill-current text-primary"
-                          aria-label="Reference ONU"
+                        <MapPinned className="size-3 shrink-0 fill-current text-primary"
+                          aria-label="Reference point"
                         />
                       )}
                       {d.pon_port && (
@@ -394,7 +371,7 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
                       )}
                       {!d.matched ? (
                         <span className="shrink-0 text-muted-foreground"
-                          title="Recorded here, but this MAC is in no current roster — an RMA'd box, or a mistyped sticker">
+                          title="Recorded here, but this MAC is in no current roster. An RMA'd box, or a mistyped sticker.">
                           not in roster
                         </span>
                       ) : d.state !== "online" ? (
@@ -405,7 +382,7 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
                           {fmtDbm(d.rx_dbm)}
                           {delta != null && Math.abs(delta) >= 0.5 && (
                             <span className={cn("ml-1", low ? "text-warning" : "text-faint-foreground")}
-                              title="Against this splitter's own median — same feeder, same split loss">
+                              title="Against this splitter's own median. Same feeder, same split loss.">
                               {delta > 0 ? "+" : ""}{delta.toFixed(1)}
                             </span>
                           )}
@@ -423,6 +400,9 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
       {attaching && olt && (
         <AttachDropsDialog splitter={self} head={olt} current={drops}
           onClose={() => setAttaching(false)} />
+      )}
+      {openSub && (
+        <SubscriberDialog mac={openSub} onClose={() => setOpenSub(null)} />
       )}
     </div>
   )
@@ -540,7 +520,7 @@ function AttachDropsDialog({ splitter, head, current, onClose }: {
           {!opticsQ.isLoading && rows.length === 0 && (
             <p className="px-3 py-4 text-center text-xs text-muted-foreground">
               {onus.length === 0
-                ? "No ONU roster for this OLT yet — the SNMP walk has to run first."
+                ? "No ONU roster for this OLT yet. The SNMP walk has to run first."
                 : "Nothing matches."}
             </p>
           )}
@@ -562,13 +542,26 @@ function AttachDropsDialog({ splitter, head, current, onClose }: {
                 <span className="min-w-0 flex-1 truncate">
                   {onuName(o) || <span className="font-mono">{o.serial}</span>}
                 </span>
-                {o.place && <MapPin className="size-3 shrink-0 fill-current text-primary" />}
+                {/* Same grammar as the Optical tab's toggle, and it must stay
+                    the same or one list teaches a reading the other contradicts:
+                    FILL says "we have a location", the ringed glyph and the
+                    primary hue say "its power is vouched for". Rendering every
+                    surveyed customer as the latter is what let a fleet's survey
+                    read as a fleet of witnesses. Nothing is drawn at all for an
+                    unrecorded subscriber — in THIS list the row is a checkbox
+                    the operator is about to tick, so an absent mark is already
+                    the loud state. */}
+                {o.place && (o.place.witness
+                  ? <MapPinned className="size-3 shrink-0 fill-current text-primary"
+                      aria-label="Reference point" />
+                  : <MapPin className="size-3 shrink-0 fill-current text-muted-foreground"
+                      aria-label="On the map" />)}
                 <span className="shrink-0 font-mono text-2xs text-faint-foreground">
                   {o.pon_port}{o.onu_id != null ? `:${o.onu_id}` : ""}
                 </span>
                 {elsewhere && (
                   <span className="shrink-0 rounded bg-warning-soft px-1 py-px text-2xs text-warning"
-                    title={`Currently recorded on ${elsewhere.name} — ticking this moves the drop`}>
+                    title={`Currently recorded on ${elsewhere.name}. Ticking this moves the drop.`}>
                     on {elsewhere.name}
                   </span>
                 )}

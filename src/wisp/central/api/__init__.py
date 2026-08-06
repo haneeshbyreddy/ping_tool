@@ -7,7 +7,7 @@ session check (and with AuthError/InventoryError mapped to 422 by the caller).
 """
 from __future__ import annotations
 
-from wisp.central.api import devices, edge, fleet, orgs, outages, proxy, users
+from wisp.central.api import devices, edge, field, fleet, orgs, outages, proxy, users
 
 GET = {
     "/healthz": orgs.healthz,
@@ -29,6 +29,7 @@ GET = {
     "/api/inventory/link-ports": devices.link_ports,
     "/api/inventory/optics": devices.optics,
     "/api/inventory/onu-search": devices.onu_search,
+    "/api/inventory/subscriber": devices.subscriber,
     "/api/inventory/onu-places": devices.onu_places,
     "/api/inventory/onu-coverage": devices.onu_coverage,
     "/api/inventory/drops": devices.onu_drops,
@@ -55,6 +56,13 @@ GET = {
     "/api/issues/pdf": outages.issues_pdf,
     "/api/issues/xlsx": outages.issues_xlsx,
     "/api/logs": outages.logs,
+    # Worker location tracking. `shift` is the caller's own state (worker-
+    # readable); `workers`/`tokens` are the owner's view of the crew. The INGEST
+    # is not here — /field/track is public and machine-credentialed, handled in
+    # server.py beside /whatsapp/webhook.
+    "/api/field/shift": field.shift,
+    "/api/field/workers": field.workers,
+    "/api/field/tokens": field.tokens,
     "/api/proxy/sessions": proxy.sessions_list,
     "/api/proxy/audit": proxy.audit_list,
 }
@@ -97,6 +105,8 @@ POST = {
     "/api/inventory/field-onu": devices.field_onu,
     "/api/inventory/field-onu-name": devices.field_onu_name,
     "/api/inventory/onu-place": devices.onu_place,
+    "/api/inventory/onu-witness": devices.onu_witness,
+    "/api/inventory/onu-contact": devices.onu_contact,
     "/api/inventory/drops/set": devices.set_onu_drops,
     "/api/inventory/route": devices.route,
     "/api/inventory/link-style": devices.link_style,
@@ -129,6 +139,9 @@ POST = {
     "/api/regions": devices.region_add,
     "/api/regions/rename": devices.region_rename,
     "/api/regions/delete": devices.region_delete,
+    "/api/field/shift": field.shift_write,
+    "/api/field/token": field.token_issue,
+    "/api/field/token/revoke": field.token_revoke,
     "/api/proxy/session": proxy.session_create,
     "/api/proxy/close": proxy.session_close,
     "/api/outages/acknowledge": outages.acknowledge,

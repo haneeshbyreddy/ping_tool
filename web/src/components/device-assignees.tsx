@@ -60,7 +60,7 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
       // is a fact to surface rather than a reason to reject the operator's edit.
       if (res.unreachable?.length) {
         toast.warning(
-          `Saved — but ${res.unreachable.join(", ")} ${res.unreachable.length === 1 ? "has" : "have"} no WhatsApp number, so no page will reach ${res.unreachable.length === 1 ? "them" : "them"}`)
+          `Saved, but ${res.unreachable.join(", ")} ${res.unreachable.length === 1 ? "has" : "have"} no WhatsApp number, so no page reaches them`)
       } else {
         toast.success("Paging responsibility updated")
       }
@@ -112,7 +112,7 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
               what an unassigned device does. */}
           <p className="text-xs text-faint-foreground">
             {effective.length === 0 ? (
-              <>Not assigned — <span className="text-muted-foreground">every worker</span> is paged
+              <>Not assigned, so <span className="text-muted-foreground">every worker</span> is paged
                 when this device or one of its monitored ports goes down. Owners are always paged.</>
             ) : (
               <>Owners, plus the accounts below, are paged when this device or one of its
@@ -143,7 +143,7 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
               )}
               {roster.isSuccess && accounts.length === 0 && (
                 <p className="text-xs text-faint-foreground">
-                  No field accounts yet — add one in Users to assign it here.
+                  No field accounts yet. Add one in Users to assign it here.
                 </p>
               )}
               {accounts.map((a) => {
@@ -179,7 +179,7 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
                     disabled={save.isPending}
                     onClick={() => save.mutate(ticked)}>
                     <BellRing className="size-3" />
-                    {ticked.length === 0 ? "Clear — page every worker" : "Save"}
+                    {ticked.length === 0 ? "Clear · page every worker" : "Save"}
                   </Button>
                   <Button size="sm" variant="ghost" className="h-7 text-xs"
                     onClick={() => setDraft(null)}>
@@ -201,7 +201,7 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
           {/* Responsibility flows DOWN, so say what this row actually costs. */}
           {self.child_count > 0 && (
             <p className="border-t pt-2 text-2xs text-faint-foreground">
-              Also covers everything below this device — {self.child_count} direct
+              Also covers everything below this device: {self.child_count} direct
               {self.child_count === 1 ? " child" : " children"} and their subtrees.
             </p>
           )}

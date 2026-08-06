@@ -196,8 +196,8 @@ export function OrganizationsPage() {
             + `${deleting.node_count} probe${deleting.node_count === 1 ? "" : "s"}, `
             + `${deleting.user_count} login${deleting.user_count === 1 ? "" : "s"}, and all outage, `
             + "alert and billing history for this org. Monitoring stops immediately. "
-            + "This cannot be undone. Uninstall any probe still pointed here first — "
-            + "self-enrollment would re-create the org as an empty shell."
+            + "This cannot be undone. Uninstall any probe still pointed here first, or "
+            + "self-enrollment re-creates the org as an empty shell."
           }
           requireText={deleting.org_id}
           confirmLabel="Delete org"

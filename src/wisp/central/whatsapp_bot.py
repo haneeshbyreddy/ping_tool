@@ -63,7 +63,7 @@ _ASK_MAC, _ASK_NAME = "ask:mac", "ask:name"
 _MENU_BUTTONS = ((_ASK_MAC, "Search by MAC"), (_ASK_NAME, "Search by name"))
 _FMT_MAC = ("📇 Send the ONU's MAC address.\n\n"
             "Example: a4:f2:1b:00:11:22\n"
-            "• separators don't matter — a4f21b001122 works too\n"
+            "• separators don't matter, a4f21b001122 works too\n"
             "• a partial MAC is fine (at least 3 characters), e.g. 1b0011")
 _FMT_NAME = ("🔖 Send the ONU's name as provisioned on the OLT.\n\n"
              "Example: hc_kiran\n"
@@ -248,7 +248,7 @@ class WhatsAppBot:
             lines.append(f"Found {len(hits)} ONUs on {name}:")
             for o in hits[:_MAX_LIST]:
                 title = onuroster.display_name(o) or "ONU"
-                lines.append(f"• {title} — PON {o.get('pon_port') or '?'}"
+                lines.append(f"• {title} · PON {o.get('pon_port') or '?'}"
                              f" · {_state_label(o.get('state'))} · Rx {_rx(o, olt_has_rx)}")
             if len(hits) > _MAX_LIST:
                 lines.append(f"…and {len(hits) - _MAX_LIST} more")
@@ -307,14 +307,14 @@ class WhatsAppBot:
             row = self._outage(org, oid)
             device = (row or {}).get("device_name") or "the outage"
             self.notifier.send_text(
-                sender, f"✅ Thanks — you're marked as on the way to {device}. "
+                sender, f"✅ Thanks, you're marked as on the way to {device}. "
                         f"The team can see it.")
             self._tell_assigner(org, row, user.get("username") or "")
         elif outcome == "already":
             self.notifier.send_text(sender, "✅ You had already accepted this one.")
         elif outcome == "closed":
             self.notifier.send_text(
-                sender, "👍 That outage has already recovered — nothing to go out for.")
+                sender, "👍 That outage has already recovered, nothing to go out for.")
         else:
             self.notifier.send_text(
                 sender, "🔒 That job isn't assigned to you (it may have been "
@@ -365,8 +365,8 @@ class WhatsAppBot:
             return
         if sweeper.busy(did):
             self.notifier.send_text(
-                sender, f"A read of {dev.get('name')} is already running — "
-                        "try again shortly.")
+                sender, f"A read of {dev.get('name')} is already running. "
+                        "Try again shortly.")
             return
         target = sweeper.target(org, did)   # the SAME eligibility the button/route use
         if target is None:
@@ -385,7 +385,7 @@ class WhatsAppBot:
         log.info("whatsapp rx-refresh queued by user=%s for %s/device=%s",
                  user["id"], org, did)
         self.notifier.send_text(
-            sender, f"🔄 Reading {dev.get('name')} now — send the MAC again "
+            sender, f"🔄 Reading {dev.get('name')} now. Send the MAC again "
                     "in a minute for fresh dBm.")
 
     def _map(self, sender: str, org: str, did: int | None, onu: str) -> None:
@@ -414,7 +414,7 @@ class WhatsAppBot:
         if not rows:
             self.notifier.send_text(sender, f"🟢 No recent outages for {dev.get('name')}.")
             return
-        lines = [f"Recent outages — {dev.get('name')}:"]
+        lines = [f"Recent outages · {dev.get('name')}:"]
         for r in rows:
             when = _ago(r.get("started_at"), now)
             if r.get("resolved_at"):
@@ -524,8 +524,8 @@ def _freshness_note(dev: dict, now: datetime, down: bool) -> str:
     if down:
         age = _ago(opt_ts, now)
         tail = f" (last optics {age} ago)" if age != "?" else ""
-        return f"⚠️ {dev.get('name')} is {dev.get('state')} — readings are frozen{tail}."
+        return f"⚠️ {dev.get('name')} is {dev.get('state')}, so readings are frozen{tail}."
     secs = _age_secs(opt_ts, now)
     if secs is not None and secs > onuroster.STALE_S:
-        return f"⏳ Optics last walked {_ago(opt_ts, now)} ago — readings may be stale."
+        return f"⏳ Optics last walked {_ago(opt_ts, now)} ago, so readings may be stale."
     return ""

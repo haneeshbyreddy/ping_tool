@@ -2,11 +2,13 @@ import type {
   AccountUser, AdminOverview, AssignmentRoster, BillingInfo, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
-  BranchFault, SplitterLoad, SubscriberDrop,
+  BranchFault, SplitterLoad, Subscriber, SubscriberDrop,
   Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
+  FieldTokensResponse, FieldWorkersResponse, ShiftState,
 } from "./types"
 import type { ThemeOverrides } from "./theme-tokens"
+import type { MapDetail } from "@/map/detail"
 
 export class ApiError extends Error {
   status: number
@@ -77,6 +79,9 @@ export const adminApi = {
     // sparse colour diff over the shipped palette, per theme mode; `{}` is a
     // stock theme. See lib/theme-tokens.ts and central/theme.py.
     theme_overrides: ThemeOverrides
+    // EFFECTIVE map zoom floors (defaults filled in, unlike the sparse theme
+    // diff above) — one setting for every org. See central/mapdetail.py.
+    map_detail: MapDetail
   }>("/api/admin/settings"),
   saveSettings: (body: {
     google_maps_key?: string | null
@@ -97,6 +102,9 @@ export const adminApi = {
     }
     // omit to leave colours alone; `{}` resets every org to the shipped palette
     theme_overrides?: ThemeOverrides
+    // omit to leave map density alone; posting the shipped defaults IS the reset
+    // (central clears the row rather than storing a copy of them)
+    map_detail?: MapDetail
   }) =>
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
 }
@@ -188,14 +196,18 @@ export const inventoryApi = {
   // `witness` key: placing a REFERENCE ONU is the operator's claim about a power
   // supply and flips PON mass-drop verdicts, so it stays on setOnuPlace and
   // owner-only. This one records where the box is, and nothing more.
+  // `label` and `phone` are REQUIRED by the server, not merely accepted: a
+  // survey row a crew can't act on isn't worth the pin. Typed optional-free.
   locateOnuInField: (body: {
     mac: string; lat: number; lng: number
-    accuracy_m: number | null; source: "gps" | "manual"; label?: string | null
+    accuracy_m: number | null; source: "gps" | "manual"
+    label: string; phone: string
   }) => request<{ ok: boolean }>("/api/inventory/field-onu", { method: "POST", body }),
-  // Rename only. Writes `onu_places.label` — NOT the roster's name, which the
-  // SNMP walk rewrites every sweep. Separate from the placement call so fixing a
-  // spelling can't restamp the pin's accuracy or reattribute who placed it.
-  nameOnuInField: (body: { mac: string; label: string | null }) =>
+  // Contact details only. Writes `onu_places.label`/`.phone` — NOT the roster's
+  // name, which the SNMP walk rewrites every sweep. Separate from the placement
+  // call so fixing a spelling can't restamp the pin's accuracy or reattribute
+  // who placed it.
+  nameOnuInField: (body: { mac: string; label: string; phone: string }) =>
     request<{ ok: boolean }>("/api/inventory/field-onu-name", { method: "POST", body }),
   setSnmp: (id: number, body: {
     snmp_enabled: boolean; snmp_community?: string | null; snmp_port?: number | string
@@ -283,10 +295,44 @@ export const inventoryApi = {
   },
   onuPlaces: (org?: string | null) =>
     request<{ places: OnuPlace[] }>(`/api/inventory/onu-places${tq(org)}`),
+  /** ONE subscriber, whole — the object `subscriber-detail.tsx` renders. Keyed
+   *  on the sticker MAC, which is the only identity that survives a re-homed
+   *  drop (a slot key rots: `onu_optics` never deletes a vacated one). */
+  subscriber: (mac: string, org?: string | null) =>
+    request<Subscriber>(`/api/inventory/subscriber?mac=${encodeURIComponent(mac)}`
+      + tq(org).replace(/^\?/, "&")),
+  /** Record who a subscriber is from the desk — no coordinate involved.
+   *
+   *  Deliberately NOT `setOnuPlace` with null coordinates: that call's meaning is
+   *  the map pin (and, when it clears one, the retraction of a power claim).
+   *  This one only ever touches what the operator typed, which is why an ISP can
+   *  finally name the 2,150 subscribers nobody has stood at. A blank field is
+   *  written as NULL rather than skipped — the form SHOWS what is stored, so
+   *  emptying one is deliberate. */
+  setOnuContact: (body: {
+    mac: string; label?: string | null; phone?: string | null
+    notes?: string | null; org_id?: string | null
+  }) => request<{ ok: boolean }>("/api/inventory/onu-contact", { method: "POST", body }),
+  /** Place, move or clear a subscriber's pin. A LOCATION and nothing else.
+   *
+   *  **There is deliberately no `witness` key** — the server payload cannot
+   *  spell one either. This route used to force the claim TRUE, so moving a
+   *  surveyed pin or reopening the dialog to add a phone number silently
+   *  promoted an ordinary customer to a power-backed witness, and a dark witness
+   *  makes ponfault call a fibre cut and roll a crew. The claim has exactly one
+   *  verb, `setOnuWitness`. */
   setOnuPlace: (body: {
     mac: string; lat: number | null; lng: number | null
-    label?: string | null; notes?: string | null; org_id?: string | null
+    label?: string | null; phone?: string | null
+    notes?: string | null; org_id?: string | null
   }) => request<{ ok: boolean }>("/api/inventory/onu-place", { method: "POST", body }),
+  /** The power-supply claim ALONE — no coordinate moves, no provenance is
+   *  restamped. What makes "on the map but not vouched for" expressible, which
+   *  is the state a surveyed fleet is mostly in. 404s on a subscriber nobody has
+   *  recorded yet. */
+  setOnuWitness: (body: { mac: string; witness: boolean; org_id?: string | null }) =>
+    request<{ ok: boolean; witness: boolean }>("/api/inventory/onu-witness",
+      { method: "POST", body }),
   // Subscriber drops: which passive box each ONU hangs off. Map-only like
   // `routes` — every page lists devices, only the map and a splitter's own
   // panel need to know what is behind each box.
@@ -569,4 +615,28 @@ export const usersApi = {
   totpRegenerate: (body: { password: string; code: string }) =>
     request<{ ok: true; recovery_codes: string[] }>(
       "/api/users/totp/recovery", { method: "POST", body }),
+}
+
+// Worker location tracking. The INGEST is not here — that is the tracker app
+// POSTing to the public /field/track, with no cookie and no SPA involved.
+export const fieldApi = {
+  /** the caller's OWN shift (worker-readable) */
+  shift: () => request<ShiftState>("/api/field/shift"),
+  setShift: (action: "start" | "end") =>
+    request<{ ok: true; on_shift: boolean; started_at?: string; already: boolean }>(
+      "/api/field/shift", { method: "POST", body: { action } }),
+
+  /** where the crew is (owner-only) */
+  workers: (org?: string | null) =>
+    request<FieldWorkersResponse>(`/api/field/workers${tq(org)}`),
+
+  /** tracker credentials (owner-only). `issueToken` returns the plaintext ONCE. */
+  tokens: (org?: string | null) =>
+    request<FieldTokensResponse>(`/api/field/tokens${tq(org)}`),
+  issueToken: (user_id: number, org_id?: string | null) =>
+    request<{ ok: true; user_id: number; token: string; server_url: string }>(
+      "/api/field/token", { method: "POST", body: { user_id, org_id } }),
+  revokeToken: (user_id: number, org_id?: string | null) =>
+    request<{ ok: boolean }>(
+      "/api/field/token/revoke", { method: "POST", body: { user_id, org_id } }),
 }

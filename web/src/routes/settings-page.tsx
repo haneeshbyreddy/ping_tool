@@ -14,6 +14,7 @@ import type { AccountUser, Role } from "@/lib/types"
 import { AssignmentCard } from "@/components/assignment-card"
 import { BillingCard } from "@/components/billing-card"
 import { ConfirmDialog } from "@/components/confirm-dialog"
+import { FieldTrackingCard } from "@/components/field-tracking-card"
 import { NeedsOrg } from "@/components/needs-org"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
 import { GponProfilesCard } from "@/components/gpon-profiles-card"
@@ -107,12 +108,10 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
             onChange={(e) => setPollInterval(e.target.value)}
           />
           <p className="max-w-lg text-xs text-muted-foreground">
-            How often every probe in this org pings its devices and reports back.
-            Each cycle is one ping sweep plus one report, and outage detection speed
-            follows it (a device is confirmed DOWN after 3 failed cycles, so 30s
-            &asymp; 90s to a page, 60s &asymp; 3 min). Probes pick a change up within
-            one cycle, no restart. 10&ndash;120s; blank = automatic (60s). Lower is
-            faster detection but more ICMP load on your gear.
+            How often probes ping their devices and report back. A device is
+            confirmed down after 3 failed cycles, so 30s is about 90s to a page.
+            Blank is automatic (60s). Range 10 to 120 seconds, applied within one
+            cycle. Lower is faster but more ICMP load on your gear.
           </p>
         </div>
         <div className="flex flex-col gap-1.5">
@@ -120,11 +119,10 @@ function OrgSettingsCard({ org, canWrite }: { org: string; canWrite: boolean }) 
             <MessageCircle className="size-3.5 text-muted-foreground" /> Alerts (WhatsApp)
           </Label>
           <p className="max-w-lg text-xs text-muted-foreground">
-            Alerts go out over WhatsApp. Every owner and worker account with a number gets
-            every alert (device, port and probe up/down) at once, plus the platform admin
-            number &mdash; no per-role routing. Set each person's number under{" "}
-            <span className="font-medium">Users</span> below; the admin number and the Meta
-            API config live in <span className="font-medium">Platform</span> settings.
+            Every owner and worker account with a WhatsApp number gets every alert.
+            Set numbers under <span className="font-medium">Users</span> below; the
+            Meta API config lives in <span className="font-medium">Platform</span>
+            settings.
           </p>
           {canWrite && (
             <div className="flex items-center gap-2">
@@ -410,8 +408,8 @@ function UsersCard({ org }: { org: string }) {
             <Select value={role} onValueChange={(v) => setRole(v as Role)}>
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="owner">Owner — full access</SelectItem>
-                <SelectItem value="worker">Worker — field app, triage only</SelectItem>
+                <SelectItem value="owner">Owner · full access</SelectItem>
+                <SelectItem value="worker">Worker · field app, triage only</SelectItem>
               </SelectContent>
             </Select>
             {error && <p className="text-xs text-destructive">{error}</p>}
@@ -546,6 +544,12 @@ const SECTIONS: Array<{
       // is a person's beat, not a probe setting — and since the roles collapsed,
       // "who works here" IS "who has a login".
       { id: "assignments", label: "Device responsibility", render: (c) => <AssignmentCard org={c.org!} /> },
+      // Provisioning a worker's PHONE with the tracker app. Same section as the
+      // accounts and the paging assignments for the same reason: the thing being
+      // configured is a person, not a probe — and the credential it issues is
+      // per-login-account, so the list this panel works from is exactly the list
+      // directly above it.
+      { id: "tracking", label: "Location tracking", render: (c) => <FieldTrackingCard org={c.org!} /> },
     ],
   },
 ]

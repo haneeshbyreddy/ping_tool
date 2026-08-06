@@ -9,6 +9,7 @@ from wisp.central.store_orgs import OrgStoreMixin
 from wisp.central.store_users import UserStoreMixin
 from wisp.central.store_fleet import FleetStoreMixin
 from wisp.central.store_devices import DeviceStoreMixin
+from wisp.central.store_field import FieldStoreMixin
 from wisp.central.store_outages import OutageStoreMixin
 from wisp.central.store_proxy import ProxyStoreMixin
 from wisp.central.store_snmp import SnmpStoreMixin
@@ -544,28 +545,54 @@ CREATE TABLE IF NOT EXISTS pon_fault_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (org_id, device_id, pon_port)
 );
--- Operator-placed REFERENCE ONUs (central/ponfault.py witness evidence, and the
--- map's subordinate ONU layer). Sparse by construction — no row means "not a
--- reference point", and clearing one is a DELETE, so a stock org carries none.
+-- THE OPERATOR'S RECORD OF A SUBSCRIBER — everything about a drop that no walk
+-- can tell us: who lives there, the number to ring, where the box is, and
+-- whether its power can be relied on. Sparse by construction: no row means
+-- nobody has written anything down, so a stock org carries none.
 --
--- Placing an ONU here IS the operator vouching for its power: the ISP picks the
--- subscribers it knows run on a UPS, solar or a tower supply. Nothing infers
--- that, and there is deliberately no power column — the act of placing is the
--- whole signal, which is why the UI must say so at the point of the click.
+-- It began (2026-07-28) as a pure REFERENCE-POINT table — a coordinate and a
+-- power claim — and the field survey then hung `label` and `phone` on it, which
+-- is how the customer record ended up as a passenger on a map pin. That cost two
+-- things until 2026-08-03: a name and a number could not be recorded WITHOUT a
+-- coordinate (both write paths demanded lat/lng), so an ISP with 2,156
+-- subscribers and a handful of pins had nowhere to put the other 2,150 names;
+-- and "Remove" on the map card — an eye-off icon that reads as "hide this pin" —
+-- ran a DELETE and took the name and phone number with it, silently.
+--
+-- So: LAT/LNG ARE NULLABLE, still both-or-nothing. Clearing a pin clears the
+-- COORDINATES and leaves the record standing (`clear_onu_place_coords`); the row
+-- is deleted only when it holds nothing at all — no coordinates, no name, no
+-- number, no notes, and not a witness (`_prune_onu_place`, the rule
+-- `_prune_link_route` already follows for link styling). A reader that means
+-- "has a PIN" must therefore say `lat IS NOT NULL` and not merely "has a row" —
+-- `onu_place_macs(located_only=True)` is that question, and the survey's
+-- coverage count is its one caller.
+--
+-- PLACING IS THE WITNESS CLAIM, so UNPLACING RETRACTS IT (`witness=0` on the
+-- same UPDATE). The ISP picks the subscribers it knows run on a UPS, solar or a
+-- tower supply; nothing infers that and there is no power column, so the act of
+-- vouching is the whole signal — which is why the UI states the contract at the
+-- click, and why clearing the pin has to be read as taking it back. A witness
+-- that outlived its pin would be a live input to a fibre-cut verdict with
+-- nothing left on the one screen that lists witnesses: the exact inverse of "a
+-- pin that quietly stopped witnessing is the one failure this list must not
+-- conceal". It also keeps alerting byte-identical across this change — a bare
+-- reference point, vouched for but never named, still prunes away completely.
+-- Only what an operator TYPED survives an unpin.
 --
 -- Keyed on the MAC/serial (onuroster._norm_mac form), NOT on (device, onu_key):
 -- onu_optics never deletes a removed ONU's row and a re-registered ONU changes
 -- slot, so a slot key would rot. The MAC is the sticker on the box in the
 -- customer's house, so re-homing a drop to another PON — or another OLT — moves
--- the reference point with it and needs no click. An RMA'd ONU orphans its row,
--- which is correct: the box really did change.
+-- the record with it and needs no click. An RMA'd ONU orphans its row, which is
+-- correct: the box really did change.
 CREATE TABLE IF NOT EXISTS onu_places (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id     TEXT NOT NULL,
     mac        TEXT NOT NULL,      -- onuroster._norm_mac of the serial
-    lat        REAL NOT NULL,      -- both-or-nothing: clearing is a DELETE, so
-    lng        REAL NOT NULL,      -- an unplaced reference point cannot exist
-    label      TEXT,               -- operator's name for the site
+    lat        REAL,               -- both-or-nothing, and NULL = no pin yet (or
+    lng        REAL,               -- cleared). The record itself survives.
+    label      TEXT,               -- operator's name for the subscriber
     notes      TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -843,6 +870,63 @@ CREATE TABLE IF NOT EXISTS proxy_audit (
     ts        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_audit_org ON proxy_audit(org_id, id);
+-- Worker location tracking (central/field.py). Workers run the off-the-shelf
+-- Traccar Client; it POSTs OsmAnd fixes to the public /field/track ingest.
+--
+-- The credential is the NODE-TOKEN pattern, deliberately: only a SHA-256 hash is
+-- stored, the plaintext is shown once and is rotatable but never recoverable.
+-- It rides Traccar's `id` field, which is what keeps the server URL IDENTICAL
+-- for every worker — one string to put on screen, in a QR, and to read down a
+-- phone line — while identity stays per-person.
+CREATE TABLE IF NOT EXISTS field_tokens (
+    org_id     TEXT NOT NULL,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by INTEGER,
+    revoked_at TEXT,
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_field_tokens_hash ON field_tokens(token_hash);
+-- On-shift periods, declared in the web app. The tracker app's OWN on/off switch
+-- is the real toggle — when it is off the phone transmits nothing, which is a far
+-- better promise than receiving a worker's evening and choosing not to store it.
+-- This is the SECOND, explicit declaration, and the two-tap cost is deliberate:
+-- when somebody marks on-shift and no fixes arrive, that DISCREPANCY is the
+-- "the OEM battery manager killed the service" alarm. It is a feature, not
+-- redundancy, so nothing here may be inferred from the fixes.
+CREATE TABLE IF NOT EXISTS worker_shifts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_worker_shifts_open
+    ON worker_shifts(org_id, user_id, ended_at);
+-- Append-only fixes, PRUNED TO cfg.field_track_retention_days (7) daily, the way
+-- rollup.py prunes hourly buckets. Do not ship a change here without the prune:
+-- `data/releases/` is the standing example of a directory nothing prunes, and
+-- the retention window is the whole privacy argument for the feature.
+--
+-- UNIQUE(org_id, user_id, ts) makes a replay idempotent. Traccar retries a fix
+-- it did not get a 200 for, so without it a flaky link writes the same position
+-- several times and inflates a trail into a stutter.
+CREATE TABLE IF NOT EXISTS worker_locations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT NOT NULL,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ts          TEXT NOT NULL,
+    lat         REAL NOT NULL,
+    lng         REAL NOT NULL,
+    accuracy_m  REAL,
+    speed_mps   REAL,
+    heading     REAL,
+    battery_pct INTEGER,
+    UNIQUE(org_id, user_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_worker_locations_ts
+    ON worker_locations(org_id, user_id, ts);
 """
 
 class CentralStore(
@@ -854,6 +938,7 @@ class CentralStore(
     SnmpStoreMixin,
     ProxyStoreMixin,
     AssignmentStoreMixin,
+    FieldStoreMixin,
 ):
 
     _TENANT_TABLES = (
@@ -1049,11 +1134,81 @@ class CentralStore(
                 ("accuracy_m", "REAL"),
                 ("place_source", "TEXT"),
                 ("placed_by", "TEXT"),
-                ("placed_at", "TEXT")))
+                ("placed_at", "TEXT"),
+                # The subscriber's contact number (operator's call, 2026-07-31).
+                # NULLABLE although the field capture now REQUIRES it: every row
+                # placed before today has no number, and a NOT NULL column would
+                # have to invent one. The mandate lives on the write path, so a
+                # tech reopening an old pin fills it in then — which is how the
+                # backfill actually happens. Same shape as `label`: operator-
+                # owned, no walk touches it.
+                ("phone", "TEXT")))
+            # …and only once those columns exist, since the rebuild copies them.
+            self._relax_onu_place_coords(conn)
             self._seed_google_key(conn)
             self._collapse_roles(conn)
             self._upper_onu_labels(conn)
             conn.commit()
+
+
+    @staticmethod
+    def _relax_onu_place_coords(conn) -> None:
+        """A subscriber's record stops needing a coordinate (2026-08-03).
+
+        `onu_places` shipped as a reference-POINT table, so lat/lng were NOT NULL
+        and clearing a point was a DELETE. Once the field survey hung `label` and
+        `phone` on the same row that made the customer record a passenger on a
+        map pin: a name and a number could not be recorded without standing at
+        the house, and the map card's "Remove" deleted the contact details along
+        with the pin. Both are the same missing degree of freedom, so both are
+        fixed by relaxing the columns — see the table comment for what replaces
+        "clearing is a DELETE".
+
+        SQLite cannot drop a NOT NULL in place, so this is the documented
+        12-step rebuild: create, copy, drop, rename. Guarded on lat's own
+        `notnull` flag, which makes it a no-op on every start after the first and
+        on a DB created from the current `_SCHEMA`.
+
+        It runs INSIDE `__init__`'s open transaction (as `_ensure_columns` does)
+        so a crash mid-rebuild rolls back to the old table rather than leaving
+        the org's subscriber records half-copied. `onu_places` is referenced by
+        no foreign key — `onu_drops` points at `org_devices`, not at this — so
+        dropping it cannot dangle anything, which is what makes the rebuild safe
+        with `PRAGMA foreign_keys=ON` still set.
+        """
+        info = list(conn.execute("PRAGMA table_info(onu_places)"))
+        if not any(r["name"] == "lat" and r["notnull"] for r in info):
+            return
+        # Copy by NAME, and only the names both tables share: an older DB that
+        # never reached one of the `_ensure_columns` above would otherwise fail
+        # the INSERT on a column the SELECT can't supply.
+        cols = [r["name"] for r in info if r["name"] != "id"]
+        names = ", ".join(cols)
+        conn.execute("""
+            CREATE TABLE onu_places_new (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id       TEXT NOT NULL,
+                mac          TEXT NOT NULL,
+                lat          REAL,
+                lng          REAL,
+                label        TEXT,
+                notes        TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                witness      INTEGER NOT NULL DEFAULT 1,
+                accuracy_m   REAL,
+                place_source TEXT,
+                placed_by    TEXT,
+                placed_at    TEXT,
+                phone        TEXT,
+                UNIQUE(org_id, mac)
+            )""")
+        conn.execute(f"INSERT INTO onu_places_new ({names})"
+                     f" SELECT {names} FROM onu_places")
+        conn.execute("DROP TABLE onu_places")
+        conn.execute("ALTER TABLE onu_places_new RENAME TO onu_places")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_onu_places_org"
+                     " ON onu_places(org_id)")
 
 
     @staticmethod

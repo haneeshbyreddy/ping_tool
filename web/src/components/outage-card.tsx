@@ -173,7 +173,7 @@ export function OutageCard({ outage }: { outage: Outage }) {
         {outage.status === "assigned" && (
           <p className="text-xs text-muted-foreground">
             Waiting for {outage.assigned_to.length === 1 ? "a reply" : "someone"} to
-            accept. Still down — nobody has confirmed they are going.
+            accept. Still down, and nobody has confirmed they are going.
           </p>
         )}
         {outage.status === "in_progress" && outage.accepted_by.length > 0 && (

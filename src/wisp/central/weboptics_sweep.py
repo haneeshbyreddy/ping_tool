@@ -323,8 +323,8 @@ class WebOpticsSweeper:
                 org_id, node_id, idle_s=max(30, int(self.cfg.web_optics_browse_idle_s))):
             log.info("web optics: %s is being browsed — skipping this pass", name)
             self._record(org_id, device_id, vendor, "skipped",
-                         "someone is browsing a device on this probe — the OLT "
-                         "holds one web session, so we wait for them to finish")
+                         "someone is browsing a device on this probe. The OLT "
+                         "holds one web session, so we wait for them to finish.")
             return None
 
         creds = self._credentials(org_id, device_id)

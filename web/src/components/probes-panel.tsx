@@ -502,7 +502,7 @@ export function ProbesPanel({
         <div className="flex items-center gap-3">
           {canWrite && data && (
             <label className="flex items-center gap-2 text-xs text-muted-foreground"
-              title="When a newer release is published, central rolls the fleet forward itself — one probe canaries first, the rest follow once it proves healthy. Off: updates wait for the Update button.">
+              title="When a newer release is published, central rolls the fleet forward itself. One probe canaries first, the rest follow once it proves healthy. Off: updates wait for the Update button.">
               Auto-update
               <Switch checked={data.auto_update} disabled={autoUpdate.isPending}
                 onCheckedChange={(v) => autoUpdate.mutate(v)} />

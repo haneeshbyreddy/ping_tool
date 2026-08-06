@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from wisp.config import CONFIG, Config
-from wisp.central import api, auth, billing, inventory, pki, secretbox, theme, totp
+from wisp.central import api, auth, billing, field, inventory, pki, secretbox, theme, totp
 from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
@@ -77,6 +77,12 @@ _WORKER_GET = {
     "/api/inventory", "/api/inventory/routes", "/api/inventory/ports",
     "/api/inventory/link-ports", "/api/inventory/optics",
     "/api/inventory/onu-search", "/api/inventory/onu-places",
+    # One subscriber, whole. Read-side only — it JOINs readers already on this
+    # list (optics, onu-places, onu-search, drops) and adds no fact a worker
+    # could not already reach by opening four screens; withholding it would only
+    # mean the field keeps doing that. It is also the screen a site visit is
+    # actually about: the customer whose drop is dark.
+    "/api/inventory/subscriber",
     "/api/inventory/onu-coverage", "/api/inventory/snmp-status",
     "/api/inventory/rx-status", "/api/inventory/perf",
     "/api/inventory/perf/samples", "/api/pon/faults", "/api/pon/summary",
@@ -89,6 +95,10 @@ _WORKER_GET = {
     # nothing. The PDF/XLSX exports are the same rows, filtered by the same
     # chips, and a field worker filing what it drove out to fix is the point.
     "/api/issues", "/api/issues/pdf", "/api/issues/xlsx",
+    # A worker's OWN shift state. The Start/End button has to know which one it
+    # is before it is pressed. Deliberately NOT /api/field/workers, which is the
+    # owner's view of where the whole crew is.
+    "/api/field/shift",
 }
 # The ONLY writes a worker may perform: acknowledge/accept/post-mortem (triage),
 # its own password, and the "I've paid" ping (any org member sends it from the
@@ -113,6 +123,12 @@ _WORKER_POST = {
     # claim about a power supply and flips PON mass-drop verdicts, so it stays
     # owner-only on /api/inventory/onu-place. See devices.field_onu.
     "/api/inventory/field-onu", "/api/inventory/field-onu-name",
+    # Start/end own shift (central/field.py). A statement about themselves and
+    # nothing else: org_id and user_id come from the SESSION, it writes no
+    # location, names no device and cannot reach another account. It is also the
+    # ONLY thing worker location tracking asks a worker to do in the web app —
+    # the tracker app's own on/off switch is what actually transmits.
+    "/api/field/shift",
 }
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
@@ -373,6 +389,67 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             threading.Thread(target=bot.handle, args=(payload,),
                              name="wisp-wa-bot", daemon=True).start()
 
+        # ----- worker location ingest (public transport special-case, like edge
+        # ingest and the WhatsApp webhook — NOT a cookie-authed /api route, and
+        # deliberately not in api/__init__'s tables or the worker allowlists,
+        # which are for session-authenticated dashboard calls). The tracker is
+        # off-the-shelf Traccar Client and carries no cookie; it authenticates
+        # with a per-worker token in the OsmAnd `id` field. See central/field.py.
+        def _field_track(self, parsed) -> None:
+            """One OsmAnd fix from a worker's phone.
+
+            BOTH VERBS, and params from the query string OR a form body: client
+            builds differ, and a fix silently dropped because we only handled one
+            shape is the worst failure this feature has.
+
+            Deliberately NOT billing-gated, consistent with edge ingest — a
+            lapsed bill must not silently stop recording where staff are.
+
+            Nothing here logs the request line: the token rides in the query
+            string, and `log_message` is `log.debug` for exactly this reason.
+            Keep it that way.
+            """
+            params = parse_qs(parsed.query)
+            if self.command == "POST":
+                raw = self._read_raw()
+                if raw:
+                    try:
+                        form = parse_qs(raw.decode("utf-8", "replace"))
+                    except Exception:
+                        form = {}
+                    # the URL wins where both carry a key — that is where the
+                    # Android client puts them
+                    for k, v in form.items():
+                        params.setdefault(k, v)
+            identity = store.resolve_field_token(
+                field.param(params, "id", "deviceid", "device_id"))
+            if identity is None:
+                # Flat 401, and nothing is written. Traccar keeps a rejected fix
+                # buffered and retries, which is the right behaviour here: fix
+                # the token on the handset and the backlog delivers itself.
+                self._send_text(401, "unauthorized")
+                return
+            org, user_id = identity
+            if not self.field_rate.allow(f"{org}:{user_id}"):
+                self._send_text(429, "too many fixes")
+                return
+            try:
+                fix = field.clean_fix(params, cfg)
+            except field.TrackDropped as exc:
+                # Received, and deliberately not stored. 200 on purpose: a 4xx
+                # would wedge the client's offline buffer behind a fix we are
+                # never going to accept, and the newer ones we do want would
+                # never arrive.
+                self._reply(200, {"ok": True, "stored": False, "reason": str(exc)})
+                return
+            except field.TrackError as exc:
+                self._reply(400, {"error": str(exc)})
+                return
+            stored = store.record_worker_fix(org, user_id, fix)
+            # `stored: false` here means a REPLAY of a fix already held — Traccar
+            # re-sends anything it did not get a 200 for, so this is normal.
+            self._reply(200, {"ok": True, "stored": stored})
+
         def _presented_bearer(self) -> str:
             got = self.headers.get("Authorization", "")
             return got[7:] if got.startswith("Bearer ") else ""
@@ -502,7 +579,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return False
             if not billing.org_locked(store, user["org_id"]):
                 return False
-            self._reply(402, {"error": "payment required — account locked",
+            self._reply(402, {"error": "payment required, account locked",
                               "locked": True})
             return True
 
@@ -676,6 +753,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             if route == "/whatsapp/webhook":
                 self._whatsapp_verify(qs)
                 return
+            if route == "/field/track":
+                self._field_track(parsed)
+                return
             if route == "/edge/proxy/next":
                 api.proxy.edge_next(self, qs)
                 return
@@ -703,6 +783,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             route = parsed.path
             if route == "/whatsapp/webhook":
                 self._whatsapp_inbound()
+                return
+            if route == "/field/track":
+                self._field_track(parsed)
                 return
             if route.startswith("/api/proxy/") and route not in _PROXY_EXACT:
                 self._proxy_forward("POST", route, parsed.query)
@@ -862,6 +945,10 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.registry = registry
     Handler.secretbox = secret_box
     Handler.proxy = ProxyHub(device_max_inflight=cfg.proxy_device_max_inflight)
+    # Per-token ceiling on the worker-location ingest. One bucket per process,
+    # like LoginThrottle — it bounds a looping client, it is not a credential
+    # check (that is the token itself).
+    Handler.field_rate = field.TrackRate(cfg.field_track_rate_per_min)
     # The web-optics sweeper is a request service too now: the Optical panel's
     # manual refresh drives the very same object the background sweep does, so
     # its per-OLT lock covers both and a click can't collide with a pass.
@@ -945,6 +1032,9 @@ def serve(cfg: Config = CONFIG) -> None:
     from wisp.central.watchdog import start_central_watchdog_thread
     start_central_watchdog_thread(cfg, httpd.store)
     central_rollup.start_central_rollup_prune_thread(cfg, httpd.store)
+    # Worker-location retention. Not optional: the 7-day window is the whole
+    # answer to what this feature keeps about the people who work for the org.
+    field.start_field_prune_thread(cfg, httpd.store)
     billing.start_central_billing_thread(cfg, httpd.store)
     from wisp.central.weboptics_sweep import start_web_optics_thread
     start_web_optics_thread(cfg, httpd.store, httpd.proxy, httpd.secretbox,

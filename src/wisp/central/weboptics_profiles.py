@@ -104,7 +104,7 @@ def _clean_path(raw, field_name: str) -> str:
     if "://" in path or path.startswith("//"):
         raise InventoryError(
             f"{field_name} must be a path on the device (like /action/opm.html), "
-            "not a full URL — the tunnel supplies the address itself")
+            "not a full URL. The tunnel supplies the address itself.")
     if "\\" in path or ".." in path:
         raise InventoryError(f"{field_name} must not contain '..' or backslashes")
     if not _PATH_RE.match(path):
@@ -155,7 +155,7 @@ def _clean_columns(raw) -> dict[str, str]:
     for key, val in raw.items():
         if key not in FIELDS:
             raise InventoryError(
-                f"unknown column {key!r} — must be one of: {', '.join(FIELDS)}")
+                f"unknown column {key!r}: must be one of {', '.join(FIELDS)}")
         head = str(val or "").strip()
         if not head:
             continue
@@ -177,7 +177,7 @@ def _clean_order(raw) -> tuple[str, ...]:
         # the gap is what makes the positions line up.
         if val and val not in FIELDS:
             raise InventoryError(
-                f"unknown column {val!r} in column_order — must be one of: "
+                f"unknown column {val!r} in column_order: must be one of "
                 f"{', '.join(FIELDS)} (or blank to skip a column)")
         out.append(val)
     if len(out) > 40:
@@ -255,7 +255,7 @@ def clean_web_optics_profile_payload(data: dict) -> dict:
     order = _clean_order(data.get("column_order"))
     if not columns and not order:
         raise InventoryError(
-            "the profile must say where the readings are — map columns by "
+            "the profile must say where the readings are: map columns by "
             "heading, or give the table's column order")
     for required in REQUIRED_FIELDS:
         if required not in columns and required not in order:
@@ -264,7 +264,7 @@ def clean_web_optics_profile_payload(data: dict) -> dict:
                 "cannot be told from a layout row, or a reading from a slot")
     if "rx_dbm" not in columns and "rx_dbm" not in order:
         raise InventoryError(
-            "the profile must locate 'rx_dbm' — per-ONU received power is the "
+            "the profile must locate 'rx_dbm': per-ONU received power is the "
             "reading this whole subsystem exists to recover")
 
     pon_label = str(data.get("pon_label") or "").strip()

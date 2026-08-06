@@ -1,3 +1,5 @@
+import type { MapDetail } from "@/map/detail"
+
 export type Role = "owner" | "worker"
 
 export interface User {
@@ -23,6 +25,9 @@ export interface Org {
   map_region: string | null
   // the superadmin's server-wide Map Tiles key, injected into every org row
   google_maps_key: string | null
+  // the superadmin's server-wide map zoom floors, injected the same way — NOT
+  // org data; every row carries the identical value (central/mapdetail.py)
+  map_detail: MapDetail | null
   // dashboard-set probe cadence for this org's edges; null = automatic
   poll_interval_s: number | null
   // paywall tier (central/billing.py PLANS) — superadmin-set only
@@ -118,6 +123,15 @@ export const DEVICE_TYPES = [
   "core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul",
 ] as const
 /** Passive plant: on the map and in the tree, never probed — no IP, no FSM. */
+/** Every device type that IS passive plant — what `isPassiveType` answers, and
+ *  therefore what decides whether a row is kept out of `org_device_topology`,
+ *  skipped by billing and allowed to carry subscriber drops. Mirrors
+ *  `inventory.PASSIVE_TYPES` on the server and must keep mirroring it.
+ *
+ *  NOT the list the operator picks from when CREATING one — that is
+ *  `map/plant.ts:PLANT_KINDS`, narrowed to `splitter`. Removing a type from
+ *  HERE would promote any existing row of that type to monitored gear, complete
+ *  with an FSM and the ability to page, which is why the two lists are separate. */
 export const PASSIVE_DEVICE_TYPES = ["splitter", "fdb", "closure"] as const
 /** How many ways a passive splits the fibre. CLOSED, and matching
  *  `inventory.SPLIT_RATIOS` on the server — only what an ISP actually stocks,
@@ -430,8 +444,15 @@ export interface OnuOptic {
   updated_at: string
   /** frozen at the moment the ONU left `online` (store upsert CASE) */
   last_online_at: string | null
-  /** set when this ONU is a placed REFERENCE point — see OnuPlace */
-  place: { lat: number; lng: number; label: string | null } | null
+  /** set when this ONU has a PIN — see OnuPlace. A field-located subscriber has
+   *  one too, and `witness` is what separates the two claims: it rides here
+   *  because the tab's reference-point toggle used to key on `place != null`
+   *  and so rendered an ordinary surveyed drop as a reference point, whose
+   *  Save then re-asserted a power claim nobody had made. */
+  place: {
+    lat: number; lng: number; label: string | null; phone: string | null
+    witness: boolean
+  } | null
   /** the passive box this subscriber's drop comes off (`onu_drops`), or null
    *  when nobody has recorded one. The id only — the device list already holds
    *  the name, and a second copy could disagree with it. */
@@ -523,6 +544,11 @@ export interface OnuPlace {
   lat: number
   lng: number
   label: string | null
+  /** the subscriber's contact number. REQUIRED by the field survey (name, number
+   *  and location are captured together or not at all), optional on the desktop
+   *  reference-ONU dialog — whose meaning is the power-supply claim, not the
+   *  customer record. Null on every pin placed before 2026-07-31. */
+  phone: string | null
   notes: string | null
   /** TRUE = a REFERENCE ONU: the operator's claim that this subscriber's power is
    *  reliable, which nothing detects and which flips a PON mass-drop verdict from
@@ -554,6 +580,15 @@ export interface OnuPlace {
   name: string | null
   state: OnuOptic["state"]
   rx_dbm: number | null
+  /** graded against the OLT's own thresholds by the optics monitor — pass it to
+   *  `onuSev` with `state` rather than re-deriving a verdict from `rx_dbm`, or
+   *  the map and the Optical tab can grade one subscriber differently. */
+  severity: OnuOptic["severity"]
+  /** the OPTICS walk's stamp — the clock `rx_dbm` above rides. NOT
+   *  `port_updated_at` (a different sweep): a fresh port table says nothing
+   *  about how old the light reading beside it is. Null when the placement
+   *  matched no roster row. */
+  optics_updated_at: string | null
   /** The ONU's OWN ifTable interface on the OLT (C-Data EPON gives each ONU a
    *  row), so a reference point can carry a real per-subscriber rate. Null on
    *  vendors whose builds don't name interfaces that way — render "no reading",
@@ -631,6 +666,25 @@ export interface OnuCoverageRow {
   device_id: number
   device_name: string | null
 }
+/** A subscriber on this OLT that already HAS a pin — the done half of the same
+ *  queue. It carries the placement itself (name, number, coordinates) because
+ *  the only reason to tap a done row is to correct one of them, and a
+ *  correction that arrived without the pin would re-place the subscriber and
+ *  restamp a real GPS fix as a hand-placed point. */
+export interface OnuCoverageLocatedRow extends OnuCoverageRow {
+  /** the operator's own name (`onu_places.label`), which outranks the walked one */
+  label: string | null
+  phone: string | null
+  lat: number
+  lng: number
+  /** a REFERENCE ONU — a claim about a power supply, not just a location. Must
+   *  be visible before a tech re-pins it (see OnuPlace). */
+  witness: boolean
+  accuracy_m: number | null
+  place_source: "gps" | "manual" | null
+  placed_by: string | null
+  placed_at: string | null
+}
 export interface OnuCoverageResponse {
   total: number
   placed: number
@@ -638,12 +692,110 @@ export interface OnuCoverageResponse {
   /** only populated when ?device_id= names one OLT — the fleet's whole unplaced
    *  set is thousands of rows and has no business crossing a handset's link. */
   unplaced: OnuCoverageRow[]
+  /** the other half of that one OLT's list, off the SAME roster pass — so its
+   *  length IS the row's `placed` counter rather than a second derivation. */
+  located: OnuCoverageLocatedRow[]
 }
 
 export interface OnuSearchResponse {
   matches: OnuSearchMatch[]
   /** hit the server's result cap — the needle is too broad, type more */
   truncated: boolean
+}
+
+/** ONE SUBSCRIBER, WHOLE (`GET /api/inventory/subscriber`).
+ *
+ *  A subscriber was the only first-class object in this product with no home. A
+ *  device has one panel that the tree, the map and an issue row all open; a
+ *  subscriber had six partial projections — `OnuOptic`, `OnuPlace`,
+ *  `SubscriberDrop`, `OnuSearchHit` and the survey's two coverage rows — each
+ *  carrying a different subset, none complete, none addressable. This is the
+ *  object `subscriber-detail.tsx` renders, and the six above stay as they are:
+ *  LISTS should be slim, and every one of them now opens this.
+ *
+ *  It is a JOIN of readers that already exist, never a second source of truth,
+ *  so nothing here may be re-derived — grade Rx with `onuSev` off
+ *  `roster.severity`, name the subscriber with `onuName`, and read freshness off
+ *  `olt.optics_updated_at`. */
+export interface Subscriber {
+  /** normalized identity (`onuroster._norm_mac`) — the ONU's serial as the OLT
+   *  reports it, which is what the sticker on the customer's box says. NOT the
+   *  customer's own device MAC, and the UI must not label it as one. */
+  mac: string
+  /** what the OPERATOR has written down: name, number, pin, the power claim.
+   *  Null when nobody has recorded anything — which is the common case on a
+   *  fleet that has just started surveying, and reads as "no record yet", never
+   *  as an error. */
+  record: SubscriberRecord | null
+  /** false = this MAC is in no current roster. An RMA'd box, reported rather
+   *  than hidden: a record that quietly stopped describing anything is the one
+   *  failure this panel must not conceal. */
+  matched: boolean
+  /** on more than one live slot, so the server refuses to say which OLT it
+   *  belongs to — picking a winner sends a tech to the wrong house. */
+  ambiguous: boolean
+  slots: number
+  /** the freshest-walk roster row, byte-for-byte what the Optical tab shows for
+   *  the same slot. Null when `matched` is false or `ambiguous` is true. */
+  roster: OnuOptic | null
+  olt: {
+    id: number
+    name: string | null
+    /** the OLT's ICMP state, for the FROZEN rule — an unreachable box proves its
+     *  readings are stale up to 15 min before staleness would notice, so every
+     *  reading below it must look frozen rather than green. */
+    state: string | null
+    /** the OPTICS walk's own stamp, never `port_updated_at` */
+    optics_updated_at: string | null
+  } | null
+  /** the plant this drop hangs off: the subscriber's own splitter first, then
+   *  any cascade, ending at the OLT. Null = nobody recorded a serving splitter,
+   *  which the panel says outright rather than implying direct fibre. */
+  drop: { passive_id: number; chain: SubscriberPlantHop[] } | null
+  /** the ONU's OWN ifTable row, never the PON aggregate (shared by up to 64
+   *  subscribers). Null on vendors whose firmware names no per-ONU interface —
+   *  a different sentence from "the walk is stale", and the panel says which. */
+  rate: {
+    if_name: string | null
+    port_state: string | null
+    in_bps: number | null
+    out_bps: number | null
+    updated_at: string | null
+  } | null
+  /** the OLT's own thresholds. Present so nothing re-grades a reading against a
+   *  global default the box doesn't use. */
+  thresholds: { warn_dbm: number; crit_dbm: number } | null
+}
+
+export interface SubscriberRecord {
+  label: string | null
+  phone: string | null
+  notes: string | null
+  /** a REFERENCE ONU: the operator's claim that this subscriber's power is
+   *  reliable. Retracted when the pin is cleared — placing is what makes the
+   *  claim, so unplacing is what takes it back. */
+  witness: boolean
+  /** null = recorded from the desk (or the pin was cleared). The record itself
+   *  no longer needs a coordinate. */
+  lat: number | null
+  lng: number | null
+  accuracy_m: number | null
+  place_source: "gps" | "manual" | null
+  placed_by: string | null
+  placed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** One box between a subscriber and its OLT. `split_ratio` null on the OLT
+ *  itself, and on a passive nobody has told us the ratio for — which is why
+ *  `cumulativeSplit` refuses to multiply a partial chain. */
+export interface SubscriberPlantHop {
+  id: number
+  name: string | null
+  device_type: string | null
+  split_ratio: number | null
+  pon_port: string | null
 }
 
 export interface OpticsResponse {
@@ -1118,4 +1270,74 @@ export interface AssignmentRoster {
       worker, which is the safe default, but an operator who thinks assignment is
       finished needs to see the number rather than infer it */
   unassigned: number
+}
+
+// ----- worker location tracking ----------------------------------------------
+// Workers run the off-the-shelf Traccar Client, which POSTs OsmAnd fixes to the
+// public /field/track ingest. Central stores a live position plus a short trail
+// on a 7-day clock. Server side: central/field.py, central/store_field.py.
+
+/** One fix as stored. `speed_mps` is SI — the wire carries knots (the OsmAnd
+ *  protocol's unit) and central converts once, at ingest. */
+export interface WorkerFix {
+  ts: string
+  lat: number
+  lng: number
+  accuracy_m: number | null
+  speed_mps: number | null
+  heading: number | null
+  battery_pct: number | null
+}
+
+/** One account's tracking state, as FACTS. The four map states are derived from
+ *  these in `map/workers.ts`, never shipped — freshness ticks with the clock, so
+ *  a state stamped at response time would go on claiming "here now" for as long
+ *  as the tab stayed open. */
+export interface FieldWorker {
+  user_id: number
+  username: string
+  role: Role
+  /** a live tracker credential exists. Without one, "on shift" is a declaration
+   *  nothing can corroborate. */
+  has_token: boolean
+  last_fix: WorkerFix | null
+  /** today's route, oldest → newest, in the operator's own timezone's day */
+  trail: Array<[number, number]>
+  shift_started_at: string | null
+  shift_ended_at: string | null
+  on_shift: boolean
+}
+
+export interface FieldWorkersResponse {
+  workers: FieldWorker[]
+  trail_since: string
+  /** how old a fix may be and still count as "here now". Server-owned so the
+   *  threshold has ONE source even though the classification is client-side. */
+  fresh_s: number
+  retention_days: number
+}
+
+/** An org account and its tracker-credential state. The token itself is shown
+ *  once at issue and is not recoverable — only "issued <date>" survives. */
+export interface FieldAccount {
+  user_id: number
+  username: string
+  role: Role
+  issued_at: string | null
+  revoked_at: string | null
+}
+
+export interface FieldTokensResponse {
+  accounts: FieldAccount[]
+  /** identical for every worker — the token rides Traccar's `id` field, which is
+   *  the whole reason there is one string to put on screen and in a QR */
+  server_url: string
+  retention_days: number
+}
+
+export interface ShiftState {
+  on_shift: boolean
+  started_at: string | null
+  ended_at: string | null
+  has_token: boolean
 }

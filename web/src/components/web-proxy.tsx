@@ -175,7 +175,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
                 <Label htmlFor="wui-alt" className="text-xs font-medium">Different web UI address</Label>
                 <p className="mt-0.5 text-2xs text-muted-foreground">
                   Turn on only if the admin page isn't at {device.ip_address} on
-                  80/443 — for example port-forwarded to a different IP or port.
+                  80/443, for example port-forwarded to another IP or port.
                 </p>
               </div>
               <Switch id="wui-alt" checked={altAddr} onCheckedChange={setAltAddr}
@@ -197,7 +197,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
                 </div>
                 {altRedundant && (
                   <p className="mt-2 text-2xs text-muted-foreground">
-                    That's the device's own address — saving will switch this off.
+                    That's the device's own address, so saving switches this off.
                   </p>
                 )}
               </>
@@ -225,7 +225,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
             </Select>
             <p className="text-2xs text-muted-foreground">
               {authMode === "basic"
-                ? "Signed in automatically when you open the web UI — the login never touches your browser."
+                ? "Signed in automatically when you open the web UI. The login never touches your browser."
                 : "The login page is pre-filled when you open the web UI; you still solve any captcha and click sign in."}
             </p>
           </div>
@@ -268,7 +268,7 @@ export function WebUiLiveIcon({ device }: { device: OrgDevice }) {
   const sess = useLiveWebSession(device)
   if (!allowed || !sess) return null
   return (
-    <span title={`Web UI session live · opened ${ago(sess.created_at)} — click to open`}
+    <span title={`Web UI session live · opened ${ago(sess.created_at)} · click to open`}
       className="inline-flex cursor-pointer"
       onClick={(e) => {
         e.stopPropagation()
@@ -377,9 +377,9 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
     // Close the tunnel when the tech closes the tab, rather than leaving it to
     // time out — see watchSessionTab.
     watchSessionTab(sess.sid, shown)
-    toast.success(`Connected — opening ${device.name}'s web UI`, {
+    toast.success(`Connected. Opening ${device.name}'s web UI…`, {
       id: tid,
-      description: "If the tab stalls, the probe may still be waking — refresh it once.",
+      description: "If the tab stalls, the probe may still be waking. Refresh it once.",
     })
     return true
   } catch (e) {

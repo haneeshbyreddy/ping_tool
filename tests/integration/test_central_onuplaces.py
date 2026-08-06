@@ -132,17 +132,146 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertAlmostEqual(body["places"][0]["lat"], 16.0)
         self.assertEqual(body["places"][0]["label"], "MOVED")
 
-    def test_clearing_is_a_DELETE_leaving_no_row_behind(self):
-        # the table is sparse: an unplaced reference point is the ABSENCE of a
-        # row, never a row with empty coordinates
-        self._onu("ispA", self.olt, "1", "AA:BB")
-        self._place("AA:BB")
+    def _unplace(self, mac):
         status, body, _ = self._req("POST", "/api/inventory/onu-place",
-                                    {"mac": "AA:BB", "lat": None, "lng": None},
+                                    {"mac": mac, "lat": None, "lng": None},
                                     cookie=self._owner())
         self.assertEqual(status, 200, body)
+
+    def test_clearing_a_BARE_reference_point_still_leaves_no_row_behind(self):
+        # The table stays sparse. A point that was vouched for and never named
+        # holds nothing an operator typed, so unplacing it prunes the row exactly
+        # as the old delete did — the record only outlives its pin when there is
+        # a record to outlive it.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._place("AA:BB")
+        self._unplace("AA:BB")
         self.assertEqual(self._places()[1]["places"], [])
         self.assertEqual(self.store.onu_place_macs("ispA"), set())
+        self.assertIsNone(self.store.get_onu_place("ispA", "AA:BB"))
+
+    def test_removing_a_pin_does_NOT_forget_who_the_subscriber_is(self):
+        # THE BUG THIS FEATURE EXISTS TO KILL. "Remove" on the map card is an
+        # eye-off icon that reads as "hide this pin"; it ran a DELETE, so it
+        # destroyed the customer's name and phone number with no confirmation
+        # and no way back.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._place("AA:BB", label="Ramesh", phone="9876543210")
+        self._unplace("AA:BB")
+        # off the map…
+        self.assertEqual(self._places()[1]["places"], [])
+        # …but still on file, and still findable by the panel that opens it
+        rec = self.store.get_onu_place("ispA", "AA:BB")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["label"], "RAMESH")
+        self.assertEqual(rec["phone"], "9876543210")
+        self.assertIsNone(rec["lat"])
+        self.assertIsNone(rec["lng"])
+
+    def test_unplacing_RETRACTS_the_witness_claim(self):
+        # Unplacing takes the claim back. A witness surviving with no pin would
+        # keep voting on fibre-cut verdicts while being absent from the only
+        # screen that lists witnesses.
+        #
+        # Note what it takes to SET UP now: placing is a location and nothing
+        # more (operator's call, 2026-08-04), so the claim has to be made
+        # explicitly through its own verb. Only the retraction still rides the
+        # pin — the asymmetry is deliberate and documented on
+        # `clear_onu_place_coords`.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._place("AA:BB", label="Water tank", phone="9876543210")
+        self.assertEqual(self.store.onu_place_macs("ispA"), set(),
+                         "a pin is not a claim")
+        self.store.set_onu_witness("ispA", "AA:BB", True)
+        self.assertEqual(self.store.onu_place_macs("ispA"), {"AA:BB"})
+        self._unplace("AA:BB")
+        self.assertEqual(self.store.onu_place_macs("ispA"), set())
+        # the contact record is what survives — not the claim
+        self.assertEqual(self.store.get_onu_place("ispA", "AA:BB")["label"],
+                         "WATER TANK")
+
+    def test_provenance_goes_with_the_coordinates_it_describes(self):
+        # accuracy_m is "the radius this measurement is good to". With no
+        # measurement left there is no radius, and keeping the figure would have
+        # the record claim a 6 m fix for a point that no longer exists.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self.store.place_onu_in_field(
+            "ispA", "AA:BB", 15.85, 74.5, witness=False, accuracy_m=6.0,
+            source="gps", placed_by="field", label="RAMESH", phone="9876543210")
+        self._unplace("AA:BB")
+        rec = self.store.get_onu_place("ispA", "AA:BB")
+        self.assertIsNone(rec["accuracy_m"])
+        self.assertIsNone(rec["place_source"])
+        self.assertIsNone(rec["placed_at"])
+        self.assertEqual(rec["label"], "RAMESH")
+
+    # --- a subscriber can be recorded from the desk, with no coordinate -------
+
+    def test_a_name_and_number_can_be_recorded_WITHOUT_a_location(self):
+        # The write that was impossible until 2026-08-03: every path into this
+        # table demanded lat/lng, so an ISP with 2,156 subscribers and a handful
+        # of pins had nowhere to put 2,150 names.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        status, body, _ = self._req(
+            "POST", "/api/inventory/onu-contact",
+            {"mac": "AA:BB", "label": "Ramesh", "phone": "98765 43210"},
+            cookie=self._owner())
+        self.assertEqual(status, 200, body)
+        rec = self.store.get_onu_place("ispA", "AA:BB")
+        self.assertEqual(rec["label"], "RAMESH")      # uppercased on the way in
+        self.assertEqual(rec["phone"], "9876543210")  # separators compacted
+        self.assertIsNone(rec["lat"])
+
+    def test_recording_a_name_is_NOT_vouching_for_a_power_supply(self):
+        # There is no `witness` key on this payload at all — the claim is only
+        # ever made where the UI states the contract, never as a side effect of
+        # typing somebody's name.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._req("POST", "/api/inventory/onu-contact",
+                  {"mac": "AA:BB", "label": "Ramesh", "witness": True},
+                  cookie=self._owner())
+        self.assertEqual(self.store.onu_place_macs("ispA"), set())
+
+    def test_an_unlocated_record_is_NOT_drawn_on_the_map(self):
+        # It has no coordinates, so shipping it would put a marker at (null,
+        # null) and inflate every count the map takes off this list.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._req("POST", "/api/inventory/onu-contact",
+                  {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
+        self.assertEqual(self._places()[1]["places"], [])
+
+    def test_an_unlocated_record_does_not_count_as_surveyed(self):
+        # Coverage asks "has a PIN", which is now narrower than "has a row" — a
+        # subscriber named from the desk still needs the visit, and counting the
+        # row would report a survey as finished that nobody has walked.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._req("POST", "/api/inventory/onu-contact",
+                  {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
+        status, body, _ = self._req("GET", "/api/inventory/onu-coverage",
+                                    cookie=self._owner())
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["placed"], 0)
+        self.assertEqual(body["total"], 1)
+
+    def test_emptying_a_desk_record_prunes_it(self):
+        # The table stays sparse in both directions, or a cleared record leaves
+        # a husk the operator cannot get rid of.
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        self._req("POST", "/api/inventory/onu-contact",
+                  {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
+        self._req("POST", "/api/inventory/onu-contact",
+                  {"mac": "AA:BB", "label": "", "phone": ""},
+                  cookie=self._owner())
+        self.assertIsNone(self.store.get_onu_place("ispA", "AA:BB"))
+
+    def test_recording_a_subscriber_is_an_OWNER_write(self):
+        self._onu("ispA", self.olt, "1", "AA:BB")
+        status, _, _ = self._req(
+            "POST", "/api/inventory/onu-contact",
+            {"mac": "AA:BB", "label": "Ramesh"},
+            cookie=self._login("field", "fieldpassword"))
+        self.assertEqual(status, 403)
+        self.assertIsNone(self.store.get_onu_place("ispA", "AA:BB"))
 
     # --- identity ------------------------------------------------------------
 
@@ -154,7 +283,8 @@ class OnuPlacesTest(unittest.TestCase):
         self._place("  A4:F2:1B  ")
         _, body = self._places()
         self.assertEqual(len(body["places"]), 1)
-        self.assertEqual(self.store.onu_place_macs("ispA"), {"A4:F2:1B"})
+        self.assertEqual(
+            self.store.onu_place_macs("ispA", witness_only=False), {"A4:F2:1B"})
 
     def test_separators_are_NOT_stripped_from_identity(self):
         # search_key is punctuation-blind; identity deliberately is not, or two
@@ -248,7 +378,8 @@ class OnuPlacesTest(unittest.TestCase):
             {"mac": "AA:BB", "lat": 15.0, "lng": 74.0, "org_id": "ispA"},
             cookie=cookie)
         self.assertEqual(status, 200, body)
-        self.assertEqual(self.store.onu_place_macs("ispA"), {"AA:BB"})
+        self.assertEqual(
+            self.store.onu_place_macs("ispA", witness_only=False), {"AA:BB"})
 
     def test_a_superadmin_with_NO_org_is_refused_not_crashed(self):
         # There is no org-less reference point to store, so this must be a clean
@@ -333,6 +464,51 @@ class OnuPlacesTest(unittest.TestCase):
         p = self._places()[1]["places"][0]
         self.assertTrue(p["ambiguous"])
         self.assertIsNone(p["if_name"])
+
+    # --- what the map's subscriber LABEL needs --------------------------------
+    #
+    # The name beside a pin carries the Rx reading (map/refonu.ts:refHasRx), and
+    # a dBm on screen carries no date — so the SPA has to be able to tell a
+    # fresh measurement from a stale one and a graded one from an ungraded one
+    # WITHOUT a second request. These two fields are what make that decidable;
+    # the refusals themselves are SPA-side (there is no frontend suite), so what
+    # is pinned here is that it has the facts to refuse with.
+
+    def test_a_placement_carries_the_optics_VERDICT_and_its_CLOCK(self):
+        self._onu("ispA", self.olt, "0/6.1", "AA:BB", pon="0/6", onu_id=1)
+        self._place("AA:BB")
+        p = self._places()[1]["places"][0]
+        self.assertEqual(p["rx_dbm"], -21.0)
+        # the OLT's own threshold verdict, not one re-derived from the number —
+        # thresholds are per-OLT, so a second grading rule would disagree with
+        # the Optical tab about the same drop
+        self.assertEqual(p["severity"], "ok")
+        self.assertIsNotNone(p["optics_updated_at"])
+
+    def test_the_dbm_clock_is_the_OPTICS_walk_not_the_PORT_walk(self):
+        """Two different sweeps. A port table refreshed a moment ago says
+        nothing about how old the light reading beside it is, and gating the
+        printed dBm on the wrong clock is how last week's number renders as
+        now."""
+        self._onu("ispA", self.olt, "0/1.3", "AA:BB", pon="EPON0/1", onu_id=3,
+                  age_s=4000)
+        self._port(self.olt, 16, "EPON01ONU3")   # fresh port row, stale optics
+        self._place("AA:BB")
+        p = self._places()[1]["places"][0]
+        self.assertIsNotNone(p["port_updated_at"])
+        self.assertNotEqual(p["optics_updated_at"], p["port_updated_at"])
+
+    def test_an_unmatched_placement_carries_NO_reading_to_print(self):
+        """Its MAC left every roster (an RMA'd box). There is no row behind the
+        pin, so there must be no verdict and no clock — a label that printed a
+        remembered dBm for a subscriber nothing is walking would be the exact
+        'stale reading with no date' this split exists to prevent."""
+        self._place("DE:AD:BE:EF:00:01")
+        p = self._places()[1]["places"][0]
+        self.assertFalse(p["matched"])
+        self.assertIsNone(p["rx_dbm"])
+        self.assertIsNone(p["severity"])
+        self.assertIsNone(p["optics_updated_at"])
 
     # --- the fold into the Optical tab ---------------------------------------
 

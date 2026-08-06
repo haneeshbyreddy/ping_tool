@@ -152,8 +152,35 @@ def optics(h, qs):
     for o in onus:
         mac = onuroster._norm_mac(o.get("serial"))
         p = placed.get(mac)
-        o["place"] = ({"lat": p["lat"], "lng": p["lng"], "label": p["label"]}
-                      if p else None)
+        # `place` keeps meaning "has a PIN", which since 2026-08-03 is narrower
+        # than "has a record": a subscriber named from the desk has a row and no
+        # coordinates. Every reader of this field asks the pin question (the
+        # reference-point toggle's fill, the map deep link), so a record without
+        # one must read as unplaced or the toggle would claim a point that isn't
+        # on the map. It carries `witness` so the two claims a pin can be stay
+        # distinguishable — see below.
+        pinned = p if p and p["lat"] is not None else None
+        o["place"] = ({"lat": pinned["lat"], "lng": pinned["lng"],
+                       "label": pinned["label"],
+                       # WHICH of the two claims this pin is. The tab's toggle
+                       # used to read `place != null` — "has a pin" — so an
+                       # ordinary surveyed drop already rendered as a reference
+                       # point, and its dialog's Save re-asserted a power claim
+                       # nobody had made. SQLite hands the column back as 0/1;
+                       # cast at the edge, where the SPA declares a boolean.
+                       "witness": bool(pinned["witness"]),
+                       # The contact number rides along so the Optical tab can
+                       # OFFER it back rather than blanking a number the field
+                       # recorded — this dialog writes the same row, and a form
+                       # that posts an empty field it never showed is how a
+                       # desktop edit silently undoes a survey.
+                       "phone": pinned["phone"]}
+                      if pinned else None)
+        # …and the number itself regardless of the pin, for the same reason one
+        # level out: the subscriber panel opens from this row and must show what
+        # is stored. `label` already arrives on every roster row via the store's
+        # `_LABEL_JOIN`; this is its other half.
+        o["phone"] = p["phone"] if p else None
         o["drop_passive_id"] = attached.get(mac)
     h._reply(200, {
         "onus": onus,
@@ -428,8 +455,8 @@ def rx_refresh(h, user, body):
     # whatever actually happened last with "you can't read this".
     dev = sweeper.target(org, device_id)
     if dev is None:
-        h._reply(400, {"error": "this OLT isn't set up for web-UI optical reads "
-                                "— see the Optical tab for what's missing"})
+        h._reply(400, {"error": "this OLT isn't set up for web-UI optical reads. "
+                                "See the Optical tab for what's missing."})
         return
 
     def _run() -> None:
@@ -513,7 +540,7 @@ def create(h, user, body):
             upgrade = ("upgrade to Pro or VIP for more"
                        if plan == "free" else "upgrade to VIP for unlimited devices")
             h._reply(422, {"error": f"{label} plan is limited to {cap} monitored "
-                                    f"devices — {upgrade} (Settings → Plan & billing)"})
+                                    f"devices. {upgrade} (Settings → Plan & billing)"})
             return
     did = h.store.create_org_device(org, clean)
     h._reply(200, {"id": did})
@@ -631,9 +658,18 @@ def onu_coverage(h, qs):
     nobody finishes.
 
     Per-OLT because that is how a field walk is actually organised: a tech works
-    one PON area at a time. `?device_id=` adds that OLT's UNPLACED rows, so the
-    list a worker pulls up is only ever one OLT deep — the full fleet's unplaced
-    set is thousands of rows and has no business crossing a handset's connection.
+    one PON area at a time. `?device_id=` adds that OLT's rows — both the ones
+    still to visit and the ones already LOCATED — so the list a worker pulls up
+    is only ever one OLT deep; the full fleet's set is thousands of rows and has
+    no business crossing a handset's connection.
+
+    The located half is what makes the expanded list agree with the `placed/total`
+    on the row it opened from: both halves come off the SAME roster pass and the
+    same placement set, so `len(located)` IS that counter rather than a second
+    derivation of it. It carries the stored name, number and pin because the only
+    reason to tap a done row is to CORRECT one of them — and a correction that
+    arrived without the pin would re-place the subscriber, restamping a real GPS
+    fix as a hand-placed point (see `field_onu_name`).
 
     Counted over the FRESHEST-walk roster view (`current_roster`, staleness-blind)
     for the same reason the Optical tab and ONU search use it: `onu_optics` never
@@ -647,7 +683,11 @@ def onu_coverage(h, qs):
         return
     now = datetime.now(timezone.utc)
     roster = onuroster.current_roster(h.store.org_onu_rows(org), now, stale_s=None)
-    placed = h.store.onu_place_macs(org, witness_only=False)
+    # "Has a PIN", which since 2026-08-03 is narrower than "has a record": a
+    # subscriber named from the desk has a row and still needs the visit, so
+    # counting rows here would report a survey as finished that nobody has
+    # walked. This is the one caller that asks the located question.
+    placed = h.store.onu_place_macs(org, witness_only=False, located_only=True)
 
     olts: dict[int, dict] = {}
     for r in roster:
@@ -662,29 +702,59 @@ def onu_coverage(h, qs):
             o["placed"] += 1
 
     want = q_int_or(qs, "device_id", 0)
-    unplaced = []
+    unplaced: list[dict] = []
+    located: list[dict] = []
+    # Only for the ONE named OLT: the fleet's placements can run to the size of
+    # the roster, and the counts above need nothing but the MAC set.
+    details = {p["mac"]: p for p in h.store.list_onu_places(org)} if want else {}
     if want:
         for r in roster:
             if r.get("device_id") != want:
                 continue
             mac = onuroster._norm_mac(r.get("serial"))
-            if not mac or mac in placed:
+            if not mac:
                 continue
-            unplaced.append({"mac": mac, "name": r.get("name"),
-                             "pon_port": r.get("pon_port"),
-                             "onu_id": r.get("onu_id"),
-                             "state": r.get("state"),
-                             "device_id": want,
-                             "device_name": r.get("device_name")})
+            row = {"mac": mac, "name": r.get("name"),
+                   "pon_port": r.get("pon_port"),
+                   "onu_id": r.get("onu_id"),
+                   "state": r.get("state"),
+                   "device_id": want,
+                   "device_name": r.get("device_name")}
+            if mac not in placed:
+                unplaced.append(row)
+                continue
+            p = details.get(mac) or {}
+            located.append({**row,
+                            # The operator's own name and number, so reopening a
+                            # done row starts from what is stored rather than
+                            # asking a tech to retype it (the field write demands
+                            # all three).
+                            "label": p.get("label"),
+                            "phone": p.get("phone"),
+                            "lat": p.get("lat"),
+                            "lng": p.get("lng"),
+                            # A reference ONU is somebody's claim about a power
+                            # supply; the row has to say so before it is re-pinned.
+                            # SQLite hands the column back as 0/1 — cast at the
+                            # edge, where the SPA's type declares a boolean.
+                            "witness": bool(p.get("witness")),
+                            "accuracy_m": p.get("accuracy_m"),
+                            "place_source": p.get("place_source"),
+                            "placed_by": p.get("placed_by"),
+                            "placed_at": p.get("placed_at")})
         # Slot order, not whichever ONUs happen to be up — a tech reads down a
-        # stable list and a shuffled one loses their place between visits.
-        unplaced.sort(key=lambda x: (x["pon_port"] or "", x["onu_id"] or 0))
+        # stable list and a shuffled one loses their place between visits. Both
+        # halves share it so the two interleave into one walk-order list.
+        key = lambda x: (x["pon_port"] or "", x["onu_id"] or 0)  # noqa: E731
+        unplaced.sort(key=key)
+        located.sort(key=key)
 
     h._reply(200, {
         "total": sum(o["total"] for o in olts.values()),
         "placed": sum(o["placed"] for o in olts.values()),
         "olts": sorted(olts.values(), key=lambda o: (o["device_name"] or "")),
         "unplaced": unplaced,
+        "located": located,
     })
 
 
@@ -722,12 +792,14 @@ def field_onu(h, user, body):
         org, clean["mac"], clean["lat"], clean["lng"],
         witness=h.store.onu_place_witness(org, clean["mac"]) is True,
         accuracy_m=clean["accuracy_m"], source=clean["source"],
-        placed_by=user["username"], label=clean["label"])
+        placed_by=user["username"], label=clean["label"],
+        phone=clean["phone"])
     h._reply(200, {"ok": ok})
 
 
 def field_onu_name(h, user, body):
-    """Name a located subscriber, from the field. Worker-reachable.
+    """Correct a located subscriber's name and number, from the field.
+    Worker-reachable.
 
     The name goes to `onu_places.label`, NOT `onu_optics.name`. The roster's name
     is whatever the OLT reports and the SNMP upsert rewrites it (`name=
@@ -746,7 +818,8 @@ def field_onu_name(h, user, body):
         h._reply(400, {"error": "org_id is required"})
         return
     clean = inventory.clean_field_onu_name_payload(body)
-    ok = h.store.set_onu_place_label(org, clean["mac"], clean["label"])
+    ok = h.store.set_onu_place_contact(org, clean["mac"], clean["label"],
+                                       clean["phone"])
     # 404 rather than creating a row: a name with no location is not a placement,
     # and inventing a pin-less one would put a subscriber in the coverage count
     # that nobody has actually been to.
@@ -783,7 +856,11 @@ def onu_places(h, qs):
         if mac:
             by_mac.setdefault(mac, []).append(r)
     resolved = []
-    for p in h.store.list_onu_places(org):
+    # PINS, not records. A subscriber can now be named and phoned without ever
+    # having been located, and such a row has no coordinates to draw — shipping
+    # it would put a marker at (null, null) and inflate every count the map
+    # takes off this list.
+    for p in h.store.list_onu_places(org, located_only=True):
         hits = by_mac.get(p["mac"], [])
         r = hits[0] if len(hits) == 1 else {}
         resolved.append((p, hits, r))
@@ -823,6 +900,19 @@ def onu_places(h, qs):
                     "name": r.get("name"),
                     "state": r.get("state"),
                     "rx_dbm": r.get("rx_dbm"),
+                    # Rx grades against the OLT's own thresholds, so the map
+                    # prints the SAME verdict the Optical tab does rather than
+                    # re-deriving one from the number (`optical-panel:onuSev` is
+                    # structurally typed on state+severity for exactly this).
+                    "severity": r.get("severity"),
+                    # …and the OPTICS walk's own stamp. A dBm on screen carries
+                    # no date, which is the whole reason `RxFreshness` exists —
+                    # on the map there is nowhere to put one, so a reading past
+                    # the staleness gate is simply not printed. This is the
+                    # walk's clock, NOT `port_updated_at`: the two ride
+                    # different sweeps and a fresh port table says nothing about
+                    # how old the light reading beside it is.
+                    "optics_updated_at": r.get("updated_at"),
                     # the ONU's OWN interface. `port_state` is a SECOND opinion
                     # on a different clock from `state` above (the optical
                     # roster) — they agreed on 1542 of 1557 live rows, and where
@@ -833,6 +923,153 @@ def onu_places(h, qs):
                     "out_bps": port["out_bps"] if port else None,
                     "port_updated_at": port["updated_at"] if port else None})
     h._reply(200, {"places": out})
+
+
+# How far up the plant chain the panel will walk from a subscriber's splitter.
+# A cascade is 1:4 into 1:8 in practice, occasionally three deep; this is a
+# guard against a cycle in operator-entered parent links, not a real limit.
+# Same instinct as `assignment`'s cycle guard — a read is the last thing that
+# may spin on a bad row.
+_MAX_PLANT_HOPS = 12
+
+
+def subscriber(h, qs):
+    """EVERYTHING about one subscriber, in one object, keyed on the sticker MAC.
+
+    This endpoint exists because a subscriber was the only first-class thing in
+    this product with no home. A device has one panel that the tree, the map and
+    an issue row all open; a subscriber had SIX partial projections —
+    `OnuOptic` in the Optical tab, `OnuPlace` on the map, `SubscriberDrop` in the
+    splitter panel, `OnuSearchHit` in search, and two more in the survey — each
+    carrying a different subset, none of them complete, and none addressable. An
+    operator had to know which screen held which fact, which is exactly what
+    "customer data is spread across" describes.
+
+    So this is deliberately a JOIN of things that already exist and NOT a new
+    source of truth. Every part comes from the reader the matching screen
+    already uses:
+
+    * the RECORD is `onu_places` — the only operator-owned facts here (name,
+      number, pin, the power claim). Null when nobody has written anything down.
+    * the ROSTER row is `current_roster` over `list_onu_optics`, the same
+      freshest-walk view the Optical tab renders, so the panel and the tab can
+      never disagree about a slot.
+    * the RATE is the ONU's OWN ifTable row (`onu_if_token`), never the PON
+      aggregate, which is shared by up to 64 subscribers.
+    * the PLANT chain is `onu_drops` plus the passive parent links.
+
+    Two identity states are reported rather than resolved, both for the reason
+    `onu_places` already gives: an RMA'd box leaves a record matching no roster
+    row (`matched` false), and a MAC on more than one live slot cannot be said to
+    be at one OLT (`ambiguous`) — picking a winner would send a tech to the
+    wrong house. Read-only; nothing here writes and nothing pages."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    mac = onuroster._norm_mac((qs.get("mac") or [""])[0])
+    if not mac:
+        h._reply(400, {"error": "mac is required"})
+        return
+    now = datetime.now(timezone.utc)
+
+    # Resolve the MAC against the same org-wide freshest-walk view the map's
+    # placement list uses — count agreement with every other surface starts here.
+    hits = [r for r in onuroster.current_roster(h.store.org_onu_rows(org), now,
+                                                stale_s=None)
+            if onuroster._norm_mac(r.get("serial")) == mac]
+    record = h.store.get_onu_place(org, mac)
+    out: dict = {
+        "mac": mac,
+        "record": ({**record, "witness": bool(record.get("witness"))}
+                   if record else None),
+        "matched": bool(hits),
+        "ambiguous": len(hits) > 1,
+        "slots": len(hits),
+        "roster": None, "olt": None, "drop": None, "rate": None,
+        "thresholds": None,
+    }
+    # A record for a MAC in no roster, or on two live slots, is as far as this
+    # can honestly go: the first is a swapped box, the second is a C-Data
+    # registration table holding both the old slot and the new one.
+    if len(hits) != 1:
+        h._reply(200, out)
+        return
+
+    did = hits[0].get("device_id")
+    # TWO reads of the same device, because neither carries the whole row:
+    # `get_org_device` is SELECT * over org_devices and has the per-OLT optical
+    # thresholds; `list_org_devices` LEFT JOINs device_states and is the only
+    # one that knows whether the box is UP. The plant chain needs the list
+    # anyway, so this costs one query, not two.
+    dev = h.store.get_org_device(org, did) if did is not None else None
+    if not dev:
+        h._reply(200, out)
+        return
+    by_id = {d["id"]: d for d in h.store.list_org_devices(org)}
+
+    # The FULL optical row, not the slim org-wide projection: tx, the OLT's own
+    # receive level, the acknowledgement window and the Rx baseline all live on
+    # `onu_optics` and all belong on a panel somebody is reading at a pole.
+    # Taken through `current_roster` again so this is byte-for-byte the row the
+    # Optical tab shows for the same slot.
+    row = next((o for o in onuroster.current_roster(
+                    h.store.list_onu_optics(org, did), now, stale_s=None)
+                if o.get("onu_key") == hits[0].get("onu_key")), None)
+    out["roster"] = row or hits[0]
+    out["olt"] = {"id": dev["id"], "name": dev.get("name"),
+                  # The FROZEN rule needs the OLT's ICMP state, not a freshness
+                  # stamp: an unreachable box proves its readings are stale up to
+                  # 15 minutes before staleness would notice, and every reading
+                  # below it must look frozen rather than green. Only
+                  # `list_org_devices` joins device_states, so it comes from
+                  # there — `get_org_device` would silently answer None and the
+                  # panel would render a dead OLT's last walk as live.
+                  "state": (by_id.get(did) or {}).get("state"),
+                  "optics_updated_at": (row or {}).get("updated_at")}
+    # Per-OLT thresholds, because Rx is graded against the box's own numbers —
+    # re-deriving a verdict from the dBm would let this panel call a drop healthy
+    # that the Optical tab calls critical.
+    out["thresholds"] = {
+        "warn_dbm": (dev.get("optical_warn_dbm")
+                     if dev.get("optical_warn_dbm") is not None
+                     else h.cfg.optical_warn_dbm),
+        "crit_dbm": (dev.get("optical_crit_dbm")
+                     if dev.get("optical_crit_dbm") is not None
+                     else h.cfg.optical_crit_dbm)}
+
+    token = onuroster.onu_if_token(hits[0].get("pon_port"), hits[0].get("onu_id"))
+    port = h.store.onu_interfaces(org, {did}).get((did, token)) if token else None
+    if port:
+        out["rate"] = {"if_name": port["if_name"],
+                       "port_state": port["oper_status"],
+                       "in_bps": port["in_bps"], "out_bps": port["out_bps"],
+                       "updated_at": port["updated_at"]}
+
+    # WHERE IT HANGS. The chain from the subscriber's own splitter up through
+    # any cascade to the OLT is the plant a crew actually works on, and it is the
+    # reason a straight line to the OLT was never the network. Ships names and
+    # split ratios so the panel can state the cumulative split without a second
+    # round trip.
+    passive_id = h.store.onu_drop_map(org).get(mac)
+    if passive_id is not None:
+        chain = []
+        node = by_id.get(passive_id)
+        seen: set[int] = set()
+        while node and node["id"] not in seen and len(chain) < _MAX_PLANT_HOPS:
+            seen.add(node["id"])
+            chain.append({"id": node["id"], "name": node.get("name"),
+                          "device_type": node.get("device_type"),
+                          "split_ratio": node.get("split_ratio"),
+                          "pon_port": node.get("pon_port")})
+            if node["id"] == did:
+                break
+            parent = node.get("parent_device_id")
+            node = by_id.get(parent) if parent is not None else None
+        out["drop"] = {"passive_id": passive_id, "chain": chain}
+    h._reply(200, out)
 
 
 def _resolved_drops(h, org: str, now):
@@ -952,18 +1189,27 @@ def set_onu_drops(h, user, body):
     dev = h.store.get_org_device(org, clean["passive_id"]) or {}
     if dev.get("device_type") not in inventory.PASSIVE_TYPES:
         raise inventory.InventoryError(
-            "a drop comes off passive plant — pick a splitter, FDB or closure")
+            "a drop comes off passive plant: pick a splitter, FDB or closure")
     n = h.store.set_onu_drops(org, clean["macs"], clean["passive_id"])
     h._reply(200, {"ok": True, "attached": n})
 
 
 def onu_place(h, user, body):
-    """Place, move or clear a reference ONU. Owner-only.
+    """Place, move or clear a subscriber's pin. Owner-only.
 
-    Placing IS the operator's claim that this subscriber's power is reliable —
-    there is no power column and nothing detects it — so the UI must state that
-    contract at the click. A placement changes PON-fault verdicts (ponfault's
-    witness rule), which is why this is a write right and not triage."""
+    Placing a REFERENCE ONU is the operator's claim that this subscriber's power
+    is reliable — there is no power column and nothing detects it — so the UI
+    must state that contract at the click. A placement changes PON-fault verdicts
+    (ponfault's witness rule), which is why this is a write right and not triage.
+
+    But a pin is not by itself that claim, and this route used to insist it was:
+    it passed no `witness` and took `set_onu_place`'s default of True, so MOVING
+    a surveyed pin or reopening the dialog to add a phone number promoted an
+    ordinary customer to a witness. **Putting somebody on the map is now a
+    LOCATION here exactly as it is on the handset** — this route cannot make the
+    claim or withdraw it at all, and `/api/inventory/onu-witness` is the only
+    verb that can (operator's call, 2026-08-04: an explicit toggle, and adding a
+    location from the desktop stays an ordinary customer point)."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
@@ -978,10 +1224,74 @@ def onu_place(h, user, body):
         return
     clean = inventory.clean_onu_place_payload(body)
     if clean["lat"] is None:
-        ok = h.store.delete_onu_place(org, clean["mac"])
+        # UNPIN, not forget. This called `delete_onu_place` until 2026-08-03,
+        # so the map card's "Remove" — an eye-off icon reading as "hide this
+        # pin" — destroyed the subscriber's name and phone number with it, no
+        # confirmation and no way back. The record survives; the store prunes it
+        # only if the pin was the only thing on it.
+        ok = h.store.clear_onu_place_coords(org, clean["mac"])
     else:
-        ok = h.store.set_onu_place(org, clean["mac"], clean["lat"], clean["lng"],
-                                   clean["label"], clean["notes"])
+        # The claim is READ, never taken from the body — `clean_onu_place_payload`
+        # cannot even spell it. A location write preserves whatever the record
+        # already says, in both directions: it may not promote an ordinary
+        # customer, and it may not quietly demote a witness whose pin somebody
+        # corrected.
+        ok = h.store.set_onu_place(
+            org, clean["mac"], clean["lat"], clean["lng"],
+            clean["label"], clean["notes"], phone=clean["phone"],
+            witness=h.store.onu_place_witness(org, clean["mac"]) is True)
+    h._reply(200, {"ok": ok})
+
+
+def onu_witness(h, user, body):
+    """Vouch for a subscriber's power supply, or take it back. Owner-only.
+
+    The claim on its own, with no coordinate involved — which is what makes it
+    possible to say "on the map, but NOT vouched for", the state an ISP that has
+    surveyed its drops is mostly in. Before this, making the claim meant placing
+    a pin and withdrawing it meant REMOVING one, so the only expressible opinions
+    were "unmapped" and "witness".
+
+    Owner-only and off the worker allowlist, like `onu-place` and for the same
+    reason: this is the input `ponfault` reads to call a dark PON a power cut
+    rather than a fibre cut, and it is invisible on a handset. 404 on a
+    subscriber nobody has recorded — a claim about a stranger is a bug, not a new
+    record."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    # A superadmin is org_id IS NULL and is the operator on this deployment, so
+    # the body is the only thing that says which org owns the record.
+    if not org:
+        h._reply(400, {"error": "org_id is required"})
+        return
+    clean = inventory.clean_onu_witness_payload(body)
+    if not h.store.set_onu_witness(org, clean["mac"], clean["witness"]):
+        h._reply(404, {"error": "nothing is recorded for that subscriber yet"})
+        return
+    h._reply(200, {"ok": True, "witness": clean["witness"]})
+
+
+def onu_contact(h, user, body):
+    """Record who a subscriber is from the desk — no coordinate involved.
+
+    Owner-only, like every other inventory write. Deliberately NOT worker-
+    reachable: the field's two writes are `field-onu` and `field-onu-name`,
+    which are bounded by what they cannot do (neither can clear a pin, neither
+    can touch the witness claim), and widening the worker surface is a decision
+    to take on its own rather than as a side effect of adding a desk form."""
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    # Same reason `onu_place` needs this: a superadmin is org_id IS NULL and is
+    # the operator on this deployment, so the body is the only thing that says
+    # which org owns the record.
+    if not org:
+        h._reply(400, {"error": "org_id is required to record a subscriber"})
+        return
+    clean = inventory.clean_onu_contact_payload(body)
+    ok = h.store.set_onu_contact(org, clean["mac"], clean["label"],
+                                 clean["phone"], clean["notes"])
     h._reply(200, {"ok": ok})
 
 
@@ -1011,7 +1321,7 @@ def _link_write_scope(h, user, clean):
     linked |= h.store.org_device_peer_map(org).get(clean["child_id"], set())
     if clean["parent_id"] not in linked:
         raise inventory.InventoryError(
-            "no link between those devices — set the parent first")
+            "no link between those devices. Set the parent first.")
     return org
 
 
@@ -1155,8 +1465,8 @@ def snmp_walk_create(h, user, body):
     node = device.get("assigned_node_id")
     if not node:
         raise inventory.InventoryError(
-            "assign this device to a probe first — the walk runs from "
-            "its assigned node")
+            "assign this device to a probe first. The walk runs from "
+            "its assigned node.")
     clean = inventory.clean_walk_payload(body)
     wid = h.store.create_snmp_walk(org, did, node, clean["root_oid"],
                                    clean["max_varbinds"],

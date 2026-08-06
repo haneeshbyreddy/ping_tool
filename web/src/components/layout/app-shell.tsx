@@ -152,12 +152,19 @@ export function AppShell() {
                             end={item.to === "/"}
                             className={cn(
                               "text-xs font-medium text-muted-foreground transition-colors",
-                              // Active state is elevation + a 2px inset rail, NOT a
-                              // colored fill: the accent stays reserved for things
-                              // that are actionable, so status colors keep being the
-                              // loudest thing on screen.
+                              // Active state is a wash + a 2px inset rail. The rail
+                              // carries the ACCENT, which reverses an earlier call
+                              // ("accent stays reserved… so status colors keep being
+                              // the loudest thing on screen") on a measurement that
+                              // says the opposite: --foreground on the sidebar is
+                              // 14.16:1 dark / 13.38:1 light, --primary is 7.40 /
+                              // 3.95 — so the rail this replaces was TWICE as loud
+                              // as the accent, and the change makes it quieter, not
+                              // louder. It also gives the accent one consistent job
+                              // (focus / selection / where-you-are) instead of
+                              // spending --foreground weight on chrome.
                               isNavActive(item.to) &&
-                                "bg-foreground/[0.07] text-foreground shadow-[inset_2px_0_0_var(--foreground)] hover:bg-foreground/[0.07] hover:text-foreground",
+                                "bg-foreground/[0.07] text-foreground shadow-[inset_2px_0_0_var(--primary)] hover:bg-foreground/[0.07] hover:text-foreground",
                             )}
                           >
                             <item.icon className="size-4" />

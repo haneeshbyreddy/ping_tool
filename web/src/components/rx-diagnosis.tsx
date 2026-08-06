@@ -41,7 +41,7 @@ function verdict(rx: RxStatusResponse): Verdict {
       steps: [
         "Set the GPON vendor in the device's settings, or wait for the probe's "
           + "SNMP sweep to match it from the box's sysObjectID.",
-        "If its SNMP walk isn't landing at all, fix that first — the roster has "
+        "If its SNMP walk isn't landing at all, fix that first. The roster has "
           + "to exist before a reading has anywhere to attach.",
       ],
     }
@@ -53,7 +53,7 @@ function verdict(rx: RxStatusResponse): Verdict {
         + `class the readings often exist only on the OLT's own web page, which `
         + `needs a recipe before it can be read.`,
       steps: [
-        "Open the OLT's optical page once through the web proxy — that records "
+        "Open the OLT's optical page once through the web proxy. That records "
           + "its path, which is what a recipe is written from.",
         "Add the vendor under Settings → Monitoring → Web-UI optics vendors. "
           + "No probe update is needed; central does the reading.",
@@ -81,8 +81,8 @@ function verdict(rx: RxStatusResponse): Verdict {
   }
   if (!rx.has_credentials) {
     return {
-      cause: `A recipe for “${rx.web_profile}” is configured and ready — it just `
-        + "has no login for this OLT, so it has never asked the box for a reading.",
+      cause: `A recipe for “${rx.web_profile}” is configured, but it has no login `
+        + "for this OLT, so it has never asked the box for a reading.",
       steps: [
         "Store the OLT's web-UI username and password in this device's panel "
           + "(Health tab → device web UI).",
@@ -112,7 +112,7 @@ function verdict(rx: RxStatusResponse): Verdict {
           "Readings attach to ONLINE ONUs by MAC address. If the roster is "
             + "stale, or a MAC appears on two live slots, the reading is dropped "
             + "rather than attributed to the wrong subscriber.",
-          "Check the SNMP optical walk is landing — the roster is what a "
+          "Check the SNMP optical walk is landing. The roster is what a "
             + "reading merges onto.",
         ],
         tone: "warning",
@@ -131,7 +131,7 @@ function verdict(rx: RxStatusResponse): Verdict {
       return {
         cause: `The OLT's web page couldn't be reached: ${scrape.detail ?? "no detail"}.`,
         steps: [
-          "Check the web address override in the device's settings — the page "
+          "Check the web address override in the device's settings. The page "
             + "isn't always on the probe address, port 80.",
           "Confirm the probe's tunnel is up (Network → Probes).",
         ],
@@ -147,7 +147,7 @@ function verdict(rx: RxStatusResponse): Verdict {
       return {
         cause: `The last pass skipped this OLT: ${scrape.detail ?? "no detail"}.`,
         steps: [
-          "This is normal and self-correcting — the reader waits rather than "
+          "This is normal and self-correcting. The reader waits rather than "
             + "competing with an operator or a dormant tunnel.",
         ],
       }
@@ -231,7 +231,7 @@ export function RxFreshness({ device, canWrite }: {
     const left = REFRESH_WATCH_MS - (Date.now() - startedAt.current)
     const t = setTimeout(() => {
       setAwaiting(null)
-      toast.error(`No result from ${device.name} yet — it may still be reading.`)
+      toast.error(`No result from ${device.name} yet. It may still be reading.`)
     }, Math.max(0, left))
     return () => clearTimeout(t)
   }, [pending, awaiting, scrape, device.id, device.name, queryClient])

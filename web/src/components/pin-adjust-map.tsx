@@ -55,13 +55,20 @@ function Recenter({ lat, lng, follow }: { lat: number; lng: number; follow: bool
   return null
 }
 
-export function PinAdjustMap({ org, lat, lng, adjusted, onAdjust, onReset }: {
+export function PinAdjustMap({ org, lat, lng, adjusted, moved, onAdjust, onReset }: {
   org: string | null | undefined
   lat: number
   lng: number
-  /** true once the operator has moved it — drives the follow/leave-alone rule
-   *  and the "reset" affordance. */
+  /** true once the pin is a fixed point rather than the live fix — drives the
+   *  follow/leave-alone rule and the "reset" affordance. */
   adjusted: boolean
+  /** …and whether THIS visit moved it. Separate because a REOPENED placement
+   *  arrives with a stored pin nobody has touched: it is not following the GPS
+   *  either, but telling the operator it was "moved by hand" describes a drag
+   *  that didn't happen — and the caption's whole job is to say what will be
+   *  saved. Defaults to `adjusted` for a plain capture, where the only way to
+   *  stop following the fix IS a drag. */
+  moved?: boolean
   onAdjust: (lat: number, lng: number) => void
   onReset: () => void
 }) {
@@ -153,9 +160,11 @@ export function PinAdjustMap({ org, lat, lng, adjusted, onAdjust, onReset }: {
 
       <div className="flex items-center justify-between gap-2">
         <p className="text-2xs text-faint-foreground">
-          {adjusted
-            ? "Pin moved by hand — saved as an exact spot, not a GPS reading."
-            : "Drag the pin if the fix is off the mark."}
+          {(moved ?? adjusted)
+            ? "Pin moved by hand. Saved as an exact spot, not a GPS reading."
+            : adjusted
+              ? "Where this was recorded. Drag it to move it, or leave it alone."
+              : "Drag the pin if the fix is off the mark."}
         </p>
         {adjusted && (
           <Button

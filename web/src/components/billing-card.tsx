@@ -161,7 +161,7 @@ export function BillingCard({ org }: { org: string }) {
           {capPct != null && capPct >= 100 && (
             <p className="text-xs text-muted-foreground">
               Device limit reached. Adding more needs {billing.plan === "free" ? "Pro or VIP" : "VIP"}.
-              Passive plant (splitters, FDBs, closures) never counts.
+              Passive plant never counts.
             </p>
           )}
           <div className="flex items-baseline justify-between text-xs">

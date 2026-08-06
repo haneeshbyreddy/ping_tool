@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { IndianRupee, MapPin, MessageCircle, Trash2 } from "lucide-react"
+import { IndianRupee, Map, MapPin, MessageCircle, Minus, Plus, RotateCcw, Trash2 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { adminApi, ApiError } from "@/lib/api"
+import {
+  DETAIL_DEFAULTS, DETAIL_MAX, DETAIL_ROWS, detailFrom, detailMin,
+  isDetailDefault, normalizeDetail, type MapDetail,
+} from "@/map/detail"
 import { AppearanceCard } from "@/components/appearance-card"
 import { QrImage } from "@/components/qr-image"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -51,14 +55,114 @@ function GoogleMapsCard() {
             spellCheck={false} onChange={(e) => setKey(e.target.value)} />
         </div>
         <p className="max-w-lg text-xs text-muted-foreground">
-          Pasted once here, this key enables the Google basemaps on every organization's
-          Map view. Org owners don't configure anything. It is sent to signed-in
-          browsers, so use a referrer-restricted key. Leave blank to hide the Google
+          Enables the Google basemaps on every organization's Map. It is sent to
+          signed-in browsers, so use a referrer-restricted key. Blank hides the Google
           options everywhere.
         </p>
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
           Save
         </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
+// Server-wide, superadmin-only: the zoom at which each map layer starts drawing.
+//
+// These were hardcoded constants, then briefly a per-browser preference in the
+// map's own Layers popover, and are now ONE configuration for every account
+// (operator's call, 2026-08-02). Density is a judgement about how the product
+// should read, made by the person who looks at the fleet all day — handing it to
+// every user buys a support surface ("my map looks different from yours") in
+// exchange for a choice nobody else asked to make.
+function MapDetailCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading } = useQuery({
+    queryKey: ["admin-settings"],
+    queryFn: adminApi.settings,
+  })
+  // Local until Save, unlike the map's old live-editing popover: this form is a
+  // room away from the thing it changes, so an accidental click shouldn't reach
+  // every browser on the install before the superadmin has looked at it.
+  const [detail, setDetail] = useState<MapDetail>(DETAIL_DEFAULTS)
+  useEffect(() => { if (data?.map_detail) setDetail(detailFrom(data.map_detail)) }, [data])
+
+  const save = useMutation({
+    mutationFn: (d: MapDetail) => adminApi.saveSettings({ map_detail: d }),
+    onSuccess: () => {
+      toast.success("Map detail saved for all organizations")
+      queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
+      // every Map view reads these off its /api/orgs row, same as the Maps key
+      queryClient.invalidateQueries({ queryKey: ["orgs"] })
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
+  })
+  // Normalise on the way IN, so the ordering invariant holds for the render that
+  // follows rather than being re-checked at every read site. Central repairs it
+  // again on save — this is the affordance, not the enforcement.
+  const set = (k: keyof MapDetail, v: number) =>
+    setDetail((d) => normalizeDetail({ ...d, [k]: v }))
+
+  if (isLoading) return <Skeleton className="h-24 w-full" />
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Map className="size-4 text-muted-foreground" /> Map detail (all organizations)
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2.5">
+        <p className="max-w-lg text-xs text-muted-foreground">
+          The zoom level each map layer starts drawing at. Lower shows more while
+          zoomed out, higher keeps the map clearer. Zoom runs roughly 4 (country)
+          · 10 (city) · 14 (neighbourhood) · 17 (street).
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {DETAIL_ROWS.map((r) => {
+            const v = detail[r.key]
+            const lo = detailMin(detail, r.key)
+            return (
+              <div key={r.key} className="flex items-start justify-between gap-4 max-w-lg">
+                <div className="min-w-0">
+                  <Label className="text-xs">{r.label}</Label>
+                  <p className="text-2xs text-muted-foreground">{r.hint}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <Button variant="outline" size="icon" className="size-7"
+                    disabled={v <= lo} aria-label={`${r.label}: show earlier`}
+                    onClick={() => set(r.key, v - 1)}>
+                    <Minus className="size-3" />
+                  </Button>
+                  <span className="w-6 text-center text-sm font-medium tabular-nums">{v}</span>
+                  <Button variant="outline" size="icon" className="size-7"
+                    disabled={v >= DETAIL_MAX} aria-label={`${r.label}: show later`}
+                    onClick={() => set(r.key, v + 1)}>
+                    <Plus className="size-3" />
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        <div className="flex items-center gap-2">
+          <Button size="sm" className="w-fit" disabled={save.isPending}
+            onClick={() => save.mutate(detail)}>
+            Save
+          </Button>
+          {/* Only once these differ from the shipped values: a Reset sitting on
+              an untouched control is one more thing to read past, and its
+              absence is itself the answer to "am I on the defaults?" Saving the
+              defaults CLEARS the stored row, so a reset install keeps following
+              them if they ever change. */}
+          {!isDetailDefault(detail) && (
+            <Button variant="ghost" size="sm" className="w-fit text-muted-foreground"
+              disabled={save.isPending}
+              onClick={() => { setDetail(DETAIL_DEFAULTS); save.mutate(DETAIL_DEFAULTS) }}>
+              <RotateCcw className="size-3" /> Reset to defaults
+            </Button>
+          )}
+        </div>
       </CardContent>
     </Card>
   )
@@ -90,7 +194,7 @@ function PlatformBillingCard() {
     // so accept by extension too
     const isImage = file.type.startsWith("image/") || /\.svg$/i.test(file.name)
     if (!isImage) { toast.error("Choose an image file (PNG, SVG or JPG)"); return }
-    if (file.size > 400_000) { toast.error("Image too large — use a QR under 400 KB"); return }
+    if (file.size > 400_000) { toast.error("Image too large. Use a QR under 400 KB."); return }
     const reader = new FileReader()
     reader.onload = () => setQr(String(reader.result || ""))
     reader.onerror = () => toast.error("Couldn't read that file")
@@ -153,8 +257,7 @@ function PlatformBillingCard() {
           </div>
           <p className="max-w-lg text-xs text-muted-foreground">
             A UPI QR image (PNG, SVG or JPG) orgs scan to pay, shown beside the
-            GPay number on the lock screen — they can tap it to enlarge. Leave
-            empty to show just the number.
+            GPay number on the lock screen. Leave empty to show just the number.
           </p>
         </div>
 
@@ -246,7 +349,7 @@ function WhatsAppCard() {
         <label className="flex items-center justify-between gap-3 max-w-sm">
           <span className="flex flex-col">
             <span className="text-sm font-medium">Send alerts over WhatsApp</span>
-            <span className="text-xs text-muted-foreground">The only alert channel — off means no pages go out</span>
+            <span className="text-xs text-muted-foreground">The only alert channel. Off means no pages go out.</span>
           </span>
           <Switch checked={enabled} onCheckedChange={setEnabled} />
         </label>
@@ -262,7 +365,7 @@ function WhatsAppCard() {
           <Label>Access token</Label>
           <Input type="password" autoComplete="off" spellCheck={false}
             className="max-w-sm font-mono text-xs"
-            placeholder={tokenSet ? "•••••••• stored — leave blank to keep" : "paste the Meta access token"}
+            placeholder={tokenSet ? "•••••••• stored · leave blank to keep" : "paste the Meta access token"}
             value={token} onChange={(e) => setToken(e.target.value)} />
           <p className="max-w-lg text-xs text-muted-foreground">
             A permanent System User token with <code>whatsapp_business_messaging</code>.
@@ -298,17 +401,16 @@ function WhatsAppCard() {
             className="max-w-sm font-mono text-xs" spellCheck={false}
             onChange={(e) => setAdminNumber(e.target.value)} />
           <p className="max-w-lg text-xs text-muted-foreground">
-            The superadmin's WhatsApp number for platform ops pings &mdash; an org tapping
-            "I've paid", a self-downgrade to Free, and release-mirror failures. It also
-            joins every org's alert audience. Leave blank to skip the ops pings.
+            Platform ops pings only: an org tapping "I've paid", a self-downgrade to
+            Free, and release-mirror failures. Org alerts never come here. Leave blank
+            to skip them.
           </p>
         </div>
 
         <p className="max-w-lg text-xs text-muted-foreground">
-          The approved template's body takes 4 parameters, in order: Device, Status,
-          Detail, Time Logged (<code>{"{{1}}"}</code>&hellip;<code>{"{{4}}"}</code>). Each
-          person is paged on their own number, set on their account in Accounts. Use the
-          "Send test alert" button under an org's Settings &rarr; Organization to verify.
+          The approved template takes 4 parameters in order: Device, Status, Detail,
+          Time Logged (<code>{"{{1}}"}</code>&hellip;<code>{"{{4}}"}</code>). Verify with
+          "Send test alert" under an org's Settings &rarr; Organization.
         </p>
 
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
@@ -341,12 +443,14 @@ export function PlatformPage() {
         <h1 className="text-lg font-semibold tracking-tight">Platform settings</h1>
         <p className="text-sm text-muted-foreground">
           Server-wide configuration that applies to every organization: the look of the
-          dashboard, the Google Maps key, how subscribers pay, and the WhatsApp channel.
+          dashboard, the Google Maps key and map detail, how subscribers pay, and the
+          WhatsApp channel.
         </p>
       </div>
 
       <AppearanceCard />
       <GoogleMapsCard />
+      <MapDetailCard />
       <PlatformBillingCard />
       <WhatsAppCard />
     </div>

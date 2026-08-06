@@ -79,7 +79,7 @@ function DevicePicker({ account, devices, onClose }: {
     },
     onSuccess: (r) => {
       if (r.unreachable.length) {
-        toast.warning(`Saved — ${account.username} has no WhatsApp number, so no page will reach them yet`)
+        toast.warning(`Saved. ${account.username} has no WhatsApp number, so no page reaches them yet.`)
       } else {
         const parts = [
           r.added ? `${r.added} added` : null,
@@ -125,9 +125,9 @@ function DevicePicker({ account, devices, onClose }: {
       <DialogHeader>
         <DialogTitle>Devices {account.username} is paged for</DialogTitle>
         <DialogDescription>
-          Ticking a device also covers everything below it, so one aggregation switch
-          or OLT can carry a whole region. This changes notifications only —{" "}
-          {account.username} can already see the entire network.
+          Ticking a device also covers everything below it, so one switch or OLT can
+          carry a whole region. Notifications only: {account.username} can already
+          see the entire network.
         </DialogDescription>
       </DialogHeader>
 
@@ -235,10 +235,9 @@ export function AssignmentCard({ org }: { org: string }) {
       </CardHeader>
       <CardContent className="flex flex-col gap-0 p-0">
         <p className="px-4 pb-3 text-xs text-muted-foreground">
-          Who gets a WhatsApp page when a device — or one of its monitored ports —
-          goes down. Responsibility covers everything below the device it's set on.
-          Owners are always paged, and this changes nothing about what anyone can
-          see on the dashboard.
+          Who gets a WhatsApp page when a device or one of its monitored ports goes
+          down. Covers everything below the device it's set on. Owners are always
+          paged, and nobody's view of the dashboard changes.
         </p>
 
         {(roster.isLoading || inventory.isLoading) && (
@@ -262,7 +261,7 @@ export function AssignmentCard({ org }: { org: string }) {
               </p>
               <p className="text-xs text-muted-foreground">
                 {a.devices === 0 ? (
-                  <>Not assigned — paged for every unassigned device</>
+                  <>Not assigned · paged for every unassigned device</>
                 ) : (
                   <>Paged for {a.devices} device{a.devices === 1 ? "" : "s"}
                     {a.assigned !== a.devices && <> · {a.assigned} set directly</>}</>
@@ -286,9 +285,9 @@ export function AssignmentCard({ org }: { org: string }) {
               <span>Every device has someone responsible for it.</span>
             ) : (
               <span>
-                {unassigned} device{unassigned === 1 ? "" : "s"} nobody is assigned to —
-                every worker is paged for {unassigned === 1 ? "it" : "them"}. That's the
-                safe default, not an error.
+                {unassigned} device{unassigned === 1 ? "" : "s"} nobody is assigned to,
+                so every worker is paged for {unassigned === 1 ? "it" : "them"}. That's
+                the safe default, not an error.
               </span>
             )}
           </div>

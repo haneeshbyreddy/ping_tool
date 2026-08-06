@@ -33,15 +33,15 @@ import {
 
 // What each scraped column means, in the tech's words rather than the schema's.
 const FIELD_HELP: Record<string, string> = {
-  onu_ref: "the cell holding the ONU's identity — required, it's how a data row is told from a heading",
-  serial: "MAC address — required, it's what a reading is matched to a subscriber by",
+  onu_ref: "required · the cell holding the ONU's identity, how a data row is told from a heading",
+  serial: "required · MAC address, what a reading is matched to a subscriber by",
   name: "the ONU's description / subscriber name",
   distance_m: "ranging distance",
   temp_c: "ONU temperature",
-  voltage_v: "supply voltage — used to spot a dead sensor printing rails",
+  voltage_v: "supply voltage, used to spot a dead sensor printing rails",
   tx_bias_ma: "transmit bias current",
   tx_dbm: "ONU transmit power",
-  rx_dbm: "ONU received power — the reading this exists for",
+  rx_dbm: "ONU received power, the reading this exists for",
 }
 const SESSION_HELP: Record<string, string> = {
   "rotating-key": "no cookie; a token in each page's script, changing every response",
@@ -154,7 +154,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
     },
     onSuccess: () => {
       toast.success(editing ? "Recipe saved" : "Recipe created", {
-        description: "Central picks it up on the next optics sweep — no probe update.",
+        description: "Central picks it up on the next optics sweep. No probe update.",
       })
       queryClient.invalidateQueries({ queryKey: ["web-optics-profiles"] })
       onDone()
@@ -173,7 +173,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
           <Input placeholder="e.g. cdata-gpon" value={name}
             onChange={(e) => setName(e.target.value)} />
           <p className="text-2xs text-muted-foreground">
-            Must match the device's GPON vendor — the same token the dropdown
+            Must match the device's GPON vendor: the same token the dropdown
             and the probe's auto-detect use. That's how an OLT is bound to this.
           </p>
         </div>
@@ -207,7 +207,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
           ))}
         </div>
         <p className="text-2xs text-muted-foreground">
-          Paths only — never a full URL. The address comes from the device, which
+          Paths only, never a full URL. The address comes from the device, which
           is what stops a recipe pointing central at some other machine.
         </p>
       </div>
@@ -264,7 +264,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
             value={opticsStatic} onChange={(e) => setOpticsStatic(e.target.value)} />
           <p className="text-2xs text-muted-foreground">
             Some firmware only measures when the page's Refresh button is part of
-            the request — include it if the capture shows it.
+            the request. Include it if the capture shows it.
           </p>
         </div>
         <div className="flex flex-col gap-2">
@@ -272,7 +272,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
           <Input className="h-8 font-mono text-xs" placeholder="1, 2, 3, 4"
             value={pons} onChange={(e) => setPons(e.target.value)} />
           <p className="text-2xs text-muted-foreground">
-            Fallback only — the real port list comes from the OLT's own SNMP
+            Fallback only. The real port list comes from the OLT's own SNMP
             roster, gaps and all.
           </p>
           <Input className="h-8 font-mono text-xs" placeholder="words that identify this UI, e.g. epon, olt"
@@ -327,7 +327,7 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
           <Plus className="size-3.5" /> Add column
         </Button>
         <p className="text-2xs text-muted-foreground">
-          Matched against the table's own heading row, not by position — so a
+          Matched against the table's own heading row, not by position, so a
           firmware update that inserts a column can't quietly turn transmit power
           into received power. A partial heading is enough ("Distance" matches
           "Distance(m)").
@@ -402,12 +402,10 @@ export function WebOpticsCard({ org, isSuperadmin }: {
       </CardHeader>
       <CardContent className="flex flex-col gap-0 p-0">
         <p className="px-4 pb-3 text-xs text-muted-foreground">
-          Some OLTs report per-ONU optical power (dBm) nowhere in SNMP — they
-          measure it only when their own web page is opened. A recipe here lets
-          central read that page through the probe's existing tunnel, so those
-          ONUs get a real dBm. Central does the reading, so no probe update is
-          needed. Requires the org's web-proxy capability and the OLT's stored
-          web login.
+          Some OLTs report per-ONU dBm nowhere in SNMP, and measure it only when
+          their own web page is opened. A recipe lets central read that page
+          through the probe's tunnel. Needs the org's web-proxy capability and the
+          OLT's stored web login. No probe update.
           {isSuperadmin && " Recipes you add here apply to every organization."}
         </p>
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}

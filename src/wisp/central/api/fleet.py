@@ -20,7 +20,7 @@ def _probe_cap_blocked(h, org: str) -> bool:
     upgrade = ("upgrade to Pro or VIP for more"
                if plan == "free" else "upgrade to VIP for unlimited probes")
     h._reply(422, {"error": f"{label} plan includes {cap} edge "
-                            f"probe{'s' if cap != 1 else ''} — {upgrade} "
+                            f"probe{'s' if cap != 1 else ''}. {upgrade} "
                             "(Settings → Plan & billing)"})
     return True
 
@@ -49,8 +49,8 @@ def register(h, user, body):
     node_id = inventory.clean_node_id(body.get("node_id"))
     if h.store.get_node_token_status(org, node_id):
         raise inventory.InventoryError(
-            f"node {node_id!r} is already registered for {org!r} — "
-            "use rotate instead of registering it again")
+            f"node {node_id!r} is already registered for {org!r}. "
+            "Use rotate instead of registering it again.")
     if _probe_cap_blocked(h, org):
         return
     node_token = h.store.issue_node_token(org, node_id, created_by=user["id"])
@@ -111,8 +111,8 @@ def restart(h, user, body):
     node_id = inventory.clean_node_id(body.get("node_id"))
     if not h.store.request_restart(org, node_id):
         raise inventory.InventoryError(
-            f"{node_id!r} has never reported — the restart directive rides "
-            "its heartbeat, so there is no channel to deliver it through yet")
+            f"{node_id!r} has never reported. The restart directive rides its "
+            "heartbeat, so there is no channel to deliver it through yet.")
     h._reply(200, {"ok": True})
 
 
@@ -129,12 +129,12 @@ def update(h, user, body):
                  if n["node_id"] == node_id), None)
     if node is None:
         raise inventory.InventoryError(
-            f"{node_id!r} has never reported — the update directive rides "
-            "its heartbeat, so there is no channel to deliver it through yet")
+            f"{node_id!r} has never reported. The update directive rides its "
+            "heartbeat, so there is no channel to deliver it through yet.")
     if not is_newer(target, node.get("version")):
         raise inventory.InventoryError(
-            f"{node_id!r} already runs {node.get('version')} — the latest "
-            f"published release is {target}")
+            f"{node_id!r} already runs {node.get('version')}. The latest "
+            f"published release is {target}.")
     h.store.set_rollout(org, target, [node_id],
                         note=f"manual update via dashboard ({user['username']})")
     h._reply(200, {"ok": True, "target_version": target})

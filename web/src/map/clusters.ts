@@ -10,7 +10,7 @@
 // and zoom-dependent by design: no schema, no assignment workflow — placing
 // devices at the same spot IS the rack assignment.
 import type L from "leaflet"
-import type { OrgDevice } from "@/lib/types"
+import { isPassiveType, type OrgDevice } from "@/lib/types"
 import { cachedDivIcon, esc, pinTone, type Placed } from "@/map/pins"
 
 const CLUSTER_PX = 44
@@ -33,22 +33,57 @@ export function project(lat: number, lng: number, zoom: number): [number, number
   ]
 }
 
+/** PASSIVE PLANT NEVER FOLDS — it is treated like a subscriber, not like gear
+ *  (operator, 2026-08-05: "passive devices should not combine with active devices,
+ *  they should be treated like customer locations").
+ *
+ *  A site badge is a claim about GEAR: a count, a status ring, and a card of
+ *  boxes that each have a state and an outage. A splitter has none of those, so
+ *  folding one in makes the count answer a question nobody asked — "4 devices, 1
+ *  down" where two of the four are plastic — and it hides the box a crew actually
+ *  drives to behind a number. Exactly the reasoning that already kept subscribers
+ *  out of this pass ("a site badge mixing plant with subscribers would count
+ *  nonsense"); plant was on the wrong side of that line.
+ *
+ *  Each passive comes back as its own single-member cluster rather than being
+ *  dropped, so it still renders as a pin, still has a `pinPos` entry, and still
+ *  anchors its drop lines — the render walks this list, and a passive missing
+ *  from it would vanish from the map.
+ *
+ *  Consequence worth knowing: dense plant now overlaps at low zoom instead of
+ *  folding. That is what subscribers already do and is the accepted trade — plant
+ *  is far sparser than drops, and a splitter you can see beats a badge that
+ *  counts it. It also means the CLUSTERING PASS is no longer one of the things
+ *  telling a splitter from a subscriber; the hole, the always-drawn ratio plate
+ *  and the plant-vs-drop rank now carry that alone. */
 export function buildClusters(placed: Placed[], zoom: number): SiteCluster[] {
   const acc: Array<{ px: [number, number]; members: Placed[] }> = []
+  const loose: Placed[] = []
   for (const d of placed) {
+    if (isPassiveType(d.device_type)) {
+      loose.push(d)
+      continue
+    }
     const p = project(d.lat, d.lng, zoom)
     const hit = acc.find((c) => Math.hypot(c.px[0] - p[0], c.px[1] - p[1]) < CLUSTER_PX)
     if (hit) hit.members.push(d)
     else acc.push({ px: p, members: [d] })
   }
-  return acc.map((c) => ({
-    key: c.members.map((m) => m.id).sort((a, b) => a - b).join(","),
-    members: c.members,
-    center: [
-      c.members.reduce((s, m) => s + m.lat, 0) / c.members.length,
-      c.members.reduce((s, m) => s + m.lng, 0) / c.members.length,
-    ] as [number, number],
-  }))
+  // Plant first so gear paints over it on a DOM-order tie, matching every other
+  // place this map ranks the two.
+  return [
+    ...loose.map((d) => ({
+      key: String(d.id), members: [d], center: [d.lat, d.lng] as [number, number],
+    })),
+    ...acc.map((c) => ({
+      key: c.members.map((m) => m.id).sort((a, b) => a - b).join(","),
+      members: c.members,
+      center: [
+        c.members.reduce((s, m) => s + m.lat, 0) / c.members.length,
+        c.members.reduce((s, m) => s + m.lng, 0) / c.members.length,
+      ] as [number, number],
+    })),
+  ]
 }
 
 const CLUSTER_TONE_ORDER = ["destructive", "warning", "success", "muted"] as const
