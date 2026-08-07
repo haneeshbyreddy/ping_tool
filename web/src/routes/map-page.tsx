@@ -106,6 +106,12 @@ const ponKey = (p: OnuPlace): string => p.pon_port ?? "—"
 /** one PON of one OLT, as the focus picker and the status strip count it */
 interface PonRow { pon: string; total: number; dark: number }
 
+/** Below this much spread, a power-pattern wave is ONE SITE, not an area: no
+ *  hull is drawn for it and the verdict says so in words. `incidents.evaluate`
+ *  rounds its radius to 10 m, so this only ever rejects a rack's worth of GPS
+ *  noise — anything a crew could drive between still gets its circle. */
+const HULL_MIN_M = 30
+
 /** how much wider the dark casing runs than the link stroke it backs */
 const CASING_OVER = 3
 /** A fine dot is mostly overhang: at CASING_OVER the casing is 2.5x the dot's
@@ -1963,20 +1969,39 @@ export function MapPage() {
           )
         })}
         {/* power-outage hull: several independent feeds dark inside one small
-            circle — shade the area so the eye reads "feeder", not "fiber" */}
-        {powerIncidents.map((inc, i) => (
-          <Circle
-            key={`pw-${i}-${inc.since ?? ""}`}
-            center={inc.center as [number, number]}
-            radius={Math.max((inc.radius_km ?? 0) * 1000 * 1.15, 400)}
-            interactive={false}
-            pathOptions={{
-              color: "var(--warning)", opacity: 0.6,
-              fillColor: "var(--warning)", fillOpacity: 0.07,
-              ...strokeAt(lineK, 1.5, "6 6"),
-            }}
-          />
-        ))}
+            circle — shade the area so the eye reads "feeder", not "fiber".
+
+            THE RADIUS IS THE MEASURED EXTENT AND NOTHING ELSE. It used to carry
+            a 400 m floor so a zero-extent wave still drew something, and that is
+            exactly backwards: a rack whose four feeds all went dark sits on ONE
+            pin, extent 0.0 km, and the floor shaded 800 m of a village nobody
+            had measured — a claim about the ground invented to satisfy a
+            legibility want. Same error as the ONU spokes that were removed for
+            fabricating a bearing EPON ranging cannot give. On this map
+            everything reads as geography.
+
+            So a point incident draws NO hull, and loses nothing: its site badge
+            is already ringed red, and the strip's verdict says "one site" in
+            words, which is the honest form of the thing this circle was
+            attempting. A wave with real spread still gets its area, padded 15%
+            so the pins sit inside the line rather than on it. */}
+        {powerIncidents.map((inc, i) => {
+          const r = (inc.radius_km ?? 0) * 1000 * 1.15
+          if (r < HULL_MIN_M) return null
+          return (
+            <Circle
+              key={`pw-${i}-${inc.since ?? ""}`}
+              center={inc.center as [number, number]}
+              radius={r}
+              interactive={false}
+              pathOptions={{
+                color: "var(--warning)", opacity: 0.6,
+                fillColor: "var(--warning)", fillOpacity: 0.07,
+                ...strokeAt(lineK, 1.5, "6 6"),
+              }}
+            />
+          )
+        })}
         {/* suspected-cut stretch: louder than any link (thick, dashed), and the
             ✕ is clickable — it opens the OLT's Optical tab with the verdict */}
         {cutSegments.map((s) => (
@@ -2526,7 +2551,23 @@ export function MapPage() {
           broken by DOM order, so those cards were burying the search results and
           the PON chips. A transient list covering a status bar is the wrong way
           round. The ladder on this map, bottom-up: cards 1000 · controls 1001 ·
-          this strip 1002 · the plant menu 1003. */}
+          this strip 1002 · the plant menu 1003.
+
+          EVERYTHING that states what is on the map goes IN here, in the wrap
+          flow — never as a second absolutely-positioned bar in the same band
+          (operator, 2026-08-07: "something seems to be behind the elements and
+          i can't read it"). The power-outage verdict was its own `top-3 left-1/2`
+          pill at z-1000: dead centre of the band this strip already occupies,
+          one rung BELOW it, so the moment the strip grew past halfway the
+          verdict slid underneath the buttons and read as torn fragments of a
+          sentence. Centring is not a layout — it is a bet that the left side
+          stays short. It also escaped `.wisp-panel-strip`, so it could run under
+          an open device panel as well. In the flow it wraps instead, which is
+          the one behaviour that cannot collide at any width.
+
+          MODE banners (placement, route drawing) stay centred at `top-14`: they
+          are what the next CLICK will do, not what the map is showing, and only
+          one is ever up. */}
       <div className="wisp-panel-strip pointer-events-none absolute top-3 left-3 z-[1002] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
         <MapSearch devices={devices} org={scopeOrg} bounds={region.bounds}
           onDevice={searchDevice} onOnu={searchOnu} onPlace={searchPlace} />
@@ -2542,6 +2583,35 @@ export function MapPage() {
           )}
           {isLoading && <span className="text-muted-foreground">loading…</span>}
         </div>
+        {/* power-pattern verdict: the read a veteran gets off the wall — many
+            feeds, one small circle. It sits right after the down count because
+            it EXPLAINS that count; it explains the red, never silences it. */}
+        {powerIncidents.length > 0 && (
+          <button
+            className="pointer-events-auto flex h-8 max-w-full min-w-0 items-center gap-2 rounded-lg border border-warning/50 bg-popover/95 px-3 text-xs backdrop-blur hover:brightness-110 dark:bg-popover/95"
+            title="Zoom to the affected area"
+            onClick={() => {
+              const inc = powerIncidents[0]
+              if (!inc.center) return
+              mapRef.current?.flyToBounds(
+                L.latLng(inc.center[0], inc.center[1])
+                  .toBounds(Math.max((inc.radius_km ?? 0) * 2600, 1200)),
+                { padding: [48, 48] })
+            }}>
+            <span className="shrink-0 font-semibold text-warning">⚡ Power-outage pattern</span>
+            <span className="min-w-0 truncate text-muted-foreground">
+              {powerIncidents[0].count} devices · {powerIncidents[0].branches} independent feeds
+              {/* A wave whose members all sit on ONE pin has no area, and
+                  "0.0 km area" printed a measurement of nothing. Say which of
+                  the two it is: a rack that went dark is a site, not a
+                  neighbourhood, and it is also why no hull is drawn for it. */}
+              {" · "}{(powerIncidents[0].radius_km ?? 0) * 1000 >= HULL_MIN_M
+                ? `${(powerIncidents[0].radius_km ?? 0).toFixed(1)} km area`
+                : "one site"}
+              {powerIncidents[0].since && <> · {durationSince(powerIncidents[0].since)}</>}
+            </span>
+          </button>
+        )}
         {(troubles.length > 0 || troubleOnly) && (
           <Button variant={troubleOnly ? "default" : "outline"} size="sm"
             className={cn("pointer-events-auto h-8 backdrop-blur", !troubleOnly && "bg-popover/95 dark:bg-popover/95")}
@@ -2643,29 +2713,6 @@ export function MapPage() {
           )
         })()}
       </div>
-
-      {/* power-pattern banner: the verdict a veteran reads off the wall — many
-          feeds, one small circle. Explains the red, never silences it. ------- */}
-      {powerIncidents.length > 0 && (
-        <button
-          className="absolute top-3 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-warning/50 bg-popover/95 dark:bg-popover/95 px-3.5 py-1.5 text-xs backdrop-blur hover:brightness-110"
-          title="Zoom to the affected area"
-          onClick={() => {
-            const inc = powerIncidents[0]
-            if (!inc.center) return
-            mapRef.current?.flyToBounds(
-              L.latLng(inc.center[0], inc.center[1])
-                .toBounds(Math.max((inc.radius_km ?? 0) * 2600, 1200)),
-              { padding: [48, 48] })
-          }}>
-          <span className="font-semibold text-warning">⚡ Power-outage pattern</span>
-          <span className="text-muted-foreground">
-            {powerIncidents[0].count} devices · {powerIncidents[0].branches} independent feeds
-            · {(powerIncidents[0].radius_km ?? 0).toFixed(1)} km area
-            {powerIncidents[0].since && <> · {durationSince(powerIncidents[0].since)}</>}
-          </span>
-        </button>
-      )}
 
       {/* plant capture banners -------------------------------------------------
           Same pill as every other map mode, for the same reason: a map that has
