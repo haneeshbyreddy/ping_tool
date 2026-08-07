@@ -496,7 +496,7 @@ export function HomePage() {
           }${troubled.length > 2 ? `, and ${troubled.length - 2} more` : ""} need attention.` }
 
   return (
-    <div className="wisp-page flex flex-col gap-4 p-4 md:px-8 md:py-6">
+    <div className="wisp-page @container flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div className="flex items-center justify-between gap-4">
         {/* "Home", not "Overview": the superadmin's /overview platform page owns
             that word, and both were in the sidebar at once. */}
@@ -529,10 +529,18 @@ export function HomePage() {
           card each, so the two that are shouting have to compete with eight that
           are not. A tile reading zero is not news — it is the ABSENCE of news —
           so it collapses into one quiet strip below, where it remains readable
-          and clickable but costs no attention. */}
+          and clickable but costs no attention.
+
+          The grid is sized by CONTAINER queries, not viewport ones: it is as
+          likely to be living in half a window (split view) as in a whole one,
+          and `md:` asks the wrong box. The steps reproduce the old widths
+          exactly at every viewport — the container is the page box, so a 768px
+          `md:` viewport is a ~448px container — with ONE step added at @md,
+          because three tiles across 4 columns of a 600px pane truncate their
+          own titles. */}
       {loudStats.length > 0 && (
-        <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-4",
-          loudStats.length >= 5 && "xl:grid-cols-5")}>
+        <div className={cn("grid grid-cols-2 gap-3 @md:grid-cols-3 @2xl:grid-cols-4",
+          loudStats.length >= 5 && "@4xl:grid-cols-5")}>
           {loudStats.map((s) => <StatTile key={s.key} s={s} />)}
         </div>
       )}
@@ -567,7 +575,7 @@ export function HomePage() {
               </span>
             </div>
           </div>
-          <div className="grid gap-3 md:grid-cols-2 md:items-start xl:grid-cols-3">
+          <div className="grid gap-3 @md:grid-cols-2 @md:items-start @4xl:grid-cols-3">
             {staleNodes.map((n) => <StaleNodeCard key={n.node_id} node={n} />)}
             {activeOutages.map((o) => <OutageCard key={o.id} outage={o} />)}
             {visiblePostmortems.map((o) => <OutageCard key={o.id} outage={o} />)}
@@ -583,7 +591,7 @@ export function HomePage() {
         </div>
       )}
 
-      <div className="grid items-start gap-4 lg:grid-cols-[1.85fr_1fr]">
+      <div className="grid items-start gap-4 @2xl:grid-cols-[1.85fr_1fr]">
         <Panel title="Network" count={`${rankedDevices.length} devices`}
           action={{ label: "Topology", to: "/topology" }}>
           {devices.isLoading && <Skeleton className="m-4 h-32" />}

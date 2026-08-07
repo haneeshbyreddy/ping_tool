@@ -8,6 +8,8 @@ import { useIsMobile } from "@/hooks/use-mobile"
 import { billingApi } from "@/lib/api"
 import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
 import { NAV_ITEMS, MORE_ITEMS, NAV_GROUPS } from "./nav-items"
+import { useSplit } from "@/hooks/use-split-view"
+import { SplitControl, SplitView } from "./split-view"
 import { AlarmChips } from "./alarm-chips"
 import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
@@ -24,6 +26,7 @@ import { Button } from "@/components/ui/button"
 
 export function AppShell() {
   const { user, scopeOrg } = useAuth()
+  const split = useSplit()
   // Read-only worker: no Settings, no billing. On a phone it gets the survey
   // screen and nothing else (see FieldShell at the foot of this file).
   const isWorker = !!user && !user.is_superadmin && user.role === "worker"
@@ -184,7 +187,19 @@ export function AppShell() {
         </SidebarFooter>
       </Sidebar>
 
-      <SidebarInset>
+      {/* A SPLIT NEEDS A DEFINITE HEIGHT, and this is the only place that can
+          give it one. The shell's column is `min-h-svh` — a FLOOR, so it grows
+          to its content — and `flex: 1 1 0%` does NOT stop a flex item
+          contributing its content height to that intrinsic measurement (only to
+          its minimum during layout). With a page that sizes itself in `svh`
+          that is harmless, but a pane sizes its map with `height: 100%`, which
+          against an auto-height ancestor resolves to `auto`, i.e. back to
+          content: the two definitions chase each other and the whole shell
+          settled ~900px taller than the window, scrolling the panes off the
+          bottom. `h-svh` turns the floor into an exact height and the
+          percentage chain resolves. Applied ONLY while split, so the ordinary
+          layout keeps growing exactly as it always has. */}
+      <SidebarInset className={cn(split.view && "h-svh overflow-hidden")}>
         <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-3 border-b bg-background px-3 md:px-6">
           <SidebarTrigger className="hidden text-muted-foreground md:flex" />
           {/* No sidebar below md, so the workspace row (and, for a superadmin,
@@ -210,6 +225,12 @@ export function AppShell() {
             onClick={goToSearch}>
             <Search className="size-4" />
           </Button>
+          {/* Splitting the window is a statement about the WORKSPACE, not about
+              the org or the account, so it rides the top bar beside search
+              rather than the sidebar (which lists destinations) or the account
+              menu (which is per-person config). It hides itself outright on a
+              window too small for either layout. */}
+          <SplitControl />
           {/* Mobile only: the sidebar (and with it the account menu) is hidden
               below md, so this is the only identity surface there. On desktop it
               would be a second door to the same three actions. */}
@@ -226,9 +247,7 @@ export function AppShell() {
             : <BillingBanner billing={billing} org={billingOrg} />
         )}
 
-        <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
-          <Outlet />
-        </main>
+        <ShellMain />
 
         {/* Mobile bottom tab bar — More folds Settings/Logs, which get their own
             sidebar entries on desktop. */}
@@ -274,6 +293,29 @@ export function AppShell() {
         </nav>
       </SidebarInset>
     </SidebarProvider>
+  )
+}
+
+/** The page area.
+ *
+ *  With no split open this is the markup it has always been — `flex-1
+ *  overflow-y-auto`, one `<Outlet/>`, no wrapper — so the ordinary single-page
+ *  case cannot regress on a feature it isn't using. A split swaps the scroll
+ *  container for a fixed-height box, because each PANE scrolls itself: leaving
+ *  the scroll here would let the whole two-pane layout slide as one. */
+function ShellMain() {
+  const split = useSplit()
+  if (!split.view) {
+    return (
+      <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
+        <Outlet />
+      </main>
+    )
+  }
+  return (
+    <main className="min-h-0 flex-1 overflow-hidden pb-16 md:pb-0">
+      <SplitView><Outlet /></SplitView>
+    </main>
   )
 }
 

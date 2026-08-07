@@ -404,9 +404,9 @@ function DeviceForm({
 
   return (
     <Card ref={cardRef} className="border-primary/30">
-      <CardContent className="flex flex-col gap-3 px-4">
+      <CardContent className="@container flex flex-col gap-3 px-4">
         <p className="text-sm font-semibold">{editing ? `Edit: ${editing.name}` : "Add device"}</p>
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 @lg:grid-cols-2">
           <div className="flex flex-col gap-1.5">
             <Label>Name</Label>
             <Input placeholder="e.g. ap-ridge-09" value={form.name}
@@ -1210,14 +1210,14 @@ function DeviceRow({
         <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
           unassigned && "text-muted-foreground")}>{device.name}</span>
         {device.device_type && (
-          <span className="hidden shrink-0 text-xs text-faint-foreground lg:inline">{device.device_type}</span>
+          <span className="hidden shrink-0 text-xs text-faint-foreground @2xl:inline">{device.device_type}</span>
         )}
         {/* A row that renders away from its parent is the one place the tree
             stops showing where a device actually hangs — so it says so, right on
             the row. Two ways to get here: the operator lifted it (tree_detached),
             or it's plant, which lists below the gear it hangs off. */}
         {lifted && parentName && (
-          <span className="hidden min-w-0 shrink items-center gap-1 text-xs text-faint-foreground sm:inline-flex"
+          <span className="hidden min-w-0 shrink items-center gap-1 text-xs text-faint-foreground @sm:inline-flex"
             title={device.tree_detached === 1
               ? `Hangs off ${parentName}, shown at the top level for readability`
               : `Fed from ${parentName}. Passive plant lists below the gear.`}>
@@ -1240,13 +1240,15 @@ function DeviceRow({
           <div className="flex items-center justify-end gap-1.5">
             <DeviceAlarmChips device={device} hasOptics={hasOptics} openTab={openTab} />
           </div>
-          <DeviceOnuHealth device={device} hasOptics={hasOptics} openTab={openTab} />
+          <span className="hidden @3xl:inline-flex">
+            <DeviceOnuHealth device={device} hasOptics={hasOptics} openTab={openTab} />
+          </span>
           {/* min-w, not w: the RIGHT edge is what aligns, and a DEGRADED row
               carries "DEGRADED · 12 ms · 4% loss" which may not be truncated. */}
           <div className="flex min-w-[4.5rem] shrink-0 justify-end">
             <DeviceMetrics device={device} />
           </div>
-          <span className="hidden w-[8.5rem] shrink-0 text-right font-mono text-xs text-muted-foreground md:inline-block">
+          <span className="hidden w-[8.5rem] shrink-0 text-right font-mono text-xs text-muted-foreground @xl:inline-block">
             {device.ip_address}
           </span>
           {/* The capability cluster is 0–4 icons wide depending on what a box
@@ -1256,7 +1258,7 @@ function DeviceRow({
               different x (1448 / 1491 / 1518) purely from icon count. Its own
               fixed, right-justified box, so what a device supports can never
               move what every device reports. */}
-          <div className="flex w-[4.75rem] shrink-0 items-center justify-end gap-1.5">
+          <div className="hidden w-[4.75rem] shrink-0 items-center justify-end gap-1.5 @3xl:flex">
             <WebUiLiveIcon device={device} />
             <DeviceCapabilityIcons device={device} hasOptics={hasOptics} hasPorts={hasPorts} />
           </div>
@@ -1693,7 +1695,7 @@ export function TopologyPage() {
 
   type Ordered = OrgDevice & { depth: number; descendantCount: number }
   const renderList = (list: Ordered[]) => (
-    <Card className="gap-0 overflow-hidden py-0">
+    <Card className="@container gap-0 overflow-hidden py-0">
       {list.map((d) => (
         <Fragment key={d.id}>
           <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
@@ -1713,7 +1715,8 @@ export function TopologyPage() {
   // No drill-in placement to solve here any more: the open card's details render
   // in the page's side panel, so cards never reflow around an expanded block.
   const renderGrid = (list: Ordered[]) => (
-    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+    <div className="@container">
+      <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2 @4xl:grid-cols-3">
       {list.map((d) => (
         <Fragment key={d.id}>
           <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit}
@@ -1728,6 +1731,7 @@ export function TopologyPage() {
           )}
         </Fragment>
       ))}
+      </div>
     </div>
   )
 
@@ -1739,7 +1743,11 @@ export function TopologyPage() {
     // of them means you can't find the next device without closing the one
     // you're reading. Reading the live width is what keeps that gutter honest —
     // a hardcoded one would gap or overlap the moment the panel is resized.
-    <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6" style={panel.vars}>
+    // `wisp-tree-page` exists for one CSS rule (index.css, `[data-pane]`): in a
+    // split pane the floating device panel has to anchor to the PANE instead of
+    // the viewport. This element must stay UNPOSITIONED for that to work — the
+    // panel climbs past it to the pane, which is the box that doesn't scroll.
+    <div className="wisp-tree-page mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6" style={panel.vars}>
       <div className="wisp-panel-clear flex items-center justify-between">
         <h1 className="text-base font-semibold">Network</h1>
         <ViewToggle view={view} onChange={changeView} />
@@ -1966,7 +1974,7 @@ export function TopologyPage() {
           panel depends on. Dimming alone is enough. */}
       {openDevice && (
         <div aria-hidden
-          className="pointer-events-none fixed inset-0 z-[35] bg-black/25 dark:bg-black/45" />
+          className="wisp-tree-scrim pointer-events-none fixed inset-0 z-[35] bg-black/25 dark:bg-black/45" />
       )}
       {openDevice && (
         // Opaque, unlike the Map's panel: /95 + backdrop-blur is right over

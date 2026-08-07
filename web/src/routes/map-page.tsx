@@ -80,7 +80,7 @@ import { MapSearch, type OnuHit, type PlaceHit } from "@/map/search"
 import {
   CASING_OPACITY, CASING_OPACITY_HOVER, casingAt, lineScale, strokeAt,
 } from "@/map/stroke"
-import { FIT_PADDING, MapEvents, ViewController, loadView } from "@/map/view"
+import { FIT_PADDING, InvalidateOnResize, MapEvents, ViewController, loadView } from "@/map/view"
 import {
   trailStyle, workerCensus, workerIcon, workerPlaced, workerState, workerZIndex,
 } from "@/map/workers"
@@ -1770,9 +1770,15 @@ export function MapPage() {
   })
 
   return (
-    // header is h-14 (3.5rem); the mobile tab bar overlays the bottom ~4rem
+    // header is h-14 (3.5rem); the mobile tab bar overlays the bottom ~4rem.
+    //
+    // `--wisp-pane-h` is the SPLIT-VIEW override and is unset everywhere else,
+    // so the fallback below is the height this page has always had. A map is the
+    // one page here that must fill its box exactly rather than scroll, so it is
+    // also the one page that cannot be handed a viewport measurement when it is
+    // only getting half the viewport.
     <div ref={wrapRef} style={panel.vars} className={cn(
-      "wisp-map-wrap relative h-[calc(100svh-3.5rem-4rem)] md:h-[calc(100svh-3.5rem)]",
+      "wisp-map-wrap relative h-[var(--wisp-pane-h,calc(100svh-3.5rem-4rem))] md:h-[var(--wisp-pane-h,calc(100svh-3.5rem))]",
       (placingId != null || placingOnu != null) && "wisp-map-placing",
       lowZoom && "wisp-map-lowzoom",
     )}>
@@ -1798,6 +1804,7 @@ export function MapPage() {
         worldCopyJump
       >
         <AttributionPrefix />
+        <InvalidateOnResize />
         {googleActive ? (
           <GoogleLayer
             // dark and labels are in the key as well as the props: each styled

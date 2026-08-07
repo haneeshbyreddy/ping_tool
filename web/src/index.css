@@ -824,6 +824,14 @@
 @media (min-width: 48rem) {
   .wisp-device-panel {
     width: var(--wisp-panel-w, 26.25rem);
+    /* A ceiling the dragged width can never breach, in terms of whatever box the
+       panel is actually pinned to. Without it a width dragged on a wide window
+       (or restored from localStorage after one) is wider than the SPLIT PANE it
+       now lives in, and the panel hangs out over its neighbour. Doing it in CSS
+       rather than in the hook's clamp covers mount, resize and drag at once —
+       the hook cannot know which box it ended up in. Outside a split the
+       containing block is the viewport, so this is the same ceiling as before. */
+    max-width: calc(100% - 1.5rem);
   }
   /* Chrome that must not end up under the panel, off ONE measurement: the
      Network page reserves a gutter on its toolbar rows, the Map's top strip caps
@@ -1148,6 +1156,36 @@
    own chrome is INSIDE the wrapper, so its z-[1000] still wins over the panes. */
 .wisp-map-wrap {
   isolation: isolate;
+}
+
+/* SPLIT VIEW (components/layout/split-view.tsx). Everything here is scoped to
+   `[data-pane]` and so is inert until a split is actually open — the single-page
+   layout must not pay for a feature it isn't using.
+
+   The one thing a page can't do for itself is stop being anchored to the
+   VIEWPORT. The Network page floats its device panel with `position: fixed`,
+   which is right when the page owns the window and wrong the instant it owns
+   half of it: the panel would sail over the pane next door. `absolute` inside
+   the pane is the fix, and it lands correctly because of two deliberate
+   properties — `.wisp-tree-page` is unpositioned (so the panel climbs to the
+   pane), and the pane's outer box does NOT scroll (so an absolute child stays
+   put while the tree scrolls under it, which is the entire point of a floating
+   panel). The Map's panel is already `absolute` inside `.wisp-map-wrap` and is
+   untouched by this — hence the `.wisp-tree-page` scope rather than a blanket
+   rule on `.wisp-device-panel`, whose top offsets differ per page. */
+[data-pane] .wisp-tree-page .wisp-device-panel {
+  position: absolute;
+  /* The 4.25rem it uses against the viewport is clearing the app header. Inside
+     a pane the header is already above us, so this is just the pane's own inset
+     — the same 0.75rem gutter the panel keeps at its other three edges. */
+  top: 0.75rem;
+  bottom: auto;
+  max-height: calc(100% - 1.5rem);
+}
+/* Its scrim is `fixed inset-0` for the same reason, and left alone it would dim
+   the entire app — including the pane the panel isn't in, and the header. */
+[data-pane] .wisp-tree-scrim {
+  position: absolute;
 }
 .wisp-map-wrap:fullscreen {
   height: 100vh;

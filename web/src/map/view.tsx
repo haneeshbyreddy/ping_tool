@@ -54,6 +54,38 @@ export function MapEvents({ org, onMapClick, onMapContext, onZoom, onMoved }: {
   return null
 }
 
+/** Tells Leaflet its container changed size.
+ *
+ *  Leaflet measures its container on init and thereafter only on a WINDOW
+ *  resize, so anything that changes the map's box without resizing the window
+ *  leaves it painting tiles for its old size — the canvas keeps the old width
+ *  and the rest of the box renders empty. Three things here do exactly that:
+ *  collapsing the sidebar, opening or closing a SPLIT PANE, and dragging the
+ *  split divider. Only the first predates split view, which is why this was
+ *  never noticed: it takes a big step change to be obvious, and switching a
+ *  split from side-by-side to stacked is the biggest one there is.
+ *
+ *  Safe inside a ResizeObserver because `invalidateSize` re-reads the box and
+ *  redraws; it does not change the box, so it cannot feed itself. rAF-batched so
+ *  a divider DRAG costs one recalculation per frame rather than one per
+ *  observation, and `animate: false` because the map is not moving — its frame
+ *  is.
+ */
+export function InvalidateOnResize() {
+  const map = useMap()
+  useEffect(() => {
+    const el = map.getContainer()
+    let frame = 0
+    const ro = new ResizeObserver(() => {
+      if (frame) return
+      frame = requestAnimationFrame(() => { frame = 0; map.invalidateSize({ animate: false }) })
+    })
+    ro.observe(el)
+    return () => { if (frame) cancelAnimationFrame(frame); ro.disconnect() }
+  }, [map])
+  return null
+}
+
 export const FIT_PADDING: L.FitBoundsOptions = { padding: [56, 56], maxZoom: 15 }
 
 // One decision-maker for the viewport, INSIDE MapContainer (useMap — a ref on

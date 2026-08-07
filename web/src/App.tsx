@@ -4,6 +4,7 @@ import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { ErrorBoundary } from "@/components/error-boundary"
 import { AuthProvider } from "@/hooks/use-auth"
+import { SplitProvider } from "@/hooks/use-split-view"
 import { RequireAuth } from "@/components/layout/require-auth"
 import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
@@ -38,6 +39,12 @@ function App() {
         <AuthProvider>
           <TooltipProvider>
             <HashRouter>
+              {/* Above the routes, not inside AppShell: the shell has to READ
+                  the split state to size itself (a split needs a definite
+                  height, see ShellMain), and a provider it renders itself is one
+                  it cannot read. It sits inside HashRouter because swapping
+                  panes navigates the real router. */}
+              <SplitProvider>
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
                 <Route element={<RequireAuth />}>
@@ -70,6 +77,7 @@ function App() {
                   </Route>
                 </Route>
               </Routes>
+              </SplitProvider>
             </HashRouter>
             <Toaster />
           </TooltipProvider>

@@ -56,7 +56,7 @@ function OrgRow({ org }: { org: OverviewOrg }) {
         type="button"
         onClick={() => expandable && setOpen((o) => !o)}
         className={cn(
-          "grid w-full grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 px-4 py-2.5 text-left md:grid-cols-[minmax(10rem,1.4fr)_repeat(4,minmax(0,1fr))_auto] md:px-5",
+          "grid w-full grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 px-4 py-2.5 text-left @md:grid-cols-[minmax(10rem,1.4fr)_repeat(4,minmax(0,1fr))_auto] @md:px-5",
           expandable && "cursor-pointer transition-colors hover:bg-foreground/5",
         )}
       >
@@ -168,7 +168,7 @@ export function OverviewPage() {
   ]
 
   return (
-    <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">
+    <div className="wisp-page wisp-page--narrow @container flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Overview</h1>
         <p className="text-sm text-muted-foreground">
@@ -179,7 +179,7 @@ export function OverviewPage() {
 
       <ServerHealthCard />
 
-      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border @md:grid-cols-4">
         {stats.map((s) => (
           <div key={s.key} className="bg-card px-5 py-4">
             <p className="flex items-center gap-1.5 text-2xs font-medium tracking-wide text-muted-foreground uppercase">

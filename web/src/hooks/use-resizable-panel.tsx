@@ -102,9 +102,20 @@ export function useResizablePanel(opts: {
       },
       onPointerMove: (e) => {
         if (!resizing.current) return
-        // measured from the viewport's right edge, which is what the panel is
-        // pinned to — no sidebar or map offset enters into it
-        apply(window.innerWidth - e.clientX - PANEL_GUTTER)
+        // Measured from the panel's OWN right edge, which is the one thing that
+        // holds still during the drag whatever the panel is pinned to. It used
+        // to read `window.innerWidth`, which is the same number only while the
+        // panel spans the whole window — in a SPLIT PANE the panel is pinned to
+        // the pane's right edge instead, and measuring from the window's put the
+        // grip a whole neighbouring pane away from the cursor.
+        //
+        // `offsetParent` is the panel Card itself (the grip is absolutely
+        // positioned inside it, and the Card is positioned in every layout).
+        // With no offsetParent at all — display:none, or a fixed ancestor chain
+        // — the old viewport measurement is the right fallback.
+        const host = e.currentTarget.offsetParent as HTMLElement | null
+        const rightEdge = host ? host.getBoundingClientRect().right + PANEL_GUTTER : window.innerWidth
+        apply(rightEdge - e.clientX - PANEL_GUTTER)
       },
       onPointerUp: (e) => {
         if (!resizing.current) return
