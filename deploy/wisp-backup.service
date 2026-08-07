@@ -1,0 +1,25 @@
+# WISP central — consistent snapshot of the database + the git-ignored secrets.
+#
+# Everything this product cannot re-derive lives on one disk: `data/central.db` and the
+# three untracked files (`data/secret.key`, `data/central_session_secret`,
+# `deploy/central.env`). The code is on GitHub; this is the half that is not.
+#
+#   sudo cp deploy/wisp-backup.service deploy/wisp-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-backup.timer
+#   # one-off now:  sudo systemctl start wisp-backup.service
+#   # prove it:     .venv/bin/python tools/backup.py --verify
+#
+# Safe to run against a live server: `VACUUM INTO` takes a read lock and cannot observe a
+# half-applied transaction. It does NOT stop or pause central.
+[Unit]
+Description=WISP central — database + secrets snapshot
+After=wisp-central.service
+
+[Service]
+Type=oneshot
+User=haneeshbyreddy
+WorkingDirectory=/home/haneeshbyreddy/ping_tool
+ExecStart=/home/haneeshbyreddy/ping_tool/.venv/bin/python3 tools/backup.py --keep 14
+# A snapshot must never be the thing that fills the disk it is protecting.
+Nice=10
+IOSchedulingClass=idle

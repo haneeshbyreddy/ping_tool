@@ -1,0 +1,20 @@
+# Daily snapshot, plus one shortly after boot.
+#
+# Persistent=true is load-bearing: if the VM was off (or rebooted, as it did on
+# 2026-08-07) at the scheduled time, the run happens on the next boot instead of being
+# skipped. A backup schedule that silently skips is how a gap appears exactly around the
+# incident you wanted the backup for.
+#
+# 02:30 UTC = 08:00 IST — after the night's activity, before the operator's day.
+[Unit]
+Description=WISP central — daily database + secrets snapshot
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+OnBootSec=5min
+Persistent=true
+# Keep the snapshot off the exact minute every other cron-shaped thing fires.
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
