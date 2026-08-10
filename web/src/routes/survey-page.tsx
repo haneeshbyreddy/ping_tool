@@ -12,7 +12,7 @@ import { useGpsFix, GOOD_FIX_M, type GpsFix } from "@/hooks/use-gps-fix"
 import { usePonOptions } from "@/hooks/use-pon-options"
 import { inventoryApi, ApiError } from "@/lib/api"
 import {
-  SPLIT_RATIOS, isPassiveType,
+  isPassiveType,
   type OnuCoverageLocatedRow, type OnuCoverageRow, type OnuPlace, type OrgDevice,
 } from "@/lib/types"
 // The map's plant rules, shared rather than re-derived: the two surfaces must
@@ -24,6 +24,7 @@ import {
 import { NeedsOrg } from "@/components/needs-org"
 import { ShiftButton } from "@/components/field-tracking-card"
 import { PinAdjustMap } from "@/components/pin-adjust-map"
+import { SplitRatioField, type SplitRatio } from "@/components/split-ratio-field"
 import { Chip, StatusDot, type Tone } from "@/components/status-badge"
 import { ago } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -34,11 +35,9 @@ import { Skeleton } from "@/components/ui/skeleton"
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
-import { Segmented } from "@/components/ui/segmented"
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 
 /** Radix refuses an empty Select value, and "not recorded" is a real answer. */
-const NO_RATIO = "__none__"
 const NO_FEEDER = "__nofeeder__"
 const NO_PON = "__nopon__"
 /** The only plant kind an operator may create — see `plant.ts:PLANT_KINDS`. */
@@ -720,7 +719,7 @@ function CaptureSheet({ target, onClose, onDone, placed, devices, fieldOnly, org
   const { fix, phase, error, start, reset } = useGpsFix()
   const [name, setName] = useState("")
   const [phone, setPhone] = useState("")
-  const [ratio, setRatio] = useState<string>(NO_RATIO)
+  const [split, setSplit] = useState<SplitRatio>({ ratio: null, inputs: null })
   // The box this one hangs off. OWNER-ONLY, and that is a capability limit
   // rather than a screen one: `field-passive` deliberately cannot set a parent
   // (it is the one worker-reachable route that adds an `org_devices` row, and
@@ -764,7 +763,7 @@ function CaptureSheet({ target, onClose, onDone, placed, devices, fieldOnly, org
     // Same default as the map sheet, for the same reason: a splitter that
     // splits nothing is not a thing anyone stocks. "None" stays reachable —
     // an unrecorded ratio is a real answer and must never be guessed.
-    setRatio(target?.kind === "passive" ? "8" : NO_RATIO)
+    setSplit({ ratio: target?.kind === "passive" ? 8 : null, inputs: null })
     setFeederId(null); setFeederTouched(false)
     setPon(""); setPonTouched(false)
     // The subscriber's details start from whatever was recorded before — these
@@ -823,6 +822,7 @@ function CaptureSheet({ target, onClose, onDone, placed, devices, fieldOnly, org
           name: body.name, ip_address: "", device_type: body.device_type,
           region, tags: [], parent_device_id: parentId,
           pon_port: pon, split_ratio: body.split_ratio ? Number(body.split_ratio) : null,
+          split_inputs: body.split_inputs ?? null,
         })
         return { id, wired: true }
       } catch {
@@ -955,7 +955,8 @@ function CaptureSheet({ target, onClose, onDone, placed, devices, fieldOnly, org
           name: name.trim(), device_type: PLANT_KIND,
           lat: coords.lat, lng: coords.lng,
           accuracy_m: coords.accuracy, source: coords.source,
-          split_ratio: ratio === NO_RATIO ? null : ratio,
+          split_ratio: split.ratio ? String(split.ratio) : null,
+          split_inputs: split.inputs,
           // Region and PON ride the FIRST call as well as the follow-up, even
           // though the update would write them anyway: if the parent write is
           // the half that fails, everything it could have carried is already
@@ -1138,16 +1139,7 @@ function CaptureSheet({ target, onClose, onDone, placed, devices, fieldOnly, org
                   sheet, so one splitter recorded two ways comes out the same. */}
               <div className="flex flex-col gap-1.5">
                 <Label>Split ratio</Label>
-                <Segmented
-                  className="w-full"
-                  value={ratio}
-                  onChange={setRatio}
-                  options={[
-                    ...SPLIT_RATIOS.map((r) => ({ value: String(r), label: `1:${r}` })),
-                    { value: NO_RATIO, label: "None",
-                      title: "A box that only splices has no ratio, and an unknown one must not be guessed" },
-                  ]}
-                />
+                <SplitRatioField value={split} onChange={setSplit} />
               </div>
 
               <div className="flex flex-col gap-1.5">

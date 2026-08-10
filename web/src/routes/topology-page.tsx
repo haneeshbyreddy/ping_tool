@@ -9,7 +9,8 @@ import { useNow } from "@/hooks/use-now"
 import { usePonOptions } from "@/hooks/use-pon-options"
 import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
 import { billingApi, gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
-import { DEVICE_TYPES, SPLIT_RATIOS, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
+import { DEVICE_TYPES, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
+import { SplitRatioField } from "@/components/split-ratio-field"
 import { oltHead, ponOptions } from "@/map/plant"
 import { DOT as ONU_DOT, onuSev } from "@/components/optical-panel"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
@@ -250,14 +251,14 @@ interface DeviceFormState {
   snmp_port: string
   gpon_vendor: string
   pon_port: string
-  /** passive plant only, as a string for the Select ("" = not recorded) */
+  /** passive plant only, as a string ("" = not recorded) */
   split_ratio: string
+  /** passive plant only: fibres feeding it, as a string ("" = one) */
+  split_inputs: string
   /** OLT only, as a string for the Select ("" = not set → the global cap) */
   onu_pon_limit: string
 }
 
-// Radix refuses an empty SelectItem value, so "not recorded" needs a sentinel
-const NO_SPLIT = "__none__"
 // …and "not recorded" on the PON-port Select, for the same reason
 const NO_PON = "__nopon__"
 // …and so does "not set" on the PON-type Select, for the same reason
@@ -277,7 +278,7 @@ const EMPTY_FORM: DeviceFormState = {
   name: "", ip_address: "", device_type: "", region: "", tags: [],
   parent_device_id: "",
   assigned_node_id: "", snmp_enabled: false, snmp_community: "", snmp_port: "161",
-  gpon_vendor: "", pon_port: "", split_ratio: "", onu_pon_limit: "",
+  gpon_vendor: "", pon_port: "", split_ratio: "", split_inputs: "", onu_pon_limit: "",
 }
 
 function DeviceForm({
@@ -300,6 +301,7 @@ function DeviceForm({
     gpon_vendor: editing.gpon_vendor ?? "",
     pon_port: editing.pon_port ?? "",
     split_ratio: editing.split_ratio ? String(editing.split_ratio) : "",
+    split_inputs: editing.split_inputs ? String(editing.split_inputs) : "",
     onu_pon_limit: editing.onu_pon_limit ? String(editing.onu_pon_limit) : "",
   } : { ...EMPTY_FORM })
   const [error, setError] = useState("")
@@ -370,6 +372,9 @@ function DeviceForm({
         // "not recorded", so leaving it out would clear a ratio set from the
         // splitter's own panel every time somebody renamed the box here.
         split_ratio: passive && form.split_ratio ? Number(form.split_ratio) : null,
+        // Same rule, same reason: an absent key reads as "one input", so a
+        // rename here would quietly downgrade a 2:16 recorded on the map.
+        split_inputs: passive && form.split_inputs ? Number(form.split_inputs) : null,
       }
       if (editing) {
         await inventoryApi.update(editing.id, payload)
@@ -471,16 +476,16 @@ function DeviceForm({
           {passive && (
             <div className="flex flex-col gap-1.5">
               <Label>Split ratio (optional)</Label>
-              <Select value={form.split_ratio || NO_SPLIT}
-                onValueChange={(v) => setForm({ ...form, split_ratio: v === NO_SPLIT ? "" : v })}>
-                <SelectTrigger><SelectValue placeholder="Not recorded" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NO_SPLIT}>Not recorded</SelectItem>
-                  {SPLIT_RATIOS.map((r) => (
-                    <SelectItem key={r} value={String(r)}>1:{r}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <SplitRatioField
+                value={{
+                  ratio: form.split_ratio ? Number(form.split_ratio) : null,
+                  inputs: form.split_inputs ? Number(form.split_inputs) : null,
+                }}
+                onChange={(next) => setForm({
+                  ...form,
+                  split_ratio: next.ratio ? String(next.ratio) : "",
+                  split_inputs: next.inputs ? String(next.inputs) : "",
+                })} />
             </div>
           )}
           <div className="flex flex-col gap-1.5">

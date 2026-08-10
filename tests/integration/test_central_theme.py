@@ -139,10 +139,44 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertLess(html.index('id="wisp-theme"'), html.index("</head>"))
 
     def test_stock_install_injects_nothing(self):
-        status, raw = self._req("GET", "/app")
+        for path in ("/app", "/"):
+            status, raw = self._req("GET", path)
+            self.assertEqual(status, 200)
+            html = raw.decode("utf-8") if isinstance(raw, bytes) else json.dumps(raw)
+            self.assertNotIn('<style id="wisp-theme">', html, path)
+
+    def test_the_marketing_page_is_themed_too(self):
+        """`/` shipped its own hardcoded palette, so repainting the product left
+        the front door on the old colours. It reads the same injected block the
+        SPA does — see landing.html's --lp-* layer for the consuming half, and
+        test_theme.py:LandingArtifactTest for what keeps that half honest."""
+        cookie = self._login("root", "rootpassword")
+        self._req("POST", "/api/admin/settings",
+                  {"theme_overrides": {"dark": {"--background": "#141414",
+                                                "--card": "#1f1f1f",
+                                                "--primary": "#6196a5"}}},
+                  cookie=cookie)
+        status, raw = self._req("GET", "/")
         self.assertEqual(status, 200)
         html = raw.decode("utf-8") if isinstance(raw, bytes) else json.dumps(raw)
-        self.assertNotIn("wisp-theme", html)
+        self.assertIn('<style id="wisp-theme">', html)
+        self.assertIn("--background:#141414;", html)
+        self.assertLess(html.index('id="wisp-theme"'), html.index("</head>"))
+
+    def test_a_light_only_palette_leaves_the_marketing_page_alone(self):
+        """The page is `<html class="dark">`, so it takes the dark half and only
+        the dark half. Getting this backwards is the regression that blew out
+        dark mode in the SPA — there it showed as light text on white, here it
+        would be a black-on-black front door."""
+        cookie = self._login("root", "rootpassword")
+        self._req("POST", "/api/admin/settings",
+                  {"theme_overrides": {"light": {"--background": "#ffffff"}}},
+                  cookie=cookie)
+        status, raw = self._req("GET", "/")
+        self.assertEqual(status, 200)
+        html = raw.decode("utf-8") if isinstance(raw, bytes) else json.dumps(raw)
+        self.assertIn(":root:not(.dark){--background:#ffffff;}", html)
+        self.assertNotIn(":root.dark{", html)
 
     def test_hostile_stored_value_cannot_escape_the_style_element(self):
         """Defence in depth: even with a bad row written straight to the DB

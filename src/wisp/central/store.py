@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from wisp.central import fiber
 from wisp.central.store_assign import AssignmentStoreMixin
 from wisp.central.store_orgs import OrgStoreMixin
 from wisp.central.store_users import UserStoreMixin
@@ -380,18 +381,23 @@ CREATE INDEX IF NOT EXISTS idx_org_device_links_parent ON org_device_links(org_i
 -- stay implicit (the device pins), so moving a pin rubber-bands the route instead
 -- of orphaning it. Dashboard-side only; the edge never sees geometry.
 --
--- `color`/`label_pos` are the operator's cartography, NOT state: a colour is a
--- name from inventory.LINK_COLORS (a closed palette, deliberately no free hex —
--- see there) and only ever paints a HEALTHY line, and label_pos is a 0..1
--- fraction along the rendered path. They live here rather than in a second table
--- because the key is already exactly "one link" — the same reason routes do.
+-- `cable_id`/`core_no`/`cores` are ALL DEAD, and so is `color` (2026-08-08). They
+-- are the fossil record of three earlier answers to "which glass is this span": a
+-- decorative tint operators used to group spans by drum, then a fibre count on the
+-- span itself, then a membership pointing at a cable. Fibre is its own graph now
+-- (see _FIBRE_SCHEMA) and none of them is read. Left in place rather than migrated
+-- away, the ntfy-topics convention — but note that a dead column with a REFERENCES
+-- clause is NOT inert: `cable_id` pinned cables it named and made them undeletable
+-- until the rebuild cleared it. What survives here is CARTOGRAPHY: `label_pos`, an
+-- operator's 0..1 fraction along the rendered path, and the waypoints above.
+
 CREATE TABLE IF NOT EXISTS link_routes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     org_id     TEXT NOT NULL,
     child_id   INTEGER NOT NULL REFERENCES org_devices(id),
     parent_id  INTEGER NOT NULL REFERENCES org_devices(id),
     waypoints  TEXT NOT NULL,            -- JSON [[lat,lng],...]
-    color      TEXT,                     -- LINK_COLORS name; NULL = tone default
+    color      TEXT,                     -- DEAD since 2026-08-08; see above
     label_pos  REAL,                     -- 0..1 along the path; NULL = midpoint
     updated_at TEXT NOT NULL,
     updated_by TEXT,
@@ -929,6 +935,126 @@ CREATE INDEX IF NOT EXISTS idx_worker_locations_ts
     ON worker_locations(org_id, user_id, ts);
 """
 
+# THE FIBRE PLANT, kept apart from `_SCHEMA` because `_rebuild_fibre_plant` has to
+# re-execute exactly this after dropping it. Two statements of one DDL is how a
+# rebuilt table silently ends up one column behind the one a fresh install gets.
+#
+# THE MODEL (2026-08-09, the ISPs' own words): *fibre runs between two couplers, and
+# at a coupler you join cable to cable, or take a core out to a device on a single
+# fibre* — plus *any core may carry anything, including a customer line*, and so *a
+# customer point is a coupler too*.
+#
+# What that replaced was a graph nothing stored. A `run` was (cable, core, device A,
+# device B), so glass could only be recorded between two BOXES; the closure where the
+# sheath is actually opened was a derived projection (`org_cable_taps`); and a cable
+# had no ends of its own. `org_cable_runs`, `org_cable_taps` and `org_splices` are
+# GONE, and with them `fiber.core_path` — a core of a segment has exactly two ends,
+# so the double booking that checker existed to catch is now unrepresentable rather
+# than merely absent.
+_FIBRE_SCHEMA = """
+-- A CABLE: one sheath SEGMENT, with two ENDS THAT ARE RECORDED.
+--
+-- That is the whole change. A cable knows where it starts and stops, so core N of it
+-- runs end to end BY DEFINITION and there is nothing left to write down about the
+-- run. Opening a sheath at a new closure SPLITS it into two cables and splices every
+-- core straight through (`cablepath.split`), which is what the crew physically does
+-- — and it is what keeps segment-per-span from being a tax on tapping a street.
+--
+-- AN END IS A FIBRE POINT: a device (an OLT, a switch, a splitter, or one of the
+-- passive joint boxes) OR a subscriber. Deliberately not a third registry of places:
+-- passive plant already lives in `org_devices` and subscribers in `onu_places`, and
+-- a customer had to become a possible end because these operators daisy-chain a lane
+-- — core 1 into this house, cores 2-4 onward to the next three. Hence a nullable
+-- PAIR per end with exactly one side set: the device FK is what makes deleting a box
+-- take its cable with it, and a MAC is what a subscriber is keyed on everywhere else
+-- (`onu_places` is keyed (org, mac) and has no stable id to point at).
+--
+-- Deliberately NOT a device: no state, no FSM, no outage, absent from
+-- org_device_topology, read by no alerting shell. Recording fibre can never re-page
+-- a fleet — the standing a splitter's split ratio has, and the reason this whole
+-- surface is safe to hand to an operator mid-survey.
+--
+-- `path` IS THE GLASS ON THE GROUND and it is COMPLETE, first vertex to last —
+-- unlike `link_routes.waypoints`, which omits its ends because those are two device
+-- pins and the line must rubber-band when one is dragged. A cable ends wherever the
+-- glass does. Which end of `path` belongs to `a` is NOT stored: `cablepath.orient`
+-- measures it, so a cable drawn backwards still draws correctly and a retrace cannot
+-- silently flip it.
+CREATE TABLE IF NOT EXISTS org_cables (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT NOT NULL,
+    name        TEXT NOT NULL,       -- required: a sheath nobody can name is not an object
+    cores       INTEGER,             -- fiber.FIBER_COUNTS; NULL = unsurveyed
+    path        TEXT,                -- JSON [[lat,lng],...] COMPLETE; NULL = untraced
+    a_device_id INTEGER REFERENCES org_devices(id),
+    a_mac       TEXT,                -- exactly one of a_device_id / a_mac
+    b_device_id INTEGER REFERENCES org_devices(id),
+    b_mac       TEXT,                -- …and the two ends may not be the same point
+    notes       TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_org_cables_org ON org_cables(org_id);
+CREATE INDEX IF NOT EXISTS idx_org_cables_a ON org_cables(org_id, a_device_id);
+CREATE INDEX IF NOT EXISTS idx_org_cables_b ON org_cables(org_id, b_device_id);
+
+-- WHAT EACH FIBRE CARRIES. Sparse: a row exists only for a core somebody has written
+-- something against, because the whole point of this schema is that an unrecorded
+-- core stays unrecorded rather than being claimed as spare.
+--
+-- Free text on purpose. A real core register reads "BSNL leased line", "village A
+-- tower", "reserved for the new OLT" — a mixture of destinations, customers and
+-- intentions no closed vocabulary survives contact with. Where a core GOES is
+-- derived (`fiber.trace`) and never typed here: what a core carries is the operator's
+-- claim, where it runs is the record's.
+CREATE TABLE IF NOT EXISTS org_cable_cores (
+    org_id     TEXT NOT NULL,
+    cable_id   INTEGER NOT NULL REFERENCES org_cables(id),
+    core_no    INTEGER NOT NULL,
+    label      TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    PRIMARY KEY (cable_id, core_no)
+);
+CREATE INDEX IF NOT EXISTS idx_org_cable_cores_org ON org_cable_cores(org_id);
+
+-- A JOINT: at this point, this fibre is joined to that one — or taken out to the
+-- equipment standing here.
+--
+-- ONE TABLE FOR BOTH because they are the same kind of statement (this fibre ends
+-- here, in this way) and because they consume a fibre end identically: one fibre
+-- joins exactly one fibre, whether the other side is another strand or an OLT's PON
+-- port. `b_cable_id IS NULL` is the termination, and it is the ONLY way a core is
+-- attached to a box — which is why a device connection needs no table of its own.
+--
+-- The POINT is the same nullable pair the cable's ends are, and it must be one of
+-- BOTH cables' own ends (`fiber.joint_refusal` → `absent`): a strand passing a
+-- closure it was never cut at is not available to be joined there.
+--
+-- Canonical (a_cable, a_core) < (b_cable, b_core) so one splice is one row whichever
+-- fibre the operator picked up first — the rule cross-links and the old runs kept.
+CREATE TABLE IF NOT EXISTS org_fibre_joints (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER REFERENCES org_devices(id),   -- the point: exactly one of
+    mac        TEXT,                                 -- device_id / mac is set
+    a_cable_id INTEGER NOT NULL REFERENCES org_cables(id),
+    a_core_no  INTEGER NOT NULL,
+    b_cable_id INTEGER REFERENCES org_cables(id),    -- NULL = terminates into the
+    b_core_no  INTEGER,                              -- equipment at this point
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_org ON org_fibre_joints(org_id);
+CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_device ON org_fibre_joints(org_id, device_id);
+CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_mac ON org_fibre_joints(org_id, mac);
+CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_a ON org_fibre_joints(a_cable_id);
+CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_b ON org_fibre_joints(b_cable_id);
+"""
+
+
 class CentralStore(
     OrgStoreMixin,
     UserStoreMixin,
@@ -959,6 +1085,14 @@ class CentralStore(
         with self._connect() as conn:
             self._migrate_tenant_to_org(conn)
             conn.executescript(_SCHEMA)
+            # BEFORE the fibre DDL, not after: on an upgraded DB `org_cables`
+            # still has its old shape, so `CREATE TABLE IF NOT EXISTS` is a no-op
+            # and the indexes beside it name columns that do not exist yet. The
+            # rebuild drops the old table and runs the same script itself; the
+            # second call is then the idempotent safety net for every DB that has
+            # already been through it.
+            self._rebuild_fibre_plant(conn)
+            conn.executescript(_FIBRE_SCHEMA)
             self._ensure_columns(conn, "orgs", (
                 ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_worker", "TEXT"),
                 # Map view viewport lock; a key from the dashboard's region list
@@ -1061,12 +1195,22 @@ class CentralStore(
                 # passive plant only (splitter/fdb/closure): which PON it serves
                 ("pon_port", "TEXT"),
                 # passive plant only: how many ways this box splits the fibre —
-                # inventory.SPLIT_RATIOS, the 1:2 / 1:4 / 1:8 the field actually
+                # inventory.SPLIT_RATIOS, the 1:2 … 1:16 the field actually
                 # stocks. NULL = not recorded (an FDB or closure that only
                 # splices). Drives the recorded-load bar and the cumulative
                 # split down a cascade; NOT an occupancy claim on its own, since
                 # a leg nobody recorded is unknown, not free.
                 ("split_ratio", "INTEGER"),
+                # passive plant only: how many fibres FEED the box — 2 for a
+                # protection-input splitter (a 2:16), NULL for the ordinary
+                # single-input form. NULL means ONE here, not "unrecorded": every
+                # splitter predating this column was already rendered "1:N" by a
+                # label that assumed one input, so a gap reading would mark the
+                # whole live plant record incomplete overnight. Says nothing
+                # about whether that input is CONNECTED — that is
+                # org_device_links, and keeping the two apart is what lets a
+                # panel say "two inputs, one feed recorded".
+                ("split_inputs", "INTEGER"),
                 # OLT only: per-PON ONU cap override (NULL = cfg.onu_pon_limit, the
                 # EPON 1:64 default); a 1:128 GPON box raises it so it never
                 # false-pages "at capacity" (central/onualert.py)
@@ -1115,9 +1259,24 @@ class CentralStore(
             # that already created it (Phase 1) needs the column backfilled.
             self._ensure_columns(conn, "device_webui_credentials", (
                 ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
-            # Link styling landed after the table shipped as geometry-only.
+            # `label_pos` is the operator's cartography — where the chip rides
+            # along the rendered path — and it is all that is left of what this
+            # row once tried to say about plant. `color`/`cores`/`core_no`/
+            # `cable_id` were the three earlier answers to "which glass is this
+            # span"; a DB that already has them keeps them, unread, but a fresh
+            # one is NOT given them. That is the one departure from the
+            # park-the-column convention, and `cable_id` is why: a dead column
+            # carrying a REFERENCES clause still pins its parent row, which is
+            # exactly how a cable became undeletable in the field.
             self._ensure_columns(conn, "link_routes", (
                 ("color", "TEXT"), ("label_pos", "REAL")))
+            # A subscriber's drop got geometry the same day the cable did. Same
+            # shape as link_routes.waypoints — intermediate vertices only, JSON,
+            # running SPLITTER → ONU — and the same payoff: a traced drop stops
+            # being drawn dotted, because the dash on this map means "nobody
+            # surveyed this" and somebody just did.
+            self._ensure_columns(conn, "onu_drops", (
+                ("waypoints", "TEXT NOT NULL DEFAULT '[]'"),))
             # LOCATING an ONU and VOUCHING for its power supply became two
             # different claims when the field survey shipped (2026-07-28). Until
             # then the table held only the latter, so placing WAS the claim and
@@ -1272,6 +1431,70 @@ class CentralStore(
         # 'worker' with the collapse, so a bare `admin create-user` wrote it too).
         conn.execute(
             "UPDATE users SET role='owner' WHERE org_id IS NULL AND role!='owner'")
+
+
+    @staticmethod
+    def _rebuild_fibre_plant(conn) -> None:
+        """Throw the recorded cable away and rebuild the table around the coupler.
+
+        THIS IS A DELIBERATE, ONE-TIME DATA LOSS, and it is the operators' own
+        decision (2026-08-09). They corrected the model — fibre runs between two
+        couplers, a core may carry anything including a customer, so a customer
+        point is a coupler too — and when told that carrying the old span-based
+        logic alongside the new one would leave the module twice the size, they
+        said to clear it and lay it again. Every reader here should know that the
+        alternative was considered: a migration could have guessed a cable's ends
+        from the runs on it, but a guessed end is a closure a crew drives to, and
+        that is the one thing this subsystem must never invent.
+
+        What is destroyed is the fibre RECORD: cables, runs, taps, splices, core
+        labels, and the span geometry that only ever existed to draw them. What is
+        NOT touched, because it is what a survey actually costs to collect:
+        `org_devices` (every pin, ratio, parent and tag), `onu_places` (every
+        customer pin, name and number) and `onu_drops` (which splitter leg feeds
+        which customer — a different fact from which glass carries it, and the
+        input branch-fault localization runs on).
+
+        ORDER IS EVERYTHING, because `_connect` runs `PRAGMA foreign_keys=ON` and
+        every one of these points at `org_cables(id)`. `link_routes.cable_id` is in
+        that list although the column is DEAD — a dead column with a REFERENCES
+        clause still pins its parent, which is exactly how a migrated cable became
+        undeletable in the field. So: children, then the pointer in `link_routes`,
+        then the table itself.
+
+        Guarded by a marker in `app_settings` rather than by "are there any cables
+        yet", for the reason every migration here is: the operator's next act is to
+        record cables, and a data-shaped guard would wipe them again on the next
+        restart.
+        """
+        done = conn.execute(
+            "SELECT 1 FROM app_settings WHERE key='fibre_plant_rebuilt'").fetchone()
+        if done:
+            return
+        conn.execute("INSERT INTO app_settings (key, value)"
+                     " VALUES ('fibre_plant_rebuilt', ?)", (_now_iso(),))
+        have = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        # Children first — including the two that only ever existed to reconstruct
+        # a graph the cable now stores itself.
+        for table in ("org_splices", "org_cable_runs", "org_cable_taps",
+                      "org_cable_cores", "org_fibre_joints"):
+            if table in have:
+                conn.execute(f"DELETE FROM {table}")
+        for table in ("org_splices", "org_cable_runs", "org_cable_taps"):
+            if table in have:
+                conn.execute(f"DROP TABLE {table}")
+        if "link_routes" in have:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(link_routes)")}
+            if "cable_id" in cols:
+                conn.execute("UPDATE link_routes SET cable_id=NULL")
+            # The per-span route editor went in the same session the cable got a
+            # route of its own, so any waypoints left here are geometry with no
+            # way to edit them. Cartography (`label_pos`) is kept.
+            conn.execute("UPDATE link_routes SET waypoints='[]'")
+        if "org_cables" in have:
+            conn.execute("DROP TABLE org_cables")
+        conn.executescript(_FIBRE_SCHEMA)
 
 
     @staticmethod

@@ -930,9 +930,39 @@ class SnmpStoreMixin:
         normalizer and it does not get a second spelling inside a query."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT mac, passive_id, created_at, updated_at FROM onu_drops"
+                "SELECT mac, passive_id, waypoints, created_at, updated_at"
+                " FROM onu_drops"
                 " WHERE org_id=? ORDER BY passive_id, mac", (org_id,)).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            # Same tolerance list_link_routes keeps: a route is presentation, and
+            # a row somebody hand-edited must degrade to "not traced" rather than
+            # take the map down with it.
+            try:
+                d["waypoints"] = json.loads(d["waypoints"] or "[]")
+            except (TypeError, ValueError):
+                d["waypoints"] = []
+            out.append(d)
+        return out
+
+    def set_onu_drop_route(self, org_id: str, mac: str,
+                           waypoints: list[list[float]]) -> bool:
+        """Trace (or straighten) one subscriber's drop cable.
+
+        Writes ONLY the geometry, onto a drop that must already exist: the row IS
+        the record of which splitter feeds this customer, and a route with no
+        anchor to start from would be a path drawn from nowhere. An empty list
+        straightens it back — the drop reverts to the dotted chord and stops
+        claiming to be surveyed. Returns False when no drop is recorded, which
+        the route reports rather than repairing by inventing an attachment."""
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE onu_drops SET waypoints=?, updated_at=?"
+                " WHERE org_id=? AND mac=?",
+                (json.dumps(waypoints), _now_iso(), org_id, mac))
+            conn.commit()
+            return cur.rowcount > 0
 
     def onu_drop_map(self, org_id: str) -> dict[str, int]:
         """Just MAC -> passive_id. The shape every read path actually wants."""
@@ -948,15 +978,24 @@ class SnmpStoreMixin:
         exactly once, or one sticker inflates a splitter's recorded load.
 
         Re-attaching MOVES the drop: a subscriber comes off exactly one box, so
-        there is nothing to merge and the newest statement wins."""
+        there is nothing to merge and the newest statement wins.
+
+        …and a move DISCARDS the traced route, because that path was drawn to the
+        box the customer no longer hangs off. Keeping it would leave a solid line
+        — this map's word for "surveyed" — running to the wrong splitter, which
+        is worse than the dotted chord it falls back to. Guarded on the passive
+        actually CHANGING, so re-saving the same box (the bulk dialog's normal
+        idempotent write) never destroys a traced drop."""
         if not macs:
             return 0
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             conn.executemany(
-                "INSERT INTO onu_drops (org_id, mac, passive_id, created_at,"
-                " updated_at) VALUES (?,?,?,?,?)"
+                "INSERT INTO onu_drops (org_id, mac, passive_id, waypoints,"
+                " created_at, updated_at) VALUES (?,?,?,'[]',?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET"
+                " waypoints=CASE WHEN passive_id != excluded.passive_id"
+                "   THEN '[]' ELSE waypoints END,"
                 " passive_id=excluded.passive_id, updated_at=excluded.updated_at",
                 [(org_id, m, passive_id, now, now) for m in macs])
             conn.commit()

@@ -43,7 +43,12 @@ export function subPath(path: Array<[number, number]>, d0: number, d1: number): 
     Returns null when no placed splitter serves the port — no fake geometry. */
 export function ponPath(
   olt: Placed, port: string | null, devices: OrgDevice[],
-  routeByKey: Map<string, Array<[number, number]>>,
+  // The rich geometry map: `pts` is what is DRAWN, which since 2026-08-09 may
+  // be the stretch of a traced CABLE the span borrows rather than its own
+  // trace. The cut bracket should follow whichever the map draws — it is the
+  // same glass, and a bracket measured along a chord under a line drawn along
+  // the street would put the ✕ somewhere the operator can see it isn't.
+  routeByKey: Map<string, { pts: Array<[number, number]> }>,
 ): Array<[number, number]> | null {
   const path: Array<[number, number]> = [[olt.lat, olt.lng]]
   const seen = new Set<number>([olt.id])
@@ -57,7 +62,7 @@ export function ponPath(
       && (first ? d.pon_port === port : (d.pon_port === port || d.pon_port == null)))
     const next = kids.find((d) => routeByKey.has(`${d.id}:${cur.id}`)) ?? kids[0]
     if (!next) break
-    const wps = routeByKey.get(`${next.id}:${cur.id}`) ?? []
+    const wps = routeByKey.get(`${next.id}:${cur.id}`)?.pts ?? []
     path.push(...wps, [next.lat, next.lng])
     seen.add(next.id)
     cur = next

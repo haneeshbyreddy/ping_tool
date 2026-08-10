@@ -314,6 +314,37 @@ export function refHasChip(p: OnuPlace): boolean {
   return isRefDark(p) || refHasRate(p)
 }
 
+/** Where a drop's chip sits: the midpoint of the line as DRAWN.
+ *
+ *  On an untraced drop that is the chord's midpoint, as it always was. On a
+ *  traced one it is the midpoint of the walked path, which can be a long way
+ *  from the chord's — a drop that runs to the end of a lane and back is metres
+ *  from the straight line between its two ends.
+ *
+ *  ONE function because two callers need the same answer for different reasons:
+ *  the render puts the chip there, and the shared screen-space budget reserves
+ *  its box there. Those diverging is how a budget reports itself clear over a
+ *  visible collision — the exact failure the single shared reservation exists to
+ *  prevent — so the two may not each compute it.
+ *
+ *  Deliberately the geometric midpoint of the SEGMENT LIST rather than the
+ *  half-way point by distance: this is a label position on a short span, not a
+ *  measurement, and `pointAlong` would pull in the whole distance machinery to
+ *  move a chip by a few pixels. */
+export function refChipPos(
+  from: { lat: number; lng: number }, p: OnuPlace,
+): [number, number] {
+  const pts: Array<[number, number]> = [
+    [from.lat, from.lng], ...(p.drop_waypoints ?? []), [p.lat, p.lng],
+  ]
+  const mid = (pts.length - 1) / 2
+  const i = Math.floor(mid)
+  const t = mid - i
+  const [alat, alng] = pts[i]
+  const [blat, blng] = pts[Math.min(i + 1, pts.length - 1)]
+  return [alat + (blat - alat) * t, alng + (blng - alng) * t]
+}
+
 export function refBwIcon(p: OnuPlace): L.DivIcon | null {
   // Null, not an empty chip: the MARKER must not render at all, or the plate's
   // own border draws a blank pill on the line — which is the thing being

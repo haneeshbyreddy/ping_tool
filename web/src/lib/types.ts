@@ -132,12 +132,27 @@ export const DEVICE_TYPES = [
  *  `map/plant.ts:PLANT_KINDS`, narrowed to `splitter`. Removing a type from
  *  HERE would promote any existing row of that type to monitored gear, complete
  *  with an FSM and the ability to page, which is why the two lists are separate. */
-export const PASSIVE_DEVICE_TYPES = ["splitter", "fdb", "closure"] as const
+export const PASSIVE_DEVICE_TYPES = ["splitter", "coupler", "fdb", "closure"] as const
 /** How many ways a passive splits the fibre. CLOSED, and matching
  *  `inventory.SPLIT_RATIOS` on the server — only what an ISP actually stocks,
  *  because the ratio feeds the load bar and the cumulative split down a
  *  cascade, and "1:7" would produce arithmetic nobody can act on. */
-export const SPLIT_RATIOS = [2, 4, 8] as const
+export const SPLIT_RATIOS = [2, 4, 8, 16] as const
+/** How many fibres FEED the box: an ordinary 1:N, or a 2:N carrying a second
+ *  input for a protection feed.
+ *
+ *  It is NOT a second ratio — light entering either input still splits N ways,
+ *  so `cumulativeSplit` multiplies outputs and a 2:16 has exactly the sixteen
+ *  legs a 1:16 has. And it is NOT the topology: whether that input is CONNECTED,
+ *  and to what, is a link. This says only how many ports the box was built with,
+ *  which is what makes the useful sentence sayable — a 2:N with one feed
+ *  recorded is either unprotected or undocumented.
+ *
+ *  null means ONE, not "unrecorded" — the one place in this schema where absence
+ *  takes a default. Every splitter placed before this existed was already drawn
+ *  "1:N" by a label that assumed a single input, so reading null as a gap would
+ *  mark the whole live plant record incomplete overnight. */
+export const SPLIT_INPUTS = [1, 2] as const
 export type DeviceType =
   (typeof DEVICE_TYPES)[number] | (typeof PASSIVE_DEVICE_TYPES)[number]
 export const isPassiveType = (t: string | null | undefined): boolean =>
@@ -223,12 +238,162 @@ export interface LinkRoute {
   child_id: number
   parent_id: number
   waypoints: Array<[number, number]>
-  /** LinkColor name; null = the line's own tone */
-  color: string | null
   /** 0..1 along the rendered path; null = midpoint */
   label_pos: number | null
+  /** WHICH PHYSICAL SHEATH this section is cut from — several spans point at
+   *  one cable, which is the whole reason `org_cables` exists. null = nobody has
+   *  recorded one, where every span starts. */
+  cable_id: number | null
+  /** Denormalized from the cable so a renderer can label a line without holding
+   *  the cable list; the cable row is authoritative for both. */
+  cable_name: string | null
+  cores: number | null
+  /** Which strand of that cable this run uses, 1..cores. Its COLOUR comes from
+   *  the TIA-598 sequence and is what a splicer is told; the number alone is
+   *  useless past 12 fibres, where it becomes a tube plus a position (see
+   *  `strandAt`). null = the cable is known but the strand isn't. Never storable
+   *  without a cable — the server refuses a strand with nothing to be a strand
+   *  of, and moving a span to another cable discards it. */
+  core_no: number | null
+  /** TRUE when these waypoints are the CABLE's route, not this span's own.
+   *
+   *  A span with no trace of its own, on a cable somebody HAS traced, runs down
+   *  that cable between the two points its boxes tap it at — so the geometry is
+   *  surveyed, but it was surveyed as a street rather than as this section. The
+   *  hover card says which, because "somebody walked this span" and "somebody
+   *  walked the street this span is cut from" are different claims and only the
+   *  first is about these two boxes. Resolved server-side, in one place, so the
+   *  map and every distance central computes measure the same line. */
+  from_cable: boolean
   updated_at: string
   updated_by: string | null
+}
+
+/** A FIBRE POINT: anywhere glass lands or is joined.
+ *
+ *  A device (a coupler, an FDB, a splitter, an OLT) or a SUBSCRIBER — the case
+ *  the ISPs added, and what lets a lane of houses be daisy-chained down one 4F.
+ *  Deliberately not a registry of its own: passive plant already lives in
+ *  `org_devices` and customers in `onu_places`, so this is a resolved view of
+ *  one or the other, never a third table. */
+export interface FibrePoint {
+  kind: "device" | "onu"
+  device_id: number | null
+  mac: string | null
+  name?: string | null
+  device_type?: string | null
+  lat?: number | null
+  lng?: number | null
+}
+
+/** What one core does at one END of its cable.
+ *
+ *  Three states and they must never render alike: joined onward into another
+ *  sheath, taken out to the equipment standing here, or — the absent case, which
+ *  is simply no entry — nothing recorded. Unrecorded is NEVER "spare". */
+export interface CoreEnd {
+  /** set when this core continues into another cable */
+  cable_id?: number
+  cable_name?: string | null
+  core_no?: number
+  /** set when this core is taken out to the box or customer at this point */
+  terminates?: boolean
+  point?: string | null
+}
+
+/** A CABLE: one sheath SEGMENT, and the two points it runs between.
+ *
+ *  Not a device — no state, no FSM, no outage, and no alerting shell reads it.
+ *  It is plant, with the standing a splitter's split ratio has. */
+export interface Cable {
+  id: number
+  name: string
+  /** FIBER_COUNTS; null = the sheath is known but its size isn't. */
+  cores: number | null
+  /** WHERE THE GLASS RUNS — a COMPLETE route, ends included, unlike a link's
+   *  waypoints (which omit theirs because its two ends are device pins and the
+   *  line must rubber-band when one is dragged). A cable ends wherever the glass
+   *  does. Empty = nobody has traced it, and the map draws the chord. */
+  path: Array<[number, number]>
+  /** Walked segment by segment, because crews order drum by the metre. null on
+   *  an untraced cable — nobody walked it, and zero would be a measurement. */
+  length_m: number | null
+  a: FibrePoint
+  b: FibrePoint
+  notes: string | null
+  /** What each core does, keyed by core number as a STRING (JSON keys always
+   *  are) and then by which END. Sparse: a core with no entry is unrecorded. */
+  plan: Record<string, { a?: CoreEnd; b?: CoreEnd }>
+  /** What each fibre CARRIES — free text, sparse. Where it GOES is derived and
+   *  never typed, so the panel can render one as a note and the other as fact. */
+  labels: Record<string, string>
+  /** How many cores have anything against them — a joint at either end, or a
+   *  label. RECORDED, never "used": the rest are not spare, nobody wrote them
+   *  down. */
+  cores_recorded: number
+  updated_at: string
+  updated_by: string | null
+}
+
+/** One cable end landing at a point — a column of the splice tray. */
+export interface TrayCable {
+  cable_id: number
+  name: string
+  cores: number | null
+  /** which end of that cable this is */
+  end: "a" | "b"
+  /** the point at the far end of it */
+  far: FibrePoint
+  labels: Record<string, string>
+  /** DERIVED and advisory — which way a splicer would hold the tray. It decides
+   *  nothing: any two fibres open here may be joined, and a point the feed walk
+   *  never reached simply has everything on one side. */
+  side: "feed" | "onward"
+}
+
+/** One joint: these two fibres are joined here — or this one is taken out to
+ *  the equipment standing here (`b_cable_id` null). */
+export interface FibreJoint {
+  id: number
+  a_cable_id: number
+  a_core_no: number
+  b_cable_id: number | null
+  b_core_no: number | null
+}
+
+/** THE TRAY: everything landing on one point, from ONE read so the two columns
+ *  and the connectors between them cannot disagree. */
+export interface PointFibre {
+  point: FibrePoint
+  cables: TrayCable[]
+  joints: FibreJoint[]
+}
+
+/** One section of a traced path: this fibre, entered here, leaving there. */
+export interface TraceHop {
+  cable_id: number
+  cable_name: string | null
+  cores: number | null
+  core_no: number
+  from: FibrePoint
+  to: FibrePoint
+}
+
+/** THE WHOLE OPTICAL PATH ONE FIBRE MAKES, across sheaths and joints.
+ *
+ *  Walked on the server. A `fault` stops the walk AT `fault_at` and what comes
+ *  back is the part that is unambiguous — drawing a confident line past a fork
+ *  is how a splicer ends up at the wrong closure. */
+export interface FibreTrace {
+  ok: boolean
+  fault: "fork" | "loop" | "missing" | null
+  fault_at: FibrePoint | null
+  hops: TraceHop[]
+  /** the points end to end, in order */
+  points: FibrePoint[]
+  /** what the two extreme ends are taken out to, when anything — the half of the
+   *  answer a hop list cannot carry ("…and it lands on SPL-4"). */
+  ends: Array<{ point: FibrePoint } | null>
 }
 
 export interface OrgRegion {
@@ -247,6 +412,18 @@ export interface OrgDevice {
   /** free-form labels for Network-page filtering (≤8, cosmetic only) */
   tags: string[]
   parent_device_id: number | null
+  /** WHAT FEEDS THIS BOX PHYSICALLY — the declared parent when there is one,
+   *  otherwise derived from the fibre (a run into it from the direction of the
+   *  gear). Since placing a box stopped asking what feeds it, a splitter can be
+   *  perfectly well recorded with `parent_device_id: null` and still sit on a
+   *  chain; this is the field the split total, the PON inheritance and the
+   *  branch-fault verdict walk.
+   *
+   *  It NEVER shadows `parent_device_id`, which stays exactly what somebody
+   *  typed: that column is the monitoring dependency and decides what pages, so
+   *  a recorded splice must not be able to move it. Computed server-side so
+   *  central's own verdicts and this browser walk one chain. */
+  feed_device_id: number | null
   /** tree presentation only: render at the top level, not inside the parent's
    *  subtree. The parent link stays real everywhere else (map, suppression). */
   tree_detached: 0 | 1
@@ -260,12 +437,16 @@ export interface OrgDevice {
   gpon_vendor: string | null
   /** passive plant only: which PON this splitter/FDB serves (e.g. "0/6") */
   pon_port: string | null
-  /** passive plant only: how many ways this box splits (2 | 4 | 8; see
+  /** passive plant only: how many ways this box splits (2 | 4 | 8 | 16; see
    *  SPLIT_RATIOS). null = not recorded — which is also the honest value for a
    *  closure that only splices. Drives the recorded-load bar and the cumulative
    *  split down a cascade; never an occupancy claim on its own, because a leg
    *  nobody wrote down is unknown, not free. */
   split_ratio: number | null
+  /** passive plant only: how many fibres feed it (2 on a protection-input
+   *  splitter). null reads as ONE — see SPLIT_INPUTS. Never multiplied into any
+   *  split arithmetic; a 2:16 splits sixteen ways, same as a 1:16. */
+  split_inputs: number | null
   /** OLT only: how many ONUs fit on one PON before it reads as full. EPON tops
    *  out at 1:64 and GPON at 1:128, so one global default false-pages half a
    *  mixed fleet. null = not set, i.e. the server's global cap applies. */
@@ -573,6 +754,13 @@ export interface OnuPlace {
    *  in between, which is the plant a crew actually works on. Null = unrecorded,
    *  and the map falls back to the OLT while rendering the difference. */
   drop_passive_id: number | null
+  /** The drop cable's traced path — intermediate vertices only, running
+   *  SPLITTER → subscriber, exactly like a link route. Empty is the ordinary
+   *  case and means nobody has walked it, which the map draws DOTTED; a
+   *  non-empty list is somebody's survey and draws SOLID. The two may never
+   *  render alike — a dash on this map is its word for "we did not trace this",
+   *  and a straight line that looks traced is what a crew quotes drum off. */
+  drop_waypoints: Array<[number, number]>
   device_id: number | null
   device_name: string | null
   onu_id: number | null
@@ -795,6 +983,7 @@ export interface SubscriberPlantHop {
   name: string | null
   device_type: string | null
   split_ratio: number | null
+  split_inputs: number | null
   pon_port: string | null
 }
 

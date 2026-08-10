@@ -65,10 +65,25 @@ const NAME_STEM: Record<PlantKind, string> = {
  *  nothing and the sheet says so rather than naming a box from another village. */
 export const FEEDER_RADIUS_KM = 2
 
+/** What feeds a box, physically. `feed_device_id` when the server derived one
+ *  from the fibre, else the declared parent — one expression, in one place,
+ *  because a chain walked two ways is a chain that can disagree with itself.
+ *
+ *  The server already prefers the declared parent when there is one, so this is
+ *  only a fallback for a bundle talking to a central that predates the field
+ *  (the SPA deploys the instant it is built; central needs a restart). */
+const feedOf = (d: OrgDevice): number | null =>
+  d.feed_device_id ?? d.parent_device_id ?? null
+
 /** The chain of passives from a box up to the powered gear feeding it, nearest
- *  first. Walks the LIVE parent links, so re-parenting a splitter moves its
- *  whole story with it and nothing needs re-entering. Cycle-guarded: a bad row
- *  must not spin a render.
+ *  first. Cycle-guarded: a bad row must not spin a render.
+ *
+ *  Walks the PLANT feed, not `parent_device_id` (2026-08-09). Placing a box
+ *  stopped asking what feeds it — the honest answer arrives later, when a core
+ *  is pulled into it — so a splitter recorded entirely from the fibre has no
+ *  declared parent and would otherwise have no chain at all: no split total, no
+ *  PON, and no branch-fault span. What it does have is a run, and the run says
+ *  the same thing better, because it also says which core.
  *
  *  Lived in `splitter-panel.tsx` until the map started authoring plant too. It
  *  is here now because a pure map helper importing a panel component to get one
@@ -77,13 +92,15 @@ export const FEEDER_RADIUS_KM = 2
 export function feedChain(device: OrgDevice, byId: Map<number, OrgDevice>) {
   const passives: OrgDevice[] = []
   let head: OrgDevice | null = null
-  let cur = device.parent_device_id != null ? byId.get(device.parent_device_id) : undefined
+  const first = feedOf(device)
+  let cur = first != null ? byId.get(first) : undefined
   const seen = new Set<number>([device.id])
   while (cur && !seen.has(cur.id)) {
     seen.add(cur.id)
     if (!isPassiveType(cur.device_type)) { head = cur; break }
     passives.push(cur)
-    cur = cur.parent_device_id != null ? byId.get(cur.parent_device_id) : undefined
+    const up = feedOf(cur)
+    cur = up != null ? byId.get(up) : undefined
   }
   return { passives, head }
 }
@@ -93,7 +110,15 @@ export function feedChain(device: OrgDevice, byId: Map<number, OrgDevice>) {
  *  The number that decides whether a PON has any budget left, and it is not
  *  something a single box can answer. Null when any box in the chain has no
  *  recorded ratio: a partial product would understate the split, and
- *  understating it is how a PON ends up over-built. */
+ *  understating it is how a PON ends up over-built.
+ *
+ *  OUTPUTS ONLY — `split_inputs` is deliberately not read here, and its callers
+ *  are deliberately the only places left that still print a hard-coded "1:".
+ *  A 2:16 has a protection feed and still splits sixteen ways, so a second input
+ *  multiplies nothing; and a CASCADE TOTAL always has one fibre entering at the
+ *  head, whatever the boxes below it were built with. So `1:{total}` is correct
+ *  at those three render sites and must not be "fixed" to use `ratioLabel` —
+ *  that helper describes ONE BOX, and this is a property of a whole chain. */
 export function cumulativeSplit(device: OrgDevice, byId: Map<number, OrgDevice>): number | null {
   const { passives } = feedChain(device, byId)
   let total = 1
@@ -255,7 +280,8 @@ export function ponFor(
     seen.add(cur.id)
     const pon = (cur.pon_port ?? "").trim()
     if (pon) return { pon, inherited: true }
-    cur = cur.parent_device_id != null ? byId.get(cur.parent_device_id) : undefined
+    const up = feedOf(cur)
+    cur = up != null ? byId.get(up) : undefined
   }
   return { pon: null, inherited: false }
 }

@@ -11,6 +11,9 @@ from wisp.central import theme  # noqa: E402
 
 _SPA_TOKENS = (Path(__file__).resolve().parents[2]
                / "web" / "src" / "lib" / "theme-tokens.ts")
+_PUBLIC = Path(__file__).resolve().parents[2] / "web" / "public"
+_LANDING = _PUBLIC / "landing.html"
+_OVERLAY = _PUBLIC / "showcase.js"
 
 
 class _FakeStore:
@@ -177,6 +180,82 @@ class AllowlistParityTest(unittest.TestCase):
         spa = set(re.findall(r'"(--[a-z0-9-]+)"', src))
         spa.discard("--font-sans")
         self.assertEqual(spa, set(theme._TOKENS))
+
+
+class LandingArtifactTest(unittest.TestCase):
+    """The marketing page follows the same overrides the dashboard does, and
+    the way it does so is fragile in a specific way worth pinning.
+
+    `landing.html` is a pre-bundled artifact: a JSON-encoded template that the
+    page unpacks and swaps in over its own documentElement. Re-exporting it
+    from the design tool would restore the hardcoded palette it shipped with,
+    and NOTHING would look broken — the page renders perfectly, it just stops
+    following Settings → Platform → Appearance, which nobody notices until
+    somebody repaints and only half the product moves.
+    """
+
+    def _template(self) -> str:
+        src = _LANDING.read_text(encoding="utf-8")
+        m = re.search(r'<script type="__bundler/template">\n(.*?)\n  </script>',
+                      src, re.S)
+        self.assertIsNotNone(m, "landing.html has no bundler template")
+        return json.loads(m.group(1))
+
+    def test_landing_claims_the_dark_half_of_the_override_map(self):
+        # render_css scopes to `:root.dark` / `:root:not(.dark)`, so a page with
+        # no class on <html> would pick up the LIGHT overrides. This page has
+        # one palette and it is dark.
+        self.assertIn('<html class="dark">', _LANDING.read_text(encoding="utf-8"))
+        self.assertIn('<html class="dark">', self._template())
+
+    def test_the_unpacker_carries_the_style_block_across_the_dom_swap(self):
+        src = _LANDING.read_text(encoding="utf-8")
+        self.assertIn("document.getElementById('wisp-theme')", src)
+        swap = src.index("document.documentElement.replaceWith(doc.documentElement)")
+        reattach = src.index("document.head.appendChild(themeStyle)")
+        self.assertLess(swap, reattach, "re-attached before the swap wipes it")
+
+    def test_every_page_colour_reads_a_token(self):
+        """No colour literal may survive outside the mapping layer.
+
+        Colours on this page live in inline style="" attributes, which outrank
+        any stylesheet — so an injected block themes nothing unless the markup
+        itself says var(--lp-*). One straggler is one element left wearing the
+        shipped palette on a repainted install.
+        """
+        tpl = self._template()
+        body = tpl[tpl.index("</style>", tpl.index("html, body { margin")):]
+        # The hero canvas paints via ctx.fillStyle, which takes a colour and not
+        # a var(); it resolves the custom property itself and keeps the shipped
+        # value as the fallback. The accent prop's editor options are authoring
+        # metadata, not rendered colour.
+        for allowed in ("cssColor('--lp-accent', this.props.accent ?? '#5680bd')",
+                        "cssColor('--lp-ok', '#43d68c')"):
+            self.assertIn(allowed, body)
+            body = body.replace(allowed, "")
+        body = re.sub(r'data-props="[^"]*"', "", body)
+        strays = set(re.findall(r'#[0-9a-fA-F]{6}\b', body))
+        strays |= set(re.findall(r'rgba?\((?!0,0,0)[0-9.,\s]+\)', body))
+        self.assertEqual(strays, set(), f"hardcoded colours on the landing page: {strays}")
+
+    def test_every_lp_token_maps_to_one_central_validates(self):
+        """A --lp-* pointing at a token theme.py drops is a control that looks
+        wired and does nothing."""
+        tpl = self._template()
+        referenced = set(re.findall(r'var\((--(?!lp-)[a-z0-9-]+),', tpl))
+        self.assertTrue(referenced, "the mapping layer reads no tokens at all")
+        self.assertEqual(referenced - set(theme._TOKENS), set())
+
+    def test_the_overlay_borrows_the_page_palette(self):
+        """showcase.js floats ON the landing page; an overlay keeping its own
+        blue would be the one thing still wearing the shipped colours."""
+        src = _OVERLAY.read_text(encoding="utf-8")
+        # Every literal left is either a var() fallback or a black shadow/mask.
+        for line in src.splitlines():
+            for lit in re.findall(r'#[0-9a-fA-F]{3,6}\b|rgba?\([0-9.,\s]+\)', line):
+                if lit in ("#000", "rgba(0,0,0,.4)"):
+                    continue
+                self.assertIn("var(--lp-", line, f"unthemed colour {lit}: {line.strip()}")
 
 
 if __name__ == "__main__":

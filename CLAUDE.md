@@ -420,8 +420,8 @@ owners always page for everything, and a device's WORKERS are its assignees.
   sweep. `unit/test_gpon:test_one_serial_on_two_slots_stays_two_rows`.
 - **GPON profiles are DATA** (`gpon_profiles`), served in the `/edge/devices` reply. Built-in
   callables travel as a CLOSED vocabulary (`state_map`+`state_default`, `pon_index`
-  `as_is|first_segment`, `pon_label` template); `gpon_profile_from_dict` rejects the WHOLE
-  profile on anything outside it — never a best-effort partial. A same-named row shadows a
+  `as_is|first_segment|packed_ifindex`, `pon_label` template); `gpon_profile_from_dict` rejects
+  the WHOLE profile on anything outside it — never a best-effort partial. A same-named row shadows a
   built-in (huawei/dbc stay in edge code as fallbacks for older fleets). `set_profiles` runs
   every cycle and MUST stay a fingerprint-gated no-op on an unchanged payload — rebuilding
   pollers churns SnmpEngines (the leak invariant).
@@ -436,6 +436,27 @@ owners always page for everything, and a device's WORKERS are its assignees.
   profile offers it — a Select with no item for its own value renders blank, and saving that
   blank silently unstamps the vendor. Still a closed set: a name no profile carries is refused,
   since a typo'd vendor reads on screen as "this OLT has no optics".
+- **`packed_ifindex` exists because a PON can live in the OID INDEX and nowhere else**
+  (2026-08-07, chandana-network MAIN_OLT4, a Stelfiber **STGP08X** under its own **PEN 50224** —
+  the box names no maker, `sysDescr` is a bare `STGP08X`, so the vendor is the OPERATOR's
+  identification and the PEN is the only machine-checkable half).
+  That OLT keys its ONU roster by a byte-packed ifIndex — `chassis<<24 | slot<<16 | pon<<8 | onu`,
+  so PON 1 ONU 0 is 16777472 (0x01000100) — and carries NO PON column at all: every roster
+  column was checked against the decoded PON and none matches (col17/col18 are the subscriber's
+  PPPoE username/password). `as_is` would have made pon_port the raw ifIndex, i.e. 310 singleton
+  "PONs" on an 8-PON box. **The strategy supplies BOTH halves on purpose** — `_ONU_INDEX_STRATEGIES`
+  is keyed by the same name, because deriving the PON from a packed index while reading the onu
+  id off the same index unpacked reports ONU 16777472 on PON 1. Verified against the OLT's own
+  text column (`.3.12.2.1.2` = "ONT01/000") on all 310 rows and against its own per-PON counters
+  (`.3.2.3.1`). `unit/test_gpon:CentralProfileTest`, and the profile itself is
+  `tools/gpon_add_stgp08x.py` (version-gated: an edge ≤ v0.15.14 rejects the whole profile).
+  Its state column maps **0 → unknown, never offline** — those 68 slots are authorisation
+  entries that never registered (blank vendor, distance 0, last-seen "-"), and dark-by-default
+  would have handed `ponfault` a fabricated mass-drop cohort. Its per-ONU optics DO exist
+  (`.3.12.3.1`: Rx dBm×100, the 3.3 V rail, temperature) but are indexed `<ifindex>.0.0` against
+  the roster's `<ifindex>`, so `parse_onu_table` keys them as different rows — mapping rx yields
+  448 rows of which ZERO carry both a serial and a reading. Joining them is a parser change, not
+  a profile edit.
 
 ### Reference ONUs: the witness that replaces dying-gasp (2026-07-28)
 
@@ -605,12 +626,37 @@ entire plant a crew works on.
   and the caption says so outright. The ONE capacity claim that survives an incomplete
   record is OVER-subscription (more recorded drops than legs is provable either way), so
   it is the only one made. Same instinct as "nothing is wrong" vs "nothing is measured".
-- **`SPLIT_RATIOS` is CLOSED at (2, 4, 8)** — what the ISPs actually stock. The ratio
-  feeds the load bar and the cumulative split down a cascade (`1:4 × 1:8 = 1:32`, which
-  is what says whether a PON has budget left), so "1:7" would produce arithmetic nobody
-  can act on. Widening it is one line in `inventory.py` + `types.ts`. `cumulativeSplit`
-  returns null if ANY box in the chain lacks a ratio — a partial product UNDERSTATES the
-  split, and understating it is how a PON gets over-built.
+- **`SPLIT_RATIOS` is CLOSED at (2, 4, 8, 16)** — what the ISPs actually stock; 16 arrived
+  by request 2026-08-08, and 32/64 are the same one line in `inventory.py` + `types.ts`.
+  The ratio feeds the load bar and the cumulative split down a cascade (`1:4 × 1:8 = 1:32`,
+  which is what says whether a PON has budget left), so "1:7" would produce arithmetic
+  nobody can act on. `cumulativeSplit` returns null if ANY box in the chain lacks a ratio —
+  a partial product UNDERSTATES the split, and understating it is how a PON gets over-built.
+- **`split_inputs` is the OTHER axis (1 or 2), and it is NOT a second ratio**
+  (`SPLIT_INPUTS`, 2026-08-08 — the operator asked for "1/16 and 2/16"). A 2:16 has a second
+  input for a protection feed and still splits SIXTEEN ways, so nothing multiplies it and
+  `cumulativeSplit` reads outputs alone. Three things follow:
+  - **NULL means ONE, not "unrecorded"** — the one place in this schema where absence takes
+    a default instead of reading as a gap. Every splitter predating the column was already
+    drawn `1:N` by a label that assumed one input, so a gap reading would have marked all 41
+    on the live fleet incomplete overnight to document something nobody had got wrong. `1` is
+    likewise STORED as NULL (sparse storage, same rule as the theme overrides).
+  - **It says how many ports the box was MANUFACTURED with, never how many are CONNECTED** —
+    that is `org_device_links`. Keeping the two apart is exactly what lets the panel say the
+    useful thing: *"two inputs · 1 feed recorded"*, i.e. either genuinely unprotected or
+    simply undrawn, which need opposite actions. Feeds counted = primary parent + backup
+    links; a PEER is a cable between equals and is excluded, or a cross-link would report a
+    protection feed that isn't there.
+  - **A second input needs a ratio first** (a "2:?" names no product), and clearing the ratio
+    clears it in the SAME write. Enforced server-side, and the picker disables the inputs
+    group until a ratio is chosen so the form cannot produce a 422.
+- **The ratio STRING is built in exactly one place**, `drops.ts:ratioLabel`/`deviceRatioLabel`.
+  It was hand-written as `1:{ratio}` at EIGHT render sites, and the day inputs became real
+  every one of them would have gone on printing `1:` over a 2:16 — the same failure
+  `onuName` was extracted to kill. `SplitRatioField` is likewise ONE control across the
+  splitter panel, plant-create, the device form and the survey sheet; it lays the two axes
+  out either side of a literal `:` so the control spells the answer that is written on the
+  box's casing.
 - **A branch fault names a SPAN, not a distance.** Every recorded subscriber below one
   passive dark while a sibling branch stays lit ⇒ the break is in the ONE span feeding
   it. This beats the ranging bracket outright on the C-Data fleet, whose `distance_m` is
@@ -697,9 +743,42 @@ entire plant a crew works on.
   WEAKER and saying so — because a reference point must not vanish for want of plant
   records, but "routed through its splitter" and "we only know the PON" may not look
   alike.
+- **…UNLESS IT HAS BEEN TRACED, and then it is SOLID** (`onu_drops.waypoints`,
+  `POST /api/inventory/drop-route`, 2026-08-08 — the operator asked for "customer line
+  route editing"). The last hop was the only span on this map that could never be drawn,
+  and a drop is not straight: it runs down a pole line and along a street, which is where a
+  van goes when it breaks. Tracing one therefore EARNS the solid stroke a drawn cable route
+  gets — the dash means "nobody surveyed this", somebody just did, and the two states may
+  not look alike in EITHER direction (an untraced drop may not look surveyed; a surveyed one
+  may not go on apologising for itself).
+  - **ONE editor, two kinds of span** (`map-page.tsx:RouteEdit`, a `link | drop` union).
+    Same gesture, same waypoint list, same undo/straighten/vertex-drag — only the row it
+    saves into differs. A second editor would be two sets of behaviours to keep in step, and
+    the day they drifted the map would have taught two ways to trace one network.
+  - **Keyed on the MAC and requiring a RECORDED DROP** — 404 otherwise, never a row invented
+    on the spot. With no recorded splitter the map falls back to the OLT, and that line is an
+    ADMITTED GUESS ("we only know the PON"); tracing it would promote the guess into surveyed
+    geometry a crew orders drum against. Record the splitter first, which is the order the
+    work happens in anyway.
+  - **RE-HOMING A DROP DISCARDS ITS ROUTE** (`set_onu_drops`, guarded on the passive actually
+    CHANGING). That path was walked to the box the customer no longer hangs off, so keeping it
+    leaves a solid — i.e. surveyed — line running to the wrong splitter. The guard is what
+    lets the bulk dialog re-save its whole set idempotently without destroying traced work.
+  - **Waypoints run SPLITTER → ONU**, matching `dropAnchor`'s return order, so no renderer
+    ever reverses a list — the same discipline `link_routes` keeps by bending the peer KEY
+    rather than the waypoint order.
+  - **A traced drop may finally be MEASURED, and only then**: the hover card prints
+    along-cable metres (`polyKm`, segment-by-segment, because Mercator stretches with
+    latitude and this is a drum figure). An untraced one prints none — the resting map's
+    refusal to measure an unsurveyed span, kept on the one surface with room to explain it.
+  - `refChipPos` is ONE function because the render AND the shared chip budget both need the
+    midpoint of the line as DRAWN; on a traced drop that is nowhere near the chord's, and the
+    two computing it separately is how a budget reports itself clear over a visible collision.
 - Tests: `unit/test_drops` (the rules and every refusal),
   `integration/test_central_drops` (identity, passive-only, org isolation, bulk/detach,
-  cascade, and the count-agreement between the rollup and the drill-down).
+  cascade, and the count-agreement between the rollup and the drill-down),
+  `integration/test_central_cableplant:DropRouteTest` (the 404, the re-home discard, the
+  idempotent re-save that must NOT discard, and separator-exact MAC identity).
 
 ### Field survey: the worker places the plant (2026-07-28)
 
@@ -1472,7 +1551,8 @@ construction: it rides the web-proxy tunnel the edge already serves — no edge 
 
 ### Topology extras
 
-- **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` = splitter/fdb/closure),
+- **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` = splitter/coupler/fdb/
+  closure — `coupler` is the ISPs' own word for a joint box and is what a cable end lands on),
   NOT a second registry — parent chains, map pins and routes all come free. `ip_address` stays
   `''`; validation rejects an IP/probe on a passive and a PASSIVE PARENT for a monitored device
   (passive-under-passive is fine — plant hangs below gear). Containment is
@@ -2657,43 +2737,336 @@ stops reading as one product.
   needs no per-kind reversal. `list_link_routes` and `_link_write_scope` match a peer in either
   order. Until this was fixed, **every peer route save 400'd** although the map offered the
   editor.
-- **Per-link cartography rides `link_routes`, not a second table**: that row is keyed exactly
-  "one link", so `color` and `label_pos` live there beside the geometry. Consequences:
-  `set_link_route` no longer DELETEs on an empty waypoint list (`_prune_link_route` drops a row
-  only when waypoints AND colour AND label_pos are all empty, or clearing a drawn path would
-  silently repaint the line), and `set_link_style` is SPARSE so the colour picker and a label
-  drag can't clobber each other. **Colour is a CLOSED palette of NAMES** (the product-wide
-  vocabulary; values in index.css as `--map-line-*`), never a free hex.
-  `paintedLineColor` refuses to paint a line whose tone is destructive/warning, and selection
-  emphasis still overrides — status and "which path did I click" both outrank decoration. The
-  `--map-line-*` tokens are ONE set for both themes (unlike every other colour here): the
+- **A span's own record rides `link_routes`, not a second table**: that row is keyed exactly
+  "one span", so `cable_id`, `core_no` and `label_pos` live there beside the geometry.
+  Consequences: `set_link_route` no longer DELETEs on an empty waypoint list
+  (`_prune_link_route` drops a row only when waypoints AND cable AND strand AND label_pos are
+  all empty, or straightening a path would silently forget which cable it is in), and
+  `set_link_style` is SPARSE so the cable picker, the strand picker and a chip drag can't
+  clobber each other.
+  **THE PER-LINK COLOUR IS GONE** (2026-08-08, operator's call) — see the cable section below.
+  Its only real use was saying "these spans are one physical cable", which `org_cables` now says
+  properly; `map/linkcolor.ts`, `paintedLineColor` and `inventory.LINK_COLORS` are DELETED and a
+  line's colour is its tone plus selection emphasis, nothing else. The PALETTE itself survives
+  under `inventory.PALETTE` for tags and probes, and the `--map-line-*` token prefix stays for
+  history. Those tokens are ONE set for both themes (unlike every other colour here): the
   backdrop is raster tiles, equally bright under either app theme, and the dark casing does the
   contrast work. Deliberately NOT in `theme.py:_TOKENS` — cartography, not brand theming.
-- **The bandwidth chip's position is a FRACTION along the path** (`label_pos`, 0..1), snapped to
-  the line every frame. Never a lat/lng: the line rubber-bands when either pin moves and a saved
-  coordinate would drift off the cable it names. The chip borrows a coloured line's hue on its
-  border and a left rail, never the rate text (a port alarm's tone owns the whole chip and wins).
-- **Link hover distance is a MAP-level mousemove, never a polyline mouseover**: hovering a cable
-  reads out ground distance to each end (`map/linkhover.tsx`), but polylines must stay
-  non-interactive, so the probe projects the cursor and walks pre-projected geometry. Distances
-  are walked segment-by-segment in METRES (`geometry.alongKm`), not a projected fraction —
-  Mercator stretches with latitude and a splicing crew orders drum off this. **Only the CHORD
-  case is labelled** — "straight-line" stays for exactly that reason, while "along cable" was
-  dropped as obvious (operator's call, 2026-07-31: the traced line already shows what was
-  measured, so the words captioned the picture; a chord looks identical to a cable and doesn't).
-  **The readout is also suppressed while anything is SELECTED** (device panel, site card,
-  subscriber card): a card open means the operator is reading one object, and measuring every
-  cable the cursor crosses on the way to it is noise — closing the card re-arms it. Two perf
-  invariants: the readout
-  icon must NOT go through `cachedDivIcon` (its text changes per pixel, and a cache overflow
-  `clear()`s the pin icons, restarting every down-pulse), and the probe calls `setHover` only
-  when the rounded readout CHANGES (mousemove fires per pixel and the common case is "nowhere
-  near a cable").
-- **Cut overlay**: walks the OLT→passive-chain path (drawn routes where traced, chords where
-  not; the first hop must name the PON, deeper plant may leave `pon_port` blank), clamps the
-  RANGING interval into the geometry, paints the stretch + a pulsing ✕ opening the OLT's Optical
-  tab. No placed splitter chain = no overlay (the fault card still carries the distance).
-  Power-pattern waves render a dashed warning hull + banner.
+
+### THE FIBRE PLANT: cables between couplers, and what each core is joined to (2026-08-09)
+
+`central/fiber.py` ↔ `web/src/lib/fiber.ts`, `central/cablepath.py`, `org_cables` +
+`org_fibre_joints` + `org_cable_cores`, `components/cable-record.tsx`,
+`components/coupler-tray.tsx`, `map/cables.ts`, the cable card and the Fibre section in
+`map-page.tsx`.
+
+**THE ISPs CORRECTED THE MODEL AND THEY WERE RIGHT.** Their own sentence: *fibre runs
+between two couplers, and at a coupler you join cable to cable, or take a core out to a
+device on a single fibre* — plus two facts that follow, *any core may carry anything,
+including a customer line*, and therefore *a customer point is a coupler too* (which is
+what makes a lane of daisy-chained houses possible: core 1 into this one, cores 2–4
+onward to the next three). They also agreed to ABANDON the recorded cable and lay it
+again rather than carry two models, which is what made replacing it possible.
+
+**A CABLE IS A SEGMENT WITH TWO RECORDED ENDS.** That is the whole change, and every
+other change here is a deletion that falls out of it:
+
+- **The RUN is gone.** `org_cable_runs` was *(cable, core, device A, device B)* — glass
+  could only be recorded between two BOXES. A cable knows its ends now, so core N of it
+  runs between them BY DEFINITION and there is nothing left to write down.
+- **The TAP is gone.** `org_cable_taps` recorded where a sheath is opened for a box,
+  because the boxes hung off a cable were not ON it. A cable end IS the tap. No
+  projection, no lateral, no re-snapping on retrace, and `cablepath.between`/`span_path`
+  went with it.
+- **The DOUBLE-BOOKING CHECKER is gone.** `core_path`/`core_faults` existed to catch two
+  unrelated runs both written as core 7 — the error that sends a splicer to cut a live
+  customer. A core of a segment has exactly two ends and cannot be two disconnected runs,
+  so that state is UNREPRESENTABLE rather than merely unreported.
+- **The IMPLICIT-CONTINUITY RULE is gone with it.** "Two sections of one cable on one core
+  meeting at a box are continuous by definition" was the load-bearing sentence of the old
+  model, and the reason a splice restating it had to be refused. Two sections of one cable
+  can no longer meet — opening a sheath mid-span SPLITS it and splices every core through.
+  One fact, one home, and the home is now a row somebody can see.
+
+`unit/test_fiber:SegmentModelTest` and `unit/test_cablepath:SegmentModelTest` assert those
+names STAY deleted, the same way `LINK_COLORS` must stay deleted: re-exporting one is how
+the old model creeps back.
+
+- **A FIBRE POINT is a device OR a subscriber, and it is NOT a table.** Passive plant
+  already lives in `org_devices` and customers in `onu_places`; a third registry of places
+  is the thing this codebase refuses everywhere else. Carried as a nullable PAIR
+  (`a_device_id`/`a_mac`) so the device side keeps a real foreign key — that is what makes
+  deleting a box take its cable with it — while the subscriber side is a MAC, because
+  `onu_places` is keyed (org, mac) and has no stable id to point at. `fiber.py` treats a
+  point as an opaque hashable and never looks inside one, which is what lets its walks be
+  tested against plain tuples.
+- **`coupler` joined `PASSIVE_TYPES`, and it is the ISPs' OWN WORD** for the joint box.
+  Not a synonym for `closure` bolted on for taste: a cable end has to land on something,
+  laying one creates a coupler at each end that lands on empty ground, and a vocabulary an
+  operator has to translate their own plant into is the first place a survey stalls.
+- **A cable ends on WHATEVER IT IS DROPPED ON** — a coupler, an OLT, a splitter, a
+  customer (operator's call). Taken literally, "always between two couplers" would mean a
+  second pin beside every OLT, splitter and customer: 76 extra marks on the current fleet.
+  The rule it was really protecting — *a line must never appear because of a setting* — is
+  kept and was already true.
+- **`parent_device_id` IS UNTOUCHED.** It is the monitoring dependency that decides
+  suppression and therefore what pages, so a recorded splice may never move it. Nothing in
+  this feature writes to `org_devices` or `org_device_links` — except the coupler a SPLIT
+  creates, which is safe for exactly one reason: a passive is excluded from
+  `org_device_topology` and is created with no parent.
+  `test_recording_fibre_NEVER_reaches_the_engine`.
+- **The PLANT chain still comes from the fibre when nothing is declared**
+  (`org_plant_feed_map` over `fiber.feed_map`), and DECLARED still wins. A feed arriving
+  THROUGH a customer is dropped rather than reported: the walk follows a daisy chain
+  correctly, but that map is device→device and there is no id to name a subscriber with.
+
+**THE FIVE GESTURES.** Each is one action; there are no create-then-attach chains.
+
+1. **Lay a cable.** Right-click → *Trace a cable from here*, or *Lay a cable* in the cable
+   list. Click along the street; a click within `SNAP_PX` (24, the same screen-space budget
+   the edit-pins drag uses) snaps onto a pin and RECORDS WHICH — `RouteEdit.endA`/`endB`,
+   set as they are clicked and never inferred afterwards from coordinates, because two
+   boxes racked at one point would be indistinguishable and "near enough" is the kind of
+   threshold this map has been wrong about three times. One sheet then asks for a name and
+   a fibre count (a row of chips, not a select — the count is read off a drum tag). **An
+   end that landed on open ground becomes a COUPLER**, which is what makes "a cable runs
+   between two couplers" true by CONSTRUCTION rather than by a rule.
+2. **Open a coupler mid-span** (`cablepath.split`, `POST /api/inventory/cable/split`). The
+   segment is cut at the click, a coupler stands at the cut, **every core is spliced
+   straight through**, and the joints at each far end move to the half that still reaches
+   them. This is what keeps segment-per-span from being a tax: a crew tapping a street does
+   not redraw the street. **Every core, not just the recorded ones** — splitting a sheath
+   must not change what any fibre does, and a core left discontinuous would silently change
+   the answer for every fibre nobody had got round to recording. It is the physical default
+   and every one of them is clearable in the tray. Both halves keep the drum's NAME; the
+   ends tell them apart. Cutting at an extreme end is refused rather than making a stub.
+3. **Splice** (`components/coupler-tray.tsx`) — **A SPLICE SCHEDULE: ONE ROW PER FIBRE, and
+   the destination lives ON THE ROW.** The two-column facing-pages tray is GONE (2026-08-10),
+   and the reason is a real ask it could not serve: *core 1 to OLT1, core 2 to OLT2, core 3 to
+   a customer*. Facing pages make the destination a property of the PANEL, but a closure's
+   terminations fan out to many boxes, so that arrangement could be ENTERED and never
+   DISPLAYED — the cores that went elsewhere drew as EMPTY cells, and empty reads as "nothing
+   here" when it means "spoken for, elsewhere". The panel hid the work you had just done, on
+   the one screen built to show it. Three more followed from the same shape: three
+   destinations meant three trips through a dropdown setting a MODE before each click; undo
+   only worked while the right destination happened to be on show; and a customer could not
+   be picked at all (the list was built from devices, so "this core is that drop" was
+   unsayable — though the tail route had always accepted `to_mac`).
+   Five rules hold the schedule together:
+   - **ONE searchable menu per row**, grouped *Splice into* / *Take into* / *Customer*, because
+     an operator knows the NAME of the destination and should not have to know our filing.
+     A splice takes a second click for the CORE — auto-picking one would be a capacity claim,
+     and "recorded is never occupied" is what this subsystem is built on.
+   - **TWO KINDS OF RUN COLLAPSE, and omitting either buries the rows that matter.**
+     Straight-through, because nine closures in ten are 1:1 and 24 identical lines are not
+     information; and UNRECORDED, because a 96F with four cores in use would otherwise put 92
+     rows of "+ join" around the four you came to read. **A CROSSING NEVER COLLAPSES** — core
+     3 to core 7 is the one thing at a closure worth reading twice.
+   - **A RUN NEVER CROSSES A BUFFER TUBE.** A crew opens one tube at a time, so "1–24 straight
+     through" describes a job nobody does in one go.
+   - **A COLLAPSED FREE RUN STAYS ACTIONABLE, and getting this wrong made a fresh cable a DEAD
+     END** — every core of a new 12F is unrecorded, so the whole schedule folded to one grey
+     line with no visible way to join anything. The row NAMES the core it will act on
+     (`join core 4`), so one click does the common thing while the chevron still opens the run.
+   - **A cable with every core already joined HERE is shown DISABLED, not hidden**
+     (`all joined here`). Taking a core out to a box lays a 1F tail that lands at this point
+     too, so a closure feeding an 8-PON OLT grows eight one-fibre cables that were being
+     offered as splice targets with nothing to give. "Full" and "not a cable here" are
+     different answers — the same reason a used core is greyed rather than dropped.
+   **A TAIL IS REPORTED AS THE BOX IT REACHES**, never as the 1F sheath in between: storage is
+   three rows, but what the operator did was send that core to that OLT, and a schedule
+   answering "→ a1 core 4 → HLY-OLT-2, core 1" describes its own bookkeeping back at them.
+   **`Splice all through` is still one button** — it SKIPS what is already joined, so pressing
+   it after hand-work leaves the hand-work, and the schedule then shows the run BROKEN around
+   the core that was taken (5–8, then core 9 free, then 10–12). That readout is the clearest
+   argument for the form: the two-column view could not express it at all.
+   **The arcs are gone and nothing was lost** — their one job was showing 1:1 across two
+   cables, and a collapsed run says that in words AND states the core numbers.
+4. **Take a core to a box** — a joint with no second cable. `b_cable_id IS NULL` is the
+   TERMINATION, and it is the only way a core is attached to equipment, which is why
+   connecting a device needs no route and no table of its own.
+   **THE BOX MAY BE SOMEWHERE ELSE, AND THAT HALF WAS UNSAYABLE UNTIL 2026-08-09.** The
+   ISPs' sentence was *"at a coupler you join cable to cable, or take a core out to a
+   device ON A SINGLE FIBRE"*, and only the case where the device already stands at the
+   cable's end was built. Two walls met in the middle: a strand may be joined only where
+   its own sheath is opened (`joint_refusal` → `absent`, correct physics and staying), and
+   the single fibre that physically reaches the OLT could not be laid because **1 was not
+   in `FIBER_COUNTS`**. So the commonest tail in an access network — a pass-through closure
+   feeding the OLT beside it — had no route through this record at all, which is exactly
+   how it was reported ("I can't figure out how to connect it to an OLT/switch").
+   `POST /api/inventory/fibre/tail` → `store.take_core_to_box`, driven from the tray's own
+   destination picker. Six things hold:
+   - **IT IS A MACRO, NOT A NEW CONCEPT.** It writes the three rows a patient operator
+     would write by hand — a 1F cable between the two points, a splice here, a termination
+     there — so `trace`, `split_org_cable`, the delete cascade and the tray's own refusals
+     all keep working with no knowledge that a shortcut exists. Nothing it can record is
+     unrecordable without it. The moment it writes something the manual path cannot, there
+     are two models of a tail again.
+   - **ONE TRANSACTION, AND THE FIBRE IS CHECKED BEFORE THE CABLE IS LAID.** A refused
+     splice that still left its tail behind would put a new line on the map, which an
+     operator reasonably reads as the connection having been made.
+   - **THE TAIL IS 1F AND UNTRACED, deliberately.** One core out is one strand; nobody
+     surveys the two metres from a closure to the rack beside it, and an empty path draws
+     the dashed chord — this map's own word for "recorded, not walked". `length_m` stays
+     null, because zero would be a measurement. An operator with a real 8F tail lays it by
+     hand and splices in the tray, which has always worked.
+   - **THE NAME CARRIES THE SOURCE CABLE AND CORE** (`a1 core 4 → HLY-OLT-2`). An 8-PON
+     OLT fed off one closure gets eight tails between the same two points; named for the
+     points alone all eight are one string and the OLT's picker offers eight identical
+     rows. The first cut used the POINT name (`a1 JC1 core 4 → …`) and that is a
+     half-fact — a closure is not a cable, so "core 4" had no sheath to be a core of.
+   - **THE PICKER IS NEAREST-FIRST WITH THE DISTANCE PRINTED, and refuses nothing.** A tail
+     is a real cable appearing on the map, so the box 40 km away must not sit one careless
+     click under the box 30 m away — but a long tail is unusual rather than impossible, and
+     this record does not block real plant for looking strange. Computed in `map-page`
+     (the page holds every pin; a route for it would be a second answer to drift from),
+     capped at 12, unplaced boxes excluded, and a box already cabled from here says so
+     because the honest action then is to splice onto that cable instead.
+   - **The tray OPENS ON THE BIGGEST CABLE**, ties broken by the server's feed hint. It was
+     the feed outright until tails existed: light at a closure now arrives up a 1F tail, so
+     feed-first opened the tray on a single strand with the 24F trunk — the thing you came to
+     work on — hidden behind a dropdown.
+   - **Re-picking watches the POINT, not just its cables.** One cable's two ends are two
+     points, so walking to the far end of the same sheath leaves the pick perfectly valid
+     while the schedule on screen is about the wrong end.
+   Tests: `integration/test_central_cableplant:FibreTailTest`, `unit/test_fiber`.
+
+   > A ONE-DAY DESIGN, KEPT ONLY AS A LESSON: on 2026-08-09 the same complaint was answered
+   > by putting THE BOX in the two-column tray's right-hand picker, with a dashed socket per
+   > strand. It fixed the OLT case and was superseded the next morning by the schedule above,
+   > because the second column can hold exactly one destination and a closure's terminations
+   > do not. What survives is the diagnosis, twice over: **a mode you can only reach by
+   > stumbling into it is not shipped**, and **a panel that cannot DISPLAY an arrangement it
+   > can RECORD is worse than one that refuses it**. Do not re-add facing columns.
+5. **Trace** (`fiber.trace`, `GET /api/inventory/fibre/trace?cable=&core=`). Walks both
+   directions across sheaths and joints. A fork or a loop STOPS the walk at that point and
+   returns the unambiguous part plus `fault_at`: drawing a confident line past a fork is how
+   a splicer ends up at the wrong closure.
+
+- **THE HALF-COUPLER IS A VIEW, NOT A CONSTRAINT** (his idea, 2026-08-09: *"make coupler as
+  two part so that line will always be between two those half coupler parts"*). The instinct
+  is right — a cable end is a real thing you point at, and a splice tray genuinely has two
+  sides — so the tray is two columns and **the operator picks which cable is on each**. It
+  is wrong as a rule because a closure routinely has three to six cable entries (trunk in,
+  trunk out, two branches), and cable-to-cable joins happen AT couplers: a hard two-half
+  model makes branching a trunk impossible without a device in the middle. So a coupler
+  holds N cable ends and the tray shows two at a time.
+- **ONE FIBRE JOINS EXACTLY ONE FIBRE, enforced on the WRITE** (`fiber.joint_refusal` →
+  `absent` / `self` / `taken`), so an operator finds out while looking at the tray rather
+  than as a fault chip later. The route answers **200 with a NAMED refusal**, not a bare
+  400: on a splice tray an unexplained rejection is indistinguishable from a broken button.
+  What is deliberately NOT refused: the same core number of two DIFFERENT cables (a 12F
+  spliced through to a 12F is twelve of those — the old model had to refuse it and keeping
+  that would block the commonest closure there is), and a U-turn within one cable (rare,
+  buildable, and `trace` reports it if it ever matters).
+- **RECORDED IS NEVER OCCUPIED**, the splitter-legs rule verbatim. `cores_recorded` counts a
+  core with a joint at EITHER end or a label; counting only joints printed "0 of 12 cores
+  recorded" above a plainly recorded core, which is the count-agreement rule broken inside
+  one card. The reply carries no `cores_free`/`spare` key at all (pinned).
+- **WHERE A CORE GOES IS DERIVED; WHAT IT CARRIES IS TYPED.** `org_cable_cores` survives as
+  free text ("BSNL leased line", "village A tower", "reserved") and the core plan renders it
+  apart from the joints, so a note can never be mistaken for a finding.
+- **TWO REFUSALS ON THE CABLE ITSELF.** Shrinking the count under a core IN USE is refused
+  (a joint naming core 19 of a 12F would render a tube and a colour in full confidence);
+  clearing the count entirely is a different statement and clears every joint and label with
+  it. **MOVING AN END discards the joints made at the end that moved** — a splice is a fact
+  about a particular closure — guarded on the end actually CHANGING so a rename is
+  idempotent, the same shape as `set_onu_drops` discarding a route only on a real re-home.
+- **ORIENTATION IS MEASURED, NEVER STORED** (`cablepath.orient`, mirrored in
+  `map/cables.ts`). A cable's vertices are in the order somebody drew them, which says
+  nothing about which end the record calls `a`; a stored claim would have to be kept true
+  through every retrace. Decided on the TOTAL of the two end stubs, never either alone — a
+  pin can easily be nearer the wrong end of a street that doubles back, and deciding each
+  end independently is how both stubs get drawn to one vertex with the cable crossing
+  itself. An unplaced end abstains.
+- **LENGTH is walked segment by segment** (`cablepath.length_m`), because crews order drum by
+  the metre and Mercator stretches with latitude. An untraced cable has NO length rather than
+  zero — nobody walked it, and zero would be a measurement.
+- **The line takes `--map-plant` at FULL chroma**, weight `2 + fiberBoost(cores)`, no status
+  tone (a cable has no state; what is broken is the topology drawn over it). An UNTRACED
+  cable draws the chord between its two pins, DASHED (`CABLE_DASH`, a wider period than the
+  drop's because a dash array is absolute px and a finer period on a wider stroke closes into
+  a solid line, i.e. into a claim somebody surveyed it). Tracing a core lights its whole path
+  by EMPHASIS — weight and opacity, never hue.
+- **THE CABLE SAYS ITS OWN NAME ON THE MAP** (`cables.ts:cableIcon`/`cableLabelPos`,
+  2026-08-09, from an ISP walkthrough of a real street). Four violet lines met at a closure
+  and NOTHING on any of them said which was the 24F trunk and which the 4F branch —
+  identifying one meant clicking a box and reading a list, on a map, where the object you
+  are looking at is the LINE. Every other family here already earned a chip (the link's
+  rate, the drop's); the cable, which this whole view is now about, had none. Four rules:
+  - **The NAME leads, the count follows.** A bare `24F` separates a trunk from a branch but
+    not one trunk from another, and segment-per-span means a drum is several cables sharing
+    a name — so the name is what makes four lines read as one route. Clamped in CSS (14ch)
+    with the full string, the walked length and `coresRecordedLabel` coverage in the title;
+    a chip that grew to fit its text would overrun the box the budget reserved for it.
+  - **It joins the shared collision budget as a THIRD family** — the documented rule — and
+    it forced that budget to stop using ONE box for everything. 78px was a fair overestimate
+    for `↓3.7M ↑1.2M` and a large under-estimate for `HALIYA TRUNK 24F` (**measured at
+    134px**), so two wide chips 80px apart passed the test and visibly overlapped. A claim
+    now carries its own half-width (`CHIP_HALF`) and a pair is judged on the SUM: narrow
+    families keep their density, only the wide one spreads. Re-measure on any content change.
+  - **The CHIP is the click target, not the polyline.** Clicking it opens the cable panel.
+    Making the line interactive would have been the obvious move and is the documented trap —
+    an interactive polyline swallows the placement and route-drawing clicks the map is also
+    for, which is why every topology line here is `interactive={false}`.
+  - **`cableLines` resolves the geometry ONCE** for the render and the budget. On a traced
+    street the midpoint of the line as drawn is nowhere near the chord's, and computing it
+    twice is exactly how a budget reports itself clear over a visible collision.
+- **The Layers control is "Dependency links", NOT "Links with no cable"** — the old name
+  went stale the day the segment model landed. It was written when a topology link could
+  carry a cable and most did not; a link now carries no plant record BY CONSTRUCTION, so the
+  set it hides is not "the ones nobody got to yet" but all of them, always. A control naming
+  a state that can no longer occur reads as broken, and this one is the answer to the
+  commonest fibre complaint (dashed dependency lines shouting over surveyed cable): switching
+  it off leaves a pure plant map. The legend gained the two CABLE rows it never had — traced
+  and untraced, the pair a crew must tell apart because one is a route they quote drum
+  against and the other is an admitted straight line.
+- **A STRAND COLOUR MAY NEVER BE A LINE'S STROKE, AND NEVER TEXT.** TIA-598-D contains red,
+  orange, yellow and green — the exact hues reserved for alarms — so a cable painted red
+  because it is core 7 is a fabricated outage. It renders as a DOT in a neutral chip and a
+  SWATCH in a panel: the identity-chip grammar the two-colour-axes pass settled. The tray's
+  CONNECTOR is neutral for the same reason plus one more: two dozen coloured arcs crossing
+  one gutter on a 24F is a pattern, not information.
+- **PAST 12 FIBRES THE SEQUENCE RESTARTS INSIDE A BUFFER TUBE**, and the tube is what a crew
+  opens first. Core 25 of a 48F is the BLUE fibre in the GREEN tube. Stored as plain
+  integers, presented through `locate()`/`strandAt()`; the core plan and the tray both draw
+  twelve to a row so each row IS a tube, which teaches the arithmetic instead of explaining
+  it. `unit/test_fiber:TubeTest`.
+- **`FIBER_COUNTS` is CLOSED** (1/2/4/6/8/12/24/48/96) and MIRRORED in TS, like the theme
+  allowlist and the map-detail defaults — a browser draws swatches before any request
+  resolves and central validates without asking a browser. `SpaAgreementTest` reads the TS
+  source and fails on drift, including every hex: a name drift mislabels a colour in words, a
+  hex drift draws the wrong swatch beside the right word, and the second is worse.
+  **1F is a single-fibre TAIL, not a rounding of "small"** — see gesture 4. Leaving it out is
+  what made a closure feeding an OLT unrecordable, so if this list is ever trimmed, 1 is the
+  one entry that costs a feature rather than a convenience.
+- **A TOPOLOGY LINK CARRIES NO PLANT RECORD.** `link_routes` is CARTOGRAPHY only
+  (`label_pos`); a body still naming `cable_id`/`core_no`/`cores` is REFUSED with a message
+  naming the new route, and `/cable/run`, `/cable/tap` and `/cable/splice` answer "fibre is
+  recorded on the cable itself now — reload the page" rather than 404ing. The SPA deploys the
+  instant it is built while central needs a restart, so that pairing is routine and a silent
+  404 there reads as a bug. A link with no cable over its pair still draws its dotted chord —
+  after the wipe that is every link, which is the honest state and doubles as the to-do list.
+- **THE WIPE** (`store._rebuild_fibre_plant`, guarded by an `app_settings` marker). Cables,
+  runs, taps, splices, core labels and the span geometry that only existed to draw them are
+  DESTROYED; `org_devices` (every pin, ratio, parent, tag), `onu_places` (every customer pin,
+  name, number) and `onu_drops` are untouched. A migration could have guessed a cable's ends
+  from the runs on it — and a guessed end is a closure a crew drives to, which is the one
+  thing this subsystem must never invent. ORDER IS EVERYTHING (`PRAGMA foreign_keys=ON`):
+  children, then `link_routes.cable_id`, then `DROP TABLE org_cables`. That dead column still
+  PINNED its parent, which is how a migrated cable became undeletable in the field.
+  Rehearsed on a copy of prod: 99 devices / 81 placed and 289 customers / 285 placed
+  unchanged, 106 drops kept, 58 cables and 57 runs gone.
+- **`onu_drops` SURVIVES, and is not a duplicate** (operator's call). A drop says which
+  splitter LEG a customer uses — an optical split, which is what capacity and branch-fault
+  localization run on; a cable says which glass carries it. Different facts.
+- Tests: `unit/test_fiber`, `unit/test_cablepath`,
+  `integration/test_central_cableplant` (`CableRecordTest`, `CableRouteTest`,
+  `FibreJointTest`, `FibreTraceTest`).
+- **Still to do: SHARED RISK.** N cables through one duct is a common-cause group — today a
+  cut behind a 12F reads as N unrelated outages and `incidents.py` can even grade it `power`.
+  Feeding cable membership in as a hypothesis is the monitoring payoff and was deliberately
+  scoped out.
 
 ## Config
 

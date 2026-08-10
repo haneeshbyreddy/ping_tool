@@ -22,9 +22,9 @@
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, MapPin, MapPinned, Search, Split, TriangleAlert } from "lucide-react"
+import { ChevronRight, GitMerge, MapPin, MapPinned, Search, Split, TriangleAlert } from "lucide-react"
 import { inventoryApi, ApiError } from "@/lib/api"
-import { SPLIT_RATIOS, isPassiveType, type OnuOptic, type OrgDevice, type SubscriberDrop } from "@/lib/types"
+import { isPassiveType, type OnuOptic, type OrgDevice, type SubscriberDrop } from "@/lib/types"
 import { useAuth } from "@/hooks/use-auth"
 import { onuName } from "@/lib/format"
 import { fmtKm, distanceKm, polyKm } from "@/map/geometry"
@@ -32,6 +32,8 @@ import { fmtKm, distanceKm, polyKm } from "@/map/geometry"
 // helper importing a panel component to get one rule is how a module graph
 // knots, and both surfaces have to agree about what feeds what.
 import { cumulativeSplit, feedChain } from "@/map/plant"
+import { deviceRatioLabel, hasProtectionInput } from "@/map/drops"
+import { SplitRatioField, type SplitRatio } from "@/components/split-ratio-field"
 import { SubscriberDialog } from "@/components/subscriber-detail"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -39,12 +41,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog"
-import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
-} from "@/components/ui/select"
 import { cn } from "@/lib/utils"
-
-const NONE = "__none__"
 
 /** Cable metres from the powered head down to this box, following drawn routes
  *  where the operator traced them and the straight chord where they didn't.
@@ -123,14 +120,18 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
   // inventory row rather than the prop this panel was rendered with — otherwise
   // setting a ratio here would quietly revert a rename made somewhere else.
   const setRatio = useMutation({
-    mutationFn: (ratio: number | null) => {
+    // BOTH halves, always. They are one answer ("what kind of splitter is
+    // this"), and the server validates them together — a write carrying the
+    // ratio but not the inputs would leave a 2:16 claiming a second feed on a
+    // ratio that had just changed under it.
+    mutationFn: ({ ratio, inputs }: SplitRatio) => {
       const d = invQ.data?.devices.find((x) => x.id === device.id) ?? device
       return inventoryApi.update(d.id, {
         name: d.name, ip_address: d.ip_address,
         device_type: d.device_type, region: d.region,
         tags: d.tags, parent_device_id: d.parent_device_id,
         assigned_node_id: d.assigned_node_id, gpon_vendor: d.gpon_vendor,
-        pon_port: d.pon_port, split_ratio: ratio,
+        pon_port: d.pon_port, split_ratio: ratio, split_inputs: inputs,
         onu_pon_limit: d.onu_pon_limit,
       })
     },
@@ -163,6 +164,15 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
   const load = dropsQ.data?.load ?? null
   const outlierDb = dropsQ.data?.outlier_db ?? 3
   const ratio = self.split_ratio
+  const ratioText = deviceRatioLabel(self)
+  // How many feeds have actually been DRAWN into this box, against how many it
+  // was built with. Primary parent + declared backup links — the same two edge
+  // kinds that carry a feed anywhere else in this product. Peers are excluded
+  // on purpose: a cross-link is a cable between equals, not something feeding a
+  // splitter, and counting one would report a protection feed that isn't there.
+  const protection = hasProtectionInput(self)
+  const feeds = (self.parent_device_id != null ? 1 : 0)
+    + (self.backup_parents?.length ?? 0)
   const over = !!ratio && !!load && load.recorded > ratio
 
   // Worst first: a panel opened during a fault should answer "what is broken"
@@ -186,7 +196,7 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
         <Split className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="text-2xs font-medium text-muted-foreground">Distribution</span>
         <span className="ml-auto flex items-center gap-2 font-mono text-2xs text-faint-foreground">
-          {ratio && <span>1:{ratio}</span>}
+          {ratioText && <span>{ratioText}</span>}
           {load ? <span>{load.recorded} recorded</span> : null}
           {load?.dark ? <span className="text-destructive">{load.dark} dark</span> : null}
         </span>
@@ -209,8 +219,8 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
                   <span key={p.id} className="flex items-center gap-1.5 text-muted-foreground">
                     <ChevronRight className="size-3" />
                     <span>{p.name}</span>
-                    {p.split_ratio && (
-                      <span className="font-mono text-2xs text-faint-foreground">1:{p.split_ratio}</span>
+                    {deviceRatioLabel(p) && (
+                      <span className="font-mono text-2xs text-faint-foreground">{deviceRatioLabel(p)}</span>
                     )}
                   </span>
                 ))}
@@ -246,25 +256,37 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-2">
               <span className="wisp-eyebrow">Split ratio</span>
-              {canWrite && (
-                <Select
-                  value={ratio ? String(ratio) : NONE}
-                  onValueChange={(v) => setRatio.mutate(v === NONE ? null : Number(v))}>
-                  <SelectTrigger size="sm" className="h-7 w-28 text-xs">
-                    <SelectValue placeholder="Not recorded" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>Not recorded</SelectItem>
-                    {SPLIT_RATIOS.map((r) => (
-                      <SelectItem key={r} value={String(r)}>1:{r}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
               {!canWrite && (
-                <span className="font-mono text-xs">{ratio ? `1:${ratio}` : "—"}</span>
+                <span className="font-mono text-xs">{ratioText ?? "—"}</span>
               )}
             </div>
+            {canWrite && (
+              <SplitRatioField
+                value={{ ratio, inputs: self.split_inputs }}
+                disabled={setRatio.isPending}
+                onChange={(next) => setRatio.mutate(next)} />
+            )}
+            {/* A SECOND INPUT IS A CLAIM ABOUT THE BOX, NOT ABOUT THE WIRING —
+                which is exactly why it is worth saying out loud how many feeds
+                are actually recorded. A 2:16 with one link drawn to it is
+                either genuinely unprotected or simply undocumented, and those
+                need opposite actions; the map can't tell them apart and neither
+                can this panel, so it reports the count and stops. Same
+                discipline as "recorded is never occupied" two paragraphs down:
+                state the record, never infer the world from it. */}
+            {protection && (
+              <div className="flex items-start gap-1.5 rounded border border-border-subtle bg-muted/50 px-2 py-1 text-2xs text-muted-foreground">
+                <GitMerge className="mt-px size-3 shrink-0" />
+                <span>
+                  Two inputs ·{" "}
+                  <span className="font-mono text-foreground">{feeds}</span>{" "}
+                  {feeds === 1 ? "feed" : "feeds"} recorded.{" "}
+                  {feeds < 2
+                    ? "The protection feed is either not connected or not drawn."
+                    : "Both feeds are on the map."}
+                </span>
+              </div>
+            )}
             {ratio ? (
               <>
                 <div className="flex h-2 gap-px overflow-hidden rounded-sm" role="img"

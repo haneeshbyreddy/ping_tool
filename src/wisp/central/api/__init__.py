@@ -25,6 +25,9 @@ GET = {
     "/api/inventory": devices.list_devices,
     "/api/regions": devices.regions,
     "/api/inventory/routes": devices.routes,
+    "/api/inventory/cables": devices.cables,
+    "/api/inventory/fibre": devices.device_fibre,
+    "/api/inventory/fibre/trace": devices.fibre_trace,
     "/api/inventory/ports": devices.ports,
     "/api/inventory/link-ports": devices.link_ports,
     "/api/inventory/optics": devices.optics,
@@ -109,7 +112,25 @@ POST = {
     "/api/inventory/onu-contact": devices.onu_contact,
     "/api/inventory/drops/set": devices.set_onu_drops,
     "/api/inventory/route": devices.route,
+    "/api/inventory/drop-route": devices.drop_route,
     "/api/inventory/link-style": devices.link_style,
+    "/api/inventory/cable": devices.cable_save,
+    "/api/inventory/cable/core": devices.cable_core,
+    "/api/inventory/cable/path": devices.cable_path,
+    "/api/inventory/cable/split": devices.cable_split,
+    "/api/inventory/cable/delete": devices.cable_delete,
+    "/api/inventory/fibre/joint": devices.fibre_joint,
+    "/api/inventory/fibre/tail": devices.fibre_tail,
+    "/api/inventory/fibre/through": devices.fibre_through,
+    "/api/inventory/fibre/clear": devices.fibre_clear,
+    # RETIRED with the run/tap model (2026-08-09), and answering a sentence
+    # rather than a 404. The SPA deploys the instant it is built while central
+    # needs a restart, so a browser holding the old bundle against the new server
+    # is routine — and a bare 404 there reads as "the button is broken" instead
+    # of "reload the page".
+    "/api/inventory/cable/run": devices.cable_gone,
+    "/api/inventory/cable/tap": devices.cable_gone,
+    "/api/inventory/cable/splice": devices.cable_gone,
     "/api/inventory/snmp": devices.snmp,
     "/api/inventory/web-access": devices.web_access,
     "/api/inventory/capability": devices.capability,

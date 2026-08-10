@@ -12,9 +12,10 @@ import L from "leaflet"
 import { Circle, MapContainer, Marker, Polyline, ZoomControl } from "react-leaflet"
 import "leaflet/dist/leaflet.css"
 import {
-  ArrowDown, ArrowLeftRight, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Crosshair,
+  ArrowLeft, Check, ChevronDown, ChevronRight, Copy, Crosshair,
   Expand, EyeOff, Layers, ListTree, LocateFixed, MapPin, MapPinOff, Maximize2, Navigation,
-  Pencil, Plus, Shrink, Slash, Spline, Undo2, Users, X,
+  Pencil, Plus, Route, Scissors, Shrink, Slash, Spline, Trash2, Undo2, Users, Waypoints, X,
+  Cable as CableIcon,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDarkMode } from "@/hooks/use-dark-mode"
@@ -22,21 +23,29 @@ import { useNow } from "@/hooks/use-now"
 import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
 import { fieldApi, inventoryApi, orgsApi, ApiError } from "@/lib/api"
 import { mapRegionOf } from "@/lib/map-regions"
-import { isPassiveType, type OnuPlace, type OrgDevice, type PonFault } from "@/lib/types"
+import { isPassiveType, type Cable, type FibrePoint, type OnuPlace, type OrgDevice,
+         type PonFault } from "@/lib/types"
 import {
   DeviceDetail, DevicePanelHeader, RowTag, deviceTabs, type DeviceTab,
 } from "@/components/device-detail"
+import { CableForm, CableList, CablePanel } from "@/components/cable-record"
+import { CouplerTray } from "@/components/coupler-tray"
+import {
+  CABLE_DASH, cableIcon, cableLabelPos, cablePolyline, cableTraced,
+} from "@/map/cables"
 import { SubscriberDetail } from "@/components/subscriber-detail"
+import {
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { StatusDot } from "@/components/status-badge"
-import { durationSince } from "@/lib/format"
+import { durationSince, onuName } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
-  DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
+  DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -49,7 +58,6 @@ import { buildClusters, clusterIcon, project, toneRank, type SiteCluster } from 
 import { cutIcon, pointAlong, ponPath, subPath } from "@/map/cut"
 import { DevHoverCard } from "@/map/devhover"
 import { alongKm, distanceKm, fmtKm, nearestOnPath, pointAt, polyKm } from "@/map/geometry"
-import { LINK_COLORS, isLinkColor, linkColorName, linkColorVar, paintedLineColor } from "@/map/linkcolor"
 import { LinkHoverProbe, hoverIcon, projectLinks, type LinkHover } from "@/map/linkhover"
 import { bindLinkPorts, bwRank, linkBwIcon, linkKey, linkLabelPos, type LinkBinding } from "@/map/linklabel"
 import {
@@ -57,8 +65,7 @@ import {
 } from "@/map/pins"
 import {
   REF_DASH, REF_HOVER_BOOST, REF_NAME_DY, isRefDark, isRefEvidence, refBwIcon,
-  refHasChip,
-  refLineTone, refNameIcon, refOnuIcon, refZIndex,
+  refChipPos, refHasChip, refLineTone, refNameIcon, refOnuIcon, refZIndex,
 } from "@/map/refonu"
 import { RefHoverCard } from "@/map/refhover"
 import { SiteHoverCard, type SiteHoverCtx } from "@/map/sitehover"
@@ -72,13 +79,13 @@ import {
 } from "@/map/plant"
 import { PlantMenu, type ArmKind, type PlantMenuAnchor } from "@/map/plantmenu"
 import {
-  AttachCustomerDialog, PlantCreateDialog,
+  AttachCustomerDialog, nearestRegion, PlantCreateDialog,
   type CustomerDraft, type PlantDraft,
 } from "@/components/plant-create"
 import { detailFrom } from "@/map/detail"
 import { MapSearch, type OnuHit, type PlaceHit } from "@/map/search"
 import {
-  CASING_OPACITY, CASING_OPACITY_HOVER, casingAt, lineScale, strokeAt,
+  CASING_OPACITY, CASING_OPACITY_HOVER, casingAt, fiberBoost, lineScale, strokeAt,
 } from "@/map/stroke"
 import { FIT_PADDING, InvalidateOnResize, MapEvents, ViewController, loadView } from "@/map/view"
 import {
@@ -89,6 +96,19 @@ const BW_LABELS_KEY = "wisp:map:bw-labels"
 const REF_ONUS_KEY = "wisp:map:ref-onus"
 const WORKERS_KEY = "wisp:map:workers"
 const GOOGLE_LABELS_KEY = "wisp:map:google-labels"
+const UNCABLED_KEY = "wisp:map:uncabled"
+
+/** The dash for a link with NO cable recorded — "these two are joined, nobody
+ *  has said by what".
+ *
+ *  A FIFTH member of a family whose four periods are already argued over, so it
+ *  is picked against them: drop "1 7" (8px), peer "1.5 7" (8.5), ref "1 10"
+ *  (11), backup "5 8" (13). This sits at a 9px period with a 3px ON — read as
+ *  medium DASHES where drop/peer/ref are dots, and clearly shorter than the
+ *  backup's long dash. `strokeAt` scales it with the weight, which is not
+ *  optional: an unscaled dash closes into a SOLID line as the stroke widens,
+ *  and solid on this map means surveyed cable a crew quotes drum against. */
+const UNCABLED_DASH = "3 6"
 
 /** Every layer that has a zoom floor now reads it from `map/detail.ts`, which
  *  holds the shipped defaults, their reasoning and the one ordering invariant
@@ -123,13 +143,61 @@ const CASING_OVER_FINE = 1.5
 
 /** One drawable cable span the selected device is an end of. `childId`/`parentId`
     are the link_routes key and fix the waypoint direction (parent→child). */
-type Cable = {
-  childId: number; parentId: number; other: OrgDevice
-  dir: "up" | "down" | "across"
-  kind: "primary" | "backup" | "peer"
-  route?: Array<[number, number]>
-  color?: string | null
-}
+/** What the route editor is currently tracing.
+ *
+ *  The kinds carry the SAME waypoint list and differ only in what addresses
+ *  the row it saves into — a device pair for a cable between boxes, a MAC for a
+ *  subscriber's drop (`onu_drops` is keyed on the sticker for the same reason
+ *  every subscriber-side record here is: `onu_optics` never deletes a vacated
+ *  slot, so a slot key rots the moment an ONU is re-registered), a cable id for
+ *  the street itself.
+ *
+ *  ONE editor, two kinds of span. A second would be two sets of gestures to keep
+ *  in step, and the day they drifted this map would teach two ways to trace one
+ *  network.
+ *
+ *  `cable` is the odd one and the reason the union earns its keep: it has NO
+ *  ANCHORS. A link is drawn between two pins and a drop between a splitter and
+ *  an ONU, so both lists are INTERMEDIATE vertices and the ends move with the
+ *  boxes. A cable ends wherever the glass ends — routinely mid-street with
+ *  nothing recorded there — so its list is the whole route, first vertex to
+ *  last. Everything downstream of `anchors` keys off that difference. */
+type RouteEdit = { points: Array<[number, number]> } & (
+  | { kind: "drop"; mac: string }
+  /** `cableId` null = a cable that does not exist yet: the route is drawn FIRST
+   *  and the sheath is named on save. That order is the point — a cable is a
+   *  thing in the ground, so drawing it is how you say it exists, and the four
+   *  hand-made cables on the live fleet with nothing attached to them are what
+   *  asking for a name first produced. */
+  | { kind: "cable"; cableId: number | null; name: string
+      /** WHAT THE TWO ENDS LANDED ON, recorded as they are clicked rather than
+       *  worked out afterwards from coordinates. A cable's ends are the whole of
+       *  what this model added, so they may not be inferred: two boxes racked at
+       *  one point would be indistinguishable, and "near enough" is exactly the
+       *  kind of threshold this map has already been wrong about three times.
+       *
+       *  Null means the click landed on open ground, and a coupler is created
+       *  there on save. That is what makes "a cable runs between two couplers"
+       *  true BY CONSTRUCTION instead of by rule — the operator draws a line and
+       *  the closures appear, which is the order the work happens in. */
+      endA?: FibreEnd | null; endB?: FibreEnd | null }
+)
+
+/** One end of a cable being drawn: the point it snapped onto. */
+type FibreEnd = { device_id?: number; mac?: string; name: string }
+
+/** THE PIN A CLICK LANDED ON, in SCREEN space, or null for open ground.
+ *
+ *  Screen space and not ground distance, deliberately: this is an affordance
+ *  about the cursor — the same 24 px the edit-pins drag already snaps within —
+ *  and a metre threshold would mean a click that snaps at one zoom and misses at
+ *  another. Nothing about plant is decided here; the operator sees the vertex
+ *  jump onto the pin, and the banner names what it caught.
+ *
+ *  Devices are preferred over subscribers on a tie because a customer pin is the
+ *  smaller mark and routinely sits within a fingertip of the splitter feeding it
+ *  — the same collision `refhover` had to be given a keep-out for. */
+const SNAP_PX = 24
 
 /** A drawn route needs somewhere to go: TRUE when a link's two ends resolve to
  *  the same point on screen, which is the only case where traced geometry cannot
@@ -180,6 +248,63 @@ export function MapPage() {
   const queryClient = useQueryClient()
   const mapRef = useRef<L.Map | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  // The cable whose core plan is open, and the core being TRACED on the map.
+  //
+  // Two pieces of state rather than one, because they answer different
+  // questions and only one of them is a claim about the map: a cable can be open
+  // with no core picked (reading the plan), and a trace has to survive the panel
+  // being scrolled. `traceCore` is cleared whenever the cable changes — core 7
+  // of one sheath is a different piece of glass from core 7 of another, so
+  // carrying a selection across would highlight a run nobody asked for.
+  const [cableOpen, setCableOpenRaw] = useState<number | null>(null)
+  const [traceCore, setTraceCore] = useState<number | null>(null)
+  const cableDelete = useConfirm()
+  /** The cable LIST, the entry point cables had none of. Separate from
+   *  `cableOpen` so the back arrow has somewhere to go and closing the panel
+   *  from a cable doesn't reopen the list behind it. */
+  const [cableList, setCableList] = useState(false)
+  /** OPENING A COUPLER MID-SPAN: the map is armed, and the next click on the
+   *  cable is where it is cut. A mode rather than a drag, because the point
+   *  wanted is a place on the STREET — a thing you point at, not a handle you
+   *  move — and because the coupler does not exist yet, so there would be
+   *  nothing to take hold of. The server snaps it onto the route, so a click
+   *  merely has to be near. */
+  const [splitAt, setSplitAt] = useState<
+    { cableId: number; cableName: string } | null>(null)
+  /** The POINT whose splice tray is open — a box, or a customer. Both, because
+   *  a customer point is a coupler too: that is the case the ISPs added, and it
+   *  is what lets a lane of houses be daisy-chained down one 4F. */
+  const [trayAt, setTrayAt] = useState<
+    { device_id?: number | null; mac?: string | null } | null>(null)
+  const [trayError, setTrayError] = useState<string | null>(null)
+  /** THE FIBRE BEING FOLLOWED, end to end across sheaths and joints.
+   *
+   *  A strand changes both sheath and core number at the second hop of any real
+   *  access network, so this is the only thing that can answer "where does this
+   *  fibre actually go" — out of the OLT on the trunk, through the closure it is
+   *  cut at, onward on the distribution cable. Held as the fibre it started
+   *  from, because that is what the operator clicked. */
+  const [traceFrom, setTraceFrom] = useState<
+    { cableId: number; coreNo: number } | null>(null)
+  const setCableOpen = useCallback((id: number | null) => {
+    setCableOpenRaw(id)
+    setTraceCore(null)
+  }, [])
+  /** Naming a cable: an existing one being renamed (`id`), or a brand-new one
+   *  whose route has just been TRACED (`path`, no id).
+   *
+   *  Creation came back on 2026-08-09, reversing the rule that there is no
+   *  create form because "a cable that is nowhere is not a thing that exists".
+   *  That was right when a cable had no geometry — it was an abstraction, and
+   *  the live fleet grew four of them attached to nothing. A cable has a
+   *  surveyed route now, so one drawn down a street IS somewhere, and it is in
+   *  the ground before anything is spliced to it. Which is why the ROUTE comes
+   *  first and this form second: you have already put it somewhere by the time
+   *  you are asked what to call it. */
+  const [cableForm, setCableForm] = useState<
+    { id?: number; name: string; cores: number | null
+      path?: Array<[number, number]>
+      ends?: [FibreEnd | null, FibreEnd | null] } | null>(null)
   // The device under the cursor. Hovering a box lights the CABLES INTO IT —
   // the question a network map is asked more than any other ("what does this
   // connect to") and, until now, one that cost a click and a panel to answer.
@@ -241,23 +366,40 @@ export function MapPage() {
   // because a menu pinned to a screen position stops pointing at the ground it
   // was opened over the moment the map pans under it.
   const [plantMenu, setPlantMenu] = useState<PlantMenuAnchor | null>(null)
-  // The create sheet's subject: a kind, a coordinate and the feeder the click
-  // inferred. Non-null means the sheet is open.
+  // The create sheet's subject: a kind and a coordinate. Non-null means the
+  // sheet is open. It carried an inferred FEEDER until 2026-08-09 — placing a
+  // box no longer guesses what feeds it, so there is nothing left to infer.
   const [plantDraft, setPlantDraft] = useState<PlantDraft | null>(null)
   const [customerDraft, setCustomerDraft] = useState<CustomerDraft | null>(null)
+  // The passive the delete confirm is about. Held apart from `plantMenu`, which
+  // is dismissed the moment the item is clicked: the dialog has to keep naming
+  // the box after the menu it came from is gone.
+  const [plantDelete, setPlantDelete] = useState<OrgDevice | null>(null)
+  const confirmPlantDelete = useConfirm()
   // "Click where it goes." Set by a menu item opened ON a pin (that pin already
   // owns its own coordinate, so creating at it would stack two boxes on one
   // point) and by "Save and add another", which is what makes recording a whole
   // feeder run one continuous gesture rather than eight round trips.
-  const [armed, setArmed] = useState<{ kind: ArmKind; parentId: number | null } | null>(null)
+  //
+  // `passiveId` is for the CUSTOMER kind alone, and that asymmetry is the point:
+  // a tech at a drop knows in one instant both where the box is and which
+  // splitter its fibre comes off, so that inheritance is a fact rather than a
+  // guess. The person placing the SPLITTER usually does not yet know which core
+  // will feed it, which is why plant inherits nothing any more.
+  const [armed, setArmed] = useState<{ kind: ArmKind; passiveId: number | null } | null>(null)
   // The `+` button's mode: the next click opens the MENU rather than creating
   // anything. A context menu nobody knows to right-click for is a feature that
   // does not exist, and this is the visible twin of it.
   const [addNext, setAddNext] = useState(false)
-  // drawing a cable path for one link: clicks append vertices, drags adjust
-  const [routeEdit, setRouteEdit] = useState<{
-    childId: number; parentId: number; points: Array<[number, number]>
-  } | null>(null)
+  // Drawing a cable path: clicks append vertices, drags adjust.
+  //
+  // TWO KINDS OF SPAN, ONE EDITOR. A link between devices and a subscriber's
+  // drop are the same gesture over the same ground and the same waypoint list —
+  // only the row they land in differs (`link_routes` keyed on a device pair,
+  // `onu_drops` keyed on a MAC). A second editor would mean a second set of
+  // undo/straighten/vertex-drag behaviours to keep in step, and the day they
+  // drifted the map would have taught two ways to trace one network.
+  const [routeEdit, setRouteEdit] = useState<RouteEdit | null>(null)
   const [editPins, setEditPins] = useState(false)
   const [troubleOnly, setTroubleOnly] = useState(false)
   // live zoom drives clustering; MapEvents reports it on mount and every zoomend
@@ -300,6 +442,21 @@ export function MapPage() {
   }
   // per-link ↓/↑ chips off the bound ports; on unless the operator switched
   // them off (Layers popover) — an org with no bindings simply shows none
+  // LINKS WITH NO FIBRE RECORDED. On by default, because switching them off is
+  // the strong claim: on this fleet 59 of 62 placed links have no cable recorded
+  // yet, so a default of "off" would blank almost every map and take the
+  // branch-fault span with it. Off is the PURE PLANT view — every line you can
+  // see is glass somebody wrote down — which is what the operator asked for
+  // (2026-08-09) after deleting a cable and finding the line still there.
+  const [showUncabled, setShowUncabled] = useState(() => {
+    try { return localStorage.getItem(UNCABLED_KEY) !== "off" } catch { return true }
+  })
+  const toggleUncabled = () => {
+    setShowUncabled((v) => {
+      try { localStorage.setItem(UNCABLED_KEY, v ? "off" : "on") } catch { /* private mode */ }
+      return !v
+    })
+  }
   const [bwLabels, setBwLabels] = useState(() => {
     try { return localStorage.getItem(BW_LABELS_KEY) !== "off" } catch { return true }
   })
@@ -364,21 +521,71 @@ export function MapPage() {
     enabled: !!scopeOrg,
     staleTime: 60_000,
   })
+  // The CABLES: the physical sheaths several spans are cut from. Its own query
+  // rather than folded into `routes` for the reason routes aren't folded into
+  // `/api/inventory` — every page lists devices, only the map (and the cable
+  // panel it opens) needs plant. Reference data that will not change this
+  // month, so it shares the routes' slow staleTime.
+  const cablesQ = useQuery({
+    queryKey: ["cables", scopeOrg],
+    queryFn: () => inventoryApi.cables(scopeOrg),
+    enabled: !!scopeOrg,
+    staleTime: 60_000,
+  })
+  /** Everything landing on the point whose tray is open. Its own read, not a
+   *  slice of the cable list: the tray is a question about a POINT ("what is
+   *  joined to what in here"), and answering it out of the org's cables would
+   *  mean the browser re-deriving what the server already resolves — including
+   *  the feed side, which comes from a walk no panel holds. */
+  const fibreQ = useQuery({
+    queryKey: ["point-fibre", scopeOrg, trayAt?.device_id ?? null, trayAt?.mac ?? null],
+    queryFn: () => inventoryApi.pointFibre(trayAt!, scopeOrg),
+    enabled: trayAt != null,
+  })
+  /** The whole optical path one fibre makes. Server-walked — see `trace_fibre`
+   *  on why an algorithm is not mirrored into the browser the way a vocabulary
+   *  is. */
+  const traceQ = useQuery({
+    queryKey: ["fibre-trace", scopeOrg, traceFrom?.cableId ?? null,
+               traceFrom?.coreNo ?? null],
+    queryFn: () => inventoryApi.traceFibre(traceFrom!.cableId, traceFrom!.coreNo,
+                                           scopeOrg),
+    enabled: traceFrom != null,
+  })
+  // Geometry, and WHOSE it is. A span with no trace of its own, on a cable
+  // somebody HAS traced, arrives here already carrying the stretch of that
+  // cable between the two points its boxes tap it at — resolved server-side, in
+  // `list_link_routes`, so the map and every distance central computes measure
+  // one line. `fromCable` rides along because the two are not the same claim:
+  // surveyed as this section, or surveyed as the street it is cut from.
   const routeByKey = useMemo(() => {
-    const m = new Map<string, Array<[number, number]>>()
+    const m = new Map<string, { pts: Array<[number, number]>; fromCable: boolean }>()
     for (const r of routesQ.data?.routes ?? [])
-      if (r.waypoints.length > 0) m.set(`${r.child_id}:${r.parent_id}`, r.waypoints)
+      if (r.waypoints.length > 0)
+        m.set(`${r.child_id}:${r.parent_id}`,
+              { pts: r.waypoints, fromCable: r.from_cable })
     return m
   }, [routesQ.data])
   // A link's styling rides the same rows as its geometry, but is looked up
   // separately: a coloured link commonly has NO drawn route (that's the whole
   // point — you colour the parallel chords you can't otherwise tell apart), so
   // it must not be filtered out by the waypoints test above.
+  // Everything on a link_routes row that ISN'T its geometry: the operator's
+  // cartography (colour, label position) and the CABLE RECORD (how many fibres
+  // the span carries, which strand this run uses). One map because it is one
+  // row — and because the render needs them together anyway, the chip carrying
+  // the cable facts being the same chip that borrows the colour.
   const styleByKey = useMemo(() => {
-    const m = new Map<string, { color: string | null; label_pos: number | null }>()
+    const m = new Map<string, {
+      label_pos: number | null; cable_id: number | null
+      cable_name: string | null; cores: number | null; core_no: number | null
+    }>()
     for (const r of routesQ.data?.routes ?? [])
-      if (r.color != null || r.label_pos != null)
-        m.set(`${r.child_id}:${r.parent_id}`, { color: r.color, label_pos: r.label_pos })
+      if (r.label_pos != null || r.cable_id != null || r.core_no != null)
+        m.set(`${r.child_id}:${r.parent_id}`, {
+          label_pos: r.label_pos, cable_id: r.cable_id,
+          cable_name: r.cable_name, cores: r.cores, core_no: r.core_no,
+        })
     return m
   }, [routesQ.data])
 
@@ -536,6 +743,62 @@ export function MapPage() {
   const selected = selectedId != null ? byId.get(selectedId) ?? null : null
   const placing = placingId != null ? byId.get(placingId) ?? null : null
 
+  /** Boxes the tray may run a single-fibre tail to, NEAREST FIRST.
+   *
+   *  Computed here rather than served, because "which boxes are near this one"
+   *  is a question about the map — this page already holds every pin, and a
+   *  route for it would be a second answer to drift from the first.
+   *
+   *  DISTANCE IS THE WHOLE SAFETY PROPERTY, and it is a soft one on purpose. A
+   *  tail is a real cable appearing on the map, so the box 40 km away must not
+   *  sit one careless click under the box 30 m away — but nothing is REFUSED,
+   *  because a long tail is unusual rather than impossible, and this record does
+   *  not block real plant for looking strange. Ordering and a printed distance
+   *  are the guard; the list is capped so the menu stays a menu.
+   *
+   *  Unplaced boxes are excluded outright. A tail needs two ends to draw between,
+   *  and offering one that renders nothing is how a recorded connection becomes
+   *  invisible — the exact failure the first surveyed pin hit. */
+  const trayBoxes = useMemo(() => {
+    const here = fibreQ.data?.point
+    if (!here || here.lat == null || here.lng == null) return []
+    const { lat, lng } = here
+    return placed
+      .filter((d) => d.id !== here.device_id)
+      .map((d) => ({
+        id: d.id, name: d.name, device_type: d.device_type,
+        km: distanceKm(lat, lng, d.lat!, d.lng!),
+      }))
+      .sort((a, b) => a.km - b.km)
+      .slice(0, 12)
+  }, [fibreQ.data?.point, placed])
+
+  /** SUBSCRIBERS a fibre may be taken out to, nearest first.
+   *
+   *  The case the tray could not express at all until now: its picker was built
+   *  from `placed` DEVICES, so "core 3 is the drop to that customer" — the ISPs'
+   *  own sentence, and the reason a customer point is a coupler in this model —
+   *  had no way in. The server always accepted it (`to_mac` on the tail route);
+   *  only the list was missing.
+   *
+   *  PLACED customers only, and the menu says so when there are none. A tail is
+   *  a cable and a cable needs two ends to draw between; offering the whole
+   *  roster would put thousands of unplaceable rows in a picker and end in a
+   *  recorded connection nothing can render. */
+  const trayPeople = useMemo(() => {
+    const here = fibreQ.data?.point
+    if (!here || here.lat == null || here.lng == null) return []
+    const { lat, lng } = here
+    return places
+      .filter((p) => p.lat != null && p.lng != null && p.mac !== here.mac)
+      .map((p) => ({
+        mac: p.mac, name: onuName(p),
+        km: distanceKm(lat, lng, p.lat!, p.lng!),
+      }))
+      .sort((a, b) => a.km - b.km)
+      .slice(0, 12)
+  }, [fibreQ.data?.point, places])
+
   // What a right-click on bare ground can infer. Both are SUGGESTIONS and the
   // menu names them in the item you are about to press, so a wrong guess costs a
   // glance rather than a wrong branch-fault verdict later. Over a PIN neither is
@@ -602,7 +865,7 @@ export function MapPage() {
   // branch-fault span drawn over customers that aren't would be the louder lie.
   const plantPinned = editPins || routeEdit != null || armed != null || addNext
     || placingId != null || placingOnu != null || plantDraft != null
-    || customerDraft != null || plantMenu != null
+    || customerDraft != null || plantMenu != null || splitAt != null
   // The plant an OLT focus leaves drawn — null when nothing is focused. The
   // rules (and the two reasons a box out of scope still stays) live in
   // `plant.ts:plantInScope`; it is fed `shownPlaces` rather than `places`, so a
@@ -799,9 +1062,22 @@ export function MapPage() {
   const hoverCtx = (p: OnuPlace) => {
     const anchor = dropAnchor(p.drop_passive_id, p.device_id, byId)
     const olt = p.device_id != null ? byId.get(p.device_id) : undefined
+    // Measured only where the drop was actually WALKED, and only through its own
+    // splitter. Both halves matter: an untraced drop is a straight line between
+    // two pins and reporting its length would put a drum figure on a span nobody
+    // surveyed, and the OLT fallback is a stated guess about which end the cable
+    // even runs to. `polyKm` walks it segment-by-segment in metres for the same
+    // reason `linkhover` does — Mercator stretches with latitude, and this is a
+    // number somebody orders cable against.
+    const traced = anchor?.kind === "splitter" && (p.drop_waypoints?.length ?? 0) > 0
+      && anchor.device.lat != null && anchor.device.lng != null
     return {
       anchorName: anchor?.device.name ?? null,
       viaSplitter: anchor?.kind === "splitter",
+      dropKm: traced
+        ? polyKm([[anchor!.device.lat!, anchor!.device.lng!],
+                  ...p.drop_waypoints, [p.lat, p.lng]])
+        : null,
       frozen: !!olt && isDownState(olt),
     }
   }
@@ -915,6 +1191,46 @@ export function MapPage() {
   // Every member of the hovered site, so a badge lights the cables into ALL of
   // them. A fold is a presentational accident — the same three boxes unfolded
   // would each light their own feed on hover — so the emphasis has to survive it.
+  /** The spans carrying the core being traced, as `child:parent` keys.
+   *
+   *  THE TRACE IS EMPHASIS, NEVER COLOUR. A strand's own jacket colour may not
+   *  reach a stroke — the TIA-598 sequence contains red, orange, yellow and
+   *  green, the hues this map reserves for alarms — so a traced run is drawn the
+   *  way a selected path is: heavier and fully opaque, with the colour living in
+   *  the panel's swatch. That also means a traced line in TROUBLE still renders
+   *  red, which is the right precedence: what is broken outranks what is being
+   *  read about.
+   *
+   *  Built from the cable's own span list rather than by re-scanning the routes,
+   *  so the highlighted run and the panel's core plan cannot disagree about
+   *  which spans are on core 7.
+   *
+   *  TWO SOURCES, ONE SET OF KEYS, and they answer different questions. The
+   *  CORE PLAN lights the sections of one cable on one strand — a picture of
+   *  that sheath. FOLLOWING A FIBRE lights the glass itself, which changes both
+   *  sheath and core number at every closure it is cut at, so on a real access
+   *  network the second is strictly longer than the first and usually starts
+   *  somewhere else entirely. They share a key set because they light lines the
+   *  same way, and only one can be active at a time. */
+  /** WHICH CABLES ARE LIT, and by which of the two things that can light one.
+   *
+   *  THE CORE PLAN lights the ONE cable whose core is picked — a picture of that
+   *  sheath. FOLLOWING A FIBRE lights the glass itself, which changes both sheath
+   *  and core number at every closure it is cut at, so on a real access network
+   *  the second is strictly longer than the first and usually starts somewhere
+   *  else entirely. They share a set because they light lines the same way, and
+   *  only one can be active at a time.
+   *
+   *  EMPHASIS ONLY — weight and opacity, never hue. A cable in trouble does not
+   *  exist (a cable has no state), but the topology drawn over it does, and what
+   *  is broken must always outrank what is being read about. */
+  const tracedCables = useMemo(() => {
+    const ids = new Set<number>()
+    for (const hop of traceQ.data?.hops ?? []) ids.add(hop.cable_id)
+    if (cableOpen != null && traceCore != null) ids.add(cableOpen)
+    return ids
+  }, [cableOpen, traceCore, traceQ.data])
+
   const hoverLinkIds = useMemo(() => {
     const ids = new Set<number>()
     if (hoverId != null) ids.add(hoverId)
@@ -1003,17 +1319,332 @@ export function MapPage() {
     onError: (e) => toast.error(`Couldn't save the route${e instanceof ApiError ? `: ${e.message}` : ""}`),
   })
 
+  // The same save for the last hop. A separate mutation rather than a branch
+  // inside `setRoute` because it invalidates a DIFFERENT query — the drop's
+  // geometry rides `onu-places` (one read of `onu_drops` gives the map both the
+  // anchor and the path to it), and invalidating "routes" here would leave the
+  // traced drop dotted until something else happened to refetch.
+  const setDropRoute = useMutation({
+    mutationFn: ({ mac, waypoints }: { mac: string; waypoints: Array<[number, number]> }) =>
+      inventoryApi.setDropRoute(mac, waypoints, scopeOrg),
+    onSuccess: (_r, v) => {
+      queryClient.invalidateQueries({ queryKey: ["onu-places"] })
+      setRouteEdit(null)
+      toast.success(v.waypoints.length
+        ? "Drop cable traced"
+        // Straightening is not a failure and shouldn't read like one — it is
+        // the honest state for a span nobody has walked, and the line going
+        // back to dotted is the map saying exactly that.
+        : "Drop straightened — back to an untraced line")
+    },
+    onError: (e) => toast.error(
+      `Couldn't save the drop route${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  // Tracing the street itself. A third mutation rather than a branch, for the
+  // same reason the drop is one: it invalidates a DIFFERENT pair of queries.
+  // "cables" holds the route being written, and "routes" holds every span that
+  // BORROWS it — the server resolves a cabled span's geometry, so a trace saved
+  // without invalidating the second would leave the very spans this feature
+  // exists for drawing chords until something else happened to refetch.
+  const setCablePath = useMutation({
+    mutationFn: ({ cableId, path }: { cableId: number; path: Array<[number, number]> }) =>
+      inventoryApi.setCablePath(cableId, path),
+    onSuccess: (_r, v) => {
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      setRouteEdit(null)
+      toast.success(v.path.length
+        ? "Cable traced — untraced spans on it now follow the glass"
+        // Same honesty as straightening a drop: this is the correct state for
+        // a street nobody has walked, not a failure.
+        : "Cable route cleared — its spans go back to straight lines")
+    },
+    onError: (e) => toast.error(
+      `Couldn't save the cable route${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
   // Per-link cartography: colour, and where the bandwidth chip rides the line.
   // Sparse by design — each call names only what it changes, so moving a label
   // can't clear a colour.
   const setLinkStyle = useMutation({
+    // The style shape is TAKEN FROM THE API CLIENT rather than restated here.
+    // It was restated, and the copy went stale the moment the row grew the cable
+    // record: a conditional spread widens loosely enough that `cores` slipped
+    // past the narrow local type without an error, so the one write that had to
+    // be type-checked was the one that wasn't. Deriving it means the client is
+    // the single declaration and a new field can't be silently unsendable.
     mutationFn: ({ childId, parentId, style }: {
       childId: number; parentId: number
-      style: { color?: string | null; label_pos?: number | null }
+      style: Parameters<typeof inventoryApi.setLinkStyle>[2]
     }) => inventoryApi.setLinkStyle(childId, parentId, style),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["routes"] }),
+    // Both keys: a span joining a cable changes the cable's own span list and
+    // core plan, so refreshing one without the other leaves the panel claiming a
+    // strand is free that the map has just drawn.
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+    },
     onError: (e) => toast.error(`Couldn't save${e instanceof ApiError ? `: ${e.message}` : ""}`),
   })
+
+  /** LAY A CABLE — its two ends, its route, and the couplers its ends needed.
+   *
+   *  THE COUPLERS ARE THE POINT. An end that landed on open ground gets one made
+   *  for it right there, so "a cable runs between two couplers" is true BY
+   *  CONSTRUCTION rather than by a rule an operator has to satisfy first. That is
+   *  the whole difference between this and the flow it replaces, which asked what
+   *  a box was fed from before it would let you save it.
+   *
+   *  Not atomic, and the failure is deliberately the benign one: a coupler with
+   *  no cable is a pin somebody can see and delete, where a cable with a missing
+   *  end would be a record that cannot be drawn or repaired from the map. The
+   *  route is written last for the same reason — a named cable with no path is
+   *  something the panel already reports as "not traced". */
+  const saveCable = useMutation({
+    mutationFn: async (v: {
+      id?: number; name: string; cores: number | null
+      path?: Array<[number, number]>
+      ends?: [FibreEnd | null, FibreEnd | null]
+    }) => {
+      let a = v.ends?.[0] ?? null
+      let b = v.ends?.[1] ?? null
+      const path = v.path ?? []
+      if (v.id == null) {
+        const coupler = async (at: [number, number] | undefined, n: number) => {
+          if (!at) throw new Error("a cable needs a point at both ends")
+          const name = `${v.name} JC${n}`
+          const { id } = await inventoryApi.create({
+            org_id: scopeOrg ?? undefined,
+            name, ip_address: "", device_type: "coupler",
+            region: nearestRegion(at[0], at[1], devices), tags: [],
+            // NOTHING FEEDS IT YET, and that is a recorded state rather than a
+            // gap in one: the fibre says what feeds a box, and this coupler is
+            // about to be one end of the cable that answers it.
+            parent_device_id: null, pon_port: null,
+            split_ratio: null, split_inputs: null,
+          })
+          await inventoryApi.setLocation(id, at[0], at[1])
+          return { device_id: id, name }
+        }
+        if (!a) a = await coupler(path[0], 1)
+        if (!b) b = await coupler(path[path.length - 1], 2)
+      }
+      const { id } = await inventoryApi.saveCable({
+        id: v.id, name: v.name, cores: v.cores,
+        ...(a && b ? {
+          a_device_id: a.device_id ?? null, a_mac: a.mac ?? null,
+          b_device_id: b.device_id ?? null, b_mac: b.mac ?? null,
+        } : {}),
+      }, scopeOrg)
+      if (v.id == null && path.length) await inventoryApi.setCablePath(id, path)
+      return id
+    },
+    onSuccess: (id, v) => {
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      // A new coupler is a new device and a new plant feed, so the tree and
+      // every split total behind it are stale the moment this lands.
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+      setCableForm(null)
+      if (v.id == null) {
+        setRouteEdit(null)
+        setCableList(false)
+        setCableOpen(id)
+        toast.success(`${v.name} laid`, {
+          description: "Open a tray at either end to say which cores go where.",
+        })
+      }
+    },
+    onError: (e) => toast.error(`Couldn't save${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  /** OPEN A COUPLER MID-SPAN. One call does what the crew does — cut the sheath,
+   *  stand a coupler at the cut, splice every core straight through — so nothing
+   *  already recorded at either far end is disturbed. It creates an org_devices
+   *  row, which is safe for exactly one reason: a coupler is a PASSIVE, so it is
+   *  excluded from `org_device_topology` and joins no dependency chain. */
+  const splitCable = useMutation({
+    mutationFn: (v: { cableId: number; lat: number; lng: number }) =>
+      inventoryApi.splitCable(v.cableId, v.lat, v.lng),
+    onSuccess: (out) => {
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      // A coupler is a new device and a new plant feed, so the tree and every
+      // split total behind it are stale the moment this lands.
+      queryClient.invalidateQueries({ queryKey: ["inventory"] })
+      setSplitAt(null)
+      setCableOpen(out.cable_id)
+      toast.success("Coupler opened", {
+        description: out.spliced
+          ? `${out.spliced} cores spliced straight through — clear any you actually cut.`
+          : "Record a fibre count on the cable to splice its cores through.",
+      })
+    },
+    onError: (e) => toast.error(
+      `Couldn't open a coupler${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  /** JOIN TWO FIBRES, or take one out to the equipment at this point.
+   *
+   *  A REFUSAL IS NOT AN ERROR HERE. The server answers 200 with a named reason
+   *  ("that fibre is already joined to another one"), because on a splice tray
+   *  an unexplained rejection is indistinguishable from a broken button — so it
+   *  lands in the tray beside the two fibres it is about, where a toast would
+   *  slide away from the only thing that makes it mean anything. */
+  const setFibreJoint = useMutation({
+    mutationFn: (v: {
+      point: { device_id?: number | null; mac?: string | null }
+      a: { cableId: number; coreNo: number }
+      b: { cableId: number; coreNo: number } | null
+    }) => inventoryApi.setFibreJoint({
+      ...v.point,
+      a_cable_id: v.a.cableId, a_core_no: v.a.coreNo,
+      b_cable_id: v.b?.cableId ?? null, b_core_no: v.b?.coreNo ?? null }),
+    onSuccess: (out) => {
+      if (!out.ok) { setTrayError(out.reason ?? "That join was refused"); return }
+      setTrayError(null)
+      queryClient.invalidateQueries({ queryKey: ["point-fibre"] })
+      queryClient.invalidateQueries({ queryKey: ["fibre-trace"] })
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+    },
+    onError: (e) => setTrayError(
+      e instanceof ApiError ? e.message : "Couldn't record that join"),
+  })
+
+  /** TAKE ONE CORE OUT TO A BOX SOMEWHERE ELSE.
+   *
+   *  Lays a single-fibre tail and lands it at both ends in one write. Same
+   *  refusal discipline as a splice — a 200 carrying `ok:false` is the named
+   *  reason, not an error — because it goes through the same physics on the way
+   *  in. It also creates a CABLE, so the map's own queries have to be told. */
+  const takeCoreToBox = useMutation({
+    mutationFn: (v: {
+      point: { device_id?: number | null; mac?: string | null }
+      a: { cableId: number; coreNo: number }
+      /** a box OR a customer — the tail route always took both, and offering
+       *  only boxes is what made "this core is that customer's drop" unsayable */
+      to: { deviceId?: number; mac?: string }
+    }) => inventoryApi.takeCoreToBox({
+      ...v.point, a_cable_id: v.a.cableId, a_core_no: v.a.coreNo,
+      to_device_id: v.to.deviceId ?? null, to_mac: v.to.mac ?? null }),
+    onSuccess: (out) => {
+      if (!out.ok) { setTrayError(out.reason ?? "That tail was refused"); return }
+      setTrayError(null)
+      for (const key of ["point-fibre", "fibre-trace", "cables", "routes"]) {
+        queryClient.invalidateQueries({ queryKey: [key] })
+      }
+    },
+    onError: (e) => setTrayError(
+      e instanceof ApiError ? e.message : "Couldn't run that tail"),
+  })
+
+  const spliceThrough = useMutation({
+    mutationFn: (v: {
+      point: { device_id?: number | null; mac?: string | null }
+      a: number; b: number
+    }) => inventoryApi.spliceThrough({
+      ...v.point, a_cable_id: v.a, b_cable_id: v.b }),
+    onSuccess: (out) => {
+      queryClient.invalidateQueries({ queryKey: ["point-fibre"] })
+      queryClient.invalidateQueries({ queryKey: ["fibre-trace"] })
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      setTrayError(out.reason ?? null)
+      if (!out.reason) {
+        toast.success(`${out.spliced} core${out.spliced === 1 ? "" : "s"} spliced`,
+          out.skipped ? {
+            description: `${out.skipped} already joined — left alone.`,
+          } : undefined)
+      }
+    },
+    onError: (e) => setTrayError(
+      e instanceof ApiError ? e.message : "Couldn't splice those through"),
+  })
+
+  const clearFibreJoint = useMutation({
+    mutationFn: (v: {
+      point: { device_id?: number | null; mac?: string | null }
+      cableId: number; coreNo: number
+    }) => inventoryApi.clearFibreJoint({
+      ...v.point, cable_id: v.cableId, core_no: v.coreNo }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["point-fibre"] })
+      queryClient.invalidateQueries({ queryKey: ["fibre-trace"] })
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      setTrayError(null)
+    },
+    onError: (e) => setTrayError(
+      e instanceof ApiError ? e.message : "Couldn't undo that join"),
+  })
+
+  const setCoreLabel = useMutation({
+    mutationFn: ({ cableId, coreNo, label }: {
+      cableId: number; coreNo: number; label: string
+    }) => inventoryApi.setCableCore(cableId, coreNo, label || null),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["cables"] }),
+    onError: (e) => toast.error(`Couldn't save${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  const deleteCable = useMutation({
+    mutationFn: (id: number) => inventoryApi.deleteCable(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["cables"] })
+      queryClient.invalidateQueries({ queryKey: ["routes"] })
+      setCableOpen(null)
+    },
+    onError: (e) => toast.error(`Couldn't delete${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  /** DELETING A PASSIVE, from the map that recorded it.
+   *
+   *  Passive plant is created here, so it is removed here: a splitter that was
+   *  put in the wrong street, or a coupler left behind by a re-trace, is a pin
+   *  somebody is looking at, and making them find it again in the Network tree
+   *  is how a wrong pin stays on the map.
+   *
+   *  The server sweeps everything hanging off the row (its drops, the cables
+   *  ending on it, the splices made in it), so the only thing this has to get
+   *  right is SAYING so first, and invalidating every one of those views after.
+   *  A 200 carrying `ok:false` is the refusal path, not an error: the store
+   *  answers that way when the box still has children. */
+  const deletePassive = useMutation({
+    mutationFn: (id: number) => inventoryApi.remove(id),
+    onSuccess: (res, id) => {
+      if (!res.ok) {
+        toast.error(res.reason || "Couldn't delete that box")
+        return
+      }
+      for (const key of ["inventory", "drops", "cables", "routes", "point-fibre",
+                         "fibre-trace", "onu-places"]) {
+        queryClient.invalidateQueries({ queryKey: [key] })
+      }
+      // A panel or a fibre tray still open on a box that no longer exists is the
+      // "floating over nothing" failure this map is careful about elsewhere.
+      setPlantDelete(null)
+      if (selectedId === id) setSelectedId(null)
+      setTrayAt((t) => (t?.device_id === id ? null : t))
+    },
+    onError: (e) => toast.error(
+      `Couldn't delete${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  /** What the delete takes with it, counted from what the map already holds.
+   *
+   *  Said BEFORE the click rather than discovered after it: a splitter carries
+   *  the drops recorded off it and every cable landing on it, and none of that
+   *  is visible from the pin. */
+  const plantDeleteToll = useMemo(() => {
+    if (!plantDelete) return null
+    const children = devices.filter(
+      (d) => d.parent_device_id === plantDelete.id).length
+    return {
+      children,
+      drops: loadByPassive.get(plantDelete.id)?.recorded ?? 0,
+      cables: (cablesQ.data?.cables ?? []).filter(
+        (c) => c.a.device_id === plantDelete.id
+            || c.b.device_id === plantDelete.id).length,
+    }
+  }, [plantDelete, devices, loadByPassive, cablesQ.data])
 
   // Search: a placed device flies to its pin; an unplaced one goes straight into
   // placement mode (search Gachibowli → pick the device → click the map).
@@ -1187,12 +1818,19 @@ export function MapPage() {
   }, [focusOnuMac, places, flyToOnu])
 
   useEffect(() => {
+    // STANDS DOWN WHILE THE NAMING DIALOG IS OPEN, and this is not defensive
+    // tidying: the dialog opens OVER a live route editor (the traced line has to
+    // stay visible — it is what is being named), and Radix closes on Escape from
+    // its own document listener. Both firing means one Esc backs out of naming
+    // AND throws away the survey that was just walked. Cancel returns to the
+    // editor with the route intact; nothing here may quietly make Esc destructive.
+    if (cableForm != null) return
     if (placingId == null && routeEdit == null && placingOnu == null
-      && armed == null && !addNext) return
+      && armed == null && !addNext && splitAt == null) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setPlacingId(null); setRouteEdit(null); setPlacingOnu(null)
-        setArmed(null); setAddNext(false); return
+        setArmed(null); setAddNext(false); setSplitAt(null); return
       }
       // Ctrl/⌘-Z pops the last waypoint. Nothing focusable is on screen while a
       // route is being drawn (the device panel is hidden), but guard anyway so a
@@ -1206,7 +1844,7 @@ export function MapPage() {
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [placingId, placingOnu, routeEdit, armed, addNext])
+  }, [placingId, placingOnu, routeEdit, armed, addNext, cableForm, splitAt])
 
   // Open the plant menu over a point. `device` is the pin it was opened ON, and
   // the two cases differ: over a pin the menu offers actions ABOUT that box (and
@@ -1227,21 +1865,69 @@ export function MapPage() {
     openPlantMenu(ll.lat, ll.lng, point.x, point.y, null)
   }, [openPlantMenu])
 
+  /** The pin under a click, within `SNAP_PX`, or null for open ground.
+   *
+   *  Reads the LIVE lists rather than anything cached on a cable, so a box
+   *  dragged a second ago snaps where it now is. Both kinds are candidates
+   *  because a cable may end on a customer — the case that makes a lane of
+   *  daisy-chained houses recordable. */
+  const snapToPoint = useCallback((ll: L.LatLng) => {
+    const map = mapRef.current
+    if (!map) return null
+    const at = map.latLngToContainerPoint(ll)
+    let best: { end: FibreEnd; pos: [number, number]; d: number } | null = null
+    const offer = (pos: [number, number], end: FibreEnd, bias: number) => {
+      const p = map.latLngToContainerPoint(pos)
+      const d = Math.hypot(p.x - at.x, p.y - at.y) + bias
+      if (d <= SNAP_PX && (!best || d < best.d)) best = { end, pos, d }
+    }
+    for (const d of placed) offer([d.lat, d.lng], { device_id: d.id, name: d.name }, 0)
+    for (const pl of places) {
+      if (pl.lat == null || pl.lng == null) continue
+      offer([pl.lat, pl.lng], { mac: pl.mac, name: onuName(pl) }, 1)
+    }
+    return best as { end: FibreEnd; pos: [number, number] } | null
+  }, [placed, places])
+
   const onMapClick = useCallback((ll: L.LatLng) => {
     // A menu is open: the click that dismisses it must not also do something.
     // Leaflet fires click after the capture-phase mousedown the menu closes on,
     // so without this the first click outside a menu would place a box.
     if (plantMenu != null) { setPlantMenu(null); return }
     if (routeEdit != null) {
-      setRouteEdit((re) => re && { ...re, points: [...re.points, [ll.lat, ll.lng]] })
+      // LAYING A CABLE snaps its ends onto whatever they land on, and records
+      // WHICH — see `FibreEnd`. A drop's route is anchored at both ends already,
+      // so it takes the raw click.
+      const snap = routeEdit.kind === "cable" ? snapToPoint(ll) : null
+      setRouteEdit((re) => {
+        if (!re) return re
+        const at: [number, number] = snap ? snap.pos : [ll.lat, ll.lng]
+        const points = [...re.points, at]
+        if (re.kind !== "cable") return { ...re, points }
+        return {
+          ...re, points,
+          // The FIRST click is end A for good. Every click after it is the
+          // candidate for end B, so a snap followed by a free click correctly
+          // reads as "ends on open ground" rather than keeping a stale catch.
+          endA: re.points.length === 0 ? snap?.end ?? null : re.endA,
+          endB: re.points.length === 0 ? re.endB : snap?.end ?? null,
+        }
+      })
+    } else if (splitAt != null) {
+      // OPENING THE SHEATH HERE. The raw click goes up: the server snaps it onto
+      // the cable's own route, so a click near the line is enough and the cut
+      // lands exactly on the glass. Deliberately not snapped here first — one
+      // owner of that projection, or the coupler and the two halves drawn from
+      // it eventually disagree about the same closure.
+      splitCable.mutate({ cableId: splitAt.cableId, lat: ll.lat, lng: ll.lng })
     } else if (armed != null) {
       // "click where it goes", from a pin's menu item or from Save-and-add-
       // another. One click, one record: the coordinate is the click and
       // everything else was decided when the mode was armed.
       if (armed.kind === "customer") {
-        setCustomerDraft({ lat: ll.lat, lng: ll.lng, passiveId: armed.parentId })
+        setCustomerDraft({ lat: ll.lat, lng: ll.lng, passiveId: armed.passiveId })
       } else {
-        setPlantDraft({ kind: armed.kind, lat: ll.lat, lng: ll.lng, parentId: armed.parentId })
+        setPlantDraft({ kind: armed.kind, lat: ll.lat, lng: ll.lng })
       }
       setArmed(null)
     } else if (addNext) {
@@ -1269,24 +1955,30 @@ export function MapPage() {
     // toggleRefOnus/setOnuPlace are stable enough for this handler's purpose;
     // refOnus is read fresh each render so the deps below cover the branch
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [placingId, placingOnu, refOnus, routeEdit, setLocation,
-      armed, addNext, plantMenu, openPlantMenu])
+  }, [placingId, placingOnu, refOnus, routeEdit, setLocation, snapToPoint,
+      armed, addNext, plantMenu, openPlantMenu, splitAt, splitCable])
 
-  // A box was recorded. `again` re-arms the map with THIS box as the next
-  // feeder — the chain flow — rather than opening its panel, because somebody
-  // recording a feeder run is walking it, not reading it.
+  // A box was recorded. `again` re-arms the map for the NEXT box rather than
+  // opening this one's panel, because somebody recording a feeder run is
+  // walking it, not reading it. It used to re-arm with this box as the next
+  // one's feeder; nothing is inherited now, so it re-arms with the kind alone.
   const onPlantCreated = useCallback((
     created: { id: number; name: string }, again: boolean,
   ) => {
     const kind = plantDraft?.kind
     setPlantDraft(null)
     if (again && kind) {
-      setArmed({ kind, parentId: created.id })
+      setArmed({ kind, passiveId: null })
       toast.success(`${created.name} recorded`, {
         description: "Click where the next box goes.",
       })
     } else {
-      toast.success(`${created.name} recorded`)
+      // Opened, because the box is placed and joined to nothing and the next
+      // thing to do is say what feeds it — which is the Fibre section of the
+      // panel that just opened.
+      toast.success(`${created.name} recorded`, {
+        description: "Pull a core in to say what feeds it.",
+      })
       setSelectedId(created.id)
     }
   }, [plantDraft])
@@ -1439,18 +2131,40 @@ export function MapPage() {
   const links = useMemo(() => {
     const out: Array<{
       key: string; from: Placed; to: Placed; tone: string
-      kind: "primary" | "backup" | "peer"
+      kind: "primary" | "backup" | "peer" | "run"
       // the link_routes key — what a style/geometry write for this line addresses
       childId: number; parentId: number
-      route?: Array<[number, number]>
-      color?: string | null
+      route?: { pts: Array<[number, number]>; fromCable: boolean }
       labelPos?: number | null
+      /** the sheath this span is cut from, and the strand this run uses */
+      cableId: number | null
+      cableName: string | null
+      cores: number | null
+      coreNo: number | null
       binding?: LinkBinding
     }> = []
     const placedById = new Map(drawnDevices.map((d) => [d.id, d]))
+    // WHICH CABLE A LINK IS CUT FROM: whichever one runs between the same two
+    // points. A cable is not a property of a link any more — it needs no link to
+    // exist and draws itself — but a link over a pair that IS joined by fibre
+    // should still say so on its chip, and should stop being dashed.
+    const cableByPair = new Map<string, Cable>()
+    for (const c of cablesQ.data?.cables ?? []) {
+      if (c.a.device_id == null || c.b.device_id == null) continue
+      for (const k of [`${c.a.device_id}:${c.b.device_id}`,
+                       `${c.b.device_id}:${c.a.device_id}`]) {
+        const cur = cableByPair.get(k)
+        // A measured sheath beats an unmeasured one: `12F` says more than a bare
+        // name, and it is the same glass either way.
+        if (!cur || (cur.cores == null && c.cores != null)) cableByPair.set(k, c)
+      }
+    }
     const styled = (childId: number, parentId: number) => {
       const s = styleByKey.get(`${childId}:${parentId}`)
-      return { childId, parentId, color: s?.color, labelPos: s?.label_pos }
+      const c = cableByPair.get(`${childId}:${parentId}`)
+      return { childId, parentId, labelPos: s?.label_pos,
+               cableId: c?.id ?? null, cableName: c?.name ?? null,
+               cores: c?.cores ?? null, coreNo: null }
     }
     for (const d of drawnDevices) {
       const tone = pinTone(d)
@@ -1469,8 +2183,8 @@ export function MapPage() {
           binding: linkBindings.get(linkKey(d.id, bp)) })
       }
       // Cross-links are undirected and BOTH ends list each other, so draw only
-      // from the lower id — otherwise every cable renders twice, and the second
-      // line would carry the far end's tone.
+      // from the lower id — otherwise every line renders twice, and the second
+      // would carry the far end's tone.
       for (const pid of d.peer_ids ?? []) {
         if (pid < d.id) continue
         const p = placedById.get(pid)
@@ -1488,7 +2202,7 @@ export function MapPage() {
       }
     }
     return out
-  }, [drawnDevices, routeByKey, styleByKey, linkBindings])
+  }, [drawnDevices, routeByKey, styleByKey, linkBindings, cablesQ.data])
 
   // The geometry each line is actually DRAWN along, resolved once so the render,
   // the hover probe and the label all measure the same path. A drawn route is
@@ -1516,10 +2230,13 @@ export function MapPage() {
   const drawnLinks = useMemo(() => links.map((l) => {
     const from = pinPos.get(l.from.id) ?? [l.from.lat, l.from.lng] as [number, number]
     const to = pinPos.get(l.to.id) ?? [l.to.lat, l.to.lng] as [number, number]
-    const wp = l.route
+    const wp = l.route?.pts
     const drawn = !!wp?.length && !foldedTogether(from, to)
     const pts: Array<[number, number]> = drawn ? [from, ...wp!, to] : [from, to]
-    return { ...l, from3: from, to3: to, pts, drawn }
+    // Surveyed either way, but not by the same survey — see the hover readout,
+    // which is the one surface with room to say which.
+    return { ...l, from3: from, to3: to, pts, drawn,
+             fromCable: drawn && !!l.route?.fromCable }
   }), [links, pinPos])
 
   // WHICH ↓/↑ chips actually render.
@@ -1550,28 +2267,85 @@ export function MapPage() {
   // A cable between two boxes carries the whole branch below it; one customer's
   // rate never outranks that, and a name — which the mark's tone, the hover
   // title and the card all still carry — never outranks a reading.
+  /** WHERE A FIBRE POINT IS, whichever kind it is.
+   *
+   *  ONE resolver for both, because a cable end may be a box or a customer and
+   *  every surface that draws one needs the other. The server ships coordinates
+   *  on the end itself, but they are read HERE from the live lists so a pin
+   *  dragged this second moves its cable with it — a cable reply is reference
+   *  data on a slow staleTime, and a line lagging its own pin reads as a
+   *  rendering fault. */
+  const pinOfPoint = useCallback((pt: FibrePoint): [number, number] | null => {
+    if (pt.device_id != null) {
+      const d = byId.get(pt.device_id)
+      return d && isPlaced(d) ? [d.lat, d.lng] : null
+    }
+    const place = pt.mac ? places.find((x) => x.mac === pt.mac) : null
+    return place && place.lat != null && place.lng != null
+      ? [place.lat, place.lng] : null
+  }, [byId, places])
+
+  /** EVERY CABLE AS IT WILL BE DRAWN — resolved ONCE.
+   *
+   *  The render and the chip budget both need this geometry, and on a traced
+   *  street the midpoint of the line as drawn is nowhere near the midpoint of
+   *  the chord between its ends. Two computations of it is exactly how a budget
+   *  reports itself clear over a collision that is plainly visible — the rule
+   *  `refChipPos` was extracted for, applied to the family that came after. */
+  const cableLines = useMemo(() => {
+    if (zoom < detail.passives) return []
+    return (cablesQ.data?.cables ?? []).flatMap((cable) => {
+      if (routeEdit?.kind === "cable" && routeEdit.cableId === cable.id) return []
+      const pts = cablePolyline(cable, pinOfPoint)
+      return pts.length < 2 ? [] : [{ cable, pts }]
+    })
+  }, [cablesQ.data, pinOfPoint, zoom, detail.passives, routeEdit])
+
   const chipShown = useMemo(() => {
     const links = new Set<string>()
+    const cables = new Set<number>()
     const refs = new Set<string>()
     const names = new Set<string>()
-    const taken: Array<[number, number]> = []
-    // A generous fixed box, not a measurement of each chip's text: measuring
-    // would mean laying the icons out to read them back, and an overestimate
-    // fails safe — it drops a chip that would just have fitted, and never keeps
-    // one that overlaps.
-    const fits = (x: number, y: number) =>
-      !taken.some(([tx, ty]) => Math.abs(tx - x) < 78 && Math.abs(ty - y) < 20)
-    const claim = (x: number, y: number) => { taken.push([x, y]) }
+    const taken: Array<[number, number, number]> = []
+    // A generous fixed box PER FAMILY, not a measurement of each chip's text:
+    // measuring would mean laying the icons out to read them back, and an
+    // overestimate fails safe — it drops a chip that would just have fitted, and
+    // never keeps one that overlaps.
+    //
+    // ONE GLOBAL NUMBER STOPPED WORKING WHEN THE CABLE CHIPS ARRIVED. It was 78,
+    // which is a fair overestimate for `↓3.7M ↑1.2M` and a large UNDER-estimate
+    // for `HALIYA TRUNK 24F` — measured in the browser at 134px against a rate
+    // chip's ~90 and a subscriber's ~50. Two 134px chips 80px apart pass a
+    // 78px test and visibly overlap, which is the exact failure this budget
+    // exists to prevent. So a claim carries its own half-width and a pair is
+    // judged on the SUM: dense areas keep their narrow chips, and only the wide
+    // family spreads. Re-measure these if a chip's content or clamp changes.
+    const CHIP_HALF = { link: 48, cable: 68, ref: 28, name: 44 }
+    const fits = (x: number, y: number, half: number) =>
+      !taken.some(([tx, ty, th]) =>
+        Math.abs(tx - x) < th + half && Math.abs(ty - y) < 24)
+    const claim = (x: number, y: number, half: number) => {
+      taken.push([x, y, half])
+    }
 
     const cands: Array<{ key: string; x: number; y: number; rank: number }> = []
     for (const l of bwLabels ? drawnLinks : []) {
-      if (!l.binding) continue
+      // A link earns a chip from EITHER half — a bound port's live rate, or a
+      // recorded cable. The budget's predicate has to match the render's
+      // exactly, or an absence goes on reserving pixels away from something
+      // that would have drawn (the rule `refHasChip` is written against, here
+      // for the family that came after it).
+      if (!l.binding && !l.cores) continue
       // dimming is applied here too, so a chip the render will not draw can't
       // reserve pixels away from one it will
       const emphasized = selectedId != null
         && (l.to.id === selectedId || downstream.has(l.to.id))
       if (troubleOnly && l.tone !== "destructive" && l.tone !== "warning" && !emphasized)
         continue
+      // A chip may never outlive the line it rides — and it must not reserve
+      // pixels away from one that IS drawn, which is the documented rule for
+      // every family in this budget.
+      if (!showUncabled && l.cableId == null) continue
       // the ends must be far enough apart on screen that the chip has a line to
       // sit on — zoomed out, the pins (and clusters) own the pixels
       const [ax, ay] = project(l.from3[0], l.from3[1], zoom)
@@ -1579,16 +2353,48 @@ export function MapPage() {
       if (Math.hypot(bx - ax, by - ay) < 90) continue
       const [plat, plng] = linkLabelPos(l.pts, l.labelPos)
       const [x, y] = project(plat, plng, zoom)
-      cands.push({ key: l.key, x, y, rank: bwRank(l.binding, l.from.id, l.to.id) })
+      cands.push({ key: l.key, x, y,
+        rank: bwRank(l.binding, l.from.id, l.to.id, l.cores) })
     }
     cands.sort((a, b) => b.rank - a.rank)
     for (const c of cands) {
-      if (!fits(c.x, c.y)) continue
-      claim(c.x, c.y)
+      if (!fits(c.x, c.y, CHIP_HALF.link)) continue
+      claim(c.x, c.y, CHIP_HALF.link)
       links.add(c.key)
     }
 
-    // Subscriber rate chips, second — and ranked EVIDENCE first among
+    // CABLE NAME CHIPS, second. They join this budget rather than starting a
+    // third one — the documented rule, and the reason is visible here: a cable
+    // chip and a link rate chip ride the SAME line and collide with each other
+    // exactly as readably as two of either would, so two budgets would each
+    // report themselves clear while the screen showed a smear.
+    //
+    // Ranked under live rates and over subscribers. A rate is STATE and this is
+    // reference, which is the ordering this map keeps everywhere; but one
+    // customer's rate never outranks the identity of the sheath their whole
+    // branch hangs off. Within themselves, the most glass first: on a street
+    // where a 24F trunk and a 4F branch overlap, the trunk is the one worth the
+    // pixels.
+    const cableCands: Array<{ id: number; x: number; y: number; cores: number }> = []
+    for (const c of cableLines) {
+      const [plat, plng] = cableLabelPos(c.pts)
+      const [x, y] = project(plat, plng, zoom)
+      // Same span test the link chips make: zoomed out the pins own the pixels
+      // and there is no line left for a label to sit on.
+      const [ax, ay] = project(c.pts[0][0], c.pts[0][1], zoom)
+      const [bx, by] = project(c.pts[c.pts.length - 1][0],
+                               c.pts[c.pts.length - 1][1], zoom)
+      if (Math.hypot(bx - ax, by - ay) < 90) continue
+      cableCands.push({ id: c.cable.id, x, y, cores: c.cable.cores ?? 0 })
+    }
+    cableCands.sort((a, b) => b.cores - a.cores)
+    for (const c of cableCands) {
+      if (!fits(c.x, c.y, CHIP_HALF.cable)) continue
+      claim(c.x, c.y, CHIP_HALF.cable)
+      cables.add(c.id)
+    }
+
+    // Subscriber rate chips, third — and ranked EVIDENCE first among
     // themselves. On a surveyed fleet these outnumber link chips a hundred to
     // one and nearly all of them read "idle", so if exactly one can be drawn it
     // must be the one saying a power-backed witness has gone dark. An ordinary
@@ -1612,15 +2418,19 @@ export function MapPage() {
       // the span must be long enough for the chip to sit ON the line rather
       // than on top of the pin whose state matters more than its rate
       if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 56) continue
-      refCands.push({
-        mac: p.mac, dark: isRefEvidence(p),
-        x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2,
-      })
+      // Reserved where the chip will actually LAND, which on a traced drop is
+      // the midpoint of the walked path and not of the chord — those diverge by
+      // exactly as much as the cable bends. A budget measuring one point while
+      // the render draws at another reports itself clear over a collision, which
+      // is the failure this single shared reservation exists to prevent.
+      const [clat, clng] = refChipPos(to, p)
+      const [cx, cy] = project(clat, clng, zoom)
+      refCands.push({ mac: p.mac, dark: isRefEvidence(p), x: cx, y: cy })
     }
     refCands.sort((x, y) => Number(y.dark) - Number(x.dark))
     for (const c of refCands) {
-      if (!fits(c.x, c.y)) continue
-      claim(c.x, c.y)
+      if (!fits(c.x, c.y, CHIP_HALF.ref)) continue
+      claim(c.x, c.y, CHIP_HALF.ref)
       refs.add(c.mac)
     }
 
@@ -1652,13 +2462,13 @@ export function MapPage() {
     }
     nameCands.sort((x, y) => Number(y.dark) - Number(x.dark))
     for (const c of nameCands) {
-      if (!fits(c.x, c.y)) continue
-      claim(c.x, c.y)
+      if (!fits(c.x, c.y, CHIP_HALF.name)) continue
+      claim(c.x, c.y, CHIP_HALF.name)
       names.add(c.mac)
     }
-    return { links, refs, names }
-  }, [drawnLinks, bwLabels, zoom, troubleOnly, selectedId, downstream,
-      refLinesVisible, refNamesVisible, refVisible, shownPlaces, byId])
+    return { links, cables, refs, names }
+  }, [drawnLinks, bwLabels, showUncabled, zoom, troubleOnly, selectedId, downstream,
+      refLinesVisible, refNamesVisible, refVisible, shownPlaces, byId, cableLines])
 
   // Measuring is a READ, so it stays available to everyone — but not while the
   // map is being used as an input surface: during placement or route drawing the
@@ -1682,6 +2492,7 @@ export function MapPage() {
   // `keepOut` ring below is the other half of that fix: this stops the readout
   // once the pointer is ON a pin, and the ring stops it on the way in.
   const hoverEnabled = placingId == null && routeEdit == null && !editPins
+    && splitAt == null
     && selectedId == null && siteCluster == null && selectedOnuMac == null
     && hoverPlace == null && hoverDevice == null && hoverSite == null
   const hoverable = useMemo(
@@ -1700,6 +2511,26 @@ export function MapPage() {
   }, [clusters, zoom, hoverEnabled])
   useEffect(() => { if (!hoverEnabled) setHover(null) }, [hoverEnabled])
 
+  /** EVERY CABLE ENDING ON THE SELECTED BOX. A cable is undirected, so both ends
+   *  are asked. This is what replaced "which device is this from?" on the create
+   *  sheet: a box's relationship to the network is the fibre landing on it, and
+   *  that fibre's geometry belongs to the cable it is in.
+   *
+   *  ABOVE THE `!scopeOrg` RETURN, and it has to stay there: it landed below it
+   *  while this feature was being built, which is a hooks-order violation —
+   *  React renders fewer hooks on the scope-less pass and throws. `oxlint`
+   *  catches it as `rules-of-hooks`; the two `useResizablePanel` reports beside
+   *  it are older and are NOT this. */
+  const deviceCables = useMemo(() => {
+    if (!selected) return []
+    return (cablesQ.data?.cables ?? [])
+      .filter((c) => c.a.device_id === selected.id || c.b.device_id === selected.id)
+      .map((c) => ({
+        cable: c,
+        far: c.a.device_id === selected.id ? c.b : c.a,
+      }))
+  }, [selected, cablesQ.data])
+
   if (!scopeOrg) return <NeedsOrg />
 
   const down = troubles.filter((d) => pinTone(d) === "destructive").length
@@ -1712,55 +2543,59 @@ export function MapPage() {
   const parent = selected?.parent_device_id != null ? byId.get(selected.parent_device_id) : null
   const linkKm = selected && isPlaced(selected) && parent && isPlaced(parent)
     ? distanceKm(selected.lat, selected.lng, parent.lat, parent.lng) : null
-  const selRoute = selected && parent ? routeByKey.get(`${selected.id}:${parent.id}`) : undefined
+  // The panel's "cable" figure measures what is DRAWN — borrowed from the cable
+  // or traced by hand, both are surveyed geometry and a crew drives the length
+  // either way. Which survey it was is the hover readout's to say.
+  const selRoute = selected && parent
+    ? routeByKey.get(`${selected.id}:${parent.id}`)?.pts : undefined
   const routeKm = selRoute && selected && isPlaced(selected) && parent && isPlaced(parent)
     ? polyKm([[parent.lat, parent.lng], ...selRoute, [selected.lat, selected.lng]]) : null
 
-  // Every cable this device is an END of, not just the one going up. A device
-  // owns the spans down to its children as much as its uplink, but the panel
-  // used to expose the parent link alone — so a downstream route could only be
-  // drawn by knowing to open the CHILD instead, and nothing anywhere said
-  // whether a link already had a path drawn on it.
-  const cables: Cable[] = []
-  if (selected && isPlaced(selected)) {
-    const add = (childId: number, parentId: number, other: OrgDevice | undefined,
-      dir: Cable["dir"], kind: Cable["kind"]) => {
-      // both ends must be pinned — a route needs two anchors to rubber-band to
-      if (!other || !isPlaced(other)) return
-      cables.push({ childId, parentId, other, dir, kind,
-        route: routeByKey.get(`${childId}:${parentId}`),
-        color: styleByKey.get(`${childId}:${parentId}`)?.color })
-    }
-    if (selected.parent_device_id != null)
-      add(selected.id, selected.parent_device_id, byId.get(selected.parent_device_id), "up", "primary")
-    for (const bp of selected.backup_parents ?? [])
-      add(selected.id, bp, byId.get(bp), "up", "backup")
-    for (const d of devices) {
-      if (d.id === selected.id) continue
-      if (d.parent_device_id === selected.id) add(d.id, selected.id, d, "down", "primary")
-      else if (d.backup_parents?.includes(selected.id)) add(d.id, selected.id, d, "down", "backup")
-    }
-    // A cross-link has no child end, but its ROUTE does. The renderer draws a
-    // peer from the LOWER id, so waypoints have to run lower→higher or the
-    // saved path renders back-to-front; pin that order here, at the one place
-    // peer routes are written.
-    for (const pid of selected.peer_ids ?? [])
-      add(Math.max(selected.id, pid), Math.min(selected.id, pid), byId.get(pid), "across", "peer")
-  }
-  const drawnCables = cables.filter((c) => c.route).length
+  // THE PER-SPAN ROUTE EDITOR IS GONE (2026-08-09, operator: "for a device like
+  // splitter or OLT there is option to lay out the line. I don't want that
+  // too"). It was the last way left to draw a line that is NOT a cable, and a
+  // span with geometry of its own is a SECOND record of one piece of glass —
+  // which is what made deleting a cable leave its line behind, and what "a
+  // span's own trace always wins" then kept on screen.
+  //
+  // Geometry is authored on the CABLE now (its own Trace/Retrace), and every
+  // span cut from it follows. The hand-traced spans that already existed were
+  // MOVED onto their cables rather than orphaned — `tools/cable_backfill.py
+  // --adopt-traces` — because a record nobody can see or edit is worse than one
+  // that is merely wrong.
 
-  const startRouteEdit = (c: Cable) => {
+
+  /** Trace the last hop: the drop cable from a splitter to one customer.
+   *
+   *  Only reachable from a drop that HAS a recorded splitter — the server 404s
+   *  otherwise, and rightly: the fallback line to the OLT is explicitly a guess
+   *  ("we only know the PON"), so tracing it would turn that guess into surveyed
+   *  geometry a crew would quote drum off. Record the splitter first, which is
+   *  the order the work happens in anyway. */
+  const startDropRouteEdit = (p: OnuPlace) => {
     setPlacingId(null)
     setPlaceOpen(false)
-    setRouteEdit({ childId: c.childId, parentId: c.parentId, points: c.route ?? [] })
+    setPlacingOnu(null)
+    setRouteEdit({ kind: "drop", mac: p.mac, points: p.drop_waypoints ?? [] })
   }
-  const editingChild = routeEdit ? byId.get(routeEdit.childId) : null
-  const editingParent = routeEdit ? byId.get(routeEdit.parentId) : null
+  // The drop being traced, resolved to its two real ends: the splitter it comes
+  // off and the subscriber it feeds. Both must exist and be placed — which they
+  // always are at this point, since tracing is only offered from a recorded,
+  // located drop, and `dropAnchor` is the same resolver the line itself uses so
+  // the editor can never anchor somewhere the render wouldn't.
+  const editingDrop = routeEdit?.kind === "drop"
+    ? (places.find((p) => p.mac === routeEdit.mac) ?? null) : null
+  const editingDropAnchor = editingDrop
+    ? dropAnchor(editingDrop.drop_passive_id, editingDrop.device_id, byId) : null
+
   // `open` must match when a Card actually RENDERS (route editing replaces it),
-  // or the chrome makes room for a panel that isn't there. BOTH right-rail cards
-  // count: a subscriber opens in the same rail at the same width, and counting
-  // only the device panel left the top strip claiming width that was under it.
-  const railOpen = (!!selected || !!selectedRef) && !routeEdit
+  // or the chrome makes room for a panel that isn't there. EVERY right-rail card
+  // counts: a subscriber opens in the same rail at the same width, and so does a
+  // cable — counting only the device panel left the top strip claiming width
+  // that was under it, and left the control column (including the Cables button
+  // that opened the thing) buried behind the panel with no way to toggle it off.
+  const railOpen = (!!selected || !!selectedRef || cableOpen != null || cableList)
+    && !routeEdit
   // Its own stored width and a tighter ceiling than the Network page's: this
   // panel floats over the map it's read against, and past ~halfway it stops
   // being a panel on a map and becomes a map behind a panel.
@@ -1836,10 +2671,76 @@ export function MapPage() {
           <Marker position={hover.at} icon={hoverIcon(hover)}
             interactive={false} zIndexOffset={1100} />
         )}
-        {drawnLinks.map((l) => {
-          // the link being redrawn renders as the edit preview instead
-          if (routeEdit && l.to.id === routeEdit.childId && l.from.id === routeEdit.parentId)
-            return null
+        {/* TRACED CABLES — the glass itself, drawn before every topology line so
+            it sits UNDER them.
+
+            A span that borrows this route draws exactly on top of these pixels,
+            so the overdraw is invisible; what this layer is actually for is the
+            two cases a span cannot show. One is the street traced PAST the last
+            box on it — the trace-first workflow, where the whole point is that
+            the next splitter has a route waiting for it. The other is a span
+            somebody traced by hand along a different line, where seeing both is
+            the information ("the cable runs here, this section was drawn
+            there") rather than a rendering fault.
+
+            PLANT'S OWN HUE AT FULL CHROMA, and the step matters: `--map-plant`
+            and `--map-plant-quiet` are not loud and quiet versions of one
+            thing, they are two SENTENCES — quiet means "nothing recorded here",
+            which is the exact opposite of what a traced route is. Subordination
+            is carried by WIDTH (2 against a feed's 2.5) and by STACKING (drawn
+            before every topology line, so it is always underneath), never by
+            draining the colour out of a fact somebody surveyed.
+
+            It takes no status tone at all, because a cable has no state; what
+            is broken is the SPAN drawn over it, and that still renders red.
+            Gated on the plant zoom floor with the boxes it feeds, or a lone
+            violet line would hang in a viewport with nothing at either end. */}
+        {cableLines.map(({ cable: c, pts }) => {
+          const traced = cableTraced(c)
+          // EMPHASIS, NEVER HUE. A traced core lights its whole path across the
+          // map; a cable has no state to colour, and what IS broken is the
+          // topology drawn over it, which must always stay the loudest thing.
+          const lit = tracedCables.has(c.id)
+          const w = 2 + fiberBoost(c.cores) + (lit ? 1.5 : 0)
+          return (
+            <Fragment key={`cable-${c.id}`}>
+              {/* Heavier for the glass in it, like every other line that
+                  carries a fibre count — this is the sheath itself, so if
+                  anything on the map earns that treatment it does. */}
+              <Polyline interactive={false} positions={pts}
+                pathOptions={{ color: "#000", opacity: CASING_OPACITY,
+                  ...casingAt(lineK, w, CASING_OVER_FINE),
+                  ...(traced ? {} : { dashArray: CABLE_DASH }) }} />
+              <Polyline interactive={false} positions={pts}
+                pathOptions={{ color: "var(--map-plant)", opacity: lit ? 1 : 0.9,
+                  ...strokeAt(lineK, w),
+                  ...(traced ? {} : { dashArray: CABLE_DASH }) }} />
+              {/* THE CABLE SAYS ITS OWN NAME. Four violet lines meeting at a
+                  closure were previously told apart only by clicking a box and
+                  reading a list — on a map, where the thing you are looking at
+                  is the LINE. Placement, ranking and suppression are resolved
+                  in the shared budget; a suppressed chip is not lost, zooming
+                  in spreads the midpoints and it returns.
+                  CLICKING IT OPENS THE CABLE, which is the other half: the
+                  chip is a marker, so it can be the handle WITHOUT making the
+                  polyline interactive — and a live polyline here would swallow
+                  the placement and route-drawing clicks the map is also for. */}
+              {chipShown.cables.has(c.id) && (
+                <Marker position={cableLabelPos(pts)} icon={cableIcon(c)}
+                  zIndexOffset={550}
+                  eventHandlers={{ click: () => { setCableList(false)
+                                                  setCableOpen(c.id) } }} />
+              )}
+            </Fragment>
+          )
+        })}
+                {drawnLinks.map((l) => {
+          // PURE PLANT VIEW: every line on screen is glass somebody recorded.
+          // Filtered at the RENDER, not in `drawnLinks`, deliberately — the
+          // branch-fault overlay paints on the span feeding a dark branch, and
+          // that is an alarm, so it keeps its line at every setting. Same
+          // exemption the plant zoom floor makes for a dark splitter.
+          if (!showUncabled && l.cableId == null) return null
           // a selected device lights up its whole downstream path
           const emphasized = selectedId != null
             && (l.to.id === selectedId || downstream.has(l.to.id))
@@ -1850,6 +2751,14 @@ export function MapPage() {
           // higher-ranked chip — is resolved once in `bwShown`, because whether
           // THIS chip renders depends on the others.
           const labeled = chipShown.links.has(l.key)
+          // Built once and hoisted, because it may legitimately be null (a link
+          // with neither a bound port nor a recorded cable) — which is what keeps
+          // an ungated future caller a type error rather than an empty pill
+          // floating on a line.
+          const chipIcon = labeled
+            ? linkBwIcon(l.binding, l.from, l.to,
+                         { cores: l.cores, coreNo: l.coreNo, name: l.cableName })
+            : null
           // a cable INTO the box under the cursor. Direct links only — hover is
           // a peek, not a selection, and lighting a whole subtree on mouseover
           // would make the map twitch as the pointer crosses a dense site.
@@ -1881,17 +2790,44 @@ export function MapPage() {
           // cable in trouble still draws at 3, because on this map status outranks
           // structure everywhere else and a thin red line would be the one place
           // it didn't.
-          const distribution = l.kind === "primary"
+          // A run counts as distribution on the same test: how a pair is
+          // JOINED (a declared parent, or a recorded core) says nothing about
+          // whether the span is a feeder or a distribution leg — the boxes at
+          // its ends do.
+          const distribution = (l.kind === "primary" || l.kind === "run")
             && isPassiveType(l.from.device_type) && isPassiveType(l.to.device_type)
+          // A TRACED CORE reads at selection weight, because that is what it is:
+          // the operator has named one strand and this is where it goes. It joins
+          // the existing ladder rather than starting a scale of its own, and it
+          // adds no colour at all — the strand's jacket hue stays in the panel,
+          // where it cannot be mistaken for a status tone.
+          const traced = l.cableId != null && tracedCables.has(l.cableId)
+          // THE FIBRE BOOST IS ADDED LAST AND IS ADDITIVE, which is the whole
+          // condition the "no stroke treatment for core count" note left behind:
+          // the tier above is derived from TOPOLOGY and keeps its order inside
+          // any one fibre class. A 12F distribution leg still draws under a 12F
+          // feed; what the boost separates is how much glass is in the sheath,
+          // an axis this ladder never spoke to.
           const weight = (l.kind === "peer" ? 2
-            : emphasized ? 3.5
+            : emphasized || traced ? 3.5
             : l.tone === "destructive" ? 3
             : distribution ? 2.1 : 2.5)
-            + (hovered && !emphasized ? 0.75 : 0)
+            + (hovered && !emphasized && !traced ? 0.75 : 0)
+            + fiberBoost(l.cores)
           // backup = long dash (a standby path), peer = fine dot (cabling).
           // Periods are sized to survive CASING_OVER: a dash pattern has to be
           // longer than the casing's overhang or the cased dots touch.
-          const dashArray = l.kind === "backup" ? "5 8" : l.kind === "peer" ? "1.5 7" : undefined
+          //
+          // AND A LINK WITH NO CABLE RECORDED IS DASHED, whatever kind it is.
+          // This is the same rule the drop line and the ref-ONU line have always
+          // kept — dotted means "nobody surveyed this", solid means traced fibre
+          // — applied to the one layer that never got it. Until now a topology
+          // link drew solid whether or not any glass was recorded, so deleting a
+          // cable changed nothing on screen and recording one changed nothing
+          // either: the line was never the cable, it was `parent_device_id`.
+          const dashArray = l.kind === "backup" ? "5 8"
+            : l.kind === "peer" ? "1.5 7"
+            : l.cableId == null ? UNCABLED_DASH : undefined
           const casingOver = l.kind === "peer" ? CASING_OVER_FINE : CASING_OVER
           return (
             <Fragment key={l.key}>
@@ -1915,21 +2851,25 @@ export function MapPage() {
                 interactive={false}
                 positions={pts}
                 pathOptions={{
-                  // Emphasis (a selected path) still overrides a custom colour —
-                  // "which line did I just click" has to beat "which cable is
-                  // this", and paintedLineColor already refuses to paint a line
-                  // that's in trouble.
-                  color: emphasized && l.tone === "muted" ? "var(--primary)"
-                    : paintedLineColor(l.tone, l.color, lineColor(l.tone)),
-                  opacity: dimmed ? 0.12 : hovered || emphasized ? 1
+                  // The operator tint is GONE (2026-08-08): the only thing it was
+                  // ever used to say — "these spans are one physical cable" — is
+                  // what `org_cables` says properly, and a strand's OWN colour may
+                  // never reach a stroke (the TIA-598 sequence contains the alarm
+                  // hues). So a line's colour is its tone and nothing else, and
+                  // the one override left is emphasis: "which line did I just
+                  // click" outranks a muted default.
+                  color: (emphasized || traced) && l.tone === "muted" ? "var(--primary)"
+                    : lineColor(l.tone),
+                  opacity: dimmed && !traced ? 0.12
+                    : hovered || emphasized || traced ? 1
                     : l.kind === "peer" ? 0.85 : l.tone === "muted" ? 0.85 : 0.9,
                   ...strokeAt(lineK, weight, dashArray),
                 }}
               />
-              {labeled && (
+              {labeled && chipIcon && (
                 <Marker
                   position={linkLabelPos(pts, l.labelPos)}
-                  icon={linkBwIcon(l.binding!, l.from, l.to, l.color)}
+                  icon={chipIcon}
                   zIndexOffset={600}
                   // Slid along the line in the same mode that moves pins — one
                   // "rearrange the map" mode, not a second one to discover.
@@ -1965,9 +2905,17 @@ export function MapPage() {
                     click: () => {
                       // in pin-edit mode the chip is a handle, not a link
                       if (placingId != null || routeEdit != null || editPins) return
-                      // the chip opens the Ports tab of whichever box owns the port
-                      setDetailTab("ports")
-                      setSelectedId([...l.binding!.keys()][0])
+                      // A chip with a bound port opens the Ports tab of whichever
+                      // box owns it. A CABLE-ONLY chip has no port to show, so it
+                      // opens the far end of the span instead — the box you would
+                      // be looking for when you clicked a cable label. Landing on
+                      // an empty Ports tab would read as a broken panel.
+                      if (l.binding) {
+                        setDetailTab("ports")
+                        setSelectedId([...l.binding.keys()][0])
+                      } else {
+                        setSelectedId(l.to.id)
+                      }
                     },
                   }}
                 />
@@ -2034,17 +2982,41 @@ export function MapPage() {
           </Fragment>
         ))}
         {routeEdit && (() => {
-          const child = byId.get(routeEdit.childId)
-          const par = byId.get(routeEdit.parentId)
-          if (!child || !par || !isPlaced(child) || !isPlaced(par)) return null
+          // The two ENDS, whichever kind is being traced. Everything after this
+          // is identical for a trunk, a drop and a cable — same vertices, same
+          // drag, same double-click-to-remove — which is the whole reason the
+          // editor was widened rather than duplicated.
+          //
+          // A CABLE HAS NO ENDS TO ANCHOR TO, and that is not a missing case:
+          // it ends wherever the glass ends, so the vertices ARE the route
+          // rather than intermediates between two pins. It renders the points
+          // alone, which also means the first click of a fresh trace draws
+          // nothing until the second — correct, since one point is a place and
+          // not a run, and the server refuses it for the same reason.
+          //
+          // The DROP and the LATERAL are anchored; the cable is not. The `link`
+          // kind went with the per-span route editor, since a span's geometry
+          // is its cable's.
+          const ends: [[number, number], [number, number]] | null =
+            editingDrop && editingDropAnchor
+              // splitter → subscriber, the direction the waypoints are stored in
+              ? [[(editingDropAnchor.device as Placed).lat,
+                  (editingDropAnchor.device as Placed).lng],
+                 [editingDrop.lat, editingDrop.lng]]
+              : null
+          const anchored = routeEdit.kind !== "cable"
+          if (anchored && !ends) return null
+          const line: Array<[number, number]> = ends
+            ? [ends[0], ...routeEdit.points, ends[1]]
+            : routeEdit.points
           return (
             <>
-              <Polyline
+              {line.length > 1 && <Polyline
                 interactive={false}
-                positions={[[par.lat, par.lng], ...routeEdit.points, [child.lat, child.lng]]}
+                positions={line}
                 pathOptions={{ color: "var(--primary)", opacity: 0.9,
                   ...strokeAt(lineK, 2.5, "6 6") }}
-              />
+              />}
               {routeEdit.points.map((pt, i) => (
                 <Marker
                   key={`v-${i}`}
@@ -2154,10 +3126,9 @@ export function MapPage() {
                   // the splitter on the same pole as the OLT is a real case.
                   if (armed != null) {
                     if (armed.kind === "customer") {
-                      setCustomerDraft({ lat: d.lat, lng: d.lng, passiveId: armed.parentId })
+                      setCustomerDraft({ lat: d.lat, lng: d.lng, passiveId: armed.passiveId })
                     } else {
-                      setPlantDraft({ kind: armed.kind, lat: d.lat, lng: d.lng,
-                                      parentId: armed.parentId })
+                      setPlantDraft({ kind: armed.kind, lat: d.lat, lng: d.lng })
                     }
                     setArmed(null)
                     return
@@ -2221,6 +3192,10 @@ export function MapPage() {
           // answer without clicking.
           const hovered = p.mac === hoverOnuMac
           if (!refLinesVisible && !hovered) return null
+          // The drop being traced right now is drawn by the EDITOR, not here —
+          // two lines along the same span (one stored, one live) read as a
+          // rendering fault and make the vertices impossible to aim at.
+          if (routeEdit?.kind === "drop" && routeEdit.mac === p.mac) return null
           // The line from a subscriber to the plant it hangs off.
           //
           // It ends at the SPLITTER whose drop feeds it — an ISP connects a
@@ -2238,7 +3213,20 @@ export function MapPage() {
           if (!anchor) return null
           const to = anchor.device as Placed
           const viaSplitter = anchor.kind === "splitter"
-          const pts: Array<[number, number]> = [[to.lat, to.lng], [p.lat, p.lng]]
+          // A TRACED drop follows the ground; an untraced one is the chord it
+          // has always been. Waypoints run splitter → subscriber, which is the
+          // order they were stored in, so nothing is reversed here.
+          //
+          // Only a drop routed through its actual SPLITTER may carry geometry:
+          // the OLT fallback is explicitly a guess ("we only know the PON"), and
+          // waypoints on a guessed anchor would be a surveyed-looking path to
+          // the wrong end. The server refuses to store them, so this can only
+          // fire on a stale reply — but drawing is where it would be believed.
+          const dropPath = viaSplitter ? (p.drop_waypoints ?? []) : []
+          const traced = dropPath.length > 0
+          const pts: Array<[number, number]> = traced
+            ? [[to.lat, to.lng], ...dropPath, [p.lat, p.lng]]
+            : [[to.lat, to.lng], [p.lat, p.lng]]
           const tone = refLineTone(p)
           // Sized to the TOPOLOGY lines (a feed is 2.5, a peer 2, a selected
           // path 3.5) rather than to a rank below them. Twice now this layer has
@@ -2258,7 +3246,15 @@ export function MapPage() {
           // hover may make a line findable, never make it look healthy.
           const refWeight = (tone === "dark" ? 4.5 : viaSplitter ? 3.5 : 2.5)
             + (hovered ? REF_HOVER_BOOST : 0)
-          const refDash = hovered ? undefined : viaSplitter ? DROP_DASH : REF_DASH
+          // A TRACED DROP IS SOLID, AND THAT IS THE WHOLE POINT OF TRACING IT.
+          // Every dash on this map means "nobody surveyed this" — it is why a
+          // drop was the tightest dotted line here, being the least surveyed
+          // span there is. Somebody has now walked this one, so it earns the
+          // same solid stroke a drawn cable route gets. The two states must
+          // never look alike in either direction: an untraced drop may not look
+          // surveyed, and a surveyed one may not go on apologising for itself.
+          const refDash = traced || hovered ? undefined
+            : viaSplitter ? DROP_DASH : REF_DASH
           // Two gates and they answer different questions: the budget says
           // whether there are pixels for a chip, `refBwIcon` whether there is
           // anything to write in one. Hoisted because it may legitimately be
@@ -2325,7 +3321,7 @@ export function MapPage() {
                   the same test the drawn-route/chord fallback uses. */}
               {bwIcon && (
                 <Marker
-                  position={[(to.lat + p.lat) / 2, (to.lng + p.lng) / 2]}
+                  position={refChipPos(to, p)}
                   icon={bwIcon}
                   interactive={false}
                   zIndexOffset={-150}
@@ -2341,9 +3337,16 @@ export function MapPage() {
             is exactly what a crew drives to. Read-side only: this overlay is
             derived from plant records and pages nobody. */}
         {branchFaults.map((f) => {
+          // Either kind of join: since the plant chain can come from a run,
+          // the span a branch fault names is routinely a recorded core rather
+          // than a declared parent, and dropping that case would take the
+          // overlay off exactly the boxes recorded the new way. Ends may arrive
+          // in either order — a run is undirected.
           const link = drawnLinks.find(
-            (l) => l.kind === "primary" && l.to.id === f.passive_id
-              && l.from.id === f.parent_id)
+            (l) => (l.kind === "primary" || l.kind === "run")
+              && ((l.to.id === f.passive_id && l.from.id === f.parent_id)
+                || (l.kind === "run" && l.from.id === f.passive_id
+                    && l.to.id === f.parent_id)))
           if (!link) return null
           const box = byId.get(f.passive_id)
           const parentBox = f.parent_id != null ? byId.get(f.parent_id) : undefined
@@ -2731,16 +3734,15 @@ export function MapPage() {
           <span className="min-w-0 truncate">
             {addNext ? "Click the map to add something here" : armed?.kind === "customer" ? (
               <>Click where the customer stands
-                {armed.parentId != null && byId.get(armed.parentId) && (
-                  <> · on <span className="font-medium">{byId.get(armed.parentId)!.name}</span></>
+                {armed.passiveId != null && byId.get(armed.passiveId) && (
+                  <> · on <span className="font-medium">{byId.get(armed.passiveId)!.name}</span></>
                 )}
               </>
             ) : (
-              <>Click where the {armed ? PLANT_LABEL[armed.kind as PlantKind] : "box"} goes
-                {armed?.parentId != null && byId.get(armed.parentId) && (
-                  <> · below <span className="font-medium">{byId.get(armed.parentId)!.name}</span></>
-                )}
-              </>
+              // No "below X" any more: a box is placed, and nothing is drawn to
+              // it until a core is pulled in. Naming a feeder here would promise
+              // a line that Save is deliberately not going to draw.
+              <>Click where the {armed ? PLANT_LABEL[armed.kind as PlantKind] : "box"} goes</>
             )}
           </span>
           <Button variant="ghost" size="icon" className="size-5 shrink-0" title="Cancel (Esc)"
@@ -2784,35 +3786,89 @@ export function MapPage() {
         </div>
       )}
 
-      {/* route-drawing banner ---------------------------------------------------- */}
-      {routeEdit && editingChild && editingParent && (
-        <div className="absolute top-14 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
-          <Spline className="size-3.5 text-primary" />
-          <span>
-            Click along the cable path <span className="font-mono font-semibold">{editingParent.name}</span>
-            {" → "}<span className="font-mono font-semibold">{editingChild.name}</span>
+      {/* route-drawing banner ----------------------------------------------------
+          ONE banner for both kinds of span. What it names changes (two boxes for
+          a cable, a splitter and a customer for a drop) but every control below
+          is the same, because the gesture is the same — and a second banner with
+          its own undo and its own straighten is how two ways to trace one
+          network end up on one map. */}
+      {routeEdit && (routeEdit.kind === "cable"
+        || !!(editingDrop && editingDropAnchor)) && (
+        <div className="absolute top-14 left-1/2 z-[1000] flex max-w-[min(94vw,44rem)] -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+          <Spline className="size-3.5 shrink-0 text-primary" />
+          <span className="min-w-0 truncate">
+            {routeEdit.kind === "cable" ? (
+              // No "A → B": a cable is not between two boxes, which is the
+              // whole reason it has a route of its own. It is named instead.
+              <>Click along <span className="font-mono font-semibold">{routeEdit.name}</span></>
+            ) : (<>
+              Click along the drop cable{" "}
+              <span className="font-mono font-semibold">
+                {editingDropAnchor!.device.name}
+              </span>
+              {" → "}
+              <span className="font-mono font-semibold">{onuName(editingDrop!)}</span>
+            </>)}
             <span className="text-muted-foreground"> · drag to adjust, double-click removes
               · {routeEdit.points.length} pt{routeEdit.points.length === 1 ? "" : "s"}</span>
+            {/* WHY SAVE IS DEAD, said rather than left to be inferred. A new
+                cable starts on the point that was right-clicked, so the very
+                first thing an operator sees is a Save button that does nothing
+                when pressed — which is indistinguishable from a broken one. One
+                point is genuinely not a route (nothing can project onto it, and
+                every span on the cable would silently fall back to a chord), so
+                the button is right to refuse; it just has to say so. */}
+            {routeEdit.kind === "cable" && routeEdit.cableId == null
+              && routeEdit.points.length < 2 && (
+              <span className="text-warning"> · click at least
+                {routeEdit.points.length === 1 ? " one more point" : " two points"}</span>
+            )}
+            {routeEdit.kind === "cable" && routeEdit.cableId != null
+              && routeEdit.points.length === 1 && (
+              <span className="text-warning"> · click at least one more point</span>
+            )}
           </span>
           {/* Undo pops the LAST point placed (double-click still removes any
               specific one); straighten drops them all, which on save deletes the
               route row outright — the store treats an empty list as "clear". */}
-          <Button variant="ghost" size="icon" className="size-5" title="Undo last point (Ctrl+Z)"
+          <Button variant="ghost" size="icon" className="size-5 shrink-0" title="Undo last point (Ctrl+Z)"
             disabled={!routeEdit.points.length}
             onClick={() => setRouteEdit((re) => re && { ...re, points: re.points.slice(0, -1) })}>
             <Undo2 className="size-3" />
           </Button>
-          <Button variant="ghost" size="icon" className="size-5"
+          <Button variant="ghost" size="icon" className="size-5 shrink-0"
             title="Straighten · drop every point, back to a straight line"
             disabled={!routeEdit.points.length}
             onClick={() => setRouteEdit((re) => re && { ...re, points: [] })}>
             <Slash className="size-3" />
           </Button>
-          <Button size="sm" className="h-6 px-2 text-2xs"
-            disabled={setRoute.isPending}
-            onClick={() => setRoute.mutate({
-              childId: routeEdit.childId, parentId: routeEdit.parentId, waypoints: routeEdit.points,
-            })}>
+          <Button size="sm" className="h-6 shrink-0 px-2 text-2xs"
+            // ONE POINT IS NOT A ROUTE, and the server refuses it — nothing can
+            // project onto a single coordinate, so a cable would quietly fall
+            // back to a chord. Disabling here says so before the 422 does.
+            //
+            // A NEW cable needs TWO, and that is a different rule: zero points
+            // on a RETRACE is a real statement (it clears the route), but on a
+            // cable that does not exist yet there is nowhere to stand its two
+            // couplers. Saving with none used to open the naming sheet reading
+            // "0 points traced" and then fail on submit — a button that is
+            // enabled and cannot work is indistinguishable from a broken one.
+            disabled={setRoute.isPending || setDropRoute.isPending
+              || setCablePath.isPending
+              || (routeEdit.kind === "cable"
+                  && routeEdit.points.length < (routeEdit.cableId == null ? 2 : 1)
+                  && !(routeEdit.cableId != null && routeEdit.points.length === 0))}
+            onClick={() => routeEdit.kind === "cable"
+              // A cable that does not exist yet is NAMED NOW, with its route
+              // already drawn — which is the order that keeps a cable from
+              // being an abstraction. The form carries the path so the two land
+              // in one gesture; nothing is written until it is submitted, so
+              // cancelling leaves no empty sheath behind.
+              ? (routeEdit.cableId == null
+                ? setCableForm({ name: "", cores: null, path: routeEdit.points,
+                                 ends: [routeEdit.endA ?? null, routeEdit.endB ?? null] })
+                : setCablePath.mutate({ cableId: routeEdit.cableId, path: routeEdit.points }))
+              : setDropRoute.mutate({ mac: routeEdit.mac, waypoints: routeEdit.points })}>
             <Check className="size-3" /> Save
           </Button>
           <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
@@ -2885,6 +3941,34 @@ export function MapPage() {
                   <div className="my-1 border-t" />
                 </>
               )}
+              {/* THE PURE PLANT VIEW. Switching this off leaves only lines with
+                  a cable recorded against them — which is what the map claims to
+                  be, and what an operator means when they delete a cable and
+                  expect the line to go with it.
+
+                  IT USED TO BE CALLED "Links with no cable", AND THAT NAME WENT
+                  STALE THE DAY THE SEGMENT MODEL LANDED. It was written when a
+                  topology link could carry a cable and most did not ("59 of 62
+                  here"); a link now carries NO plant record BY CONSTRUCTION —
+                  glass is recorded on the cable itself — so the set it hides is
+                  not "the ones nobody got to yet", it is all of them, always.
+                  A control whose name describes a state that can no longer occur
+                  reads as broken, and this one is the answer to the commonest
+                  fibre complaint there is (the dashed dependency lines shouting
+                  over the surveyed cable), so it has to be findable.
+
+                  ON by default, which stays the cautious direction: these lines
+                  are the monitoring tree, and blanking them by default would hide
+                  the dependency an operator navigates by. */}
+              <button
+                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
+                title="The parent → child lines the monitoring tree draws. They are dashed because they are a dependency, not a surveyed cable — fibre is recorded on the cable itself now, so none of them ever carries glass. Switch off for a plant-only map where every line is a sheath somebody wrote down."
+                onClick={toggleUncabled}>
+                <span>Dependency links</span>
+                <span className={cn("text-2xs font-medium", showUncabled ? "text-success" : "text-muted-foreground")}>
+                  {showUncabled ? "shown" : "hidden"}
+                </span>
+              </button>
               <button
                 className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
                 title="Live ↓/↑ rate chips on links with a bound port (device panel → Uplinks)"
@@ -2956,17 +4040,28 @@ export function MapPage() {
               <p className="px-2 pt-1 pb-0.5 text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
                 Links
               </p>
+              {/* THE CABLE IS FIRST AND IT IS THE ONLY VIOLET ROW. It was
+                  missing entirely, which left the one line family this map is
+                  now built around — the sheath, in its own identity hue, at its
+                  own weight — as the only thing on screen with no entry in the
+                  key. Its two states are the pair an ISP has to be able to tell
+                  apart at a glance, because one is a surveyed route a crew
+                  quotes drum against and the other is an admitted straight
+                  line. */}
               {([
-                ["", "Feed (parent → child)"],
-                ["4 6", "Backup uplink (ring)"],
-                ["1 4", "Cross-link (same level)"],
-                [DROP_DASH, "Subscriber drop (splitter → ONU)"],
-              ] as Array<[string, string]>).map(([dash, label]) => (
+                ["", "var(--map-plant)", "Cable — route traced"],
+                [CABLE_DASH, "var(--map-plant)", "Cable — not traced yet"],
+                ["", "var(--map-link)", "Feed (parent → child)"],
+                ["4 6", "var(--map-link)", "Backup uplink (ring)"],
+                ["1 4", "var(--map-link)", "Cross-link (same level)"],
+                [DROP_DASH, "var(--map-link)", "Subscriber drop (splitter → ONU)"],
+              ] as Array<[string, string, string]>).map(([dash, color, label]) => (
                 <div key={label} className="flex items-center gap-2 px-2 py-1 text-xs">
                   <span className="flex w-4 shrink-0 items-center justify-center">
-                    <svg width="16" height="2" aria-hidden>
-                      <line x1="0" y1="1" x2="16" y2="1" stroke="var(--map-link)"
-                        strokeWidth="2" strokeDasharray={dash || undefined} />
+                    <svg width="16" height="3" aria-hidden>
+                      <line x1="0" y1="1.5" x2="16" y2="1.5" stroke={color}
+                        strokeWidth={color === "var(--map-plant)" ? 3 : 2}
+                        strokeDasharray={dash || undefined} />
                     </svg>
                   </span>
                   <span className="text-muted-foreground">{label}</span>
@@ -3027,6 +4122,22 @@ export function MapPage() {
           title="Fit all pins" onClick={fitAll} disabled={placed.length === 0}>
           <Maximize2 className="size-3.5" />
         </Button>
+        {/* CABLES get a control of their own, because they are ORG-LEVEL PLANT
+            and reaching one used to mean guessing which device it happened to
+            touch — through a panel, a button, a submenu and an item. That is why
+            the live fleet ended up with two cables both named "main": the first
+            attempt confirmed nothing, so it was made again. A trunk is not a
+            property of the box at one end of it. */}
+        <Button variant={cableOpen != null || cableList ? "default" : "outline"} size="icon"
+          className={cn("size-8 backdrop-blur",
+            cableOpen == null && !cableList && "bg-popover/95 dark:bg-popover/95")}
+          title="Cables"
+          onClick={() => {
+            if (cableOpen != null || cableList) { setCableOpen(null); setCableList(false) }
+            else setCableList(true)
+          }}>
+          <CableIcon className="size-3.5" />
+        </Button>
         <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title="Go to my location" onClick={locateMe}>
           <LocateFixed className="size-3.5" />
@@ -3071,6 +4182,245 @@ export function MapPage() {
           </div>
         )}
       </div>
+
+      {/* CABLES: the list, and one cable's core plan --------------------------
+          IN THE DRILL-IN SLOT, not floating on the left. It shipped at
+          `top-14 left-3` on the theory that a right-hand panel would cover the
+          end of a traced run — and that was wrong twice over, verified in a
+          browser against real data. The AUTHORING is in the device panel on the
+          right, so opening a cable put the answer ~1000px from where the
+          operator was looking and read as "nothing happened"; and that slot
+          already belongs to the unplaced drawer AND the site card, so the site
+          card rendered straight over the top of it. Every other drill-in in this
+          product opens here. A cable is not a device, but this slot is about
+          INTERACTION, not taxonomy: it is where "the thing you just opened"
+          goes, and being somewhere else is indistinguishable from being broken.
+
+          It takes the slot FROM the device panel while open, with a back arrow
+          when it was opened from one — a drill-in with a way back, rather than
+          two panels competing for one strip of screen. */}
+      {/* Stands down while the route editor has the map, exactly as the device
+          panel does — and it MUST, because `railOpen` already excludes an
+          editing session: a card rendering while the chrome believes it is
+          closed puts the control column back under the panel. */}
+      {(cableOpen != null || cableList) && !routeEdit && (() => {
+        const cable = cableOpen == null ? null
+          : cablesQ.data?.cables.find((c) => c.id === cableOpen)
+        const cables = cablesQ.data?.cables ?? []
+        return (
+          <Card className="wisp-device-panel absolute inset-x-2 bottom-2 z-[1001] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover py-0 md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:w-95 md:max-h-[calc(100%-4.5rem)]">
+            <div className="flex items-center gap-1.5 border-b px-3 py-2">
+              {cable && (
+                <Button variant="ghost" size="icon" className="size-6"
+                  title="All cables" onClick={() => { setCableOpen(null); setCableList(true) }}>
+                  <ArrowLeft className="size-3.5" />
+                </Button>
+              )}
+              <p className="min-w-0 flex-1 truncate text-xs font-semibold">
+                {cable ? cable.name : `Cables · ${cables.length}`}
+              </p>
+              <Button variant="ghost" size="icon" className="size-6"
+                onClick={() => { setCableOpen(null); setCableList(false) }}>
+                <X className="size-3.5" />
+              </Button>
+            </div>
+            {!cable && (
+              // The LIST — the entry point that did not exist. A cable is
+              // org-level plant, so reaching one should never require guessing
+              // which device it happens to touch. Not having this is why the
+              // live fleet has two cables both called "main": the first attempt
+              // gave no visible confirmation, so it was made again.
+              <div className="overflow-y-auto px-2 py-2">
+                <CableList cables={cables} canWrite={canWrite}
+                  onOpen={(id) => { setCableList(false); setCableOpen(id) }}
+                  onLay={canWrite ? () => {
+                    setCableList(false)
+                    setRouteEdit({ kind: "cable", cableId: null, name: "New cable",
+                                   points: [] })
+                  } : undefined} />
+              </div>
+            )}
+            {cable && (
+            <div className="overflow-y-auto px-3 py-2.5">
+              {cableForm?.id === cable.id ? (
+                <CableForm initial={cableForm}
+                  ends={[cable.a.name ?? "unplaced", cable.b.name ?? "unplaced"]}
+                  busy={saveCable.isPending}
+                  onCancel={() => setCableForm(null)}
+                  onSave={(v) => saveCable.mutate({ ...v, id: cable.id })} />
+              ) : (
+                <CablePanel cable={cable} canWrite={canWrite}
+                  busy={saveCable.isPending || splitCable.isPending}
+                  selectedCore={traceCore} onCore={setTraceCore}
+                  onEdit={() => setCableForm({
+                    id: cable.id, name: cable.name, cores: cable.cores })}
+                  onDelete={cableDelete.ask}
+                  // FOLLOWING a fibre is not the same as reading the core plan,
+                  // and both are offered from the same cell: the plan lights the
+                  // sections of THIS sheath, the trace follows the glass across
+                  // every closure it is cut at.
+                  onTrace={(coreNo) =>
+                    setTraceFrom({ cableId: cable.id, coreNo })}
+                  // Tracing hands the map over to the editor, so the panel
+                  // stands down — the cable stays "open" underneath, and saving
+                  // or cancelling brings it straight back.
+                  onRetrace={() => setRouteEdit({
+                    kind: "cable", cableId: cable.id, name: cable.name,
+                    points: cable.path ?? [],
+                  })}
+                  // Arms the map: the next click on the route is where the
+                  // sheath is opened. A mode rather than a drag, because the
+                  // coupler does not exist yet — there is nothing to take hold
+                  // of — and the point wanted is a place on the street.
+                  onSplit={() => setSplitAt({
+                    cableId: cable.id, cableName: cable.name })}
+                  onLabel={(coreNo, label) =>
+                    setCoreLabel.mutate({ cableId: cable.id, coreNo, label: label ?? "" })} />
+              )}
+            </div>
+            )}
+          </Card>
+        )
+      })()}
+
+      {/* Deleting a cable un-claims its spans, so it says what SURVIVES as well
+          as what goes — the same shape the un-place confirm was given after a
+          benign-looking icon turned out to delete a device's coordinates with no
+          warning. Not `requireText`: the spans keep their geometry and rejoining
+          a rebuilt cable is a few clicks, so this is reversible enough that
+          making somebody type would only train them to type without reading. */}
+      {cableOpen != null && (() => {
+        const cable = cablesQ.data?.cables.find((c) => c.id === cableOpen)
+        if (!cable) return null
+        return (
+          <ConfirmDialog {...cableDelete.props}
+            title={`Delete "${cable.name}"?`}
+            description={cable.cores_recorded
+              ? `${cable.cores_recorded} recorded core${cable.cores_recorded === 1 ? "" : "s"} go with it — a splice names two fibres, and one of them is about to stop existing.`
+              : "Nothing is recorded on it yet."}
+            confirmLabel="Delete cable"
+            onConfirm={() => deleteCable.mutate(cable.id)} />
+        )
+      })()}
+
+      {/* OPENING A COUPLER — the same banner shape the route editor uses,
+          because it is the same kind of moment: the map has stopped being a
+          picture and become an input, and the one thing that must never happen
+          is an operator clicking on it without knowing that. */}
+      {splitAt && (
+        <div className="absolute top-14 left-1/2 z-[1000] flex max-w-[min(94vw,44rem)] -translate-x-1/2 items-center gap-2 rounded-full border border-primary/40 bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+          <Scissors className="size-3.5 shrink-0 text-primary" />
+          <span className="min-w-0 truncate">
+            Click where{" "}
+            <span className="font-mono font-semibold">{splitAt.cableName}</span>
+            {" "}is opened
+            {/* SAID, because a click that lands 30 m off the line and comes back
+                sitting exactly on it looks like a bug rather than the feature it
+                is. The server owns that projection — one owner, or the coupler
+                and the two halves drawn from it drift apart. */}
+            <span className="text-muted-foreground"> · it snaps to the cable, and
+              every core is spliced straight through</span>
+          </span>
+          <Button variant="ghost" size="icon" className="size-5" title="Cancel (Esc)"
+            onClick={() => setSplitAt(null)}>
+            <X className="size-3" />
+          </Button>
+        </div>
+      )}
+
+      {/* FOLLOWING A FIBRE. The lit path is on the map; this says what it IS,
+          which the map cannot — every hop is the same neutral emphasis, so
+          without the words there is no way to tell a two-cable run from a
+          six-cable one, or to know where the certainty ran out. */}
+      {traceFrom != null && traceQ.data && (
+        <div className="absolute top-14 left-1/2 z-[1000] flex max-w-[min(94vw,52rem)] -translate-x-1/2 items-center gap-2 rounded-full border border-border-strong bg-popover/95 dark:bg-popover/95 py-1.5 pr-2 pl-3.5 text-xs shadow-none backdrop-blur">
+          <Route className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate">
+            {traceQ.data.hops.map((h, i) => (
+              <Fragment key={`${h.cable_id}:${h.core_no}:${i}`}>
+                {i === 0 && (
+                  <span className="font-mono font-semibold">{h.from.name}</span>
+                )}
+                <span className="text-muted-foreground">
+                  {" "}·{" "}{h.cable_name} core {h.core_no}{" "}·{" "}
+                </span>
+                <span className="font-mono font-semibold">{h.to.name}</span>
+              </Fragment>
+            ))}
+            {/* A FAULT STOPS THE WALK AND SAYS SO. What is drawn is the part
+                that is unambiguous; carrying on past a fork would draw a
+                confident line down whichever branch sorted first, and somebody
+                would drive to it. */}
+            {traceQ.data.fault === "fork" && (
+              <span className="text-warning">
+                {" "}· stops at {traceQ.data.fault_at?.name} — two fibres claim to
+                continue it
+              </span>
+            )}
+            {traceQ.data.fault === "loop" && (
+              <span className="text-warning">
+                {" "}· the record loops back on itself at {traceQ.data.fault_at?.name}
+              </span>
+            )}
+          </span>
+          <Button variant="ghost" size="icon" className="size-5 shrink-0"
+            title="Stop following" onClick={() => setTraceFrom(null)}>
+            <X className="size-3" />
+          </Button>
+        </div>
+      )}
+
+      {/* THE TRAY. A dialog rather than the right rail, and that is a judgement
+          about the WORK, not about the taxonomy: joining fibres is a focused job
+          done once at a box, over a two-column layout that cannot fit in a 380px
+          panel, while everything the rail holds is a thing you read WITH the
+          map. It also opens over the point it is about, which is the check the
+          cable panel failed once by opening ~1000px from where the operator was
+          looking. */}
+      <Dialog open={trayAt != null}
+        onOpenChange={(o) => { if (!o) { setTrayAt(null); setTrayError(null) } }}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              Inside {fibreQ.data?.point.name ?? "this point"}
+            </DialogTitle>
+            <DialogDescription className="text-2xs">
+              One row per fibre, and what each one does here — spliced onward
+              into another sheath, or taken out to a box or a customer. Runs
+              that all do the same thing fold into a line.
+            </DialogDescription>
+          </DialogHeader>
+          {fibreQ.data && trayAt != null && (
+            <div className="max-h-[65vh] overflow-y-auto pr-1">
+              <CouplerTray
+                fibre={fibreQ.data}
+                canWrite={canWrite}
+                busy={setFibreJoint.isPending || spliceThrough.isPending
+                      || clearFibreJoint.isPending || takeCoreToBox.isPending}
+                error={trayError}
+                boxes={trayBoxes}
+                people={trayPeople}
+                onClearError={() => setTrayError(null)}
+                onJoin={(a, b) => setFibreJoint.mutate({ point: trayAt, a, b })}
+                onTail={(a, to) =>
+                  takeCoreToBox.mutate({ point: trayAt, a, to })}
+                onThrough={(a, b) => spliceThrough.mutate({ point: trayAt, a, b })}
+                onClear={(f) => clearFibreJoint.mutate({
+                  point: trayAt, cableId: f.cableId, coreNo: f.coreNo })}
+                onTrace={(f) => {
+                  // Leaving the tray for the map is the point of the button, so
+                  // it closes: a lit path under a modal is a path nobody can see.
+                  setTrayAt(null)
+                  setTraceCore(null)
+                  setTraceFrom({ cableId: f.cableId, coreNo: f.coreNo })
+                }} />
+            </div>
+          )}
+          {fibreQ.isLoading && (
+            <p className="py-6 text-center text-2xs text-faint-foreground">Reading…</p>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* unplaced drawer ------------------------------------------------------- */}
       {placeOpen && canWrite && (
@@ -3206,6 +4556,15 @@ export function MapPage() {
                 setSelectedId(deviceId)
                 setSelectedOnuMac(null)
               },
+              // Tracing takes over the map, so the card that launched it stands
+              // down — same reason the device panel hides during a route edit:
+              // it occupies the right rail, which is map you need to click
+              // waypoints onto, and a drop often runs straight under it.
+              onTraceDrop: (m) => {
+                const place = places.find((x) => x.mac === m)
+                if (place) startDropRouteEdit(place)
+                setSelectedOnuMac(null)
+              },
             }} />
         </Card>
       )}
@@ -3215,7 +4574,7 @@ export function MapPage() {
           is map you need to click waypoints onto, and the route being edited
           often runs straight under it. selectedId is KEPT, not cleared — the
           panel comes back on save/cancel with the same device still open. */}
-      {selected && !routeEdit && (
+      {selected && !routeEdit && cableOpen == null && !cableList && (
         // Opaque, and no longer /95 + backdrop-blur. Seeing the tiles through it
         // reads as atmosphere on an empty stretch of map and as noise the moment
         // anything is under it — a label or a satellite frame ghosting up through
@@ -3295,94 +4654,6 @@ export function MapPage() {
                   {canWrite && isPlaced(selected) && (
                     <span className="mx-1 h-4 w-px shrink-0 bg-border" aria-hidden />
                   )}
-                  {canWrite && cables.length > 0 && (
-                    // The button carries STATE: a device with any drawn cable
-                    // reads as active, so "does this link have a path?" is
-                    // answerable without opening the menu. Every cable opens a
-                    // submenu rather than acting on click — a span has two
-                    // editable things now (its path and its colour), so even a
-                    // device with ONE cable has a choice to make.
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon"
-                          className={cn("size-7", drawnCables ? "text-primary" : "text-muted-foreground")}
-                          title="Cables on this device">
-                          <Spline className="size-3.5" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-64">
-                        <DropdownMenuLabel className="text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
-                          Cables · {drawnCables}/{cables.length} drawn
-                        </DropdownMenuLabel>
-                        {cables.map((c) => (
-                          <DropdownMenuSub key={`${c.childId}:${c.parentId}`}>
-                            <DropdownMenuSubTrigger>
-                              {c.dir === "up" ? <ArrowUp className="size-3.5 shrink-0 text-muted-foreground" />
-                                : c.dir === "down" ? <ArrowDown className="size-3.5 shrink-0 text-muted-foreground" />
-                                : <ArrowLeftRight className="size-3.5 shrink-0 text-muted-foreground" />}
-                              <span className="min-w-0 flex-1 truncate font-mono text-xs">{c.other.name}</span>
-                              {c.kind !== "primary" && <RowTag tone="muted">{c.kind}</RowTag>}
-                              {/* colour reads as a swatch, not a word — it's the
-                                  thing you're matching against the map */}
-                              {isLinkColor(c.color) && (
-                                <span className="size-2.5 shrink-0 rounded-full"
-                                  style={{ background: linkColorVar(c.color) }} aria-hidden />
-                              )}
-                            </DropdownMenuSubTrigger>
-                            <DropdownMenuSubContent className="w-56">
-                              <DropdownMenuItem onSelect={() => startRouteEdit(c)}>
-                                <Spline className="size-3.5 shrink-0 text-muted-foreground" />
-                                <span className="flex-1">{c.route ? "Edit" : "Draw"} cable route</span>
-                                <span className={cn("shrink-0 text-2xs",
-                                  c.route ? "text-primary" : "text-faint-foreground")}>
-                                  {c.route ? `${c.route.length} pt` : "none"}
-                                </span>
-                              </DropdownMenuItem>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuLabel className="text-2xs font-semibold tracking-wide text-muted-foreground uppercase">
-                                Line colour
-                              </DropdownMenuLabel>
-                              {/* Swatches, not a list of names: picking a colour
-                                  is a visual match against the map behind the
-                                  panel. Grid rather than a row so the hit targets
-                                  stay finger-sized. */}
-                              <div className="flex flex-wrap gap-1.5 px-2 py-1.5">
-                                {LINK_COLORS.map((col) => (
-                                  <button key={col} type="button"
-                                    title={linkColorName(col)}
-                                    aria-label={linkColorName(col)}
-                                    aria-pressed={c.color === col}
-                                    className={cn(
-                                      "size-6 rounded-md border transition-colors",
-                                      c.color === col
-                                        ? "border-foreground/70" : "border-border hover:border-border-strong")}
-                                    style={{ background: linkColorVar(col) }}
-                                    onClick={() => setLinkStyle.mutate({
-                                      childId: c.childId, parentId: c.parentId,
-                                      style: { color: c.color === col ? null : col },
-                                    })} />
-                                ))}
-                              </div>
-                              <DropdownMenuItem disabled={!c.color}
-                                onSelect={() => setLinkStyle.mutate({
-                                  childId: c.childId, parentId: c.parentId,
-                                  style: { color: null, label_pos: null },
-                                })}>
-                                <Undo2 className="size-3.5 shrink-0 text-muted-foreground" />
-                                Reset colour &amp; label
-                              </DropdownMenuItem>
-                            </DropdownMenuSubContent>
-                          </DropdownMenuSub>
-                        ))}
-                        {/* the status tones are never available as a choice, so
-                            say what a coloured line still can't hide */}
-                        <p className="px-2 pt-1 pb-1.5 text-2xs leading-snug text-faint-foreground">
-                          A line in trouble always renders red or amber, whatever
-                          colour you give it.
-                        </p>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  )}
                   {canWrite && (
                     <Button variant="ghost" size="icon" className="size-7 text-muted-foreground"
                       title="Type coordinates (paste from a GPS app)"
@@ -3408,10 +4679,84 @@ export function MapPage() {
                       <MapPinOff className="size-3.5" />
                     </Button>
                   )}
+                  {/* DELETE, for PLANT only, and the second way in to it: the
+                      right-click menu is where this feature lives, and a context
+                      menu is undiscoverable on its own. Gear is not offered it
+                      here for the same reason it isn't offered there. Un-pin
+                      stays beside it because they are genuinely different acts
+                      on a box that was put in the wrong place: one says the
+                      coordinate is wrong, the other that the box isn't there. */}
+                  {canWrite && isPassiveType(selected.device_type) && (
+                    <Button variant="ghost" size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      title="Delete this box and its plant record"
+                      onClick={() => {
+                        setPlantDelete(selected)
+                        confirmPlantDelete.ask()
+                      }}>
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  )}
                 </span>
               </>
             )}
           </div>
+          {/* WHAT FIBRE LANDS ON THIS BOX, and the one place a box gets joined
+              to the network now.
+              
+              It sits directly under the coordinates because those are the two
+              facts a freshly placed box has and lacks: it is somewhere, and it
+              is spliced to nothing. Putting the fix for the second right under
+              the first is what stops "no line appeared" reading as a failed
+              save. Below the map's own read-outs would bury it; above the
+              coordinates would put a network fact ahead of a ground one. */}
+          {(canWrite || deviceCables.length > 0) && (
+            <div className="space-y-1.5 border-b px-4 py-2.5">
+              <p className="wisp-eyebrow">Fibre</p>
+              {deviceCables.length === 0 ? (
+                <p className="text-2xs text-faint-foreground">
+                  No cable is recorded as ending here. Lay one on the map — that
+                  is what joins a box to the network now.
+                </p>
+              ) : (
+                <ul className="space-y-0.5">
+                  {deviceCables.map(({ cable, far }) => (
+                    <li key={cable.id}>
+                      <button type="button"
+                        onClick={() => { setCableList(false); setCableOpen(cable.id) }}
+                        className="flex w-full items-baseline gap-2 rounded px-1 py-1 text-left hover:bg-foreground/5">
+                        <span className="truncate text-xs">{cable.name}</span>
+                        {cable.cores != null && (
+                          <span className="shrink-0 font-mono text-2xs text-muted-foreground">
+                            {cable.cores}F
+                          </span>
+                        )}
+                        <span className="ml-auto shrink-0 truncate text-2xs text-faint-foreground">
+                          {/* The far end is NAMED, never hidden. A cable with an
+                              unplaced end is real and recorded; the reason no
+                              line is drawn is that nobody has put the other
+                              point on the map — a different problem. */}
+                          {far.name ?? "far end unplaced"}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {/* THE TRAY is the one place a box is joined to the network, so
+                  the way in sits right under the coordinates: those are the two
+                  facts a freshly placed box has and lacks — it is somewhere, and
+                  it is spliced to nothing. */}
+              {deviceCables.length > 0 && (
+                <Button size="sm" variant="outline" className="w-full"
+                  onClick={() => { setTrayError(null)
+                                   setTrayAt({ device_id: selected.id }) }}>
+                  <Waypoints className="size-3" />
+                  {canWrite ? "Open the tray" : "What is joined here"}
+                </Button>
+              )}
+            </div>
+          )}
           {/* Cable length is a sentence, so it gets its own line — sharing the
               coords row with four buttons is what wrapped that row. ONE readout,
               not two competing ones: drawn length leads (splicing crews quote
@@ -3597,19 +4942,36 @@ export function MapPage() {
       {plantMenu && canWrite && (
         <PlantMenu
           anchor={plantMenu}
-          feeder={menuFeeder}
+          near={menuFeeder}
           dropOn={menuDropOn}
           width={wrapRef.current?.clientWidth ?? 0}
           height={wrapRef.current?.clientHeight ?? 0}
           onClose={() => setPlantMenu(null)}
-          onPlant={(kind, parentId) => {
-            setPlantDraft({ kind, lat: plantMenu.lat, lng: plantMenu.lng, parentId })
+          onPlant={(kind) => {
+            setPlantDraft({ kind, lat: plantMenu.lat, lng: plantMenu.lng })
             setPlantMenu(null)
           }}
-          onArm={(kind, parentId) => {
-            setArmed({ kind, parentId })
+          onArm={(kind, passiveId) => {
+            setArmed({ kind, passiveId })
             setPlantMenu(null)
             setSelectedId(null)
+          }}
+          onCable={(lat, lng, on) => {
+            // A NEW cable: the route is drawn first and named on save. `cableId`
+            // null is what says so, and it is the whole reason this editor kind
+            // takes a nullable id.
+            //
+            // Starting ON a pin records that box as end A immediately — the
+            // commonest thing a trunk does is leave a box, and inferring it back
+            // from the coordinate afterwards is exactly the guess a cable's ends
+            // exist to stop.
+            setPlantMenu(null)
+            setSelectedId(null)
+            setPlacingId(null)
+            setRouteEdit({
+              kind: "cable", cableId: null, name: "New cable",
+              points: [[lat, lng]],
+              endA: on ? { device_id: on.id, name: on.name } : null, endB: null })
           }}
           onCustomer={(passiveId) => {
             setCustomerDraft({ lat: plantMenu.lat, lng: plantMenu.lng, passiveId })
@@ -3620,7 +4982,88 @@ export function MapPage() {
             setSelectedId(d.id)
             setPlantMenu(null)
           }}
+          onDelete={(d) => {
+            setPlantMenu(null)
+            setPlantDelete(d)
+            confirmPlantDelete.ask()
+          }}
         />
+      )}
+      {/* Named, and it says what goes rather than only that something will.
+          A splitter's drops and the cables ending on it are swept with it, and
+          neither is visible from the pin being right-clicked. The children case
+          is a REFUSAL, so the dialog states it and the button says Close: the
+          server would answer ok:false anyway, and a confirm that can only fail
+          is worse than one that explains itself. No `requireText`: plant is
+          re-recorded in a few clicks, and typing on a routine delete trains
+          people to type without reading. */}
+      {plantDelete && plantDeleteToll && (
+        plantDeleteToll.children > 0 ? (
+          <ConfirmDialog {...confirmPlantDelete.props}
+            title={`${plantDelete.name} has ${plantDeleteToll.children} box${plantDeleteToll.children === 1 ? "" : "es"} below it`}
+            description="Move or delete those first. A box with plant hanging off it can't be removed."
+            confirmLabel="Close"
+            onConfirm={() => setPlantDelete(null)} />
+        ) : (
+          <ConfirmDialog {...confirmPlantDelete.props}
+            title={`Delete ${plantDelete.name}?`}
+            description={[
+              plantDeleteToll.drops
+                ? `${plantDeleteToll.drops} recorded drop${plantDeleteToll.drops === 1 ? "" : "s"} go with it. Those subscribers stay in the roster and go back to reading "splitter not recorded".`
+                : "",
+              plantDeleteToll.cables
+                ? `${plantDeleteToll.cables} cable${plantDeleteToll.cables === 1 ? "" : "s"} ending here ${plantDeleteToll.cables === 1 ? "is" : "are"} deleted too, with the splices made in them.`
+                : "",
+              !plantDeleteToll.drops && !plantDeleteToll.cables
+                ? "Nothing is recorded against it."
+                : "",
+              "Nothing keeps a copy.",
+            ].filter(Boolean).join(" ")}
+            confirmLabel="Delete"
+            onConfirm={() => deletePassive.mutate(plantDelete.id)} />
+        )
+      )}
+      {/* NAMING A CABLE YOU HAVE JUST TRACED.
+      
+          A DIALOG, and it has to be one. The route editor owns the whole map
+          while it is open — the cable panel is closed and the drill-in rail is
+          gone — so the panel-embedded form this shared with a RENAME rendered
+          nowhere at all, and pressing Save looked like pressing nothing. That
+          is the third time this feature has produced a "nothing is happening"
+          from a surface opening somewhere the operator was not: check where a
+          thing DRAWS, never just that the handler fired.
+          
+          It is also the right shape on its own terms — this is the terminal
+          step of a gesture, it must not be missable, and the traced line stays
+          visible behind it because that is what is being named. Cancel returns
+          to the editor with the route intact rather than discarding a survey. */}
+      {canWrite && cableForm && cableForm.id == null && (
+        <Dialog open onOpenChange={(v) => { if (!v) setCableForm(null) }}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Spline className="size-4 text-muted-foreground" />
+                Name this cable
+              </DialogTitle>
+              <DialogDescription>
+                {/* WHAT THE ENDS CAUGHT, said before it is saved. An end that
+                    landed on open ground becomes a coupler, and that is a device
+                    appearing on the map — so it is announced here rather than
+                    discovered afterwards as two pins nobody asked for. */}
+                {cableForm.path?.length ?? 0} points traced.
+                {cableForm.ends && (cableForm.ends[0] == null || cableForm.ends[1] == null)
+                  ? " A coupler is created at each end that lands on open ground."
+                  : " It runs between the two points you clicked."}
+              </DialogDescription>
+            </DialogHeader>
+            <CableForm initial={cableForm} busy={saveCable.isPending}
+              ends={[cableForm.ends?.[0]?.name ?? "new coupler",
+                     cableForm.ends?.[1]?.name ?? "new coupler"]}
+              onCancel={() => setCableForm(null)}
+              onSave={(v) => saveCable.mutate({
+                ...v, path: cableForm.path, ends: cableForm.ends })} />
+          </DialogContent>
+        </Dialog>
       )}
       {canWrite && (
         <PlantCreateDialog draft={plantDraft} devices={devices} org={scopeOrg}

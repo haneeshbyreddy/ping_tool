@@ -6,8 +6,8 @@ import logging
 import threading
 from datetime import datetime, timezone
 
-from wisp.central import (assignment, billing, drops, inventory, onuroster,
-                          ponfault, weboptics_profiles)
+from wisp.central import (assignment, billing, drops, fiber, inventory,
+                          onuroster, ponfault, weboptics_profiles)
 from wisp.central.api.common import (DENIED, body_org_write, can_survey,
                                      device_read_scope, device_write_org,
                                      olt_liveness, org_or_400, q_int_or,
@@ -875,7 +875,12 @@ def onu_places(h, qs):
     # the line to its SPLITTER rather than straight to the OLT — the straight
     # line skipped every splitter between them, which is the plant a crew works
     # on. Null = nobody recorded one, and the map renders that difference.
-    attached = h.store.onu_drop_map(org)
+    #
+    # …and the drop's own traced GEOMETRY where somebody has walked it. Both come
+    # off ONE read of the table rather than `onu_drop_map` plus a second query:
+    # the anchor and the path to it are the same record, and fetching them apart
+    # is how a line ends up drawn to a splitter its waypoints no longer lead to.
+    drops_by_mac = {d["mac"]: d for d in h.store.list_onu_drops(org)}
     out = []
     for p, hits, r in resolved:
         token = onuroster.onu_if_token(r.get("pon_port"), r.get("onu_id"))
@@ -892,7 +897,13 @@ def onu_places(h, qs):
                     "witness": bool(p.get("witness")),
                     "ambiguous": len(hits) > 1,
                     "slots": len(hits),
-                    "drop_passive_id": attached.get(p["mac"]),
+                    "drop_passive_id": (drops_by_mac.get(p["mac"]) or {}).get("passive_id"),
+                    # Intermediate vertices, splitter → subscriber. Empty is the
+                    # ordinary case and means "never traced", which the map draws
+                    # dotted; a non-empty list is somebody's survey and draws
+                    # SOLID. The two must never render alike — a dash on this map
+                    # is its word for "we did not walk this".
+                    "drop_waypoints": (drops_by_mac.get(p["mac"]) or {}).get("waypoints") or [],
                     "device_id": r.get("device_id"),
                     "device_name": r.get("device_name"),
                     "onu_id": r.get("onu_id"),
@@ -1063,6 +1074,7 @@ def subscriber(h, qs):
             chain.append({"id": node["id"], "name": node.get("name"),
                           "device_type": node.get("device_type"),
                           "split_ratio": node.get("split_ratio"),
+                          "split_inputs": node.get("split_inputs"),
                           "pon_port": node.get("pon_port")})
             if node["id"] == did:
                 break
@@ -1109,8 +1121,11 @@ def onu_drops(h, qs):
     devices = h.store.list_org_devices(org)
     down_olts, stale_olts = olt_liveness(devices, now, h.cfg.central_node_stale_s)
     fresh = {d["id"] for d in devices} - down_olts - stale_olts
+    # The PLANT chain, not the declared one: a splitter recorded by pulling a
+    # core into it has no `parent_device_id` at all, and localizing a break to
+    # one span is exactly what that box was recorded for.
     faults = drops.branch_faults(
-        resolved, h.store.org_device_parent_map(org), fresh_olt_ids=fresh,
+        resolved, h.store.org_plant_feed_map(org), fresh_olt_ids=fresh,
         # only PASSIVE plant may be named: ancestors are walked to tally
         # subtrees, and without this an OLT that lost every ONU would qualify
         # against its parent switch and paint its BACKHAUL as a fibre break
@@ -1336,9 +1351,8 @@ def route(h, user, body):
 
 
 def link_style(h, user, body):
-    """Per-link map styling: colour from the closed palette, label position along
-    the line. Owner-gated like every inventory write; purely cartographic — it
-    can't reach the engine, an alert or a state row."""
+    """Where one span's chip sits. Cartography only, since the plant record it
+    used to share this row with became a run (`cable_run` below)."""
     clean = inventory.clean_link_style_payload(body)
     org = _link_write_scope(h, user, clean)
     if org is DENIED:
@@ -1346,6 +1360,419 @@ def link_style(h, user, body):
     h.store.set_link_style(org, clean["child_id"], clean["parent_id"],
                            clean["fields"], updated_by=user["username"])
     h._reply(200, {"ok": True})
+
+
+def cable_gone(h, user, body):
+    """The run/tap/splice routes, answering in words instead of vanishing.
+
+    A cable knows its own two ends now, so there is no run to record; a cable end
+    IS the tap, so there is nothing to project; and a splice is a joint between
+    two cores rather than between two runs. A browser still asking for these is
+    holding a bundle older than this central, which is a routine pairing — the
+    SPA deploys the moment it is built and central needs a restart — so the reply
+    says what happened. A silent 404 there is indistinguishable from a bug."""
+    raise inventory.InventoryError(
+        "fibre is recorded on the cable itself now — reload the page")
+
+
+def cables(h, qs):
+    """Every cable in the org, its two ends, and what each core does at each end.
+
+    ONE reply builds the whole panel. The core plan, the ends and the length are
+    all statements about the same sheath, and assembling them from separate reads
+    is how a card ends up saying "0 of 12 cores recorded" above two recorded
+    cores.
+    """
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    h._reply(200, {"cables": h.store.list_org_cables(org),
+                   "counts": list(fiber.FIBER_COUNTS)})
+
+
+def cable_save(h, user, body):
+    """Lay a cable, or edit one. Owner-only, like every plant write.
+
+    A cable RUNS BETWEEN TWO FIBRE POINTS and says so on its own row, which is
+    the correction this whole subsystem was given on 2026-08-09. It needs no
+    `parent_device_id`, no cross-link and no prior relationship of any kind
+    between its ends — and it cannot create one: nothing here writes to
+    `org_devices` or `org_device_links`, so recording fibre can never rebuild an
+    engine, re-parent a switch or re-page a fleet. What it CAN do is fill in the
+    plant chain (`org_plant_feed_map`), read by the map, the split arithmetic and
+    branch-fault localization, and by no alerting shell.
+
+    Both ends are checked against the resolved org in the store, which is the one
+    cross-org leak a body naming two ids could otherwise produce.
+    """
+    clean = inventory.clean_cable_payload(body)
+    if clean["id"] is None:
+        org = body_org_write(h, user, body)
+        if org is DENIED:
+            return
+        if not org:
+            h._reply(400, {"error": "org_id is required"})
+            return
+    else:
+        # An existing cable re-derives its org from its own row, like every
+        # org_devices write — a body's org_id is only ever trusted on create.
+        org = h.store.cable_org(clean["id"])
+        if not org:
+            h._reply(404, {"error": "cable not found"})
+            return
+        if not h._can_write(user, org):
+            h._reply(403, {"error": "forbidden"})
+            return
+    if not _ends_in_org(h, org, clean["a"], clean["b"]):
+        return
+    try:
+        cable_id = h.store.set_org_cable(
+            org, clean["id"], name=clean["name"], cores=clean["cores"],
+            notes=clean["notes"], a=clean["a"], b=clean["b"],
+            updated_by=user["username"])
+    except fiber.FiberError as exc:
+        raise inventory.InventoryError(str(exc)) from exc
+    except ValueError as exc:
+        raise inventory.InventoryError(str(exc)) from exc
+    h._reply(200, {"ok": True, "id": cable_id})
+
+
+def _ends_in_org(h, org: str, *ends) -> bool:
+    """Every named point really belongs to this org. Replies and returns False if not.
+
+    A point is a device id or a subscriber MAC, and both are just numbers and
+    strings in a body — so this is the check that stops one org's cable claiming
+    to land on another org's box. Same shape as the device-id scoping every other
+    write in this file does; it is here rather than in `inventory` because it
+    needs the store.
+    """
+    devices, macs = set(), set()
+    for end in ends:
+        if not end:
+            continue
+        if end.get("device_id") is not None:
+            devices.add(end["device_id"])
+        elif end.get("mac"):
+            macs.add(end["mac"])
+    for device_id in devices:
+        if h.store.device_org(device_id) != org:
+            h._reply(404, {"error": "device not found"})
+            return False
+    if macs and not h.store.onu_places_exist(org, macs):
+        h._reply(404, {"error": "customer not found"})
+        return False
+    return True
+
+
+def cable_core(h, user, body):
+    """What one fibre of a cable CARRIES. Blank clears it.
+
+    Free text on purpose: a real core register reads "BSNL leased line", "village
+    A tower", "reserved for the new OLT" — destinations, customers and intentions
+    mixed together, which no closed vocabulary survives. Where a core GOES is a
+    different fact entirely, derived from the joints (`fibre_trace`) and never
+    typed, so the panel can render one as a note and the other as a record."""
+    try:
+        cable_id = int(body.get("cable_id"))
+        core_no = int(body.get("core_no"))
+    except (TypeError, ValueError):
+        raise inventory.InventoryError("cable_id and core_no are required")
+    org = h.store.cable_org(cable_id)
+    if not org:
+        h._reply(404, {"error": "cable not found"})
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    cable = next((c for c in h.store.list_org_cables(org) if c["id"] == cable_id), None)
+    if cable and cable["cores"] and not (1 <= core_no <= cable["cores"]):
+        raise inventory.InventoryError(
+            f"core number must be between 1 and {cable['cores']}")
+    label = str(body.get("label") or "").strip()[:80] or None
+    h.store.set_cable_core_label(org, cable_id, core_no, label,
+                                 updated_by=user["username"])
+    h._reply(200, {"ok": True})
+
+
+def cable_delete(h, user, body):
+    """Delete a cable, its joints and its core register.
+
+    A cascade, unlike the version this replaces, and for a reason that only
+    became true when the cable got ends: a joint names two fibres, and one of
+    them has just stopped existing. Leaving those rows would leave a tray drawing
+    connectors to a sheath that is gone."""
+    try:
+        cable_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        raise inventory.InventoryError("cable id is required")
+    org = h.store.cable_org(cable_id)
+    if not org:
+        h._reply(404, {"error": "cable not found"})
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    h._reply(200, {"ok": h.store.delete_org_cable(org, cable_id)})
+
+
+def cable_path(h, user, body):
+    """Trace where a cable physically runs. Owner-only, like every plant write.
+
+    It writes GEOMETRY AND NOTHING ELSE — it cannot rename the cable, change its
+    fibre count, or move either end. Same discipline as `drop_route`, and the
+    same reason: a route is a survey, and a survey must not be able to quietly
+    restate the record it is a survey OF."""
+    clean = inventory.clean_cable_path_payload(body)
+    org = h.store.cable_org(clean["cable_id"])
+    if not org:
+        h._reply(404, {"error": "cable not found"})
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    if not h.store.set_cable_path(org, clean["cable_id"], clean["path"],
+                                  user["username"]):
+        h._reply(404, {"error": "cable not found"})
+        return
+    h._reply(200, {"ok": True})
+
+
+def cable_split(h, user, body):
+    """Open a coupler on this cable: cut it here and splice every core through.
+
+    THE GESTURE THIS MODEL IS BUILT AROUND. A cable's ends are recorded now, so a
+    box tapped halfway down a street has to become a real end — and asking an
+    operator to redraw the street to achieve that is how a plant record stops
+    being kept. This does what the crew does: open the closure, put a coupler in
+    it, fusion-splice the tray straight through.
+
+    It DOES create an `org_devices` row, which every other write in this file's
+    fibre half deliberately does not. That is safe for exactly one reason and it
+    is worth stating: the row is a PASSIVE, so it is excluded from
+    `org_device_topology` — the single choke point the engine, the rebuild
+    fingerprint and `/edge/devices` all read — and it is created with no parent,
+    so it joins no dependency chain. A coupler cannot re-page a fleet."""
+    clean = inventory.clean_cable_split_payload(body)
+    org = h.store.cable_org(clean["cable_id"])
+    if not org:
+        h._reply(404, {"error": "cable not found"})
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    try:
+        out = h.store.split_org_cable(
+            org, clean["cable_id"], lat=clean["lat"], lng=clean["lng"],
+            name=clean["name"], updated_by=user["username"])
+    except ValueError as exc:
+        raise inventory.InventoryError(str(exc)) from exc
+    h._reply(200, {"ok": True, **out})
+
+
+def _joint_scope(h, user, body, *cable_keys):
+    """Resolve the org from the CABLES named, and check the point belongs to it.
+
+    Off the cable's own row rather than the body's `org_id`, like every other
+    plant write — and BOTH cables are checked, because a splice names two and
+    trusting only the first is how one org's glass gets joined to another's.
+    """
+    ids = []
+    for key in cable_keys:
+        raw = body.get(key)
+        if raw in (None, "", "null"):
+            continue
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            raise inventory.InventoryError(f"{key} is invalid")
+    if not ids:
+        raise inventory.InventoryError("a cable is required")
+    org = h.store.cable_org(ids[0])
+    if not org:
+        h._reply(404, {"error": "cable not found"})
+        return DENIED, None
+    for other in ids[1:]:
+        if h.store.cable_org(other) != org:
+            h._reply(404, {"error": "cable not found"})
+            return DENIED, None
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return DENIED, None
+    return org, ids
+
+
+def fibre_joint(h, user, body):
+    """Join two fibres at a point — or take one out to the equipment standing there.
+
+    ONE ROUTE FOR BOTH, because they are the same statement: this fibre ends
+    here, in this way. A missing `b_cable_id` is the termination, and it is the
+    only way a core is attached to a box — which is why connecting a device needs
+    no route of its own.
+
+    The physics (both fibres open at this point, neither already joined here) is
+    `fiber.joint_refusal`, read once in the store. What comes back NAMES the
+    refusal rather than 400-ing blankly: on a splice tray, an unexplained
+    rejection is indistinguishable from a broken button.
+    """
+    org, _ = _joint_scope(h, user, body, "a_cable_id", "b_cable_id")
+    if org is DENIED:
+        return
+    cables = {c["id"]: c for c in h.store.list_org_cables(org)}
+    a_cable = cables.get(_int_or_none(body.get("a_cable_id")))
+    b_cable = cables.get(_int_or_none(body.get("b_cable_id")))
+    clean = inventory.clean_fibre_joint_payload(
+        body, a_cores=a_cable["cores"] if a_cable else None,
+        b_cores=b_cable["cores"] if b_cable else None)
+    if not _ends_in_org(h, org, clean):
+        return
+    h._reply(200, h.store.set_fibre_joint(org, clean, updated_by=user["username"]))
+
+
+def fibre_tail(h, user, body):
+    """Take one core out of a cable to a box standing somewhere ELSE.
+
+    The other half of "take a core out to a device", and the half that had no
+    route through this record at all: a strand may only be joined where its own
+    sheath is opened, so a trunk core could never reach an OLT beside the closure
+    — and the single fibre that physically does reach it could not be laid,
+    because 1 was not a fibre count. Between the two, the commonest tail in an
+    access network was unsayable.
+
+    A MACRO over three writes the tray can already make by hand (a 1F tail, a
+    splice here, a termination there), so nothing downstream learns a new shape.
+    Both points are org-checked — the FAR one especially, since it is picked from
+    a list the browser may have been holding for a while.
+    """
+    org, _ = _joint_scope(h, user, body, "a_cable_id")
+    if org is DENIED:
+        return
+    cables = {c["id"]: c for c in h.store.list_org_cables(org)}
+    a_cable = cables.get(_int_or_none(body.get("a_cable_id")))
+    clean = inventory.clean_fibre_tail_payload(
+        body, a_cores=a_cable["cores"] if a_cable else None)
+    if not _ends_in_org(h, org, clean, clean["to"]):
+        return
+    h._reply(200, h.store.take_core_to_box(org, clean, updated_by=user["username"]))
+
+
+def fibre_through(h, user, body):
+    """Splice every free core of one cable straight through to another, 1:1.
+
+    Nine closures in ten are exactly this, and doing it as N gestures is the
+    difference between a plant record that gets written and one that does not.
+    A core already joined here is SKIPPED, never overwritten, so pressing it
+    twice is safe and pressing it after some hand-work leaves the hand-work."""
+    org, _ = _joint_scope(h, user, body, "a_cable_id", "b_cable_id")
+    if org is DENIED:
+        return
+    clean = inventory.clean_fibre_through_payload(body)
+    if not _ends_in_org(h, org, clean):
+        return
+    try:
+        out = h.store.splice_through(org, clean, updated_by=user["username"])
+    except ValueError as exc:
+        raise inventory.InventoryError(str(exc)) from exc
+    h._reply(200, out)
+
+
+def fibre_clear(h, user, body):
+    """Undo whatever this fibre is joined to at this point.
+
+    Named by the FIBRE rather than by the joint's id, so either side of a splice
+    can undo it — and because what the operator is looking at is a row in a tray,
+    not a database row."""
+    org, _ = _joint_scope(h, user, body, "cable_id")
+    if org is DENIED:
+        return
+    clean = inventory.clean_fibre_clear_payload(body)
+    if not _ends_in_org(h, org, clean):
+        return
+    h._reply(200, {"ok": h.store.clear_fibre_joint(org, clean)})
+
+
+def _int_or_none(raw):
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def device_fibre(h, qs):
+    """THE TRAY: every cable end landing at one point, and the joints between them.
+
+    One reply, like `cables`: the two columns, the connectors drawn between them
+    and each row's "already joined to" note all describe the same closure, and
+    assembling them from separate reads is how a connector gets drawn to a fibre
+    the list beside it calls free.
+
+    Takes `device` OR `onu`, because a customer point is a coupler too — that is
+    the case the ISPs added, and it is what lets a lane of houses be
+    daisy-chained down one 4F."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    device_id = _int_or_none((qs.get("device") or [""])[0])
+    mac = (qs.get("onu") or [""])[0].strip()
+    if device_id is None and not mac:
+        h._reply(400, {"error": "device or onu is required"})
+        return
+    h._reply(200, h.store.point_fibre(
+        org, device_id=device_id,
+        mac=onuroster._norm_mac(mac) if mac else None))
+
+
+def fibre_trace(h, qs):
+    """The whole optical path one fibre makes, across sheaths and joints.
+
+    Its own read rather than a field on the cable reply: a trace is a walk of the
+    ORG's glass, not a property of the cable somebody happens to be looking at,
+    and shipping one per core would compute a network-wide walk for every strand
+    of every cable on every panel open."""
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    cable_id = _int_or_none((qs.get("cable") or [""])[0])
+    core_no = _int_or_none((qs.get("core") or [""])[0])
+    if cable_id is None or core_no is None:
+        h._reply(400, {"error": "cable and core are required"})
+        return
+    h._reply(200, h.store.trace_fibre(org, cable_id, core_no))
+
+
+def drop_route(h, user, body):
+    """Trace the cable of ONE SUBSCRIBER'S DROP: the splitter → the customer.
+
+    Owner-gated, like the link routes it mirrors — a worker places pins, an owner
+    draws plant. It writes geometry and NOTHING else: it cannot create a drop,
+    move one to another splitter, or touch the subscriber's record. That is why
+    a MAC with no recorded drop is a 404 rather than a row invented on the spot —
+    the drop row IS the statement of which splitter feeds this customer, and a
+    route with no anchor would be a path drawn from nowhere. Record the splitter
+    first, which is also the order a crew works in."""
+    clean = inventory.clean_drop_route_payload(body)
+    # A MAC names no device, so the org comes from the caller's own scope — the
+    # same resolution the drop DETACH path and the reference-point write use.
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+    if not org:
+        h._reply(400, {"error": "org_id is required"})
+        return
+    ok = h.store.set_onu_drop_route(org, clean["mac"], clean["waypoints"])
+    if not ok:
+        h._reply(404, {"error": "no drop recorded for that subscriber."
+                                " Record which splitter feeds it first."})
+        return
+    h._reply(200, {"ok": True, "points": len(clean["waypoints"])})
 
 
 def snmp(h, user, body):

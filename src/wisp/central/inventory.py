@@ -7,20 +7,56 @@ import re
 # why it is not search_key). Imported rather than mirrored: a second spelling
 # rule here would let one sticker become two reference points.
 from wisp.central.onuroster import _norm_mac
+# The fibre-strand standard: cable sizes, the TIA-598 colour sequence, and the
+# tube arithmetic past 12. Imported rather than mirrored for the same reason
+# _norm_mac is — one spelling rule, or a strand validated here and rendered there
+# could disagree about which core exists.
+from wisp.central.fiber import (
+    FiberError, clean_cable_name, clean_core_no, clean_fiber_count)
 
 DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
-# Passive plant: splitters, fiber distribution boxes, splice closures. They live in
-# org_devices (parent chains, map pins, routes — all shared machinery), but they
-# don't ping: no IP, no probe assignment, no FSM. Three choke points keep them away
-# from the monitoring path — org_device_topology (engine + /edge/devices),
+# Passive plant: splitters, couplers, fiber distribution boxes, splice closures.
+# They live in org_devices (parent chains, map pins, routes — all shared machinery),
+# but they don't ping: no IP, no probe assignment, no FSM. Three choke points keep
+# them away from the monitoring path — org_device_topology (engine + /edge/devices),
 # node_expected_ips (no assignment), device_reliability (no uptime math).
-PASSIVE_TYPES = ("splitter", "fdb", "closure")
+#
+# `coupler` arrived 2026-08-09 and it is THE ISPs' OWN WORD for the joint box where
+# a sheath is opened and cores are spliced — the node the whole fibre model now
+# hangs off. It is not a synonym for `closure` bolted on for taste: a cable end has
+# to land on something, laying one creates a coupler at each end that lands on empty
+# ground, and a vocabulary an operator has to translate their own plant into is the
+# first place a survey stalls. The others stay; a box that is only ever a splice
+# point is a coupler, a box that splits light is a splitter.
+PASSIVE_TYPES = ("splitter", "coupler", "fdb", "closure")
 # How many ways a passive splits the fibre. A CLOSED vocabulary, and deliberately
-# only the three an ISP actually stocks: the ratio is not decoration, it is what
+# only what an ISP actually stocks: the ratio is not decoration, it is what
 # the recorded-load bar and the cumulative split down a cascade are computed
 # from, so a free-form number would let "1:7" or "1:100" produce arithmetic
-# nobody can act on. Widening this is a one-line edit when a real box turns up.
-SPLIT_RATIOS = (2, 4, 8)
+# nobody can act on. Widening this is a one-line edit when a real box turns up —
+# 16 arrived that way (operator, 2026-08-08); 32 and 64 are the same one line.
+SPLIT_RATIOS = (2, 4, 8, 16)
+# How many fibres FEED the box: an ordinary 1:N, or a 2:N with a second input for
+# a protection feed. Two things this is deliberately NOT.
+#
+# It is not a second ratio — light entering either input still splits N ways, so
+# `cumulativeSplit` multiplies OUTPUTS and nothing here changes a leg count. A
+# 2:16 has sixteen legs, the same as a 1:16.
+#
+# And it is not the topology. Whether that second input is CONNECTED, and to
+# what, is `org_device_links` — this column says only how many ports the box was
+# manufactured with, which is a fact about hardware the operator reads off the
+# casing. Keeping the two apart is what lets the panel say the useful thing: a
+# 2:N with one feed recorded is either unprotected or undocumented, and that
+# sentence is only sayable while "has two inputs" and "has two feeds" are
+# separate facts.
+#
+# NULL means ONE, not "unrecorded" — the one place in this schema where an absent
+# value takes a default rather than reading as a gap. Every splitter that existed
+# before this column did was rendered "1:N" by a label that assumed a single
+# input, and 41 of them are on the live fleet; making NULL mean "unknown" would
+# mark all of them incomplete overnight to record something nobody got wrong.
+SPLIT_INPUTS = (1, 2)
 SNMP_VERSIONS = ("2c",)
 
 def _gpon_vendors(extra: set[str] | None = None) -> frozenset[str]:
@@ -148,9 +184,11 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
     if pon_port and len(pon_port) > 32:
         raise InventoryError("PON port must be 32 characters or fewer")
 
-    # how many ways this box splits (1:2 / 1:4 / 1:8). Passive-only: powered gear
-    # doesn't split fibre, and a ratio there would feed the load bar nonsense.
+    # how many ways this box splits (1:2 … 1:16), and how many fibres feed it
+    # (1 or 2). Passive-only: powered gear doesn't split fibre, and a ratio there
+    # would feed the load bar nonsense.
     split_ratio = _split_ratio(data) if passive else None
+    split_inputs = _split_inputs(data, split_ratio) if passive else None
 
     # How many ONUs fit on one of this OLT's PONs before it reads as full. EPON
     # tops out at 1:64 and GPON at 1:128, so ONE global default can only be right
@@ -165,6 +203,7 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor,
             "pon_port": pon_port, "split_ratio": split_ratio,
+            "split_inputs": split_inputs,
             "onu_pon_limit": onu_pon_limit}
 
 
@@ -187,6 +226,39 @@ def _split_ratio(data: dict) -> int | None:
             "split ratio must be one of: "
             + ", ".join(f"1:{r}" for r in SPLIT_RATIOS))
     return ratio
+
+
+def _split_inputs(data: dict, ratio: int | None) -> int | None:
+    """How many fibres feed this box: 1 (ordinary) or 2 (protection input).
+
+    Bounded BY THE RATIO, and that pairing is the whole validation: "two inputs"
+    is a statement about a splitter, so a closure that only splices cannot carry
+    one, and neither can a box whose ratio nobody has recorded — that would be a
+    2:? , which names a product that does not exist. Same shape as
+    `fiber.clean_core_no` refusing a strand with no cable to be a strand of.
+
+    A missing key reads as None so the column survives every existing caller
+    untouched, and None renders as one input (see SPLIT_INPUTS)."""
+    raw = data.get("split_inputs")
+    if raw in (None, "", "null"):
+        return None
+    if isinstance(raw, str):
+        # tolerate "2:16" and "2" alike — the field writes the whole ratio down
+        raw = raw.strip().split(":")[0] or "0"
+    try:
+        inputs = int(raw)
+    except (TypeError, ValueError):
+        raise InventoryError("split inputs is invalid")
+    if inputs not in SPLIT_INPUTS:
+        raise InventoryError(
+            "split inputs must be one of: " + ", ".join(str(i) for i in SPLIT_INPUTS))
+    if inputs > 1 and not ratio:
+        raise InventoryError(
+            "record the split ratio before recording a second input")
+    # 1 is the default form of the object, so it is stored as absence — that
+    # keeps the sparse-storage rule this schema follows everywhere else, and it
+    # means a box saved through an older form is not silently "re-recorded".
+    return inputs if inputs > 1 else None
 
 def clean_location_payload(data: dict) -> dict:
     """Map pin for a device: both coordinates, or both null (= remove the pin)."""
@@ -290,7 +362,8 @@ def clean_field_passive_payload(data: dict) -> dict:
             "ip_address": "", "parent_device_id": None,
             "assigned_node_id": None, "region": region,
             "pon_port": pon_port or None,
-            "split_ratio": _split_ratio(data),
+            "split_ratio": (ratio := _split_ratio(data)),
+            "split_inputs": _split_inputs(data, ratio),
             "lat": loc["lat"], "lng": loc["lng"],
             "accuracy_m": loc["accuracy_m"], "source": loc["source"]}
 
@@ -635,27 +708,29 @@ def normalize_web_access(clean: dict, device_ip: str | None) -> dict:
 
 ROUTE_MAX_WAYPOINTS = 200
 
-# Per-link map colours: a CLOSED palette of names, never a free hex field.
+# THE operator colour vocabulary: a CLOSED palette of names, never a free hex.
+#
+# ONE set for the whole product, not one per feature — TAG and PROBE colours
+# (org_colors) draw from these names, so a colour means the same thing wherever
+# an operator meets it, and anything colour-coded later reuses it too.
 #
 # Two reasons it's names. (1) The map's loudest colours must stay the status
-# tones — a free picker lets an operator paint a healthy link the same red as a
-# down one, which fakes an alarm on the one screen that exists to show alarms.
+# tones — a free picker lets an operator paint a healthy thing the same red as a
+# broken one, which fakes an alarm on the one screen that exists to show alarms.
 # Every name here is deliberately clear of --destructive / --warning / --success
-# / --primary, and the renderer only paints a link that ISN'T in trouble anyway.
-# (2) The actual values live in index.css (--map-line-*), so they stay theme
-# data rather than being frozen into DB rows the day someone picked them —
-# the same argument as theme_overrides storing a sparse diff.
+# / --primary. (2) The actual values live in index.css (--map-line-*, a prefix
+# kept for history: the map got here first), so they stay theme data rather than
+# being frozen into DB rows the day someone picked them — the same argument as
+# theme_overrides storing a sparse diff.
 #
-# These distinguish PARALLEL cables from each other; they encode nothing. Keep
-# the vocabulary tiny.
-LINK_COLORS = ("violet", "magenta", "teal", "lime", "indigo", "chalk")
-
-# ONE colour vocabulary for the whole product, not one per feature. The map's
-# link palette came first; TAG and PROBE colours (org_colors) draw from the same
-# names, so a colour means the same thing wherever an operator meets it — and
-# every argument above carries over unchanged, in particular that none of these
-# can impersonate a status tone. Anything colour-coded later reuses this too.
-PALETTE = LINK_COLORS
+# It USED to paint map links as well, and that use is GONE (2026-08-08). Nobody
+# was decorating: twelve of the live fleet's twenty-four drawn routes were
+# painted and every one was a trunk, so the tint was being made to mean "these
+# spans are one physical cable" — six names, one org-wide namespace, `magenta`
+# naming two different cables at two different sites. `org_cables` says it
+# properly, so the tint was removed rather than left as a second way to say the
+# same thing. Don't re-add a link colour; give the spans a cable.
+PALETTE = ("violet", "magenta", "teal", "lime", "indigo", "chalk")
 
 # What a colour is attached to. 'tag' keys on the tag text, 'node' on node_id —
 # neither is a foreign key, deliberately: a tag exists only as text inside
@@ -685,17 +760,13 @@ def clean_color_key(kind: str, raw) -> str:
     return key
 
 
-def clean_route_payload(data: dict) -> dict:
-    """Drawn cable path for a link: intermediate vertices only, parent→child order.
+def _waypoints(raw) -> list[list[float]]:
+    """Intermediate vertices of a drawn cable path, validated and rounded.
 
-    An empty waypoint list clears the route. Endpoint devices are validated by the
-    caller (the pair must be a real link in this org)."""
-    try:
-        child_id = int(data.get("child_id"))
-        parent_id = int(data.get("parent_id"))
-    except (TypeError, ValueError):
-        raise InventoryError("child_id and parent_id are required")
-    raw = data.get("waypoints")
+    Shared by the two things that have geometry — a link between devices and a
+    subscriber's drop — because they are the same claim about the ground and a
+    second copy of this would drift. Endpoints are never in the list: they are
+    the pins, so moving one rubber-bands the path instead of orphaning it."""
     if raw in (None, "", "null"):
         raw = []
     if not isinstance(raw, list):
@@ -713,30 +784,368 @@ def clean_route_payload(data: dict) -> dict:
         if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
             raise InventoryError("waypoint coordinates are out of range")
         waypoints.append([round(lat, 6), round(lng, 6)])
-    return {"child_id": child_id, "parent_id": parent_id, "waypoints": waypoints}
+    return waypoints
 
 
-def clean_link_style_payload(data: dict) -> dict:
-    """A link's map styling: colour and/or bandwidth-label position.
+def clean_route_payload(data: dict) -> dict:
+    """Drawn cable path for a link: intermediate vertices only, parent→child order.
 
-    SPARSE — a key absent from the body means "leave it alone", so the colour
-    picker and the label drag can write independently without either clobbering
-    the other. An explicit null clears. Endpoint devices are validated by the
+    An empty waypoint list clears the route. Endpoint devices are validated by the
     caller (the pair must be a real link in this org)."""
     try:
         child_id = int(data.get("child_id"))
         parent_id = int(data.get("parent_id"))
     except (TypeError, ValueError):
         raise InventoryError("child_id and parent_id are required")
+    return {"child_id": child_id, "parent_id": parent_id,
+            "waypoints": _waypoints(data.get("waypoints"))}
+
+
+def _cable_end(data: dict, side: str) -> dict | None:
+    """One end of a cable: a device, or a subscriber, or nothing said about it.
+
+    A FIBRE POINT is anywhere glass lands — a coupler, an FDB, a splitter, an OLT,
+    or a customer — and the two kinds are carried as two nullable keys rather than
+    a `{kind, ref}` object because that is the shape the columns take: the device
+    side is a real foreign key (so deleting a box takes its cable with it) and the
+    subscriber side is a MAC (`onu_places` is keyed (org, mac) and has no stable id
+    to point at).
+
+    Returning None means the body said nothing about this end, which on an update
+    reads as "leave it alone" — a rename must not have to restate where the cable
+    goes. Saying BOTH is refused rather than resolved by precedence: a body
+    claiming one end is two different places is a bug in the caller, and picking a
+    winner would hide it.
+    """
+    device_raw = data.get(f"{side}_device_id")
+    mac_raw = data.get(f"{side}_mac")
+    has_device = device_raw not in (None, "", "null")
+    has_mac = mac_raw not in (None, "", "null")
+    if has_device and has_mac:
+        raise InventoryError(f"end {side.upper()} is a box or a customer, not both")
+    if has_device:
+        try:
+            return {"device_id": int(device_raw), "mac": None}
+        except (TypeError, ValueError):
+            raise InventoryError(f"end {side.upper()} device id is invalid")
+    if has_mac:
+        mac = _norm_mac(str(mac_raw))
+        if not mac:
+            raise InventoryError(f"end {side.upper()} customer id is invalid")
+        return {"device_id": None, "mac": mac}
+    if f"{side}_device_id" in data or f"{side}_mac" in data:
+        # An explicit null. There is no such thing as a cable with one end, so
+        # this is a clear statement that cannot be honoured — say so.
+        raise InventoryError(f"a cable needs a point at end {side.upper()}")
+    return None
+
+
+def clean_cable_payload(data: dict) -> dict:
+    """A CABLE: one sheath segment, its fibre count, and the two points it runs between.
+
+    The ends are the whole of what changed on 2026-08-09. A cable used to be a bag
+    of spans and its ends were wherever those spans happened to reach; now it is a
+    segment that knows where it starts and stops, which is what lets core N of it
+    run end to end with nothing else written down.
+
+    Both ends are REQUIRED ON CREATE and OPTIONAL ON UPDATE. One end is not a
+    weaker version of a cable, it is an unusable one — but renaming a trunk must
+    not have to restate its geometry, and the split and retrace paths deliberately
+    never touch the ends at all.
+
+    A cable may not run from a point to itself. Not pedantry: both ends land in one
+    tray, so every core of it would offer to be spliced to itself, and `feed_map`
+    would be asked which of two identical points feeds the other.
+    """
+    cable_id = data.get("id")
+    if cable_id in (None, "", "null"):
+        cable_id = None
+    else:
+        try:
+            cable_id = int(cable_id)
+        except (TypeError, ValueError):
+            raise InventoryError("cable id is invalid")
+    try:
+        name = clean_cable_name(data.get("name"))
+        cores = clean_fiber_count(data.get("cores"))
+    except FiberError as exc:
+        raise InventoryError(str(exc)) from exc
+    notes = str(data.get("notes") or "").strip() or None
+    if notes and len(notes) > 500:
+        raise InventoryError("notes must be 500 characters or fewer")
+    a, b = _cable_end(data, "a"), _cable_end(data, "b")
+    if cable_id is None and (a is None or b is None):
+        raise InventoryError("a cable runs between two points — name both ends")
+    if (a is None) != (b is None):
+        raise InventoryError("change both ends of a cable together, or neither")
+    if a is not None and a == b:
+        raise InventoryError("a cable cannot run from a point back to itself")
+    return {"id": cable_id, "name": name, "cores": cores, "notes": notes,
+            "a": a, "b": b}
+
+
+def clean_cable_path_payload(data: dict) -> dict:
+    """Where a CABLE physically runs — a complete route, not intermediates.
+
+    This is the one waypoint list in this schema that includes its own ends, and
+    the difference is not a detail. A span's geometry omits them because its ends
+    ARE two device pins and the line has to rubber-band when one is dragged; a
+    cable ends wherever the glass ends, which is routinely a closure on a pole with
+    nothing recorded there. Validating it through the same `_waypoints` helper
+    keeps one definition of "a coordinate we will accept", while the endpoint rule
+    differs and is stated in both places.
+
+    ONE POINT IS REFUSED, and an empty list clears the route. A single coordinate
+    is a place, not a run: nothing can be projected onto it, so every reader would
+    silently fall back to a chord — which reads as "the trace did not save" rather
+    than as the refusal it is.
+    """
+    try:
+        cable_id = int(data.get("cable_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("cable_id is required")
+    path = _waypoints(data.get("path"))
+    if len(path) == 1:
+        raise InventoryError("a cable route needs at least two points")
+    return {"cable_id": cable_id, "path": path}
+
+
+def clean_cable_split_payload(data: dict) -> dict:
+    """Open a sheath at a new closure: cut the cable here and make two of it.
+
+    This is what keeps segment-per-span from being a tax. A crew tapping an
+    existing street cable does not redraw the street — they open it at a pole,
+    splice most cores straight through and take a few out. The record has to be
+    able to do the same thing, in one gesture, without disturbing anything already
+    written at either far end.
+
+    The coordinate arrives raw and is SNAPPED to the cable's own route by the store
+    (`cablepath.split`), because a click lands near a line and never on it. What is
+    refused here is only what no snapping could rescue: a missing or absurd
+    coordinate. Cutting at the extreme end is refused too, but by the store — that
+    depends on the route, which this validator deliberately does not read.
+    """
+    try:
+        cable_id = int(data.get("cable_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("cable_id is required")
+    try:
+        lat, lng = float(data.get("lat")), float(data.get("lng"))
+    except (TypeError, ValueError):
+        raise InventoryError("a split needs the point to cut at")
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
+        raise InventoryError("split coordinates are out of range")
+    name = str(data.get("name") or "").strip() or None
+    if name and len(name) > 64:
+        raise InventoryError("name must be 64 characters or fewer")
+    return {"cable_id": cable_id, "lat": lat, "lng": lng, "name": name}
+
+
+def _fibre_point(data: dict) -> dict:
+    """WHERE a joint is made: a box, or a customer. Exactly one."""
+    device_raw, mac_raw = data.get("device_id"), data.get("mac")
+    has_device = device_raw not in (None, "", "null")
+    has_mac = mac_raw not in (None, "", "null")
+    if has_device == has_mac:
+        raise InventoryError("a joint is made at a box or at a customer, not both")
+    if has_device:
+        try:
+            return {"device_id": int(device_raw), "mac": None}
+        except (TypeError, ValueError):
+            raise InventoryError("device_id is invalid")
+    mac = _norm_mac(str(mac_raw))
+    if not mac:
+        raise InventoryError("mac is invalid")
+    return {"device_id": None, "mac": mac}
+
+
+def clean_fibre_joint_payload(data: dict, *, a_cores: int | None = None,
+                              b_cores: int | None = None) -> dict:
+    """At this point, this fibre is joined to that one — or taken out to the box.
+
+    ONE PAYLOAD FOR BOTH, because they are the same kind of statement and consume
+    a fibre end identically: one fibre joins exactly one fibre, whether the far
+    side is another strand or an OLT's PON port. A missing `b_cable_id` is the
+    TERMINATION, and it is the only way a core is attached to equipment — which is
+    why connecting a device needs no second route and no second table.
+
+    Deliberately thin on the rules that matter. Whether both fibres are actually
+    OPEN at this point, and whether either is already joined here, needs the cables
+    and the existing joints — so it lives in `fiber.joint_refusal`, read once by
+    the store. Re-checking it here would put the physics in two places. Core
+    numbers ARE bounded here, because that needs only the count, and the count is
+    passed in for exactly that reason.
+    """
+    point = _fibre_point(data)
+    try:
+        a_cable_id = int(data.get("a_cable_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("a_cable_id is required")
+    try:
+        a_core_no = clean_core_no(data.get("a_core_no"), a_cores)
+    except FiberError as exc:
+        raise InventoryError(str(exc)) from exc
+    if a_core_no is None:
+        raise InventoryError("a joint names a specific fibre — give a core number")
+    b_raw = data.get("b_cable_id")
+    if b_raw in (None, "", "null"):
+        return {**point, "a_cable_id": a_cable_id, "a_core_no": a_core_no,
+                "b_cable_id": None, "b_core_no": None}
+    try:
+        b_cable_id = int(b_raw)
+    except (TypeError, ValueError):
+        raise InventoryError("b_cable_id is invalid")
+    try:
+        b_core_no = clean_core_no(data.get("b_core_no"), b_cores)
+    except FiberError as exc:
+        raise InventoryError(str(exc)) from exc
+    if b_core_no is None:
+        raise InventoryError("a splice names a specific fibre at both ends")
+    return {**point, "a_cable_id": a_cable_id, "a_core_no": a_core_no,
+            "b_cable_id": b_cable_id, "b_core_no": b_core_no}
+
+
+def clean_fibre_tail_payload(data: dict, *, a_cores: int | None = None) -> dict:
+    """Take ONE core out of a cable to a box that is somewhere ELSE.
+
+    The ISPs described this as one primitive — *at a coupler you join cable to
+    cable, or take a core out to a device on a single fibre* — and only the half
+    where the device already stands at the cable's end was built. The other half
+    was not merely awkward, it was UNSAYABLE: a strand may only be joined where
+    its own sheath is opened (`joint_refusal` → absent, correct physics), and a
+    single-fibre tail could not be laid because 1 was not a fibre count. So the
+    commonest connection in the plant — a closure feeding an OLT — had no route
+    through this record at all.
+
+    It is a MACRO, not a new concept, and that is the whole design. It writes the
+    same three rows a patient operator would write by hand — a 1F cable between
+    the two points, a splice at this end, a termination at the far one — so
+    `trace`, `split`, cascade-delete and the tray all keep working on it with no
+    knowledge that a shortcut exists. Nothing here can be recorded that could not
+    be recorded without it.
+
+    The far point is REQUIRED and must differ from this one. A tail from a box to
+    itself is not a shorter tail, it is a cable this schema already refuses.
+    """
+    point = _fibre_point(data)
+    try:
+        a_cable_id = int(data.get("a_cable_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("a_cable_id is required")
+    try:
+        a_core_no = clean_core_no(data.get("a_core_no"), a_cores)
+    except FiberError as exc:
+        raise InventoryError(str(exc)) from exc
+    if a_core_no is None:
+        raise InventoryError("a tail names a specific fibre — give a core number")
+    to = _cable_end(data, "to")
+    if to is None:
+        raise InventoryError("name the box this fibre goes out to")
+    if (to["device_id"], to["mac"]) == (point["device_id"], point["mac"]):
+        raise InventoryError("a fibre cannot be taken out to the point it leaves")
+    # The tail's name is DERIVED, never typed. A pigtail is not an object anybody
+    # names on site — asking for one would put a text field in the way of the
+    # gesture this exists to make single — and both ends are already on screen.
+    name = str(data.get("name") or "").strip()
+    return {**point, "a_cable_id": a_cable_id, "a_core_no": a_core_no,
+            "to": to, "name": name or None}
+
+
+def clean_fibre_through_payload(data: dict) -> dict:
+    """Splice every free core of one cable straight through to another, 1:1.
+
+    Nine closures in ten are exactly this, and doing it as N separate joints is
+    the difference between a record that gets written and one that does not — the
+    same argument the bulk drops dialog is built on. It is a convenience over
+    `clean_fibre_joint_payload` and nothing more: every pair it produces goes
+    through the same refusals, and a core already joined here is SKIPPED rather
+    than overwritten, so pressing it twice is safe and pressing it after some
+    hand-work does not undo the hand-work.
+    """
+    point = _fibre_point(data)
+    try:
+        a_cable_id = int(data.get("a_cable_id"))
+        b_cable_id = int(data.get("b_cable_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("two cables are required")
+    if a_cable_id == b_cable_id:
+        raise InventoryError("a cable cannot be spliced straight through to itself")
+    return {**point, "a_cable_id": a_cable_id, "b_cable_id": b_cable_id}
+
+
+def clean_fibre_clear_payload(data: dict) -> dict:
+    """Undo one joint, named by the fibre rather than by the row.
+
+    Keyed on (cable, core) at the point rather than on the joint's id because that
+    is what the operator is looking at — a row in a tray, not a database id — and
+    because either side of a splice must be able to undo it. Naming the row would
+    make "clear this fibre" depend on which of the two the caller happened to hold.
+    """
+    point = _fibre_point(data)
+    try:
+        cable_id = int(data.get("cable_id"))
+        core_no = int(data.get("core_no"))
+    except (TypeError, ValueError):
+        raise InventoryError("cable_id and core_no are required")
+    return {**point, "cable_id": cable_id, "core_no": core_no}
+
+
+def clean_drop_route_payload(data: dict) -> dict:
+    """Drawn cable path for ONE SUBSCRIBER'S DROP: splitter → the customer.
+
+    The last hop, and until now the only span on this map that could never be
+    traced. It was drawn as a dotted straight line, which is honest — dotted means
+    "nobody surveyed this" — but a drop is not straight: it runs down a pole line
+    and along a street, and when it breaks that geometry is where the van goes.
+
+    Keyed on the MAC, like every other subscriber-side record here
+    (`onu_places`, `onu_drops`), because `onu_optics` never deletes a vacated slot
+    and a re-registered ONU moves — so a slot key rots and a MAC carries the drop
+    with the customer. Normalized through the SAME `_norm_mac` on the way in, or
+    one sticker grows two routes.
+
+    Waypoints run SPLITTER → ONU. That is the direction the line is drawn in
+    (`dropAnchor` returns the anchor first), and matching it means the renderer
+    never reverses a list — the same reason `link_routes` fixed parent→child and
+    then bent the peer KEY rather than the waypoint order to keep it true."""
+    mac = _norm_mac(_str(data, "mac", required=True))
+    if not mac:
+        raise InventoryError("mac is required")
+    return {"mac": mac, "waypoints": _waypoints(data.get("waypoints"))}
+
+
+def clean_link_style_payload(data: dict) -> dict:
+    """How one span DRAWS. Cartography, and since 2026-08-09 nothing else.
+
+    It used to carry the plant record too — which sheath this section is cut from
+    and which strand it runs on — because a span was the only thing in the schema
+    that could hold it. That was the constraint the whole "place a box and it draws
+    a line" problem came out of: glass could only be recorded between boxes
+    somebody had already wired together on a form. Fibre is its own graph now
+    (`org_cables` + `org_fibre_joints`), which needs no link at all, so what is
+    left here is genuinely a property of the drawn line: where the operator dragged
+    its chip.
+
+    SPARSE — a key absent from the body means "leave it alone", an explicit null
+    clears. Endpoint devices are validated by the caller (the pair must be a real
+    link in this org).
+    """
+    try:
+        child_id = int(data.get("child_id"))
+        parent_id = int(data.get("parent_id"))
+    except (TypeError, ValueError):
+        raise InventoryError("child_id and parent_id are required")
+    # SAID, NOT IGNORED. A body still carrying the old plant keys comes from a
+    # bundle older than this central — the SPA deploys the instant it is built
+    # while central needs a restart, so that pairing is routine — and quietly
+    # dropping them would leave an operator watching a cable they believe they
+    # just recorded fail to appear anywhere, with a 200 to say it worked.
+    for moved in ("cable_id", "core_no", "cores"):
+        if moved in data:
+            raise InventoryError(
+                "a span no longer carries a cable: lay one with"
+                " POST /api/inventory/cable")
     fields: dict = {}
-    if "color" in data:
-        raw = data.get("color")
-        if raw in (None, "", "null", "default"):
-            fields["color"] = None
-        elif raw in LINK_COLORS:
-            fields["color"] = raw
-        else:
-            raise InventoryError(f"colour must be one of: {', '.join(LINK_COLORS)}")
     if "label_pos" in data:
         raw = data.get("label_pos")
         if raw in (None, "", "null"):
@@ -748,12 +1157,13 @@ def clean_link_style_payload(data: dict) -> dict:
                 raise InventoryError("label_pos must be a number between 0 and 1")
             if not (0.0 <= pos <= 1.0):
                 raise InventoryError("label_pos must be between 0 and 1")
-            # 4dp ≈ 10cm on a 1km span — finer than a label can be dragged, and
+            # 4dp ~ 10cm on a 1km span — finer than a label can be dragged, and
             # it keeps the row byte-stable so an idle drag isn't a write.
             fields["label_pos"] = round(pos, 4)
     if not fields:
-        raise InventoryError("nothing to set: pass color and/or label_pos")
+        raise InventoryError("nothing to set: pass label_pos")
     return {"child_id": child_id, "parent_id": parent_id, "fields": fields}
+
 
 def clean_region_name(raw) -> str:
     name = str(raw).strip() if raw is not None else ""
@@ -1006,7 +1416,11 @@ GPON_PROFILE_OIDS = ("rx", "tx", "state", "distance", "serial", "name",
                      "ident_key", "ident_pon", "ident_onu", "ident_state",
                      "ident_distance", "ident_name")
 GPON_PROFILE_STATES = ("online", "offline", "dying_gasp", "los", "unknown")
-GPON_PON_INDEX_STRATEGIES = ("as_is", "first_segment")
+# `packed_ifindex` needs an edge newer than v0.15.14 (gpon.py `_packed_pon`); an
+# older probe REJECTS the whole profile and leaves that OLT's optics off, which
+# is the safe direction but is invisible from here — see tools/gpon_add_stgp08x.py
+# for the version gate.
+GPON_PON_INDEX_STRATEGIES = ("as_is", "first_segment", "packed_ifindex")
 
 def clean_gpon_profile_payload(data: dict) -> dict:
     name = _str(data, "name", required=True).lower()

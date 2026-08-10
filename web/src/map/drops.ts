@@ -58,8 +58,40 @@ export function dropTone(load: SplitterLoad | undefined, frozen = false): DropTo
   return "ok"
 }
 
-export const ratioLabel = (r: number | null | undefined): string | null =>
-  r ? `1:${r}` : null
+/** How a splitter is written down: `1:8`, or `2:16` for a protection-input box.
+ *
+ *  THE ONE PLACE THIS STRING IS BUILT. It was hand-written as `1:{ratio}` at
+ *  eight separate render sites, which is exactly the shape of bug `onuName`
+ *  was extracted to kill: the day inputs became a real column, every one of
+ *  those would have gone on printing `1:` over a 2:16 — a box drawn on the map,
+ *  in its panel, in the cascade rows and in the subscriber record as something
+ *  it is not. A rule spread across eight screens is a rule that will be updated
+ *  on seven.
+ *
+ *  `inputs` null reads as ONE, never as a gap: every splitter recorded before
+ *  that column existed was already rendered with a hard-coded `1:`, so treating
+ *  absence as unknown would mark the whole live plant record incomplete to
+ *  document something nobody had got wrong. */
+export function ratioLabel(
+  ratio: number | null | undefined, inputs?: number | null,
+): string | null {
+  return ratio ? `${inputs && inputs > 1 ? inputs : 1}:${ratio}` : null
+}
+
+/** The same string straight off a device row — what nearly every caller wants,
+ *  and the form that cannot be called with the two halves mismatched. */
+export const deviceRatioLabel = (
+  d: Pick<OrgDevice, "split_ratio" | "split_inputs">,
+): string | null => ratioLabel(d.split_ratio, d.split_inputs)
+
+/** Does this box carry a second, protection input?
+ *
+ *  Worth its own predicate because the interesting question is never the number
+ *  — it is whether the operator has told us there are TWO, which is the only
+ *  case where "how many of them are actually fed" is a sentence worth saying. */
+export const hasProtectionInput = (
+  d: Pick<OrgDevice, "split_inputs">,
+): boolean => (d.split_inputs ?? 1) > 1
 
 /** Is this box carrying more drops than it has legs?
  *
@@ -89,13 +121,13 @@ export const isOversubscribed = (d: OrgDevice, load?: SplitterLoad): boolean =>
  *  one of the two. FDB and closure have no ratio by nature and so always name
  *  themselves; every splitter on the live fleet has one. */
 export function passivePinLabel(d: OrgDevice): string {
-  return ratioLabel(d.split_ratio) ?? d.name
+  return deviceRatioLabel(d) ?? d.name
 }
 
 export function passiveTitle(d: OrgDevice, load?: SplitterLoad,
                              frozen = false): string {
   const bits: string[] = [d.name]
-  const ratio = ratioLabel(d.split_ratio)
+  const ratio = deviceRatioLabel(d)
   if (ratio) bits.push(`${ratio} splitter`)
   if (d.pon_port) bits.push(`PON ${d.pon_port}`)
   if (!load || load.recorded === 0) {

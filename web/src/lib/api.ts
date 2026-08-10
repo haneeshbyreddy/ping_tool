@@ -1,8 +1,8 @@
 import type {
-  AccountUser, AdminOverview, AssignmentRoster, BillingInfo, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  AccountUser, AdminOverview, AssignmentRoster, BillingInfo, Cable, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
-  BranchFault, SplitterLoad, Subscriber, SubscriberDrop,
+  BranchFault, FibreTrace, PointFibre, SplitterLoad, Subscriber, SubscriberDrop,
   Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
   FieldTokensResponse, FieldWorkersResponse, ShiftState,
@@ -46,6 +46,17 @@ async function request<T>(path: string, opts: { method?: string; body?: unknown 
 
 export function tq(org?: string | null): string {
   return org ? `?org=${encodeURIComponent(org)}` : ""
+}
+
+/** The org scope as a SUBSEQUENT query param, for a read that already has one.
+ *
+ *  Its own helper rather than `tq(org).replace("?", "&")`: the param `_scope_org`
+ *  reads is `org`, and getting that wrong is invisible to an OWNER (whose org
+ *  comes from the session) while 400-ing every SUPERADMIN — the exact failure
+ *  the cables read shipped with, found only because somebody logged in as the
+ *  other role. One spelling, in one place, for both shapes. */
+export function aq(org?: string | null): string {
+  return org ? `&org=${encodeURIComponent(org)}` : ""
 }
 
 export const authApi = {
@@ -156,8 +167,13 @@ export interface DevicePayload {
   assigned_node_id?: string | null
   gpon_vendor?: string | null
   pon_port?: string | null
-  /** passive plant only: 2 | 4 | 8 (see SPLIT_RATIOS), null = not recorded */
+  /** passive plant only: 2 | 4 | 8 | 16 (see SPLIT_RATIOS), null = not recorded */
   split_ratio?: number | null
+  /** passive plant only: fibres feeding it (2 = a protection-input splitter).
+      null reads as ONE, not "unknown" — see SPLIT_INPUTS. MUST ride every
+      update, like split_ratio: the server reads an absent key as "not
+      recorded", so omitting it downgrades a 2:16 on the next rename. */
+  split_inputs?: number | null
   /** OLT only: ONUs per PON before "at capacity" (EPON 64 / GPON 128),
       null = the server's global cap */
   onu_pon_limit?: number | null
@@ -190,7 +206,8 @@ export const inventoryApi = {
   createFieldPassive: (body: {
     name: string; device_type: string; lat: number; lng: number
     accuracy_m: number | null; source: "gps" | "manual"
-    split_ratio?: string | null; region?: string | null; pon_port?: string | null
+    split_ratio?: string | null; split_inputs?: number | null
+    region?: string | null; pon_port?: string | null
   }) => request<{ id: number }>("/api/inventory/field-passive", { method: "POST", body }),
   // Locating a subscriber's ONU from the field. Deliberately carries no
   // `witness` key: placing a REFERENCE ONU is the operator's claim about a power
@@ -257,13 +274,129 @@ export const inventoryApi = {
   setRoute: (child_id: number, parent_id: number, waypoints: Array<[number, number]>) =>
     request<{ ok: boolean }>("/api/inventory/route",
       { method: "POST", body: { child_id, parent_id, waypoints } }),
-  // A link's map styling. SPARSE on purpose — omit a key to leave it alone, so
-  // dragging a label can't clear a colour and vice versa.
+  // Trace one subscriber's drop cable, splitter → customer. An empty list
+  // straightens it back to the dotted chord. 404s when no drop is recorded:
+  // the drop row is the anchor, and a path from nowhere is not a route.
+  setDropRoute: (mac: string, waypoints: Array<[number, number]>, org?: string | null) =>
+    request<{ ok: boolean; points: number }>("/api/inventory/drop-route",
+      { method: "POST", body: { mac, waypoints, org_id: org ?? undefined } }),
+  // Where one span's chip sits. Cartography, and nothing else any more: fibre
+  // is its own graph (`saveCable`), which needs no topology link at all.
   setLinkStyle: (
-    child_id: number, parent_id: number,
-    style: { color?: string | null; label_pos?: number | null },
+    child_id: number, parent_id: number, style: { label_pos?: number | null },
   ) => request<{ ok: boolean }>("/api/inventory/link-style",
     { method: "POST", body: { child_id, parent_id, ...style } }),
+  // Every cable in the org: its two ends, its route, its length and what each
+  // core does at each end. ONE read builds the whole panel — the plan, the ends
+  // and the counts have to agree about one sheath, and three reads at three
+  // moments is how a card says "0 of 12 recorded" above a recorded core.
+  //
+  // `tq` — i.e. `?org=`, the param `_scope_org` actually reads. Spelled it
+  // `?org_id=` first, which works for an OWNER (their org comes from the
+  // session) and 400s for a SUPERADMIN, whose org can only come from the query
+  // string. It shipped because the browser check was run as an owner: verifying
+  // one role proves nothing about the other on any org-scoped read.
+  cables: (org: string | null) =>
+    request<{ cables: Cable[]; counts: number[] }>(`/api/inventory/cables${tq(org)}`),
+  // LAY A CABLE, or edit one. Both ends are required on create and optional on
+  // update — one end is not a weaker version of a cable, it is an unusable one,
+  // but a rename must not have to restate the geometry.
+  //
+  // An end is a device OR a customer, never both. It writes no device row and no
+  // link, so recording fibre can never re-parent anything or page anybody; what
+  // it does feed is the PLANT chain (split totals, PON inheritance, branch
+  // faults).
+  saveCable: (
+    cable: {
+      id?: number; name: string; cores: number | null; notes?: string | null
+      a_device_id?: number | null; a_mac?: string | null
+      b_device_id?: number | null; b_mac?: string | null
+    },
+    org: string | null,
+  ) => request<{ ok: boolean; id: number }>("/api/inventory/cable",
+    { method: "POST", body: { ...cable, org_id: org ?? undefined } }),
+  // What one fibre CARRIES. Free text — a real core register mixes destinations,
+  // customers and intentions ("BSNL", "village A tower", "reserved"), and no
+  // closed vocabulary survives that. Where it GOES is derived, never typed.
+  setCableCore: (cable_id: number, core_no: number, label: string | null) =>
+    request<{ ok: boolean }>("/api/inventory/cable/core",
+      { method: "POST", body: { cable_id, core_no, label } }),
+  // Trace where the cable physically runs. A COMPLETE path, ends included —
+  // unlike setRoute's, whose ends are two device pins. An empty list clears it.
+  // Geometry and nothing else: not the name, not the fibre count, not the ends.
+  setCablePath: (cable_id: number, path: Array<[number, number]>) =>
+    request<{ ok: boolean }>("/api/inventory/cable/path",
+      { method: "POST", body: { cable_id, path } }),
+  // OPEN A COUPLER on this cable: cut it here, stand a coupler at the cut and
+  // splice every core straight through. The gesture the segment model is built
+  // around — it is what the crew does, and it is what stops "a cable has ends"
+  // from meaning "redraw the street every time you tap it".
+  splitCable: (cable_id: number, lat: number, lng: number, name?: string | null) =>
+    request<{
+      ok: boolean; cable_id: number; new_cable_id: number
+      coupler_id: number; spliced: number
+    }>("/api/inventory/cable/split",
+      { method: "POST", body: { cable_id, lat, lng, name } }),
+  deleteCable: (id: number) =>
+    request<{ ok: boolean }>("/api/inventory/cable/delete",
+      { method: "POST", body: { id } }),
+  // THE TRAY: every cable end landing on one point, and the joints between them.
+  // Takes a device OR a customer, because a customer point is a coupler too.
+  pointFibre: (point: { device_id?: number | null; mac?: string | null },
+               org: string | null) =>
+    request<PointFibre>(`/api/inventory/fibre?${
+      point.device_id != null ? `device=${point.device_id}`
+        : `onu=${encodeURIComponent(point.mac ?? "")}`}${aq(org)}`),
+  // The whole optical path one fibre makes, across sheaths and joints. Its own
+  // read because a trace is a walk of the ORG's glass, not a property of the
+  // cable being looked at — shipping one per core would run a network-wide walk
+  // for every strand of every cable on every panel open.
+  traceFibre: (cable_id: number, core_no: number, org: string | null) =>
+    request<FibreTrace>(
+      `/api/inventory/fibre/trace?cable=${cable_id}&core=${core_no}${aq(org)}`),
+  // JOIN TWO FIBRES at a point — or, with no `b`, take one out to the equipment
+  // standing there. One route for both, because they are the same statement and
+  // consume a fibre end identically.
+  //
+  // It answers 200 with `ok:false` and a NAMED refusal rather than a bare 400:
+  // on a splice tray an unexplained rejection is indistinguishable from a broken
+  // button, and the name is what lets the UI print the sentence.
+  setFibreJoint: (joint: {
+    device_id?: number | null; mac?: string | null
+    a_cable_id: number; a_core_no: number
+    b_cable_id?: number | null; b_core_no?: number | null
+  }) => request<{ ok: boolean; id?: number; refused?: string; reason?: string }>(
+    "/api/inventory/fibre/joint", { method: "POST", body: joint }),
+  // Take ONE core out to a box standing somewhere ELSE: lays a single-fibre tail
+  // between the two points and lands it at both ends, in one write. The other
+  // half of "take a core out to a device" — a strand may only be joined where its
+  // own sheath is opened, so without this a closure could never feed the OLT
+  // beside it.
+  takeCoreToBox: (tail: {
+    device_id?: number | null; mac?: string | null
+    a_cable_id: number; a_core_no: number
+    to_device_id?: number | null; to_mac?: string | null
+  }) => request<{
+    ok: boolean; cable_id?: number; name?: string
+    refused?: string; reason?: string
+  }>("/api/inventory/fibre/tail", { method: "POST", body: tail }),
+  // Splice every FREE core of one cable straight through to another, 1:1. Nine
+  // closures in ten are exactly this, and doing it as N gestures is the
+  // difference between a record that gets written and one that does not.
+  // Already-joined cores are SKIPPED, so it is safe to press twice and safe to
+  // press after hand-work.
+  spliceThrough: (through: {
+    device_id?: number | null; mac?: string | null
+    a_cable_id: number; b_cable_id: number
+  }) => request<{ ok: boolean; spliced: number; skipped: number; reason?: string }>(
+    "/api/inventory/fibre/through", { method: "POST", body: through }),
+  // Undo whatever this fibre is joined to here. Named by the FIBRE, not the
+  // joint's id, so either side of a splice can undo it.
+  clearFibreJoint: (clear: {
+    device_id?: number | null; mac?: string | null
+    cable_id: number; core_no: number
+  }) => request<{ ok: boolean }>("/api/inventory/fibre/clear",
+    { method: "POST", body: clear }),
   addBackupLink: (child_id: number, parent_id: number) =>
     request<{ ok: true }>("/api/inventory/links", { method: "POST", body: { child_id, parent_id } }),
   removeBackupLink: (child_id: number, parent_id: number) =>

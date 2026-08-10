@@ -18,6 +18,7 @@
 // behind, this can say which of the three reasons it is.
 import { onuSev } from "@/lib/format"
 import type { OnuPlace } from "@/lib/types"
+import { fmtKm } from "@/map/geometry"
 import { HoverCard, cardRow, type CardTone, type HoverCardModel } from "@/map/hovercard"
 import { bwIsIdle, fmtShort } from "@/map/linklabel"
 import { esc } from "@/map/pins"
@@ -28,6 +29,13 @@ export interface RefHoverCtx {
    *  subscriber, or the OLT when no drop has been recorded. */
   anchorName: string | null
   viaSplitter: boolean
+  /** Length along the TRACED drop cable (km), when somebody has walked it. Null
+   *  on an untraced drop — and it stays null rather than falling back to the
+   *  straight chord, because a crew orders drum against whatever number appears
+   *  beside a cable. The resting map already refuses to measure an unsurveyed
+   *  span (`linkhover` labels only the chord case, and says so in words); this
+   *  card keeps the same rule by simply not printing one. */
+  dropKm: number | null
   /** Its OLT is DOWN. Every SNMP reading behind an unreachable box stopped being
    *  a claim about now up to 15 minutes before the staleness gate would notice,
    *  so the readings are dropped and the card says why — the frozen rule's
@@ -96,8 +104,18 @@ function refModel(p: OnuPlace, c: RefHoverCtx): HoverCardModel {
   // Keyed on the ANCHOR, not on `matched`: an orphaned placement whose drop was
   // recorded still draws a line to its splitter, and a card that left that row
   // out would be silent about the one span on screen.
-  if (c.viaSplitter && c.anchorName) rows.push(cardRow("Drop", esc(c.anchorName)))
-  else if (p.matched) rows.push(cardRow("Drop", "not recorded", "wisp-mapcard__v--soft"))
+  if (c.viaSplitter && c.anchorName) {
+    // A traced drop can finally be MEASURED, and that is the payoff of tracing
+    // it: the span the card names is now a walked path rather than a straight
+    // line between two pins. The metres go beside the splitter's name because
+    // the pair is the sentence a crew needs — which box, and how far from it.
+    rows.push(cardRow("Drop", esc(c.anchorName)
+      + (c.dropKm != null
+        ? ` <span class="wisp-mapcard__v--soft">· ${esc(fmtKm(c.dropKm))}</span>`
+        : "")))
+  } else if (p.matched) {
+    rows.push(cardRow("Drop", "not recorded", "wisp-mapcard__v--soft"))
+  }
   if (p.matched) {
     const where = [p.device_name, p.pon_port && `PON ${p.pon_port}`]
       .filter(Boolean).join(" · ")

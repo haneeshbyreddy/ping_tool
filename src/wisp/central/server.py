@@ -645,7 +645,7 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             data = path.read_bytes()
             if rel == "landing.html" and cfg.showcase_enabled:
                 data = self._inject_showcase(data)
-            if rel == "index.html":
+            if rel in ("index.html", "landing.html"):
                 data = self._inject_theme(data)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -675,6 +675,16 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             theme.py:render_css. Best-effort throughout: a store hiccup or a
             missing </head> must serve the app on the stock palette, never 500
             the dashboard over cosmetics.
+
+            THE LANDING PAGE GETS THE SAME BLOCK, and needs two things this one
+            doesn't. It is `<html class="dark">` (it has one palette and that
+            palette is dark, so it claims the dark half of the override map),
+            and because it is a bundle that rebuilds its whole DOM via
+            documentElement.replaceWith, its unpacker re-attaches this element
+            by id after the swap. Its own colours read `var(--lp-*)`, one
+            mapping layer pointing at the tokens below — an injected stylesheet
+            alone would change nothing there, since every colour on that page
+            lives in an inline style="" attribute that outranks it.
             """
             try:
                 css = theme.render_css(theme.load(store))

@@ -16,7 +16,7 @@ import { isFresh } from "@/lib/format"
 import type { LinkPort } from "@/lib/types"
 import { pointAlong } from "@/map/cut"
 import { polyKm } from "@/map/geometry"
-import { isLinkColor, linkColorVar } from "@/map/linkcolor"
+import { cableChipText, strandHex, strandLabel } from "@/lib/fiber"
 import { cachedDivIcon, esc } from "@/map/pins"
 
 /** the ports bound to one link, by the device each port belongs to */
@@ -107,13 +107,27 @@ export function linkRates(b: LinkBinding | undefined, fromId: number, toId: numb
  *  wins, and an idle one loses to everything: if exactly one of two overlapping
  *  chips can be read, it should be the one with something to say. */
 export function bwRank(
-  b: LinkBinding, fromId: number, toId: number,
+  b: LinkBinding | undefined, fromId: number, toId: number,
+  cores?: number | null,
 ): number {
-  const tone = linkTone(b)
+  const tone = b ? linkTone(b) : null
   if (tone === "down") return Number.MAX_SAFE_INTEGER
   if (tone === "warn") return Number.MAX_SAFE_INTEGER - 1
-  const { down, up } = linkRates(b, fromId, toId)
-  return Math.max(down ?? 0, up ?? 0)
+  const { down, up } = b ? linkRates(b, fromId, toId) : { down: null, up: null }
+  const rate = Math.max(down ?? 0, up ?? 0)
+  // A CABLE-ONLY CHIP RANKS BELOW EVERY LIVE RATE, and by fibre count within
+  // itself. Two reasons it can't just share the rate scale: a cable record is
+  // reference data that will not change this month, so when exactly one of two
+  // colliding chips can be drawn it should be the one reporting NOW; and the
+  // fleet's plant links (splitters) carry no bound port at all, so without a
+  // floor of their own they would all rank 0 and be suppressed in arrival order
+  // rather than by which cable matters. Fibre count is the right tiebreak among
+  // them — a 48F backbone is the span you look for first.
+  //
+  // Negative so the whole family sits under an idle bound port: "this link is
+  // doing nothing" is still a statement about the present.
+  if (rate === 0 && !b) return -1_000_000 + (cores ?? 0)
+  return rate
 }
 
 export function linkTone(b: LinkBinding): "down" | "warn" | null {
@@ -137,43 +151,85 @@ export const linkLabelPos = (
   pointAlong(pts, polyKm(pts) * 1000 * (frac == null ? 0.5 : frac))
 
 export function linkBwIcon(
-  b: LinkBinding, from: { id: number; name: string }, to: { id: number; name: string },
-  color?: string | null,
-): L.DivIcon {
-  const { down, up } = linkRates(b, from.id, to.id)
+  b: LinkBinding | undefined,
+  from: { id: number; name: string }, to: { id: number; name: string },
+  cable?: { cores: number | null; coreNo: number | null; name?: string | null },
+): L.DivIcon | null {
+  const cableText = cableChipText(cable?.cores, cable?.coreNo)
+  // Nothing to say, no chip. A badge that exists only to announce an absence
+  // spends the pixels a live reading would have used — the lesson `refHasChip`
+  // already paid for on the subscriber layer, and the reason a link with
+  // neither a bound port nor a recorded cable draws nothing at all.
+  if (!b && !cableText) return null
+
+  const { down, up } = b ? linkRates(b, from.id, to.id) : { down: null, up: null }
   const hasRates = down != null || up != null
-  const ends = [[from, b.get(from.id)] as const, [to, b.get(to.id)] as const]
-    .filter(([, p]) => p)
-    .map(([d, p]) => `${d.name} ${portLabel(p!)}`)
-    .join(" ↔ ")
-  const title = esc(hasRates
-    ? `${ends} · ↓ ${fmtFull(down)} toward ${to.name} · ↑ ${fmtFull(up)}`
-    : `${ends} · no recent rate reading`)
+  const ends = b
+    ? [[from, b.get(from.id)] as const, [to, b.get(to.id)] as const]
+      .filter(([, p]) => p)
+      .map(([d, p]) => `${d.name} ${portLabel(p!)}`)
+      .join(" ↔ ")
+    : `${from.name} ↔ ${to.name}`
+  // The cable half of the tooltip is where the strand gets NAMED. On the chip
+  // it is a dot and a number, which is all that fits; a splicer needs the
+  // colour in words, and past twelve fibres the tube as well — "core 25" alone
+  // sends somebody to the wrong bundle.
+  const cableTitle = cable?.cores || cable?.name
+    ? [cable.name, cable.cores ? `${cable.cores}F` : null,
+       cable.coreNo ? strandLabel(cable.coreNo, cable.cores)
+         : cable.cores ? "strand not recorded" : null]
+      .filter(Boolean).join(" · ")
+    : null
+  const rateTitle = !b ? null : hasRates
+    ? `↓ ${fmtFull(down)} toward ${to.name} · ↑ ${fmtFull(up)}`
+    : "no recent rate reading"
+  const title = esc([ends, cableTitle, rateTitle].filter(Boolean).join(" · "))
+
   // arrows in their own span so CSS can quiet them: the rate is the data, the
   // ↓↑ is only which way it flows. fmtShort output is number-derived, so the
   // port name is the one branch that needs escaping.
   const ar = (g: string) => `<span class="wisp-linkbw__ar">${g}</span>`
   const idle = hasRates && bwIsIdle(down, up)
-  const body = !hasRates
-    ? `<span class="wisp-linkbw__port">${esc(portLabel([...b.values()][0]))}</span>`
-    : idle
-      // One word, not two zeroes: "↓0 ↑0" is still four glyphs of arithmetic to
-      // dismiss, and the chip's job here is to be recognised and skipped.
-      ? `<span class="wisp-linkbw__idle">idle</span>`
-      : `${ar("↓")}${fmtShort(down ?? 0)}${ar("↑")}${fmtShort(up ?? 0)}`
-  const tone = linkTone(b)
+  const rateBody = !b ? ""
+    : !hasRates
+      ? `<span class="wisp-linkbw__port">${esc(portLabel([...b.values()][0]))}</span>`
+      : idle
+        // One word, not two zeroes: "↓0 ↑0" is still four glyphs of arithmetic
+        // to dismiss, and the chip's job here is to be recognised and skipped.
+        ? `<span class="wisp-linkbw__idle">idle</span>`
+        : `${ar("↓")}${fmtShort(down ?? 0)}${ar("↑")}${fmtShort(up ?? 0)}`
+
+  // THE STRAND IS A DOT, NEVER THE TEXT AND NEVER THE LINE. The TIA-598
+  // sequence contains red, orange, yellow and green — the hues this product
+  // reserves for alarms — so a cable rendered in its strand colour is a
+  // fabricated outage on the one screen that exists to show real ones. Neutral
+  // text beside a coloured mark is the identity-chip grammar the two-colour-axes
+  // pass settled, and it is exactly why an identity fact can carry a "red"
+  // without ever being read as one.
+  const strand = cable?.coreNo
+    ? `<span class="wisp-strand" style="--strand:${strandHex(cable.coreNo)}"></span>`
+    : ""
+  const cableBody = cableText
+    ? `${strand}<span class="wisp-linkbw__cable">${esc(cableText)}</span>`
+    : ""
+  // Cable first, rate second: what the span IS outranks what is flowing through
+  // it right now for the purpose of finding it, and the rate is the half that
+  // changes. Keeping the stable half leftmost means a chip doesn't reshuffle
+  // under the eye every time the walk lands.
+  const body = cableBody && rateBody
+    ? `${cableBody}<span class="wisp-linkbw__sep"></span>${rateBody}`
+    : cableBody || rateBody
+
+  const tone = b ? linkTone(b) : null
   const cls = ["wisp-linkbw"]
   if (idle && !tone) cls.push("wisp-linkbw--idle")
   if (tone) cls.push(`wisp-linkbw--${tone}`)
-  // The chip borrows its line's colour so a stack of labels over parallel
-  // cables is readable — but only when the line HAS a custom colour and nothing
-  // is wrong with it: a port alarm's tone owns the chip outright, same rule as
-  // the stroke. Rendered as an inline custom property (the tint reaches a border
-  // and a rail through one value) — safe because `color` is validated against
-  // the closed palette on both sides before it ever gets here.
-  const tint = !tone && isLinkColor(color)
-    ? ` style="--wisp-link-tint:${linkColorVar(color)}"` : ""
-  if (tint) cls.push("wisp-linkbw--tinted")
+  // The chip used to borrow the line's operator tint, which went with the tint
+  // itself (2026-08-08). Telling near-parallel cables apart is now the CABLE's
+  // job and it does it with words: the chip prints the count and the strand, and
+  // the tooltip names the sheath. A stack of labels over two trunks is readable
+  // because they say `24F·7` and `12F·3`, which is a fact about each rather than
+  // a colour somebody had to remember the meaning of.
   return cachedDivIcon(
-    `<div class="${cls.join(" ")}"${tint} title="${title}">${body}</div>`)
+    `<div class="${cls.join(" ")}" title="${title}">${body}</div>`)
 }

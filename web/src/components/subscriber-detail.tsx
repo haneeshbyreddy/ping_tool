@@ -30,12 +30,13 @@ import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import {
-  Crosshair, ExternalLink, MapPin, Pencil, Phone, Shield, ShieldOff, X,
+  Crosshair, ExternalLink, MapPin, Pencil, Phone, Shield, ShieldOff, Spline, X,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { ApiError, inventoryApi } from "@/lib/api"
 import type { Subscriber, SubscriberPlantHop } from "@/lib/types"
 import { ago, fmtDateTime, isDownState, isFresh, onuName, onuSev } from "@/lib/format"
+import { ratioLabel } from "@/map/drops"
 import { RowTag } from "@/components/device-detail"
 import { StatusDot } from "@/components/status-badge"
 import { Button } from "@/components/ui/button"
@@ -288,6 +289,10 @@ export interface SubscriberActions {
   onOpenOlt?: (deviceId: number, mac: string) => void
   /** Open the splitter its drop comes off. */
   onOpenPassive?: (deviceId: number) => void
+  /** Trace the drop cable from that splitter to this customer. Map-only, like
+   *  `onPlace` — off the map there is nothing to trace onto, so the panel
+   *  simply doesn't offer it rather than navigating somewhere unasked. */
+  onTraceDrop?: (mac: string) => void
   onClose?: () => void
 }
 
@@ -454,7 +459,7 @@ export function SubscriberDetail({ mac, actions }: {
                         {hop.name}
                       </button>
                       {hop.split_ratio != null && (
-                        <span className="text-faint-foreground">1:{hop.split_ratio}</span>
+                        <span className="text-faint-foreground">{ratioLabel(hop.split_ratio, hop.split_inputs)}</span>
                       )}
                     </span>
                   ))}
@@ -620,6 +625,21 @@ export function SubscriberDetail({ mac, actions }: {
               onClick={() => actions.onPlace!(sub.mac, rec?.label || name)}>
               <Crosshair className="size-3" />
               {rec?.lat != null ? "Move" : "Place"}
+            </Button>
+          )}
+          {/* Tracing the last hop. Gated on BOTH ends existing, because a
+              route needs two anchors to rubber-band between: the customer's own
+              pin, and the splitter its drop is recorded against. Without the
+              splitter the map draws to the OLT instead, and that line is an
+              admitted guess — tracing it would promote "we only know the PON"
+              into surveyed geometry a crew orders drum against. The server
+              refuses it too; this is the half that explains why. */}
+          {actions?.onTraceDrop && rec?.lat != null && sub.drop && (
+            <Button variant="ghost" size="sm" className="h-7 flex-1 text-2xs"
+              title="Click along the drop cable's real path. A traced drop stops being drawn as a dotted straight line."
+              onClick={() => actions.onTraceDrop!(sub.mac)}>
+              <Spline className="size-3" />
+              Trace drop
             </Button>
           )}
           {/* The claim, as its own verb. Offered whenever there is a record to

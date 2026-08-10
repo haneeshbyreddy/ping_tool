@@ -1289,6 +1289,7 @@
    FDB and closure take it too: they are the same PLANT rank, and what tells the
    three apart is the silhouette, never the colour. */
 .wisp-pin--t-splitter .wisp-pin__dot,
+.wisp-pin--t-coupler .wisp-pin__dot,
 .wisp-pin--t-fdb .wisp-pin__dot,
 .wisp-pin--t-closure .wisp-pin__dot { background: var(--map-plant-quiet); }
 .wisp-pin--drops-weak .wisp-pin__label { color: var(--warning); }
@@ -1405,6 +1406,33 @@
 }
 .wisp-linkbw__idle { letter-spacing: 0.02em; }
 .wisp-linkbw:hover { border-color: var(--ring); }
+/* THE CABLE'S OWN CHIP — its NAME, and the glass in it.
+   The complaint it answers: four violet lines meet at a closure and nothing on
+   any of them says which is the 24F trunk and which is the 4F branch, so
+   identifying a cable meant clicking a box and reading a list. It borrows the
+   rate chip's shell on purpose — same lines, same collision budget, one family
+   — and takes NO status tone, because a cable has no state and every red on
+   this map has to keep meaning the same thing.
+   THE NAME IS CLAMPED, NOT ALLOWED TO GROW. The budget reserves a fixed box per
+   chip, so a chip that sized to its text would overrun the space its neighbour
+   was promised — and plant here is named `manjulapur`/`IK REDDY`/`HALIYA TRUNK`.
+   The full string, the length and the recorded coverage are in the title. */
+.wisp-cablechip { gap: 5px; display: inline-flex; align-items: baseline; }
+.wisp-cablechip__n {
+  display: inline-block;
+  /* 14ch fits the names this plant actually uses (`HALIYA TRUNK`, `SPL-C feed`)
+     and is what the collision box below was measured against. Widening it
+     without re-measuring `CHIP_BOX_X` is how a budget starts reporting itself
+     clear over chips that visibly overlap. */
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+/* the count is the second fact, so it reads quieter than the name — the same
+   ranking `.wisp-linkbw__cable` keeps against a live rate */
+.wisp-cablechip__f { color: var(--muted-foreground); font-weight: 400; }
 .wisp-linkbw--warn {
   color: var(--warning);
   border-color: color-mix(in oklab, var(--warning) 70%, var(--border-strong));
@@ -1415,19 +1443,183 @@
 }
 .wisp-linkbw--warn .wisp-linkbw__ar,
 .wisp-linkbw--down .wisp-linkbw__ar { color: inherit; opacity: 0.6; }
-/* A chip on a coloured line borrows that colour, so a stack of labels over
-   near-parallel cables says which belongs to which without a click. It lands on
-   the BORDER and a left rail, never the rate itself: the number has to stay
-   --foreground-weight legible over satellite, and six palette hues can't all
-   clear that bar as text. Tone classes come later in this file's cascade and
-   win outright — a port alarm owns the whole chip. */
-.wisp-linkbw--tinted {
-  border-color: color-mix(in oklab, var(--wisp-link-tint) 75%, var(--border-strong));
-  border-left-width: 3px;
-  border-left-color: var(--wisp-link-tint);
-  padding-left: 4px;
+/* THE CABLE HALF OF A LINK CHIP — "12F", or "12F·7" with its strand.
+   Quieter than a rate and deliberately so: a fibre count is the most stable
+   fact on this map (it will not change this month) while the rate beside it is
+   the reading. Both are reference data, but only one of them is NEWS. */
+.wisp-linkbw__cable { color: var(--muted-foreground); font-weight: 400; }
+/* Hairline between the cable and the rate. A separator rather than a glyph:
+   "·" would read as part of the "12F·7" it sits next to, which is the one
+   ambiguity this chip cannot afford — those two numbers mean different things. */
+.wisp-linkbw__sep {
+  display: inline-block;
+  width: 1px;
+  height: 0.85em;
+  margin: 0 5px;
+  vertical-align: -0.1em;
+  background: var(--border-strong);
 }
-.wisp-linkbw--tinted .wisp-linkbw__ar { color: var(--wisp-link-tint); opacity: 0.85; }
+/* THE STRAND MARK — a fibre's standard TIA-598 colour, and the ONLY form that
+   colour is ever allowed to take.
+   The sequence contains red, orange, yellow and green: the exact hues this
+   product reserves for alarms, on the one screen that exists to show them. As a
+   line stroke or as text it would be a fabricated outage. As a small filled
+   MARK beside neutral text it is the identity-chip grammar the two-colour-axes
+   pass settled — structurally identical to a plane dot, impossible to read as a
+   status.
+   The ring is not decoration: WHITE (#f5f5f2) and BLACK (#1c1c1e) are both real
+   members of the standard, and one of them disappears into every surface this
+   can sit on. Fudging their hexes to "readable" greys would print the wrong
+   colour name to a splicer, so the mark keeps its true fill and gets an edge. */
+.wisp-strand {
+  display: inline-block;
+  width: 0.6em;
+  height: 0.6em;
+  margin-right: 4px;
+  border-radius: 2px;
+  vertical-align: -0.02em;
+  background: var(--strand);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--foreground) 45%, transparent);
+}
+/* In a panel there is room for the mark to be read as a swatch rather than
+   glanced at as a dot, so it grows and squares off — same object, more space. */
+.wisp-strand--lg { width: 0.85rem; height: 0.85rem; margin-right: 0; border-radius: 3px; }
+
+/* THE CORE PLAN's cells. A core is one of three things and they may never be
+   read as each other, so each state changes a DIFFERENT channel:
+
+   not recorded  a WELL — recessed, no fill. Deliberately not a pale swatch:
+                 "nobody wrote this down" and "this is spare" are different
+                 sentences, and drawing an empty core as a faded colour would
+                 make the second claim. Same instinct as the map printing no
+                 dBm rather than a dash.
+   recorded      FILLED with its TIA-598 strand colour. The only place that
+                 colour is allowed to be an area rather than a dot, because a
+                 core plan IS a picture of the sheath — and it is still inside a
+                 neutral panel, never on a line and never as text.
+   at fault      keeps its fill and takes a WARNING RING. The strand colour is
+                 identity and the ring is status; stacking them is what lets a
+                 red-jacketed core at fault stay distinguishable from a
+                 red-jacketed core that is fine. */
+.wisp-core {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 1.5rem;
+  border-radius: 3px;
+  background: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transition: transform 120ms var(--ease-out, ease), box-shadow 120ms ease;
+}
+.wisp-core:hover { transform: scaleY(1.12); }
+/* A FREE core that can be filled says so on hover, and only on hover. At rest it
+   stays the recessed well — "nobody wrote this down" is the honest resting state
+   and an affordance drawn permanently would edge it back toward reading as
+   "spare", which is the one claim this panel may not make. */
+.wisp-core--free:hover {
+  background: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.wisp-core--on {
+  background: var(--strand);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--foreground) 40%, transparent);
+}
+.wisp-core--fault {
+  box-shadow: inset 0 0 0 2px var(--warning);
+}
+/* Selection is the map's cue too — this cell and the traced run light together,
+   so the ring has to survive both other states rather than replace them. */
+.wisp-core--active {
+  box-shadow: inset 0 0 0 1px var(--background), 0 0 0 2px var(--foreground);
+}
+.wisp-core--active.wisp-core--fault {
+  box-shadow: inset 0 0 0 2px var(--warning), 0 0 0 2px var(--foreground);
+}
+
+/* A STRAND NOBODY HAS NAMED, at swatch size. The core plan's `not recorded`
+   cell, extracted because the splice tray needs the same sentence in a row of
+   text where `.wisp-core`'s `flex: 1 1 0` would eat the line. Same rule it was
+   extracted from: a WELL, never a pale swatch — "nobody wrote this down" and
+   "this is spare" may not render alike. */
+.wisp-strand-well {
+  display: inline-block;
+  flex: none;
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 3px;
+  background: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/* THE SPLICE CONNECTOR. Neutral, and that is the rule rather than the taste:
+   the TIA-598 sequence is red/orange/yellow/green — this product's alarm
+   vocabulary — and a strand colour is a MARK, never a line. It also would not
+   survive a 24F, where two dozen coloured arcs crossing a 56px gutter is a
+   pattern and not information. The colour lives on the swatch at each end,
+   which is where a splicer reads it.
+
+   Quiet at rest (it is reference: what is ALREADY joined), lifting only for the
+   join being worked on — the same ranking every line on the map keeps. */
+.wisp-splice-arc {
+  stroke: var(--border-strong);
+  transition: stroke 120ms ease;
+}
+.wisp-tray:hover .wisp-splice-arc { stroke: var(--muted-foreground); }
+.wisp-splice-arc--on { stroke: var(--foreground); }
+
+/* WHERE A CABLE IS OPENED — a short bar ACROSS the glass, never a dot on it.
+   The shape is the meaning: the sheath was cut here. A dot would be one more
+   round mark on a map whose round marks are all boxes that have a state, and
+   this has none.
+
+   It is deliberately OUTSIDE the mark scale (`--mark-*`): that ladder ranks
+   marks which stand for a THING — gear, plant, a subscriber — and a tap stands
+   for an EVENT on a line. It is sized against the line instead, at roughly
+   twice a feed's width, which is what makes it read as a cut rather than as
+   another object hung off the cable.
+
+   TWO STATES, and they may never be confused. RECORDED is a survey and takes
+   plant's own hue at full chroma; DERIVED is the map showing its working —
+   hollow, quiet, obviously provisional. Neither is a status tone: nothing here
+   can be broken. */
+.wisp-tap {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 9px;
+  /* ROTATED TO THE CABLE'S OWN BEARING (`taps.ts:tapAngle`). A fixed vertical
+     tick is only a cut on an east-west street; on the first diagonal cable it
+     met it lay almost ALONG the glass and read as a bulge. The angle is a
+     custom property so the icon stays one cached html string per 5° step. */
+  transform: translate(-50%, -50%) rotate(var(--tap-a, 0deg));
+  border-radius: 1px;
+  /* THE SURFACE COLOUR, NOT THE CABLE'S. Drawn first as a filled violet bar it
+     was violet-on-violet — a cut mark in the same hue as the glass it cuts,
+     legible only by its own casing, and in light mode barely at all. Filling it
+     with `--card` makes it read as what it is: a NOTCH through the line, and one
+     that inverts with the theme so it stays a notch on either. */
+  background: color-mix(in oklab, var(--card) 65%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--map-plant) 55%, transparent),
+              0 0 0 2px rgb(0 0 0 / 0.35);
+  transition: height 120ms ease, background 120ms ease;
+}
+/* SURVEYED: longer, opaque, and ringed in plant's own hue. The ranking between
+   the two is LENGTH and CRISPNESS rather than colour, because both are marks on
+   the same object and a hue step would have to come out of the one violet this
+   layer already spends on the cable. */
+.wisp-tap--rec {
+  height: 13px;
+  background: var(--card);
+  box-shadow: 0 0 0 1.5px var(--map-plant), 0 0 0 2.5px rgb(0 0 0 / 0.45);
+}
+/* The one being moved, or the one whose box is selected. It grows rather than
+   changing hue — the hue already carries recorded-vs-derived, and stacking a
+   second meaning on it is how a mark stops being readable. */
+.wisp-tap--on {
+  height: 19px;
+  box-shadow: 0 0 0 1.5px var(--map-plant), 0 0 0 2.5px rgb(0 0 0 / 0.45),
+              0 0 0 4px var(--foreground);
+}
 /* The reference-ONU variant of the same chip: one subscriber's own rate, off
    the per-ONU ifTable row. Smaller and lighter than a link chip because the
    line it rides is subordinate — but the SAME chip, since a rate is a rate and
@@ -1466,7 +1658,6 @@
   background: var(--foreground);
   border: 1.5px solid var(--background);
 }
-.wisp-linkhover--tinted .wisp-linkhover__dot { background: var(--wisp-link-tint); }
 .wisp-linkhover__box {
   position: absolute;
   left: 50%;
@@ -1484,9 +1675,6 @@
   font-size: var(--text-2xs);
   line-height: 1.4;
   white-space: nowrap;
-}
-.wisp-linkhover--tinted .wisp-linkhover__box {
-  border-color: color-mix(in oklab, var(--wisp-link-tint) 75%, var(--border-strong));
 }
 .wisp-linkhover__end { display: flex; align-items: baseline; gap: 4px; }
 /* the distance is the answer; the end it's measured to is the label */
@@ -1641,6 +1829,18 @@
 }
 .wisp-pin--t-closure .wisp-pin__dot {
   --mark-w: calc(var(--mark-plant) * var(--markshape-circle));
+}
+/* A COUPLER is the joint box every cable end lands in, so it is the commonest
+   plant mark on a surveyed fleet — and it has to be told apart from the
+   splitter at a glance, since the two sit metres apart and only one of them
+   divides light. Plant rank like the rest; the ROUNDED SQUARE is the shape left
+   unused by the ladder (splitter is a rotated square, FDB a square, closure a
+   circle), and it reads as "a box with things joined inside it" rather than as
+   a device. Sized through `--markshape-square` because at 22% radius the ~1%
+   ink error is a fraction of a pixel — the same call `fdb` already makes. */
+.wisp-pin--t-coupler .wisp-pin__dot {
+  --mark-w: calc(var(--mark-plant) * var(--markshape-square));
+  border-radius: 34%;
 }
 
 /* Reference ONUs (map/refonu.ts): operator-placed subscribers vouched for as

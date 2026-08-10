@@ -49,7 +49,8 @@ export interface HoverLink {
   from: { name: string }
   to: { name: string }
   drawn: boolean
-  color?: string | null
+  /** The geometry is the CABLE's route, not this section's own trace. */
+  fromCable: boolean
 }
 
 export interface LinkHover {
@@ -60,7 +61,7 @@ export interface LinkHover {
   fromKm: number
   toKm: number
   drawn: boolean
-  color?: string | null
+  fromCable: boolean
 }
 
 /** Pre-project every line once per zoom; a mousemove then only walks numbers. */
@@ -123,7 +124,7 @@ export function LinkHoverProbe({ projected, enabled, onHover, zoom, keepOut }: {
           // span the device panel quotes, or the readout looks broken
           toKm: Math.max(polyKm(link.pts) - from, 0),
           drawn: link.drawn,
-          color: link.color,
+          fromCable: link.fromCable,
         }
       }
       emit(best)
@@ -143,9 +144,11 @@ export function LinkHoverProbe({ projected, enabled, onHover, zoom, keepOut }: {
     pin icons with it — which restarts every down-pulse on the map. There is only
     ever one of these alive, so a fresh icon per frame is the cheap side. */
 export function hoverIcon(h: LinkHover): L.DivIcon {
-  const tint = h.color ? ` style="--wisp-link-tint:var(--map-line-${esc(h.color)})"` : ""
+  // The operator tint this readout used to borrow went with the tint itself
+  // (2026-08-08). A measurement is not a place for identity anyway — which
+  // cable a span belongs to is a fact the cable panel names in words.
   const html =
-    `<div class="wisp-linkhover${h.color ? " wisp-linkhover--tinted" : ""}"${tint}>`
+    `<div class="wisp-linkhover">`
     + `<span class="wisp-linkhover__dot"></span>`
     + `<div class="wisp-linkhover__box">`
     + `<span class="wisp-linkhover__end">`
@@ -160,7 +163,17 @@ export function hoverIcon(h: LinkHover): L.DivIcon {
     // the line on screen visibly follows the traced path the number is measured
     // along, so the words only restated the picture. The chord looks identical
     // to a cable and must keep saying that it isn't one.
-    + (h.drawn ? "" : `<span class="wisp-linkhover__note">straight-line</span>`)
+    //
+    // THREE STATES, never two. A span that borrows its CABLE's route is
+    // measured along surveyed geometry — so it is not a chord and must not
+    // apologise like one — but nobody walked THIS section: what was walked is
+    // the street it is cut from, and the number is the stretch between the two
+    // points these boxes tap it at. Saying so is the difference between "we
+    // measured this run" and "we measured the cable this run is in", which is
+    // exactly the distinction a crew ordering drum needs.
+    + (h.drawn
+      ? (h.fromCable ? `<span class="wisp-linkhover__note">along the cable</span>` : "")
+      : `<span class="wisp-linkhover__note">straight-line</span>`)
     + `</div></div>`
   return L.divIcon({ className: "wisp-pin-anchor", iconSize: [0, 0], html })
 }

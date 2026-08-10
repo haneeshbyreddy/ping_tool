@@ -1,9 +1,17 @@
-"""Per-link map cartography: line colour and where the bandwidth chip rides it.
+"""Where one span's chip rides, and which links may carry cartography at all.
 
-Both live on link_routes — same key, same "one link" grain as the drawn cable
-path — so the interesting behaviour is that geometry and styling share a row
-without clobbering each other, and that a colour is a name from a CLOSED palette
-rather than free text (the map's loudest colours must stay the status tones).
+This file has been narrowed twice by the same movement. The per-link COLOUR it
+was originally written for went on 2026-08-08 — its real job was saying "these
+spans are one physical cable", which six palette names in one org-wide namespace
+could never do (`magenta` named one cable at HALIYA and a different one at SAGAR
+on the live fleet), and `org_cables` says it properly.
+
+Then MEMBERSHIP itself went on 2026-08-09. `cable_id`/`core_no` sat here because
+a link was the only thing in the schema that could hold them — which is exactly
+why placing a box had to ask what fed it before any glass could be recorded. A
+RUN names its own two ends and needs no link, so those rules moved wholesale to
+`test_central_cableplant`, and what is left here really is a property of the
+drawn line: where somebody dragged its label.
 
 Also pins the cross-link fix: a peer's presentation is keyed (child=higher,
 parent=lower) so waypoints still run parent→child, and the write path used to
@@ -84,50 +92,22 @@ class LinkStyleApiTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         return {(r["child_id"], r["parent_id"]): r for r in body["routes"]}
 
-    # --- colour --------------------------------------------------------------
-
-    def test_colour_survives_on_a_link_with_no_drawn_route(self):
-        # The whole point of colouring is telling apart near-parallel chords, and
-        # a chord is exactly the link nobody has drawn a route for — styling must
-        # not require geometry to exist first.
-        cookie = self._login()
-        status, body, _ = self._req("POST", "/api/inventory/link-style",
-                                    {"child_id": self.edge, "parent_id": self.core,
-                                     "color": "violet"}, cookie=cookie)
+    def _cable(self, cookie, name="trunk", cores=12):
+        status, body, _ = self._req(
+            "POST", "/api/inventory/cable",
+            {"org_id": "ispA", "name": name, "cores": cores}, cookie=cookie)
         self.assertEqual(status, 200, body)
-        row = self._routes(cookie)[(self.edge, self.core)]
-        self.assertEqual(row["color"], "violet")
-        self.assertEqual(row["waypoints"], [])
-        self.assertIsNone(row["label_pos"])
+        return body["id"]
 
-    def test_colour_is_a_closed_palette(self):
-        cookie = self._login()
-        for bad in ("#ff0000", "red", "destructive", "rgb(255,0,0)"):
-            status, body, _ = self._req("POST", "/api/inventory/link-style",
-                                        {"child_id": self.edge, "parent_id": self.core,
-                                         "color": bad}, cookie=cookie)
-            self.assertEqual(status, 422, f"{bad} was accepted: {body}")
-        self.assertEqual(self._routes(cookie), {})
+    # --- cartography, and the row it shares with geometry --------------------
 
-    def test_clearing_the_colour_drops_a_row_that_holds_nothing_else(self):
+    def test_a_chip_position_survives_the_route_being_straightened(self):
+        # The prune rule: "empty" means every column on the row, not just the
+        # geometry. Straightening a drawn path must not throw away a label
+        # somebody positioned by hand.
         cookie = self._login()
         self._req("POST", "/api/inventory/link-style",
-                  {"child_id": self.edge, "parent_id": self.core, "color": "teal"},
-                  cookie=cookie)
-        status, body, _ = self._req("POST", "/api/inventory/link-style",
-                                    {"child_id": self.edge, "parent_id": self.core,
-                                     "color": None}, cookie=cookie)
-        self.assertEqual(status, 200, body)
-        self.assertEqual(self._routes(cookie), {})
-
-    # --- geometry and styling share one row ----------------------------------
-
-    def test_clearing_a_route_keeps_the_colour(self):
-        # The row is geometry AND styling now; "empty" has to mean all of it.
-        # Erasing a drawn path must not silently repaint the line.
-        cookie = self._login()
-        self._req("POST", "/api/inventory/link-style",
-                  {"child_id": self.edge, "parent_id": self.core, "color": "lime"},
+                  {"child_id": self.edge, "parent_id": self.core, "label_pos": 0.25},
                   cookie=cookie)
         self._req("POST", "/api/inventory/route",
                   {"child_id": self.edge, "parent_id": self.core,
@@ -137,29 +117,19 @@ class LinkStyleApiTest(unittest.TestCase):
                                      "waypoints": []}, cookie=cookie)
         self.assertEqual(status, 200, body)
         row = self._routes(cookie)[(self.edge, self.core)]
-        self.assertEqual(row["color"], "lime")
+        self.assertAlmostEqual(row["label_pos"], 0.25)
         self.assertEqual(row["waypoints"], [])
 
-    def test_a_style_write_is_sparse(self):
-        # Moving a label and picking a colour are different panels; neither may
-        # clear the other by omitting it.
+    def test_a_write_naming_a_CABLE_is_refused_here(self):
+        # The one thing this endpoint must NOT quietly accept. Membership moved
+        # to `/api/inventory/cable/run`, and a body still sending `cable_id`
+        # comes from a stale bundle — silently ignoring it would leave an
+        # operator watching a cable they think they just recorded fail to appear.
         cookie = self._login()
-        self._req("POST", "/api/inventory/link-style",
-                  {"child_id": self.edge, "parent_id": self.core, "color": "indigo"},
-                  cookie=cookie)
-        self._req("POST", "/api/inventory/link-style",
-                  {"child_id": self.edge, "parent_id": self.core, "label_pos": 0.25},
-                  cookie=cookie)
-        row = self._routes(cookie)[(self.edge, self.core)]
-        self.assertEqual(row["color"], "indigo")
-        self.assertAlmostEqual(row["label_pos"], 0.25)
-
-        self._req("POST", "/api/inventory/link-style",
-                  {"child_id": self.edge, "parent_id": self.core, "color": "chalk"},
-                  cookie=cookie)
-        row = self._routes(cookie)[(self.edge, self.core)]
-        self.assertEqual(row["color"], "chalk")
-        self.assertAlmostEqual(row["label_pos"], 0.25)
+        status, body, _ = self._req("POST", "/api/inventory/link-style",
+                                    {"child_id": self.edge, "parent_id": self.core,
+                                     "cable_id": 1, "core_no": 3}, cookie=cookie)
+        self.assertEqual(status, 422, body)
 
     def test_label_pos_stays_on_the_line(self):
         cookie = self._login()
@@ -183,36 +153,36 @@ class LinkStyleApiTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": hi, "parent_id": lo,
-                                     "color": "magenta"}, cookie=cookie)
+                                     "label_pos": 0.4}, cookie=cookie)
         self.assertEqual(status, 200, body)
         status, body, _ = self._req("POST", "/api/inventory/route",
                                     {"child_id": hi, "parent_id": lo,
                                      "waypoints": [[17.5, 78.5]]}, cookie=cookie)
         self.assertEqual(status, 200, body)
         row = self._routes(cookie)[(hi, lo)]
-        self.assertEqual(row["color"], "magenta")
+        self.assertAlmostEqual(row["label_pos"], 0.4)
         self.assertEqual(row["waypoints"], [[17.5, 78.5]])
 
     def test_unlinked_devices_cannot_be_styled(self):
         cookie = self._login()
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": self.far, "parent_id": self.edge,
-                                     "color": "teal"}, cookie=cookie)
+                                     "label_pos": 0.5}, cookie=cookie)
         self.assertEqual(status, 422, body)
 
     def test_styling_is_an_owner_write(self):
-        # Cartography is inventory, and a worker triages rather than reconfigures.
+        # Plant is inventory, and a worker triages rather than reconfigures.
         cookie = self._login("hand", "handpassword")
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": self.edge, "parent_id": self.core,
-                                     "color": "teal"}, cookie=cookie)
+                                     "label_pos": 0.5}, cookie=cookie)
         self.assertEqual(status, 403, body)
 
     def test_another_orgs_owner_is_refused(self):
         cookie = self._login("bowner", "bownerpassword")
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": self.edge, "parent_id": self.core,
-                                     "color": "teal"}, cookie=cookie)
+                                     "label_pos": 0.5}, cookie=cookie)
         self.assertIn(status, (403, 404), body)
         self.assertEqual(self._routes(self._login()), {})
 

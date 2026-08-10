@@ -10,6 +10,15 @@ from wisp.central.store_util import _now_iso
 
 class OrgStoreMixin:
 
+    #: Org-scoped tables that are REFERENCED by another org-scoped table and so
+    #: cannot wait for their turn in `delete_org`'s alphabetical sweep. Both
+    #: entries point at `org_cables`, which sorts between them — `org_cable_cores`
+    #: happens to be safe today and is listed anyway, because relying on where a
+    #: table's NAME falls in the alphabet is not a rule anyone can maintain. The
+    #: list is the mechanism; the alternative is discovering the next one as a
+    #: bare IntegrityError on somebody's real delete.
+    _DELETE_FIRST = ("org_fibre_joints", "org_cable_cores")
+
     def set_org(self, org_id: str, name: str | None = None,
                 ntfy_topic: str | None = None, ntfy_topic_owner: str | None = None,
                 ntfy_topic_worker: str | None = None,
@@ -294,13 +303,20 @@ class OrgStoreMixin:
         (superadmins in `users`, the built-in `snmp_profiles`/`gpon_profiles`)
         and an equality match already spares them.
 
-        ORDER MATTERS: `_connect` runs with `PRAGMA foreign_keys=ON` and every FK
-        in the schema points at ``org_devices(id)``, so the device table goes
-        LAST — sweeping it alphabetically (before `switch_ports`, `snmp_walks`,
-        …) leaves those rows dangling at statement end and SQLite aborts the
-        whole delete. Constraints stay IMMEDIATE rather than deferred on
-        purpose: a violation surviving this ordering means a row references
+        ORDER MATTERS: `_connect` runs with `PRAGMA foreign_keys=ON` and nearly
+        every FK in the schema points at ``org_devices(id)``, so the device table
+        goes LAST — sweeping it alphabetically (before `switch_ports`,
+        `snmp_walks`, …) leaves those rows dangling at statement end and SQLite
+        aborts the whole delete. Constraints stay IMMEDIATE rather than deferred
+        on purpose: a violation surviving this ordering means a row references
         another org's device, which should fail loudly, not be swept away.
+
+        ``org_cables(id)`` is the referenced table this rule exists for, and the
+        alphabet does NOT satisfy it: `org_fibre_joints` sorts AFTER it, so a
+        plain alphabetical sweep would take the cables out from under live joint
+        rows and abort the whole delete. Hence `_DELETE_FIRST` — the explicit
+        head this docstring predicted would eventually be needed. A new
+        table that is REFERENCED by another org-scoped one belongs in it.
         """
         deleted: dict[str, int] = {}
         with self._write_lock, self._connect() as conn:
@@ -314,6 +330,8 @@ class OrgStoreMixin:
                 cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
                 if "org_id" in cols:
                     scoped.append(table)
+            head = [t for t in self._DELETE_FIRST if t in scoped]
+            scoped = head + [t for t in scoped if t not in head]
             for table in (*scoped, "org_devices", "orgs"):
                 cur = conn.execute(f"DELETE FROM {table} WHERE org_id=?", (org_id,))
                 if cur.rowcount:

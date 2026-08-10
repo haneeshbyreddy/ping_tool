@@ -87,9 +87,17 @@ class ColorTest(unittest.TestCase):
         for name in inventory.PALETTE:
             self.assertNotIn(name, ("red", "amber", "orange", "green", "yellow"))
 
-    def test_link_and_label_colours_are_one_vocabulary(self):
-        # a second palette would drift out of step the first time either grew
-        self.assertEqual(inventory.PALETTE, inventory.LINK_COLORS)
+    def test_the_palette_is_not_reachable_as_a_link_colour(self):
+        # The map's per-link tint was REMOVED (2026-08-08) once `org_cables` gave
+        # "these spans are one physical cable" a real place to live — six names in
+        # one org-wide namespace could never say it (`magenta` named two different
+        # cables at two different sites). The palette itself survives for tags and
+        # probes. Re-exporting it under the old name is how it creeps back into
+        # the link write path, so the alias must stay gone.
+        self.assertFalse(hasattr(inventory, "LINK_COLORS"))
+        with self.assertRaises(inventory.InventoryError):
+            inventory.clean_link_style_payload(
+                {"child_id": 1, "parent_id": 2, "color": "teal"})
 
     # --- round trip ----------------------------------------------------------
 

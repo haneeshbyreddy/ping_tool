@@ -257,6 +257,16 @@ def opm_reply(key, rows_html=""):
     return reply(200, body)
 
 
+_KEYLESS_PAGE = OPM_PAGE[:OPM_PAGE.index("<script>")] + "</body></html>"
+
+
+def keyless_opm_reply():
+    """chandana-network MAIN_OLT (2026-08-07): the SAME optical page, every
+    heading and every row on it, and no SessionKey ANYWHERE — the build simply
+    never mints one, where its sibling on the next IP does."""
+    return reply(200, _KEYLESS_PAGE.encode("gb2312"))
+
+
 def login_page():
     """The GET of /action/login.html that now precedes every login POST."""
     return reply(200, b"<html><body><form>login</form></body></html>")
@@ -298,6 +308,68 @@ class ScrapeOpmTest(unittest.TestCase):
         pons = [dict(p.split("=", 1) for p in s["body"].decode().split("&"))["select"]
                 for s in opm]
         self.assertEqual(pons, ["1", "2", "3", "4"])
+
+    def test_a_build_that_mints_no_token_is_read_keyless(self):
+        # MAIN_OLT serves the optical page with all nine headings and no token.
+        # Calling that "login rejected" cost a whole fleet's Rx column and read
+        # as "check the password", which was never wrong.
+        hub = FakeHub([login_page(), frameset_reply()]
+                      + [keyless_opm_reply() for _ in range(5)])
+        rows, err = scrape_opm(client(hub), "admin", "pw", pons=(1, 2, 3, 4))
+        self.assertIsNone(err)
+        self.assertEqual(len(rows), 16)                 # 4 ONUs x 4 PONs
+        # The POSTs must go out shaped as this build's own page would send them:
+        # the field is OMITTED, never sent empty or with a made-up value.
+        for s in hub.seen[3:]:
+            body = dict(p.split("=", 1) for p in s["body"].decode().split("&"))
+            self.assertNotIn("SessionKey", body)
+            self.assertEqual(body["port_refresh"], "Refresh")
+
+    def test_a_page_that_is_NOT_the_table_is_still_refused_keyless(self):
+        # The bar is EVERY mapped heading, so the page has to prove it is the
+        # table before an admin session goes on to POST at it. A session-limit
+        # notice clears none of them, and must not be scraped "just in case".
+        hub = FakeHub([login_page(), frameset_reply(),
+                       reply(200, b"<html><title>OLT Web Management Interface"
+                                  b"</title><body>session limit</body></html>")])
+        rows, err = scrape_opm(client(hub), "admin", "pw", pons=(1, 2))
+        self.assertEqual(rows, [])
+        self.assertIn("login rejected", err)
+        self.assertEqual(len(hub.seen), 3)              # no per-PON POST went out
+
+    def test_a_partial_heading_match_refuses_and_says_the_count(self):
+        # A renamed column is a profile fault to report, not a reason to scrape a
+        # page we may be misreading.
+        thin = _KEYLESS_PAGE.replace("RX Power", "Rx Optical Power")
+        hub = FakeHub([login_page(), frameset_reply(),
+                       reply(200, thin.encode("gb2312"))])
+        rows, err = scrape_opm(client(hub), "admin", "pw", pons=(1,))
+        self.assertEqual(rows, [])
+        self.assertIn("8 of 9", err)
+        self.assertEqual(len(hub.seen), 3)
+
+    def test_a_keyless_session_lost_midway_keeps_what_it_read(self):
+        # A keyless build has no token to go missing, so the rotating-key check
+        # cannot run — but a human logging in still displaces us, and the page
+        # stops being the table when it happens.
+        # The entry GET consumes one keyless page; PON1 then gets the second and
+        # PON2 gets bounced to the login form.
+        hub = FakeHub([login_page(), frameset_reply(), keyless_opm_reply(),
+                       keyless_opm_reply(),
+                       reply(200, b"<html><body>Please log in</body></html>")])
+        rows, err = scrape_opm(client(hub), "admin", "pw", pons=(1, 2, 3))
+        self.assertEqual(len(rows), 4)                  # PON1's readings survive
+        self.assertIn("session lost", err)
+
+    def test_a_token_rotating_build_is_untouched_by_the_keyless_path(self):
+        # MAIN_OLT2 sits on the next IP, rotates its key and works today. The
+        # keyless path must be reachable ONLY when no key is on the page.
+        hub = FakeHub([login_page(), frameset_reply(), opm_reply("k1"),
+                       opm_reply("k2")])
+        rows, err = scrape_opm(client(hub), "admin", "pw", pons=(1,))
+        self.assertIsNone(err)
+        body = dict(p.split("=", 1) for p in hub.seen[3]["body"].decode().split("&"))
+        self.assertEqual(body["SessionKey"], "k1")
 
     def test_bad_credentials_are_an_error_not_an_empty_optics_reading(self):
         # The device re-serves the login page with HTTP 200. Read naively that
@@ -588,6 +660,43 @@ class DiagnoseLoginTest(unittest.TestCase):
     def test_a_re_served_login_page_reads_as_a_refused_password(self):
         why = diagnose_login(
             '<form action="/action/login.html"><input name="password"></form>')
+        self.assertIn("password was refused", why)
+
+    def test_the_optical_page_without_a_token_is_NOT_called_unrecognised(self):
+        # chandana-network MAIN_OLT, 2026-08-07: a ~14 KB page titled "OLT Web
+        # Management Interface", no SessionKey, and it is NOT the login page.
+        # "unrecognised reply · 14017 chars" is true and useless — it cannot
+        # tell a build that hands out no token (fix: a profile row) from a held
+        # session (fix: log somebody out), which are opposite actions.
+        why = diagnose_login(_KEYLESS_PAGE)
+        self.assertIn("IS the optical page", why)
+        self.assertIn("mints no token", why)        # names the actual cause
+        self.assertNotIn("unrecognised", why)
+
+    def test_a_partly_matching_page_is_called_a_profile_fault_not_a_build_quirk(self):
+        # "all headings, no token" is a working build to read keyless; "most
+        # headings" is a renamed column. One sentence covering both said neither.
+        why = diagnose_login(_KEYLESS_PAGE.replace("RX Power", "Rx Optical Power"))
+        self.assertIn("8 of 9", why)
+        self.assertIn("profile", why)
+        self.assertNotIn("IS the optical page", why)
+
+    def test_a_page_that_is_not_the_optical_page_says_that_too(self):
+        # The other side of the same coin: saying which it is only helps if the
+        # negative is stated as a finding rather than left as silence.
+        why = diagnose_login("<html><title>OLT Web Management Interface</title>"
+                             "<body>session limit reached</body></html>")
+        self.assertIn("NOT the optical page", why)
+
+    def test_an_i18n_login_page_still_reads_as_a_refused_password(self):
+        # This firmware builds its login form from /i18N/login_en_US.properties,
+        # so the WORD "password" need never appear on a page that is plainly the
+        # login form. The input's type attribute is markup, not copy, and no
+        # translation bundle can hide it.
+        why = diagnose_login(
+            "<html><title>OLT Web Management Interface</title><body>"
+            "<input type='password' id='pwd'><div id='btn'></div>"
+            "</body></html>")
         self.assertIn("password was refused", why)
 
     def test_something_that_is_not_the_olt_says_so(self):

@@ -14,7 +14,7 @@ from wisp.config import Config
 from wisp.ingress.gpon import (
     DBC, HUAWEI, GponPollerPool, GponProfile, OnuOptic, PROFILES,
     gpon_profile_from_dict, match_gpon_profile, parse_onu_table, PysnmpGponPoller,
-    STATE_ONLINE, STATE_OFFLINE,
+    STATE_ONLINE, STATE_OFFLINE, STATE_UNKNOWN,
 )
 from wisp.ingress.snmp import SnmpTarget
 from apps.daemon.main import _gather_onu_optics
@@ -537,6 +537,64 @@ class CentralProfileTest(unittest.TestCase):
         self.assertEqual(p.decode_state("weird"), STATE_OFFLINE)  # state_default
         self.assertEqual(p.format_pon("3.7"), "3")                # first_segment
         self.assertEqual(p.format_pon_label("2"), "EPON0/2")
+
+    def test_packed_ifindex_reads_pon_and_onu_off_ONE_integer(self):
+        # The STGP08X (PEN 50224) indexes its ONU roster by a byte-packed
+        # ifIndex, not by pon.onu: chassis<<24 | slot<<16 | pon<<8 | onu. Values
+        # and the pon/onu they must yield are taken from walk 284 of
+        # chandana-network's MAIN_OLT4, where the OLT's own text column
+        # ("ONT01/000") agreed with this decode on all 310 rows.
+        p = gpon_profile_from_dict(_central_spec(
+            pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
+        for idx, pon, onu in (("16777472", "1", 0),      # ONT01/000
+                              ("16777473", "1", 1),      # ONT01/001
+                              ("16777728", "2", 0),      # ONT02/000
+                              ("16779357", "8", 93)):    # ONT08/093
+            self.assertEqual(p.format_pon(idx), pon, idx)
+            self.assertEqual(p.derive_onu_id(idx), onu, idx)
+
+    def test_packed_ifindex_never_reports_a_confident_pon_zero(self):
+        # A profile pointed at an index that is NOT packed must read as "cannot
+        # tell", never group every ONU on the box onto one fabricated port.
+        p = gpon_profile_from_dict(_central_spec(
+            pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
+        self.assertEqual(p.format_pon("not-a-number"), "not-a-number")
+        self.assertIsNone(p.derive_onu_id("not-a-number"))
+
+    def test_the_two_halves_of_a_packed_index_travel_together(self):
+        # Deriving the PON from a packed index while reading the onu id off the
+        # same index UNPACKED would report ONU 16777472 on PON 1. Any strategy
+        # without its own onu reading must keep the default.
+        packed = gpon_profile_from_dict(_central_spec(
+            pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
+        self.assertIsNotNone(packed.derive_onu_id)
+        plain = gpon_profile_from_dict(_central_spec(pon_index="first_segment"))
+        self.assertIsNone(plain.derive_onu_id)   # falls back to _derive_onu_id
+
+    def test_packed_ifindex_survives_the_whole_parse(self):
+        # End to end through parse_onu_table: the roster column is the OLT's
+        # own, and one of these rows is a never-registered authorisation entry
+        # (state '0'), which must NOT come back offline.
+        p = gpon_profile_from_dict(_central_spec(
+            pon_index="packed_ifindex", pon_label="",
+            oids={"state": "1.3.6.1.4.1.50224.3.12.2.1.4",
+                  "serial": "1.3.6.1.4.1.50224.3.12.2.1.15"},
+            state_map={"1": "online", "2": "offline", "0": "unknown"},
+            state_default="unknown"))
+        vb = [("1.3.6.1.4.1.50224.3.12.2.1.4.16777473", "1"),
+              ("1.3.6.1.4.1.50224.3.12.2.1.15.16777473", "TJNW95e075b8"),
+              ("1.3.6.1.4.1.50224.3.12.2.1.4.16779357", "2"),
+              ("1.3.6.1.4.1.50224.3.12.2.1.4.16777728", "0")]
+        by_key = {o.onu_key: o for o in parse_onu_table(vb, p)}
+        self.assertEqual(by_key["16777473"].pon_port, "1")
+        self.assertEqual(by_key["16777473"].onu_id, 1)
+        self.assertEqual(by_key["16777473"].serial, "TJNW95e075b8")
+        self.assertEqual(by_key["16777473"].state, STATE_ONLINE)
+        self.assertEqual(by_key["16779357"].pon_port, "8")
+        self.assertEqual(by_key["16779357"].state, STATE_OFFLINE)
+        # The 68 unprovisioned slots on this box: never registered, no vendor,
+        # distance 0. Dark-by-default would have invented an outage cohort.
+        self.assertEqual(by_key["16777728"].state, STATE_UNKNOWN)
 
     def test_from_dict_rejects_anything_outside_the_vocabulary(self):
         # A half-understood profile guessing at an OLT is the fabricated-reading

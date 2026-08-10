@@ -63,6 +63,13 @@ class GponProfile:
     oid_ident_distance: str = ""
     oid_ident_name: str = ""
     format_pon_label: Callable[[str], str] = lambda pon: pon
+    # How the metric table's OID index yields an ONU id, when the index is not
+    # already one. None = the default `_derive_onu_id` (trailing segment, or the
+    # whole index if it is a bare number). A vendor that PACKS pon and onu into
+    # one integer ifIndex needs its own reading, and it has to travel WITH the
+    # pon strategy: deriving the PON from a packed index while reading the onu
+    # id off the same index unpacked would report ONU 16777472 on PON 1.
+    derive_onu_id: Callable[[str], int | None] | None = None
     # The maker's sysObjectID arc (PEN prefix) this profile claims. Vendor
     # auto-detect matches an untagged OLT's sysObjectID against these by longest
     # prefix — author at the most specific arc actually verified (a vendor-wide
@@ -140,9 +147,43 @@ PROFILES: dict[str, GponProfile] = {HUAWEI.name: HUAWEI, DBC.name: DBC}
 # vocabulary rejects the WHOLE profile — a half-understood profile guessing at an
 # OLT is the fabricated-reading trap; a rejected one just leaves optics off.
 _STATE_VOCAB = (STATE_ONLINE, STATE_OFFLINE, STATE_DYING_GASP, STATE_LOS, STATE_UNKNOWN)
+def _packed_ifindex(idx: str) -> int | None:
+    """The leading segment of an OID index as an int, or None.
+
+    Some OLTs index their ONU tables by a byte-packed ifIndex rather than by
+    `pon.onu` — chassis<<24 | slot<<16 | pon<<8 | onu, so PON 1 ONU 0 is
+    16777472 (0x01000100). The two halves are then a shift and a mask apart,
+    which is why `packed_ifindex` has to supply BOTH readings.
+    """
+    head = (idx or "").split(".", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def _packed_pon(idx: str) -> str:
+    # Degrade to the index itself rather than inventing a PON: a profile whose
+    # index turns out not to be packed must read as "we cannot tell", never as
+    # a confident PON 0 that would group every ONU on the box onto one port.
+    n = _packed_ifindex(idx)
+    return str((n >> 8) & 0xFF) if n is not None else idx
+
+
+def _packed_onu(idx: str) -> int | None:
+    n = _packed_ifindex(idx)
+    return (n & 0xFF) if n is not None else None
+
+
 _PON_INDEX_STRATEGIES: dict[str, Callable[[str], str]] = {
     "as_is": lambda idx: idx,
     "first_segment": lambda idx: idx.split(".", 1)[0] if idx else idx,
+    "packed_ifindex": _packed_pon,
+}
+# Keyed by the SAME strategy name, so a profile cannot select one half of a
+# packed index without the other. Absent = the default `_derive_onu_id`.
+_ONU_INDEX_STRATEGIES: dict[str, Callable[[str], int | None]] = {
+    "packed_ifindex": _packed_onu,
 }
 _PROFILE_OID_FIELDS = ("rx", "tx", "state", "distance", "serial", "name",
                        "ident_key", "ident_pon", "ident_onu", "ident_state",
@@ -216,6 +257,7 @@ def gpon_profile_from_dict(raw: dict) -> GponProfile | None:
         distance_scale=scales.get("distance", 1.0),
         decode_state=_state_decoder(state_map, default_state),
         format_pon=_PON_INDEX_STRATEGIES[pon_index],
+        derive_onu_id=_ONU_INDEX_STRATEGIES.get(pon_index),
         oid_ident_key=oids.get("ident_key", ""), oid_ident_pon=oids.get("ident_pon", ""),
         oid_ident_onu=oids.get("ident_onu", ""),
         oid_ident_state=oids.get("ident_state", ""),
@@ -351,7 +393,7 @@ def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
     return OnuOptic(
         onu_key=idx or serial or "?",
         pon_port=profile.format_pon(idx),
-        onu_id=_derive_onu_id(idx),
+        onu_id=(profile.derive_onu_id or _derive_onu_id)(idx),
         name=_clean_name(cells.get("name")),
         serial=serial,
         state=_metric_state(cells, profile),

@@ -241,6 +241,24 @@ def session_key(html: str, profile=None) -> str | None:
     return m.group(1) if m else None
 
 
+def optics_headings_seen(html: str, profile=None) -> tuple[list[str], int]:
+    """Which of the profile's own column headings this page prints, and how many
+    it maps. ONE definition, because two callers ask the same question for
+    opposite purposes — `diagnose_login` to word a refusal, `scrape_optics` to
+    decide whether a tokenless page is safe to read anyway — and a page they
+    graded differently would mean a build that reports "not the optical page"
+    and then gets scraped, or the reverse.
+
+    HEADINGS ONLY, never a row. This answers "am I looking at the right page",
+    which is exactly the question a guessed `optics_path` gets wrong; it must
+    never become a way to lift a reading.
+    """
+    prof = profile if profile is not None else DBC
+    cols = prof.columns or {}
+    low = html.lower()
+    return ([h for h in cols.values() if h and h.strip().lower() in low], len(cols))
+
+
 def diagnose_login(html: str, profile=None) -> str:
     """Why a login reply carried no SessionKey, in terms an operator can act on.
 
@@ -264,7 +282,16 @@ def diagnose_login(html: str, profile=None) -> str:
     # a reply that links the login page under any of its several spellings (this
     # firmware also serves login_first.html) still reads as one.
     login_hint = prof.login_page_path.strip("/").lower().rsplit(".", 1)[0]
+    # A PASSWORD INPUT is the build-agnostic tell, and it is needed: this
+    # firmware renders its login text from /i18N/login_en_US.properties through
+    # jQuery, so the word "password" can be absent from a page that is plainly
+    # the login form — which made a bounced login read as "unrecognised reply".
+    # The input's own type attribute is markup, not copy, so no bundle can hide
+    # it. Quoted either way, and `type = "password"` with spaces is legal HTML.
+    has_password_input = re.search(
+        r"""<input[^>]*type\s*=\s*['"]?password""", low) is not None
     looks_like_login = (bool(login_hint) and login_hint in low
+                        or has_password_input
                         or ("password" in low and "form" in low))
     if key_field in html:
         seen = key_shapes(html, key_field)
@@ -303,13 +330,37 @@ def diagnose_login(html: str, profile=None) -> str:
                 f"({page_shape(html)})")
     if looks_like_login:
         return "the device served its login page again, so the password was refused"
+    # Is this the OPTICAL PAGE with no token, or some other page entirely? Those
+    # are opposite fixes — a `session` strategy on a profile row vs. freeing the
+    # OLT's single web session — and until 2026-08-07 they gave the identical
+    # "unrecognised reply · N chars", which cost a whole session of guessing on
+    # chandana-network's MAIN_OLT. The profile already carries the page's own
+    # headings, so ASK THE PAGE: nothing else on this firmware prints "RX Power"
+    # next to "MAC Address". Headings only, never a row — this decides which
+    # question to ask next, it never lifts a reading.
+    headings, wanted = optics_headings_seen(html, prof)
+    if wanted and len(headings) == wanted:
+        # scrape_optics reads this case keyless rather than refusing, so this
+        # wording is only reachable through another caller. Keep the two apart:
+        # "all headings" and "most headings" are a working build and a profile
+        # fault, and one sentence covering both said neither.
+        return (f"this IS the optical page — all {wanted} column headings are on "
+                f"it — but it carries no {key_field}. This build mints no token "
+                f"({page_shape(html)})")
+    if len(headings) >= 3:
+        return (f"this looks like the optical page but only {len(headings)} of "
+                f"{wanted} column headings matched, and there is no {key_field} "
+                "on it either, so it was not read: a renamed column is a profile "
+                "fault to fix, not a page to guess at. Check this profile's "
+                f"column names against this build ({page_shape(html)})")
     # The vendor's own words, from the profile. An empty marker list means the
     # operator gave us nothing to recognise the box by, so we say nothing about
     # it rather than inventing a verdict.
     if prof.vendor_markers and not any(m in low for m in prof.vendor_markers):
         return ("the reply does not look like this OLT's web UI at all. Check "
                 "the address really reaches the OLT and not a router in front.")
-    return f"unrecognised reply · {page_shape(html)}"
+    return (f"unrecognised reply, and it is NOT the optical page (none of this "
+            f"profile's column headings are on it) · {page_shape(html)}")
 
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.{0,80}?)</title>", re.I | re.S)
@@ -691,13 +742,41 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
                     "optical page; it needs its own capture and profile")
     if not opened.ok:
         return [], f"could not open the optics page: {opened.error or opened.status}"
+    keyless = False
     key = session_key(_decode(opened, prof), prof) if prof.rotates_key else None
     if prof.rotates_key and not key:
-        # No key on the page that definitely has one when logged in => we are
-        # not logged in. Say WHICH of the several very different reasons it was
-        # (see diagnose_login) — never let any of them read as "this OLT
-        # reports no optics".
-        return [], f"login rejected: {diagnose_login(_decode(opened, prof), prof)}"
+        page = _decode(opened, prof)
+        # "No key" USUALLY means "not logged in" — but not always, and the page
+        # itself settles it. chandana-network's MAIN_OLT (2026-08-07) serves this
+        # very page with ALL NINE of the profile's headings on it and no token
+        # anywhere: the login plainly worked and this build simply does not mint
+        # a SessionKey, where its sibling on the next IP does. Treating that as a
+        # refusal cost a fleet's Rx column and read as "check the password",
+        # which was never wrong.
+        #
+        # The bar is EVERY mapped heading, not a majority: the page has to prove
+        # it is the table before an admin session goes on to POST at it. A login
+        # page, a session-limit notice or a menu clears none of them. If a build
+        # renames one column this refuses and SAYS the count, which is the fault
+        # being reported rather than a scrape running on a page we misread.
+        #
+        # Scoping this per device via a profile row is NOT the alternative it
+        # looks like: `name` is deliberately the same token as gpon_profiles.name
+        # / org_devices.gpon_vendor, so a row for this OLT would shadow the
+        # recipe for every OLT in the org — including the one on .102 that DOES
+        # rotate a key and works today.
+        seen, wanted = optics_headings_seen(page, prof)
+        if not (wanted and len(seen) == wanted):
+            # Say WHICH of the several very different reasons it was (see
+            # diagnose_login) — never let any of them read as "this OLT reports
+            # no optics".
+            return [], f"login rejected: {diagnose_login(page, prof)}"
+        # `optics_form` already omits the field when key is None, so the POSTs go
+        # out shaped exactly as this build's own page would send them.
+        keyless = True
+        log.info("web optics: %s serves the optical page with no %s but all %d"
+                 " headings — reading it keyless", prof.optics_path,
+                 prof.session_key_field, wanted)
 
     rows: list[dict] = []
     for done, pon in enumerate(pons):
@@ -715,13 +794,25 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
         if not resp.ok:
             return rows, f"PON{pon}: {resp.error or resp.status}"
         page = _decode(resp, prof)
-        nxt = session_key(page, prof) if prof.rotates_key else key
-        if prof.rotates_key and not nxt:
-            # Session died mid-scrape. The likeliest cause is benign and worth
-            # knowing: this firmware keeps no cookie, so a human logging into
-            # the OLT can displace our session (and we can displace theirs).
-            return rows, f"PON{pon}: session lost (someone else logged in?)"
-        key = nxt
+        if keyless:
+            # A keyless build has no token to go missing, so the mid-scrape check
+            # below cannot run — but the thing it protects against (our session
+            # displaced by a human logging in, since this firmware keeps no
+            # cookie) still happens. The page proves itself the same way it did
+            # on entry: bounced to the login form, the headings go with it.
+            seen, wanted = optics_headings_seen(page, prof)
+            if len(seen) != wanted:
+                return rows, (f"PON{pon}: the optical page stopped being itself "
+                              f"({len(seen)} of {wanted} headings) — session lost"
+                              " to another login?")
+        else:
+            nxt = session_key(page, prof) if prof.rotates_key else key
+            if prof.rotates_key and not nxt:
+                # Session died mid-scrape. The likeliest cause is benign and worth
+                # knowing: this firmware keeps no cookie, so a human logging into
+                # the OLT can displace our session (and we can displace theirs).
+                return rows, f"PON{pon}: session lost (someone else logged in?)"
+            key = nxt
         rows.extend(parse_optics_table(page, prof, pon))
     return rows, None
 

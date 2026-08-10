@@ -121,6 +121,59 @@ export const CASING_OPACITY = 0.55
  *  than a second free number, so raising one raises both. */
 export const CASING_OPACITY_HOVER = 0.68
 
+// ---- Fibre count as weight --------------------------------------------------
+//
+// A multi-core cable draws heavier than a thin one (operator, 2026-08-09: *"the
+// multi core line should always be different colour, I mean make it a little
+// thick or something to differentiate"*). **This REVERSES "no stroke treatment
+// for core count, deliberately"** — which anticipated exactly this ask and left
+// the one condition it has to meet: the feeder/distribution tier is derived from
+// TOPOLOGY and must not be silently overridden by fibre count.
+//
+// So it is ADDITIVE, never a replacement. Every existing rung keeps its order
+// within any one fibre class: a 12F distribution leg still draws under a 12F
+// feed, which still draws under a 12F selected path. What the boost separates is
+// the axis the ladder never spoke to — how much glass is in the sheath.
+//
+// WEIGHT, NOT COLOUR, and the alternative really is closed rather than merely
+// unfashionable. Red/amber/green are the status tones on the one screen that
+// exists to show them; `--map-plant` violet is already the cable's OWN traced
+// route, so a cabled span in violet could not be told from the sheath it runs
+// in; the TIA-598 strand colours contain four alarm hues and may never be a
+// stroke; and the free per-link tint was removed at the operator's own request
+// three days ago, because six palette names in one namespace cannot name cables.
+// Weight is the only channel left that carries an ORDER, which is what a fibre
+// count is.
+//
+// LOGARITHMIC, because the counts are: 2 → 96 is six doublings, and a linear
+// map would make a 96F six times a 16F rather than one step further along. The
+// coefficient puts a 12F at +1.08 (~43% over an ordinary feed — clearly heavier
+// side by side, still obviously a cable) and caps the whole family at +2.
+//
+// MEASURED, at z13 / z17 (base 2.5 feed): unrecorded 2.50/3.85, 2F 2.80/4.31,
+// 12F 3.58/5.51, 24F 3.88/5.98, 96F 4.48/6.90.
+//
+// A FAT TRUNK THEREFORE OUT-WEIGHS A SELECTED THIN ONE (12F feed 3.58 vs a
+// selected 2F path at 3.5), and that is accepted rather than overlooked. Neither
+// selection nor trouble is signalled by weight alone: a selected path turns
+// `--primary` and lights end to end together, a down link is red. Weight only
+// ever reinforces them, and inside any ONE cable the selected and hovered states
+// stay strictly heavier than the resting one, which is the comparison an eye
+// actually makes. Capping low enough to avoid the crossing would have cost the
+// differentiation this exists for.
+export const FIBER_BOOST_PER_DOUBLING = 0.3
+export const FIBER_BOOST_MAX = 2
+
+/** How much heavier a line draws for the glass in it. 0 when nobody has recorded
+ *  a count — an unsurveyed line may not be dressed as a thin one, since "we
+ *  don't know" and "it is small" are different sentences, and the smallest real
+ *  cable still gets a step of its own. */
+export function fiberBoost(cores: number | null | undefined): number {
+  if (!cores || cores < 2) return 0
+  return round(Math.min(FIBER_BOOST_MAX,
+                        FIBER_BOOST_PER_DOUBLING * Math.log2(cores)))
+}
+
 /** What a Polyline needs: a weight and, when it is dashed, a matching period. */
 export interface Stroke {
   weight: number
