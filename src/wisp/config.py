@@ -69,16 +69,6 @@ class Config:
 
     backup_alerts: bool = field(default_factory=lambda: _env_bool("WISP_BACKUP_ALERTS", True))
 
-    # Device web-UI proxy (reverse tunnel through the edge). Activation is
-    # CENTRAL-DRIVEN: the per-org orgs.web_proxy flag (superadmin-set) is the
-    # gate, and the edge tunnel is dormant until a /report reply carries a live
-    # session — so proxy_enabled defaults ON (since v0.15.8; the double-dark
-    # per-edge flag was the field trap: a missing env var read as a 504).
-    # WISP_PROXY_ENABLED=0 stays the kill switch, honored independently on
-    # central (routes 404) and on any single edge (tunnel never built).
-    # See webplan.md. proxy_mgmt_ports
-    # is the CLOSED set of device ports the tunnel may reach; a session may target
-    # nothing else (the anti-pivot clamp, alongside the edge's device-list gate).
     proxy_enabled: bool = field(default_factory=lambda: _env_bool("WISP_PROXY_ENABLED", True))
     proxy_mgmt_ports: str = field(default_factory=lambda: _env("WISP_PROXY_MGMT_PORTS", "80,443"))
     proxy_session_ttl_s: int = field(
@@ -88,19 +78,10 @@ class Config:
     proxy_workers: int = field(default_factory=lambda: _env_int("WISP_PROXY_WORKERS", 4))
     proxy_request_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_PROXY_REQUEST_TIMEOUT_S", 30.0))
-    # TCP-connect budget to the DEVICE, separate from the request timeout above:
-    # a LAN box either accepts within a few seconds or never will — the long
-    # timeout is for slow pages, not dead sockets (fast-failure fix 2026-07-20).
-    # Also the per-candidate budget of the session-open preflight probe.
     proxy_connect_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_PROXY_CONNECT_TIMEOUT_S", 5.0))
     proxy_max_body_bytes: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_MAX_BODY_BYTES", 8 * 1024 * 1024))
-    # Per-session static-asset cache on CENTRAL (2026-07-29). 44% of every
-    # request this tunnel has ever carried was a re-fetch of an unchanging
-    # asset inside ONE session — measured over proxy_audit, jquery-1.7.1.min.js
-    # alone accounting for 553 fetches of a single OLT. Off = every asset pays
-    # a full round trip to the device again. See central/proxy.py:AssetCache.
     proxy_cache_enabled: bool = field(
         default_factory=lambda: _env_bool("WISP_PROXY_CACHE", True))
     proxy_cache_ttl_s: float = field(
@@ -109,79 +90,27 @@ class Config:
         default_factory=lambda: _env_int("WISP_PROXY_CACHE_MAX_ENTRIES", 128))
     proxy_cache_max_bytes: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_CACHE_MAX_BYTES", 4 * 1024 * 1024))
-    # How many requests the edge may have in flight against ONE device at once.
-    # The ceiling of the adaptive ladder (ingress/webproxy.py:_DeviceGate), which
-    # walks DOWN from here when a box refuses connections. proxy_workers bounds
-    # the node; this bounds the box, because a weak embedded HTTP server is the
-    # thing that actually falls over.
     proxy_device_max_inflight: int = field(
         default_factory=lambda: _env_int("WISP_PROXY_DEVICE_MAX_INFLIGHT", 4))
-    # Idle seconds before the edge closes a kept-alive connection to a device.
-    # Long enough to span a tech reading a page, short enough that we are not
-    # holding a socket open on an embedded box that only has a handful.
     proxy_keepalive_idle_s: float = field(
         default_factory=lambda: _env_float("WISP_PROXY_KEEPALIVE_IDLE_S", 90.0))
 
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
-    # Per-subsystem sweep cadence. These were ONE clock (WISP_SNMP_INTERVAL_S, 90s)
-    # until 2026-07-17: all three walks fired on the same tick AND the next sweep was
-    # gated on all three completing. On a weak C-Data/DBC agent the 75s roster walk
-    # launched alongside the 60s ifTable walk, starved it, and — because next_snmp was
-    # stamped at sweep START — overran the 90s period and re-fired immediately, walking
-    # those boxes back-to-back all day. HILL-OLT-1/PYLON sat at 0% port-walk success
-    # while their optics stayed fresh: the polling caused the failure. Each subsystem
-    # now rides its own clock, gated only on its own task.
-    #
-    # Naming mirrors the walk timeouts below: bare `snmp_*` = health, `port_*` =
-    # ifTable, `gpon_*` = ONU roster. snmp_interval_s <= 0 still disables SNMP
-    # WHOLESALE (it is the master gate, not just health's clock) — keep that.
-    # All three sit at 300s (reliability over freshness, 2026-07-17): a walk
-    # can fail once and the reading is still fresher than the 900s staleness
-    # gates that freeze roster/port alert state; don't raise them past ~600s
-    # without revisiting those. Equal periods mean the clocks fire on the SAME
-    # tick every time — safe only because the daemon serializes same-device
-    # walks via the shared _SnmpAirtime gate.
     snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 300))
     port_interval_s: int = field(default_factory=lambda: _env_int("WISP_PORT_INTERVAL_S", 300))
     gpon_interval_s: int = field(default_factory=lambda: _env_int("WISP_GPON_INTERVAL_S", 300))
     snmp_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_SNMP_WALK_TIMEOUT_S", 20.0))
-    # GPON roster walks get their own, larger cap: a slow EPON agent (PYLON/NDN
-    # class) needs >20s for 5 roster columns x hundreds of ONUs, and the optics
-    # sweep is a background task under the SNMP semaphore — a slow OLT delays
-    # nothing but its own reading. 20s starved those boxes into permanently
-    # stale optics (field-diagnosed 2026-07-09 via remote diag walks).
     gpon_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_GPON_WALK_TIMEOUT_S", 75.0))
-    # Per-REQUEST tolerance for the GPON roster walk, separate from the global 2s
-    # snmp_timeout_s. A slow C-Data/DBC EPON agent (PYLON class) intermittently
-    # drops or delays a single GETBULK on the big .12 registration table; at 2s x
-    # 1 retry one unanswered request fails the WHOLE walk ("No SNMP response
-    # received before timeout") and freezes the roster for a full snmp_interval —
-    # field-diagnosed 2026-07-13, PYLON roster stuck ~25 min while health/ports
-    # stayed fresh on the same box. More time + more retries per request rides out
-    # the slow spells; the gpon_walk_timeout_s cap still bounds the total.
     gpon_request_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_GPON_REQUEST_TIMEOUT_S", 5.0))
     gpon_request_retries: int = field(
         default_factory=lambda: _env_int("WISP_GPON_REQUEST_RETRIES", 3))
-    # Ports/health/diag walks get the SAME per-request patience (2026-07-18,
-    # EDGE_HALIYA field diagnosis): from that edge, strict 2s x 1-retry SNMP got
-    # ZERO responses for 26h on every device while optics — same boxes, same
-    # engine pattern, but 5s x 3 retries — stayed 100% fresh, and one-off diag
-    # walks with an idle agent answered instantly. Weak agents answer whoever
-    # retries longest; a 4s per-request window loses every contended exchange.
-    # Walk caps still bound the total, the airtime gate bounds the contention.
     snmp_request_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_SNMP_REQUEST_TIMEOUT_S", 5.0))
     snmp_request_retries: int = field(
         default_factory=lambda: _env_int("WISP_SNMP_REQUEST_RETRIES", 3))
-    # Port (ifTable) walks get their own cap for the same reason GPON does: a big OLT
-    # (HILL/PYLON class, 200+ interfaces x 10 columns) can't finish 10 bulk-walk
-    # columns inside 20s, timed out every cycle, and left switch_ports permanently
-    # stale while health/optics stayed fresh (same box, smaller walks) — field-
-    # diagnosed 2026-07-09. Like optics it's a background task under the SNMP
-    # semaphore, so a slow OLT delays nothing but its own port reading.
     port_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_PORT_WALK_TIMEOUT_S", 60.0))
     snmp_max_inflight: int = field(
@@ -197,101 +126,36 @@ class Config:
     optical_crit_dbm: float = field(
         default_factory=lambda: _env_float("WISP_OPTICAL_CRIT_DBM", -27.0))
     optical_alerts: bool = field(default_factory=lambda: _env_bool("WISP_OPTICAL_ALERTS", True))
-    # Web-UI optics scrape (central/weboptics_sweep.py): the ONLY source of
-    # per-ONU Rx on C-Data/DBC EPON, whose firmware exposes it in no SNMP OID.
-    # Central-side, over the existing proxy tunnel — no edge code. The clock is
-    # SLOW on purpose: Rx drifts over days, and the scrape makes a weak OLT
-    # query every ONU over EPON-OAM, so it must never look like polling.
     web_optics_enabled: bool = field(
         default_factory=lambda: _env_bool("WISP_WEB_OPTICS_ENABLED", True))
     web_optics_interval_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_INTERVAL_S", 900))
-    # How long a scraped reading stays merge-eligible. Past this the readings
-    # are dropped rather than aged into the roster: a scrape that quietly
-    # stopped working must not keep a week-old dBm alive under a live badge.
     web_optics_max_age_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_MAX_AGE_S", 3600))
-    # Ceiling on ONE OLT's scrape. The per-request timeout bounds a hop; this
-    # bounds the device, which is what matters now the sweep is fleet-wide and
-    # strictly sequential — a slow 8-PON box must not hold the thread while
-    # every other OLT's readings age. A partial scrape merges normally, so
-    # spending the budget costs the PONs already read nothing.
     web_optics_device_budget_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_DEVICE_BUDGET_S", 120))
-    # How recently a web-UI proxy session must have been USED before the sweeper
-    # treats it as "someone is browsing this box" and stands down. The skip is
-    # right — this firmware holds ONE session, so scraping mid-browse logs the
-    # operator out — but keying it on the session merely EXISTING was not: a
-    # session lives for proxy_session_ttl_s (600s) after its last request and
-    # nothing tells central a tab was closed, so one forgotten tab suppressed
-    # the optical read of EVERY OLT on that probe (the gate is per-node).
-    # Someone actually working a device UI clicks inside three minutes; someone
-    # who walked away does not.
     web_optics_browse_idle_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_BROWSE_IDLE_S", 180))
-    # Worker location tracking (central/field.py). Workers run the off-the-shelf
-    # Traccar Client, which POSTs OsmAnd fixes to the public /field/track ingest;
-    # central stores a live position plus a short trail. CENTRAL-ONLY — no edge
-    # code, no APK.
-    #
-    # RETENTION IS THE POLICY, not a size limit: a full crew at the designed 90 s
-    # cadence is ~6 MB/month, so this is never a volume problem. Seven days
-    # answers "did he reach the site" and "what route did the van take today"
-    # without accumulating a movement archive of staff, which is a different and
-    # much worse thing to hold.
     field_track_retention_days: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_RETENTION_DAYS", 7))
-    # Above this a "fix" is a cell-tower estimate covering half a town, and
-    # storing it would put a pin on the map that means nothing. Unlike the survey
-    # (where a loose pin that SAYS it is loose beats no pin, because a human
-    # chose to record it) nobody is standing there deciding — the phone is
-    # transmitting on a timer, so the honest thing is to drop the noise.
     field_track_max_accuracy_m: float = field(
         default_factory=lambda: _env_float("WISP_FIELD_TRACK_MAX_ACCURACY_M", 500.0))
-    # How far back a fix may be stamped and still be stored. GENEROUS on purpose:
-    # offline buffering is a recommended Traccar setting precisely because the
-    # crew drives through dead zones, so a whole morning replaying at once is the
-    # feature working. Past the retention window it would land in a trail nobody
-    # will ever see.
     field_track_max_age_s: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_MAX_AGE_S", 86400))
-    # …and how far into the future. A fix from ahead of now is a broken phone
-    # clock, and it would sort to the head of the trail and read as "here now".
     field_track_max_skew_s: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_MAX_SKEW_S", 300))
-    # Per-token ceiling, as a token bucket rather than a minimum gap: a minimum
-    # gap would throw away exactly the buffered burst we asked the client to
-    # keep. At the designed 90 s cadence a device spends ~0.7/min, so an hour of
-    # buffer flushes well inside one minute's allowance while a looping client
-    # still hits the wall.
     field_track_rate_per_min: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_RATE_PER_MIN", 60))
-    # When a worker on shift stops counting as "here now". Three missed reports
-    # at the 90 s cadence — enough that one dead zone isn't an alarm, short
-    # enough that "last known 40 minutes ago" can never render as a live
-    # position. The dashboard reads this off the API so the threshold has ONE
-    # source; the classification itself is the SPA's (it ticks with the clock).
     field_track_fresh_s: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_FRESH_S", 300))
-    # PON mass-drop heads-up (central/ponalert.py): page the operator when a
-    # PON reads as a fiber cut. State is tracked regardless; only paging gates.
     pon_fault_alerts: bool = field(
         default_factory=lambda: _env_bool("WISP_PON_FAULT_ALERTS", True))
-    # ONU-roster hygiene (central/onualert.py): per-PON ONU cap (EPON tops out at a
-    # 1:64 split — page when a PON is full) and redundant-MAC detection (same ONU MAC
-    # on 2+ slots = clone/loop/double-registration). Per-OLT `onu_pon_limit` override
-    # (org_devices) raises the cap for a 1:128 GPON box. State tracked regardless of
-    # the gates, like ponalert; both page the operator transition-only.
     onu_pon_limit: int = field(
         default_factory=lambda: _env_int("WISP_ONU_PON_LIMIT", 64))
     onu_limit_alerts: bool = field(
         default_factory=lambda: _env_bool("WISP_ONU_LIMIT_ALERTS", True))
     onu_dup_mac_alerts: bool = field(
         default_factory=lambda: _env_bool("WISP_ONU_DUP_MAC_ALERTS", True))
-    # Empty = per-OLT sysObjectID auto-detect (the normal path). Set to force one
-    # vendor profile on every untagged OLT this edge probes — an escape hatch for
-    # a box whose sysObjectID is missing or lies; per-device `gpon_vendor` from the
-    # dashboard overrides both.
     gpon_vendor: str = field(default_factory=lambda: _env("WISP_GPON_VENDOR", ""))
 
     latency_threshold_ms: float = field(
@@ -315,14 +179,6 @@ class Config:
         default_factory=lambda: _env_int("WISP_ESCALATE_EVERY_MIN", 60)
     )
 
-    # Notification governor (central/notify_policy.py). Since ntfy was removed
-    # 2026-07-24 only an ALLOWLIST of kinds pages (device/uplink/port/probe
-    # up+down); the SNMP-derived stream and the hourly escalation are turned OFF
-    # (state still written, nothing sent), so the digest machinery below is
-    # currently DORMANT — kept because re-enabling a kind is a one-line allowlist
-    # edit. `digest_interval_min` still gates a digest send should a kind rejoin
-    # the digest tier; `alert_cooldown_min` is a per-(device, kind) PUSH backstop
-    # (0 = off).
     digest_interval_min: int = field(
         default_factory=lambda: _env_int("WISP_DIGEST_INTERVAL_MIN", 60)
     )
@@ -332,30 +188,13 @@ class Config:
 
     prober: str = field(default_factory=lambda: _env("WISP_PROBER", "icmp").lower())
 
-    # Send-retry policy shared by every notifier: network/timeout/5xx retries
-    # with exponential backoff, 4xx fails fast (egress/notifiers.py). Named
-    # generically since ntfy was removed 2026-07-24; the old WISP_NTFY_RETRIES*
-    # env vars are gone.
     notify_retries: int = field(default_factory=lambda: _env_int("WISP_NOTIFY_RETRIES", 3))
     notify_retry_backoff_s: float = field(
         default_factory=lambda: _env_float("WISP_NOTIFY_RETRY_BACKOFF_S", 0.5)
     )
-    # DISPLAY-only zone for the timestamps a human reads off a notification
-    # ("Time Logged" in the WhatsApp template). Everything central stores stays
-    # UTC — the dashboard localises in the browser, so a page is the one place a
-    # stored timestamp reaches a person with nothing to convert it. Default IST;
-    # an unknown zone name falls back to UTC (egress/notifiers.py:_display_zone).
     display_tz: str = field(
         default_factory=lambda: _env("WISP_DISPLAY_TZ", "Asia/Kolkata"))
 
-    # WhatsApp (Meta Cloud API) is the SOLE notification channel — ntfy was
-    # removed 2026-07-24. Central-side egress only; the edge never builds a
-    # notifier (all paging is central's). These env vars are FALLBACK defaults
-    # only: the live config (enable toggle + token + phone-id + template + the
-    # superadmin ops number) is superadmin-managed in the dashboard
-    # (app_settings, Settings → Platform) and read FRESH at send time, so it
-    # changes with no restart. Per-account recipient numbers live in the DB
-    # (users.whatsapp_number), resolved per org+role, never here.
     enable_whatsapp: bool = field(
         default_factory=lambda: _env_bool("WISP_ENABLE_WHATSAPP", True))
     whatsapp_token: str = field(default_factory=lambda: _env("WISP_WHATSAPP_TOKEN", ""))
@@ -365,16 +204,8 @@ class Config:
     whatsapp_lang: str = field(default_factory=lambda: _env("WISP_WHATSAPP_LANG", "en"))
     whatsapp_api_version: str = field(
         default_factory=lambda: _env("WISP_WHATSAPP_API_VERSION", "v20.0"))
-    # Superadmin ops pings (org 'I've paid' / churn / release-sync failing) have
-    # no org role, so they page this single E.164 number instead of a role's
-    # per-account numbers. Set in Settings → Platform (app_settings); env is the
-    # fallback. Empty = those ops pings are silently skipped.
     whatsapp_admin_number: str = field(
         default_factory=lambda: _env("WISP_WHATSAPP_ADMIN_NUMBER", ""))
-    # Inbound webhook (the lookup bot). verify_token is echoed back to Meta at
-    # subscription time (GET handshake); app_secret signs every notification POST
-    # (X-Hub-Signature-256). Both live in app_settings (Settings → Platform), read
-    # fresh per request; these env values are the fallback.
     whatsapp_verify_token: str = field(
         default_factory=lambda: _env("WISP_WHATSAPP_VERIFY_TOKEN", ""))
     whatsapp_app_secret: str = field(
@@ -392,26 +223,12 @@ class Config:
         default_factory=lambda: _env_int("WISP_TRACEMALLOC_EVERY", 0))
     central_db: Path = field(
         default_factory=lambda: Path(_env("WISP_CENTRAL_DB", str(DATA_DIR / "central.db"))))
-    # Master key for at-rest encryption of stored device secrets (web-UI logins;
-    # central/secretbox.py). Base64 (>=32 bytes) or a passphrase. Empty = central
-    # generates and reuses a 0600 `secret.key` beside central.db. Keep it stable:
-    # rotating it makes previously-stored device passwords undecryptable.
     secret_key: str = field(default_factory=lambda: _env("WISP_SECRET_KEY", ""))
     central_bind: str = field(default_factory=lambda: _env("WISP_CENTRAL_BIND", "0.0.0.0"))
     central_port: int = field(default_factory=lambda: _env_int("WISP_CENTRAL_PORT", 8443))
-    # Release mirror: central pulls the latest release's assets (installers +
-    # agent binaries + manifest) into `release_cache_dir` and serves them at
-    # /download/ — edges never talk to GitHub. The repo is public, so the token
-    # is optional (only needed to lift the anonymous API rate limit or if the
-    # repo ever goes private again).
     releases_repo: str = field(default_factory=lambda: _env(
         "WISP_RELEASES_REPO", "haneeshbyreddy/ping_tool"))
     github_token: str = field(default_factory=lambda: _env("WISP_GITHUB_TOKEN", ""))
-    # Field-app (APK) mirror: a PUBLIC repo whose latest release's .apk assets
-    # are mirrored to release_cache_dir/app/ and served at /download/app/<name>
-    # — a fixed dir, never recorded in the store, so it can't poison the edge
-    # self-update "latest". Empty = off. Fetched unauthenticated on purpose:
-    # the release-sync token is fine-grained to the main repo and would 403.
     app_releases_repo: str = field(default_factory=lambda: _env(
         "WISP_APP_RELEASES_REPO", ""))
     release_cache_dir: Path = field(
@@ -425,8 +242,6 @@ class Config:
         default_factory=lambda: _env_int("WISP_CENTRAL_NODE_STALE_S", 180))
     central_watchdog_interval_s: int = field(
         default_factory=lambda: _env_int("WISP_CENTRAL_WATCHDOG_INTERVAL_S", 0))
-    # Public marketing landing (`/`) shows a DB-driven "trusted by" ticker of org
-    # names + an early-access offer bar. Server-injected; off hides both entirely.
     showcase_enabled: bool = field(default_factory=lambda: _env_bool("WISP_SHOWCASE", True))
     rollout_health_window_s: int = field(
         default_factory=lambda: _env_int("WISP_ROLLOUT_HEALTH_WINDOW_S", 600))
@@ -434,33 +249,14 @@ class Config:
         default_factory=lambda: _env_int("WISP_AGENT_HEALTH_DEADLINE_S", 300))
 
     session_timeout_h: int = field(default_factory=lambda: _env_int("WISP_SESSION_TIMEOUT_H", 12))
-    # "Trust this device" at login rides a much longer TTL so an operator's own
-    # box isn't kicked back to the sign-in form every shift. Baked into the signed
-    # cookie at issue time (auth.issue_session), not re-read per request.
     session_remember_days: int = field(
         default_factory=lambda: _env_int("WISP_SESSION_REMEMBER_DAYS", 30))
-    # "Trust this device" for a PRIVILEGED account (owner/superadmin). Those roles
-    # are deliberately refused the worker 30-day tier (they reconfigure the whole
-    # network), but MAY extend their own box's absolute cap from the default
-    # session_timeout_h to this many hours — with no idle logout for the window
-    # (operator choice 2026-07-25). Baked into the signed cookie at issue time.
     session_trusted_admin_hours: int = field(
         default_factory=lambda: _env_int("WISP_SESSION_TRUSTED_ADMIN_H", 24))
-    # IDLE timeout: a normal (non-"remember") session dies this many minutes after
-    # the LAST authenticated request, independent of the absolute session_timeout_h
-    # cap. Slid forward on activity (auth.slide_session), so it only bites when the
-    # operator actually walks away from the desk. 0 disables idle expiry.
     session_idle_minutes: int = field(
         default_factory=lambda: _env_int("WISP_SESSION_IDLE_MIN", 30))
-    # Set the Secure flag on the session cookie (a browser then only sends it over
-    # HTTPS). ON by default — prod terminates TLS at Caddy; a plain-http dev box
-    # sets WISP_SESSION_COOKIE_SECURE=0.
     session_cookie_secure: bool = field(
         default_factory=lambda: _env_bool("WISP_SESSION_COOKIE_SECURE", True))
-    # Trust X-Forwarded-For, but ONLY when the direct socket peer is loopback (the
-    # request came through the local reverse proxy). Off = always key off the raw
-    # socket peer. Load-bearing for the login throttle: behind Caddy every request's
-    # peer is 127.0.0.1, so without this the whole world shares one throttle bucket.
     trust_forwarded_for: bool = field(
         default_factory=lambda: _env_bool("WISP_TRUST_FORWARDED_FOR", True))
 

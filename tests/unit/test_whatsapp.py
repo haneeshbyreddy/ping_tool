@@ -17,7 +17,6 @@ class _Resp:
 
 
 class _FakePoster:
-    """Stand-in for httpx.post — records every call, returns a canned status."""
     def __init__(self, status_code=200, raise_exc=None):
         self.calls = []
         self.status_code = status_code
@@ -31,7 +30,6 @@ class _FakePoster:
 
 
 class _FakeStore:
-    """Minimal store exposing only whatsapp_settings, like the notifier reads."""
     def __init__(self, settings):
         self._settings = settings
 
@@ -67,16 +65,13 @@ class FactsTest(unittest.TestCase):
 
 
 class DisplayTimeTest(unittest.TestCase):
-    """"Time Logged" is the one timestamp a human reads with no browser to
-    localise it — it shipped as raw UTC and read 5h30m behind the wall clock."""
-
     def test_utc_instant_renders_in_the_display_zone(self):
         self.assertEqual(_wa_time("2026-07-25T09:12:03+00:00"),
                          "25 Jul 2026, 2:42 PM IST")
 
     def test_naive_sqlite_stamp_is_treated_as_utc(self):
         self.assertEqual(_wa_time("2026-07-25 18:45:00"),
-                         "26 Jul 2026, 12:15 AM IST")   # crosses the date line
+                         "26 Jul 2026, 12:15 AM IST")
 
     def test_zone_is_configurable_and_unknown_zones_fall_back_to_utc(self):
         self.assertEqual(_wa_time("2026-07-25T09:12:03+00:00", "America/New_York"),
@@ -109,13 +104,11 @@ class WhatsAppNotifierTest(unittest.TestCase):
         self.assertEqual(call["headers"], {"Authorization": "Bearer TOK"})
         body = call["json"]
         self.assertEqual(body["messaging_product"], "whatsapp")
-        self.assertEqual(body["to"], "919000000001")          # digits only, no '+'
+        self.assertEqual(body["to"], "919000000001")
         self.assertEqual(body["type"], "template")
-        # falls back to the cfg default template when the store carries none
         self.assertEqual(body["template"]["name"], "wisp_alert1")
         self.assertEqual(body["template"]["language"], {"code": "en"})
         params = [p["text"] for p in body["template"]["components"][0]["parameters"]]
-        # the stored UTC instant reaches the operator in THEIR zone (IST here)
         self.assertEqual(params, ["PYLON", "DOWN", "10.0.0.1",
                                   "23 Jul 2026, 9:35 AM IST"])
 
@@ -133,7 +126,7 @@ class WhatsAppNotifierTest(unittest.TestCase):
         self.assertEqual(poster.calls, [])
 
     def test_unconfigured_is_a_noop(self):
-        wa, poster = self._wa(settings={"enabled": "1"})  # no token/phone
+        wa, poster = self._wa(settings={"enabled": "1"})
         res = wa.send("t", "b", 3, whatsapp=["919000000001"])
         self.assertFalse(res.ok)
         self.assertEqual(poster.calls, [])
@@ -145,8 +138,6 @@ class WhatsAppNotifierTest(unittest.TestCase):
         self.assertEqual(poster.calls, [])
 
     def test_db_toggle_can_disable(self):
-        # env default is now enable_whatsapp True (WhatsApp is the sole channel);
-        # a DB "0" turns it back OFF, proving the store still overrides env.
         cfg = Config()
         self.assertTrue(cfg.enable_whatsapp)
         wa = WhatsAppNotifier(cfg, _FakeStore({"enabled": "0", "token": "T",
@@ -156,22 +147,19 @@ class WhatsAppNotifierTest(unittest.TestCase):
     def test_4xx_fails_fast_5xx_retries(self):
         wa4, p4 = self._wa(poster=_FakePoster(status_code=400))
         self.assertFalse(wa4.send("t", "b", 3, whatsapp=["919000000001"]).ok)
-        self.assertEqual(len(p4.calls), 1)                    # no retry on 4xx
+        self.assertEqual(len(p4.calls), 1)
 
         wa5, p5 = self._wa(poster=_FakePoster(status_code=503))
         self.assertFalse(wa5.send("t", "b", 3, whatsapp=["919000000001"]).ok)
-        self.assertGreater(len(p5.calls), 1)                  # retried on 5xx
+        self.assertGreater(len(p5.calls), 1)
 
     def test_poster_exception_never_raises(self):
         wa, _ = self._wa(poster=_FakePoster(raise_exc=RuntimeError("boom")))
-        res = wa.send("t", "b", 3, whatsapp=["919000000001"])   # must not raise
+        res = wa.send("t", "b", 3, whatsapp=["919000000001"])
         self.assertFalse(res.ok)
 
 
 class WhatsAppFreeFormTest(unittest.TestCase):
-    """send_text / send_buttons — the inbound-bot replies (free-form, allowed
-    because the user messaged first). Same config gating + never-raise discipline
-    as the template send."""
     def _wa(self, settings=_ENABLED):
         poster = _FakePoster()
         return WhatsAppNotifier(_cfg(), _FakeStore(settings), post=poster), poster
@@ -181,7 +169,7 @@ class WhatsAppFreeFormTest(unittest.TestCase):
         res = wa.send_text("+91 90000 00001", "line1\nline2")
         self.assertTrue(res.ok)
         body = poster.calls[0]["json"]
-        self.assertEqual(body["to"], "919000000001")          # digits only
+        self.assertEqual(body["to"], "919000000001")
         self.assertEqual(body["type"], "text")
         self.assertEqual(body["text"], {"preview_url": False, "body": "line1\nline2"})
 
@@ -196,7 +184,7 @@ class WhatsAppFreeFormTest(unittest.TestCase):
         self.assertEqual(body["interactive"]["type"], "button")
         self.assertEqual(body["interactive"]["body"]["text"], "pick one")
         btns = body["interactive"]["action"]["buttons"]
-        self.assertEqual(len(btns), 3)                        # 4th dropped (Meta cap)
+        self.assertEqual(len(btns), 3)
         self.assertEqual(btns[0],
                          {"type": "reply", "reply": {"id": "refresh:1", "title": "Refresh dBm"}})
 
@@ -219,13 +207,11 @@ class WhatsAppFreeFormTest(unittest.TestCase):
     def test_free_form_never_raises(self):
         wa = WhatsAppNotifier(_cfg(), _FakeStore(_ENABLED),
                               post=_FakePoster(raise_exc=RuntimeError("boom")))
-        self.assertFalse(wa.send_text("919000000001", "hi").ok)   # captured, not raised
+        self.assertFalse(wa.send_text("919000000001", "hi").ok)
 
 
 class BuildNotifierTest(unittest.TestCase):
     def test_edge_no_store_is_whatsapp_but_inert(self):
-        # WhatsApp is the only channel; a store-less (edge) notifier is inert —
-        # nothing to read a token/numbers from — but never crashes.
         n = build_notifier(_cfg())
         self.assertIsInstance(n, WhatsAppNotifier)
         self.assertEqual(n.channel, "whatsapp")

@@ -103,13 +103,11 @@ class CleanDevicePayloadTest(unittest.TestCase):
         self.assertIsNone(clean["tags"])
 
     def test_tags_normalized_from_list_or_csv(self):
-        # list input: trimmed, empties dropped, case-insensitive dedupe keeps first
         clean = clean_device_payload(
             {"name": "Tower", "ip_address": "10.0.0.1",
              "tags": [" Hill site ", "", "backhaul", "HILL SITE"]},
             parents={}, device_id=None)
         self.assertEqual(clean["tags"], "Hill site,backhaul")
-        # a comma-separated string works the same
         clean = clean_device_payload(
             {"name": "Tower", "ip_address": "10.0.0.1", "tags": "a, b ,a"},
             parents={}, device_id=None)
@@ -153,10 +151,6 @@ class CleanDevicePayloadTest(unittest.TestCase):
                  "gpon_vendor": "acme-optics"}, parents={}, device_id=None)
 
     def test_a_db_profile_vendor_is_accepted(self):
-        # gpon_profiles are DATA (a row even shadows a built-in), so the built-in
-        # names are not the vocabulary. Validating against them alone made an OLT
-        # on a DB profile unsavable — badri_fiber's Syrotech boxes 422'd on every
-        # edit, including ones that never touched the vendor.
         clean = clean_device_payload(
             {"name": "Gpon_08", "ip_address": "10.0.0.4", "device_type": "OLT",
              "gpon_vendor": "Syrotech_GPON"}, parents={}, device_id=None,
@@ -164,8 +158,6 @@ class CleanDevicePayloadTest(unittest.TestCase):
         self.assertEqual(clean["gpon_vendor"], "syrotech_gpon")
 
     def test_a_vendor_from_no_profile_at_all_is_still_rejected(self):
-        # widening to "any string" would let a typo stamp a device with a vendor
-        # no poller can resolve, which reads on screen as "this OLT has no optics"
         with self.assertRaises(InventoryError):
             clean_device_payload(
                 {"name": "OLT-1", "ip_address": "10.0.0.4", "device_type": "OLT",
@@ -173,23 +165,18 @@ class CleanDevicePayloadTest(unittest.TestCase):
                 gpon_vendors={"syrotech_gpon"})
 
     def test_onu_pon_limit_defaults_to_none_so_the_global_cap_applies(self):
-        # NOT 64: an unset OLT must keep following cfg.onu_pon_limit, or the
-        # global setting would stop reaching every box ever saved from the form
         clean = clean_device_payload(
             {"name": "OLT-1", "ip_address": "10.0.0.4", "device_type": "OLT"},
             parents={}, device_id=None)
         self.assertIsNone(clean["onu_pon_limit"])
 
     def test_onu_pon_limit_accepted_on_an_olt(self):
-        # the GPON case this exists for: 1:128, so a full-ish PON on a GPON box
-        # stops false-paging "at capacity" at the EPON 64
         clean = clean_device_payload(
             {"name": "OLT-1", "ip_address": "10.0.0.4", "device_type": "OLT",
              "onu_pon_limit": 128}, parents={}, device_id=None)
         self.assertEqual(clean["onu_pon_limit"], 128)
 
     def test_onu_pon_limit_ignored_on_a_non_olt(self):
-        # nothing but an OLT has PONs; a cap elsewhere is a value no code reads
         clean = clean_device_payload(
             {"name": "SW", "ip_address": "10.0.0.4", "device_type": "switch",
              "onu_pon_limit": 128}, parents={}, device_id=None)
@@ -263,8 +250,6 @@ class NormalizeWebAccessTest(unittest.TestCase):
         return normalize_web_access(clean_web_access_payload(data), device_ip)
 
     def test_same_ip_standard_port_is_dropped(self):
-        # The reported case: re-typing the device's own IP on 443 reaches nothing
-        # new, so it must not be stored (it would strand the http/https fallback).
         self.assertEqual(
             self._norm({"web_ip": "10.62.62.6", "web_port": 443}),
             {"web_ip": None, "web_port": None, "web_scheme": None})
@@ -273,7 +258,6 @@ class NormalizeWebAccessTest(unittest.TestCase):
             {"web_ip": None, "web_port": None, "web_scheme": None})
 
     def test_bare_scheme_on_same_host_is_dropped(self):
-        # scheme-only resolves to same-IP:80/443 — redundant with the plain buttons.
         self.assertEqual(
             self._norm({"web_scheme": "https"}),
             {"web_ip": None, "web_port": None, "web_scheme": None})
@@ -284,8 +268,6 @@ class NormalizeWebAccessTest(unittest.TestCase):
             {"web_ip": "203.0.113.9", "web_port": 443, "web_scheme": "https"})
 
     def test_same_ip_nonstandard_port_keeps_port_drops_ip(self):
-        # A genuine same-host port-forward (e.g. :8443) is a real override, but the
-        # redundant IP is dropped so a re-parent can't pin a stale host.
         self.assertEqual(
             self._norm({"web_ip": "10.62.62.6", "web_port": 8443, "web_scheme": "https"}),
             {"web_ip": None, "web_port": 8443, "web_scheme": "https"})

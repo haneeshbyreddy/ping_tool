@@ -9,6 +9,13 @@ User=haneeshbyreddy
 WorkingDirectory=/home/haneeshbyreddy/ping_tool
 ExecStart=/home/haneeshbyreddy/ping_tool/.venv/bin/python3 apps/central/main.py
 EnvironmentFile=/home/haneeshbyreddy/ping_tool/deploy/central.env
+# ThreadingHTTPServer runs a thread per request and glibc gives each its own 64 MB
+# malloc arena (cap = 8 x cores, so 16 on this 2-core box). Freed memory returns to
+# the arena, never to the kernel, so short-lived per-request allocations — above all
+# the per-call SQLite page caches — scatter across every arena and permanently raise
+# the floor. Measured 2026-08-10: 16 arenas held 841 MB of a 978 MB RSS. Capping at 2
+# trades a little allocator contention for ~800 MB of ceiling on a 3.8 GB box.
+Environment=MALLOC_ARENA_MAX=2
 Restart=always
 RestartSec=3
 

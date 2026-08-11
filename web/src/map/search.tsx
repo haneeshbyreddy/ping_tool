@@ -1,6 +1,3 @@
-// Map search: instant device match + subscriber (ONU) lookup + OSM Nominatim
-// geocoding (browser-side, debounced 450ms + 3-char floor — stay a polite
-// keyless client; results are boxed to the org's map area).
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { MapPin, Search, Users } from "lucide-react"
@@ -17,26 +14,15 @@ import { isRefDark, refTitle } from "@/map/refonu"
 
 export interface PlaceHit { label: string; lat: number; lng: number }
 
-/** A subscriber the search found. `place` null = the MAC is in the roster but
- *  nobody has recorded where it is — a DIFFERENT answer from "no such
- *  subscriber", and the map has to say which one it is giving. */
 export interface OnuHit {
   mac: string
-  /** what to call them — the operator's own name when one was typed */
   who: string
-  /** "OLT · PON" — which OLT a sticker turned out to be on is usually the
-   *  answer a MAC lookup was after, so it rides the row rather than a click */
   where: string
   place: OnuPlace | null
 }
 
-/** Mirrors `central/api/devices.py:ONU_SEARCH_MIN`. Two characters of a MAC
- *  match half a fleet, and the server refuses a shorter needle anyway. */
 const ONU_MIN = 3
 
-// OSM Nominatim, browser-side (CORS-open, keyless — same trust model as the tile
-// CDN). Debounced + min 3 chars keeps us a polite interactive client; results are
-// boxed to the org's Settings map area so "Kondapur" finds yours, not Kolkata's.
 async function geocode(q: string, bounds: [number, number, number, number] | null): Promise<PlaceHit[]> {
   const params = new URLSearchParams({ q, format: "jsonv2", limit: "6" })
   if (bounds) {
@@ -70,23 +56,9 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
         d.name.toLowerCase().includes(needle) || d.ip_address.includes(needle)).slice(0, 6)
     : []
 
-  // Subscribers. A tech holds a sticker MAC or a customer name, and neither is
-  // an `org_devices` row — ONUs live in the SNMP roster — so a search box that
-  // only knows devices answers "nothing found" about a drop somebody surveyed
-  // this morning. Two sources, on purpose:
-  //
-  //   the PLACED set (`onu_places`) is matched CLIENT-side and instantly: it is
-  //   already cached for the map's own layer, it is small, and it is the set
-  //   this map can actually fly to — the answer to "where did my pin go";
-  //   the ROSTER (`onu-search`, debounced like the geocoder) covers every other
-  //   subscriber, which on a fleet mid-survey is nearly all of them. Without it
-  //   a real MAC reads as "no such subscriber", when the truth is "nobody has
-  //   recorded where that one is".
   const onuKey = onuSearchKey(q)
   const onuOn = open && !!org && onuKey.length >= ONU_MIN
   const placesQ = useQuery({
-    // same key + staleTime as map-page's own layer query, so this shares its
-    // cache rather than re-fetching the set already on screen
     queryKey: ["onu-places", org],
     queryFn: () => inventoryApi.onuPlaces(org),
     enabled: onuOn,
@@ -125,9 +97,6 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
         })
       }
     }
-    // Placed first: those are the ones this map can take you to. Within that,
-    // the roster's own slot order survives — a relevance sort would reshuffle
-    // the list as the operator types the tail of a MAC.
     return [...byMac.values()]
       .sort((a, b) => Number(!!b.place) - Number(!!a.place))
       .slice(0, 6)
@@ -177,9 +146,6 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
               <span className="ml-auto shrink-0 font-mono text-2xs text-muted-foreground">{d.ip_address}</span>
             </button>
           ))}
-          {/* A subscriber row states which of the two it is: a pin this map can
-              fly to, or a roster entry with no location on record. Rendering
-              them alike would make an unsurveyed drop look like a lost pin. */}
           {onuHits.map((h) => (
             <button key={`onu:${h.mac}`}
               className="flex w-full shrink-0 items-center gap-2 border-b px-3 py-1.5 text-left last:border-b-0 hover:bg-foreground/5"
@@ -190,18 +156,10 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
                 ? <StatusDot tone={!h.place.matched ? "muted"
                     : isRefDark(h.place) ? "destructive" : "success"} />
                 : <Users className="size-3.5 shrink-0 text-muted-foreground" />}
-              {/* TWO lines, unlike the device rows above: a subscriber's answer
-                  is "which OLT and which PON", and on a 288px panel that does
-                  not fit beside a customer name — one of the two ends up
-                  truncated to "HILL-OLT-1 · EP…", which is the half nobody
-                  needed. Same shape the survey's result list uses. */}
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5">
                   <span className="min-w-0 truncate text-xs font-medium">{h.who}</span>
                   {!h.place && <RowTag tone="muted">no pin</RowTag>}
-                  {/* a witness is somebody's claim about a power supply, not an
-                      ordinary drop — same word, same tone as the survey list, so
-                      one subscriber isn't described two ways in two screens */}
                   {h.place?.witness ? <Chip tone="info">reference</Chip> : null}
                 </span>
                 <span className="block truncate font-mono text-2xs text-muted-foreground">

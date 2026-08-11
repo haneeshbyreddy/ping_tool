@@ -47,8 +47,6 @@ function CopyField({ label, value, mask }: { label: string; value: string; mask?
 function CommandBlock({ command }: { command: string }) {
   return (
     <div className="relative rounded-lg bg-black p-3">
-      {/* wrap, don't scroll: an overflow-x pre needs min-w-0 on every flex ancestor
-          up the card, and one miss stretches the whole page (seen in review) */}
       <pre className="whitespace-pre-wrap break-all pr-8 font-mono text-xs leading-relaxed text-emerald-400">
         {command}
       </pre>
@@ -187,8 +185,6 @@ function ProbeRow({
   filtered?: boolean
   onFilter?: () => void
   view?: "list" | "grid"
-  /** operator palette name; the same colour tints the devices this probe
-   *  watches on the Network tree (topology-page.tsx:deviceColor) */
   color?: string | null
 }) {
   const queryClient = useQueryClient()
@@ -235,8 +231,6 @@ function ProbeRow({
 
   const stale = !!node.last_seen && isStale(node.last_seen)
 
-  // Semver, not inequality — a node AHEAD of central's newest known release (manual
-  // update before the release sync ran) must read as current, never as a downgrade offer.
   const updateAvailable = !!(node.version && latestVersion
     && isNewerVersion(latestVersion, node.version))
   const rolloutCoversNode = !!(rollout && updateAvailable
@@ -261,9 +255,6 @@ function ProbeRow({
 
   const grid = view === "grid"
 
-  // Pieces shared by the row and the card — the only difference is layout, so
-  // the badges/menu are built once. Responsive `hidden` guards that make sense
-  // in a tight row drop away in the roomier card (grid).
   const deviceBtn = onFilter != null && (deviceCount ?? 0) > 0 && (
     <button
       className={cn(
@@ -331,8 +322,6 @@ function ProbeRow({
           <MoreVertical className="size-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      {/* w-auto: the primitive defaults to the TRIGGER's width, and this trigger
-          is a size-6 icon — items wrapped and the swatch row overflowed */}
       <DropdownMenuContent align="end" className="w-auto min-w-52">
         {updateAvailable && (
           <DropdownMenuItem disabled={update.isPending}
@@ -359,8 +348,6 @@ function ProbeRow({
         <DropdownMenuItem variant="destructive" onClick={() => confirmDelete.ask()}>
           <Trash2 /> Delete
         </DropdownMenuItem>
-        {/* Colour-code the probe. Not a menu ITEM — picking a swatch must not
-            close the menu mid-decision, so it's a row inside the menu. */}
         <DropdownMenuSeparator />
         <div className="flex items-center gap-2 px-2 py-1.5"
           onClick={(e) => e.stopPropagation()}>
@@ -463,8 +450,6 @@ export function ProbesPanel({
     refetchInterval: 30_000,
   })
 
-  // Plan + probe cap, so Register can surface the paywall up front instead of
-  // after a 422 (shared cache key with Settings / the device panel).
   const billing = useQuery({
     queryKey: ["billing", org],
     queryFn: () => billingApi.get(org),
@@ -487,7 +472,6 @@ export function ProbesPanel({
   })
 
   const nodes = data?.nodes ?? []
-  // Cap counts live credentials (registered, un-revoked), matching the server.
   const activeNodeCount = nodes.filter((n) => n.registered && !n.revoked_at).length
   const nodeCap = billing.data?.node_cap ?? null
   const atNodeCap = nodeCap != null && activeNodeCount >= nodeCap

@@ -75,15 +75,6 @@ def _pings_payload(results: dict[str, PingResult]) -> dict:
         for ip, r in results.items()
     }
 
-# Per-device, per-subsystem SNMP sweep outcomes, reported to central alongside the
-# data itself ("snmp_status" on the full report). The states are a CLOSED vocabulary
-# the dashboard's guided troubleshooting switches on — extend deliberately:
-#   ok          data landed (count says how much)
-#   empty       agent answered but the subtree had nothing usable
-#   no_response agent never answered — community/ACL/SNMP-off, fix on the device
-#   timeout     walk ran past its budget — big table or rate-limited agent
-#   no_profile  agent identified itself but no vendor profile claims it
-#   error       anything else (detail carries the message)
 
 def _snmp_target(d: dict) -> SnmpTarget:
     return SnmpTarget(ip=d["ip_address"], community=d.get("snmp_community") or "",
@@ -91,18 +82,6 @@ def _snmp_target(d: dict) -> SnmpTarget:
                       version=d.get("snmp_version") or "2c")
 
 class _SnmpAirtime:
-    """One SNMP airtime gate shared by every subsystem that talks SNMP.
-
-    Two layers: a fleet-wide semaphore (snmp_max_inflight) bounding total
-    concurrent walks — per-gatherer semaphores bounded each subsystem
-    separately, so "4 concurrent" was really up to 12 — and a per-device lock
-    so two subsystems never walk the SAME agent at once. With all three sweep
-    clocks on the same 300s period they fire on the same tick every time;
-    serializing per box is what keeps a weak C-Data agent from being
-    triple-walked (the v0.15.10 lesson: our concurrency reads from outside as
-    device failure). Acquisition order is device lock FIRST — a walk queued
-    behind the same box's other walk must not pin a fleet-wide slot.
-    """
 
     def __init__(self, limit: int) -> None:
         self._sem = asyncio.Semaphore(max(1, limit))
@@ -218,9 +197,6 @@ async def _gather_onu_optics(
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         target = _snmp_target(d)
         async with gate.slot(d["ip_address"]):
-            # Vendor resolution inside the gate: the auto-detect path may do a
-            # one-varbind sysObjectID read, and ALL SNMP I/O stays bounded. None =
-            # no profile claims this box — optics deliberately off, never guessed.
             poller, info = await pool.resolve_info(d, target)
             status: dict = {"sysobjectid": info.get("sysobjectid"),
                             "profile": info.get("vendor")}
@@ -265,15 +241,6 @@ def _merge_snmp_status(into: dict[int, dict], subsystem: str,
         into.setdefault(dev_id, {})[subsystem] = st
 
 class _DiagWalkRunner:
-    """Runs central-queued diagnostic SNMP walks (reply key "snmp_walks").
-
-    Deliberately boring: sequential (one walk at a time — a diagnostic must never
-    compete with the monitoring sweeps for SNMP airtime), dedupes directive ids
-    (central re-delivers a pending walk every report until its result lands, so a
-    restart mid-walk just re-runs it), and refuses any target that isn't in the
-    device list this node currently probes — central names devices, never raw IPs.
-    A failed result upload un-marks the id so the next re-delivery retries it.
-    """
 
     def __init__(self, client: CentralBrainClient, cfg: Config = CONFIG,
                  walker=None, gate: _SnmpAirtime | None = None) -> None:
@@ -317,17 +284,10 @@ class _DiagWalkRunner:
                     ip=w["ip_address"], community=w.get("snmp_community") or "",
                     port=w.get("snmp_port") or 161,
                     version=w.get("snmp_version") or "2c")
-                # Under the shared airtime gate: a diagnostic of a weak box
-                # mid-sweep is exactly the same-agent collision the gate exists
-                # to prevent.
                 async with self._gate.slot(target.ip):
                     res = await self._walker.walk(
                         target, w.get("root_oid") or "1.3.6.1",
                         int(w.get("max_varbinds") or 2000))
-                # `truncated` travels with the result: a walk that stopped at the
-                # budget looks EXACTLY like a complete one once it's a row in the
-                # dashboard, and reading "the table isn't there" off a walk that
-                # died halfway is how a vendor onboarding loses an afternoon.
                 self._client.walk_result(
                     wid, varbinds=[[o, v] for o, v in res.varbinds],
                     truncated=res.truncated)
@@ -381,8 +341,6 @@ def _send_heartbeat(client: CentralBrainClient, cfg: Config, fleet_size: int) ->
         log.warning("central heartbeat failed: %s", exc)
         return
     if (reply or {}).get("restart"):
-        # Central-driven bounce: the supervisor consumes this file and restarts
-        # us. Same drop-a-file handoff as the update directive below.
         restart_path = Path(cfg.db_path).parent / "restart_request.json"
         tmp = restart_path.with_name("restart_request.json.tmp")
         restart_path.parent.mkdir(parents=True, exist_ok=True)
@@ -443,9 +401,7 @@ async def run_cycle_central_brain(
     if walk_runner is not None:
         walk_runner.accept(reply.get("snmp_walks"), devices)
     if proxy_tunnel is not None:
-        # dormant-until-session (webplan.md §2): this reply key is the wake-up
         proxy_tunnel.notify_sessions(reply.get("proxy_sessions"))
-        # web-proxy org ⇒ one standby long-poll so first connect is instant
         proxy_tunnel.notify_standby(bool(reply.get("proxy_standby")))
     if cfg.retry_interval_s > 0:
         await _follow_recheck(prober, client, reply, cfg)
@@ -515,11 +471,6 @@ async def _run_central_brain(
     gpon_profiles = topo.get("gpon_profiles")
 
     def _pick_interval(central_s) -> float:
-        # CLI flag > central org setting (dashboard, refreshed every cycle) >
-        # env/adaptive default. The central value is clamped to the same 10–120s
-        # window the API enforces — a stale/hand-edited row must never stretch the
-        # cadence past the fleet watchdog's stale threshold (180s default) or a
-        # healthy probe pages NODE_STALE.
         if cli_interval is not None:
             return cli_interval
         try:
@@ -539,10 +490,6 @@ async def _run_central_brain(
         f"[prober={cfg.prober}] (Ctrl-C to stop)"
     )
 
-    # snmp_interval_s <= 0 disables SNMP wholesale (master gate); each subsystem
-    # then rides its own clock below. ONE airtime gate spans all of them (plus
-    # the diag runner) so a weak agent is never walked by two subsystems at
-    # once and the fleet-wide inflight bound is real, not per-subsystem.
     airtime = _SnmpAirtime(cfg.snmp_max_inflight) if cfg.snmp_interval_s > 0 else None
     snmp_poller = build_snmp_poller(cfg) if cfg.snmp_interval_s > 0 else None
     next_ports = 0.0
@@ -558,15 +505,6 @@ async def _run_central_brain(
     walk_runner = (_DiagWalkRunner(client, cfg, gate=airtime)
                    if cfg.snmp_interval_s > 0 else None)
 
-    # Web-UI proxy tunnel: activation is CENTRAL-DRIVEN — the machinery is
-    # built by default (v0.15.8+) but stays DORMANT until a /report reply
-    # carries live proxy_sessions (notify_sessions in the cycle; central only
-    # sends them for orgs with web_proxy on), standing down when they lapse.
-    # WISP_PROXY_ENABLED=0 is the per-edge kill switch (tunnel never built).
-    # Its own central client so a 25s long-poll never ties up a connection the
-    # probe/report path needs. `lambda: devices` reads the daemon's live device
-    # list (reassigned each cycle, late-bound) so the allow-list tracks
-    # re-parenting/removals with no plumbing.
     proxy_client = build_central_client(cfg) if cfg.proxy_enabled else None
     proxy_tunnel = (build_proxy_tunnel(proxy_client, cfg, lambda: devices)
                     if proxy_client is not None else None)
@@ -579,8 +517,6 @@ async def _run_central_brain(
                 devices = topo.get("devices") or devices
                 canary_ip = topo.get("canary_ip") or canary_ip
                 snmp_profiles = topo.get("snmp_profiles") or snmp_profiles
-                # None (older central) keeps last-known; [] is a real "no
-                # central profiles" and must clear them, so no `or` fallback.
                 if topo.get("gpon_profiles") is not None:
                     gpon_profiles = topo.get("gpon_profiles")
                 new_interval = _pick_interval(topo.get("poll_interval_s"))
@@ -592,12 +528,6 @@ async def _run_central_brain(
             except CentralClientError as exc:
                 log.warning("topology refresh failed, probing last-known set: %s", exc)
         started = asyncio.get_running_loop().time()
-        # Three independent clocks (config.py): each subsystem is gated ONLY on its own
-        # task, so a slow roster walk can no longer hold the ports/health sweeps back —
-        # nor keep them fighting it for the same weak agent's airtime every tick.
-        # next_* is stamped at sweep START (period semantics, matching the old single
-        # clock); a walk that overruns its own period still self-throttles to
-        # back-to-back, which on that box is already a broken-agent signal.
         if max_cycles is None:
             if snmp_poller is not None and snmp_task is None and started >= next_ports:
                 snmp_task = asyncio.create_task(
@@ -668,16 +598,10 @@ async def _run_central_brain(
             close()
 
 def print_status(*, now=None) -> int:
-    """`wisp-edge status` — the tray's truth surface, for headless boxes.
 
-    Reads the same status.json the Windows tray renders. Exit code: 0 healthy,
-    1 starting/degraded, 2 stale/error/never-reported (scriptable).
-    """
     from wisp.runtime import edge_status
     path = edge_status.status_path(CONFIG.db_path)
     if not path.is_file():
-        # Interactive shells don't source the systemd EnvironmentFile, so
-        # WISP_DB is usually unset here — fall back to the .deb's layout.
         deb_path = Path("/etc/wisp/status.json")
         if deb_path.is_file():
             path = deb_path

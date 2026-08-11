@@ -55,16 +55,12 @@ class PerfSweepTest(unittest.TestCase):
         return self.store.device_perf_state(ORG, self.dev)
 
     def _queued(self):
-        # Perf alerts are DIGEST-tier now: they queue, they don't push. The
-        # transition-only contract still holds — one queued row per change.
         return self.store.pending_digest(ORG)
 
     def _clear_queue(self):
         self.store.mark_digests_sent(ORG, "2026-01-01T00:30:00+00:00")
 
     def test_sustained_degradation_writes_badge_off(self):
-        # Perf is OFF for now (allowlist): the badge state is written but nothing
-        # pushes or queues to the dormant digest.
         self._feed([(8.0, 0.0, 2.0, UP)] * 15 + [(120.0, 0.0, 2.0, UP)] * 3)
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._queued(), [])

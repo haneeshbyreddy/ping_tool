@@ -3,11 +3,6 @@ import { X } from "lucide-react"
 import { PALETTE, paletteName, paletteVar, type PaletteColor } from "@/lib/palette"
 import { cn } from "@/lib/utils"
 
-/** The closed-palette picker: six swatches plus "no colour".
- *
- *  Deliberately a fixed row rather than a colour input — see lib/palette.ts for
- *  why the set is closed. Small enough to live inside a dropdown or a table row,
- *  which is the point: colouring a tag shouldn't be a trip to Settings. */
 export function ColorSwatches({ value, onPick, className }: {
   value?: string | null
   onPick: (color: PaletteColor | null) => void

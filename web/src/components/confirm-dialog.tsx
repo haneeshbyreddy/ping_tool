@@ -5,13 +5,6 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog"
 
-/* One confirmation pattern for every destructive action — replaces both the
-   native confirm() and the no-confirm one-click deletes.
-
-   `requireText` raises the bar for the handful of actions with no undo AND no
-   backup (deleting an org): the operator types the name back before the button
-   arms, so a mis-click can't do it. Reserve it — asking people to type on
-   routine deletes trains them to type without reading. */
 export function ConfirmDialog({
   open, onOpenChange, title, description, confirmLabel = "Delete", requireText, onConfirm,
 }: {
@@ -24,7 +17,6 @@ export function ConfirmDialog({
   onConfirm: () => void
 }) {
   const [typed, setTyped] = useState("")
-  // a reopen must start from an empty box, never a still-armed button
   useEffect(() => { if (open) setTyped("") }, [open])
   const armed = !requireText || typed.trim() === requireText
 
@@ -60,8 +52,6 @@ export function ConfirmDialog({
   )
 }
 
-/* Local open/close state folded in — callers keep a one-liner call site:
-   const del = useConfirm(); del.ask() to open, <ConfirmDialog {...del.props}/> */
 export function useConfirm() {
   const [open, setOpen] = useState(false)
   return {

@@ -1,11 +1,3 @@
-"""Web-UI proxy — full round trip: browser -> central -> edge -> stub device -> back.
-
-This is the M0 spike proof (webplan.md). A real central server, the real edge
-ProxyTunnel worker, and a stub HTTP "device" — a browser GET to
-/api/proxy/<sid>/... comes back carrying the device's own bytes, proving the
-reverse tunnel end to end. The on-site test against a real switch/OLT stays the
-operator's; here the device is local so the mechanism is exercised honestly.
-"""
 import asyncio
 import base64
 import http.client
@@ -31,12 +23,6 @@ from wisp.runtime.central_client import build_central_client
 
 
 class _StubDevice(BaseHTTPRequestHandler):
-    """Stands in for a switch/OLT web UI: echoes method + path so the test can
-    prove the request reached it faithfully."""
-
-    # How many times each path has actually been fetched. The asset-cache tests
-    # assert on this rather than on the reply: "the browser got the bytes" is
-    # true either way, and the whole point is that the DEVICE was not asked.
     hits: dict = {}
 
     def _serve(self, body: bytes, ctype: str, extra=()):
@@ -60,8 +46,6 @@ class _StubDevice(BaseHTTPRequestHandler):
         base = self.path.split("?")[0]
         _StubDevice.hits[base] = _StubDevice.hits.get(base, 0) + 1
         if base == "/app.js":
-            # the ordinary case: a static script with no cache headers at all,
-            # which is exactly what the C-Data firmware serves
             self._serve(b"var wisp=1;/* /app.js */", "application/javascript")
             return
         if base == "/session.js":
@@ -85,7 +69,6 @@ class _StubDevice(BaseHTTPRequestHandler):
             self._serve(b'@import url(/deep/other.css);', "text/css")
             return
         if self.path == "/headers":
-            # echo the request headers the login-flow fix must forward
             lines = [f"{k}: {self.headers.get(k)}"
                      for k in ("Cookie", "Referer", "Origin", "Content-Type")]
             body = "\n".join(lines).encode()
@@ -96,7 +79,6 @@ class _StubDevice(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == "/redirect":
-            # old-firmware style: root-absolute redirect + root-scoped cookie
             self.send_response(302)
             self.send_header("Location", "/login")
             self.send_header("Set-Cookie", "DEVSID=abc; Path=/; HttpOnly")
@@ -126,13 +108,11 @@ class ProxyRoundTripTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
 
-        # 1) stub device on an ephemeral port
         self.device = ThreadingHTTPServer(("127.0.0.1", 0), _StubDevice)
         self.dev_port = self.device.server_address[1]
         self.dev_thread = threading.Thread(target=self.device.serve_forever, daemon=True)
         self.dev_thread.start()
 
-        # 2) central — proxy on, device's port whitelisted as a mgmt port
         self.cfg = Config(
             central_db=Path(self.tmp.name) / "central.db",
             central_bind="127.0.0.1", central_port=0, central_token="s3cret",
@@ -145,7 +125,6 @@ class ProxyRoundTripTest(unittest.TestCase):
             "name": "SW", "ip_address": "127.0.0.1", "device_type": "switch",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
         auth.create_user(self.store, "ispA", "owner", "ownerpassword", "owner")
-        # M1: the proxy is opt-in per org (superadmin-set capability flag)
         self.store.set_org_web_proxy("ispA", True)
 
         self.server = make_server(self.cfg, self.store)
@@ -154,7 +133,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.srv_thread.start()
         self.cookie = self._login("owner", "ownerpassword")
 
-        # 3) the real edge tunnel, pointed back at central
         self.edge_cfg = Config(
             central_url=f"http://127.0.0.1:{self.port}", central_token="s3cret",
             org_id="ispA", node_id="edge-1",
@@ -175,7 +153,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.dev_thread.join(timeout=2)
         self.tmp.cleanup()
 
-    # -- helpers ---------------------------------------------------------------
 
     def _login(self, username, password) -> str:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -222,8 +199,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         return resp.status, doc
 
     def _round_trip(self, method, path, devices, body=None, extra=None):
-        """Fire the (blocking) browser request in a thread, serve one request from
-        the edge, return the browser's result."""
         out = {}
         t = threading.Thread(target=self._browser, args=(method, path, out),
                              kwargs={"body": body, "extra": extra})
@@ -234,7 +209,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         t.join(timeout=12)
         return served, out
 
-    # -- tests -----------------------------------------------------------------
 
     def test_session_requires_login(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -255,7 +229,7 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertTrue(served)
         self.assertEqual(out["status"], 200)
         self.assertIn(b"STUB-DEVICE GET", out["body"])
-        self.assertIn(b"/status?vlan=7", out["body"])  # path + query forwarded
+        self.assertIn(b"/status?vlan=7", out["body"])
 
     def test_post_body_reaches_device(self):
         _, sess = self._open_session()
@@ -265,11 +239,10 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertTrue(served)
         self.assertEqual(out["status"], 200)
         self.assertIn(b"STUB-DEVICE POST", out["body"])
-        self.assertIn(b"got8", out["body"])  # device saw the 8-byte body
+        self.assertIn(b"got8", out["body"])
 
     def test_edge_refuses_device_not_in_its_list(self):
         _, sess = self._open_session()
-        # The edge's live device list does NOT contain 127.0.0.1 -> refuse.
         served, out = self._round_trip(
             "GET", f"/api/proxy/{sess['sid']}/status",
             devices=[{"ip_address": "10.0.0.250"}])
@@ -294,16 +267,12 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertIn("proxy_mgmt_ports", body.get("error", ""))
 
     def test_web_access_override_endpoint_used(self):
-        # The device's admin page is declared at a specific endpoint (here the stub
-        # device). The browser sends NO port, so the classic path would default to
-        # 80 and be rejected (80 isn't a mgmt port here) — a working round-trip
-        # proves the override endpoint won and drove the tunnel.
         self.store.set_org_device_web_access(
             "ispA", self.device_id, web_ip="127.0.0.1", web_port=self.dev_port,
             web_scheme="http")
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("POST", "/api/proxy/session",
-                     body=json.dumps({"device_id": self.device_id}),  # no port
+                     body=json.dumps({"device_id": self.device_id}),
                      headers={"Content-Type": "application/json", "Cookie": self.cookie})
         resp = conn.getresponse()
         sess = json.loads(resp.read() or "{}")
@@ -317,7 +286,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(out["status"], 200)
         self.assertIn(b"STUB-DEVICE GET", out["body"])
 
-    # -- M1: sessions + security -------------------------------------------------
 
     def test_session_requires_org_capability_flag(self):
         self.store.set_org_web_proxy("ispA", False)
@@ -326,10 +294,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertIn("not enabled", body.get("error", ""))
 
     def test_worker_role_cannot_open_session(self):
-        # The tunnel stays owner-only. Since roles collapsed to owner+worker
-        # (2026-07-21) `worker` is the only non-owner org role, and it is now
-        # refused TWICE over: server.py's _WORKER_ROUTES whitelist answers
-        # first (a proxy route isn't on it), with _PROXY_ROLES behind it.
         auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
         cookie = self._login("w1", "workerpassword1")
         status, _ = self._api("POST", "/api/proxy/session",
@@ -338,8 +302,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_worker_cannot_drive_owner_session(self):
-        # even a session an owner left live must not be browsable by a worker
-        # who can see its sid.
         _, sess = self._open_session()
         auth.create_user(self.store, "ispA", "w1", "workerpassword1", "worker")
         cookie = self._login("w1", "workerpassword1")
@@ -368,16 +330,8 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(rows[0]["status"], 200)
         self.assertEqual(rows[0]["device_id"], self.device_id)
 
-    # -- per-session static-asset cache (2026-07-29) ----------------------------
-    #
-    # 44% of every request this tunnel had ever carried was a re-fetch of an
-    # unchanging asset inside ONE session, and on a weak embedded HTTPS stack
-    # each of those cost a full TCP+TLS handshake — 1.00s per asset, a
-    # 7-second page. These tests pin what may and may not be remembered.
 
     def _cached_get(self, sid, path):
-        """A browser request with NO edge serving it — so a 200 here proves the
-        answer came from central's memo and the device was never asked."""
         out = {}
         self._browser("GET", f"/api/proxy/{sid}{path}", out)
         return out
@@ -392,14 +346,11 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(first["status"], 200)
         second = self._cached_get(sess["sid"], "/app.js")
         self.assertEqual(second["status"], 200)
-        # byte-identical to the miss: a hit replays the SAME rewriting path
         self.assertEqual(second["body"], first["body"])
         self.assertEqual(_StubDevice.hits["/app.js"], 1,
                          "the device was fetched twice — the cache did nothing")
 
     def test_a_cache_hit_is_still_audited(self):
-        """The audit answers 'who opened what'. Dropping cached requests would
-        make it stop reflecting what a human actually browsed."""
         _, sess = self._open_session()
         self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js",
                          devices=[{"ip_address": "127.0.0.1"}])
@@ -410,8 +361,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual({r["status"] for r in rows}, {200})
 
     def test_a_dynamic_page_is_never_cached(self):
-        """This vendor's DYNAMIC pages are .html (/action/onuauthinfo.html) —
-        the exact class a looser rule would start serving stale."""
         _StubDevice.hits.clear()
         _, sess = self._open_session()
         self._round_trip("GET", f"/api/proxy/{sess['sid']}/page.html",
@@ -424,8 +373,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(_StubDevice.hits["/page.html"], 2)
 
     def test_a_reply_carrying_session_state_is_never_cached(self):
-        """A static extension is a hint about the URL, never a promise about
-        the response: Set-Cookie, no-store and Vary each disqualify one."""
         _StubDevice.hits.clear()
         _, sess = self._open_session()
         for path in ("/session.js", "/nostore.js", "/vary.js"):
@@ -451,9 +398,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(_StubDevice.hits["/missing.js"], 2)
 
     def test_the_firmwares_own_cache_busting_still_reaches_the_device(self):
-        """`/js/misc.js?rand=52258` carries a fresh number per page load. The
-        query is part of the key, so the bust keeps working — second-guessing a
-        deliberate one is how a cache starts serving a page nobody can explain."""
         _StubDevice.hits.clear()
         _, sess = self._open_session()
         self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js?rand=1",
@@ -465,10 +409,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(_StubDevice.hits["/app.js"], 2)
 
     def test_jquerys_own_cache_buster_does_not_defeat_the_cache(self):
-        """`_=<ts>` is appended by `$.ajax({cache:false})` to everything — the
-        client library talking about the browser cache, not the vendor talking
-        about the resource. 20% of this tunnel's traffic is a static .properties
-        table wearing one, so keying it literally is a permanent miss."""
         _StubDevice.hits.clear()
         _, sess = self._open_session()
         self._round_trip("GET", f"/api/proxy/{sess['sid']}/app.js?_=111",
@@ -478,13 +418,10 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(_StubDevice.hits["/app.js"], 1)
 
     def test_the_cache_does_not_survive_into_a_new_session(self):
-        """It lives ON the session, so it dies with the credential that opened
-        it — there is no cross-session (let alone cross-org) key to get wrong."""
         _StubDevice.hits.clear()
         _, first = self._open_session()
         self._round_trip("GET", f"/api/proxy/{first['sid']}/app.js",
                          devices=[{"ip_address": "127.0.0.1"}])
-        # the edge has polled by now, so the second open runs a real preflight
         tunnel = ProxyTunnel(self.edge_client, self.edge_cfg,
                              devices_provider=lambda: [{"ip_address": "127.0.0.1"}])
         _, second = self._open_with_tunnel(tunnel)
@@ -496,9 +433,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(_StubDevice.hits["/app.js"], 2)
 
     def test_a_cached_body_is_still_rewritten_into_the_session_prefix(self):
-        """The cache stores the DEVICE's raw reply, so a hit runs the identical
-        rewrite pipeline. Caching post-rewrite bytes would work today and break
-        the moment anything downstream became session-dependent."""
         _StubDevice.hits.clear()
         _, sess = self._open_session()
         _, first = self._round_trip("GET", f"/api/proxy/{sess['sid']}/linked.css",
@@ -542,7 +476,7 @@ class ProxyRoundTripTest(unittest.TestCase):
         cookie = self._login("w1", "workerpassword1")
         status, _ = self._api("GET", "/api/proxy/audit", cookie=cookie)
         self.assertEqual(status, 403)
-        status, doc = self._api("GET", "/api/proxy/audit")  # owner
+        status, doc = self._api("GET", "/api/proxy/audit")
         self.assertEqual(status, 200)
         self.assertIn("audit", doc)
 
@@ -578,8 +512,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         return reply
 
     def test_report_reply_carries_standby_flag_for_proxy_org(self):
-        # No live session: the flag alone keeps one edge long-poll warm so the
-        # FIRST browser connect doesn't wait a report cycle (2026-07-20 fix).
         reply = self._report()
         self.assertTrue(reply.get("proxy_standby"))
         self.assertNotIn("proxy_sessions", reply)
@@ -606,13 +538,9 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertTrue(served)
         self.assertIn(f'href="/api/proxy/{sess["sid"]}/style.css"'.encode(),
                       out["body"])
-        # plain relative refs must pass through untouched
         self.assertIn(b"src=logo.png", out["body"])
 
     def test_browser_headers_forwarded_but_dashboard_cookie_stripped(self):
-        # The device login flow depends on ITS cookie coming back on every
-        # request; central's own session cookie must never leave the house, and
-        # Referer is rewritten to the device origin (firmwares CSRF-check it).
         _, sess = self._open_session()
         sid = sess["sid"]
         served, out = self._round_trip(
@@ -627,9 +555,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertIn(f"Referer: http://127.0.0.1:{self.dev_port}/page.html", text)
 
     def test_escaped_root_absolute_url_rescued_via_referer(self):
-        # Device JS builds "/js/x.js" — it escapes the sid prefix and lands on
-        # central as an unknown route. With a live session in the Referer the
-        # server must bounce it back inside the tunnel, method preserved.
         _, sess = self._open_session()
         sid = sess["sid"]
         ref = {"Referer": f"http://127.0.0.1:{self.port}/api/proxy/{sid}/index.html"}
@@ -644,12 +569,9 @@ class ProxyRoundTripTest(unittest.TestCase):
         headers = {k.lower(): v for k, v in out["headers"]}
         self.assertEqual(headers["location"], f"/api/proxy/{sid}/action/login.html")
 
-    # -- session-open preflight ---------------------------------------------------
 
     def _open_with_tunnel(self, tunnel, device_id=None):
-        """Prime polled_recently, then open a session while the tunnel serves
-        the resulting preflight probe."""
-        self.edge_client.proxy_next(0.05)  # stamps last_poll on the hub
+        self.edge_client.proxy_next(0.05)
         result = {}
         t = threading.Thread(target=lambda: result.update(
             dict(zip(("status", "body"), self._open_session(device_id)))))
@@ -659,9 +581,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         return result.get("status"), result.get("body")
 
     def test_preflight_adopts_answering_scheme(self):
-        # Owner declared the endpoint without pinning a scheme; the heuristic
-        # says http (non-443 port) but only https answers — the session must
-        # adopt https, proven by the scheme the edge is later told to fetch.
         self.store.set_org_device_web_access(
             "ispA", self.device_id, web_ip="127.0.0.1", web_port=self.dev_port,
             web_scheme=None)
@@ -706,28 +625,23 @@ class ProxyRoundTripTest(unittest.TestCase):
         status, body = self._open_with_tunnel(tunnel)
         self.assertEqual(status, 502)
         self.assertIn("unreachable", body.get("error", ""))
-        # the failed open must not leave a live session behind
         _, doc = self._api("GET", "/api/proxy/sessions")
         self.assertEqual([s for s in doc["sessions"] if s["status"] == "open"], [])
 
     def test_no_recent_poll_skips_preflight(self):
-        # Dormant tunnel / pre-standby edge: the open must not stall — the
-        # heuristic target is kept and the session opens immediately.
         before = time.monotonic()
         status, sess = self._open_session()
         self.assertEqual(status, 200, sess)
         self.assertLess(time.monotonic() - before, 3.0)
 
     def test_old_edge_fetch_reply_keeps_heuristic(self):
-        # An old edge doesn't know kind="preflight" and answers with a normal
-        # page fetch — central must keep the heuristic target and still open.
         from wisp.central.api import proxy as proxy_api
         self.edge_client.proxy_next(0.05)
         result = {}
         t = threading.Thread(target=lambda: result.update(
             dict(zip(("status", "body"), self._open_session()))))
         t.start()
-        req = self.edge_client.proxy_next(5.0)   # old edge: plain fetch reply
+        req = self.edge_client.proxy_next(5.0)
         self.assertEqual(req.get("kind"), "preflight")
         self.edge_client.proxy_reply(
             req["sid"], req["req_id"], 200, {},
@@ -736,8 +650,6 @@ class ProxyRoundTripTest(unittest.TestCase):
         self.assertEqual(result.get("status"), 200, result.get("body"))
 
     def test_one_session_per_node_newest_wins(self):
-        # Opening a second session on the same probe replaces the first: the
-        # old sid stops browsing (404) and its record reads closed, not open.
         _, first = self._open_session()
         status, second = self._open_session()
         self.assertEqual(status, 200, second)

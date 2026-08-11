@@ -1,4 +1,3 @@
-"""Probe-node enrollment tokens and manual fleet updates."""
 from __future__ import annotations
 
 from wisp.central import billing, inventory
@@ -8,10 +7,6 @@ from wisp.version import is_newer
 
 
 def _probe_cap_blocked(h, org: str) -> bool:
-    # Paywall probe cap (central/billing.py) — counts live credentials only
-    # (revoked ones don't hold a slot). Gated on REGISTRATION and on rotating
-    # a REVOKED token back to life, so a downgrade never kills a probe that's
-    # already reporting.
     plan = h.store.org_plan(org)
     cap = billing.node_cap(plan)
     if cap is None or h.store.active_node_token_count(org) < cap:
@@ -66,7 +61,6 @@ def rotate(h, user, body):
     if not status:
         raise inventory.InventoryError(
             f"node {node_id!r} isn't registered for {org!r} yet")
-    # rotating a LIVE token is free; un-revoking one adds a probe → capped
     if status.get("revoked_at") and _probe_cap_blocked(h, org):
         return
     node_token = h.store.issue_node_token(org, node_id, created_by=user["id"])
@@ -95,7 +89,6 @@ def delete(h, user, body):
 
 
 def color(h, user, body):
-    """Colour-code a probe. Presentation only — nothing reads it but the SPA."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return

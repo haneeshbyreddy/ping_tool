@@ -17,7 +17,6 @@ const AREA_LABEL: Record<OverviewProblem["area"], string> = {
   snmp: "SNMP", optics: "Optics", ports: "Ports",
 }
 
-/** "9/12" colored by shortfall; em-dash when nothing is configured at all. */
 function Ratio({ working, total }: { working: number; total: number }) {
   if (total === 0) return <span className="text-muted-foreground">—</span>
   return (
@@ -85,7 +84,6 @@ function OrgRow({ org }: { org: OverviewOrg }) {
           <Ratio working={org.ports.working} total={org.ports.monitored} />
           <span className="ml-1.5 text-xs text-muted-foreground">ports</span>
         </span>
-        {/* Mobile: fold the three ratios into one compact line under the name */}
         <span className="col-span-2 flex items-center gap-3 text-xs md:hidden">
           <span>{org.devices} devices</span>
           <span>SNMP <Ratio working={org.snmp.working} total={org.snmp.enabled} /></span>

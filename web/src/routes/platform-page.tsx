@@ -17,8 +17,6 @@ import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 
-// Server-wide, superadmin-only: ONE Google Maps key lights up the Google
-// basemaps on every org's Map view — individual ISPs never paste anything.
 function GoogleMapsCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -33,7 +31,6 @@ function GoogleMapsCard() {
     onSuccess: () => {
       toast.success("Google Maps key saved for all organizations")
       queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
-      // every org's Map view reads the key off its /api/orgs row
       queryClient.invalidateQueries({ queryKey: ["orgs"] })
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
@@ -67,23 +64,12 @@ function GoogleMapsCard() {
   )
 }
 
-// Server-wide, superadmin-only: the zoom at which each map layer starts drawing.
-//
-// These were hardcoded constants, then briefly a per-browser preference in the
-// map's own Layers popover, and are now ONE configuration for every account
-// (operator's call, 2026-08-02). Density is a judgement about how the product
-// should read, made by the person who looks at the fleet all day — handing it to
-// every user buys a support surface ("my map looks different from yours") in
-// exchange for a choice nobody else asked to make.
 function MapDetailCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ["admin-settings"],
     queryFn: adminApi.settings,
   })
-  // Local until Save, unlike the map's old live-editing popover: this form is a
-  // room away from the thing it changes, so an accidental click shouldn't reach
-  // every browser on the install before the superadmin has looked at it.
   const [detail, setDetail] = useState<MapDetail>(DETAIL_DEFAULTS)
   useEffect(() => { if (data?.map_detail) setDetail(detailFrom(data.map_detail)) }, [data])
 
@@ -92,14 +78,10 @@ function MapDetailCard() {
     onSuccess: () => {
       toast.success("Map detail saved for all organizations")
       queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
-      // every Map view reads these off its /api/orgs row, same as the Maps key
       queryClient.invalidateQueries({ queryKey: ["orgs"] })
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
   })
-  // Normalise on the way IN, so the ordering invariant holds for the render that
-  // follows rather than being re-checked at every read site. Central repairs it
-  // again on save — this is the affordance, not the enforcement.
   const set = (k: keyof MapDetail, v: number) =>
     setDetail((d) => normalizeDetail({ ...d, [k]: v }))
 
@@ -150,11 +132,6 @@ function MapDetailCard() {
             onClick={() => save.mutate(detail)}>
             Save
           </Button>
-          {/* Only once these differ from the shipped values: a Reset sitting on
-              an untouched control is one more thing to read past, and its
-              absence is itself the answer to "am I on the defaults?" Saving the
-              defaults CLEARS the stored row, so a reset install keeps following
-              them if they ever change. */}
           {!isDetailDefault(detail) && (
             <Button variant="ghost" size="sm" className="w-fit text-muted-foreground"
               disabled={save.isPending}
@@ -168,10 +145,6 @@ function MapDetailCard() {
   )
 }
 
-// Server-wide, superadmin-only: how subscribers pay. Payment is manual — orgs
-// pay the GPay number or scan the uploaded QR, tap "I've paid", and their name
-// is sent to the admin WhatsApp number (Platform → WhatsApp) so the admin marks
-// the month by hand.
 function PlatformBillingCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -190,8 +163,6 @@ function PlatformBillingCard() {
 
   const pickFile = (file?: File | null) => {
     if (!file) return
-    // SVG counts (type image/svg+xml); some OSes report an empty type for it,
-    // so accept by extension too
     const isImage = file.type.startsWith("image/") || /\.svg$/i.test(file.name)
     if (!isImage) { toast.error("Choose an image file (PNG, SVG or JPG)"); return }
     if (file.size > 400_000) { toast.error("Image too large. Use a QR under 400 KB."); return }
@@ -275,11 +246,6 @@ function PlatformBillingCard() {
   )
 }
 
-// Server-wide, superadmin-only: the experimental WhatsApp channel. This is the
-// business sender (Meta Cloud API) config only — the per-person page numbers are
-// on each login account (Accounts section), not here. WhatsApp is the SOLE alert
-// channel (ntfy removed 2026-07-24); the admin number here also receives the
-// superadmin ops pings (org 'I've paid' / churn / release-sync failing).
 function WhatsAppCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
@@ -293,8 +259,6 @@ function WhatsAppCard() {
   const [apiVersion, setApiVersion] = useState("")
   const [adminNumber, setAdminNumber] = useState("")
   const [token, setToken] = useState("")   // write-only; blank leaves the stored one
-  // `whatsapp` is absent from an OLD backend that hasn't been restarted with this
-  // feature — degrade to empty defaults rather than white-screening the page.
   const tokenSet = data?.whatsapp?.token_set ?? false
 
   useEffect(() => {
@@ -421,18 +385,6 @@ function WhatsAppCard() {
   )
 }
 
-/** The platform plane's own settings — server-wide config that reads and writes
- *  `app_settings`, NOT the scoped org. It used to sit as a "Platform" section
- *  inside the org-scoped Settings page, which was a category error: everything
- *  else in Settings is one organization's config, these four cards are the whole
- *  server's. Lifting them onto their own top-level page (reached from the
- *  Platform nav group, beside Overview and Organizations) leaves a superadmin's
- *  Settings page identical to an owner's — Organization / Plan & billing /
- *  Monitoring / Users — which is the point: Settings is now unambiguously
- *  org-scoped for everyone.
- *
- *  Self-guards on superadmin like the other platform-plane pages; the nav item
- *  is superadminOnly, so this only catches a hand-typed URL. */
 export function PlatformPage() {
   const { user } = useAuth()
   if (!user?.is_superadmin) return null

@@ -42,7 +42,6 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.tower = self.store.create_org_device(ORG, {
             "name": "Rampur Tower", "ip_address": "10.0.0.2", "device_type": "backhaul",
             "region": "Rampur", "parent_device_id": None})
-        # WhatsApp-only: seed a worker number so port up/down (active kinds) page.
         w = self.store.add_user(ORG, "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(w, "919000000009")
         self.notifier = RecordingNotifier()
@@ -145,7 +144,6 @@ class CentralPortMonitorTest(unittest.TestCase):
         self.assertEqual(st["status"], "suppressed")
 
     def test_missing_recipient_is_soft_noop(self):
-        # no WhatsApp numbers → nothing to page, but the alarm state still writes
         self.store.set_user_whatsapp(
             self.store.get_user_by_username("wkr1")["id"], None)
         self._discover_and_watch(2)
@@ -176,10 +174,6 @@ class BandwidthTest(unittest.TestCase):
                self.store.list_switch_ports(ORG, self.switch)}[idx]
 
     def _queued(self):
-        # Digest contents. Bandwidth alarms are PUSH now (operator ask
-        # 2026-07-18) — they buzz immediately via notifier.sent and must NOT
-        # land here; kept only to prove nothing bandwidth-related falls into the
-        # digest. Alarm STATE is unchanged either way.
         return self.store.pending_digest(ORG)
 
     def _watch_bw(self, idx, threshold, direction="either"):
@@ -209,7 +203,6 @@ class BandwidthTest(unittest.TestCase):
             3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_low"])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        # bandwidth alerts are OFF for now (allowlist): alarm state written, no page
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._queued(), [])
 
@@ -233,7 +226,7 @@ class BandwidthTest(unittest.TestCase):
             3, 60 * _OCT_PER_MBPS_10S, 60 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
         self.assertEqual([e.kind for e in evs], ["bw_ok"])
         self.assertEqual(self._row(3)["bw_alarm"], 0)
-        self.assertEqual(self.notifier.sent, [])       # off for now
+        self.assertEqual(self.notifier.sent, [])
 
     def test_direction_out_ignores_low_inbound(self):
         self._watch_bw(3, threshold=10, direction="out")
@@ -250,7 +243,7 @@ class BandwidthTest(unittest.TestCase):
         self.pm.sync_device(self.switch, [_pbw(
             3, 10 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        self.assertEqual(self.notifier.sent, [])       # off for now
+        self.assertEqual(self.notifier.sent, [])
 
     def test_unmonitored_port_never_bw_alarms(self):
         self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])
@@ -308,7 +301,6 @@ class BandwidthTest(unittest.TestCase):
             3, 100 * _OCT_PER_MBPS_10S, 100 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual([e.kind for e in evs], ["bw_high"])
         self.assertEqual(self._row(3)["bw_high_alarm"], 1)
-        # bandwidth alerts are OFF for now (allowlist): alarm state written, no page
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._queued(), [])
 
@@ -323,7 +315,7 @@ class BandwidthTest(unittest.TestCase):
             3, 105 * _OCT_PER_MBPS_10S, 105 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
         self.assertEqual([e.kind for e in evs], ["bw_normal"])
         self.assertEqual(self._row(3)["bw_high_alarm"], 0)
-        self.assertEqual(self.notifier.sent, [])       # off for now
+        self.assertEqual(self.notifier.sent, [])
 
     def test_low_and_high_alarms_are_independent(self):
         self.pm.sync_device(self.switch, [_pbw(3, 0, 0)], TS_SEQ[0])
@@ -366,28 +358,18 @@ class BandwidthTest(unittest.TestCase):
         self.assertEqual(self.notifier.sent, [])
 
     def test_bandwidth_summary_hides_alarms_on_an_unreachable_device(self):
-        # A device that isn't answering ICMP isn't answering SNMP either, so its
-        # bw flag and in/out_bps are frozen at the last walk before it dropped.
-        # The dashboard summary (top-bar chip + Home tile) must not report that
-        # as a live bandwidth alarm — the ICMP outage owns the device, and one
-        # fault shouldn't light two unrelated alarms.
         self._watch_bw(3, threshold=10)
         self.pm.sync_device(self.switch, [_pbw(
             3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
         self.pm.sync_device(self.switch, [_pbw(
             3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        # reachable: the alarm is real and shows
         self.store.write_device_states(ORG, [(self.switch, "UP", 1.0, 0.0, 0.1)], TS_SEQ[3])
         self.assertEqual(len(self.store.low_bandwidth_alarms(ORG)), 1)
-        # unreachable, either way it lands: suppressed from the summary...
         for state in ("DOWN", "UNREACHABLE"):
             self.store.write_device_states(ORG, [(self.switch, state, None, 100.0, None)], TS_SEQ[4])
             self.assertEqual(self.store.low_bandwidth_alarms(ORG), [], state)
-        # ...but the underlying alarm STATE is untouched, so ports.py's
-        # transition tracking (and its paging) can't be affected by this.
         self.assertEqual(self._row(3)["bw_alarm"], 1)
-        # and it comes back when the device does
         self.store.write_device_states(ORG, [(self.switch, "UP", 1.0, 0.0, 0.1)], TS_SEQ[5])
         self.assertEqual(len(self.store.low_bandwidth_alarms(ORG)), 1)
 

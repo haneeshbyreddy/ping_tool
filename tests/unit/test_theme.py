@@ -1,4 +1,3 @@
-"""Server-wide theme overrides: validation, storage, CSS rendering."""
 import json
 import re
 import sys
@@ -17,8 +16,6 @@ _OVERLAY = _PUBLIC / "showcase.js"
 
 
 class _FakeStore:
-    """Minimal get_setting/set_setting pair — theme.py touches nothing else."""
-
     def __init__(self, initial=None):
         self.settings = dict(initial or {})
 
@@ -46,14 +43,10 @@ class CleanOverridesTest(unittest.TestCase):
         })
 
     def test_drops_unknown_token(self):
-        # An arbitrary custom property would let a caller restyle anything the
-        # SPA reads, not just the palette.
         got = theme.clean_overrides({"dark": {"--not-a-real-token": "#fff"}})
         self.assertEqual(got, {})
 
     def test_drops_values_that_could_escape_the_style_block(self):
-        # These land inside a <style> element; a value carrying `}` or `<` or a
-        # url() is the whole reason _VALUE_RE exists.
         for bad in ("#fff;}body{display:none}",
                     "red</style><script>alert(1)</script>",
                     "url(https://evil.example/x.png)",
@@ -85,9 +78,6 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(theme.load(store), {"dark": {"--card": "#1c1f24"}})
 
     def test_empty_save_clears_the_row(self):
-        # Reset-to-shipped must leave NO row behind: a stored `{}` is a stale
-        # marker, and the point of the sparse diff is that untouched
-        # deployments keep following index.css.
         store = _FakeStore()
         theme.save(store, {"dark": {"--card": "#1c1f24"}})
         theme.save(store, {})
@@ -95,8 +85,6 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(theme.load(store), {})
 
     def test_load_revalidates_hostile_stored_row(self):
-        # A row written by an older build or edited straight in SQLite must
-        # still be filtered on the way OUT, not trusted because it is stored.
         store = _FakeStore({theme.SETTING_KEY: json.dumps(
             {"dark": {"--background": "#fff;}html{display:none}",
                       "--card": "#1c1f24"}})})
@@ -109,49 +97,23 @@ class StorageTest(unittest.TestCase):
 
 class RenderCssTest(unittest.TestCase):
     def test_empty_renders_nothing(self):
-        # A stock install must inject no CSS at all.
         self.assertEqual(theme.render_css({}), "")
         self.assertEqual(theme.render_css({"dark": {}}), "")
 
     def test_mode_selectors_are_mutually_exclusive_and_outrank_the_bundle(self):
-        """The regression that blew out dark mode.
 
-        `:root` and `.dark` have EQUAL specificity (0,1,0). This block is
-        injected AFTER the bundle stylesheet, so light overrides written as a
-        plain `:root{}` beat the bundle's `.dark{}` on source order and apply
-        in DARK mode — the operator's light surfaces under dark mode's light
-        text, i.e. an unreadable white screen. `:root:not(.dark)` cannot match
-        a dark document at all, and at (0,2,0) both selectors outrank the
-        bundle wherever this lands.
-        """
         css = theme.render_css({"dark": {"--card": "#1c1f24"},
                                 "light": {"--card": "#ffffff"}})
         self.assertIn(":root.dark{--card:#1c1f24;}", css)
         self.assertIn(":root:not(.dark){--card:#ffffff;}", css)
-        # a bare `:root{` would match a dark document
         self.assertNotIn(":root{", css)
 
 
 class PreviewIsModeScopedTest(unittest.TestCase):
-    """Source-level guard on the SPA's live preview.
 
-    There is no frontend test suite (CLAUDE.md), and this specific mistake
-    SHIPPED and broke a live dashboard, so it gets pinned from the Python side
-    rather than left to review.
-
-    The bug: `applyPreview` set the palette as INLINE styles on <html>. Inline
-    styles on the root element outrank every stylesheet rule INCLUDING
-    `.dark{}`, and they carry no notion of which mode they belong to — so a
-    light-mode palette previewed (or saved) that way survived a switch to dark
-    mode and painted the dark theme white, with no way for the theme class to
-    win. The preview must emit mode-SCOPED CSS into a <style> element, using
-    the same mutually-exclusive selectors the server does (see
-    RenderCssTest above for why they are `:root:not(.dark)` / `:root.dark`).
-    """
 
     def test_preview_never_writes_inline_root_styles(self):
         src = _SPA_TOKENS.read_text(encoding="utf-8")
-        # Comments explain the bug by name; only look at real code.
         code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
         code = re.sub(r"^\s*//.*$", "", code, flags=re.M)
         self.assertNotIn("documentElement.style", code,
@@ -160,39 +122,19 @@ class PreviewIsModeScopedTest(unittest.TestCase):
 
     def test_preview_uses_the_same_selectors_as_the_server(self):
         src = _SPA_TOKENS.read_text(encoding="utf-8")
-        # The SPA's renderCss must map modes the way render_css does here, or
-        # the preview shows something a save will not reproduce.
         self.assertIn('mode === "dark" ? ":root.dark" : ":root:not(.dark)"', src)
 
 
 class AllowlistParityTest(unittest.TestCase):
     def test_allowlist_matches_spa(self):
-        """theme.py's allowlist must equal the SPA's ALL_TOKENS.
 
-        These are two hand-maintained lists in different languages. A token
-        added only on the SPA side is silently dropped on save — which presents
-        as "I changed the colour and it didn't stick", a bug that is very hard
-        to trace back to a missing string in a Python set.
-        """
         src = _SPA_TOKENS.read_text(encoding="utf-8")
-        # Every "--token" literal the SPA declares as editable: the seed
-        # derivations and ADVANCED_TOKENS both spell them out as strings.
         spa = set(re.findall(r'"(--[a-z0-9-]+)"', src))
         spa.discard("--font-sans")
         self.assertEqual(spa, set(theme._TOKENS))
 
 
 class LandingArtifactTest(unittest.TestCase):
-    """The marketing page follows the same overrides the dashboard does, and
-    the way it does so is fragile in a specific way worth pinning.
-
-    `landing.html` is a pre-bundled artifact: a JSON-encoded template that the
-    page unpacks and swaps in over its own documentElement. Re-exporting it
-    from the design tool would restore the hardcoded palette it shipped with,
-    and NOTHING would look broken — the page renders perfectly, it just stops
-    following Settings → Platform → Appearance, which nobody notices until
-    somebody repaints and only half the product moves.
-    """
 
     def _template(self) -> str:
         src = _LANDING.read_text(encoding="utf-8")
@@ -202,9 +144,6 @@ class LandingArtifactTest(unittest.TestCase):
         return json.loads(m.group(1))
 
     def test_landing_claims_the_dark_half_of_the_override_map(self):
-        # render_css scopes to `:root.dark` / `:root:not(.dark)`, so a page with
-        # no class on <html> would pick up the LIGHT overrides. This page has
-        # one palette and it is dark.
         self.assertIn('<html class="dark">', _LANDING.read_text(encoding="utf-8"))
         self.assertIn('<html class="dark">', self._template())
 
@@ -216,19 +155,9 @@ class LandingArtifactTest(unittest.TestCase):
         self.assertLess(swap, reattach, "re-attached before the swap wipes it")
 
     def test_every_page_colour_reads_a_token(self):
-        """No colour literal may survive outside the mapping layer.
 
-        Colours on this page live in inline style="" attributes, which outrank
-        any stylesheet — so an injected block themes nothing unless the markup
-        itself says var(--lp-*). One straggler is one element left wearing the
-        shipped palette on a repainted install.
-        """
         tpl = self._template()
         body = tpl[tpl.index("</style>", tpl.index("html, body { margin")):]
-        # The hero canvas paints via ctx.fillStyle, which takes a colour and not
-        # a var(); it resolves the custom property itself and keeps the shipped
-        # value as the fallback. The accent prop's editor options are authoring
-        # metadata, not rendered colour.
         for allowed in ("cssColor('--lp-accent', this.props.accent ?? '#5680bd')",
                         "cssColor('--lp-ok', '#43d68c')"):
             self.assertIn(allowed, body)
@@ -239,18 +168,13 @@ class LandingArtifactTest(unittest.TestCase):
         self.assertEqual(strays, set(), f"hardcoded colours on the landing page: {strays}")
 
     def test_every_lp_token_maps_to_one_central_validates(self):
-        """A --lp-* pointing at a token theme.py drops is a control that looks
-        wired and does nothing."""
         tpl = self._template()
         referenced = set(re.findall(r'var\((--(?!lp-)[a-z0-9-]+),', tpl))
         self.assertTrue(referenced, "the mapping layer reads no tokens at all")
         self.assertEqual(referenced - set(theme._TOKENS), set())
 
     def test_the_overlay_borrows_the_page_palette(self):
-        """showcase.js floats ON the landing page; an overlay keeping its own
-        blue would be the one thing still wearing the shipped colours."""
         src = _OVERLAY.read_text(encoding="utf-8")
-        # Every literal left is either a var() fallback or a black shadow/mask.
         for line in src.splitlines():
             for lit in re.findall(r'#[0-9a-fA-F]{3,6}\b|rgba?\([0-9.,\s]+\)', line):
                 if lit in ("#000", "rgba(0,0,0,.4)"):

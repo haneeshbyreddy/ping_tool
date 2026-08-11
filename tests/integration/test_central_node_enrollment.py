@@ -354,7 +354,6 @@ class NodeUpdateHttpTest(unittest.TestCase):
         status, reply, _ = self._req("POST", "/heartbeat", hb, token="tok")
         self.assertEqual(status, 200)
         self.assertIs(reply.get("restart"), True)
-        # one-shot: delivery consumed it
         status, reply, _ = self._req("POST", "/heartbeat", hb, token="tok")
         self.assertNotIn("restart", reply)
 

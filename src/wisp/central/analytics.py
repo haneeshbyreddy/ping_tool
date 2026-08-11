@@ -30,8 +30,6 @@ def device_reliability(store, org_id: str, since: str, until: str) -> list[dict]
 
     report = []
     for did, dev in devices.items():
-        # passive plant never pings — 100%-uptime rows for splitters would only
-        # pad the averages
         if dev.get("device_type") in PASSIVE_TYPES:
             continue
         down_s = downtime.get(did, 0.0)

@@ -1,34 +1,6 @@
 #!/usr/bin/env python3
-"""Consistent, restorable snapshots of everything that only exists on this disk.
 
-Run it any time — the server keeps serving. `VACUUM INTO` is SQLite's own hot-backup:
-it takes a read lock, writes a fresh defragmented copy, and cannot observe a half-applied
-transaction. Copying `central.db` with `cp` while central is running does NOT give you
-that (the WAL holds committed pages the main file doesn't have yet), which is the usual
-way a "backup" turns out to be unrestorable on the day it's needed.
 
-WHAT GOES IN THE BUNDLE, and why each part is there:
-
-  central.db.gz      the whole database, vacuumed and verified.
-  secrets/           `data/secret.key`, `data/central_session_secret`, `deploy/central.env`.
-                     THESE ARE THE POINT. They are git-ignored, 2.5 KB together, and exist
-                     on exactly one disk. `secret.key` decrypts the stored device web-UI
-                     passwords: restore the DB without it and the credential vault is
-                     permanently unreadable — the rows survive and decode to nothing.
-  precious.sql       a plain-text dump of the config/customer tables ONLY (see _PRECIOUS).
-                     Redundant with central.db.gz on purpose: it is ~150 KB, it is readable
-                     with `less`, and it restores into a *newer* schema that a binary DB
-                     from an older build might not survive. It is the copy you can still
-                     use in two years.
-  MANIFEST.json      sizes, row counts, sha256 of the DB, the git commit, schema version.
-                     A backup you cannot identify is a backup you will not trust enough to
-                     restore from.
-
-Usage:
-    .venv/bin/python tools/backup.py                 # snapshot + prune to --keep
-    .venv/bin/python tools/backup.py --verify LATEST # prove the newest bundle restores
-    .venv/bin/python tools/backup.py --list
-"""
 from __future__ import annotations
 
 import argparse
@@ -48,18 +20,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
-# Files that exist on this disk and nowhere else. Missing ones are recorded in the
-# manifest rather than skipped silently — "the backup ran fine" must never be how you
-# find out a secret was not in it.
 _SECRETS = [
     ("data/secret.key", "device web-UI credential vault key"),
     ("data/central_session_secret", "dashboard session signing key"),
     ("deploy/central.env", "server config + WhatsApp/GitHub tokens"),
 ]
 
-# The tables the operator cannot re-derive from anything. Ping history, rollups, alert
-# logs and proxy audit are deliberately NOT here: they are 97% of the bytes and they
-# regenerate themselves within a poll cycle.
 _PRECIOUS = [
     "orgs", "users", "app_settings",
     "org_devices", "org_device_links", "org_device_workers", "org_colors",
@@ -87,15 +53,12 @@ def _sha256(path: Path) -> str:
 
 
 def _snapshot_db(src: Path, dest: Path) -> dict:
-    """Hot, consistent copy + integrity check. Raises if the copy is not sound."""
     conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=30.0)
     try:
-        # VACUUM INTO refuses to overwrite, so hand it a path that does not exist.
         conn.execute("VACUUM INTO ?", (str(dest),))
     finally:
         conn.close()
 
-    # Verify the COPY, not the original: a snapshot nobody checked is a coin flip.
     check = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
     try:
         ok = check.execute("PRAGMA integrity_check").fetchone()[0]
@@ -106,7 +69,7 @@ def _snapshot_db(src: Path, dest: Path) -> dict:
             try:
                 counts[t] = check.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             except sqlite3.Error:
-                counts[t] = None  # table not in this schema version yet
+                counts[t] = None
         user_version = check.execute("PRAGMA user_version").fetchone()[0]
     finally:
         check.close()
@@ -114,7 +77,6 @@ def _snapshot_db(src: Path, dest: Path) -> dict:
 
 
 def _dump_precious(db: Path, dest: Path) -> int:
-    """Plain-text dump of the config/customer tables, restorable into a newer schema."""
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     conn.text_factory = str
     written = 0
@@ -203,13 +165,13 @@ def backup(out_dir: Path, db_path: Path, keep: int) -> Path:
             **meta,
         }
         (tmp / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
-        raw.unlink()  # ship only the compressed copy
+        raw.unlink()
 
         with tarfile.open(bundle, "w:gz") as tar:
             for item in sorted(tmp.iterdir()):
                 tar.add(item, arcname=item.name)
 
-    os.chmod(bundle, 0o600)  # it contains secrets and subscriber PII
+    os.chmod(bundle, 0o600)
     _prune(out_dir, keep)
     return bundle
 
@@ -223,17 +185,10 @@ def _prune(out_dir: Path, keep: int) -> list[Path]:
 
 
 def verify(bundle: Path) -> dict:
-    """Prove a bundle restores: unpack it, open the DB, integrity-check, count rows.
 
-    A backup is a claim until something has actually read it back. This is the only
-    part of the system that turns the claim into a fact, so run it after any schema
-    change and don't let it become the step nobody runs.
-    """
     with tempfile.TemporaryDirectory(prefix="wisp-verify-") as tmpd:
         tmp = Path(tmpd)
         with tarfile.open(bundle, "r:gz") as tar:
-            # `data` filter: Python 3.14 rejects unfiltered extraction outright, and we
-            # are unpacking an archive to verify it, not to trust it.
             tar.extractall(tmp, filter="data")
         man = json.loads((tmp / "MANIFEST.json").read_text())
 
@@ -262,7 +217,7 @@ def verify(bundle: Path) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(description='Consistent, restorable snapshots of everything that only exists on this disk.',
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=str(REPO / "data" / "central.db"))
     ap.add_argument("--out", default=str(REPO / "data" / "backups"))

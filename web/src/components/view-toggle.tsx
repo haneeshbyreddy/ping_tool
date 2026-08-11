@@ -1,9 +1,6 @@
 import { List, LayoutGrid } from "lucide-react"
 import { cn } from "@/lib/utils"
 
-// The Network page's list/grid preference, persisted org-independently — it's a
-// UI taste, not per-network state. Its own small module so the toggle and its
-// storage key live in one place rather than buried in the 1,400-line page.
 export type ViewMode = "list" | "grid"
 const VIEW_KEY = "wisp:network:view"
 

@@ -1,9 +1,3 @@
-"""Edge-facing wire routes: topology fetch, /report ingest, heartbeat reply,
-diagnostic walk results, and the per-subsystem SNMP folds.
-
-Auth for these routes (token / node token / mTLS) is checked by the caller in
-``server.py`` before any function here runs.
-"""
 from __future__ import annotations
 
 import logging
@@ -58,8 +52,6 @@ def heartbeat_reply(h, org: str, node: str, body: dict) -> dict:
     except Exception:
         log.exception("rollout directive failed for %s/%s", org, node)
     try:
-        # One-shot, dashboard-queued (POST /api/nodes/restart). The supervisor
-        # bounces the agent; delivery consumes the flag.
         if h.store.pop_restart_request(org, node):
             reply["restart"] = True
     except Exception:
@@ -82,8 +74,6 @@ def walk_result(h, org: str, node: str, env: dict) -> None:
         if not isinstance(raw, list):
             h._reply(400, {"error": "varbinds must be a list"})
             return
-        # Server-side bound regardless of what the edge claims: cap the row
-        # count and each value's length so one walk can't bloat the DB.
         varbinds = []
         for pair in raw[:inventory.WALK_CAP_MAX_VARBINDS]:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
@@ -129,9 +119,6 @@ def report(h, org: str, env: dict) -> dict:
                                          h.notifier, h.cfg)
         central_redundancy.sweep(h.store, org, eng, cycle.redundancy,
                                  cycle.states, h.notifier, ts, h.cfg)
-        # Roll any DIGEST-tier alerts queued this org into one hourly summary.
-        # Rides the full report like escalation sweeping; own try/except so a
-        # bad flush never sinks the cycle.
         try:
             notify_policy.flush_digests(h.store, org, h.notifier, h.cfg, ts)
         except Exception:
@@ -142,23 +129,13 @@ def report(h, org: str, env: dict) -> dict:
     if recheck:
         reply["recheck"] = recheck
     if mode != "recheck":
-        # Queued diagnostic walks ride the full-report reply, like update
-        # directives ride the heartbeat — the edge never accepts inbound.
         walks = h.store.pending_snmp_walks(org, env.get("node_id", ""))
         if walks:
             reply["snmp_walks"] = walks
-        # Live web-proxy sessions ride the same channel (webplan.md §2): the
-        # edge's tunnel is DORMANT until this key tells it someone is browsing,
-        # so idle nodes hold no long-polls open. TTLs are relative seconds —
-        # the edge's clock is not trusted to agree with central's.
         if h.cfg.proxy_enabled:
             psessions = h.proxy.active_sessions_for(org, env.get("node_id", ""))
             if psessions:
                 reply["proxy_sessions"] = psessions
-            # Standby flag (first-connect fix 2026-07-20): a web-proxy org's
-            # nodes keep ONE long-poll open even with no live session, so
-            # opening a device page doesn't wait a report cycle for the
-            # tunnel to wake. Older edges ignore the key.
             if h.store.org_web_proxy(org):
                 reply["proxy_standby"] = True
     return reply
@@ -193,24 +170,14 @@ def _ingest_optics(h, org: str, eng, optics_by_device, ts: str) -> None:
         if device_id not in eng.meta or not isinstance(onus, list):
             continue
         try:
-            # Fold in anything the web-UI scraper has for this OLT BEFORE the
-            # monitor sees the roster (central/weboptics.py). On C-Data/DBC the
-            # scrape is the only source of per-ONU Rx at all, and merging here —
-            # rather than teaching the monitor a second input — is what keeps
-            # severity, the badge, PON-fault and the Optical tab on ONE code
-            # path that neither knows nor cares where a reading came from.
             onus = _merge_web_optics(h, org, device_id, onus, ts)
             monitor.sync_device(device_id, onus, ts)
         except Exception:
             log.exception("GPON optics fold failed for %s/device=%d", org, device_id)
-    # fault input only changes when a walk lands, so the mass-drop
-    # sweep rides the optics fold — transition-only, never an outage
     try:
         PonFaultAlerter(h.store, org, h.notifier, h.cfg).sweep(ts)
     except Exception:
         log.exception("PON fault sweep failed for %s", org)
-    # roster hygiene (per-PON ONU cap + redundant MAC) rides the same fold, in
-    # its own try/except so a bad roster never sinks the report cycle
     try:
         OnuRosterAlerter(h.store, org, h.notifier, h.cfg).sweep(ts)
     except Exception:
@@ -218,18 +185,12 @@ def _ingest_optics(h, org: str, eng, optics_by_device, ts: str) -> None:
 
 
 def _merge_web_optics(h, org: str, device_id: int, onus: list, ts: str) -> list:
-    """The SNMP roster with any fresh scraped readings folded in, or the roster
-    untouched. Best-effort by construction: this is an enrichment riding the
-    report path, so a failure here must cost the walk's own readings nothing."""
     if not getattr(h.cfg, "web_optics_enabled", False):
         return onus
     try:
         rows = h.store.list_web_optics(org, device_id)
         if not rows:
             return onus
-        # now_iso(), not the report's ts: `ts` comes off the EDGE's envelope
-        # while scraped_at is central's own stamp, and a probe whose clock runs
-        # slow would otherwise age out readings that were taken seconds ago.
         merged, count = weboptics.merge_scraped(
             onus, rows, now_iso(), h.cfg.web_optics_max_age_s)
         if count:
@@ -258,8 +219,6 @@ def _ingest_health(h, org: str, eng, health_by_device, ts: str) -> None:
 
 
 def _ingest_snmp_status(h, org: str, eng, status_by_device, ts: str) -> None:
-    # Per-device sweep diagnoses ({device: {subsystem: status}}). The store
-    # enforces the closed subsystem/state vocabularies and field bounds.
     if not isinstance(status_by_device, dict):
         return
     rows: list[tuple[int, str, dict]] = []

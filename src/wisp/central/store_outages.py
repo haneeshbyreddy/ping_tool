@@ -1,8 +1,3 @@
-"""FSM state persistence, outages, events, alert log, escalations, rollups and perf baseline state.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-"""
 from __future__ import annotations
 
 import json
@@ -13,9 +8,6 @@ from wisp.core.analytics import _parse
 
 
 def _assignees(raw) -> list[str]:
-    """Decode `outages.assigned_to` or `outages.accepted_by`. Anything that
-    isn't a JSON list of non-empty strings reads as "nobody" — a broken row must
-    not turn into a fabricated name on a triage card."""
     if not raw:
         return []
     try:
@@ -87,9 +79,6 @@ class OutageStoreMixin:
 
     def recent_device_outages(self, org_id: str, device_id: int,
                               limit: int = 5) -> list[dict]:
-        """The last few outages for one device, newest first — the WhatsApp bot's
-        [Recent] card ("has this box been flapping?"). Org-scoped like every read.
-        Open outages (resolved_at NULL) sort first because id is monotonic."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT started_at, resolved_at, final_state, root_cause"
@@ -243,21 +232,8 @@ class OutageStoreMixin:
 
     def assign_outage(self, org_id: str, outage_id: int, usernames: list[str],
                       by: str) -> bool:
-        """Hand an OPEN outage to one or more field accounts.
 
-        Assignment does NOT stamp the ack (it did until 2026-07-26). Naming
-        somebody is the owner ASKING; it is not that person answering, and
-        stamping the ack made an untouched outage render "In progress" the
-        instant it was handed over — the one state a NOC screen must not claim
-        falsely. It stays DOWN until an assignee accepts (`accept_outage`), which
-        is what stamps acknowledged_at/_by. Escalation is unaffected either way —
-        only recovery stops the ladder (see CLAUDE.md).
 
-        Re-assigning REPLACES the set (callers refuse an empty list, so there is
-        no "assigned to nobody" state to interpret) and KEEPS the acceptances of
-        anyone still named: dropping them would ask a worker who already said yes
-        to say it again because a second name was added beside theirs. Whoever
-        was removed loses their acceptance with the job."""
         if not usernames:
             return False
         with self._write_lock, self._connect() as conn:
@@ -288,22 +264,8 @@ class OutageStoreMixin:
 
 
     def accept_outage(self, org_id: str, outage_id: int, username: str) -> str:
-        """An assignee answering yes — "I'm on it".
 
-        The half of assignment that turns an ASK into a commitment, and the only
-        thing that may move an assigned outage to `in_progress`: until somebody
-        accepts, the dashboard says the device is down and waiting on a reply.
-        The FIRST acceptance also stamps acknowledged_at/_by (COALESCE, so an
-        earlier explicit ack keeps its own name and clock) — accepting is
-        acknowledging, and a worker shouldn't have to press two buttons.
 
-        Only somebody actually NAMED on the outage can accept: accepting is
-        answering a question that was put to you, and a stray yes from whoever
-        else happened to see the card is not a fact about who is going out.
-        Idempotent — a second yes (the app and the WhatsApp button are two ways to
-        press the same thing) is `already`, never an error.
-
-        Returns one of: ok | already | not_assigned | closed | missing."""
         who = str(username or "").strip()
         if not who:
             return "not_assigned"
@@ -357,21 +319,13 @@ class OutageStoreMixin:
         out = []
         for r in rows:
             d = dict(r)
-            # stored as JSON lists; the wire always carries real lists, so no
-            # consumer has to know either column was ever NULL (or hand-edited)
             d["assigned_to"] = _assignees(d.get("assigned_to"))
             d["accepted_by"] = _assignees(d.get("accepted_by"))
             if d["resolved_at"] is not None:
                 d["status"] = "pending_postmortem"
             elif d["acknowledged_at"]:
-                # somebody has said they are on it — either by accepting the
-                # assignment or by acknowledging outright
                 d["status"] = "in_progress"
             elif d["assigned_to"]:
-                # Named but unanswered: the device is still down and nobody has
-                # confirmed they are going. Deliberately its own state rather
-                # than `in_progress` — an owner sending a message is not a human
-                # taking the job on.
                 d["status"] = "assigned"
             else:
                 d["status"] = "unassigned"
@@ -465,8 +419,6 @@ class OutageStoreMixin:
 
     def recently_pushed(self, org_id: str, device_id: int | None, kind: str,
                         now_ts: str, within_min: int) -> bool:
-        """True if a PUSH of this (device, kind) was actually sent within the
-        window — the governor's flap backstop. `device_id IS ?` matches NULL."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT MAX(sent_at) FROM alert_log WHERE org_id=? AND device_id IS ?"

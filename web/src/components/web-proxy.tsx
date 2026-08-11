@@ -1,7 +1,3 @@
-// Device web-UI proxy (webplan.md M3): open a tunnel session against a
-// switch/OLT and drive its native web UI from the dashboard. The heavy lifting
-// is server-side (browser → central → edge → device); this file is the "Open
-// web UI" menu entry, the sessions/audit card, and nothing else.
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -28,7 +24,6 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Badge } from "@/components/ui/badge"
 
-/** The scoped org's web-proxy capability flag (superadmin-granted). */
 function useOrgProxyFlag(): boolean {
   const { scopeOrg } = useAuth()
   const { data } = useQuery({
@@ -40,10 +35,6 @@ function useOrgProxyFlag(): boolean {
   return !!data?.orgs.find((o) => o.org_id === scopeOrg)?.web_proxy
 }
 
-/** Whether the current user may open (and drive) web-UI sessions in the scoped
-    org: the org capability flag AND owner role — same gate the server enforces
-    on POST /api/proxy/session and the /api/proxy/<sid>/ browse path. Operators
-    and techs are locked out of device admin UIs entirely. */
 export function useWebProxy(): boolean {
   const { user } = useAuth()
   const flag = useOrgProxyFlag()
@@ -51,9 +42,6 @@ export function useWebProxy(): boolean {
   return flag && roleOk
 }
 
-/** Whether the current user may MANAGE stored device logins: the org proxy
-    capability AND owner role — the same gate the server enforces on
-    POST /api/inventory/credentials. Same owner-only gate as opening a session. */
 export function useCanManageCreds(): boolean {
   const { user } = useAuth()
   const flag = useOrgProxyFlag()
@@ -61,19 +49,12 @@ export function useCanManageCreds(): boolean {
   return flag && roleOk
 }
 
-/** Owner-only editor for a device's web-UI login. Stored encrypted server-side
-    (central/secretbox.py); the password is write-only from here — we only ever
-    learn whether one is set, never read it back. Caller gates with
-    useCanManageCreds()/canOpenWebUi. */
 export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [authMode, setAuthMode] = useState<"basic" | "form">("form")
-  // Address override: where the admin page actually lives. Off = the device's
-  // own IP on 80/443; on = a different IP and/or port. The scheme is inferred
-  // from the port (443 = https, everything else http) — no separate control.
   const [altAddr, setAltAddr] = useState(false)
   const [webIp, setWebIp] = useState("")
   const [webPort, setWebPort] = useState("")
@@ -86,7 +67,6 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   const hasPassword = !!creds.data?.credentials.has_password
   const hasOverride = overridePinsEndpoint(device)
 
-  // seed the fields once the current values land
   function onOpenChange(next: boolean) {
     if (next) {
       setPassword("")
@@ -104,14 +84,7 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   }
 
   const save = useMutation({
-    // password left blank => omit it so a username-only edit keeps the stored
-    // password; a typed value replaces it. The address override is saved
-    // alongside so one dialog covers "how to reach + how to log into" the UI.
     mutationFn: async () => {
-      // Only store an override that reaches somewhere the plain Connect buttons
-      // can't (a different IP or a non-standard port). Toggle off — or a
-      // redundant same-IP:80/443 entry — clears it; the server normalizes the
-      // same way (inventory.normalize_web_access).
       const ip = webIp.trim()
       const portNum = webPort.trim() ? Number(webPort.trim()) : null
       const store = altAddr && (
@@ -145,8 +118,6 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   })
   const busy = save.isPending || clear.isPending
 
-  // The toggle is on but the entry reaches nowhere new (same IP, standard/blank
-  // port) — saving will collapse it to no override, so say so.
   const typedIp = webIp.trim()
   const typedPortNum = webPort.trim() ? Number(webPort.trim()) : null
   const altRedundant = altAddr &&
@@ -244,9 +215,6 @@ export function WebUiCredentialsButton({ device }: { device: OrgDevice }) {
   )
 }
 
-/** The live tunnel session against one device, if any. Shares the
-    ["proxy-sessions", org] cache with the Settings card, so however many
-    device panels are open there's one poll. */
 export function useLiveWebSession(device: OrgDevice): ProxySession | undefined {
   const { scopeOrg } = useAuth()
   const flag = useOrgProxyFlag()
@@ -260,9 +228,6 @@ export function useLiveWebSession(device: OrgDevice): ProxySession | undefined {
     (s) => s.device_id === device.id && s.status === "open" && s.live)
 }
 
-/** Device-row capability icon (sits beside the optics/ports icons): a pulsing
-    globe while this device's web UI tunnel is live, nothing otherwise. Click
-    jumps back into the session tab. */
 export function WebUiLiveIcon({ device }: { device: OrgDevice }) {
   const allowed = useWebProxy()
   const sess = useLiveWebSession(device)
@@ -280,16 +245,9 @@ export function WebUiLiveIcon({ device }: { device: OrgDevice }) {
 }
 
 export function canOpenWebUi(device: OrgDevice): boolean {
-  // needs a probe to fetch through and an IP to fetch — passives have neither
   return !!device.ip_address && !!device.assigned_node_id
 }
 
-/** Whether a stored web-UI override points somewhere the plain http/https
-    buttons can't already reach — a DIFFERENT host, or a NON-standard port. Only
-    then does the override pin the endpoint (and the split button collapses to a
-    single Connect). A same-IP:80/443 or bare-scheme override is redundant: the
-    server normalizes it away (inventory.normalize_web_access), but we mirror the
-    check here so a legacy row still keeps its http/https fallback. */
 function overridePinsEndpoint(device: OrgDevice): boolean {
   const distinctIp = !!device.web_ip && device.web_ip !== device.ip_address
   const distinctPort =
@@ -297,8 +255,6 @@ function overridePinsEndpoint(device: OrgDevice): boolean {
   return distinctIp || distinctPort
 }
 
-// Last port that worked per device — the OLT that refuses port 80 (HILL-OLT-1
-// field lesson) should have its https choice float to the top next time.
 const PORT_KEY = "wisp:webui-port"
 
 function lastPort(deviceId: number): 80 | 443 | null {
@@ -318,22 +274,6 @@ function rememberPort(deviceId: number, port: number): void {
   } catch { /* private mode etc. — a lost preference is fine */ }
 }
 
-// Sessions this browser opened, against the tab each one is being driven from.
-//
-// Nothing on the server can tell that a browser tab was closed — the tunnel is
-// request/response, so an abandoned session is indistinguishable from an idle
-// one until its TTL runs out. That was not merely untidy: the web-optics
-// sweeper stands down for a device someone is browsing, and that gate is
-// per-PROBE, so one forgotten tab quietly suppressed the optical read of every
-// OLT behind it. The server now judges a session by when it was last USED and
-// reaps timed-out ones, which is what makes that safe under every condition;
-// this closes the common case PROMPTLY, while the dashboard is still open to
-// notice. Belt and braces, and the braces are the ones that always hold.
-//
-// Deliberately NOT hooked to the dashboard's own pagehide: that fires on a
-// plain reload too, and closing a session the operator is still using in
-// another tab because they refreshed this one would be a worse bug than the one
-// being fixed. A dashboard that goes away leaves the server's idle rule to it.
 const _openTabs = new Map<string, Window>()
 let _tabWatch: number | null = null
 
@@ -341,8 +281,6 @@ function sweepClosedTabs(): void {
   for (const [sid, tab] of [..._openTabs]) {
     if (!tab.closed) continue
     _openTabs.delete(sid)
-    // Best-effort by nature — the session expires on its own anyway, so a
-    // failed close costs a few idle minutes, never correctness.
     void proxyApi.close(sid).catch(() => { /* it will time out on its own */ })
   }
   if (_openTabs.size === 0 && _tabWatch != null) {
@@ -358,13 +296,8 @@ function watchSessionTab(sid: string, tab: Window | null): void {
 }
 
 export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promise<boolean> {
-  // The tab must open synchronously inside the click gesture or popup blockers
-  // eat it — open blank now, point it at the session once central answers.
   const tab = window.open("", "_blank")
   const tid = `webui-${device.id}`
-  // Session open now includes the probe's preflight (it checks what the device
-  // actually answers — http/https/nothing), so this can take a few seconds and
-  // a definite "unreachable" comes back HERE instead of a dead tab later.
   toast.loading(`Connecting to ${device.name}…`, {
     id: tid, description: "The probe is checking the device's web UI.",
   })
@@ -374,8 +307,6 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
     let shown: Window | null = tab
     if (tab) tab.location.replace(sess.url)
     else shown = window.open(sess.url, "_blank")
-    // Close the tunnel when the tech closes the tab, rather than leaving it to
-    // time out — see watchSessionTab.
     watchSessionTab(sess.sid, shown)
     toast.success(`Connected. Opening ${device.name}'s web UI…`, {
       id: tid,
@@ -390,25 +321,14 @@ export async function openDeviceWebUi(device: OrgDevice, port: 80 | 443): Promis
   }
 }
 
-/** The device panel's "Web UI" button (right of the Health/Optical/Ports
-    tabs): a split button — the primary "Connect" opens in one click using the
-    last-used port (http by default), and the chevron still offers http/https
-    explicitly. Both stay reachable — a device whose firmware moves ports must
-    remain switchable. Caller gates with useWebProxy()/canOpenWebUi. */
 export function WebUiButton({ device }: { device: OrgDevice }) {
   const queryClient = useQueryClient()
   const last = lastPort(device.id)
   const order: Array<80 | 443> = last === 443 ? [443, 80] : [80, 443]
   const primary = order[0] // last used, or http for a device never opened
   const open = (p: 80 | 443) => void openDeviceWebUi(device, p).then((ok) => {
-    // surface the live strip / Settings card row now, not on the next poll
     if (ok) queryClient.invalidateQueries({ queryKey: ["proxy-sessions"] })
   })
-  // A device whose override pins a DISTINCT endpoint (different host or
-  // non-standard port) has a fixed target — the port the server uses comes from
-  // the override, so the http/https chooser is moot. Show a single Connect
-  // button that names where it goes. A redundant same-IP:80/443 override does
-  // NOT pin anything (the server normalizes it away), so keep the split button.
   const hasOverride = overridePinsEndpoint(device)
   if (hasOverride) {
     const scheme = device.web_scheme || (device.web_port === 443 ? "https" : "http")
@@ -437,9 +357,6 @@ export function WebUiButton({ device }: { device: OrgDevice }) {
             <ChevronDown className="size-3 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        {/* z above the map's z-[1000] device panel — that Card is a backdrop-blur
-            stacking context, so the default z-50 menu paints behind it (invisible
-            on /map). Higher wins everywhere else too. */}
         <DropdownMenuContent align="end" className="z-[1100]">
           {order.map((p) => (
             <DropdownMenuItem key={p} onClick={() => open(p)}>
@@ -457,7 +374,6 @@ function sessionBadge(s: ProxySession) {
   if (s.status === "open" && s.live) {
     return <Badge className="bg-success-soft text-success" variant="secondary">live</Badge>
   }
-  // an 'open' row the hub forgot (central restart) is a zombie — say expired
   const label = s.status === "open" ? "expired" : s.status
   return <Badge variant="secondary" className="text-muted-foreground">{label}</Badge>
 }
@@ -468,9 +384,6 @@ function auditTone(status: number | null): string {
   return "text-muted-foreground"
 }
 
-/** Settings card: who has (had) a tunnel open against which device, plus the
-    owner-only per-request audit trail. Renders nothing while the org lacks
-    the capability flag — the feature stays invisible until granted. */
 export function WebProxyCard({ org }: { org: string }) {
   const { user } = useAuth()
   const queryClient = useQueryClient()

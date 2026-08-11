@@ -15,7 +15,6 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 
-// Human hints for the closed OID vocabulary — mirrors ingress/gpon.py.
 const OID_HELP: Record<string, string> = {
   rx: "per-ONU Rx power (optical table)",
   tx: "per-ONU Tx power (optical table)",
@@ -265,7 +264,6 @@ export function GponProfilesCard({ org, isSuperadmin }: {
     states: data?.states ?? [],
     pon_index_strategies: data?.pon_index_strategies ?? [],
   }
-  // A global profile (org_id null) is only editable by a superadmin.
   const canEdit = (p: GponProfile) => (p.org_id === null ? isSuperadmin : true)
 
   return (

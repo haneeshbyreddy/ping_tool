@@ -46,8 +46,6 @@ class PonFaultAlerterTest(unittest.TestCase):
             distance_m=distance, rx_ref_dbm=None, rx_ref_at=None, severity="ok",
             ts=_now())
         if state != "online":
-            # simulate "was online until a moment ago": the upsert only stamps
-            # last_online_at while online, so prime it directly
             with self.store._connect() as conn:
                 conn.execute(
                     "UPDATE onu_optics SET last_online_at=? WHERE org_id='ispA'"
@@ -61,14 +59,10 @@ class PonFaultAlerterTest(unittest.TestCase):
             self._onu(f"dark{i}", "los", distance=d)
 
     def _queued(self, needle=None):
-        # PON faults are DIGEST-tier: they queue for the hourly summary, they
-        # don't push. Transition-only still holds — one queued row per change.
         rows = self.store.pending_digest("ispA")
         return [r for r in rows if needle is None or needle in (r["title"] or "")]
 
     def test_fresh_fiber_fault_tracked_but_off(self):
-        # PON faults are OFF for now (allowlist): the fault is detected and its
-        # state written, but nothing pushes or queues to the dormant digest.
         self._mass_drop()
         self.alerter.sweep(_now())
         self.assertEqual(self.notifier.sent, [])
@@ -76,7 +70,6 @@ class PonFaultAlerterTest(unittest.TestCase):
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 1)
         self.assertEqual(state["kind"], "fiber")
-        # same fault on the next walk: state stands
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
@@ -93,23 +86,17 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.assertEqual(state["active"], 0)
 
     def test_stale_walk_freezes_fault_state_never_clears(self):
-        # A slow C-Data agent missing one walk made every open fault "recover"
-        # and re-page when the walk landed (36 PON_FAULT pages in one hour,
-        # 2026-07-14). A stale OLT freezes; recovery needs a fresh walk.
         self._mass_drop()
         self.alerter.sweep(_now())
         self.assertEqual(
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
-        # the OLT's walk goes stale: restamp every row 20 min into the past
         with self.store._connect() as conn:
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_recent(20.0),))
             conn.commit()
         self.alerter.sweep(_now())
-        # a stale OLT FREEZES its fault state — it never flips to recovered
         state = self.store.pon_fault_states("ispA")[(self.olt, "0/6")]
         self.assertEqual(state["active"], 1)
-        # the walk lands again, fault unchanged: state stays, nothing sent
         self._mass_drop()
         self.alerter.sweep(_now())
         self.assertEqual(
@@ -117,16 +104,11 @@ class PonFaultAlerterTest(unittest.TestCase):
         self.assertEqual(self.notifier.sent, [])
 
     def _silent_drop(self):
-        """The C-Data/DBC shape: no dying_gasp, no LOS, just bare `offline` —
-        so the gasp cross collapses and the drop reads 'fiber' by assumption."""
         self._onu("survivor", "online", distance=700, serial="AA:00")
         for i, d in enumerate((1800, 1950, 2300)):
             self._onu(f"dark{i}", "offline", distance=d, serial=f"MAC:{i}")
 
     def test_a_surviving_reference_onu_turns_a_crew_roll_into_a_power_verdict(self):
-        # The whole point of the feature. Without the reference point this org
-        # would record a fiber cut for what is really a DISCOM outage — the
-        # crew-roll ponfault exists to prevent, unpreventable on this hardware.
         self._silent_drop()
         self._onu("ups", "online", distance=2600, serial="UPS:1")
         self.alerter.sweep(_now())
@@ -186,9 +168,6 @@ class PonFaultAlerterTest(unittest.TestCase):
             self.store.pon_fault_states("ispA")[(self.olt, "0/6")]["active"], 1)
 
     def test_fault_detected_with_plant_placed(self):
-        # splitter placed ~1.2 km down the same PON, inside (0.7, 1.8] km. Suspect
-        # naming rides the (now-off) page body, so here we just confirm detection;
-        # suspect-interval naming is covered by unit/test_ponfault.
         self.store.set_org_device_location("ispA", self.olt, 17.000, 78.4)
         splitter = self.store.create_org_device("ispA", {
             "name": "FDB-14", "ip_address": "", "device_type": "splitter",
@@ -201,7 +180,6 @@ class PonFaultAlerterTest(unittest.TestCase):
 
 
 class _FakeHandler:
-    """Minimal stand-in for the request handler the api modules ride on."""
     def __init__(self, store, org, cfg=None):
         self.store = store
         self._org = org
@@ -227,8 +205,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
         self.olt = self.store.create_org_device("ispA", {
             "name": "OLT-1", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
-        # a live OLT reports every ICMP cycle — seed a fresh UP state so the
-        # liveness gate treats it as observed (a missing state row = probe silent)
         self.store.write_device_states(
             "ispA", [(self.olt, "UP", 5.0, 0.0, None)], _now())
 
@@ -252,14 +228,11 @@ class PonSummaryEndpointTest(unittest.TestCase):
 
     def test_summary_counts_fiber_dups_and_online(self):
         from wisp.central.api import outages
-        # a fiber mass-drop on 0/6 …
         self._onu("survivor", "online", distance=700)
         for i, d in enumerate((1800, 1950, 2300)):
             self._onu(f"dark{i}", "los", distance=d)
-        # … plus a live duplicate MAC (same serial, two ONLINE slots) on 0/7
         self._onu("loopA", "online", pon="0/7", serial="AA:BB:CC")
         self._onu("loopB", "online", pon="0/7", serial="AA:BB:CC")
-        # one walk stamps every row identically; the roster view keys off that
         with self.store._connect() as conn:
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_now(),))
@@ -280,8 +253,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
         self.assertEqual(body["pon_cap"], 64)
 
     def test_device_list_stamps_fiber_and_dup_chips(self):
-        # the inventory list (Network device rows) stamps the same fiber-cut and
-        # live-dup-MAC verdicts as the summary strip, mapped onto the OLT row.
         from wisp.central.api import devices
         self._onu("survivor", "online", distance=700)
         for i, d in enumerate((1800, 1950, 2300)):
@@ -300,8 +271,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
         self.assertEqual(olt["dup_macs"], 1)
 
     def test_device_list_stamps_zero_when_clean(self):
-        # every device carries the fields (default 0) so the row chips never
-        # read undefined — a healthy OLT stamps 0/0, not absent.
         from wisp.central.api import devices
         self._onu("a", "online", distance=700)
         with self.store._connect() as conn:
@@ -317,7 +286,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
 
     def test_summary_flags_pon_over_cap(self):
         from wisp.central.api import outages
-        # cap this OLT at 2 ONUs/PON; three online on 0/6 → over cap
         with self.store._connect() as conn:
             conn.execute("UPDATE org_devices SET onu_pon_limit=2 WHERE id=?",
                          (self.olt,))
@@ -337,7 +305,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
 
     def test_summary_zeroes_down_olt(self):
         from wisp.central.api import outages
-        # same fresh mass-drop + live-dup fixture as the online test …
         self._onu("survivor", "online", distance=700)
         for i, d in enumerate((1800, 1950, 2300)):
             self._onu(f"dark{i}", "los", distance=d)
@@ -347,39 +314,28 @@ class PonSummaryEndpointTest(unittest.TestCase):
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_now(),))
             conn.commit()
-        # … but the OLT itself is ICMP-down: its last walk is still fresh, so
-        # without the liveness gate it would keep contributing 3 online ONUs and a
-        # phantom fiber-cut / live-dup verdict.
         self.store.write_device_states(
             "ispA", [(self.olt, "DOWN", None, 100.0, None)], _now())
         h = _FakeHandler(self.store, "ispA")
         outages.pon_summary(h, {})
         status, body = h.reply
         self.assertEqual(status, 200)
-        # roster still sees the fresh walk, so the OLT and its ONUs still count as
-        # the blast radius — but every one of them is offline while it's down.
         self.assertEqual(body["olts"], 1)
         self.assertEqual(body["onus_total"], 6)
         self.assertEqual(body["onus_online"], 0)
         self.assertEqual(body["onus_offline"], 6)
-        # the ICMP outage owns a down OLT — no second story off frozen optics
         self.assertEqual(body["fiber_cuts"], 0)
         self.assertEqual(body["dup_macs_live"], 0)
         self.assertEqual(body["dup_macs_total"], 0)
 
     def test_summary_drops_probe_silent_olt(self):
         from wisp.central.api import outages
-        # ONUs online, walk fresh — but the OLT's PROBE has gone silent (its edge
-        # is down): central never marks the OLT down, yet we can't see it. The
-        # whole OLT drops out of the rollup, like a stale optics walk but off the
-        # faster ICMP signal — no ONUs left "online" for the 15-min optics window.
         self._onu("a", "online")
         self._onu("b", "online")
         with self.store._connect() as conn:
             conn.execute("UPDATE onu_optics SET updated_at=? WHERE org_id='ispA'",
                          (_now(),))
             conn.commit()
-        # last ICMP report is older than the 180s node-stale threshold
         self.store.write_device_states(
             "ispA", [(self.olt, "UP", 5.0, 0.0, None)], _recent(10.0))
         h = _FakeHandler(self.store, "ispA")
@@ -400,7 +356,6 @@ class PonSummaryEndpointTest(unittest.TestCase):
         h = _FakeHandler(self.store, "ispA")
         outages.pon_summary(h, {})
         _, body = h.reply
-        # the stale OLT drops out entirely — no phantom dup off frozen rows
         self.assertEqual(body["olts"], 0)
         self.assertEqual(body["dup_macs_live"], 0)
         self.assertEqual(body["onus_total"], 0)

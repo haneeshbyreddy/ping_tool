@@ -1,11 +1,3 @@
-"""SNMP guided troubleshooting, central side.
-
-The edge diagnoses each SNMP subsystem per device (`snmp_status` on the full
-/report); central stores the verdicts for the dashboard's "why is this panel
-blank" flow, and operators can mark a subsystem as hardware-unsupported so the
-admin coverage overview stops counting it as a problem.
-"""
-
 import http.client
 import json
 import os
@@ -51,7 +43,6 @@ class SnmpStatusStoreTest(unittest.TestCase):
         row = self._status()["health"]
         self.assertEqual(row["state"], "timeout")
         self.assertEqual(row["updated_at"], "2026-01-02T00:00:00+00:00")
-        # last_ok_at survives the failure; sysobjectid holds across a silent walk.
         self.assertEqual(row["last_ok_at"], "2026-01-01T00:00:00+00:00")
         self.assertEqual(row["sysobjectid"], "1.3.6.1.4.1.5651.3")
 
@@ -91,9 +82,6 @@ class SnmpStatusStoreTest(unittest.TestCase):
 
 
 class OverviewSuppressionTest(unittest.TestCase):
-    """An operator-confirmed "hardware can't do X" drops the gap from the
-    superadmin coverage rollup — denominators and problem list both."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
@@ -106,8 +94,6 @@ class OverviewSuppressionTest(unittest.TestCase):
         self.store.set_org_device_snmp("ispA", self.olt, {
             "snmp_enabled": 1, "snmp_version": "2c", "snmp_community": "public",
             "snmp_port": 161})
-        # Fresh health so the device's SNMP counts as alive — the optics gap is
-        # then the OLT's own problem, not suppressed under a dead-SNMP root cause.
         self.store.upsert_device_health(
             "ispA", self.olt, {"cpu_pct": 10.0}, self.fresh)
 
@@ -129,7 +115,6 @@ class OverviewSuppressionTest(unittest.TestCase):
         self.assertEqual(after["optics"]["olts"], 0)
         self.assertEqual(after["problems"], [])
 
-        # Flipping back to supported restores the gap as a problem.
         self.store.set_device_capability("ispA", self.olt, "optics", True)
         self.assertEqual([p["area"] for p in self._org()["problems"]], ["optics"])
 
@@ -231,7 +216,6 @@ class SnmpStatusHttpTest(unittest.TestCase):
         self.assertFalse(body["capability"][0]["supported"])
         self.assertEqual(body["capability"][0]["updated_by"], "owner")
 
-        # supported=true clears the exception.
         status, _, _ = self._req("POST", "/api/inventory/capability", {
             "device_id": self.dev, "subsystem": "optics", "supported": True},
             cookie=cookie)

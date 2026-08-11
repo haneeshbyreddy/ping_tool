@@ -21,10 +21,6 @@ def _pdf(rows, **kw):
 
 
 class StructureTest(unittest.TestCase):
-    """The file has to be openable. A hand-built PDF fails in exactly one place —
-    the xref — and it fails silently: viewers show a blank or an error, never a
-    stack trace, so the offsets are what these tests actually check."""
-
     def _xref(self, blob: bytes):
         start = int(re.search(rb"startxref\s+(\d+)", blob[-200:]).group(1))
         lines = blob[start:].split(b"\n")
@@ -35,7 +31,7 @@ class StructureTest(unittest.TestCase):
     def test_every_xref_offset_points_at_its_own_object(self):
         blob = _pdf([{"a": "one", "b": "two"}])
         count, entries = self._xref(blob)
-        self.assertEqual(entries[0][2], b"f")  # the mandatory free head entry
+        self.assertEqual(entries[0][2], b"f")
         for num, entry in enumerate(entries):
             if entry[2] == b"f":
                 continue
@@ -51,8 +47,6 @@ class StructureTest(unittest.TestCase):
         self.assertIn(b"/Root 1 0 R", blob)
 
     def test_an_empty_list_still_produces_one_page(self):
-        # "nothing is wrong" is a legitimate report, and a zero-page PDF is a
-        # corrupt file rather than an empty one.
         blob = _pdf([])
         self.assertIn(b"/Count 1", blob)
 
@@ -61,16 +55,10 @@ class StructureTest(unittest.TestCase):
         many = _pdf([{"a": "x", "b": "y"}] * 200)
         self.assertEqual(re.search(rb"/Count (\d+)", one).group(1), b"1")
         self.assertGreater(int(re.search(rb"/Count (\d+)", many).group(1)), 3)
-        # and the pagination is honest about itself
         self.assertIn(b"page 1 of ", many)
 
 
 class WidthTest(unittest.TestCase):
-    """Columns are sized from CONTENT, not from a fixed share of the page.
-
-    Proportional sizing got the issues export exactly wrong: the Detail column
-    sat on ~180pt of white space carrying "Rx -28.86 dBm" while the Item column
-    truncated the 17-character MAC the report exists to communicate."""
 
     def _need(self, col, rows, size=8.5):
         return max([pdf.text_width(col.title, size) * 1.06]
@@ -79,7 +67,7 @@ class WidthTest(unittest.TestCase):
 
     def test_a_short_column_does_not_hoard_width(self):
         narrow = pdf.Column("s", "S", 1.0)
-        greedy = pdf.Column("l", "L", 9.0)   # a high weight, but nothing to show
+        greedy = pdf.Column("l", "L", 9.0)
         rows = [{"s": "N" * 40, "l": "x"}]
         w_narrow, w_greedy = pdf._solve_widths([narrow, greedy], rows, 400.0, 8.5)
         self.assertGreater(w_narrow, w_greedy)
@@ -94,7 +82,6 @@ class WidthTest(unittest.TestCase):
         self.assertAlmostEqual(sum(widths), 600.0, places=3)
 
     def test_weight_decides_who_absorbs_a_shortfall(self):
-        # Both want more than the page has; the heavier one keeps more of it.
         light = pdf.Column("a", "A", 1.0)
         heavy = pdf.Column("b", "B", 3.0)
         rows = [{"a": "N" * 80, "b": "N" * 80}]
@@ -103,8 +90,6 @@ class WidthTest(unittest.TestCase):
         self.assertAlmostEqual(w_light + w_heavy, 200.0, places=3)
 
     def test_one_long_column_never_starves_the_narrow_ones(self):
-        # The water-filling property: an unbounded free-text column takes the
-        # shortfall alone rather than squeezing five identifier columns.
         cols = [pdf.Column(f"c{i}", f"C{i}", 1.0) for i in range(5)]
         cols.append(pdf.Column("free", "Free", 4.0))
         rows = [{**{f"c{i}": "abc" for i in range(5)}, "free": "N" * 300}]
@@ -119,8 +104,6 @@ class WidthTest(unittest.TestCase):
         self.assertAlmostEqual(sum(widths), 700.0, places=3)
 
     def test_mono_cells_are_measured_against_courier(self):
-        # Measured with the Helvetica table a mono cell fits a couple of
-        # characters too many and overruns its column.
         mac = "00:D3:9E:17:21:9E"
         self.assertEqual(pdf.fit(mac, 8.5, 60, mono=True)[-3:], "...")
         self.assertLessEqual(
@@ -130,8 +113,6 @@ class WidthTest(unittest.TestCase):
 class TextTest(unittest.TestCase):
 
     def test_parens_and_backslashes_are_escaped(self):
-        # An unescaped ')' from a real if_alias — "Gi1/0/24 (uplink)" — ends the
-        # string operand early and corrupts every following operator on the page.
         blob = _pdf([{"a": r"Gi1/0/24 (uplink)", "b": "C:\\path"}])
         self.assertIn(rb"Gi1/0/24 \(uplink\)", blob)
         self.assertIn(rb"C:\\path", blob)
@@ -142,9 +123,6 @@ class TextTest(unittest.TestCase):
         self.assertIn(b"OLT-???", blob)
 
     def test_typographic_characters_survive(self):
-        # The fonts declare WinAnsi (cp1252), so the em dash / middot / ellipsis
-        # this app's own strings are full of must render — folding to latin-1
-        # instead printed a report titled "Open issues ? ispA".
         blob = pdf.table_pdf(title="Open issues \u2014 ispA",
                              subtitle="3 issue(s) \u00b7 generated now",
                              columns=COLS, rows=[{"a": "a\u2026b", "b": "ok"}],
@@ -154,8 +132,6 @@ class TextTest(unittest.TestCase):
         self.assertNotIn(b"?", blob)
 
     def test_newlines_never_reach_the_content_stream(self):
-        # A raw newline inside a string operand is the same class of bug that
-        # broke the proxy autofill injection; here it would split an operator.
         blob = _pdf([{"a": "line1\nline2", "b": "r\ns"}])
         self.assertIn(b"line1 line2", blob)
 
@@ -167,12 +143,9 @@ class TextTest(unittest.TestCase):
         wide = "N" * 200
         self.assertTrue(pdf.fit(wide, 8.5, 60).endswith("..."))
         self.assertLessEqual(pdf.text_width(pdf.fit(wide, 8.5, 60), 8.5), 60)
-        # something that already fits is returned untouched
         self.assertEqual(pdf.fit("short", 8.5, 200), "short")
 
     def test_text_width_uses_real_helvetica_metrics(self):
-        # 'i' is narrow, 'W' wide — an average-width approximation would make
-        # truncation land in the wrong place on mono-ish device names.
         self.assertLess(pdf.text_width("i" * 10, 10), pdf.text_width("W" * 10, 10))
 
 

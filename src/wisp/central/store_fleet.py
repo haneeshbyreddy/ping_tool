@@ -1,8 +1,3 @@
-"""Edge nodes: heartbeats/liveness, enrollment tokens, releases and rollouts.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-"""
 from __future__ import annotations
 
 import hashlib
@@ -85,9 +80,6 @@ class FleetStoreMixin:
 
 
     def active_node_token_count(self, org_id: str) -> int:
-        """Registered, un-revoked probe credentials — the paywall node cap's
-        input. Deliberately NOT the `nodes` heartbeat table (it remembers
-        every identity ever seen, the watchdog lesson)."""
         with self._connect() as conn:
             return conn.execute(
                 "SELECT COUNT(*) FROM node_tokens WHERE org_id=? AND revoked_at IS NULL",
@@ -225,11 +217,7 @@ class FleetStoreMixin:
 
     def set_release_sync_status(self, ok: bool, detail: str,
                                 now: str | None = None) -> dict | None:
-        """Record the latest release-sync outcome; returns the PREVIOUS status.
 
-        The previous status is what makes transition-only paging possible — the
-        sync timer fires every 15 min and a broken mirror must page once, not 96x/day.
-        """
         prev = self.release_sync_status()
         doc = {"ok": bool(ok), "detail": detail, "at": now or _now_iso()}
         with self._write_lock, self._connect() as conn:
@@ -309,11 +297,7 @@ class FleetStoreMixin:
 
 
     def request_restart(self, org_id: str, node_id: str) -> bool:
-        """Queue a one-shot agent restart; the node's next heartbeat delivers it.
 
-        Returns False when the node has never heartbeated — there is no
-        channel to deliver through (same rule as the update directive).
-        """
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE nodes SET restart_pending=1 WHERE org_id=? AND node_id=?",
@@ -323,8 +307,6 @@ class FleetStoreMixin:
 
 
     def pop_restart_request(self, org_id: str, node_id: str) -> bool:
-        """Consume the pending restart. Delivery clears it — a directive lost
-        in flight means the operator clicks Restart again, never a loop."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE nodes SET restart_pending=0 WHERE org_id=? AND node_id=?"

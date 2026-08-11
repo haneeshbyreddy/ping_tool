@@ -1,25 +1,3 @@
-"""Subscription paywall: plan catalog, month math, and the reminder sweeper.
-
-Payment is manual. A paid-plan org pays the platform admin by the GPay number
-or QR shown on the lock screen, taps "I've paid" (which pings the admin's
-payments channel with the org name), and the admin marks that month paid
-(``org_billing_months``) from the Organizations page, as far ahead as he likes
-(pre-marking future months IS the "no warning this month" switch). The pure
-status math lives here; enforcement is elsewhere:
-
-- dashboard lock: ``server.py``'s 402 gate (``org_locked``) — edge ingest,
-  monitoring and outage paging are NEVER gated (a lapsed bill must not silence
-  an alarm; the dashboard is the paywall, not the alerting).
-- device cap: ``api/devices.create`` refuses past ``device_cap(plan)``.
-  Existing devices keep working after a downgrade — the cap only stops adds.
-
-Reminders are transition-only via ``billing_notices`` (watchdog pattern): the
-owner topic is paged once when the paid runway drops to ≤3 days, and once when
-the month starts unpaid and the dashboard locks. A failed send retries next
-sweep; only 'sent'/'skipped' suppress the retry.
-
-All month keys are 'YYYY-MM' in UTC.
-"""
 from __future__ import annotations
 
 import calendar
@@ -37,8 +15,6 @@ DEFAULT_GPAY_NUMBER = "6309671515"
 DUE_SOON_DAYS = 3
 SWEEP_INTERVAL_S = 1800
 
-# The product catalog. `device_cap` and the monthly lock are the ENFORCED
-# limits; `features` are the pitch the dashboard renders. None = unlimited.
 PLANS: dict[str, dict] = {
     "free": {
         "label": "Free",
@@ -122,12 +98,7 @@ def month_label(month: str) -> str:
 
 def compute_status(plan: str, paid_months: set[str],
                    now: datetime | None = None) -> dict:
-    """Pure paywall verdict for one org. No I/O.
 
-    status: 'free' (never locks) | 'active' | 'due_soon' (≤3 days of paid
-    runway left) | 'locked' (current month unpaid). `due_month` is the first
-    unpaid month; `days_left` counts down to its 1st (0 when locked).
-    """
     now = now or datetime.now(timezone.utc)
     current = month_key(now)
     if plan not in PAID_PLANS:
@@ -158,8 +129,6 @@ def org_locked(store, org_id: str, now: datetime | None = None) -> bool:
 
 
 class BillingSweeper:
-    """Pages each paid-plan org's owner topic on billing transitions only."""
-
     def __init__(self, store, cfg: Config = CONFIG, notifier=None) -> None:
         self.store = store
         self.cfg = cfg

@@ -5,16 +5,6 @@ import { summaryApi } from "@/lib/api"
 import { useAuth } from "@/hooks/use-auth"
 import { Chip } from "@/components/status-badge"
 
-/** Persistent bandwidth alarms in the top bar — the one alarm surface that
- *  follows you off the Home page.
- *
- *  Deliberately QUIET (the shared soft chip, not a heavier bespoke pill): on
- *  Home it sits a few hundred pixels above a "Bandwidth alarms" stat tile
- *  carrying the same number, and on the Network page the offending row already
- *  wears its own LOW BW / HIGH BW chip. A signal that shouts twice costs
- *  attention without adding information — this one is a reminder, and the
- *  page's own surfaces stay where you actually read it.
- */
 export function AlarmChips() {
   const { scopeOrg } = useAuth()
   const { data } = useQuery({

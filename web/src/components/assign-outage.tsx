@@ -13,25 +13,12 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog"
 
-/** Owner-side triage: hand an open outage to the people who will actually go out,
- *  instead of only being able to acknowledge it yourself.
- *
- *  Multi-select on purpose — a fibre job is two people, and naming both is the
- *  difference between a shift knowing who owns it and a WhatsApp thread where
- *  everyone assumes someone else went. Re-opening the dialog shows the current
- *  assignees preselected, because "assign" here is "who is on this", not an
- *  append-only log: saving REPLACES the set.
- *
- *  Workers are listed first (they are the point) but owners are selectable too —
- *  in a small ISP the owner often is the field engineer. */
 export function AssignOutage({ outage }: { outage: Outage }) {
   const { scopeOrg } = useAuth()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [picked, setPicked] = useState<string[]>(outage.assigned_to)
 
-  // Reset on every open so the dialog always opens on the CURRENT assignment,
-  // never on a half-edited selection from a dialog that was dismissed.
   useEffect(() => {
     if (open) setPicked(outage.assigned_to)
   }, [open, outage.assigned_to])
@@ -41,12 +28,6 @@ export function AssignOutage({ outage }: { outage: Outage }) {
     queryFn: () => usersApi.list(scopeOrg),
     enabled: open && !!scopeOrg,
   })
-  // Who is already PAGED for this device (Settings → Users → Device
-  // responsibility). Deciding who goes out and deciding who hears about it are
-  // separate calls — this dialog still assigns whoever the owner picks — but the
-  // standing answer to "whose patch is this" is the obvious starting point, and
-  // hunting for it in another screen mid-incident is how the wrong person gets
-  // sent. Suggestion only: never auto-assigned, never a filter.
   const inventory = useQuery({
     queryKey: ["inventory", scopeOrg],
     queryFn: () => inventoryApi.list(scopeOrg),
@@ -59,8 +40,6 @@ export function AssignOutage({ outage }: { outage: Outage }) {
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ["outages"] })
       setOpen(false)
-      // How many were REACHED is part of the outcome, not a detail: an assignee
-      // with no WhatsApp number has been given a job they haven't been told about.
       const missed = res.assigned_to.length - res.notified
       toast.success(
         `Assigned to ${res.assigned_to.join(", ")}`,
@@ -78,10 +57,6 @@ export function AssignOutage({ outage }: { outage: Outage }) {
       ? responsibilityFor(device, new Map(devices.map((d) => [d.id, d]))).effective
       : [])
 
-  // Only accounts that belong to this org can take a job; a superadmin row
-  // (org_id null) is a platform login, not a field engineer.
-  // Whoever is already responsible for the device sorts to the top — the list is
-  // read under time pressure, and the likely answer should be the first line.
   const candidates = (users.data?.users ?? [])
     .filter((u) => u.org_id === scopeOrg && u.is_active)
     .sort((a, b) => {
@@ -144,8 +119,6 @@ export function AssignOutage({ outage }: { outage: Outage }) {
                   </span>
                 )}
                 {!u.whatsapp_number && (
-                  // Said up front, not after the fact: assigning someone the app
-                  // can't reach is a decision, and it should be an informed one.
                   <span className="ml-auto flex items-center gap-1 text-2xs text-faint-foreground">
                     <MessageSquareOff className="size-3" /> no WhatsApp
                   </span>

@@ -1,10 +1,3 @@
-"""ONU serial/MAC and name search behind the Network page's device search box.
-
-The identifiers a tech actually holds for a subscriber are the ONU's MAC off the
-sticker and the name it was provisioned with, and until this endpoint neither
-reached anything in the dashboard — the roster was only visible once you already
-knew which OLT to open, which is the thing being looked up.
-"""
 import http.client
 import json
 import os
@@ -100,7 +93,6 @@ class OnuSearchTest(unittest.TestCase):
     def _serials(self, body):
         return sorted(o["serial"] for m in body["matches"] for o in m["onus"])
 
-    # --- the point of the feature -------------------------------------------
 
     def test_tail_of_a_mac_finds_its_onu_and_names_the_olt(self):
         self._onu("ispA", self.olt, "1", "A4:F2:1B:9C:44:01", pon="0/6", onu_id=12)
@@ -122,13 +114,11 @@ class OnuSearchTest(unittest.TestCase):
                 self.assertEqual(self._serials(body), ["A4:F2:1B:9C:44:01"])
 
     def test_a_dash_written_mac_is_found_by_a_colon_typed_needle(self):
-        # vendors punctuate differently; the tech types whatever they know
         self._onu("ispA", self.olt, "1", "AA-BB-CC-DD-EE-FF")
         _, body = self._search("cc%3Add%3Aee")
         self.assertEqual(self._serials(body), ["AA-BB-CC-DD-EE-FF"])
 
     def test_huawei_ascii_serial_is_searchable_too(self):
-        # not every "MAC" is hex — a Huawei GPON serial is an ASCII string
         self._onu("ispA", self.olt, "1", "HWTC1234ABCD")
         _, body = self._search("1234abcd")
         self.assertEqual(self._serials(body), ["HWTC1234ABCD"])
@@ -142,7 +132,6 @@ class OnuSearchTest(unittest.TestCase):
                          ["HILL-OLT-1", "PYLON-OLT"])
 
     def test_severity_and_state_ride_along_for_the_result_row(self):
-        # the row colors with the Optical tab's rule; it needs both fields
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", state="offline")
         _, body = self._search("aabbcc")
         onu = body["matches"][0]["onus"][0]
@@ -150,7 +139,6 @@ class OnuSearchTest(unittest.TestCase):
         self.assertIn("severity", onu)
         self.assertIn("last_online_at", onu)
 
-    # --- by provisioned name -------------------------------------------------
 
     def test_provisioned_name_is_searchable(self):
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", name="hc_kiran")
@@ -159,9 +147,6 @@ class OnuSearchTest(unittest.TestCase):
         self.assertEqual(body["matches"][0]["onus"][0]["name"], "hc_kiran")
 
     def test_name_matching_ignores_underscores_and_spacing(self):
-        """Real provisioned names carry `_` and `-` (hc_kiran, BSNL-151). The
-        needle and the stored name go through the SAME normalizer, so the tech
-        can type it however they remember it."""
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", name="hc_kiran")
         for needle in ("hc_kiran", "hc%20kiran", "hckiran", "HC_KIRAN", "c_kir"):
             with self.subTest(needle=needle):
@@ -178,10 +163,8 @@ class OnuSearchTest(unittest.TestCase):
     def test_name_and_mac_hits_combine_in_one_result_set(self):
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", name="hc_kiran")
         self._onu("ispA", self.olt, "2", "AA:BB:CC:00:00:02", name="hc_kirthi")
-        # "hc_ki" normalizes to HCKI — 4 chars, so it clears the 3-char floor
         _, body = self._search("hc_ki")
         self.assertEqual(len(body["matches"][0]["onus"]), 2)
-        # ...and a needle that only the MAC carries still works alongside
         _, body = self._search("0002")
         self.assertEqual(self._serials(body), ["AA:BB:CC:00:00:02"])
 
@@ -191,21 +174,14 @@ class OnuSearchTest(unittest.TestCase):
         _, body = self._search("kiran")
         self.assertEqual(body["matches"], [])
 
-    # --- the traps -----------------------------------------------------------
 
     def test_zombie_slot_from_an_older_walk_is_not_a_hit(self):
-        """onu_optics never deletes a removed ONU's row (that's what lets
-        last_online_at freeze), so a raw table match can be a slot that no
-        longer exists — and clicking it would land on an Optical tab that
-        doesn't list it. Only the freshest walk's rows count."""
         self._onu("ispA", self.olt, "gone", "DE:AD:BE:EF:00:01", age_s=3600)
         self._onu("ispA", self.olt, "live", "DE:AD:BE:EF:00:02", age_s=0)
         _, body = self._search("deadbeef")
         self.assertEqual(self._serials(body), ["DE:AD:BE:EF:00:02"])
 
     def test_a_stale_olt_still_answers(self):
-        """stale_s=None: a slow C-Data walk must not blank the search the way it
-        must not blank the Optical tab. The panel flags freshness itself."""
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", age_s=4000)
         _, body = self._search("aabbcc")
         self.assertEqual(self._serials(body), ["AA:BB:CC:00:00:01"])
@@ -214,7 +190,6 @@ class OnuSearchTest(unittest.TestCase):
         self._onu("ispB", self.other, "1", "AA:BB:CC:00:00:09")
         _, body = self._search("aabbcc")
         self.assertEqual(body["matches"], [])
-        # ...and ispB's own owner sees only theirs
         cookie = self._login("bowner", "bownerpassword")
         _, body = self._search("aabbcc", cookie=cookie)
         self.assertEqual(self._serials(body), ["AA:BB:CC:00:00:09"])
@@ -229,10 +204,8 @@ class OnuSearchTest(unittest.TestCase):
                 self.assertFalse(body["truncated"])
 
     def test_like_wildcards_in_the_needle_match_nothing(self):
-        """The needle is normalized to alphanumerics before it reaches SQL, so a
-        typed `%` can't turn into a match-everything LIKE pattern."""
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01")
-        _, body = self._search("%25%25%25")     # "%%%"
+        _, body = self._search("%25%25%25")
         self.assertEqual(body["matches"], [])
         _, body = self._search("___")
         self.assertEqual(body["matches"], [])
@@ -247,8 +220,6 @@ class OnuSearchTest(unittest.TestCase):
         self.assertTrue(body["truncated"])
 
     def test_onus_come_back_in_slot_order(self):
-        """Stable order the tech reads down — not a relevance sort that
-        reshuffles as the roster changes underneath (the Optical tab's rule)."""
         self._onu("ispA", self.olt, "c", "AA:BB:CC:00:00:03", pon="0/2", onu_id=1)
         self._onu("ispA", self.olt, "a", "AA:BB:CC:00:00:01", pon="0/1", onu_id=9)
         self._onu("ispA", self.olt, "b", "AA:BB:CC:00:00:02", pon="0/1", onu_id=2)
@@ -262,7 +233,6 @@ class OnuSearchTest(unittest.TestCase):
         self.assertEqual(body["matches"], [])
 
     def test_a_null_serial_onu_is_still_findable_by_name(self):
-        # the two fields are independent: no MAC reported is not "unsearchable"
         self._onu("ispA", self.olt, "1", None, name="hc_kiran")
         _, body = self._search("kiran")
         self.assertEqual(len(body["matches"][0]["onus"]), 1)
@@ -273,17 +243,11 @@ class OnuSearchTest(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_reply_is_never_http_cacheable(self):
-        """The needle rides in the URL, so a heuristically-cached 200 pins one
-        answer to one search string forever — which is exactly how a `?q=BSNL`
-        answered before name search shipped kept returning empty while `BSN`
-        and `BSNL_` (never requested, so never cached) worked."""
         self._onu("ispA", self.olt, "1", "AA:BB:CC:00:00:01", name="hc_kiran")
         self._search("kiran")
         self.assertEqual(self._last_cache_control, "no-store")
 
     def test_every_json_api_reply_is_no_store(self):
-        # not just this endpoint — the whole `_reply` funnel, so no future route
-        # reintroduces the same trap
         cookie = self._login("owner", "ownerpassword")
         for path in ("/api/me", "/api/inventory?org=ispA", "/api/orgs"):
             with self.subTest(path=path):

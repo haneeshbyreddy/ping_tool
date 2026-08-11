@@ -1,27 +1,11 @@
 import type { AssignableAccount, DeviceAssignment, OrgDevice } from "@/lib/types"
 
-// Client half of the paging-responsibility rules. The server is authoritative
-// (central/assignment.py decides who a page actually reaches); this exists so the
-// UI can say WHY a device is covered without a round trip per row — the device
-// list already carries the parent chain and the explicit rows.
-//
-// The rules mirrored here, in the same order as the Python: responsibility flows
-// DOWN the tree, inheritance UNIONS rather than overriding, and no rows at all
-// means every worker is paged.
-
 export interface Responsibility {
-  /** accounts named on this device itself */
   own: number[]
-  /** accounts covering it from an ancestor, and which device that was */
   inherited: Array<{ user_id: number; from: OrgDevice }>
-  /** own ∪ inherited — who actually gets paged (empty = every worker does) */
   effective: number[]
 }
 
-/** Walk up the PRIMARY parent chain unioning assignees, exactly like
-    `responsible_users` server-side. Backup parents and peers are deliberately
-    ignored: a failover path and a cable are not a chain of command.
-    Cycle-guarded — the same reason the Python is. */
 export function responsibilityFor(
   device: OrgDevice,
   byId: Map<number, OrgDevice>,
@@ -42,8 +26,6 @@ export function responsibilityFor(
   return { own, inherited, effective: [...own, ...inherited.map((i) => i.user_id)] }
 }
 
-/** Every device an account is responsible for: the rows naming them plus the
-    whole subtree under each. Mirrors `scope_of`. */
 export function scopeOf(userId: number, devices: OrgDevice[]): Set<number> {
   const roots = devices.filter((d) => (d.assignee_ids ?? []).includes(userId))
   if (roots.length === 0) return new Set()

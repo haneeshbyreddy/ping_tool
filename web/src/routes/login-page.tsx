@@ -26,7 +26,6 @@ export function LoginPage() {
   const [useRecovery, setUseRecovery] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
   const codeRef = useRef<HTMLInputElement>(null)
-  // Read-and-clear: the flag survives the redirect here, not a manual refresh.
   const [expired] = useState(() => {
     const was = sessionStorage.getItem(SESSION_EXPIRED_KEY) === "1"
     sessionStorage.removeItem(SESSION_EXPIRED_KEY)
@@ -44,14 +43,9 @@ export function LoginPage() {
       const second = totpRequired
         ? (useRecovery ? { recovery: code.trim() } : { totp: code.trim() })
         : undefined
-      // "Trust this device" is one checkbox; the server maps it per role once it
-      // knows who logged in — owner/superadmin get a 24h cap, a worker the 30-day
-      // tier. We can't tell the role pre-login, so we just forward the intent.
       await login(username, password, remember, second)
       navigate(from || "/", { replace: true })
     } catch (err) {
-      // A correct password on a 2FA account comes back as a 401 carrying
-      // `totp_required` — that's the prompt for the second factor, not a failure.
       if (err instanceof ApiError && err.body?.totp_required) {
         const wasAsking = totpRequired
         setTotpRequired(true)
@@ -60,7 +54,6 @@ export function LoginPage() {
         setTimeout(() => codeRef.current?.focus(), 0)
         return
       }
-      // server messages arrive lowercase ("invalid credentials") — display-cased here
       const msg = err instanceof ApiError ? err.message : "Sign-in failed. Try again."
       setError(msg.charAt(0).toUpperCase() + msg.slice(1))
       passwordRef.current?.focus()
@@ -76,7 +69,6 @@ export function LoginPage() {
 
   return (
     <div className="relative flex min-h-svh flex-col items-center justify-center overflow-hidden bg-background px-4">
-      {/* one quiet glow so the card reads as lit, not floating in a void */}
       <div aria-hidden className="pointer-events-none absolute top-1/2 left-1/2 size-[36rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary/5 blur-3xl" />
       <Card className="relative w-full max-w-sm">
         <CardHeader>

@@ -16,8 +16,6 @@ import { Skeleton } from "@/components/ui/skeleton"
 function PlanTier({ plan, billing, org }: { plan: Plan; billing: BillingInfo; org: string }) {
   const spec = billing.plans[plan]
   const current = billing.plan === plan
-  // Dropping to Free is self-serve; moving to a paid plan is manual (pay the
-  // admin by GPay/QR, they switch you) so paid tiers show no button here.
   const action = current || plan !== "free" ? null
     : <FreePlanButton org={org} className="mt-auto w-full" />
   return (
@@ -50,9 +48,6 @@ function PlanTier({ plan, billing, org }: { plan: Plan; billing: BillingInfo; or
   )
 }
 
-/** Trailing 2 + coming 10 months, read-only: which are paid, which is now.
- * The superadmin marks months from Organizations → Billing; this is the org
- * owner's receipt view. */
 function MonthStrip({ billing }: { billing: BillingInfo }) {
   const now = currentMonthKey()
   const months = Array.from({ length: 12 }, (_, i) => addMonths(now, i - 2))

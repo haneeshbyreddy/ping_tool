@@ -39,7 +39,7 @@ class ParseTest(unittest.TestCase):
 
     def test_memory_picks_the_ram_typed_row(self):
         disk = [
-            (f"{OID_HR_STORAGE_TYPE}.31", "1.3.6.1.2.1.25.2.1.4"),  # fixed disk
+            (f"{OID_HR_STORAGE_TYPE}.31", "1.3.6.1.2.1.25.2.1.4"),
             (f"{OID_HR_STORAGE_UNITS}.31", "4096"),
             (f"{OID_HR_STORAGE_SIZE}.31", "999999"),
             (f"{OID_HR_STORAGE_USED}.31", "999998"),
@@ -57,12 +57,11 @@ class ParseTest(unittest.TestCase):
 
     def test_entity_sensor_celsius_takes_the_hottest(self):
         vbs = []
-        for idx, val in (("1", "43"), ("2", "61"), ("3", "999")):  # 999 implausible
+        for idx, val in (("1", "43"), ("2", "61"), ("3", "999")):
             vbs += [(f"{OID_ENT_SENSOR_TYPE}.{idx}", "8"),
                     (f"{OID_ENT_SENSOR_SCALE}.{idx}", "9"),
                     (f"{OID_ENT_SENSOR_PRECISION}.{idx}", "0"),
                     (f"{OID_ENT_SENSOR_VALUE}.{idx}", val)]
-        # a non-celsius sensor (volts=4) must be ignored even with a big value
         vbs += [(f"{OID_ENT_SENSOR_TYPE}.9", "4"),
                 (f"{OID_ENT_SENSOR_VALUE}.9", "120")]
         h = parse_health(vbs)
@@ -88,10 +87,9 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parse_health(vbs).temp_c, 50.0)
 
     def test_fiberhome_private_tree_fills_all_three(self):
-        # An S3330-class switch exposes none of the standard MIBs; its 5651 tree does.
-        vbs = [(f"{OID_FH_HEALTH}.1.0", "69"),   # mem %
-               (f"{OID_FH_HEALTH}.2.0", "10"),   # cpu %
-               (f"{OID_FH_HEALTH}.3.0", "21"),   # temp C
+        vbs = [(f"{OID_FH_HEALTH}.1.0", "69"),
+               (f"{OID_FH_HEALTH}.2.0", "10"),
+               (f"{OID_FH_HEALTH}.3.0", "21"),
                (f"{OID_FH_MEM}.8.0", "485363712"),
                (f"{OID_FH_MEM}.5.0", "334450688")]
         h = parse_health(vbs)
@@ -102,7 +100,6 @@ class ParseTest(unittest.TestCase):
         self.assertAlmostEqual(h.mem_pct, 68.9, places=1)
 
     def test_standard_mibs_win_over_fiberhome(self):
-        # A box that answers both keeps the standard reading, not the vendor fallback.
         vbs = _ram_rows() + [(f"{OID_HR_CPU_LOAD}.1", "12"),
                              (f"{OID_FH_HEALTH}.2.0", "99"),
                              (f"{OID_FH_MEM}.8.0", "1"), (f"{OID_FH_MEM}.5.0", "1")]
@@ -128,8 +125,8 @@ def _profile(metrics, match="1.3.6.1.4.1.9999"):
 
 class ProfileTest(unittest.TestCase):
     def test_profile_fills_gaps_the_standard_mibs_left(self):
-        vbs = [("1.3.6.1.4.1.9999.1.2.0", "37"),      # vendor cpu
-               ("1.3.6.1.4.1.9999.1.3.0", "425")]     # vendor temp, tenths
+        vbs = [("1.3.6.1.4.1.9999.1.2.0", "37"),
+               ("1.3.6.1.4.1.9999.1.3.0", "425")]
         p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"},
                       "temp_c": {"oid": "1.3.6.1.4.1.9999.1.3.0", "decode": "div10"}})
         h = parse_health(vbs, p)
@@ -143,8 +140,6 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(parse_health(vbs, p).cpu_pct, 10.0)
 
     def test_signed_div100_decodes_negative_readings(self):
-        # 65036 -> (65036 - 65536) / 100 = -5.0 (the classic signed-16-bit-in-
-        # hundredths encoding; same decode covers optical dBm columns).
         vbs = [("1.3.6.1.4.1.9999.7.1", "65036")]
         p = _profile({"temp_c": {"oid": "1.3.6.1.4.1.9999.7",
                                  "decode": "signed_div100", "select": "first"}})
@@ -167,8 +162,8 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(h.to_wire()["mem_pct"], 61.0)
 
     def test_implausible_profile_values_are_dropped(self):
-        vbs = [("1.3.6.1.4.1.9999.1.2.0", "900"),   # cpu > 100
-               ("1.3.6.1.4.1.9999.1.3.0", "900")]   # temp > ceiling
+        vbs = [("1.3.6.1.4.1.9999.1.2.0", "900"),
+               ("1.3.6.1.4.1.9999.1.3.0", "900")]
         p = _profile({"cpu_pct": {"oid": "1.3.6.1.4.1.9999.1.2.0", "decode": "as_is"},
                       "temp_c": {"oid": "1.3.6.1.4.1.9999.1.3.0", "decode": "as_is"}})
         h = parse_health(vbs, p)
@@ -235,14 +230,13 @@ class GatherTest(unittest.TestCase):
         poller = _FakeHealthPoller({
             "10.0.0.1": DeviceHealth(cpu_pct=33.0, temp_c=52.0),
             "10.0.0.3": RuntimeError("boom"),
-            "10.0.0.4": DeviceHealth(),  # nothing exposed -> dropped
+            "10.0.0.4": DeviceHealth(),
         })
         out, status = asyncio.run(_gather_snmp_health(poller, devices, cfg))
         self.assertEqual(set(out), {1})
         self.assertEqual(out[1]["cpu_pct"], 33.0)
         self.assertEqual(out[1]["temp_c"], 52.0)
         self.assertNotIn("10.0.0.2", poller.walked)
-        # every walked device gets a diagnosis, data or not
         self.assertEqual(status[1]["state"], "ok")
         self.assertEqual(status[3]["state"], "error")
         self.assertEqual(status[4]["state"], "no_response")
@@ -255,8 +249,6 @@ class GatherTest(unittest.TestCase):
             {"id": 2, "ip_address": "10.0.0.2", "snmp_enabled": 1,
              "snmp_community": "public"},
         ]
-        # 1: agent answered sysObjectID but exposes no health OIDs — the
-        # "needs a vendor profile" case; 2: agent totally silent.
         poller = _FakeHealthPoller({
             "10.0.0.1": HealthReading(health=DeviceHealth(), responded=True,
                                       sysobjectid="1.3.6.1.4.1.9999.1"),

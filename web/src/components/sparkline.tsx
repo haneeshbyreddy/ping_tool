@@ -81,7 +81,6 @@ export function HourStrip({ buckets, hours = 24 }: { buckets: TrendBucket[]; hou
             className="h-4 min-w-0 flex-1 rounded-[2px] border border-border/60" />
         }
         const trouble = bucketTrouble(b)
-        // healthy hours whisper (40%) so a red/amber cell is the loudest thing here
         const cls = trouble === "down" ? "bg-destructive"
           : trouble === "loss" ? "bg-warning"
           : "bg-success/40"
@@ -97,26 +96,6 @@ export function HourStrip({ buckets, hours = 24 }: { buckets: TrendBucket[]; hou
   )
 }
 
-/** The SHAPE of the last 24 hours' latency, drawn on the same epoch-hour grid
- *  `HourStrip` uses so the two stack into one reading.
- *
- *  WHY BOTH, rather than one or the other: an OTDR shows a TRACE and an EVENT
- *  TABLE together, because the graph finds the anomaly and the table says what
- *  it was. `HourStrip` is the event table — which hours were rough — and it
- *  cannot show that a link has been climbing all afternoon while never once
- *  crossing a threshold. This is the trace. A number with no trend behind it is
- *  half a number.
- *
- *  THE GRID IS SHARED AND THAT IS LOAD-BEARING. Both floor on EPOCH hours, not
- *  local ones — CLAUDE.md's documented trap, because a half-hour zone like IST
- *  shifts every cell — so column N here is the same hour as cell N below it.
- *  Drawn across all 24 slots even where a bucket is missing, so a gap in the
- *  history is a gap in the LINE rather than a line that quietly closes over it.
- *
- *  It takes NO status tone. A latency trend is reference material: the strip
- *  beneath already carries red and amber for the hours that were actually bad,
- *  and a second red channel repeating that louder is exactly what the rank
- *  audit found wrong everywhere else on this product. */
 export function TrendSpark({ buckets, hours = 24, height = 22 }: {
   buckets: TrendBucket[]; hours?: number; height?: number
 }) {
@@ -131,8 +110,6 @@ export function TrendSpark({ buckets, hours = 24, height = 22 }: {
 
   const W = 240, pad = 2
   const max = Math.max(...seen), min = Math.min(...seen)
-  // a flat line is a REAL answer — pin it mid-height rather than letting a
-  // zero-range divide blow a steady link up into noise
   const range = max - min < 0.05 ? 1 : max - min
   const x = (i: number) => pad + (i * (W - pad * 2)) / (hours - 1)
   const y = (v: number) => height - pad - ((v - min) / range) * (height - pad * 2)

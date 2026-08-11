@@ -58,18 +58,6 @@ class CentralWatchdog:
             title, status = "✅ Probe back", "UP"
             body = f"{org}/{node}"
             priority = 3
-        # A silent probe reaches owners plus whoever is responsible for the
-        # devices that probe carries (central/assignment.py) — a probe is not a
-        # device, so its audience is derived from what sits behind it. With
-        # nothing assigned back there it stays the whole org audience: a dark
-        # probe blinds a slice of the fleet and is the last alarm to narrow on a
-        # guess. The superadmin ops number is NOT paged here (2026-07-25): a
-        # probe-down is an org page like any other, and the admin can't be buried
-        # under every org's fleet churn.
-        #
-        # A fresh resolver per page (not per tick): the watchdog thread is
-        # long-lived, and a cached tree would go on paging a stale audience for
-        # as long as central stays up.
         numbers = PagingAudience(self.store, org).for_node(node)
         ok = False
         if numbers:

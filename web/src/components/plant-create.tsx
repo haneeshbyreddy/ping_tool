@@ -1,32 +1,3 @@
-// Recording one passive box, from the map, in as few decisions as the truth
-// allows.
-//
-// **IT NO LONGER ASKS WHAT FEEDS THE BOX** (2026-08-09, the operator's ask:
-// *"when a new device is added — OLT or splitter or switch — don't ask which
-// device it is from, just place it and then we should be able to configure it…
-// I don't want small inconveniences like a line being drawn automatically"*).
-// The reason is not only ergonomic. Somebody standing at a new splitter knows
-// where it is and how many ways it splits, and routinely does NOT yet know
-// which core of which cable will feed it — that is decided at the closure, or
-// already was and nobody here remembers. This sheet used to GUESS: nearest
-// placed box within 2 km, written into `parent_device_id`, and the map drew a
-// line from it the instant you pressed Save. A claim about plant, invented from
-// proximity, on the one screen a crew reads geometry off.
-//
-// So the feed is neither asked nor guessed. It arrives with the FIBRE — *core 3
-// of that cable runs from here to there* — which is a sentence somebody can
-// stand behind, and which draws along glass that has been surveyed instead of a
-// chord between two pins.
-//
-// What is left is the one fact the ground cannot state: how many ways it splits.
-//
-// Two rules it must keep:
-//
-//   * EVERY DERIVED FIELD NAMES ITS SOURCE, and every one is changeable. A
-//     prefill you cannot see is a prefill you cannot correct.
-//   * A RATIO IS NEVER INVENTED. "Not recorded" is a real answer and stays one
-//     press away. The load bar and the cumulative split both refuse to compute
-//     from a guess, and this sheet must not hand them one.
 import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -48,9 +19,6 @@ import {
 } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
 
-/** What a right-click handed us: a kind and a coordinate. Deliberately nothing
- *  else — there is no `parentId` any more, because there is no longer a question
- *  here whose answer a click could have guessed. */
 export interface PlantDraft {
   kind: PlantKind
   lat: number
@@ -59,13 +27,6 @@ export interface PlantDraft {
 
 const NO_REGION = "__noregion__"
 
-/** The nearest placed box's region, as the only thing still worth inheriting.
- *
- *  A region is the operator's own grouping of ground, and a new splitter is
- *  physically inside whichever one its neighbours are in — so this is a fact
- *  about the COORDINATE rather than a guess about the network, which is exactly
- *  what the feeder was not. Squared degrees are enough: nothing is measured off
- *  this, it only has to pick the closest of a few dozen pins. */
 export function nearestRegion(lat: number, lng: number, devices: OrgDevice[]): string | null {
   let best: { d: number; region: string } | null = null
   for (const d of devices) {
@@ -81,8 +42,6 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
   devices: OrgDevice[]
   org: string | null
   onClose: () => void
-  /** `again` = the operator pressed "Save and add another", so the caller should
-   *  re-arm the map for the next box. */
   onCreated: (created: { id: number; name: string }, again: boolean) => void
 }) {
   const queryClient = useQueryClient()
@@ -101,16 +60,9 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
     () => (draft ? nearestRegion(draft.lat, draft.lng, devices) : null),
     [draft, devices])
 
-  // Reseed on every fresh draft. A sheet that remembered the last box's name
-  // would silently write "SPL-7" twice down a cascade being recorded quickly,
-  // which is exactly the posture this flow is for.
   useEffect(() => {
     if (!draft) return
     setName(suggestPlantName(draft.kind, devices))
-    // A splitter that splits nothing is not a thing anyone stocks, so the
-    // commonest real ratio is offered up front. "Not recorded" stays one press
-    // away: an unknown ratio is a real answer, and the load bar and the
-    // cumulative split both refuse to compute from a guess.
     setSplit({ ratio: 8, inputs: null })
     setRegion(nearestRegion(draft.lat, draft.lng, devices))
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -126,20 +78,11 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
         device_type: draft.kind,
         region,
         tags: [],
-        // NOTHING FEEDS IT YET, and that is a recorded state rather than a gap
-        // in one. The fibre says what feeds it, and until somebody records a
-        // core there is no honest answer to write here — which is also why the
-        // map draws no line from this box until there is one.
         parent_device_id: null,
         pon_port: null,
         split_ratio: split.ratio,
         split_inputs: split.inputs,
       })
-      // Two calls, and they are not atomic — there is no create-with-coordinates
-      // verb an owner can reach (`field-passive` has one, but it deliberately
-      // cannot set a parent). If the pin fails we say so and name the box rather
-      // than leaving a placed-looking row that isn't: an unplaced passive is
-      // findable in the tree, an unreported failure is not.
       try {
         await inventoryApi.setLocation(id, draft.lat, draft.lng)
       } catch {
@@ -177,7 +120,6 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
         </DialogHeader>
 
         <div className="flex flex-col gap-4">
-          {/* The one real question. First, because it is the only one. */}
           <div className="flex flex-col gap-1.5">
             <Label className="text-2xs text-muted-foreground">Split ratio</Label>
             <SplitRatioField value={split} onChange={setSplit} />
@@ -197,10 +139,6 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
             />
           </div>
 
-          {/* The only thing still inherited, and it comes from the GROUND rather
-              than from the network: a box is physically inside whichever region
-              its neighbours are in. Named and changeable, like every derived
-              field on this sheet. */}
           {regions.length > 0 && (
             <div className="flex flex-col gap-1.5">
               <Label className="text-2xs text-muted-foreground">Region</Label>
@@ -224,11 +162,6 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
             </div>
           )}
 
-          {/* WHAT HAPPENS NEXT, said here because its ABSENCE is what an
-              operator notices: they press Save and no line appears. That is the
-              feature, but only if it is announced — an unexplained absence reads
-              as a failed save, which is how somebody ends up pressing Save twice
-              and recording the same box again. */}
           <div className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2.5">
             <Waypoints className="mt-px size-3.5 shrink-0 text-muted-foreground" />
             <p className="text-2xs leading-snug text-muted-foreground">
@@ -244,10 +177,6 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
             Cancel
           </Button>
           <div className="flex gap-2">
-            {/* Plant is walked, not filled in from a desk, so the common posture
-                is "and the next one is 60 m up the road" — this saves and
-                re-arms the map, which makes recording a whole feeder run one
-                continuous gesture instead of eight round trips. */}
             <Button variant="outline" size="sm" disabled={!canSave}
               onClick={() => create.mutate({ again: true })}>
               <MapPin className="size-3.5" /> Save and add another
@@ -263,24 +192,12 @@ export function PlantCreateDialog({ draft, devices, org, onClose, onCreated }: {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Attaching a customer
-// ---------------------------------------------------------------------------
-
-/** Where a subscriber is being put, and what it will hang off.
- *
- *  `passiveId` rides WITH the coordinate on purpose. A tech standing at a drop
- *  knows both facts in the same instant — where the box is, and which splitter
- *  the fibre comes from — and until now those were two flows on two surfaces (a
- *  map pin here, a bulk dialog inside the splitter panel there). Recording half
- *  of what somebody already knows is most of why `onu_drops` sat empty. */
 export interface CustomerDraft {
   lat: number
   lng: number
   passiveId: number | null
 }
 
-/** Mirrors `central/api/devices.py:ONU_SEARCH_MIN` — the server refuses less. */
 const ONU_MIN = 3
 
 export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached }: {
@@ -299,10 +216,6 @@ export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached 
   const passive = draft?.passiveId != null
     ? devices.find((d) => d.id === draft.passiveId) ?? null : null
 
-  // Debounced and keyed exactly like the map's own search box, so the two share
-  // a cache rather than each holding their own copy of the same roster answer.
-  // `onuSearchKey` is the punctuation-blind needle — a MAC typed with colons and
-  // one typed with dashes are the same lookup, and the server agrees.
   const debounced = useDebounced(q.trim(), 450)
   const enough = onuSearchKey(debounced).length >= ONU_MIN
   const searchQ = useQuery({
@@ -313,10 +226,6 @@ export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached 
     retry: 0,
   })
   const hits = useMemo(() => {
-    // The identity is the SERIAL column, uppercased — the same normalisation the
-    // map search does, and the same one `onu_places` is keyed on. A hit with no
-    // serial has no identity a drop record could survive on, so it is skipped
-    // rather than shown as a row that cannot be clicked.
     const byMac = new Map<string, { mac: string; who: string; where: string }>()
     for (const m of searchQ.data?.matches ?? []) {
       for (const o of m.onus) {
@@ -335,10 +244,6 @@ export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached 
   const attach = useMutation({
     mutationFn: async (mac: string) => {
       if (!draft) throw new Error("no draft")
-      // The location first: it is the fact this dialog was opened to record, and
-      // it must land even if the drop write is refused. Deliberately carries NO
-      // witness claim — putting a customer on the map is a coordinate, and the
-      // power-supply claim that flips a PON verdict has its own explicit toggle.
       await inventoryApi.setOnuPlace({
         mac, lat: draft.lat, lng: draft.lng, org_id: org,
       })
@@ -367,10 +272,6 @@ export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached 
         <DialogHeader>
           <DialogTitle>Customer here</DialogTitle>
           <DialogDescription>
-            {/* A customer is never CREATED: the ONU is already in the OLT's
-                roster because the walk found it. What is being recorded is where
-                it stands, so the verb has to be "find", not "add" — and a MAC
-                the roster has never seen is a typo, not a new subscriber. */}
             Find the sticker MAC or the name on the subscriber's box. This records
             where it stands, nothing else.
           </DialogDescription>
@@ -407,8 +308,6 @@ export function AttachCustomerDialog({ draft, devices, org, onClose, onAttached 
             ) : searchQ.isLoading ? (
               <p className="px-3 py-6 text-center text-xs text-muted-foreground">Searching…</p>
             ) : hits.length === 0 ? (
-              // "No such subscriber" and "nobody has walked that OLT" are
-              // different answers, and this list may only give the first one.
               <p className="px-3 py-6 text-center text-xs text-muted-foreground">
                 No subscriber in the roster matches that.
               </p>

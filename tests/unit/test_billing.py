@@ -53,7 +53,6 @@ class ComputeStatusTest(unittest.TestCase):
         self.assertEqual(st["days_left"], 17)
 
     def test_due_soon_inside_three_days(self):
-        # July 29/30/31 are the 3 days before an unpaid August 1st
         for day in (29, 30, 31):
             st = billing.compute_status("vip", {"2026-07"}, _utc(2026, 7, day))
             self.assertEqual(st["status"], "due_soon", day)
@@ -62,8 +61,6 @@ class ComputeStatusTest(unittest.TestCase):
         self.assertEqual(st["status"], "active")
 
     def test_prepaid_months_extend_the_runway(self):
-        # Admin pre-marked Aug+Sep: no warning until Sep runs short (the
-        # "no reminder this cycle" mechanism is just future paid months).
         st = billing.compute_status("pro", {"2026-07", "2026-08", "2026-09"},
                                     _utc(2026, 7, 30))
         self.assertEqual(st["status"], "active")
@@ -71,7 +68,6 @@ class ComputeStatusTest(unittest.TestCase):
         self.assertEqual(st["due_month"], "2026-10")
 
     def test_gap_in_paid_months_ends_the_runway(self):
-        # Paid July and September but not August: runway ends with July.
         st = billing.compute_status("pro", {"2026-07", "2026-09"}, _utc(2026, 7, 30))
         self.assertEqual(st["status"], "due_soon")
         self.assertEqual(st["due_month"], "2026-08")
@@ -88,7 +84,6 @@ class SweeperTest(unittest.TestCase):
         self.store = CentralStore(Path(self.tmp.name) / "c.db")
         self.store.set_org("ispA", name="Acme", ntfy_topic_owner="own-a")
         self.store.set_org_plan("ispA", "pro")
-        # WhatsApp-only: an owner number gives the reminder a recipient.
         o = self.store.add_user("ispA", "own1", "h", "s", "owner")
         self.store.set_user_whatsapp(o, "919000000001")
         self.notifier = RecordingNotifier()
@@ -107,14 +102,12 @@ class SweeperTest(unittest.TestCase):
         self.assertEqual(page["whatsapp"], ["919000000001"])
         self.assertIn("August 2026", page["body"])
         self.assertIn(billing.DEFAULT_GPAY_NUMBER, page["body"])
-        # transition-only: a second sweep stays silent
         self.assertEqual(self.sweeper.check(now), [])
         self.assertEqual(len(self.notifier.sent), 1)
 
     def test_locked_pages_once_and_mentions_gpay(self):
         now = _utc(2026, 8, 2)
         self.assertEqual(self.sweeper.check(now), [("ispA", "2026-08", "locked")])
-        # 🔒 marks the lock tier (💳 is the due-soon reminder)
         self.assertIn("🔒", self.notifier.sent[0]["title"])
         self.assertIn(billing.DEFAULT_GPAY_NUMBER, self.notifier.sent[0]["body"])
         self.assertEqual(self.sweeper.check(now), [])
@@ -125,13 +118,10 @@ class SweeperTest(unittest.TestCase):
         now = _utc(2026, 8, 2)
         self.assertEqual(sweeper.check(now), [])
         self.assertEqual(len(failing.sent), 1)
-        # still unpaid, send failed → retried (not stranded)
         sweeper.check(now)
         self.assertEqual(len(failing.sent), 2)
 
     def test_no_recipient_is_skipped_not_retried(self):
-        # ispB has no WhatsApp numbers → its reminder is skipped (recorded, not
-        # sent) and a skip is never retried (unlike a failed send).
         self.store.set_org("ispB", name="NoNumber")
         self.store.set_org_plan("ispB", "vip")
         now = _utc(2026, 8, 2)

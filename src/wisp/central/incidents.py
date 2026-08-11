@@ -1,20 +1,3 @@
-"""Incident shape classification — power outage vs upstream failure, pure math.
-
-Central holds two graphs nobody else has together: the TOPOLOGY (who feeds
-whom) and the GEOGRAPHY (map pins). Crossing them classifies a simultaneous
-multi-device outage the way a veteran NOC eye does:
-
-  * one topological root down, children dark behind it  → "upstream" — the FSM
-    already suppresses the victims; the story is that one device/fiber.
-  * SEVERAL independent branches down at once, packed into a small geographic
-    circle → "power" — different feeds don't share fiber, but they do share an
-    electricity-board feeder. Don't roll a splicing crew at 2am for the DISCOM.
-
-This is an ANNOTATION, never a mute: it explains alarms on the dashboard and
-must not suppress, reroute, or replace any page ("trust the alarm" is
-absolute). Pure function over device rows — no I/O, injectable clock, unit
-tested with synthetic fleets.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,20 +8,20 @@ from wisp.core.analytics import _parse
 
 DOWN_STATES = frozenset({"DOWN", "UNREACHABLE"})
 
-WINDOW_MIN = 15      # devices falling within this of each other = one wave
-RADIUS_KM = 3.0      # power verdict needs the wave packed inside this circle
-MIN_DEVICES = 3      # fewer is device trouble, not an area event
+WINDOW_MIN = 15
+RADIUS_KM = 3.0
+MIN_DEVICES = 3
 
 
 @dataclass(frozen=True)
 class Incident:
-    kind: str                 # "power" | "upstream"
+    kind: str
     device_ids: tuple[int, ...]
-    branches: int             # independent down roots in the wave
-    since: str | None         # earliest outage start in the wave (+00:00)
-    center: tuple[float, float] | None   # placed members' centroid
-    radius_km: float | None   # max member distance from the centroid
-    root_name: str | None     # upstream only: the device that owns the story
+    branches: int
+    since: str | None
+    center: tuple[float, float] | None
+    radius_km: float | None
+    root_name: str | None
 
     def as_dict(self) -> dict:
         return {
@@ -72,12 +55,7 @@ def evaluate(rows: list[dict], now: datetime, *,
              window_min: int = WINDOW_MIN,
              radius_km: float = RADIUS_KM,
              min_devices: int = MIN_DEVICES) -> list[Incident]:
-    """Classify the open outage waves in one org's device rows.
 
-    `rows` are `list_org_devices()` dicts — state, outage_started_at,
-    parent_device_id, lat/lng. Returns newest wave first; waves that are
-    neither clearly upstream nor clearly power are omitted (no verdict beats a
-    wrong one on a NOC wall)."""
     if now.tzinfo is not None:
         now = now.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -94,7 +72,6 @@ def evaluate(rows: list[dict], now: datetime, *,
     downs.sort(key=lambda p: p[0])
     all_down_ids = {r["id"] for _, r in downs}
 
-    # waves: consecutive outage starts separated by more than the window split
     waves: list[list[tuple[datetime, dict]]] = [[downs[0]]]
     for pair in downs[1:]:
         if (pair[0] - waves[-1][-1][0]) > timedelta(minutes=window_min):
@@ -103,13 +80,10 @@ def evaluate(rows: list[dict], now: datetime, *,
             waves[-1].append(pair)
 
     incidents: list[Incident] = []
-    for wave in reversed(waves):            # newest first
+    for wave in reversed(waves):
         if len(wave) < min_devices:
             continue
         members = [r for _, r in wave]
-        # a root is a down device whose feed is NOT down — count independent
-        # branches against the full down set, not just this wave (an
-        # UNREACHABLE child of an older outage is still a victim, not a root)
         roots = [r for r in members
                  if r.get("parent_device_id") not in all_down_ids]
         branches = max(1, len(roots))
@@ -137,5 +111,4 @@ def evaluate(rows: list[dict], now: datetime, *,
                 kind="power", device_ids=tuple(r["id"] for r in members),
                 branches=branches, since=since, center=center,
                 radius_km=round(radius, 2), root_name=None))
-        # scattered multi-branch waves get no verdict — stay silent
     return incidents

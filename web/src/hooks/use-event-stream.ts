@@ -5,9 +5,6 @@ import { tq } from "@/lib/api"
 const LIVE_QUERY_KEYS = [
   "summary", "outages", "inventory", "logs", "nodes",
   "snmp-walks", // a queued walk's result lands on the edge's report cadence
-  // The issue list is the same trouble the tiles count, so it has to move on the
-  // same signal — a list of what is wrong that lags a device recovering is the
-  // one thing this page cannot be.
   "issues",
 ]
 
@@ -28,14 +25,6 @@ export function useEventStream(org: string | null) {
       source.addEventListener("changed", invalidateAll)
     }
 
-    // Mobile browsers freeze a backgrounded tab: the EventSource connection dies
-    // and SSE has no replay, so any `changed` event fired while we were away is
-    // lost and the UI stays on its last (stale) paint. On becoming visible again,
-    // reopen the stream unless it's actively OPEN — a dropped connection usually
-    // sits in CONNECTING (native retry, sometimes a long backoff), not CLOSED, so
-    // keying off CLOSED alone misses the common case. Then do one immediate
-    // catch-up invalidation so we resync current state rather than waiting for the
-    // next server-side change.
     const onVisible = () => {
       if (document.visibilityState !== "visible") return
       if (!source || source.readyState !== EventSource.OPEN) {

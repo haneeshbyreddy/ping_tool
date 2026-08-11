@@ -1,14 +1,3 @@
-"""Scraped optics end to end: the store round-trip, the target query's gates,
-and the merge landing on real severity/badge state.
-
-The unit tests pin the merge arithmetic. What matters here is that a scraped
-Rx reaches the SAME machinery an SNMP-derived one does — severity, the OLT
-badge, the paging transition — because the whole design bet is that the fold
-happens BEFORE CentralOpticsMonitor and nothing downstream ever learns where a
-reading came from. If that bet is wrong, C-Data ONUs get numbers on a screen
-and no alarms behind them.
-"""
-
 import os
 import sys
 import tempfile
@@ -33,7 +22,6 @@ MAC = "8C:A3:99:17:D3:38"
 
 
 def walked(onu_key, serial, state="online", rx=None):
-    """A roster row as the SNMP fold produces it on this vendor: no Rx at all."""
     return {"onu_key": onu_key, "pon_port": f"EPON0/{onu_key.split('.')[0]}",
             "onu_id": int(onu_key.split(".")[1]), "name": "sub", "serial": serial,
             "state": state, "rx_dbm": rx, "tx_dbm": None, "olt_rx_dbm": None,
@@ -79,9 +67,6 @@ class WebOpticsStoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["rx_dbm"], -23.5)
 
     def test_a_partial_scrape_leaves_untouched_pons_alone(self):
-        # The OLT holds one session slot, so a sweep can legitimately end early.
-        # Storing must never be delete-then-insert or every partial scrape would
-        # black out the PONs that simply weren't reached this time.
         self.store.upsert_web_optics(ORG, self.olt, [
             {"onu_key": "1.1", "serial": "AA:AA:AA:00:00:01", "rx_dbm": -18.0},
             {"onu_key": "3.8", "serial": MAC, "rx_dbm": -21.0}], OLD)
@@ -90,7 +75,7 @@ class WebOpticsStoreTest(unittest.TestCase):
             RECENT)
         rows = {r["onu_key"]: r for r in self._scraped()}
         self.assertEqual(rows["1.1"]["rx_dbm"], -18.4)
-        self.assertEqual(rows["3.8"]["rx_dbm"], -21.0)     # kept, just older
+        self.assertEqual(rows["3.8"]["rx_dbm"], -21.0)
         self.assertEqual(rows["3.8"]["scraped_at"], OLD)
 
     def test_rows_without_a_key_are_dropped_not_stored_blank(self):
@@ -101,9 +86,6 @@ class WebOpticsStoreTest(unittest.TestCase):
 
 
 class WebOpticsTargetsTest(unittest.TestCase):
-    """Who the sweeper is allowed to touch. Each gate keeps it off a box it has
-    no business POSTing an admin login to."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db")
@@ -130,7 +112,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         return [t["id"] for t in self.store.web_optics_targets()]
 
     def _roster(self, device_id, *pon_ports):
-        """The SNMP walk's roster — what a scraped reading merges ONTO."""
         for i, pon in enumerate(pon_ports or ("EPON0/1",)):
             self.store.upsert_onu_optics(
                 ORG, device_id, f"{i}.1", pon_port=pon, onu_id=1, name="sub",
@@ -140,7 +121,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
 
     def _detected(self, device_id, profile="dbc",
                   sysoid="1.3.6.1.4.1.37950.1.1.5.10.14.1"):
-        """What the EDGE reported about its own optics sweep of this OLT."""
         self.store.upsert_snmp_statuses(
             ORG, [(device_id, "optics",
                    {"state": "ok", "profile": profile, "sysobjectid": sysoid,
@@ -161,12 +141,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_an_edge_detected_dbc_olt_is_a_target(self):
-        # THE generalization. The vendor field is on automatic, but the edge's
-        # own optics sweep matched the dbc profile off this box's sysObjectID
-        # and said so on its report. That is the same evidence an operator
-        # would have used to pick the dropdown value, straight from the box —
-        # and requiring it is what took this subsystem off one hand-configured
-        # OLT and onto every C-Data OLT in the fleet.
         did = self._olt(vendor=None)
         self._creds(did)
         self._roster(did)
@@ -174,10 +148,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [did])
 
     def test_a_detected_vendor_without_a_sysobjectid_does_not_qualify(self):
-        # `profile` is also echoed back for an OVERRIDE — including a
-        # fleet-wide WISP_GPON_VENDOR default, which is a config value, not the
-        # box identifying itself. Only a real auto-detect stamps sysObjectID,
-        # so that is the field that has to be there.
         did = self._olt(vendor=None)
         self._creds(did)
         self._roster(did)
@@ -185,7 +155,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_another_vendors_detection_does_not_qualify(self):
-        # The login form and page path are one vendor's recipe.
         did = self._olt(vendor=None)
         self._creds(did)
         self._roster(did)
@@ -193,8 +162,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_an_undetected_olt_on_automatic_is_still_not_a_target(self):
-        # Nothing has claimed this box. "Probably C-Data" is not enough to
-        # start POSTing an admin login at it, and never was.
         for vendor in (None, "", "huawei"):
             did = self._olt(name=f"OLT-{vendor}", vendor=vendor)
             self._creds(did)
@@ -202,19 +169,11 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_an_olt_with_no_roster_is_not_a_target(self):
-        # A reading merges onto a walked slot and can never create one, so
-        # there is nothing here for a scrape to surface — the login and the
-        # page fetch could only ever be discarded. The live example is a C-Data
-        # GPON box that was logged into every 15 minutes for a day to be told
-        # its firmware has no OPM Diag page.
         did = self._olt()
         self._creds(did)
         self.assertEqual(self._ids(), [])
 
     def test_the_target_carries_the_olts_own_pon_ports(self):
-        # One POST per PON, so the sweeper has to know how many there are. The
-        # roster is the only honest source; a constant is how half the fleet's
-        # ONUs went unasked-about while the scrape reported success.
         did = self._olt()
         self._creds(did)
         self._roster(did, "EPON0/1", "EPON0/3", "EPON0/8")
@@ -229,8 +188,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_an_org_without_the_web_proxy_grant_is_not_swept(self):
-        # Without the grant the edge holds no long-poll, so every request would
-        # only burn its timeout.
         did = self._olt()
         self._creds(did)
         self._roster(did)
@@ -238,16 +195,12 @@ class WebOpticsTargetsTest(unittest.TestCase):
         self.assertEqual(self._ids(), [])
 
     def test_one_device_can_be_singled_out_without_widening_the_gates(self):
-        """The manual refresh narrows this query rather than looking a device up
-        on its own — "may this box be scraped" must have exactly one answer, or
-        a hand-triggered read could reach an OLT the sweep refuses."""
         ok, no_roster = self._olt(), self._olt(name="HILL-OLT")
         self._creds(ok)
         self._creds(no_roster)
         self._roster(ok)
         self.assertEqual([r["id"] for r in self.store.web_optics_targets(
             device_id=ok)], [ok])
-        # ineligible for the sweep is ineligible for the button, identically
         self.assertEqual(self.store.web_optics_targets(device_id=no_roster), [])
 
     def test_a_device_in_maintenance_is_left_alone(self):
@@ -259,9 +212,6 @@ class WebOpticsTargetsTest(unittest.TestCase):
 
 
 class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
-    """The point of merging before the monitor: a scraped Rx must behave in
-    every way like a walked one."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
@@ -296,20 +246,13 @@ class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
         row = self._rows()["3.8"]
         self.assertEqual(row["rx_dbm"], -29.4)
         self.assertEqual(row["severity"], "crit")
-        # Distance stays the walk's: the page's real metres are stored but not
-        # merged, or ponfault would bracket a cut across two units. See
-        # weboptics._MERGED_FIELDS.
         self.assertEqual(row["distance_m"], 2764)
         badge = self.store.get_olt_optics(ORG, self.olt)
         self.assertEqual(badge["crit_count"], 1)
         self.assertTrue(badge["alarm"])
-        # a scraped reading flows through the SAME optics path as a walked one
-        # (severity + badge); optical PAGING itself is OFF for now (allowlist).
         self.assertEqual(self.notifier.sent, [])
 
     def test_without_a_scrape_the_vendor_stays_honestly_blank(self):
-        # This is the pre-existing DBC behaviour and it must survive untouched:
-        # no reading is better than a fabricated one.
         self._sync([walked("3.8", MAC)])
         row = self._rows()["3.8"]
         self.assertIsNone(row["rx_dbm"])
@@ -317,8 +260,6 @@ class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
         self.assertEqual(self.notifier.sent, [])
 
     def test_a_stale_scrape_stops_driving_the_badge(self):
-        # A scrape that quietly stopped working must not hold an alarm open on
-        # evidence that is two days old.
         self.store.upsert_web_optics(ORG, self.olt, [
             {"onu_key": "3.8", "serial": MAC, "rx_dbm": -29.4}], OLD)
         merged = self._sync([walked("3.8", MAC)])
@@ -327,16 +268,12 @@ class ScrapedReadingDrivesAlarmsTest(unittest.TestCase):
         self.assertFalse(self.store.get_olt_optics(ORG, self.olt)["alarm"])
 
     def test_an_offline_onu_keeps_its_last_walked_state(self):
-        # The page only lists ONUs it just queried over the fibre, so a dark
-        # ONU has no reading by construction — and its zombie slot must not
-        # inherit the live one's.
         self.store.upsert_web_optics(ORG, self.olt, [
             {"onu_key": "3.8", "serial": MAC, "rx_dbm": -21.0}], RECENT)
         self._sync([walked("3.8", MAC), walked("1.4", MAC, state="offline")])
         rows = self._rows()
         self.assertEqual(rows["3.8"]["rx_dbm"], -21.0)
         self.assertIsNone(rows["1.4"]["rx_dbm"])
-        # An offline ONU is never judged, whatever its last reading was.
         self.assertEqual(rows["1.4"]["severity"], "ok")
 
 

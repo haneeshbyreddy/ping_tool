@@ -11,9 +11,6 @@ import {
 const NONE = "__none__"
 const NEW = "__new__"
 
-/* Region picker fed by /api/regions (union of declared + in-use names, so legacy
-   free-text regions appear without backfill). "New region…" swaps to a text input;
-   saving the parent form is what brings the name into circulation. */
 export function RegionSelect({ org, value, onChange, className, inputClassName }: {
   org: string
   value: string
@@ -44,7 +41,6 @@ export function RegionSelect({ org, value, onChange, className, inputClassName }
   }
 
   const names = (data?.regions ?? []).map((r) => r.name)
-  // a legacy value not (yet) in the list must still render as selected
   const options = value && !names.includes(value) ? [...names, value] : names
 
   return (

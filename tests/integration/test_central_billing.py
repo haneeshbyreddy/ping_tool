@@ -1,6 +1,3 @@
-"""Paywall end-to-end: the 402 lock gate, the device cap, and the superadmin
-billing controls — against a live central server, no clock mocking (lock state
-derives from the REAL current month, so tests mark/unmark that month)."""
 import http.client
 import json
 import os
@@ -70,7 +67,6 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         return setcookie.split(";")[0]
 
-    # ----- reads -------------------------------------------------------------
 
     def test_billing_read_free_org(self):
         cookie = self._login("owner", "ownerpassword")
@@ -82,10 +78,9 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertEqual(body["gpay_number"], billing.DEFAULT_GPAY_NUMBER)
         self.assertIn("pro", body["plans"])
 
-    # ----- the 402 lock gate -------------------------------------------------
 
     def test_locked_org_gets_402_except_me_and_billing(self):
-        self.store.set_org_plan("ispA", "pro")  # no months paid → locked now
+        self.store.set_org_plan("ispA", "pro")
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/inventory", cookie=cookie)
         self.assertEqual(status, 402)
@@ -93,7 +88,6 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertEqual(self._req("POST", "/api/inventory",
                                    {"name": "r1", "ip_address": "10.0.0.1"},
                                    cookie=cookie)[0], 402)
-        # the lock screen's lifelines stay open
         self.assertEqual(self._req("GET", "/api/me", cookie=cookie)[0], 200)
         status, body, _ = self._req("GET", "/api/billing", cookie=cookie)
         self.assertEqual(status, 200)
@@ -105,8 +99,6 @@ class CentralBillingHttpTest(unittest.TestCase):
         cookie = self._login("root", "rootpassword")
         self.assertEqual(self._req("GET", "/api/inventory?org=ispA",
                                    cookie=cookie)[0], 200)
-        # the edge keeps fetching topology with the global token — monitoring
-        # survives a lapsed bill by design
         self.assertEqual(self._req("GET", "/edge/devices?org_id=ispA",
                                    token="tok")[0], 200)
 
@@ -122,7 +114,6 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertIn(THIS_MONTH, body["paid_months"])
         self.assertEqual(self._req("GET", "/api/inventory", cookie=cookie)[0], 200)
 
-    # ----- admin billing writes ----------------------------------------------
 
     def test_admin_billing_is_superadmin_only(self):
         cookie = self._login("owner", "ownerpassword")
@@ -160,7 +151,6 @@ class CentralBillingHttpTest(unittest.TestCase):
         self.assertNotIn(THIS_MONTH, body["paid_months"])
         self.assertTrue(body["locked"])
 
-    # ----- probe cap ----------------------------------------------------------
 
     def test_free_plan_caps_at_one_probe(self):
         cookie = self._login("owner", "ownerpassword")
@@ -174,11 +164,9 @@ class CentralBillingHttpTest(unittest.TestCase):
                                     cookie=cookie)
         self.assertEqual(status, 422)
         self.assertIn("1 edge probe", body["error"])
-        # rotating the LIVE probe stays free (not a new slot)
         self.assertEqual(self._req("POST", "/api/nodes/rotate",
                                    {"org_id": "ispA", "node_id": "edge-1"},
                                    cookie=cookie)[0], 200)
-        # revoking frees the slot; re-activating it via rotate re-occupies it
         self.assertEqual(self._req("POST", "/api/nodes/revoke",
                                    {"org_id": "ispA", "node_id": "edge-1"},
                                    cookie=cookie)[0], 200)
@@ -189,7 +177,6 @@ class CentralBillingHttpTest(unittest.TestCase):
                                     {"org_id": "ispA", "node_id": "edge-1"},
                                     cookie=cookie)
         self.assertEqual(status, 422)
-        # upgrading lifts the cap (month marked so pro doesn't lock)
         root = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/billing",
                   {"org_id": "ispA", "plan": "pro"}, cookie=root)
@@ -199,7 +186,6 @@ class CentralBillingHttpTest(unittest.TestCase):
                                    {"org_id": "ispA", "node_id": "edge-3"},
                                    cookie=cookie)[0], 200)
 
-    # ----- device cap ---------------------------------------------------------
 
     def test_free_plan_caps_at_5_devices_passives_exempt(self):
         cookie = self._login("owner", "ownerpassword")
@@ -213,12 +199,10 @@ class CentralBillingHttpTest(unittest.TestCase):
                                     cookie=cookie)
         self.assertEqual(status, 422)
         self.assertIn("5", body["error"])
-        # passive plant is documentation, never metered
         status, _, _ = self._req("POST", "/api/inventory",
                                  {"name": "spl-1", "device_type": "splitter"},
                                  cookie=cookie)
         self.assertEqual(status, 200)
-        # upgrading lifts the cap (pro month marked so the org isn't locked)
         root = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/billing",
                   {"org_id": "ispA", "plan": "pro"}, cookie=root)
@@ -231,22 +215,18 @@ class CentralBillingHttpTest(unittest.TestCase):
 
 
 class PaidPingAndQrTest(CentralBillingHttpTest):
-    """Manual-payment UX: the QR rides /api/billing, and "I've paid" pings the
-    admin's payments channel with the org name — reachable even while locked."""
-
     def test_billing_read_carries_qr_and_no_gateway_flag(self):
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("GET", "/api/billing", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertIn("qr_image", body)
         self.assertIsNone(body["qr_image"])
-        self.assertNotIn("upi_enabled", body)  # the gateway flag is gone
+        self.assertNotIn("upi_enabled", body)
         self.store.set_setting("billing_qr_image", "data:image/png;base64,QRQR")
         _, body, _ = self._req("GET", "/api/billing", cookie=cookie)
         self.assertEqual(body["qr_image"], "data:image/png;base64,QRQR")
 
     def test_ive_paid_pings_the_admin_number_even_while_locked(self):
-        # pro with no month paid ⇒ LOCKED: proves /api/billing/paid is exempt
         self.store.set_org_plan("ispA", "pro")
         self.store.set_setting("whatsapp_admin_number", "919999999999")
         cookie = self._login("owner", "ownerpassword")
@@ -259,7 +239,6 @@ class PaidPingAndQrTest(CentralBillingHttpTest):
         self.assertIn("Acme", page["title"])
 
     def test_ive_paid_without_admin_number_is_not_notified(self):
-        # no admin number ⇒ nothing to notify, but the tap still succeeds
         self.store.set_org_plan("ispA", "pro")
         cookie = self._login("owner", "ownerpassword")
         status, body, _ = self._req("POST", "/api/billing/paid", {}, cookie=cookie)
@@ -273,7 +252,7 @@ class PaidPingAndQrTest(CentralBillingHttpTest):
         self.assertEqual(status, 200)
         self.assertIn("billing_qr_image", body)
         self.assertIn("whatsapp", body)
-        self.assertNotIn("upigateway_key_set", body)  # the gateway key is gone
+        self.assertNotIn("upigateway_key_set", body)
         status, _, _ = self._req("POST", "/api/admin/settings",
                                  {"billing_qr_image": "data:image/png;base64,AAo",
                                   "whatsapp": {"admin_number": "919999999999"}},
@@ -282,14 +261,11 @@ class PaidPingAndQrTest(CentralBillingHttpTest):
         _, body, _ = self._req("GET", "/api/admin/settings", cookie=root)
         self.assertEqual(body["billing_qr_image"], "data:image/png;base64,AAo")
         self.assertEqual(body["whatsapp"]["admin_number"], "919999999999")
-        # a non-image paste is refused (no javascript: URI into an <img src>)
         self.assertEqual(self._req("POST", "/api/admin/settings",
                                    {"billing_qr_image": "javascript:alert(1)"},
                                    cookie=root)[0], 422)
 
     def test_admin_settings_accepts_svg_qr(self):
-        # SVG is a first-class QR format (data:image/svg+xml passes the same
-        # data:image/ gate and renders via <img>, so no script runs)
         root = self._login("root", "rootpassword")
         svg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
         status, _, _ = self._req("POST", "/api/admin/settings",

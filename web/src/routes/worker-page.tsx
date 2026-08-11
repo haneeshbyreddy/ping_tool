@@ -6,10 +6,6 @@ import { UserMenu } from "@/components/layout/user-menu"
 import { StatusDot } from "@/components/status-badge"
 import { Skeleton } from "@/components/ui/skeleton"
 
-// The field-worker view: the single screen a `worker` session sees, whatever
-// the path (require-auth routes them here). Open issues + acknowledge +
-// post-mortem, nothing else — the server-side _WORKER_ROUTES whitelist
-// enforces the same boundary, this is just the matching chrome.
 export function WorkerPage() {
   const { user, scopeOrg } = useAuth()
   const outages = useQuery({

@@ -1,10 +1,3 @@
-"""Port-level link bindings: which physical port carries each parent→child link.
-
-The parent side reuses switch_ports.feeds_device_id (the same column ports.py
-folds a port-down into the child's outage through); the child side is the new
-uplink_device_id mirror. `/api/inventory/link-ports` serves every bound port
-org-wide in one query — the map hangs a live bandwidth label per link off it.
-"""
 import http.client
 import json
 import os
@@ -85,7 +78,6 @@ class LinkPortsApiTest(unittest.TestCase):
                                     {"username": username, "password": password})
         return setcookie.split(";")[0] if setcookie else None
 
-    # --- binding both ends of a link ----------------------------------------
 
     def test_bind_both_sides_then_list_serves_the_link(self):
         cookie = self._login()
@@ -133,7 +125,6 @@ class LinkPortsApiTest(unittest.TestCase):
         self.assertEqual(status, 403, body)
 
     def test_link_ports_list_is_org_scoped(self):
-        # ispA binds a port; ispB's list stays empty
         self.store.set_port_uplink("ispA", self._port_id(self.ap, 1), self.sw)
         cookie = self._login("bowner", "bownerpassword")
         status, body, _ = self._req("GET", "/api/inventory/link-ports", cookie=cookie)
@@ -141,8 +132,6 @@ class LinkPortsApiTest(unittest.TestCase):
         self.assertEqual(body["ports"], [])
 
     def test_walk_refresh_keeps_the_binding(self):
-        # the SNMP sweep upserts the same row every pass; the operator's cabling
-        # declaration must survive it (upsert deliberately omits the column)
         self.store.set_port_uplink("ispA", self._port_id(self.ap, 1), self.sw)
         self._port(self.ap, 1, "wan")
         row = self.store.list_switch_ports("ispA", self.ap)[0]
@@ -154,7 +143,6 @@ class LinkPortsApiTest(unittest.TestCase):
             "region": None, "parent_device_id": None})
         self._port(leaf, 2, "eth2")
         self.store.set_port_uplink("ispA", self._port_id(leaf, 2), self.sw)
-        # re-home the AP so CORE-SW has no children, then delete it
         self.store.update_org_device("ispA", self.ap, {
             "name": "HILL-AP", "ip_address": "10.0.0.2", "device_type": "ap",
             "region": None, "parent_device_id": None})

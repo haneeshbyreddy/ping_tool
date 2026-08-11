@@ -16,16 +16,6 @@ import { responsibilityFor, scopeOf } from "@/lib/assignment"
 import { isPassiveType, type AssignableAccount, type OrgDevice } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-// The bulk half of paging responsibility: one row per field account, and a picker
-// that can hand over a whole region in a couple of clicks. The per-device half
-// lives in the device panel (components/device-assignees.tsx) — same rules, other
-// direction.
-//
-// It says "paged", never "sees" or "access", because that is all this is: every
-// account keeps full visibility of the fleet (operator choice 2026-07-26). A card
-// here that implied otherwise would be teaching the operator something false about
-// their own install.
-
 function DevicePicker({ account, devices, onClose }: {
   account: AssignableAccount
   devices: OrgDevice[]
@@ -34,9 +24,6 @@ function DevicePicker({ account, devices, onClose }: {
   const queryClient = useQueryClient()
   const [query, setQuery] = useState("")
   const [region, setRegion] = useState<string | null>(null)
-  // Explicit rows for this account, as ticked in the dialog. The diff against
-  // `initial` on save is what keeps this ADDITIVE per device — untouched devices
-  // are never written, so another worker's assignment can't be collateral.
   const initial = useMemo(
     () => new Set(devices.filter((d) => (d.assignee_ids ?? []).includes(account.user_id))
       .map((d) => d.id)),
@@ -94,8 +81,6 @@ function DevicePicker({ account, devices, onClose }: {
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to save"),
   })
 
-  // What the tick set actually costs once inheritance is applied — the honest
-  // number, since one row on a region head can pull in dozens of devices.
   const reach = useMemo(() => {
     const projected = devices.map((d) => ({
       ...d,
@@ -118,9 +103,6 @@ function DevicePicker({ account, devices, onClose }: {
   }
 
   return (
-    // sm:max-w, not max-w: DialogContent's own default is a `sm:` class, and at
-    // ≥640px a plain max-w-2xl loses to it — the picker rendered at ~360px with
-    // every device name truncated to "SPL-P…".
     <DialogContent className="sm:max-w-2xl">
       <DialogHeader>
         <DialogTitle>Devices {account.username} is paged for</DialogTitle>
@@ -145,8 +127,6 @@ function DevicePicker({ account, devices, onClose }: {
           </Button>
         </div>
 
-        {/* Region is how the operator thinks about territory, so it's the primary
-            filter — "tick all shown" beside it is the bulk gesture. */}
         <div className="flex flex-wrap gap-1">
           <button type="button" onClick={() => setRegion(null)}
             className={cn("rounded-md border px-2 py-0.5 text-2xs",
@@ -184,8 +164,6 @@ function DevicePicker({ account, devices, onClose }: {
                   <span className="shrink-0 text-faint-foreground">{d.device_type}</span>
                 )}
                 {isPassiveType(d.device_type) && <Chip tone="muted">passive</Chip>}
-                {/* Already covered from an ancestor: ticking it too is harmless but
-                    pointless, and not saying so makes the list look wrong. */}
                 {via && !ticked.has(d.id) && (
                   <span className="ml-auto flex shrink-0 items-center gap-1 text-faint-foreground">
                     <CornerLeftUp className="size-3" /> via {via.name}
@@ -275,9 +253,6 @@ export function AssignmentCard({ org }: { org: string }) {
           </div>
         ))}
 
-        {/* Unassigned devices are NOT a gap — they page everybody, which is the
-            safe default. But an operator who thinks assignment is finished needs
-            the number stated, not implied by absence. */}
         {roster.isSuccess && (
           <div className="flex items-start gap-2 border-t px-4 py-2.5 text-xs text-muted-foreground">
             <BellRing className="mt-0.5 size-3.5 shrink-0 text-faint-foreground" />

@@ -1,16 +1,3 @@
-"""Operator-placed REFERENCE ONUs — the API half.
-
-An ISP picks the handful of subscribers it knows run on a UPS, solar or a tower
-supply and places them on the map. Placing IS the claim; nothing detects power.
-Those reference points then decide PON-fault verdicts (see unit/test_ponfault
-for the rules themselves), which is why placement is an owner write.
-
-What this file pins is the plumbing that the rules ride on: identity (one
-sticker is one reference point, however it was typed), org isolation, the
-sparse-table contract (clearing is a DELETE), and the honesty of the read —
-a placement whose ONU no longer exists must SAY so rather than quietly stop
-being a witness.
-"""
 import http.client
 import json
 import os
@@ -102,7 +89,6 @@ class OnuPlacesTest(unittest.TestCase):
                                     cookie=cookie or self._owner())
         return status, body
 
-    # --- the basic round trip ------------------------------------------------
 
     def test_placing_a_reference_onu_lists_it_against_its_roster_row(self):
         self._onu("ispA", self.olt, "0/6.12", "A4:F2:1B:9C:44:01", pon="0/6",
@@ -114,7 +100,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(len(body["places"]), 1)
         p = body["places"][0]
         self.assertTrue(p["matched"])
-        # stored UPPERCASE — one spelling of a customer name everywhere
         self.assertEqual(p["label"], "HILL TOWER")
         self.assertEqual(p["device_id"], self.olt)
         self.assertEqual(p["device_name"], "HILL-OLT-1")
@@ -139,10 +124,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
 
     def test_clearing_a_BARE_reference_point_still_leaves_no_row_behind(self):
-        # The table stays sparse. A point that was vouched for and never named
-        # holds nothing an operator typed, so unplacing it prunes the row exactly
-        # as the old delete did — the record only outlives its pin when there is
-        # a record to outlive it.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._place("AA:BB")
         self._unplace("AA:BB")
@@ -151,16 +132,10 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(self.store.get_onu_place("ispA", "AA:BB"))
 
     def test_removing_a_pin_does_NOT_forget_who_the_subscriber_is(self):
-        # THE BUG THIS FEATURE EXISTS TO KILL. "Remove" on the map card is an
-        # eye-off icon that reads as "hide this pin"; it ran a DELETE, so it
-        # destroyed the customer's name and phone number with no confirmation
-        # and no way back.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._place("AA:BB", label="Ramesh", phone="9876543210")
         self._unplace("AA:BB")
-        # off the map…
         self.assertEqual(self._places()[1]["places"], [])
-        # …but still on file, and still findable by the panel that opens it
         rec = self.store.get_onu_place("ispA", "AA:BB")
         self.assertIsNotNone(rec)
         self.assertEqual(rec["label"], "RAMESH")
@@ -169,15 +144,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(rec["lng"])
 
     def test_unplacing_RETRACTS_the_witness_claim(self):
-        # Unplacing takes the claim back. A witness surviving with no pin would
-        # keep voting on fibre-cut verdicts while being absent from the only
-        # screen that lists witnesses.
-        #
-        # Note what it takes to SET UP now: placing is a location and nothing
-        # more (operator's call, 2026-08-04), so the claim has to be made
-        # explicitly through its own verb. Only the retraction still rides the
-        # pin — the asymmetry is deliberate and documented on
-        # `clear_onu_place_coords`.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._place("AA:BB", label="Water tank", phone="9876543210")
         self.assertEqual(self.store.onu_place_macs("ispA"), set(),
@@ -186,14 +152,10 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(self.store.onu_place_macs("ispA"), {"AA:BB"})
         self._unplace("AA:BB")
         self.assertEqual(self.store.onu_place_macs("ispA"), set())
-        # the contact record is what survives — not the claim
         self.assertEqual(self.store.get_onu_place("ispA", "AA:BB")["label"],
                          "WATER TANK")
 
     def test_provenance_goes_with_the_coordinates_it_describes(self):
-        # accuracy_m is "the radius this measurement is good to". With no
-        # measurement left there is no radius, and keeping the figure would have
-        # the record claim a 6 m fix for a point that no longer exists.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self.store.place_onu_in_field(
             "ispA", "AA:BB", 15.85, 74.5, witness=False, accuracy_m=6.0,
@@ -205,12 +167,8 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(rec["placed_at"])
         self.assertEqual(rec["label"], "RAMESH")
 
-    # --- a subscriber can be recorded from the desk, with no coordinate -------
 
     def test_a_name_and_number_can_be_recorded_WITHOUT_a_location(self):
-        # The write that was impossible until 2026-08-03: every path into this
-        # table demanded lat/lng, so an ISP with 2,156 subscribers and a handful
-        # of pins had nowhere to put 2,150 names.
         self._onu("ispA", self.olt, "1", "AA:BB")
         status, body, _ = self._req(
             "POST", "/api/inventory/onu-contact",
@@ -218,14 +176,11 @@ class OnuPlacesTest(unittest.TestCase):
             cookie=self._owner())
         self.assertEqual(status, 200, body)
         rec = self.store.get_onu_place("ispA", "AA:BB")
-        self.assertEqual(rec["label"], "RAMESH")      # uppercased on the way in
-        self.assertEqual(rec["phone"], "9876543210")  # separators compacted
+        self.assertEqual(rec["label"], "RAMESH")
+        self.assertEqual(rec["phone"], "9876543210")
         self.assertIsNone(rec["lat"])
 
     def test_recording_a_name_is_NOT_vouching_for_a_power_supply(self):
-        # There is no `witness` key on this payload at all — the claim is only
-        # ever made where the UI states the contract, never as a side effect of
-        # typing somebody's name.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._req("POST", "/api/inventory/onu-contact",
                   {"mac": "AA:BB", "label": "Ramesh", "witness": True},
@@ -233,17 +188,12 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(self.store.onu_place_macs("ispA"), set())
 
     def test_an_unlocated_record_is_NOT_drawn_on_the_map(self):
-        # It has no coordinates, so shipping it would put a marker at (null,
-        # null) and inflate every count the map takes off this list.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._req("POST", "/api/inventory/onu-contact",
                   {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
         self.assertEqual(self._places()[1]["places"], [])
 
     def test_an_unlocated_record_does_not_count_as_surveyed(self):
-        # Coverage asks "has a PIN", which is now narrower than "has a row" — a
-        # subscriber named from the desk still needs the visit, and counting the
-        # row would report a survey as finished that nobody has walked.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._req("POST", "/api/inventory/onu-contact",
                   {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
@@ -254,8 +204,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(body["total"], 1)
 
     def test_emptying_a_desk_record_prunes_it(self):
-        # The table stays sparse in both directions, or a cleared record leaves
-        # a husk the operator cannot get rid of.
         self._onu("ispA", self.olt, "1", "AA:BB")
         self._req("POST", "/api/inventory/onu-contact",
                   {"mac": "AA:BB", "label": "Ramesh"}, cookie=self._owner())
@@ -273,11 +221,8 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertIsNone(self.store.get_onu_place("ispA", "AA:BB"))
 
-    # --- identity ------------------------------------------------------------
 
     def test_one_sticker_is_ONE_reference_point_however_it_was_typed(self):
-        # _norm_mac is case-insensitive; two spellings must not become two
-        # witnesses voting separately on the same PON
         self._onu("ispA", self.olt, "1", "A4:F2:1B")
         self._place("a4:f2:1b")
         self._place("  A4:F2:1B  ")
@@ -287,8 +232,6 @@ class OnuPlacesTest(unittest.TestCase):
             self.store.onu_place_macs("ispA", witness_only=False), {"A4:F2:1B"})
 
     def test_separators_are_NOT_stripped_from_identity(self):
-        # search_key is punctuation-blind; identity deliberately is not, or two
-        # genuinely different serials collapse into one reference point
         self._onu("ispA", self.olt, "1", "A4:F2:1B")
         self._place("A4:F2:1B")
         self._place("A4F21B")
@@ -302,12 +245,8 @@ class OnuPlacesTest(unittest.TestCase):
         status, _, _ = self._place("AA:BB", lat=91.0)
         self.assertEqual(status, 422)
 
-    # --- honesty about a placement that lost its ONU -------------------------
 
     def test_a_placement_whose_onu_is_GONE_is_listed_as_unmatched(self):
-        # an RMA'd box changes MAC, so the row survives pointing at nothing.
-        # The operator has to SEE that — a pin that silently stopped being a
-        # witness is the one failure this list must not hide.
         self._place("DE:AD:BE:EF")
         _, body = self._places()
         self.assertEqual(len(body["places"]), 1)
@@ -317,11 +256,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(p["state"])
 
     def test_a_reference_point_follows_its_onu_to_another_OLT(self):
-        # Re-homing a drop must not need a second click: the placement is keyed
-        # on the box, not on the slot it happened to occupy. onu_optics never
-        # deletes the vacated row, but current_roster keeps only the rows from
-        # each OLT's FRESHEST walk — so once the old OLT walks again without it,
-        # the zombie drops out and the reference point is at its new home.
         other = self.store.create_org_device("ispA", {
             "name": "PYLON-OLT", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None})
@@ -329,17 +263,14 @@ class OnuPlacesTest(unittest.TestCase):
         self._place("AA:BB")
         self.assertEqual(self._places()[1]["places"][0]["device_id"], self.olt)
 
-        self._onu("ispA", self.olt, "2", "EE:FF", age_s=0)   # newer walk, no AA:BB
-        self._onu("ispA", other, "9", "AA:BB", age_s=0)      # it registered here
+        self._onu("ispA", self.olt, "2", "EE:FF", age_s=0)
+        self._onu("ispA", other, "9", "AA:BB", age_s=0)
         p = self._places()[1]["places"][0]
         self.assertEqual(p["device_id"], other)
         self.assertEqual(p["device_name"], "PYLON-OLT")
         self.assertFalse(p["ambiguous"])
 
     def test_a_mac_on_two_live_slots_reports_AMBIGUOUS_rather_than_guessing(self):
-        # C-Data reg tables really do hand one MAC to two slots. A reference
-        # point standing on both isn't at one OLT, and picking a winner would
-        # put a pin's label on the wrong box.
         other = self.store.create_org_device("ispA", {
             "name": "PYLON-OLT", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None})
@@ -352,7 +283,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(p["slots"], 2)
         self.assertIsNone(p["device_id"])
 
-    # --- scope ---------------------------------------------------------------
 
     def test_another_orgs_reference_points_are_invisible(self):
         self._place("AA:BB")
@@ -361,16 +291,11 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(self.store.onu_place_macs("ispB"), set())
 
     def test_a_worker_cannot_place_a_reference_point(self):
-        # deciding what counts as a trustworthy power supply is running the org
         cookie = self._login("field", "fieldpassword")
         status, _, _ = self._place("AA:BB", cookie=cookie)
         self.assertEqual(status, 403)
 
     def test_a_superadmin_places_into_the_org_it_names(self):
-        # A superadmin is org_id IS NULL, so the org can only come from the body.
-        # This is the live-deployment case (the platform admin IS the operator
-        # here) and it 500'd on the NOT NULL insert until the SPA started sending
-        # its scope — every earlier test logged in as an org owner and missed it.
         auth.create_user(self.store, None, "root", "rootpassword", "owner")
         cookie = self._login("root", "rootpassword")
         status, body, _ = self._req(
@@ -382,9 +307,6 @@ class OnuPlacesTest(unittest.TestCase):
             self.store.onu_place_macs("ispA", witness_only=False), {"AA:BB"})
 
     def test_a_superadmin_with_NO_org_is_refused_not_crashed(self):
-        # There is no org-less reference point to store, so this must be a clean
-        # refusal. It used to reach the store and raise a NOT NULL IntegrityError,
-        # which the operator saw as "internal error" with nothing to act on.
         auth.create_user(self.store, None, "root2", "rootpassword", "owner")
         cookie = self._login("root2", "rootpassword")
         status, body, _ = self._req(
@@ -398,7 +320,6 @@ class OnuPlacesTest(unittest.TestCase):
                                  {"mac": "AA:BB", "lat": 1.0, "lng": 1.0})
         self.assertEqual(status, 401)
 
-    # --- the per-ONU rate on the map line ------------------------------------
 
     def _port(self, device_id, if_index, if_name, *, oper="up",
               in_bps=1.0e6, out_bps=8.0e6):
@@ -412,8 +333,6 @@ class OnuPlacesTest(unittest.TestCase):
             conn.commit()
 
     def test_a_reference_onu_carries_its_OWN_interface_rate(self):
-        # C-Data EPON gives each ONU an ifTable row, which is the only reason a
-        # per-subscriber rate exists at all here.
         self._onu("ispA", self.olt, "0/1.3", "AA:BB", pon="EPON0/1", onu_id=3)
         self._port(self.olt, 16, "EPON01ONU3")
         self._place("AA:BB")
@@ -423,8 +342,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertEqual(p["port_state"], "up")
 
     def test_a_described_onu_still_matches_on_the_leading_token(self):
-        # once somebody types a description the firmware appends it to if_name
-        # (and overwrites if_alias entirely) — the interface token survives
         self._onu("ispA", self.olt, "0/3.5", "AA:BB", pon="EPON0/3", onu_id=5)
         self._port(self.olt, 20, "EPON03ONU5 BSNL-238")
         self._place("AA:BB")
@@ -432,8 +349,6 @@ class OnuPlacesTest(unittest.TestCase):
                          "EPON03ONU5 BSNL-238")
 
     def test_the_PON_AGGREGATE_is_never_reported_as_one_subscribers_rate(self):
-        # EPON0/1 is the whole PON — up to 64 subscribers. Printing it on one
-        # ONU's line would put the same big number on every reference point.
         self._onu("ispA", self.olt, "0/1.3", "AA:BB", pon="EPON0/1", onu_id=3)
         self._port(self.olt, 9, "EPON0/1", in_bps=900e6, out_bps=900e6)
         self._place("AA:BB")
@@ -442,8 +357,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(p["in_bps"])
 
     def test_a_vendor_with_no_per_onu_interface_reports_no_rate(self):
-        # Gpon_04/Gpon_08 name interfaces differently and matched ZERO rows in
-        # the live fleet. That must degrade to "no reading", never to a guess.
         self._onu("ispA", self.olt, "1.4", "AA:BB", pon="1", onu_id=4)
         self._port(self.olt, 3, "gpon-onu_1/1/4:1")
         self._place("AA:BB")
@@ -452,8 +365,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(p["out_bps"])
 
     def test_an_ambiguous_placement_gets_no_rate_either(self):
-        # we refuse to say which OLT it is on, so we must refuse to say which
-        # interface's traffic is its own
         other = self.store.create_org_device("ispA", {
             "name": "PYLON-OLT", "ip_address": "10.0.0.2", "device_type": "OLT",
             "region": None, "parent_device_id": None})
@@ -465,44 +376,25 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertTrue(p["ambiguous"])
         self.assertIsNone(p["if_name"])
 
-    # --- what the map's subscriber LABEL needs --------------------------------
-    #
-    # The name beside a pin carries the Rx reading (map/refonu.ts:refHasRx), and
-    # a dBm on screen carries no date — so the SPA has to be able to tell a
-    # fresh measurement from a stale one and a graded one from an ungraded one
-    # WITHOUT a second request. These two fields are what make that decidable;
-    # the refusals themselves are SPA-side (there is no frontend suite), so what
-    # is pinned here is that it has the facts to refuse with.
 
     def test_a_placement_carries_the_optics_VERDICT_and_its_CLOCK(self):
         self._onu("ispA", self.olt, "0/6.1", "AA:BB", pon="0/6", onu_id=1)
         self._place("AA:BB")
         p = self._places()[1]["places"][0]
         self.assertEqual(p["rx_dbm"], -21.0)
-        # the OLT's own threshold verdict, not one re-derived from the number —
-        # thresholds are per-OLT, so a second grading rule would disagree with
-        # the Optical tab about the same drop
         self.assertEqual(p["severity"], "ok")
         self.assertIsNotNone(p["optics_updated_at"])
 
     def test_the_dbm_clock_is_the_OPTICS_walk_not_the_PORT_walk(self):
-        """Two different sweeps. A port table refreshed a moment ago says
-        nothing about how old the light reading beside it is, and gating the
-        printed dBm on the wrong clock is how last week's number renders as
-        now."""
         self._onu("ispA", self.olt, "0/1.3", "AA:BB", pon="EPON0/1", onu_id=3,
                   age_s=4000)
-        self._port(self.olt, 16, "EPON01ONU3")   # fresh port row, stale optics
+        self._port(self.olt, 16, "EPON01ONU3")
         self._place("AA:BB")
         p = self._places()[1]["places"][0]
         self.assertIsNotNone(p["port_updated_at"])
         self.assertNotEqual(p["optics_updated_at"], p["port_updated_at"])
 
     def test_an_unmatched_placement_carries_NO_reading_to_print(self):
-        """Its MAC left every roster (an RMA'd box). There is no row behind the
-        pin, so there must be no verdict and no clock — a label that printed a
-        remembered dBm for a subscriber nothing is walking would be the exact
-        'stale reading with no date' this split exists to prevent."""
         self._place("DE:AD:BE:EF:00:01")
         p = self._places()[1]["places"][0]
         self.assertFalse(p["matched"])
@@ -510,7 +402,6 @@ class OnuPlacesTest(unittest.TestCase):
         self.assertIsNone(p["severity"])
         self.assertIsNone(p["optics_updated_at"])
 
-    # --- the fold into the Optical tab ---------------------------------------
 
     def test_the_optics_reply_marks_which_rows_are_reference_points(self):
         self._onu("ispA", self.olt, "0/6.1", "AA:BB", pon="0/6", onu_id=1)

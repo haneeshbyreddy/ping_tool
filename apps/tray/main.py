@@ -61,10 +61,6 @@ class TrayController:
         self.app = TrayApp(refresh=self.refresh, build_menu=self.menu)
 
     def refresh(self) -> tuple[int, str]:
-        # status.json is the ONLY truth here. A schtasks /Query from this
-        # non-elevated session can't read the SYSTEM task, and its failure is
-        # indistinguishable from "not installed" without parsing localized
-        # output — gating the menu on it kept probes reading as dead for days.
         self.cfg = _load_config()
         self.view = edge_status.read_status(_status_file(self.cfg))
         node = self.cfg.get("WISP_NODE_ID", "")
@@ -76,9 +72,6 @@ class TrayController:
         running_ish = self.view.state in (
             edge_status.STATE_OK, edge_status.STATE_STARTING, edge_status.STATE_DEGRADED)
         start_label = "Restart probe" if running_ish else "Start probe"
-        # The agent self-updates underneath us while this tray binary only
-        # changes on an installer re-run — show the AGENT's running version
-        # (from status.json), not our own stale compile-time stamp.
         agent_v = ((self.view.raw or {}).get("version") or "").strip()
         title = f"WISP Edge — agent v{agent_v}" if agent_v else f"WISP Edge v{VERSION} (tray)"
         dashboard = (self.cfg.get("WISP_CENTRAL_URL") or "").strip()

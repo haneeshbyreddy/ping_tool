@@ -10,26 +10,8 @@ import {
 } from "@/map/basemaps"
 import { Button } from "@/components/ui/button"
 
-// The capture sheet's "is this actually the right spot?" panel.
-//
-// A GPS fix is a circle, not a point: 25 m of it is a whole compound, and the
-// tech standing there can SEE which rooftop the box is on. Letting them nudge
-// the pin turns an honest-but-vague reading into an exact one — this is the only
-// way a worker on a phone can produce a better position than the handset's chip,
-// and before it existed their only choice was to accept whatever came back.
-//
-// SATELLITE by default, and that is the whole point: a roadmap shows a street
-// name, imagery shows the actual building, pole line and compound wall. Nobody
-// identifies a drop from a road label.
-//
-// Deliberately NOT the map page in miniature — no clustering, no topology, no
-// device pins. One marker, one job. Anything else here would be a second map
-// implementation to keep in step with the first.
-
 const ADJUST_ZOOM = 18
 
-/** The pin being positioned. Bigger and louder than anything on the main map:
- *  it is the only object here and it is being aimed, not scanned. */
 const PIN = L.divIcon({
   className: "",
   html: '<div class="wisp-adjust-pin"><span></span></div>',
@@ -37,17 +19,11 @@ const PIN = L.divIcon({
   iconAnchor: [14, 14],
 })
 
-/** Keeps the view on the point when the FIX moves (GPS converging), but never
- *  fights the operator: once they have dragged, the map is theirs. A `useMap()`
- *  child rather than a ref on MapContainer — the ref isn't set yet on the first
- *  render that has coordinates. */
 function Recenter({ lat, lng, follow }: { lat: number; lng: number; follow: boolean }) {
   const map = useMap()
   useEffect(() => {
     if (follow) map.setView([lat, lng], map.getZoom() || ADJUST_ZOOM, { animate: false })
   }, [map, lat, lng, follow])
-  // A map created inside a sheet that animates open measures itself at the wrong
-  // size and renders one grey tile. Re-measure after the transition settles.
   useEffect(() => {
     const t = setTimeout(() => map.invalidateSize(), 260)
     return () => clearTimeout(t)
@@ -59,15 +35,7 @@ export function PinAdjustMap({ org, lat, lng, adjusted, moved, onAdjust, onReset
   org: string | null | undefined
   lat: number
   lng: number
-  /** true once the pin is a fixed point rather than the live fix — drives the
-   *  follow/leave-alone rule and the "reset" affordance. */
   adjusted: boolean
-  /** …and whether THIS visit moved it. Separate because a REOPENED placement
-   *  arrives with a stored pin nobody has touched: it is not following the GPS
-   *  either, but telling the operator it was "moved by hand" describes a drag
-   *  that didn't happen — and the caption's whole job is to say what will be
-   *  saved. Defaults to `adjusted` for a plain capture, where the only way to
-   *  stop following the fix IS a drag. */
   moved?: boolean
   onAdjust: (lat: number, lng: number) => void
   onReset: () => void
@@ -94,17 +62,7 @@ export function PinAdjustMap({ org, lat, lng, adjusted, moved, onAdjust, onReset
           center={center}
           zoom={ADJUST_ZOOM}
           zoomControl={false}
-          // MUST stay on. Two reasons, and the first is a crash: `GoogleLayer`'s
-          // ToS attribution swaps lines through `map.attributionControl`, which
-          // is UNDEFINED when this is false — so a mini-map with it off threw
-          // "undefined is not an object" the moment it rendered, but ONLY for an
-          // org that has a Google Maps key (a keyless org falls back to
-          // StreetsTiles, whose attribution is a static prop). The second is
-          // that showing Google's tiles without their attribution is a terms
-          // violation regardless of how small the map is.
           attributionControl
-          // `wisp-map` is what styles the attribution box to the app's surfaces
-          // — without it this map showed a bare white browser-default chip.
           className="wisp-map h-full w-full"
         >
           <AttributionPrefix />
@@ -130,9 +88,6 @@ export function PinAdjustMap({ org, lat, lng, adjusted, moved, onAdjust, onReset
           />
         </MapContainer>
 
-        {/* Imagery/roadmap toggle. Imagery is the default and the reason this
-            panel works, but a bare field with no landmarks is easier to place
-            against a road. */}
         {googleActive && (
           <button
             type="button"
@@ -143,10 +98,6 @@ export function PinAdjustMap({ org, lat, lng, adjusted, moved, onAdjust, onReset
           </button>
         )}
 
-        {/* Google ToS: the wordmark has to be visible wherever their tiles are,
-            and this map is no exception for being small. Same treatment as the
-            main map — white with a shadow, which is how Google renders it over
-            both roadmap and imagery. */}
         {googleActive && (
           <span aria-hidden className="pointer-events-none absolute bottom-0.5 left-1.5 z-[1000] select-none font-medium"
             style={{

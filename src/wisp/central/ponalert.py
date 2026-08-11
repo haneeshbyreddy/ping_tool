@@ -1,16 +1,3 @@
-"""PON fault heads-up alerts — the paging shell around pure ponfault math.
-
-Transition-only, like ports/optics: a fresh FIBER verdict pages the operator
-once, a verdict that stays put on the next walk stays silent, and the page
-clears when the PON comes back. POWER verdicts are recorded but never page —
-the whole point of the classification is NOT waking a splicing crew for the
-DISCOM (the ICMP ladder still owns any actual device outage).
-
-Never opens an outage (SNMP-derived facts don't); state rows are written even
-when `cfg.pon_fault_alerts` is off so the dashboard can still render them.
-Runs off the optics fold in `/report` — fault input only changes when a walk
-lands, so that IS the right cadence.
-"""
 from __future__ import annotations
 
 import logging
@@ -61,10 +48,6 @@ class PonFaultAlerter:
                 where = (f"{_fmt_km(f.cut_low_m)} to {_fmt_km(f.cut_high_m)}"
                          if f.cut_high_m is not None else "unknown distance")
                 suspect = f" · suspect {f.suspect}" if f.suspect else ""
-                # A dark reference ONU is testimony, not inference — say so, and
-                # drop "suspected". Whoever reads this at 2am decides whether to
-                # wake a splicing crew, and "we assumed" vs "a UPS-backed
-                # subscriber went dark too" are different decisions.
                 if f.evidence == "witness":
                     n = f.witness_dark
                     head = f"✂️ Fiber cut CONFIRMED: {f.device_name} PON {f.pon_port or '?'}"
@@ -79,11 +62,6 @@ class PonFaultAlerter:
                     f"{suspect}{why}",
                     f.device_id, ts)
 
-        # Recovery needs a FRESH walk that actually shows the PON back up.
-        # evaluate_org skips an OLT whose walk is >15 min stale, so its faults
-        # vanish from `current` on every slow-walk stall — clearing (then
-        # re-paging when the walk lands) was 36 PON_FAULT pages in one hour on
-        # 2026-07-14. Freeze instead: skip = no verdict.
         fresh_devs = onuroster.fresh_device_ids(rows, datetime.now(timezone.utc))
         for key, was in prior.items():
             if key in current or not was["active"]:

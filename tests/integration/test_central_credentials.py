@@ -1,6 +1,3 @@
-"""Per-device web-UI credentials: the owner stores a switch/OLT login, it lands
-ENCRYPTED at rest, the plaintext never rides back to the browser, and non-owners
-are locked out. Exercises the real central HTTP API end to end."""
 import http.client
 import json
 import os
@@ -75,7 +72,6 @@ class CredentialsTest(unittest.TestCase):
                          f"/api/inventory/credentials?device_id={self.device_id}",
                          cookie=cookie)
 
-    # -- tests -----------------------------------------------------------------
 
     def test_empty_before_set(self):
         status, doc = self._get_creds()
@@ -91,7 +87,6 @@ class CredentialsTest(unittest.TestCase):
             "password": "sravani@1987"})
         self.assertEqual((status, doc), (200, {"ok": True}))
 
-        # GET never reveals the plaintext, only that one is set
         status, doc = self._get_creds()
         self.assertEqual(doc["credentials"]["username"], "admin")
         self.assertTrue(doc["credentials"]["has_password"])
@@ -99,8 +94,6 @@ class CredentialsTest(unittest.TestCase):
         self.assertNotIn("password", doc["credentials"])
         self.assertNotIn("password_enc", doc["credentials"])
 
-        # at rest: the stored blob is ciphertext, not the plaintext, and it
-        # decrypts back with central's own key file
         row = self.store.get_device_webui_credentials("ispA", self.device_id)
         self.assertNotIn("sravani@1987", row["password_enc"])
         box = secretbox.from_config(self.cfg)
@@ -110,7 +103,6 @@ class CredentialsTest(unittest.TestCase):
         self._api("POST", "/api/inventory/credentials", {
             "device_id": self.device_id, "username": "admin",
             "password": "sravani@1987"})
-        # password key omitted -> leave it untouched, just rename the user
         status, doc = self._api("POST", "/api/inventory/credentials", {
             "device_id": self.device_id, "username": "root"})
         self.assertEqual(status, 200)
@@ -161,7 +153,6 @@ class CredentialsTest(unittest.TestCase):
         self._api("POST", "/api/inventory/credentials", {
             "device_id": self.device_id, "username": "admin",
             "password": "sravani@1987"})
-        # hard-delete the device; the FK-referenced credential row must go too
         result = self.store.delete_org_device("ispA", self.device_id)
         self.assertTrue(result["ok"], result)
         self.assertIsNone(

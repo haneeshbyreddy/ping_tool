@@ -43,8 +43,6 @@ class OnuOptic:
 @dataclass(frozen=True)
 class GponProfile:
     name: str
-    # Optional on purpose: a vendor whose real Rx OID is unknown ships WITHOUT one
-    # (roster/state/distance only) rather than a plausible-but-wrong column.
     oid_rx: str = ""
     oid_tx: str = ""
     oid_state: str = ""
@@ -63,18 +61,7 @@ class GponProfile:
     oid_ident_distance: str = ""
     oid_ident_name: str = ""
     format_pon_label: Callable[[str], str] = lambda pon: pon
-    # How the metric table's OID index yields an ONU id, when the index is not
-    # already one. None = the default `_derive_onu_id` (trailing segment, or the
-    # whole index if it is a bare number). A vendor that PACKS pon and onu into
-    # one integer ifIndex needs its own reading, and it has to travel WITH the
-    # pon strategy: deriving the PON from a packed index while reading the onu
-    # id off the same index unpacked would report ONU 16777472 on PON 1.
     derive_onu_id: Callable[[str], int | None] | None = None
-    # The maker's sysObjectID arc (PEN prefix) this profile claims. Vendor
-    # auto-detect matches an untagged OLT's sysObjectID against these by longest
-    # prefix — author at the most specific arc actually verified (a vendor-wide
-    # prefix can silently claim a sibling product: MAIPU sits under Fiberhome's
-    # PEN 5651, for example).
     match_sysobjectid: str = ""
 
 def _huawei_state(raw: str) -> str:
@@ -104,30 +91,13 @@ def _dbc_state(raw: str) -> str:
         return STATE_ONLINE
     if s in ("0", "offline"):
         return STATE_OFFLINE
-    # The .28 optical table carries no state column; a row that shows up only there
-    # is a live ONU with a fresh Rx reading, so treat a blank as online.
     return STATE_ONLINE
 
 DBC = GponProfile(
     name="dbc",
-    # NO Rx column on purpose. The `.28` optical cache (`...5.12.1.28.1.3`) was
-    # field-DEBUNKED on the PYLON EPOLT-3304: near-uniform ~-15 dBm, PON1-only,
-    # r≈0.13 against the web OPM-Diag truth — these OLTs populate per-ONU optical
-    # ON DEMAND (live EPON-OAM query), so no passive walk holds real Rx. Until a
-    # warm-capture walk finds a true OID, DBC ships roster/state/distance only:
-    # a blank Rx is recoverable, a fabricated one pages people. Restore by setting
-    # oid_rx (+ oid_serial `...28.1.2` for the MAC join) to the VALIDATED column.
     rx_scale=1.0,
     distance_scale=1.0,
     decode_state=_dbc_state,
-    # The .12 registration table is the authoritative ONU roster — every ONU on
-    # every EPON port, online or not. Enumerate from it (not the sparse .28 optical
-    # cache, which on this OLT held ~16 mostly-one-PON readings) so all PON ports
-    # show up, then join Rx by MAC. col6=MAC, col2=PON, col3=ONU-id, col5=state
-    # (1=online/0=offline), col10=Description (the web-UI ONU name; 'NULL' when
-    # unset — filtered by _clean_name), col13=distance(m). col10 OID validated by
-    # warm-capture 2026-07-13: user set EPON0/2:1 to "HCS_RAMPRASAD", walk 80 showed
-    # it at ...12.1.12.1.10.29 alongside that ONU's MAC at ...12.1.12.1.6.29.
     oid_ident_key="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.6",
     oid_ident_pon="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.2",
     oid_ident_onu="1.3.6.1.4.1.37950.1.1.5.12.1.12.1.3",
@@ -140,21 +110,9 @@ DBC = GponProfile(
 
 PROFILES: dict[str, GponProfile] = {HUAWEI.name: HUAWEI, DBC.name: DBC}
 
-# --- central-served GPON profiles (data, not code — see CLAUDE.md) -----------------
-# A built-in profile expresses vendor quirks as Python callables; a central-served
-# one carries the same behavior as data from this CLOSED vocabulary: a state lookup
-# table, a pon-index strategy name, a pon-label template. Anything outside the
-# vocabulary rejects the WHOLE profile — a half-understood profile guessing at an
-# OLT is the fabricated-reading trap; a rejected one just leaves optics off.
 _STATE_VOCAB = (STATE_ONLINE, STATE_OFFLINE, STATE_DYING_GASP, STATE_LOS, STATE_UNKNOWN)
 def _packed_ifindex(idx: str) -> int | None:
-    """The leading segment of an OID index as an int, or None.
 
-    Some OLTs index their ONU tables by a byte-packed ifIndex rather than by
-    `pon.onu` — chassis<<24 | slot<<16 | pon<<8 | onu, so PON 1 ONU 0 is
-    16777472 (0x01000100). The two halves are then a shift and a mask apart,
-    which is why `packed_ifindex` has to supply BOTH readings.
-    """
     head = (idx or "").split(".", 1)[0]
     try:
         return int(head)
@@ -163,9 +121,6 @@ def _packed_ifindex(idx: str) -> int | None:
 
 
 def _packed_pon(idx: str) -> str:
-    # Degrade to the index itself rather than inventing a PON: a profile whose
-    # index turns out not to be packed must read as "we cannot tell", never as
-    # a confident PON 0 that would group every ONU on the box onto one port.
     n = _packed_ifindex(idx)
     return str((n >> 8) & 0xFF) if n is not None else idx
 
@@ -180,8 +135,6 @@ _PON_INDEX_STRATEGIES: dict[str, Callable[[str], str]] = {
     "first_segment": lambda idx: idx.split(".", 1)[0] if idx else idx,
     "packed_ifindex": _packed_pon,
 }
-# Keyed by the SAME strategy name, so a profile cannot select one half of a
-# packed index without the other. Absent = the default `_derive_onu_id`.
 _ONU_INDEX_STRATEGIES: dict[str, Callable[[str], int | None]] = {
     "packed_ifindex": _packed_onu,
 }
@@ -198,8 +151,6 @@ def _label_formatter(template: str) -> Callable[[str], str]:
     return lambda pon: template.replace("{pon}", str(pon))
 
 def gpon_profile_from_dict(raw: dict) -> GponProfile | None:
-    """Build a GponProfile from central-served JSON; None (logged) on anything
-    outside the closed vocabulary — never a best-effort partial profile."""
     try:
         name = str(raw.get("name") or "").strip().lower()
         if not name:
@@ -270,15 +221,7 @@ def gpon_profile_from_dict(raw: dict) -> GponProfile | None:
 
 def match_gpon_profile(sysobjectid: str | None,
                        extra: dict[str, GponProfile] | None = None) -> GponProfile | None:
-    """Vendor auto-detect: longest sysObjectID-prefix wins (same rule as
-    health.py's match_profile — model-specific beats vendor-wide). `extra` is
-    the central-served set: it shadows a same-named built-in outright and wins
-    equal-length prefix ties.
 
-    None when no profile claims the arc: that OLT reports NO optics — we never
-    probe candidate OID roots and guess. A missing reading is recoverable; a
-    plausible-but-wrong dBm is the DBC 28.1.3 placeholder trap all over again.
-    """
     soid = (sysobjectid or "").strip().strip(".")
     if not soid:
         return None
@@ -343,52 +286,18 @@ def _place(oid: str, val: str, cols: dict[str, str], out: dict[str, dict]) -> bo
     return False
 
 def _clean_name(raw) -> str | None:
-    # A vendor reports an unset ONU description with a sentinel, not a blank:
-    # C-Data's reg table col10 is the literal string 'NULL' (the web UI shows it
-    # as 'N/A'). Treat those as no-name so an un-described ONU renders "unnamed",
-    # never the word NULL.
     s = (raw or "").strip()
     return None if s.upper() in ("", "NULL", "N/A", "NONE") else s
 
 def _metric_state(cells: dict, profile: GponProfile) -> str:
-    """An ABSENT state cell is `unknown`; only a state VALUE gets the default.
 
-    Rows here are assembled from whichever columns happened to arrive (`_place`
-    creates one per OID index), so an ONU can exist with no state cell at all —
-    and this is not hypothetical: these C-Data/Syrotech agents silently end a
-    GETBULK walk at a batch boundary, returning an incomplete column while
-    pysnmp reports a clean finish. Walk 187 of Gpon_04 stopped 65 rows into a
-    column that has 180.
 
-    Folding that into `state_default` made the tail of a truncated column read
-    as OFFLINE — live subscribers rendered dark, and `ponfault` counting them
-    as a mass-drop cohort, i.e. a fabricated fibre cut with nothing anywhere
-    reporting an error. `ponfault.DARK_STATES` already excludes `unknown` for
-    exactly this ("a vendor decode gap must not read as an outage cohort"); the
-    edge simply never produced it.
-
-    The distinction is the same one `_sane_optics` draws: an absent column is a
-    fact about the firmware, a missing value in a column that EXISTS is a fact
-    about this row. So a profile that maps no state OID still gets its default
-    (it is telling us it cannot know), while a profile that maps one and comes
-    back short says `unknown` rather than guessing dark.
-    """
     raw = cells.get("state")
     if profile.oid_state and raw is None:
         return STATE_UNKNOWN
     return profile.decode_state(raw if raw is not None else "")
 
 def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
-    # Identity is the ONU's physical SLOT — the metric table's own OID index —
-    # never its serial, the same rule the registration path below already states.
-    # A serial that re-registers on a second slot leaves the vacated one behind
-    # (these OLTs never drop a reg row), so a serial key collapses two distinct
-    # roster slots into one and the LAST WRITE WINS. Field-proven on badri_fiber's
-    # Syrotech GPON pair: 9 serials of 194 sit on 2-3 slots each, and keying on
-    # them stored live ONUs as offline at 0.00 dBm wherever a dark duplicate
-    # landed after the online one. That is why mapping `oids.serial` on a
-    # metric-only profile was unsafe until now — the serial is a FACT ABOUT the
-    # ONU to report, not the name of the row it goes in.
     serial = (cells.get("serial") or "").strip() or None
     return OnuOptic(
         onu_key=idx or serial or "?",
@@ -419,15 +328,9 @@ def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> li
         if not _place(oid, val, metric_cols, metric):
             _place(oid, val, ident_cols, ident)
 
-    # No registration table (e.g. Huawei) — the metric table's OID index already
-    # encodes pon.onu, so each metric row is exactly one ONU.
     if not (profile.oid_ident_key and ident):
         return [_onu_from_metric(idx, cells, profile) for idx, cells in metric.items()]
 
-    # Registration table present (DBC): it is the authoritative ONU roster across
-    # every PON. Index the (sparse) optical readings by MAC — and by MAC+onu-id, to
-    # disambiguate a MAC that re-registered on a second PON — then walk every
-    # registered ONU and attach an Rx only where the OLT actually measured one.
     opt_by_mac: dict[str, list[tuple[str, dict]]] = {}
     opt_by_mac_onu: dict[tuple[str, int], tuple[str, dict]] = {}
     for midx, cells in metric.items():
@@ -460,9 +363,6 @@ def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> li
             ocells = match[1]
         pon_port = (profile.format_pon_label(str(pon)) if pon not in (None, "")
                     else profile.format_pon(str(onu_id) if onu_id is not None else ""))
-        # Identity is the ONU's physical slot (pon.onu), not its MAC: a MAC that
-        # re-registers on another PON leaves a stale ghost sharing the MAC, so a
-        # MAC key would collapse two distinct roster slots into one.
         out.append(OnuOptic(
             onu_key=(f"{pon}.{onu_id}" if (pon not in (None, "") and onu_id is not None)
                      else (mac_raw.upper() or str(pon or onu_id or "?"))),
@@ -475,8 +375,6 @@ def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> li
             tx_dbm=_to_float(ocells.get("tx"), profile.tx_scale),
             distance_m=_to_int(cells.get("distance"), profile.distance_scale),
         ))
-    # Optical readings whose MAC never appeared in the roster still deserve a row
-    # (roster walk truncated, or an ONU registering right now) — index-derived pon.
     for midx, cells in metric.items():
         if midx not in consumed:
             out.append(_onu_from_metric(midx, cells, profile))
@@ -486,9 +384,6 @@ class PysnmpGponPoller:
 
     def __init__(self, profile: GponProfile, cfg: Config = CONFIG) -> None:
         self.profile = profile
-        # A slow EPON agent needs more per-request slack than the fast health/port
-        # walks — a single dropped GETBULK on the big roster table otherwise fails
-        # the whole walk. Falls back to the global snmp timeout if unset.
         self._timeout = cfg.gpon_request_timeout_s or cfg.snmp_timeout_s
         self._retries = max(0, cfg.gpon_request_retries)
         self._engine = None
@@ -533,19 +428,10 @@ class PysnmpGponPoller:
             raise RuntimeError(f"GPON walk of {target.ip} failed: {exc}") from exc
         return parse_onu_table(varbinds, p)
 
-# Auto-detect cache cadence: a successful read is re-checked hourly (one varbind;
-# catches a hardware swap at the same IP without an edge restart), a silent box is
-# retried sooner so optics light up quickly once its SNMP agent comes back.
 _DETECT_TTL_S = 3600.0
 _DETECT_RETRY_S = 900.0
 
 class PysnmpSysObjectIdReader:
-    """One-varbind sysObjectID fetch for vendor auto-detect.
-
-    Same engine-reuse invariant as the pollers: ONE lazy SnmpEngine for the
-    reader's lifetime, never one per read — a per-call engine leaks ~1 MiB RSS
-    + a socket FD each (see CLAUDE.md's SnmpEngine note).
-    """
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self._timeout = cfg.snmp_timeout_s
@@ -578,17 +464,7 @@ class PysnmpSysObjectIdReader:
         return sys_object_id(varbinds)
 
 class GponPollerPool:
-    """One shared poller per profile + per-OLT vendor selection.
 
-    Precedence (the dashboard dropdown is an OVERRIDE, not the primary path):
-    device `gpon_vendor` > `WISP_GPON_VENDOR` (fleet-wide escape hatch) >
-    sysObjectID longest-prefix auto-detect. Nothing matches = None: that OLT
-    reports no optics — never guess OIDs at a box.
-
-    Central-served profiles (`set_profiles`, riding the same /edge/devices reply
-    as snmp_profiles) shadow a same-named built-in and join auto-detect; the
-    built-ins stay as fallbacks for a fleet on an older central.
-    """
 
     def __init__(self, cfg: Config = CONFIG,
                  factory: Callable[[GponProfile, Config], GponPoller] = PysnmpGponPoller,
@@ -597,16 +473,12 @@ class GponPollerPool:
         self._factory = factory
         self._fallback = (getattr(cfg, "gpon_vendor", "") or "").strip().lower()
         self._pollers: dict[str, GponPoller] = {}
-        self._detector = detector  # .read(target) -> str | None; lazily built
+        self._detector = detector
         self._detected: dict[object, tuple[str | None, float]] = {}
         self._central: dict[str, GponProfile] = {}
         self._central_fp: str | None = None
 
     def set_profiles(self, raw: list[dict] | None) -> None:
-        """Install central-served profiles. Cheap no-op when the payload hasn't
-        changed — this runs every topology refresh, and rebuilding a poller means
-        a fresh SnmpEngine (see the engine-reuse invariant), so pollers rebuild
-        only on an actual edit."""
         if raw is None:
             return
         fp = json.dumps(raw, sort_keys=True, default=str)
@@ -639,19 +511,12 @@ class GponPollerPool:
         return self._poller_for(profile)
 
     async def resolve(self, device: dict, target: SnmpTarget) -> GponPoller | None:
-        """Pick the poller for one OLT; None means optics stay off for it."""
         poller, _ = await self.resolve_info(device, target)
         return poller
 
     async def resolve_info(
         self, device: dict, target: SnmpTarget,
     ) -> tuple[GponPoller | None, dict]:
-        """resolve() plus the WHY — `{"vendor", "sysobjectid", "reason"}` where
-        reason is one of `override` (dashboard/env named the vendor), `matched`
-        (sysObjectID auto-detect hit a profile), `no_profile` (agent answered,
-        no profile claims it — the actionable "onboard this vendor" case), or
-        `no_response` (sysObjectID never came back — agent silent). The edge
-        reports this verbatim so the dashboard can guide the fix."""
         vendor = (device.get("gpon_vendor") or "").strip().lower() or self._fallback
         if vendor:
             poller = self.for_vendor(vendor)

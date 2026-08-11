@@ -4,11 +4,6 @@ import type { BillingInfo } from "@/lib/types"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 
-// Surfaced the instant an "add" action is clicked while the org is at a plan
-// cap, so the paywall lands up front instead of after a form round-trips to a
-// 422 (central/billing.py enforces the same caps server-side). `resource` picks
-// which cap to read; `secondary` is an optional way through (e.g. passive plant,
-// which never counts against the device cap).
 export function UpgradeNotice({ billing, resource, note, secondary, onClose }: {
   billing: BillingInfo
   resource: "device" | "probe"

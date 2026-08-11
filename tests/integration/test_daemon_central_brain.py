@@ -221,7 +221,7 @@ class GatherSnmpPortsTest(unittest.TestCase):
                                      "last_change": None, "in_octets": None,
                                      "out_octets": None, "speed_bps": None}])
         self.assertEqual(status[1]["state"], "ok")
-        self.assertNotIn(2, status)  # snmp off: no diagnosis row
+        self.assertNotIn(2, status)
 
     def test_a_hung_walk_is_capped_not_waited_out(self):
         class _HangingPoller:
@@ -232,17 +232,12 @@ class GatherSnmpPortsTest(unittest.TestCase):
 
         devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
                   _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
-        # Port walks are capped by their own dedicated timeout, not snmp_walk_timeout_s.
         cfg = Config(port_walk_timeout_s=0.05)
         ports, status = asyncio.run(daemon._gather_snmp_ports(_HangingPoller(), devices, cfg))
         self.assertEqual(set(ports), {2})
         self.assertEqual(status[1]["state"], "timeout")
 
     def test_slow_port_walk_rides_the_port_cap_not_the_snmp_cap(self):
-        # A big OLT (HILL/PYLON class, 200+ interfaces) blows the generic 20s cap on
-        # the ifTable walk but must still land under the dedicated port budget — the
-        # 2026-07-09 stale-ports regression: switch_ports starved by snmp_walk_timeout_s
-        # while health/optics (smaller walks) stayed fresh.
         class _SlowPoller:
             async def walk(self, target):
                 await asyncio.sleep(0.1)
@@ -289,12 +284,6 @@ class GatherSnmpPortsTest(unittest.TestCase):
         self.assertLessEqual(inflight["peak"], 2)
 
 class SharedAirtimeGateTest(unittest.TestCase):
-    # The daemon hands ONE _SnmpAirtime to every SNMP subsystem (ports, health,
-    # optics, diag walks). Two invariants ride on it: the inflight bound is
-    # fleet-wide rather than per-subsystem, and one agent is never walked by
-    # two subsystems at once — with all three sweep clocks on the same 300s
-    # period they fire on the same tick every time, and concurrent walks
-    # against a weak C-Data agent read from outside as device failure.
 
     def test_same_device_never_walked_twice_at_once(self):
         per_ip: dict[str, dict] = {}
@@ -393,9 +382,6 @@ class DiagWalkRunnerTest(unittest.TestCase):
             "error": None, "truncated": False}])
 
     def test_a_truncated_walk_says_so_in_the_result(self):
-        # The flag has to leave the edge: once it's a dashboard row, a partial
-        # dump and a complete one look identical, and reading "that OID holds
-        # nothing" off a walk that stopped at the budget is a false negative.
         client = RecordingCentralClient(self.devices)
         walker = _FakeDiagWalker(result=self.WalkResult(
             varbinds=[("1.3.6.1.2.1.1.5.0", "sw1")], truncated=True))
@@ -408,7 +394,7 @@ class DiagWalkRunnerTest(unittest.TestCase):
         walker = _FakeDiagWalker(result=self.WalkResult())
         runner = daemon._DiagWalkRunner(client, Config(), walker=walker)
         self._run(runner, [_walk_directive()])
-        self._run(runner, [_walk_directive()])  # central re-delivers until done
+        self._run(runner, [_walk_directive()])
         self.assertEqual(len(walker.calls), 1)
         self.assertEqual(len(client.walk_results), 1)
 
@@ -437,7 +423,7 @@ class DiagWalkRunnerTest(unittest.TestCase):
         self._run(runner, [_walk_directive()])
         self.assertEqual(client.walk_results, [])
         client.fail_walk_result = False
-        self._run(runner, [_walk_directive()])  # re-delivery retries
+        self._run(runner, [_walk_directive()])
         self.assertEqual(len(walker.calls), 2)
         self.assertEqual(len(client.walk_results), 1)
 
@@ -466,8 +452,6 @@ class DiagWalkRunnerTest(unittest.TestCase):
 
 class HealthPassthroughTest(unittest.TestCase):
     def test_health_readings_attach_to_the_full_report(self):
-        # Regression: HttpCentralClient.report once lacked the health kwarg, so
-        # every cycle with a health sweep result died on a TypeError.
         devices = [_dev(1, "10.0.0.1")]
         prober = _FakeProber({
             "10.0.0.1": lambda: PingResult("10.0.0.1", 5.0, 0.0),

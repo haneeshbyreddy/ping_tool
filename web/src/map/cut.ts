@@ -1,14 +1,8 @@
-// ---- Fiber-cut localization (D2) -------------------------------------------
-// ponfault brackets a cut in RANGING meters from the OLT; if the operator drew
-// the PON's cable route (OLT → splitter chain), we can walk that geometry to
-// the same distance and paint the suspect stretch. Ranging is optical path
-// (slack coils included) so the stretch is an estimate — the marker says so.
 import type L from "leaflet"
 import { isPassiveType, type OrgDevice, type PonFault } from "@/lib/types"
 import { distanceKm } from "@/map/geometry"
 import { cachedDivIcon, esc, isPlaced, type Placed } from "@/map/pins"
 
-/** point `distM` meters along a polyline (clamped to its ends) */
 export function pointAlong(path: Array<[number, number]>, distM: number): [number, number] {
   let acc = 0
   for (let i = 1; i < path.length; i++) {
@@ -25,7 +19,6 @@ export function pointAlong(path: Array<[number, number]>, distM: number): [numbe
   return path[path.length - 1]
 }
 
-/** sub-polyline between two along-path distances (meters) */
 export function subPath(path: Array<[number, number]>, d0: number, d1: number): Array<[number, number]> {
   const out: Array<[number, number]> = [pointAlong(path, d0)]
   let acc = 0
@@ -38,16 +31,8 @@ export function subPath(path: Array<[number, number]>, d0: number, d1: number): 
   return out
 }
 
-/** The PON's drawn path: OLT pin → placed passive chain matching this port.
-    Per-link drawn routes are used where they exist, chords where they don't.
-    Returns null when no placed splitter serves the port — no fake geometry. */
 export function ponPath(
   olt: Placed, port: string | null, devices: OrgDevice[],
-  // The rich geometry map: `pts` is what is DRAWN, which since 2026-08-09 may
-  // be the stretch of a traced CABLE the span borrows rather than its own
-  // trace. The cut bracket should follow whichever the map draws — it is the
-  // same glass, and a bracket measured along a chord under a line drawn along
-  // the street would put the ✕ somewhere the operator can see it isn't.
   routeByKey: Map<string, { pts: Array<[number, number]> }>,
 ): Array<[number, number]> | null {
   const path: Array<[number, number]> = [[olt.lat, olt.lng]]
@@ -58,7 +43,6 @@ export function ponPath(
     const kids = devices.filter((d): d is Placed =>
       d.parent_device_id === cur.id && isPassiveType(d.device_type) && isPlaced(d)
       && !seen.has(d.id)
-      // the first hop must name the PON; deeper plant may leave it blank
       && (first ? d.pon_port === port : (d.pon_port === port || d.pon_port == null)))
     const next = kids.find((d) => routeByKey.has(`${d.id}:${cur.id}`)) ?? kids[0]
     if (!next) break

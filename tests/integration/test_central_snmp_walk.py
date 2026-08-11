@@ -1,10 +1,3 @@
-"""Remote diagnostic SNMP walks + declarative vendor profiles, central side.
-
-The walk channel is poll-only: the dashboard queues a walk, central delivers it in
-the next full /report reply to the device's assigned node, the edge posts the dump
-back to /edge/snmp-walk. Profiles ride the GET /edge/devices reply.
-"""
-
 import http.client
 import json
 import os
@@ -46,7 +39,6 @@ class SnmpWalkStoreTest(unittest.TestCase):
         self.assertEqual(pending[0]["ip_address"], "10.0.0.9")
         self.assertEqual(pending[0]["snmp_community"], "public")
         self.assertEqual(pending[0]["root_oid"], "1.3.6.1.4.1")
-        # Scoped to the walk's node — another node in the org sees nothing.
         self.assertEqual(self.store.pending_snmp_walks("ispA", "edge-2"), [])
 
     def test_new_walk_supersedes_the_pending_one(self):
@@ -64,7 +56,6 @@ class SnmpWalkStoreTest(unittest.TestCase):
             "ispA", "edge-2", wid, varbinds=[["1.3.6.1.2.1.1.5.0", "sw1"]]))
         self.assertTrue(self.store.complete_snmp_walk(
             "ispA", "edge-1", wid, varbinds=[["1.3.6.1.2.1.1.5.0", "sw1"]]))
-        # A second completion (duplicate upload) is a no-op.
         self.assertFalse(self.store.complete_snmp_walk(
             "ispA", "edge-1", wid, varbinds=[["1.3.6.1.2.1.1.5.0", "other"]]))
         walk = self.store.get_snmp_walk("ispA", wid)
@@ -73,9 +64,6 @@ class SnmpWalkStoreTest(unittest.TestCase):
         self.assertEqual(walk["result"], [["1.3.6.1.2.1.1.5.0", "sw1"]])
 
     def test_truncation_survives_the_round_trip_and_defaults_off(self):
-        # A partial dump must not read as a complete one: concluding "this OID
-        # holds nothing" off a walk that stopped at the budget is a false
-        # negative, and the row is all the dashboard has to go on.
         wid = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
         self.assertTrue(self.store.complete_snmp_walk(
             "ispA", "edge-1", wid, varbinds=[["1.3.6.1.2.1.1.5.0", "sw1"]],
@@ -84,13 +72,10 @@ class SnmpWalkStoreTest(unittest.TestCase):
         self.assertEqual(
             self.store.list_snmp_walks("ispA", self.dev)[0]["truncated"], 1)
 
-        # An older edge omits the field entirely; that must read as "complete",
-        # which is how those walks were already being treated.
         plain = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
         self.store.complete_snmp_walk("ispA", "edge-1", plain, varbinds=[])
         self.assertEqual(self.store.get_snmp_walk("ispA", plain)["truncated"], 0)
 
-        # A failed walk is never also "partial" — status already says it failed.
         bad = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
         self.store.complete_snmp_walk("ispA", "edge-1", bad, error="timeout",
                                       truncated=True)
@@ -202,13 +187,11 @@ class SnmpWalkHttpTest(unittest.TestCase):
         self.assertEqual(len(walks), 1)
         self.assertEqual(walks[0]["id"], wid)
         self.assertEqual(walks[0]["ip_address"], "10.0.0.9")
-        self.assertEqual(walks[0]["root_oid"], "1.3.6.1")  # default root
+        self.assertEqual(walks[0]["root_oid"], "1.3.6.1")
 
-        # A recheck report never carries walks.
         status, reply = self._report(mode="recheck")
         self.assertNotIn("snmp_walks", reply)
 
-        # Edge posts the result; the walk stops being delivered.
         status, resp, _ = self._req("POST", "/edge/snmp-walk", {
             "v": 1, "org_id": "ispA", "node_id": "edge-1", "walk_id": wid,
             "varbinds": [["1.3.6.1.2.1.1.5.0", "sw1"], ["1.3.6.1.2.1.1.2.0",
@@ -218,14 +201,13 @@ class SnmpWalkHttpTest(unittest.TestCase):
         status, reply = self._report()
         self.assertNotIn("snmp_walks", reply)
 
-        # Dashboard reads the list and the full dump.
         status, body, _ = self._req(
             "GET", f"/api/inventory/snmp-walks?device_id={self.dev}", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body["walks"][0]["status"], "done")
         self.assertEqual(body["walks"][0]["varbind_count"], 2)
-        self.assertEqual(body["walks"][0]["truncated"], 1)  # edge said partial
-        self.assertNotIn("result", body["walks"][0])  # list is metadata-only
+        self.assertEqual(body["walks"][0]["truncated"], 1)
+        self.assertNotIn("result", body["walks"][0])
         status, body, _ = self._req(
             "GET", f"/api/inventory/snmp-walk/result?id={wid}", cookie=cookie)
         self.assertEqual(status, 200)
@@ -233,12 +215,10 @@ class SnmpWalkHttpTest(unittest.TestCase):
 
     def test_queue_validations(self):
         cookie = self._login("owner", "ownerpassword")
-        # Bad OID.
         status, body, _ = self._req("POST", "/api/inventory/snmp-walk",
                                     {"device_id": self.dev, "root_oid": "not.an.oid"},
                                     cookie=cookie)
         self.assertEqual(status, 422)
-        # SNMP disabled.
         bare = self.store.create_org_device("ispA", {
             "name": "bare", "ip_address": "10.0.0.10", "device_type": None,
             "region": None, "parent_device_id": None, "assigned_node_id": "edge-1"})
@@ -246,7 +226,6 @@ class SnmpWalkHttpTest(unittest.TestCase):
                                     {"device_id": bare}, cookie=cookie)
         self.assertEqual(status, 422)
         self.assertIn("SNMP", body["error"])
-        # No assigned node.
         orphan = self.store.create_org_device("ispA", {
             "name": "orphan", "ip_address": "10.0.0.11", "device_type": None,
             "region": None, "parent_device_id": None, "assigned_node_id": None})
@@ -257,7 +236,6 @@ class SnmpWalkHttpTest(unittest.TestCase):
                                     {"device_id": orphan}, cookie=cookie)
         self.assertEqual(status, 422)
         self.assertIn("assign", body["error"])
-        # max_varbinds is capped server-side.
         status, body, _ = self._req("POST", "/api/inventory/snmp-walk",
                                     {"device_id": self.dev, "max_varbinds": 10**9},
                                     cookie=cookie)
@@ -286,8 +264,8 @@ class SnmpWalkHttpTest(unittest.TestCase):
                          ["1.3.6.1.2.1.1.5.0", "sw1"]]}, token="tok")
         self.assertEqual(status, 200)
         walk = self.store.get_snmp_walk("ispA", wid)
-        self.assertEqual(walk["varbind_count"], 2)  # malformed pair dropped
-        self.assertEqual(len(walk["result"][0][1]), 1024)  # value length capped
+        self.assertEqual(walk["varbind_count"], 2)
+        self.assertEqual(len(walk["result"][0][1]), 1024)
 
     def test_edge_result_requires_ingest_auth(self):
         wid = self.store.create_snmp_walk("ispA", self.dev, "edge-1", "1.3.6.1", 100)
@@ -342,14 +320,12 @@ class SnmpProfileTest(unittest.TestCase):
                                     self._payload(name="local"), cookie=owner)
         self.assertEqual(status, 200, body)
 
-        # ispA sees global + its own; ispB sees only global.
         status, body, _ = self._req("GET", "/api/snmp-profiles", cookie=owner)
         self.assertEqual({p["name"] for p in body["profiles"]},
                          {"fiberhome", "local"})
         bowner = self._login("bowner", "bownerpassword")
         status, body, _ = self._req("GET", "/api/snmp-profiles", cookie=bowner)
         self.assertEqual({p["name"] for p in body["profiles"]}, {"fiberhome"})
-        # The vocabulary rides the reply for the profile editor UI.
         self.assertIn("as_is", body["decodes"])
 
     def test_owner_cannot_touch_a_global_profile(self):
@@ -409,8 +385,6 @@ class SnmpProfileTest(unittest.TestCase):
 
 
 class GponProfileTest(unittest.TestCase):
-    """GPON vendor profiles as data — same auth shape as SNMP health profiles."""
-
     setUp = SnmpProfileTest.setUp
     tearDown = SnmpProfileTest.tearDown
     _req = SnmpWalkHttpTest._req
@@ -444,7 +418,6 @@ class GponProfileTest(unittest.TestCase):
         bowner = self._login("bowner", "bownerpassword")
         status, body, _ = self._req("GET", "/api/gpon-profiles", cookie=bowner)
         self.assertEqual({p["name"] for p in body["profiles"]}, {"vsol"})
-        # The closed vocabulary rides the reply for the profile editor UI.
         self.assertIn("first_segment", body["pon_index_strategies"])
         self.assertIn("dying_gasp", body["states"])
 
@@ -483,7 +456,6 @@ class GponProfileTest(unittest.TestCase):
         status, body, _ = self._req("GET", "/edge/devices?org_id=ispA", token="tok")
         self.assertEqual(status, 200)
         self.assertEqual([p["name"] for p in body["gpon_profiles"]], ["vsol"])
-        # The wire shape must round-trip through the edge's validator.
         from wisp.ingress.gpon import gpon_profile_from_dict
         p = gpon_profile_from_dict(body["gpon_profiles"][0])
         self.assertIsNotNone(p)
@@ -491,10 +463,6 @@ class GponProfileTest(unittest.TestCase):
         self.assertEqual(p.format_pon_label("2"), "EPON0/2")
 
     def test_an_olt_can_be_saved_on_a_profile_vendor(self):
-        # The device form offers DB profiles in its vendor dropdown, but the
-        # validator knew only the edge built-ins — so badri_fiber's two Syrotech
-        # OLTs 422'd on EVERY edit, including ones that never touched the vendor
-        # (the form sends the stored value back). A profile is a real vendor.
         owner = self._login("owner", "ownerpassword")
         self._req("POST", "/api/gpon-profiles", self._payload(name="syrotech_gpon"),
                   cookie=owner)
@@ -513,8 +481,6 @@ class GponProfileTest(unittest.TestCase):
         self.assertEqual(row["gpon_vendor"], "syrotech_gpon")
         self.assertEqual(row["onu_pon_limit"], 128)
 
-        # …and a DISABLED profile still validates: switching a profile off must
-        # not lock the operator out of the form that would change the vendor.
         profiles = self.store.list_gpon_profiles("ispA")
         pid = next(p["id"] for p in profiles if p["name"] == "syrotech_gpon")
         payload = self._payload(name="syrotech_gpon", enabled=False)
@@ -527,8 +493,6 @@ class GponProfileTest(unittest.TestCase):
             "device_type": "OLT", "gpon_vendor": "syrotech_gpon"}, cookie=owner)
         self.assertEqual(status, 200, body)
 
-        # a name no profile carries is still refused — a typo'd vendor reads on
-        # screen as "this OLT has no optics", which is the harder bug to find
         status, _, _ = self._req("POST", "/api/inventory/update", {
             "id": did, "name": "Gpon_08", "ip_address": "10.0.0.7",
             "device_type": "OLT", "gpon_vendor": "syrotek"}, cookie=owner)
@@ -536,8 +500,6 @@ class GponProfileTest(unittest.TestCase):
 
 
 class PollIntervalTest(unittest.TestCase):
-    """Dashboard-set probe cadence, delivered over the topology channel."""
-
     setUp = SnmpProfileTest.setUp
     tearDown = SnmpProfileTest.tearDown
     _req = SnmpWalkHttpTest._req
@@ -551,14 +513,11 @@ class PollIntervalTest(unittest.TestCase):
         self.assertEqual(status, 200)
         status, body, _ = self._req("GET", "/edge/devices?org_id=ispA", token="tok")
         self.assertEqual(body["poll_interval_s"], 30)
-        # Out of the 10-120s window: the fleet watchdog pages NODE_STALE at 180s,
-        # so a slower cadence must be refused, not stored.
         for bad in (5, 300, "soon"):
             status, _, _ = self._req("POST", "/api/org",
                                      {"org_id": "ispA", "poll_interval_s": bad},
                                      cookie=owner)
             self.assertEqual(status, 422, bad)
-        # null clears back to automatic.
         status, _, _ = self._req("POST", "/api/org",
                                  {"org_id": "ispA", "poll_interval_s": None},
                                  cookie=owner)

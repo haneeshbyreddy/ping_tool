@@ -1,5 +1,3 @@
-"""Org-level and superadmin routes: org CRUD, server-wide settings, system
-stats, coverage overview, test alerts, plan/billing."""
 from __future__ import annotations
 
 import logging
@@ -12,18 +10,12 @@ from wisp.central.api.common import (DENIED, body_org_write, now_iso, org_or_400
                                      superadmin_or_403)
 
 _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-# generous ceiling on the uploaded QR data-URI (~512 KB of base64); a real QR
-# PNG is a few KB, so this only stops someone pasting a photo by mistake.
 _QR_MAX_CHARS = 700_000
 
 log = logging.getLogger("wisp.central.api.orgs")
 
 
 def _admin_whatsapp(h) -> list[str]:
-    """The superadmin ops WhatsApp recipient for org-side pings ('I've paid',
-    self-downgrade to Free): the single admin number from Settings → Platform
-    (app_settings), env fallback. Empty → nothing to notify (skipped, not an
-    error) — ntfy was removed 2026-07-24, so there is no topic fallback."""
     num = (h.store.whatsapp_settings().get("admin_number")
            or h.cfg.whatsapp_admin_number or "").strip()
     return [num] if num else []
@@ -45,8 +37,6 @@ def system(h, qs):
     if not superadmin_or_403(h):
         return
     doc = sysinfo.snapshot(h.cfg.central_db)
-    # Monitor-the-monitor: a dead release mirror stalls fleet
-    # self-updates, so its health rides the superadmin box-stats card.
     doc["release_sync"] = h.store.release_sync_status()
     releases = h.store.list_releases()
     doc["latest_release"] = releases[0]["version"] if releases else None
@@ -60,10 +50,6 @@ def admin_overview(h, qs):
 
 
 def _whatsapp_public(h) -> dict:
-    """The superadmin's WhatsApp config for the settings form. The TOKEN is a
-    secret and is NEVER echoed — only whether one is stored (`token_set`). The
-    `enabled` flag falls back to the env default when the dashboard hasn't set
-    it, matching how the notifier resolves it."""
     wa = h.store.whatsapp_settings()
     toggle = wa.get("enabled")
     if toggle in (None, ""):
@@ -75,7 +61,6 @@ def _whatsapp_public(h) -> dict:
             "template": wa.get("template") or "",
             "lang": wa.get("lang") or "",
             "api_version": wa.get("api_version") or "",
-            # superadmin ops recipient (org 'I've paid' / churn / release-sync)
             "admin_number": wa.get("admin_number") or "",
             "token_set": bool(wa.get("token"))}
 
@@ -85,18 +70,9 @@ def admin_settings(h, qs):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
                    "billing_gpay_number": billing_mod.gpay_number(h.store),
-                   # the QR image (a data URI) isn't secret — echo it back so the
-                   # settings page can preview and edit it
                    "billing_qr_image": h.store.get_setting("billing_qr_image"),
-                   # WhatsApp channel — server-wide config (per-account recipient
-                   # numbers are set in Accounts; the admin ops number is here)
                    "whatsapp": _whatsapp_public(h),
-                   # sparse colour diff over the shipped palette; `{}` means a
-                   # stock theme, NOT "no colours" (see central/theme.py)
                    "theme_overrides": theme.load(h.store),
-                   # EFFECTIVE zoom floors (defaults filled in) — the form has
-                   # three number fields and needs concrete values, unlike the
-                   # sparse theme diff above
                    "map_detail": mapdetail.load(h.store)})
 
 
@@ -108,21 +84,11 @@ def list_orgs(h, qs):
     orgs = h.store.orgs()
     if org:
         orgs = [o for o in orgs if o["org_id"] == org]
-    # the ONE superadmin-pasted Google Maps key rides every org
-    # row, so each org's Map view lights up without its own key
     gkey = h.store.get_setting("google_maps_key")
-    # …and the ONE server-wide set of map zoom floors rides it the same way, for
-    # the same reason: the map already reads this row for the key, so a
-    # server-wide map setting costs no extra fetch and shares its invalidation.
-    # Neither is org data — every row carries the identical value.
     detail = mapdetail.load(h.store)
     for o in orgs:
         o["google_maps_key"] = gkey
         o["map_detail"] = detail
-    # A read-only worker reads this row for the org name and the Maps key, but the
-    # ntfy paging topics are a capability (subscribe to every page, POST spoofed
-    # ones), not just data — keep them owner/superadmin-only. Nothing a worker
-    # renders needs them.
     if user["org_id"] and user["role"] == "worker":
         for o in orgs:
             for k in ("ntfy_topic", "ntfy_topic_owner", "ntfy_topic_worker"):
@@ -143,21 +109,8 @@ def create(h, user, body):
 
 
 def delete(h, user, body):
-    """Erase an org and every row scoped to it. Superadmin-only, irreversible.
 
-    Guarded by an ECHOED org id (`confirm`), not just the role: this is the one
-    dashboard action with no undo and no backup — an org's devices, outage
-    history, billing months and login accounts all go at once. The typed echo
-    is what makes a mis-click impossible; the server enforces it so the check
-    can't be lost to a SPA refactor.
 
-    Deliberately NOT a tombstone: `_ensure_org` on the ingest path is how a new
-    probe bootstraps its org, so an edge still pointed here re-creates the row
-    (empty — devices/topics/plan are gone). Blocking that would break
-    self-enrollment for everyone to tidy one case; the dialog says to uninstall
-    the probe instead. The node's token IS purged here, so any deployment with
-    ingest auth configured rejects it outright.
-    """
     if not superadmin_or_403(h):
         return
     try:
@@ -173,8 +126,6 @@ def delete(h, user, body):
         return
     summary = h.store.org_summary(org)
     deleted = h.store.delete_org(org)
-    # the live engine is in-memory only and org ids are reusable — a stale one
-    # would hand a later org of the same name this org's FSM state
     h.registry.forget(org)
     log.warning("org %s DELETED by %s (%s devices, %s nodes, %s users)",
                 org, user["username"], summary["devices"], summary["nodes"],
@@ -192,26 +143,20 @@ def update(h, user, body):
     if "poll_interval_s" in body:
         raw = body.get("poll_interval_s")
         if raw in (None, "", "null", 0, "0"):
-            seconds = None  # back to automatic (edge env/adaptive default)
+            seconds = None
         else:
             try:
                 seconds = int(raw)
             except (TypeError, ValueError):
                 h._reply(422, {"error": "poll_interval_s must be a number of seconds"})
                 return
-            # 120s cap: the fleet watchdog pages NODE_STALE at 180s (default) —
-            # a legitimate cadence must never look like a dead probe.
             if not 10 <= seconds <= 120:
                 h._reply(422, {"error": "poll_interval_s must be between 10 and 120 seconds"})
                 return
         h.store.set_org_poll_interval(org, seconds)
     if "auto_update" in body:
-        # Fleet auto-update: central arms the staged rollout itself when the
-        # release mirror gets ahead of the fleet (rollout.maybe_auto_rollout).
         h.store.set_org_auto_update(org, bool(body.get("auto_update")))
     if "web_proxy" in body:
-        # Web-UI proxy capability (webplan.md §6.7): a blast-radius switch,
-        # not an org preference — only the superadmin grants or revokes it.
         if not user["is_superadmin"]:
             h._reply(403, {"error": "web_proxy is superadmin-set"})
             return
@@ -224,9 +169,6 @@ def update(h, user, body):
 
 
 def admin_settings_write(h, user, body):
-    # server-wide, superadmin-only: the Google Maps key is pasted
-    # ONCE here and served to every org (browser-exposed by design,
-    # referrer-restricted — central never calls Google)
     if not user["is_superadmin"]:
         h._reply(403, {"error": "forbidden"})
         return
@@ -236,10 +178,7 @@ def admin_settings_write(h, user, body):
                             str(google_key).strip()[:128])
     gpay = body.get("billing_gpay_number")
     if gpay is not None:
-        # blank falls back to billing.DEFAULT_GPAY_NUMBER
         h.store.set_setting("billing_gpay_number", str(gpay).strip()[:32])
-    # QR image the org scans to pay: a data URI ("data:image/png;base64,…").
-    # Blank clears it (the lock screen falls back to just the GPay number).
     qr = body.get("billing_qr_image")
     if qr is not None:
         qr = str(qr).strip()
@@ -250,17 +189,9 @@ def admin_settings_write(h, user, body):
             h._reply(422, {"error": "QR image is too large. Use a smaller PNG."})
             return
         h.store.set_setting("billing_qr_image", qr)
-    # WhatsApp channel config (app_settings, read fresh by the notifier — the
-    # sole channel since ntfy was removed). The token is write-only: a blank
-    # field LEAVES the stored one alone (so a routine save can't wipe the secret)
-    # — the SPA omits it unless the superadmin typed a new one, and a
-    # `token_clear` flag removes it. `admin_number` is the superadmin's ops
-    # recipient (org 'I've paid' / churn / release-sync failing).
     wa = body.get("whatsapp")
     if isinstance(wa, dict):
         if "enabled" in wa:
-            # store "1"/"0" (both non-empty, so a disable persists rather than
-            # deleting the row and falling back to the env default)
             h.store.set_setting("whatsapp_enabled", "1" if wa.get("enabled") else "0")
         for key, cap in (("phone_id", 64), ("template", 128), ("lang", 16),
                          ("api_version", 16), ("admin_number", 24)):
@@ -270,21 +201,14 @@ def admin_settings_write(h, user, body):
             h.store.set_setting("whatsapp_token", str(wa["token"]).strip()[:512])
         elif wa.get("token_clear"):
             h.store.set_setting("whatsapp_token", "")
-    # Server-wide colour overrides. Posting `{}` resets every org to the
-    # shipped palette — that IS the reset button, so an empty dict has to be
-    # distinguishable from the key being absent (absent = don't touch colours).
     if "theme_overrides" in body:
         theme.save(h.store, body.get("theme_overrides"))
-    # Server-wide map zoom floors. Absent = leave them alone; posting the
-    # shipped defaults clears the row (that IS Reset — see central/mapdetail.py).
     if "map_detail" in body:
         mapdetail.save(h.store, body.get("map_detail"))
     h._reply(200, {"ok": True})
 
 
 def billing(h, qs):
-    """Org-scoped plan + payment status. Deliberately readable while LOCKED —
-    the lock screen renders from this (see server.py's _billing_blocked)."""
     user = reader_or_401(h)
     if not user:
         return
@@ -302,27 +226,17 @@ def billing(h, qs):
         "node_count": h.store.active_node_token_count(org),
         "node_cap": billing_mod.node_cap(st["plan"]),
         "gpay_number": billing_mod.gpay_number(h.store),
-        # optional payment QR (a data URI) the lock screen renders beside the
-        # GPay number; null when the admin hasn't uploaded one
         "qr_image": h.store.get_setting("billing_qr_image"),
         "plans": billing_mod.PLANS,
     })
 
 
 def billing_paid(h, user, body):
-    """"I've paid": the org tells the platform admin a manual GPay/QR payment
-    is on its way. Pings the superadmin's WhatsApp ops number with the org name
-    so the admin can verify and mark the month. Deliberately billing-exempt
-    (server.py) — a LOCKED org taps this from the lock screen. Any signed-in
-    member of the org may send it; there is nothing to authorize, only to
-    notify."""
     org = org_or_400(h, user, body if isinstance(body, dict) else {})
     if not org:
         return
     numbers = _admin_whatsapp(h)
     if not numbers:
-        # no admin number configured — nothing to notify, but don't error the
-        # user (their payment still stands; the admin reconciles by hand)
         h._reply(200, {"ok": True, "notified": False})
         return
     name = h.store.org_name(org) or org
@@ -346,11 +260,6 @@ def billing_paid(h, user, body):
 
 
 def billing_plan(h, user, body):
-    """Self-serve plan change WITHOUT payment: only 'free'. Paid plans are
-    entered by paying (GPay/QR) and the admin marking the month. Billing-exempt:
-    the escape hatch for a locked org that would rather drop to Free than pay.
-    Existing devices keep working; the free caps only stop new creates.
-    Owner-only."""
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
@@ -372,8 +281,6 @@ def billing_plan(h, user, body):
 
 
 def _notify_admin_plan_change(h, org: str, prior: str) -> None:
-    # best-effort heads-up to the admin WhatsApp number — a lost churn signal
-    # must never 500 the downgrade
     numbers = _admin_whatsapp(h)
     if not numbers:
         return
@@ -389,9 +296,6 @@ def _notify_admin_plan_change(h, org: str, prior: str) -> None:
 
 
 def admin_billing_write(h, user, body):
-    # Superadmin-only: set an org's plan and/or toggle a paid month. Marking
-    # future months ahead of time IS the "no reminder this cycle" mechanism —
-    # the sweeper only pages when the paid runway actually runs short.
     if not user["is_superadmin"]:
         h._reply(403, {"error": "forbidden"})
         return
@@ -423,9 +327,6 @@ def test_alert(h, user, body):
     org = body_org_write(h, user, body)
     if org is DENIED:
         return
-    # No role routing (2026-07-24): a real alert reaches the whole org audience
-    # (owner + worker accounts), so the test pages exactly that. The superadmin
-    # ops number is NOT an org recipient (2026-07-25), so the test won't hit it.
     whatsapp = list(h.store.org_alert_recipients(org))
     if not whatsapp:
         h._reply(422, {"error": "no WhatsApp recipients. Add WhatsApp numbers to "

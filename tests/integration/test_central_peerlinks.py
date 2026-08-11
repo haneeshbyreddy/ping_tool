@@ -1,13 +1,3 @@
-"""Peer (cross) links: switch-to-switch cabling between boxes at the same level.
-
-Real plant is not a pure tree — aggregation switches cross-link to each other.
-Those edges are NOT dependencies: whether traffic reroutes over one depends on
-STP/routing state the monitor can't see, and a ring of cross-linked switches is
-a CYCLE, which the dependency graph must never contain (topological order,
-suppression). So peers ride the same org_device_links table under kind='peer',
-which every dependency read path filters out — the safety property this module
-exists to pin.
-"""
 import http.client
 import json
 import os
@@ -83,17 +73,12 @@ class PeerLinkTest(unittest.TestCase):
         return next(d["peer_ids"] for d in self.store.list_org_devices(org)
                     if d["id"] == device_id)
 
-    # --- the safety property -------------------------------------------------
 
     def test_a_peer_link_never_rebuilds_the_engine(self):
-        # THE invariant. A rebuild rehydrates every FSM and can re-page a fleet,
-        # so recording cabling must be inert to the engine. Same object identity
-        # before and after proves the fingerprint never moved.
         registry = EngineRegistry(self.store, self.cfg)
         before = registry.get("ispA")
         self.store.create_peer_link("ispA", self.agg1, self.agg2)
         self.assertIs(registry.get("ispA"), before)
-        # and a backup link — a real dependency — still DOES rebuild it
         self.store.create_backup_link("ispA", self.leaf, self.agg2)
         self.assertIsNot(registry.get("ispA"), before)
 
@@ -108,8 +93,6 @@ class PeerLinkTest(unittest.TestCase):
         self.assertEqual(self.store.org_device_backup_edges("ispA"), [])
 
     def test_a_ring_of_cross_links_is_allowed(self):
-        # the cycle IS the topology being recorded; a backup edge could not
-        # express this without tripping clean_backup_link's loop guard
         cookie = self._login()
         for a, b in ((self.agg1, self.agg2), (self.agg2, self.agg3),
                      (self.agg3, self.agg1)):
@@ -118,13 +101,11 @@ class PeerLinkTest(unittest.TestCase):
             self.assertEqual(status, 200, body)
         self.assertEqual(self._peers_of(self.agg1), sorted([self.agg2, self.agg3]))
 
-    # --- one cable, one row --------------------------------------------------
 
     def test_declaring_from_either_end_is_the_same_link(self):
         cookie = self._login()
         self._req("POST", "/api/inventory/peers",
                   {"a_id": self.agg2, "b_id": self.agg1}, cookie=cookie)
-        # the reverse declaration is the same cable — refused, not duplicated
         status, body, _ = self._req("POST", "/api/inventory/peers",
                                     {"a_id": self.agg1, "b_id": self.agg2}, cookie=cookie)
         self.assertEqual(status, 422, body)
@@ -145,13 +126,12 @@ class PeerLinkTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(self._peers_of(self.agg1), [])
 
-    # --- refusals ------------------------------------------------------------
 
     def test_refuses_self_and_existing_edges(self):
         cookie = self._login()
-        for a, b in ((self.agg1, self.agg1),      # itself
-                     (self.leaf, self.agg1),      # already parent/child
-                     (self.agg1, self.leaf)):     # ...in either direction
+        for a, b in ((self.agg1, self.agg1),
+                     (self.leaf, self.agg1),
+                     (self.agg1, self.leaf)):
             status, body, _ = self._req("POST", "/api/inventory/peers",
                                         {"a_id": a, "b_id": b}, cookie=cookie)
             self.assertEqual(status, 422, body)
@@ -172,7 +152,6 @@ class PeerLinkTest(unittest.TestCase):
                                     {"a_id": self.agg1, "b_id": self.agg2}, cookie=cookie)
         self.assertEqual(status, 403, body)
 
-    # --- lifecycle -----------------------------------------------------------
 
     def test_deleting_a_device_purges_its_cross_links(self):
         self.store.create_peer_link("ispA", self.agg2, self.agg3)
@@ -181,8 +160,6 @@ class PeerLinkTest(unittest.TestCase):
         self.assertEqual(self.store.org_device_peer_map("ispA").get(self.agg3), None)
 
     def test_a_cross_link_does_not_block_deleting_a_device(self):
-        # unlike a child, a peer is not a dependency — it must not hold a
-        # decommissioned switch hostage
         self.store.create_peer_link("ispA", self.agg2, self.agg3)
         self.assertTrue(self.store.delete_org_device("ispA", self.agg3)["ok"])
 

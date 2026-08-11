@@ -17,18 +17,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 
-// Worker location tracking, set up by the owner (central/field.py).
-//
-// Workers run the off-the-shelf Traccar Client — free, open source, Android and
-// iOS — rather than anything of ours. So the owner's job here is not "enable a
-// feature": it is provisioning somebody else's phone, over the phone. The panel
-// is written as STEPS AN OWNER READS OUT, not a paragraph, because that is
-// literally how it gets used.
-
-/** What the tracker has to be set to. These are the duty cycle we designed and
- *  the app's defaults are NOT it — 90 s / 30 m is what makes a trail readable
- *  without draining a handset, and offline buffering is what makes a fix survive
- *  the dead zones the crew drives through every day. */
 const TRACCAR_SETTINGS: Array<[string, string]> = [
   ["Frequency", "90 seconds"],
   ["Distance", "30 metres (whichever comes first)"],
@@ -53,13 +41,6 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   )
 }
 
-/** The QR a phone is provisioned by scanning.
- *
- *  Generated CLIENT-SIDE (`qrcode`, already a dependency for the 2FA enrolment)
- *  rather than server-side, because central is pure stdlib and this feature is
- *  not worth a Python QR library. It encodes the URL WITH the token, so what
- *  the tech scans is the whole credential — which is also why it only ever
- *  exists in the browser tab that just issued the token, and never after. */
 function TokenQr({ url }: { url: string }) {
   const [src, setSrc] = useState("")
   useEffect(() => {
@@ -69,9 +50,6 @@ function TokenQr({ url }: { url: string }) {
   return <img src={src} alt="Tracker setup QR code" className="size-40 rounded-md bg-white p-1.5" />
 }
 
-/** The one-time reveal. Same contract as a probe token, and it says so on
- *  screen: only a SHA-256 hash is stored, so this string cannot be shown again —
- *  a lost one is replaced by rotating, never recovered. */
 function IssuedToken({ username, token, serverUrl, onDone }: {
   username: string; token: string; serverUrl: string; onDone: () => void
 }) {
@@ -125,21 +103,11 @@ function IssuedToken({ username, token, serverUrl, onDone }: {
   )
 }
 
-/** Live state per account, in words.
- *
- *  The same four states the map draws, from the same `workerState` — one rule,
- *  or the panel and the map would disagree about whose phone is working. That
- *  disagreement is the whole failure this feature is meant to surface, so the
- *  two surfaces reporting it differently would be worse than either being
- *  absent. */
 function LiveChip({ w, freshS, now }: { w: FieldWorker; freshS: number; now: number }) {
   const state = workerState(w, freshS, now)
   const seen = w.last_fix ? ago(w.last_fix.ts) : null
   const map: Record<string, [Tone, string]> = {
     live: ["success", `here now · ${seen}`],
-    // The alarm. On shift and nothing arriving is almost always the handset's
-    // OEM battery manager, which no server-side code can fix — so the chip
-    // names it rather than saying "offline".
     quiet: ["warning", seen ? `on shift, gone quiet · ${seen}` : "on shift, never reported"],
     off: ["muted", seen ? `off shift · last seen ${seen}` : "off shift"],
     never: ["muted", "never reported"],
@@ -159,10 +127,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
     queryFn: () => fieldApi.tokens(org),
     enabled: !!org,
   })
-  // The live half. Fetched here as well as on the map because THIS is where an
-  // owner comes when tracking looks broken, and "issued 3 weeks ago" with no
-  // word on whether anything has ever arrived is exactly the gap that makes a
-  // setup panel useless.
   const live = useQuery({
     queryKey: ["field-workers", org],
     queryFn: () => fieldApi.workers(org),
@@ -207,11 +171,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
           deleted.
         </p>
 
-        {/* The rule that makes the whole design honest, stated first because it
-            is the one an owner has to be able to repeat to a worker: the app's
-            own switch is the shift. Nothing is received when it is off — we did
-            NOT build "always transmit and discard", because receiving somebody's
-            evening and choosing not to store it is a far worse promise. */}
         <div className="flex gap-2 rounded-lg border border-border-strong bg-muted/40 p-3">
           <Navigation className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <p className="text-xs text-muted-foreground">
@@ -232,9 +191,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
             serverUrl={serverUrl} onDone={() => setIssued(null)} />
         )}
 
-        {/* Per-account setup. Driven off the login accounts, not off the issued
-            credentials — a list of only the ones already set up can never show
-            you who is still missing. */}
         <div className="flex flex-col gap-0 overflow-hidden rounded-lg border">
           {isLoading && <div className="p-3"><Skeleton className="h-10 w-full" /></div>}
           {!isLoading && accounts.length === 0 && (
@@ -252,8 +208,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
                   <p className="truncate text-sm font-semibold">{a.username}</p>
                   <p className="text-2xs text-muted-foreground capitalize">{a.role}</p>
                 </div>
-                {/* Three different facts, never collapsed: does a credential
-                    exist, was it withdrawn, and is anything actually arriving. */}
                 {active
                   ? <span className="text-2xs text-muted-foreground">
                       identifier issued {ago(a.issued_at!)}
@@ -291,8 +245,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
           })}
         </div>
 
-        {/* Read this out to a worker. Steps, not a paragraph — the owner is on
-            the phone to somebody standing next to a van. */}
         <div className="flex flex-col gap-2">
           <p className="text-xs font-semibold">Setting up a worker&rsquo;s phone</p>
           <ol className="flex list-decimal flex-col gap-1.5 pl-5 text-xs text-muted-foreground">
@@ -325,10 +277,6 @@ export function FieldTrackingCard({ org }: { org: string }) {
           </ol>
         </div>
 
-        {/* The single most likely reason tracking will look broken, and no
-            server-side code can fix any of it. It gets its own block, and a
-            warning tone, because an owner who does not know this will conclude
-            the feature is broken and stop using it. */}
         <div className="flex gap-2 rounded-lg border border-warning/40 bg-warning/[0.06] p-3">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-warning" />
           <div className="flex flex-col gap-1.5 text-xs">
@@ -379,20 +327,9 @@ export function FieldTrackingCard({ org }: { org: string }) {
   )
 }
 
-/** The worker's own Start/End shift control (`/survey`).
- *
- *  Two taps to be on shift — the app's switch AND this — is DELIBERATE, not
- *  redundancy. The whole point is the discrepancy: when this says on-shift and
- *  no fixes arrive, that gap is the "the OEM battery manager killed the service"
- *  alarm, and nothing on the server could detect it otherwise.
- */
 export function ShiftButton({ className }: { className?: string }) {
   const { user } = useAuth()
   const queryClient = useQueryClient()
-  // A shift belongs to an ORG account — a superadmin has no org and so no shift
-  // of its own (the server 400s). Gated here rather than left to fail quietly,
-  // so the platform admin's Survey page isn't polling an endpoint that can never
-  // answer it.
   const canHaveShift = !!user && !user.is_superadmin && !!user.org_id
   const { data, isLoading } = useQuery({
     queryKey: ["field-shift"],
@@ -423,10 +360,6 @@ export function ShiftButton({ className }: { className?: string }) {
         <Navigation className={cn("size-3.5", on && "text-success")} />
         {on ? "End shift" : "Start shift"}
       </Button>
-      {/* Never claims the tracker is running — this button knows only what was
-          declared. Saying "on shift" while the phone sends nothing is the exact
-          lie the two-tap design exists to expose, so the copy stays about the
-          declaration, and the missing half is named when it is missing. */}
       <p className="text-2xs text-muted-foreground">
         {on
           ? `on shift · started ${ago(data.started_at)}`

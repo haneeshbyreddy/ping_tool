@@ -33,9 +33,6 @@ class CentralWatchdogTest(unittest.TestCase):
         self.store.record_heartbeat(org_id, node, {"fleet_size": 1},
                                     now=_iso(NOW - timedelta(seconds=age_s)))
         if org_id not in self._owned:
-            # WhatsApp-only: give the org a real owner number so a probe page has
-            # a recipient. The admin number no longer rides org alerts, so it
-            # can't be the audience here anymore.
             uid = self.store.add_user(org_id, f"own-{org_id}", "h", "s", "owner")
             self.store.set_user_whatsapp(uid, "919000000001")
             self._owned.add(org_id)
@@ -95,11 +92,8 @@ class CentralWatchdogTest(unittest.TestCase):
         self.assertEqual(acted, [("ispA", "edge-1", "alarm")])
 
     def test_pages_org_numbers_but_not_the_admin(self):
-        # A stale probe pages the org's own audience (owner/worker numbers). The
-        # platform admin number is DELIBERATELY excluded from org alerts
-        # (2026-07-25) — the admin can't be buried under every org's probe churn.
         self.store.set_setting("whatsapp_admin_number", "919999999999")
-        self._seen("ispA", "edge-1", age_s=600)   # auto-creates own-ispA @ ...0001
+        self._seen("ispA", "edge-1", age_s=600)
         notifier = RecordingNotifier()
         self._wd(notifier).check(now=NOW)
         self.assertEqual(len(notifier.sent), 1)

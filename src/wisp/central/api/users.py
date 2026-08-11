@@ -1,4 +1,3 @@
-"""Dashboard login accounts."""
 from __future__ import annotations
 
 import json
@@ -7,17 +6,12 @@ import re
 from wisp.central import auth, totp
 from wisp.central.api.common import reader_or_401
 
-# E.164, optional leading '+', 8–15 digits (separators stripped before matching).
 _WA_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 
-# Shown as the account name's issuer in the authenticator app.
 _TOTP_ISSUER = "WISP Central"
 
 
 def _can_use_totp(user: dict) -> bool:
-    # Owner + superadmin only — workers are 403'd off these routes by the
-    # whitelist anyway (they're not in _WORKER_POST); this is belt-and-braces
-    # and gates on IDENTITY before role, like every other superadmin check.
     return bool(user.get("is_superadmin")) or user.get("role") == "owner"
 
 
@@ -85,11 +79,6 @@ def password(h, user, body):
             h._reply(403, {"error": "forbidden"})
             return
     auth.set_password(h.store, target_id, body.get("new_password", ""))
-    # A password change ends every OTHER live session for that account — the
-    # point of "change it because I might be compromised" is that it locks out a
-    # stolen cookie too. Bumping the epoch invalidates them all; if you changed
-    # your OWN password, re-issue THIS tab's cookie on the new generation so you
-    # stay signed in. A teammate reset just invalidates the teammate's sessions.
     epoch = h.store.bump_session_epoch(target_id)
     cookie = None
     if target_id == user["id"]:
@@ -101,10 +90,6 @@ def password(h, user, body):
 
 
 def whatsapp(h, user, body):
-    """Set (or clear) a login account's WhatsApp number — the recipient half of
-    the experimental WhatsApp channel. Anyone may set their OWN (self-service,
-    like the password route, so a worker can add it from the field app);
-    owners/superadmins may set it for any account in their org."""
     target_id = int(body.get("id") or user["id"])
     number = str(body.get("whatsapp_number") or "").strip()
     if number:
@@ -115,7 +100,7 @@ def whatsapp(h, user, body):
             return
         number = compact
     else:
-        number = None  # blank clears it
+        number = None
     if target_id != user["id"]:
         if not (user["is_superadmin"] or user["role"] == "owner"):
             h._reply(403, {"error": "forbidden"})
@@ -128,16 +113,7 @@ def whatsapp(h, user, body):
     h._reply(200, {"ok": True, "whatsapp_number": number})
 
 
-# --- TOTP two-factor (self-service, owner/superadmin) ------------------------
-# Always operates on the CALLER's own account (user["id"]) — you can't enroll
-# someone else's phone, and disabling is a downgrade only the account holder
-# should do. Enabling/disabling and regenerating codes all re-check the password:
-# it stops an attacker at an unlocked, already-signed-in desk from turning 2FA on
-# (locking the owner out with their phone) or off (stripping the protection).
-
 def totp_start(h, user, body):
-    """Begin enrollment: mint a fresh secret, return it + the otpauth URI for the
-    QR. Inert until confirmed — a set-but-unconfirmed secret is never enforced."""
     if not _can_use_totp(user):
         h._reply(403, {"error": "forbidden"})
         return
@@ -149,8 +125,6 @@ def totp_start(h, user, body):
 
 
 def totp_confirm(h, user, body):
-    """Verify the first code against the pending secret, switch 2FA on, and hand
-    back the one-time recovery codes (shown once, stored only as hashes)."""
     if not _can_use_totp(user):
         h._reply(403, {"error": "forbidden"})
         return
@@ -173,7 +147,7 @@ def totp_confirm(h, user, body):
         return
     codes = totp.new_recovery_codes()
     h.store.activate_totp(user["id"], json.dumps([totp.recovery_hash(c) for c in codes]))
-    h.store.claim_totp_step(user["id"], step)   # so this code can't be replayed at login
+    h.store.claim_totp_step(user["id"], step)
     h._reply(200, {"ok": True, "recovery_codes": codes})
 
 
@@ -186,9 +160,6 @@ def totp_disable(h, user, body):
 
 
 def totp_regenerate(h, user, body):
-    """Mint a fresh set of recovery codes (the old ones stop working). Needs the
-    password AND a live authenticator code — proof of possession, not just a
-    hijacked session."""
     if not auth.verify_login(h.store, user["username"], body.get("password", "")):
         h._reply(422, {"error": "current password is incorrect"})
         return

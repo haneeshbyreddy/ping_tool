@@ -1,16 +1,7 @@
-"""Web-UI proxy session records + per-request audit trail (webplan.md, M1).
-
-Mixin half of ``CentralStore``. Only the session RECORD and the audit log live
-here — the live tunnel (parked requests, long-poll matching) stays process
-memory in ``central/proxy.py``; a tunnel is inherently live and dies with the
-process, but who opened what against which device must survive it.
-"""
 from __future__ import annotations
 
 from wisp.central.store_util import _now_iso
 
-# Audit rows older than this are pruned lazily on session create (a rare,
-# operator-driven event) — bounded growth without a background sweeper.
 PROXY_AUDIT_KEEP_DAYS = 60
 
 
@@ -40,9 +31,6 @@ class ProxyStoreMixin:
             conn.commit()
 
     def close_node_proxy_sessions(self, org_id: str, node_id: str) -> int:
-        """Retire every open session record on one probe — the one-tunnel-per-
-        node rule (a new session replaces whatever was open). Also sweeps
-        restart zombies: 'open' rows whose hub session died with the process."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE proxy_sessions SET status='closed'"
@@ -66,10 +54,6 @@ class ProxyStoreMixin:
         return dict(row) if row else None
 
     def list_proxy_sessions(self, org_id: str, limit: int = 50) -> list[dict]:
-        """Newest-first session records for the org — open AND recently closed,
-        so the dashboard's session view doubles as a who-opened-what history.
-        Open rows whose expires_at has passed are reported as 'expired' (the
-        hub already forgot them; the record must not claim they're live)."""
         now = _now_iso()
         with self._connect() as conn:
             rows = [dict(r) for r in conn.execute(
@@ -101,7 +85,6 @@ class ProxyStoreMixin:
                 " WHERE a.org_id=? ORDER BY a.id DESC LIMIT ?",
                 (org_id, max(1, int(limit))))]
 
-    # ----- org capability flag ------------------------------------------------
 
     def org_web_proxy(self, org_id: str) -> bool:
         with self._connect() as conn:

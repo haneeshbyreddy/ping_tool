@@ -1,11 +1,3 @@
-"""Shared request helpers for the central API handler modules.
-
-Every handler function receives the live request handler instance ``h``
-(see ``server.py``). Services ride on it as class attributes — ``h.cfg``,
-``h.store``, ``h.notifier``, ``h.registry`` — and the transport/auth
-plumbing stays on the handler (``h._reply``, ``h._user``, ``h._reader``,
-``h._scope_org``, ``h._can_write``, ``h._ingest_ok``).
-"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -20,23 +12,8 @@ def now_iso() -> str:
 
 def olt_liveness(devs: list[dict], now: datetime, node_stale_s: int
                  ) -> tuple[set[int], set[int]]:
-    """Split OLTs (any device rows, really) by what we can currently say about
-    them, using the SAME ICMP signals the device-count KPI and row graying use —
-    not just the DOWN state:
 
-      * down  — ICMP DOWN/UNREACHABLE with a FRESH report: confirmed unreachable,
-        so its ONUs are offline (callers keep them in the total as blast radius).
-      * stale — no report since ``node_stale_s`` (the probe/edge is silent): the
-        OLT is UNKNOWN, not down. Central never marks it down (a dead edge sends
-        no reports), yet its last SNMP walk lingers "fresh" for up to STALE_S — so
-        without this it would keep its ONUs "online" for ~15 min. Callers drop it
-        from the rollup entirely, exactly like a stale optics walk, just off the
-        faster ICMP signal.
 
-    A box that is both (last state DOWN, edge now gone) counts as stale — we can no
-    longer confirm it, so we stop asserting anything about it. Returns
-    ``(down_ids, stale_ids)``, disjoint.
-    """
     cutoff = now.replace(tzinfo=None) - timedelta(seconds=node_stale_s)
 
     def _fresh_state(d: dict) -> bool:
@@ -64,11 +41,6 @@ def public_user(user: dict, store) -> dict:
 
 
 def can_triage(user: dict, org: str | None) -> bool:
-    """Acknowledge/post-mortem rights: everyone in the org, plus superadmin
-    anywhere. Since roles collapsed to owner+worker (2026-07-21) that IS both
-    roles — the read-only operator/tech accounts this used to exclude no longer
-    exist. Kept as its own predicate because write rights (``_can_write``) are
-    still owner-only: a worker triages, it doesn't reconfigure."""
     if user["is_superadmin"]:
         return True
     return user["org_id"] == org and user["role"] in ("owner", "worker")
@@ -114,8 +86,6 @@ def q_int_or(qs, key: str, fallback: int) -> int:
 
 
 def device_read_scope(h, user, qs) -> tuple[int, str] | None:
-    """?device_id=N reads: parse the id, derive org from the DB row, 403 unless
-    the caller is superadmin or in that org. Replies on failure."""
     did = q_int_required(h, qs, "device_id")
     if did is None:
         return None
@@ -127,10 +97,6 @@ def device_read_scope(h, user, qs) -> tuple[int, str] | None:
 
 
 def device_write_org(h, user, device_id: int):
-    """Writes keyed by device id: org comes from the DB row (body org_id is
-    never trusted), owner/superadmin only. Returns the org or DENIED after a
-    403 — a superadmin hitting an unknown device gets org None and falls
-    through to the store's own 404, exactly like the pre-split handler."""
     org = h.store.device_org(device_id)
     if not h._can_write(user, org):
         h._reply(403, {"error": "forbidden"})
@@ -139,14 +105,7 @@ def device_write_org(h, user, device_id: int):
 
 
 def can_survey(user, org: str | None) -> bool:
-    """Field capture rights: a WORKER in this org, or anyone who can already write.
 
-    Its own predicate for the same reason `can_triage` is: recording where a box
-    physically stands is the one write a person standing at the box is better
-    placed to make than the owner at a desk, but it does not widen anything else
-    — a surveyor still cannot re-parent, rename, or delete. Keeping the check
-    separate is what stops "workers can place pins" drifting into "workers can
-    write inventory" the next time somebody reaches for `_can_write`."""
     if user["is_superadmin"]:
         return True
     if user["org_id"] != org or org is None:
@@ -155,7 +114,6 @@ def can_survey(user, org: str | None) -> bool:
 
 
 def survey_write_org(h, user, device_id: int):
-    """`device_write_org`'s field twin: org from the DB row, owner OR worker."""
     org = h.store.device_org(device_id)
     if not can_survey(user, org):
         h._reply(403, {"error": "forbidden"})
@@ -163,15 +121,10 @@ def survey_write_org(h, user, device_id: int):
     return org
 
 
-# Returned by body_org_write when the caller was rejected (403 already sent).
-# A sentinel, not None — a superadmin writing with no org_id legitimately
-# yields org=None and must not read as a denial.
 DENIED = object()
 
 
 def body_org_write(h, user, body: dict):
-    """Writes scoped by body org_id (create) or the caller's own org.
-    Returns the org (possibly None for superadmin) or DENIED after a 403."""
     org = body.get("org_id") or user["org_id"]
     if not h._can_write(user, org):
         h._reply(403, {"error": "forbidden"})

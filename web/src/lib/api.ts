@@ -3,7 +3,7 @@ import type {
   OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   BranchFault, FibreTrace, PointFibre, SplitterLoad, Subscriber, SubscriberDrop,
-  Summary, SwitchPort, SystemStats, TrendBucket, WebUiCredentials,
+  Summary, SwitchPort, SystemStats, TrayPort, TrendBucket, WebUiCredentials,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
   FieldTokensResponse, FieldWorkersResponse, ShiftState,
 } from "./types"
@@ -12,8 +12,6 @@ import type { MapDetail } from "@/map/detail"
 
 export class ApiError extends Error {
   status: number
-  // The parsed JSON body, so callers can read fields beyond the message —
-  // e.g. the login flow reads `body.totp_required` off a 401.
   body: Record<string, unknown>
   constructor(message: string, status = 0, body: Record<string, unknown> = {}) {
     super(message)
@@ -32,8 +30,6 @@ async function request<T>(path: string, opts: { method?: string; body?: unknown 
     window.dispatchEvent(new CustomEvent("wisp:unauthorized"))
   }
   if (res.status === 402) {
-    // paywall lock hit mid-session (month rolled over unpaid) — the app shell
-    // listens and re-checks /api/billing, which flips it to the lock screen
     window.dispatchEvent(new CustomEvent("wisp:payment-required"))
   }
   const isJson = res.headers.get("content-type")?.includes("json")
@@ -48,13 +44,6 @@ export function tq(org?: string | null): string {
   return org ? `?org=${encodeURIComponent(org)}` : ""
 }
 
-/** The org scope as a SUBSEQUENT query param, for a read that already has one.
- *
- *  Its own helper rather than `tq(org).replace("?", "&")`: the param `_scope_org`
- *  reads is `org`, and getting that wrong is invisible to an OWNER (whose org
- *  comes from the session) while 400-ing every SUPERADMIN — the exact failure
- *  the cables read shipped with, found only because somebody logged in as the
- *  other role. One spelling, in one place, for both shapes. */
 export function aq(org?: string | null): string {
   return org ? `&org=${encodeURIComponent(org)}` : ""
 }
@@ -80,27 +69,18 @@ export const systemApi = {
 
 export const adminApi = {
   overview: () => request<AdminOverview>("/api/admin/overview"),
-  // server-wide settings, superadmin-only; the Google key applies to every org
   settings: () => request<{
     google_maps_key: string | null
     billing_gpay_number: string
     billing_qr_image: string | null
-    // WhatsApp channel config (token never echoed — token_set only)
     whatsapp: WhatsappSettings
-    // sparse colour diff over the shipped palette, per theme mode; `{}` is a
-    // stock theme. See lib/theme-tokens.ts and central/theme.py.
     theme_overrides: ThemeOverrides
-    // EFFECTIVE map zoom floors (defaults filled in, unlike the sparse theme
-    // diff above) — one setting for every org. See central/mapdetail.py.
     map_detail: MapDetail
   }>("/api/admin/settings"),
   saveSettings: (body: {
     google_maps_key?: string | null
     billing_gpay_number?: string | null
     billing_qr_image?: string | null
-    // WhatsApp config. `token` write-only: omit to leave the stored one alone,
-    // send a value to set it, or `token_clear: true` to remove it. `admin_number`
-    // is the superadmin ops recipient (org 'I've paid' / churn / release-sync).
     whatsapp?: {
       enabled?: boolean
       phone_id?: string
@@ -111,10 +91,7 @@ export const adminApi = {
       token?: string
       token_clear?: boolean
     }
-    // omit to leave colours alone; `{}` resets every org to the shipped palette
     theme_overrides?: ThemeOverrides
-    // omit to leave map density alone; posting the shipped defaults IS the reset
-    // (central clears the row rather than storing a copy of them)
     map_detail?: MapDetail
   }) =>
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
@@ -122,15 +99,10 @@ export const adminApi = {
 
 export const billingApi = {
   get: (org?: string | null) => request<BillingInfo>(`/api/billing${tq(org)}`),
-  // superadmin: set the plan and/or toggle one paid month
   adminSave: (body: { org_id: string; plan?: Plan; month?: string; paid?: boolean }) =>
     request<{ ok: true } & BillingInfo>("/api/admin/billing", { method: "POST", body }),
-  // "I've paid": pings the admin's payments channel with the org name so they
-  // verify and mark the month. Reachable while locked — the lock-screen tap.
   markPaid: (org?: string | null) =>
     request<{ ok: true; notified: boolean }>("/api/billing/paid", { method: "POST", body: { org_id: org } }),
-  // self-serve, no payment: only "free" is accepted (paid plans are entered
-  // by paying the admin); reachable while locked — the escape hatch
   setPlan: (body: { org_id?: string | null; plan: Plan }) =>
     request<{ ok: true } & BillingInfo>("/api/billing/plan", { method: "POST", body }),
 }
@@ -139,7 +111,6 @@ export const orgsApi = {
   list: (org?: string | null) => request<{ orgs: Org[] }>(`/api/orgs${tq(org)}`),
   create: (body: { org_id: string; name?: string | null }) =>
     request<{ org_id: string }>("/api/orgs", { method: "POST", body }),
-  // irreversible: `confirm` must echo the org id — the server enforces it too
   remove: (org_id: string) =>
     request<{ ok: true; org_id: string; deleted: Record<string, number> }>(
       "/api/orgs/delete", { method: "POST", body: { org_id, confirm: org_id } }),
@@ -167,15 +138,8 @@ export interface DevicePayload {
   assigned_node_id?: string | null
   gpon_vendor?: string | null
   pon_port?: string | null
-  /** passive plant only: 2 | 4 | 8 | 16 (see SPLIT_RATIOS), null = not recorded */
   split_ratio?: number | null
-  /** passive plant only: fibres feeding it (2 = a protection-input splitter).
-      null reads as ONE, not "unknown" — see SPLIT_INPUTS. MUST ride every
-      update, like split_ratio: the server reads an absent key as "not
-      recorded", so omitting it downgrades a 2:16 on the next rename. */
   split_inputs?: number | null
-  /** OLT only: ONUs per PON before "at capacity" (EPON 64 / GPON 128),
-      null = the server's global cap */
   onu_pon_limit?: number | null
 }
 
@@ -195,10 +159,6 @@ export const inventoryApi = {
     request<{ ok: boolean }>("/api/inventory/tree-detached", { method: "POST", body: { id, on } }),
   setLocation: (id: number, lat: number | null, lng: number | null) =>
     request<{ ok: boolean }>("/api/inventory/location", { method: "POST", body: { id, lat, lng } }),
-  // The field-survey pair — the ONLY inventory writes a worker session may make.
-  // Separate from setLocation because they are different operations, not the
-  // same one with a wider audience: neither can clear a pin, and the passive
-  // create carries no parent, IP or probe (see server.py:_WORKER_POST).
   placeInField: (body: {
     id: number; lat: number; lng: number
     accuracy_m: number | null; source: "gps" | "manual"
@@ -209,28 +169,16 @@ export const inventoryApi = {
     split_ratio?: string | null; split_inputs?: number | null
     region?: string | null; pon_port?: string | null
   }) => request<{ id: number }>("/api/inventory/field-passive", { method: "POST", body }),
-  // Locating a subscriber's ONU from the field. Deliberately carries no
-  // `witness` key: placing a REFERENCE ONU is the operator's claim about a power
-  // supply and flips PON mass-drop verdicts, so it stays on setOnuPlace and
-  // owner-only. This one records where the box is, and nothing more.
-  // `label` and `phone` are REQUIRED by the server, not merely accepted: a
-  // survey row a crew can't act on isn't worth the pin. Typed optional-free.
   locateOnuInField: (body: {
     mac: string; lat: number; lng: number
     accuracy_m: number | null; source: "gps" | "manual"
     label: string; phone: string
   }) => request<{ ok: boolean }>("/api/inventory/field-onu", { method: "POST", body }),
-  // Contact details only. Writes `onu_places.label`/`.phone` — NOT the roster's
-  // name, which the SNMP walk rewrites every sweep. Separate from the placement
-  // call so fixing a spelling can't restamp the pin's accuracy or reattribute
-  // who placed it.
   nameOnuInField: (body: { mac: string; label: string; phone: string }) =>
     request<{ ok: boolean }>("/api/inventory/field-onu-name", { method: "POST", body }),
   setSnmp: (id: number, body: {
     snmp_enabled: boolean; snmp_community?: string | null; snmp_port?: number | string
   }) => request<{ ok: boolean }>("/api/inventory/snmp", { method: "POST", body: { id, ...body } }),
-  // Web-UI proxy address override (owner-only). Blank/null fields clear that part;
-  // all blank clears the override (back to the probe IP on 80/443).
   setWebAccess: (id: number, body: {
     web_ip: string | null; web_port: number | null; web_scheme: string | null
   }) => request<{ ok: boolean }>("/api/inventory/web-access", { method: "POST", body: { id, ...body } }),
@@ -245,7 +193,6 @@ export const inventoryApi = {
     request<{ ok: boolean }>("/api/inventory/ports/feeds", { method: "POST", body: { id, feeds_device_id } }),
   setPortUplink: (id: number, uplink_device_id: number | null) =>
     request<{ ok: boolean }>("/api/inventory/ports/uplink", { method: "POST", body: { id, uplink_device_id } }),
-  // every port bound to a link (either side), org-wide — the map's bandwidth labels
   linkPorts: (org?: string | null) =>
     request<{ ports: LinkPort[] }>(`/api/inventory/link-ports${tq(org)}`),
   setPortBandwidth: (
@@ -253,19 +200,12 @@ export const inventoryApi = {
   ) => request<{ ok: boolean }>("/api/inventory/ports/bandwidth", {
     method: "POST", body: { id, threshold_mbps, max_mbps, direction },
   }),
-  // ----- paging responsibility ------------------------------------------------
-  // Who gets paged about a device. NOT a permission: every account still sees the
-  // whole fleet, so nothing here belongs in a read path.
   assignments: (org?: string | null) =>
     request<AssignmentRoster>(`/api/inventory/assignments${tq(org)}`),
-  /** REPLACE one device's assignees. An empty list is meaningful — it hands the
-      device back to "every worker gets paged", the safe default. */
   setAssignees: (device_id: number, user_ids: number[]) =>
     request<{ ok: boolean; unreachable: string[] }>("/api/inventory/assign", {
       method: "POST", body: { device_id, user_ids },
     }),
-  /** ADD or REMOVE accounts across many devices, leaving other assignees on those
-      devices alone — handing over a region must not strip whoever else was on it. */
   bulkAssign: (device_ids: number[], user_ids: number[], mode: "add" | "remove") =>
     request<{ ok: boolean; changed: number; unreachable: string[] }>(
       "/api/inventory/assign", { method: "POST", body: { device_ids, user_ids, mode } }),
@@ -274,38 +214,17 @@ export const inventoryApi = {
   setRoute: (child_id: number, parent_id: number, waypoints: Array<[number, number]>) =>
     request<{ ok: boolean }>("/api/inventory/route",
       { method: "POST", body: { child_id, parent_id, waypoints } }),
-  // Trace one subscriber's drop cable, splitter → customer. An empty list
-  // straightens it back to the dotted chord. 404s when no drop is recorded:
-  // the drop row is the anchor, and a path from nowhere is not a route.
   setDropRoute: (mac: string, waypoints: Array<[number, number]>, org?: string | null) =>
     request<{ ok: boolean; points: number }>("/api/inventory/drop-route",
       { method: "POST", body: { mac, waypoints, org_id: org ?? undefined } }),
-  // Where one span's chip sits. Cartography, and nothing else any more: fibre
-  // is its own graph (`saveCable`), which needs no topology link at all.
   setLinkStyle: (
     child_id: number, parent_id: number, style: { label_pos?: number | null },
   ) => request<{ ok: boolean }>("/api/inventory/link-style",
     { method: "POST", body: { child_id, parent_id, ...style } }),
-  // Every cable in the org: its two ends, its route, its length and what each
-  // core does at each end. ONE read builds the whole panel — the plan, the ends
-  // and the counts have to agree about one sheath, and three reads at three
-  // moments is how a card says "0 of 12 recorded" above a recorded core.
-  //
-  // `tq` — i.e. `?org=`, the param `_scope_org` actually reads. Spelled it
-  // `?org_id=` first, which works for an OWNER (their org comes from the
-  // session) and 400s for a SUPERADMIN, whose org can only come from the query
-  // string. It shipped because the browser check was run as an owner: verifying
-  // one role proves nothing about the other on any org-scoped read.
   cables: (org: string | null) =>
     request<{ cables: Cable[]; counts: number[] }>(`/api/inventory/cables${tq(org)}`),
-  // LAY A CABLE, or edit one. Both ends are required on create and optional on
-  // update — one end is not a weaker version of a cable, it is an unusable one,
-  // but a rename must not have to restate the geometry.
-  //
-  // An end is a device OR a customer, never both. It writes no device row and no
-  // link, so recording fibre can never re-parent anything or page anybody; what
-  // it does feed is the PLANT chain (split totals, PON inheritance, branch
-  // faults).
+  devicePorts: (org: string | null) =>
+    request<{ ports: Record<string, TrayPort[]> }>(`/api/inventory/fibre/ports${tq(org)}`),
   saveCable: (
     cable: {
       id?: number; name: string; cores: number | null; notes?: string | null
@@ -315,83 +234,60 @@ export const inventoryApi = {
     org: string | null,
   ) => request<{ ok: boolean; id: number }>("/api/inventory/cable",
     { method: "POST", body: { ...cable, org_id: org ?? undefined } }),
-  // What one fibre CARRIES. Free text — a real core register mixes destinations,
-  // customers and intentions ("BSNL", "village A tower", "reserved"), and no
-  // closed vocabulary survives that. Where it GOES is derived, never typed.
   setCableCore: (cable_id: number, core_no: number, label: string | null) =>
     request<{ ok: boolean }>("/api/inventory/cable/core",
       { method: "POST", body: { cable_id, core_no, label } }),
-  // Trace where the cable physically runs. A COMPLETE path, ends included —
-  // unlike setRoute's, whose ends are two device pins. An empty list clears it.
-  // Geometry and nothing else: not the name, not the fibre count, not the ends.
   setCablePath: (cable_id: number, path: Array<[number, number]>) =>
     request<{ ok: boolean }>("/api/inventory/cable/path",
       { method: "POST", body: { cable_id, path } }),
-  // OPEN A COUPLER on this cable: cut it here, stand a coupler at the cut and
-  // splice every core straight through. The gesture the segment model is built
-  // around — it is what the crew does, and it is what stops "a cable has ends"
-  // from meaning "redraw the street every time you tap it".
   splitCable: (cable_id: number, lat: number, lng: number, name?: string | null) =>
     request<{
       ok: boolean; cable_id: number; new_cable_id: number
-      coupler_id: number; spliced: number
+      closure_id: number; spliced: number
     }>("/api/inventory/cable/split",
       { method: "POST", body: { cable_id, lat, lng, name } }),
   deleteCable: (id: number) =>
     request<{ ok: boolean }>("/api/inventory/cable/delete",
       { method: "POST", body: { id } }),
-  // THE TRAY: every cable end landing on one point, and the joints between them.
-  // Takes a device OR a customer, because a customer point is a coupler too.
   pointFibre: (point: { device_id?: number | null; mac?: string | null },
                org: string | null) =>
     request<PointFibre>(`/api/inventory/fibre?${
       point.device_id != null ? `device=${point.device_id}`
         : `onu=${encodeURIComponent(point.mac ?? "")}`}${aq(org)}`),
-  // The whole optical path one fibre makes, across sheaths and joints. Its own
-  // read because a trace is a walk of the ORG's glass, not a property of the
-  // cable being looked at — shipping one per core would run a network-wide walk
-  // for every strand of every cable on every panel open.
   traceFibre: (cable_id: number, core_no: number, org: string | null) =>
     request<FibreTrace>(
       `/api/inventory/fibre/trace?cable=${cable_id}&core=${core_no}${aq(org)}`),
-  // JOIN TWO FIBRES at a point — or, with no `b`, take one out to the equipment
-  // standing there. One route for both, because they are the same statement and
-  // consume a fibre end identically.
-  //
-  // It answers 200 with `ok:false` and a NAMED refusal rather than a bare 400:
-  // on a splice tray an unexplained rejection is indistinguishable from a broken
-  // button, and the name is what lets the UI print the sentence.
   setFibreJoint: (joint: {
     device_id?: number | null; mac?: string | null
     a_cable_id: number; a_core_no: number
     b_cable_id?: number | null; b_core_no?: number | null
+    port_kind?: string | null; port_no?: number | null
   }) => request<{ ok: boolean; id?: number; refused?: string; reason?: string }>(
     "/api/inventory/fibre/joint", { method: "POST", body: joint }),
-  // Take ONE core out to a box standing somewhere ELSE: lays a single-fibre tail
-  // between the two points and lands it at both ends, in one write. The other
-  // half of "take a core out to a device" — a strand may only be joined where its
-  // own sheath is opened, so without this a closure could never feed the OLT
-  // beside it.
+  connectPort: (body: {
+    device_id?: number | null; mac?: string | null
+    port_kind?: string | null; port_no?: number | null
+    to_device_id?: number | null; to_mac?: string | null
+    to_port_kind?: string | null; to_port_no?: number | null
+    org_id?: string | null
+  }) => request<{
+    ok: boolean; cable_id?: number; name?: string; far_port?: string | null
+    refused?: string; reason?: string
+  }>("/api/inventory/fibre/connect", { method: "POST", body }),
   takeCoreToBox: (tail: {
     device_id?: number | null; mac?: string | null
     a_cable_id: number; a_core_no: number
     to_device_id?: number | null; to_mac?: string | null
+    port_kind?: string | null; port_no?: number | null
   }) => request<{
     ok: boolean; cable_id?: number; name?: string
     refused?: string; reason?: string
   }>("/api/inventory/fibre/tail", { method: "POST", body: tail }),
-  // Splice every FREE core of one cable straight through to another, 1:1. Nine
-  // closures in ten are exactly this, and doing it as N gestures is the
-  // difference between a record that gets written and one that does not.
-  // Already-joined cores are SKIPPED, so it is safe to press twice and safe to
-  // press after hand-work.
   spliceThrough: (through: {
     device_id?: number | null; mac?: string | null
     a_cable_id: number; b_cable_id: number
   }) => request<{ ok: boolean; spliced: number; skipped: number; reason?: string }>(
     "/api/inventory/fibre/through", { method: "POST", body: through }),
-  // Undo whatever this fibre is joined to here. Named by the FIBRE, not the
-  // joint's id, so either side of a splice can undo it.
   clearFibreJoint: (clear: {
     device_id?: number | null; mac?: string | null
     cable_id: number; core_no: number
@@ -401,7 +297,6 @@ export const inventoryApi = {
     request<{ ok: true }>("/api/inventory/links", { method: "POST", body: { child_id, parent_id } }),
   removeBackupLink: (child_id: number, parent_id: number) =>
     request<{ ok: boolean }>("/api/inventory/links/delete", { method: "POST", body: { child_id, parent_id } }),
-  // switch-to-switch cross-link; undirected, so either order works
   addPeerLink: (a_id: number, b_id: number) =>
     request<{ ok: true }>("/api/inventory/peers", { method: "POST", body: { a_id, b_id } }),
   removePeerLink: (a_id: number, b_id: number) =>
@@ -409,16 +304,9 @@ export const inventoryApi = {
 
   optics: (deviceId: number) =>
     request<OpticsResponse>(`/api/inventory/optics?device_id=${deviceId}`),
-  // ONU lookup (serial/MAC or provisioned name) for the Network search box.
-  // Punctuation-blind server side, so the raw needle goes over as typed.
   onuSearch: (org: string | null | undefined, q: string) =>
     request<OnuSearchResponse>(
       `/api/inventory/onu-search?q=${encodeURIComponent(q)}${tq(org).replace(/^\?/, "&")}`),
-  // Reference ONUs: the subscribers an operator has vouched for as reliably
-  // powered, placed on the map. Keyed on the MAC (identity), so a re-homed drop
-  // keeps its point. Passing lat/lng null CLEARS it — the table is sparse.
-  // Survey coverage. Without a device_id it is counts only (cheap); with one it
-  // also returns that OLT's unplaced rows — the list a tech works down.
   onuCoverage: (org: string | null | undefined, deviceId?: number) => {
     const p = new URLSearchParams()
     if (org) p.set("org", org)
@@ -428,47 +316,21 @@ export const inventoryApi = {
   },
   onuPlaces: (org?: string | null) =>
     request<{ places: OnuPlace[] }>(`/api/inventory/onu-places${tq(org)}`),
-  /** ONE subscriber, whole — the object `subscriber-detail.tsx` renders. Keyed
-   *  on the sticker MAC, which is the only identity that survives a re-homed
-   *  drop (a slot key rots: `onu_optics` never deletes a vacated one). */
   subscriber: (mac: string, org?: string | null) =>
     request<Subscriber>(`/api/inventory/subscriber?mac=${encodeURIComponent(mac)}`
       + tq(org).replace(/^\?/, "&")),
-  /** Record who a subscriber is from the desk — no coordinate involved.
-   *
-   *  Deliberately NOT `setOnuPlace` with null coordinates: that call's meaning is
-   *  the map pin (and, when it clears one, the retraction of a power claim).
-   *  This one only ever touches what the operator typed, which is why an ISP can
-   *  finally name the 2,150 subscribers nobody has stood at. A blank field is
-   *  written as NULL rather than skipped — the form SHOWS what is stored, so
-   *  emptying one is deliberate. */
   setOnuContact: (body: {
     mac: string; label?: string | null; phone?: string | null
     notes?: string | null; org_id?: string | null
   }) => request<{ ok: boolean }>("/api/inventory/onu-contact", { method: "POST", body }),
-  /** Place, move or clear a subscriber's pin. A LOCATION and nothing else.
-   *
-   *  **There is deliberately no `witness` key** — the server payload cannot
-   *  spell one either. This route used to force the claim TRUE, so moving a
-   *  surveyed pin or reopening the dialog to add a phone number silently
-   *  promoted an ordinary customer to a power-backed witness, and a dark witness
-   *  makes ponfault call a fibre cut and roll a crew. The claim has exactly one
-   *  verb, `setOnuWitness`. */
   setOnuPlace: (body: {
     mac: string; lat: number | null; lng: number | null
     label?: string | null; phone?: string | null
     notes?: string | null; org_id?: string | null
   }) => request<{ ok: boolean }>("/api/inventory/onu-place", { method: "POST", body }),
-  /** The power-supply claim ALONE — no coordinate moves, no provenance is
-   *  restamped. What makes "on the map but not vouched for" expressible, which
-   *  is the state a surveyed fleet is mostly in. 404s on a subscriber nobody has
-   *  recorded yet. */
   setOnuWitness: (body: { mac: string; witness: boolean; org_id?: string | null }) =>
     request<{ ok: boolean; witness: boolean }>("/api/inventory/onu-witness",
       { method: "POST", body }),
-  // Subscriber drops: which passive box each ONU hangs off. Map-only like
-  // `routes` — every page lists devices, only the map and a splitter's own
-  // panel need to know what is behind each box.
   drops: (org?: string | null) =>
     request<{
       splitters: SplitterLoad[]; faults: BranchFault[]
@@ -477,10 +339,9 @@ export const inventoryApi = {
   splitterDrops: (deviceId: number) =>
     request<{ drops: SubscriberDrop[]; load: SplitterLoad | null; outlier_db: number }>(
       `/api/inventory/drops/subscribers?device_id=${deviceId}`),
-  // Bulk by design: the question is "which customers hang off this splitter",
-  // asked once per box. `passive_id: null` DETACHES the listed MACs.
   setDrops: (body: {
     macs: string[]; passive_id: number | null; org_id?: string | null
+    leg_no?: number | null
   }) => request<{ ok: boolean; attached?: number; detached?: number }>(
     "/api/inventory/drops/set", { method: "POST", body }),
 
@@ -495,8 +356,6 @@ export const inventoryApi = {
   ackOnu: (id: number, hours: number | null) =>
     request<{ ok: boolean }>("/api/inventory/optics/ack",
       { method: "POST", body: hours == null ? { id, until: "clear" } : { id, hours } }),
-  // Per-device web-UI login (owner-only). `password`: omit/null to leave a
-  // stored one untouched, "" to clear it, a string to set it.
   credentials: (deviceId: number) =>
     request<{ credentials: WebUiCredentials }>(`/api/inventory/credentials?device_id=${deviceId}`),
   setCredentials: (device_id: number, body: {
@@ -569,9 +428,6 @@ export interface WebOpticsProfilePayload extends WebOpticsProfileSpec {
   enabled: boolean
 }
 
-// Web-UI optics vendor recipes: the OLTs whose per-ONU Rx exists in no SNMP OID
-// and can only be read off the box's own page. A profile is what turns
-// onboarding one of those from a central deploy into a dashboard row.
 export const webOpticsApi = {
   profiles: (org?: string | null) =>
     request<WebOpticsProfilesResponse>(`/api/web-optics-profiles${tq(org)}`),
@@ -583,21 +439,13 @@ export const webOpticsApi = {
   removeProfile: (id: number) =>
     request<{ ok: boolean }>("/api/web-optics-profiles/delete",
       { method: "POST", body: { id } }),
-  // Why this OLT shows no dBm. Read-side: rendering the diagnosis must never
-  // poke the OLT — the scrape stays on its own slow clock.
   rxStatus: (deviceId: number) =>
     request<RxStatusResponse>(`/api/inventory/rx-status?device_id=${deviceId}`),
-  // Read this OLT's optical page NOW rather than at the next sweep — for the
-  // hour someone is at the pole with the fibre in their hand. Answers at once;
-  // the read runs server-side and lands in the scrape status the panel already
-  // watches, so there is one story about what happened either way.
   refresh: (deviceId: number) =>
     request<{ started: boolean }>("/api/inventory/rx-refresh",
       { method: "POST", body: { device_id: deviceId } }),
 }
 
-// Device web-UI proxy tunnel (webplan.md M3). A session is opened against one
-// device; the browser then drives the device's own UI at the returned url.
 export const proxyApi = {
   open: (device_id: number, port: number) =>
     request<{ sid: string; url: string; device_id: number; expires_at: number }>(
@@ -623,8 +471,6 @@ export const analyticsApi = {
       `/api/analytics?days=${days}${org ? `&org=${encodeURIComponent(org)}` : ""}`),
 }
 
-// The ISSUE plane: the same trouble the Home tiles count, listed one row per
-// problem instead of one row per device.
 export const issuesApi = {
   list: (org: string | null | undefined, kinds: IssueKind[] = []) => {
     const params = new URLSearchParams()
@@ -632,10 +478,6 @@ export const issuesApi = {
     if (kinds.length) params.set("kind", kinds.join(","))
     return request<IssuesResponse>(`/api/issues?${params.toString()}`)
   },
-  // Server-rendered PDF (central/pdf.py) or .xlsx (central/xlsx.py) — both pure
-  // stdlib, both filtered by the same `kinds`. Fetched rather than linked so a 401
-  // still runs through the unauthorized handling instead of navigating the tab to
-  // a JSON error, and so the caller can show a real toast.
   download: async (format: "pdf" | "xlsx", org: string | null | undefined,
                    kinds: IssueKind[] = []) => {
     const params = new URLSearchParams()
@@ -658,16 +500,9 @@ export const outagesApi = {
   list: (org?: string | null) => request<{ outages: Outage[] }>(`/api/outages${tq(org)}`),
   acknowledge: (outage_id: number) =>
     request<{ ok: boolean }>("/api/outages/acknowledge", { method: "POST", body: { outage_id } }),
-  // Owner-only. Replaces the whole assignee set; the server refuses an empty
-  // list (there is no "assigned to nobody" state) and pages exactly the named
-  // accounts, reporting how many actually had a WhatsApp number.
   assign: (outage_id: number, usernames: string[]) =>
     request<{ ok: true; assigned_to: string[]; notified: number }>(
       "/api/outages/assign", { method: "POST", body: { outage_id, usernames } }),
-  // The assignee answering yes. Any named account may call it (worker included);
-  // the server refuses anyone who isn't on the outage. Idempotent — `already`
-  // means this person had accepted before, which is not an error (the WhatsApp
-  // button and this one press the same thing).
   accept: (outage_id: number) =>
     request<{ ok: true; already: boolean; accepted_by: string[] }>(
       "/api/outages/accept", { method: "POST", body: { outage_id } }),
@@ -707,7 +542,6 @@ export const regionsApi = {
     request<{ ok: boolean; reason?: string }>("/api/regions/delete", { method: "POST", body: { org_id, name } }),
 }
 
-
 export const logsApi = {
   list: (org: string | null | undefined, limit = 100, before?: number) => {
     const params = new URLSearchParams()
@@ -729,15 +563,10 @@ export const usersApi = {
   changePassword: (body: { id?: number; current_password?: string; new_password: string }) =>
     request<{ ok: true }>("/api/users/password", { method: "POST", body }),
 
-  // Set/clear an account's WhatsApp page number (blank clears). Omit `id` to set
-  // your own — self-service, so a worker can add it too.
   setWhatsapp: (whatsapp_number: string, id?: number) =>
     request<{ ok: true; whatsapp_number: string | null }>(
       "/api/users/whatsapp", { method: "POST", body: { id, whatsapp_number } }),
 
-  // TOTP second factor (self-service, owner/superadmin). start → confirm turns it
-  // on and returns the one-time recovery codes; disable/regenerate need the
-  // password (regenerate also needs a live code).
   totpStart: () => request<{ secret: string; otpauth_uri: string }>(
     "/api/users/totp/start", { method: "POST", body: {} }),
   totpConfirm: (body: { password: string; code: string }) =>
@@ -750,20 +579,15 @@ export const usersApi = {
       "/api/users/totp/recovery", { method: "POST", body }),
 }
 
-// Worker location tracking. The INGEST is not here — that is the tracker app
-// POSTing to the public /field/track, with no cookie and no SPA involved.
 export const fieldApi = {
-  /** the caller's OWN shift (worker-readable) */
   shift: () => request<ShiftState>("/api/field/shift"),
   setShift: (action: "start" | "end") =>
     request<{ ok: true; on_shift: boolean; started_at?: string; already: boolean }>(
       "/api/field/shift", { method: "POST", body: { action } }),
 
-  /** where the crew is (owner-only) */
   workers: (org?: string | null) =>
     request<FieldWorkersResponse>(`/api/field/workers${tq(org)}`),
 
-  /** tracker credentials (owner-only). `issueToken` returns the plaintext ONCE. */
   tokens: (org?: string | null) =>
     request<FieldTokensResponse>(`/api/field/tokens${tq(org)}`),
   issueToken: (user_id: number, org_id?: string | null) =>

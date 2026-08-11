@@ -1,13 +1,3 @@
-"""Subscriber drops — the API half (the rules live in unit/test_drops).
-
-The map drew a subscriber straight to its OLT, which skips every splitter in
-between: an ISP hangs a customer off the nearest one, and there may be a second
-between that and the OLT. `onu_drops` records the last hop.
-
-What this file pins is the plumbing the rules ride on: identity (one sticker is
-one drop, however it was typed), the passive-only rule, org isolation, the
-bulk/detach contract, and that recording plant can never re-page anybody.
-"""
 import http.client
 import json
 import os
@@ -109,7 +99,6 @@ class DropsTest(unittest.TestCase):
                                     cookie=cookie or self._owner())
         return status, body
 
-    # --- the round trip ------------------------------------------------------
 
     def test_recording_drops_rolls_them_up_under_their_splitter(self):
         self._onu("AA:01", onu_id=1)
@@ -124,9 +113,6 @@ class DropsTest(unittest.TestCase):
         self.assertEqual(load["pon_ports"], ["EPON0/1"])
 
     def test_the_reply_states_how_many_subscribers_nobody_recorded(self):
-        # A thin plant record must not read as a complete one. The same instinct
-        # as the paging roster reporting its unassigned count rather than
-        # leaving it to be inferred from an absence.
         self._onu("AA:01", onu_id=1)
         self._onu("AA:02", onu_id=2)
         self._attach(["AA:01"], self.spl)
@@ -134,8 +120,6 @@ class DropsTest(unittest.TestCase):
         self.assertEqual((body["recorded"], body["unrecorded"]), (1, 1))
 
     def test_a_drop_is_keyed_on_identity_however_the_mac_was_typed(self):
-        # `_norm_mac` is trim + upper-case, applied at ONE place on the write
-        # path — or one sticker becomes two drops and a splitter over-counts.
         self._onu("AA:01", onu_id=1)
         self._attach([" aa:01 "], self.spl)
         _, body = self._drops()
@@ -143,7 +127,6 @@ class DropsTest(unittest.TestCase):
         self.assertEqual(body["splitters"][0]["recorded"], 1)
 
     def test_re_recording_MOVES_the_drop_rather_than_duplicating_it(self):
-        # A subscriber comes off exactly one box, so there is nothing to merge.
         self._onu("AA:01", onu_id=1)
         self._attach(["AA:01"], self.spl)
         self._attach(["AA:01"], self.spl2)
@@ -162,20 +145,14 @@ class DropsTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.store.list_onu_drops("ispA"), [])
 
-    # --- refusals ------------------------------------------------------------
 
     def test_a_drop_may_not_hang_off_powered_gear(self):
-        # A drop comes out of a splitter. Pointing one at a switch would put
-        # subscribers on a box that has an FSM and an outage of its own.
         self._onu("AA:01", onu_id=1)
         status, body, _ = self._attach(["AA:01"], self.olt)
-        # 422 — the InventoryError path every other validation refusal uses
         self.assertEqual(status, 422, body)
         self.assertIn("passive", body.get("error", "").lower())
 
     def test_a_worker_cannot_rewrite_the_plant_record(self):
-        # Recording plant is running the org, so it gates on write rights —
-        # the same line ack/triage sits on the other side of.
         self._onu("AA:01", onu_id=1)
         status, _, _ = self._attach(["AA:01"], self.spl,
                                     cookie=self._login("field", "fieldpassword"))
@@ -195,11 +172,8 @@ class DropsTest(unittest.TestCase):
                                   "org_id": "ispA"}, cookie=self._owner())
         self.assertEqual(status, 422)
 
-    # --- reads ---------------------------------------------------------------
 
     def test_the_per_splitter_list_and_the_rollup_agree(self):
-        # A drill-down that disagrees with the number it was opened from is
-        # worse than no drill-down.
         self._onu("AA:01", onu_id=1)
         self._onu("AA:02", onu_id=2, state="offline")
         self._attach(["AA:01", "AA:02"], self.spl)
@@ -213,8 +187,6 @@ class DropsTest(unittest.TestCase):
         self.assertEqual(body["load"]["dark"], load["dark"])
 
     def test_a_reference_point_reports_the_splitter_its_drop_comes_off(self):
-        # This is what lets the map draw the line to the splitter instead of
-        # straight to the OLT.
         self._onu("AA:01", onu_id=1)
         self._attach(["AA:01"], self.spl)
         self._req("POST", "/api/inventory/onu-place",
@@ -235,9 +207,6 @@ class DropsTest(unittest.TestCase):
         self.assertEqual(body["onus"][0]["drop_passive_id"], self.spl)
 
     def test_deleting_a_splitter_un_records_its_drops(self):
-        # The box is gone, so "which passive feeds this subscriber" genuinely
-        # has no answer — better than a dangling id, and the subscriber itself
-        # is untouched (it lives in the SNMP roster).
         self._onu("AA:01", onu_id=1)
         self._attach(["AA:01"], self.spl)
         self.assertTrue(self.store.delete_org_device("ispA", self.spl)["ok"])

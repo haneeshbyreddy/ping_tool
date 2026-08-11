@@ -280,10 +280,6 @@ class CentralPortMonitor:
     def _page(self, title: str, body: str, device_id: int, outage_id: int | None,
               payload: str, ts: str, *, enabled: bool | None = None) -> None:
         gate = self.cfg.snmp_alerts if enabled is None else enabled
-        # Port up/down AND bandwidth crossings are per-if_index; a device-level
-        # cooldown would swallow a second port dropping (or saturating) on the
-        # same switch. All are already streak- and transition-gated, so no
-        # cooldown — matters now that bandwidth PUSHes immediately, not via digest.
         self.router.emit(
             payload,
             title=title, body=body, priority=3, ts=ts, device_id=device_id,

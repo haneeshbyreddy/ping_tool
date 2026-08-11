@@ -18,10 +18,6 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 
-/** Superadmin-only billing control for one org: pick the plan, click months
- * paid/unpaid. Marking future months ahead IS the "no reminder" switch —
- * central pages the owner only when the paid runway drops under 3 days, and
- * locks the dashboard the moment a month starts unpaid. */
 export function BillingAdminDialog({ org, name }: { org: string; name: string | null }) {
   const [open, setOpen] = useState(false)
   const queryClient = useQueryClient()

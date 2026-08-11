@@ -1,15 +1,3 @@
-"""The plant record: splitters, the fibre graph, and a subscriber's drop route.
-
-  * splitters up to 1:16, and the 2:16 protection-input form;
-  * a multi-core cable on a link — fibre count and which strand a run uses;
-  * a traced route for a subscriber's drop.
-
-Grouped in one file because they are one session's answer to one question — "the
-map knows where our plant IS, but not what it is" — and because the sharpest
-rules cut across them: a strand may not outlive the cable it was bounded by, a
-route may not outlive the anchor it was drawn from, and a second input is a fact
-about hardware rather than about wiring.
-"""
 import http.client
 import json
 import os
@@ -25,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_TESTS_DIR), "src"))
 sys.path.insert(0, _TESTS_DIR)
 
 from wisp.config import Config
-from wisp.central import auth
+from wisp.central import auth, fiber, inventory
 from wisp.central.server import make_server
 from wisp.central.store import CentralStore
 
@@ -93,10 +81,6 @@ class _Base(unittest.TestCase):
             severity="ok", ts=_iso(self.now))
 
 
-# ---------------------------------------------------------------------------
-# 1. Splitters: 1:16, and the 2:16 protection-input form
-# ---------------------------------------------------------------------------
-
 class SplitInputsTest(_Base):
     def _save(self, **fields):
         body = {"id": self.spl, "name": "SPL-1", "ip_address": "",
@@ -118,17 +102,10 @@ class SplitInputsTest(_Base):
         self.assertEqual((row["split_ratio"], row["split_inputs"]), (16, 2))
 
     def test_one_input_is_stored_as_absence(self):
-        # The sparse-storage rule this schema follows everywhere: 1 is the
-        # default form of the object, so recording it explicitly must not write
-        # a row that differs from every splitter placed before the column
-        # existed.
         self.assertEqual(self._save(split_ratio=8, split_inputs=1)[0], 200)
         self.assertIsNone(self._row()["split_inputs"])
 
     def test_a_second_input_needs_a_ratio(self):
-        # "2:?" names no product anybody stocks. Refused rather than stored as
-        # half a fact — the same shape as a strand with no cable to be a strand
-        # of, one feature over.
         status, body, _ = self._save(split_ratio=None, split_inputs=2)
         self.assertEqual(status, 422, body)
 
@@ -140,11 +117,6 @@ class SplitInputsTest(_Base):
         self.assertIsNone(row["split_inputs"])
 
     def test_an_absent_key_reads_as_not_recorded_so_every_writer_must_carry_it(self):
-        # The documented trap this column inherits from `split_ratio` and
-        # `onu_pon_limit`: a caller that forgets the key silently downgrades the
-        # box on the next rename. Pinned so a NEW caller of update_org_device is
-        # a failing test rather than a support ticket about a 2:16 that keeps
-        # turning back into a 1:16.
         self._save(split_ratio=16, split_inputs=2)
         self.assertEqual(self._save(split_ratio=16, name="SPL-1-RENAMED")[0], 200)
         self.assertIsNone(self._row()["split_inputs"])
@@ -160,26 +132,8 @@ class SplitInputsTest(_Base):
         self.assertIsNone(row["split_inputs"])
 
 
-# ---------------------------------------------------------------------------
-# 2. The cable: a sheath segment between two fibre points
-# ---------------------------------------------------------------------------
-
 class CableRecordTest(_Base):
-    """A cable knows its own two ends, and everything else follows from that.
 
-    Rewritten three times, each time by the operators. First (2026-08-08) the
-    fibre count moved off the span onto a shared `org_cables` object, because a
-    count on a section cannot say four runs are the same drum. Then (2026-08-09)
-    membership moved off the topology link onto a `run`, so glass could be
-    recorded between boxes with no link at all. And now the run is gone too: the
-    ISPs described their plant as *fibre between two couplers, joined cable to
-    cable or taken out to a device on a single fibre*, so a cable has ENDS and
-    core N of it runs between them by definition.
-
-    The deletions are the win. There is no run to double-book, no tap to project
-    and no implicit continuity rule, which is why this file is shorter than the
-    one it replaces while covering more.
-    """
 
     def _cable(self, cookie, **body):
         body.setdefault("org_id", "ispA")
@@ -202,24 +156,18 @@ class CableRecordTest(_Base):
         self.assertEqual(cable["cores"], 12)
 
     def test_a_cable_needs_BOTH_ends_on_create(self):
-        # One end is not a weaker version of a cable, it is an unusable one.
         cookie = self._owner()
         st, data, _ = self._cable(cookie, name="Half", cores=12,
                                   a_device_id=self.olt)
         self.assertEqual(st, 422, data)
 
     def test_a_cable_may_not_run_from_a_point_back_to_itself(self):
-        # Both ends would land in one tray, so every core would offer to be
-        # spliced to itself and the feed walk would be asked which of two
-        # identical points feeds the other.
         cookie = self._owner()
         st, data, _ = self._cable(cookie, name="Loop", cores=12,
                                   a_device_id=self.olt, b_device_id=self.olt)
         self.assertEqual(st, 422, data)
 
     def test_a_RENAME_need_not_restate_the_ends(self):
-        # Editing the name is the commonest write this form takes; making it
-        # resend the geometry is how an end gets silently moved by a stale form.
         cookie = self._owner()
         _, made, _ = self._cable(cookie, name="Main St", cores=12,
                                  a_device_id=self.olt, b_device_id=self.spl)
@@ -230,8 +178,6 @@ class CableRecordTest(_Base):
         self.assertEqual(cable["a"]["device_id"], self.olt)
 
     def test_a_CUSTOMER_is_a_valid_end(self):
-        # The case the ISPs added: a core may carry anything, so the customer
-        # point is a coupler in its own right and a cable may end there.
         cookie = self._owner()
         self._onu("AA:BB:CC:00:00:01")
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:01", 17.0, 78.0,
@@ -251,16 +197,12 @@ class CableRecordTest(_Base):
         self.assertEqual(st, 422)
 
     def test_a_customer_nobody_has_a_record_of_is_a_404(self):
-        # A scrape can never add a subscriber and neither can this. A cable
-        # landing on a typo'd sticker would draw to a point with nothing behind
-        # it.
         cookie = self._owner()
         st, _, _ = self._cable(cookie, name="Ghost", cores=4,
                                a_device_id=self.spl, b_mac="DE:AD:BE:EF:00:01")
         self.assertEqual(st, 404)
 
     def test_an_end_in_ANOTHER_ORG_is_a_404(self):
-        # The one cross-org leak a body naming two ids could produce.
         cookie = self._owner()
         auth.create_user(self.store, "ispB", "other", "otherpassword", "owner")
         theirs = self.store.create_org_device("ispB", {
@@ -271,8 +213,6 @@ class CableRecordTest(_Base):
         self.assertEqual(st, 404)
 
     def test_shrinking_the_count_under_a_core_IN_USE_is_refused(self):
-        # A joint naming core 19 of a cable that is now a 12F would render with a
-        # tube and a colour, in full confidence, for a fibre that does not exist.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=24,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -285,8 +225,6 @@ class CableRecordTest(_Base):
         self.assertIn("19", data.get("error", ""))
 
     def test_clearing_the_count_clears_the_cores_with_it(self):
-        # A different statement from shrinking: "we no longer know what this
-        # sheath is" cannot leave strand numbers standing.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=24,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -298,9 +236,6 @@ class CableRecordTest(_Base):
         self.assertEqual(self._cables(cookie)[trunk["id"]]["plan"], {})
 
     def test_MOVING_an_end_discards_the_joints_made_at_the_old_one(self):
-        # A splice is a fact about a particular closure. Carrying it across would
-        # invent a splice nobody made — the same rule re-homing a drop keeps by
-        # discarding its traced route.
         cookie = self._owner()
         other = self.store.create_org_device("ispA", {
             "name": "SPL-2", "ip_address": "", "device_type": "splitter",
@@ -317,8 +252,6 @@ class CableRecordTest(_Base):
         self.assertEqual(self._cables(cookie)[trunk["id"]]["plan"], {})
 
     def test_re_saving_a_cable_UNCHANGED_keeps_its_joints(self):
-        # The guard is on the end actually changing, so the form can re-save
-        # idempotently — the shape `set_onu_drops` keeps.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=12,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -330,7 +263,6 @@ class CableRecordTest(_Base):
         self.assertEqual(self._cables(cookie)[trunk["id"]]["cores_recorded"], 1)
 
     def test_deleting_a_cable_takes_its_joints_and_its_core_register(self):
-        # A joint names two fibres and one of them has just stopped existing.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=12,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -349,9 +281,6 @@ class CableRecordTest(_Base):
         self.assertEqual(tray["joints"], [])
 
     def test_RECORDED_is_never_OCCUPIED(self):
-        # Three of twelve cores written down does not leave nine spare — nobody
-        # wrote them down. The reply carries no free/spare key at all, so no
-        # screen can start making that claim.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=12,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -361,9 +290,6 @@ class CableRecordTest(_Base):
             self.assertNotIn(key, cable)
 
     def test_a_LABEL_counts_as_recorded_too(self):
-        # Counting only joints printed "0 of 12 cores recorded" directly above a
-        # core plainly carrying a note — the count-agreement rule broken inside
-        # one card.
         cookie = self._owner()
         _, trunk, _ = self._cable(cookie, name="Trunk", cores=12,
                                   a_device_id=self.olt, b_device_id=self.spl)
@@ -381,18 +307,12 @@ class CableRecordTest(_Base):
         self.assertEqual(st, 403)
 
     def test_the_tray_is_owner_only_like_every_other_plant_READ(self):
-        # Matching `/api/inventory/cables` and `/api/inventory/drops`: a plant
-        # record is not one of the monitoring surfaces the worker shell renders.
-        # Widening it is a decision about the field role, not a side effect.
         cookie = self._login("field", "fieldpassword")
         st, _, _ = self._req(
             "GET", f"/api/inventory/fibre?org=ispA&device={self.spl}", None, cookie)
         self.assertEqual(st, 403)
 
     def test_recording_fibre_NEVER_reaches_the_engine(self):
-        # The standing that makes this whole surface safe to hand to an operator
-        # mid-survey. A cable is not a device: it cannot re-parent anything, and
-        # it cannot rebuild an engine or re-page a fleet.
         cookie = self._owner()
         before = self.store.org_device_topology("ispA")
         parents = self.store.org_device_parent_map("ispA")
@@ -405,9 +325,6 @@ class CableRecordTest(_Base):
         self.assertEqual(self.store.org_device_parent_map("ispA"), parents)
 
     def test_a_span_may_no_longer_carry_a_cable_and_is_TOLD_so(self):
-        # An SPA older than this central is a routine pairing — the bundle
-        # deploys live and central needs a restart — and a silent 200 would leave
-        # an operator watching a cable they think they recorded fail to appear.
         cookie = self._owner()
         st, data, _ = self._req("POST", "/api/inventory/link-style", {
             "child_id": self.spl, "parent_id": self.olt, "cable_id": 1}, cookie)
@@ -421,8 +338,6 @@ class CableRecordTest(_Base):
 
 
 class CableRouteTest(_Base):
-    """The cable's own drawn route, and the split that opens a coupler on it."""
-
     def _laid(self, cookie, path=None, cores=12):
         _, made, _ = self._req("POST", "/api/inventory/cable", {
             "org_id": "ispA", "name": "Main St", "cores": cores,
@@ -438,8 +353,6 @@ class CableRouteTest(_Base):
         return {c["id"]: c for c in data["cables"]}
 
     def test_a_traced_cable_reports_its_LENGTH_in_metres(self):
-        # Crews order drum by the metre, walked segment by segment — not the
-        # chord, which Mercator stretches with latitude.
         cookie = self._owner()
         cid = self._laid(cookie, [[17.0, 78.0], [17.0, 78.002], [17.001, 78.002]])
         self.assertAlmostEqual(self._cables(cookie)[cid]["length_m"], 323.7, places=0)
@@ -450,8 +363,6 @@ class CableRouteTest(_Base):
         self.assertIsNone(self._cables(cookie)[cid]["length_m"])
 
     def test_a_route_of_ONE_POINT_is_refused(self):
-        # A place, not a run. Storing it would make every reader fall back to a
-        # chord, which reads as "the trace did not save".
         cookie = self._owner()
         cid = self._laid(cookie)
         st, _, _ = self._req("POST", "/api/inventory/cable/path", {
@@ -459,7 +370,6 @@ class CableRouteTest(_Base):
         self.assertEqual(st, 422)
 
     def test_a_route_writes_GEOMETRY_AND_NOTHING_ELSE(self):
-        # A survey must not be able to quietly restate the record it surveys.
         cookie = self._owner()
         cid = self._laid(cookie)
         self._req("POST", "/api/inventory/cable/path", {
@@ -470,8 +380,6 @@ class CableRouteTest(_Base):
         self.assertEqual(cable["cores"], 12)
 
     def test_OPENING_A_COUPLER_splits_the_cable_and_splices_every_core_through(self):
-        # The gesture the segment model is built around: what the crew does, in
-        # one click, without disturbing anything already recorded at either end.
         cookie = self._owner()
         cid = self._laid(cookie, [[17.0, 78.0], [17.0, 78.002], [17.0, 78.004]])
         st, out, _ = self._req("POST", "/api/inventory/cable/split", {
@@ -481,13 +389,11 @@ class CableRouteTest(_Base):
         cables = self._cables(cookie)
         self.assertEqual(len(cables), 2)
         near, far = cables[out["cable_id"]], cables[out["new_cable_id"]]
-        # Both halves keep the drum's name; the ends tell them apart.
         self.assertEqual(near["name"], far["name"], "Main St")
         self.assertEqual(near["a"]["device_id"], self.olt)
-        self.assertEqual(near["b"]["device_id"], out["coupler_id"])
-        self.assertEqual(far["a"]["device_id"], out["coupler_id"])
+        self.assertEqual(near["b"]["device_id"], out["closure_id"])
+        self.assertEqual(far["a"]["device_id"], out["closure_id"])
         self.assertEqual(far["b"]["device_id"], self.spl)
-        # …and the glass still reaches end to end.
         st, trace, _ = self._req(
             "GET", f"/api/inventory/fibre/trace?org=ispA&cable={cid}&core=7",
             None, cookie)
@@ -496,10 +402,7 @@ class CableRouteTest(_Base):
         self.assertEqual([p["name"] for p in trace["points"]],
                          ["HILL-OLT-1", "JC-1", "SPL-1"])
 
-    def test_the_coupler_it_makes_is_a_PASSIVE_and_reaches_no_engine(self):
-        # It is the one write in the fibre half that touches org_devices, and it
-        # is safe for exactly one reason: passives are excluded from
-        # org_device_topology, and it is created with no parent.
+    def test_the_closure_it_makes_is_a_PASSIVE_and_reaches_no_engine(self):
         cookie = self._owner()
         cid = self._laid(cookie, [[17.0, 78.0], [17.0, 78.002], [17.0, 78.004]])
         before = self.store.org_device_topology("ispA")
@@ -508,13 +411,12 @@ class CableRouteTest(_Base):
         self.assertEqual(st, 200)
         self.assertEqual(self.store.org_device_topology("ispA"), before)
         made = [d for d in self.store.list_org_devices("ispA")
-                if d["id"] == out["coupler_id"]][0]
-        self.assertEqual(made["device_type"], "coupler")
+                if d["id"] == out["closure_id"]][0]
+        self.assertEqual(made["device_type"], "closure")
         self.assertIsNone(made["parent_device_id"])
         self.assertEqual((made["lat"], made["lng"]), (17.0, 78.002))
 
     def test_splitting_an_UNTRACED_cable_is_refused(self):
-        # There is no route to cut and no coordinate to stand the coupler on.
         cookie = self._owner()
         cid = self._laid(cookie)
         st, data, _ = self._req("POST", "/api/inventory/cable/split", {
@@ -530,8 +432,6 @@ class CableRouteTest(_Base):
         self.assertEqual(st, 422)
 
     def test_a_split_cable_with_NO_count_splices_nothing_and_says_so(self):
-        # Enumerating the cores of a sheath nobody has measured would invent the
-        # very fact this schema refuses to invent.
         cookie = self._owner()
         cid = self._laid(cookie, [[17.0, 78.0], [17.0, 78.002], [17.0, 78.004]],
                          cores=None)
@@ -541,8 +441,6 @@ class CableRouteTest(_Base):
         self.assertEqual(out["spliced"], 0)
 
     def test_a_split_carries_the_FAR_END_joints_onto_the_far_half(self):
-        # Those splices were made at that closure and belong to the half that
-        # still reaches it.
         cookie = self._owner()
         cid = self._laid(cookie, [[17.0, 78.0], [17.0, 78.002], [17.0, 78.004]])
         self._req("POST", "/api/inventory/fibre/joint", {
@@ -566,13 +464,11 @@ class CableRouteTest(_Base):
 
 
 class FibreJointTest(_Base):
-    """The tray: what is joined to what, and everything that may not be."""
-
     def setUp(self):
         super().setUp()
         self.cookie = self._owner()
         self.jc = self.store.create_org_device("ispA", {
-            "name": "JC-A", "ip_address": "", "device_type": "coupler",
+            "name": "JC-A", "ip_address": "", "device_type": "closure",
             "region": None, "parent_device_id": None})
         self.trunk = self._lay("Trunk", 12, self.olt, self.jc)
         self.branch = self._lay("Branch", 4, self.jc, self.spl)
@@ -602,8 +498,6 @@ class FibreJointTest(_Base):
         self.assertEqual(len(tray["joints"]), 1)
 
     def test_a_TERMINATION_needs_no_second_cable(self):
-        # The only way a core is attached to equipment, which is why connecting
-        # a device needs no route and no table of its own.
         st, out, _ = self._joint(device_id=self.spl, a_cable_id=self.branch,
                                  a_core_no=2)
         self.assertEqual(st, 200, out)
@@ -612,7 +506,6 @@ class FibreJointTest(_Base):
         self.assertEqual(tray["joints"][0]["b_cable_id"], None)
 
     def test_a_fibre_that_does_not_END_here_is_refused_BY_NAME(self):
-        # A bare 400 on a splice tray is indistinguishable from a broken button.
         st, out, _ = self._joint(device_id=self.olt, a_cable_id=self.branch,
                                  a_core_no=1)
         self.assertEqual(st, 200)
@@ -635,9 +528,6 @@ class FibreJointTest(_Base):
         self.assertIn("1 and 4", data.get("error", ""))
 
     def test_SPLICE_STRAIGHT_THROUGH_does_the_whole_tray_at_once(self):
-        # Nine closures in ten are exactly this, and doing it as N gestures is
-        # the difference between a record that gets written and one that does
-        # not. 1:1 runs to the SMALLER count — there is no honest core 13 of a 4F.
         st, out, _ = self._req("POST", "/api/inventory/fibre/through", {
             "device_id": self.jc, "a_cable_id": self.trunk,
             "b_cable_id": self.branch}, self.cookie)
@@ -646,8 +536,6 @@ class FibreJointTest(_Base):
         self.assertEqual(len(self._tray(self.jc)["joints"]), 4)
 
     def test_straight_through_SKIPS_what_is_already_joined_by_hand(self):
-        # Pressing it twice is safe, and pressing it after hand-work leaves the
-        # hand-work: the operator who deliberately crossed 3 to 1 keeps it.
         self._joint(device_id=self.jc, a_cable_id=self.trunk, a_core_no=3,
                     b_cable_id=self.branch, b_core_no=1)
         st, out, _ = self._req("POST", "/api/inventory/fibre/through", {
@@ -671,8 +559,6 @@ class FibreJointTest(_Base):
         self.assertEqual(self._tray(self.jc)["joints"], [])
 
     def test_a_CUSTOMER_POINT_has_a_tray_like_any_other(self):
-        # A lane of houses daisy-chained down one 4F: core 1 into this one, the
-        # rest passing onward. This is the case the ISPs added.
         self._onu("AA:BB:CC:00:00:01")
         self._onu("AA:BB:CC:00:00:02", onu_id=2)
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:01", 17.0, 78.0,
@@ -717,13 +603,11 @@ class FibreJointTest(_Base):
 
 
 class FibreTraceTest(_Base):
-    """End to end, across sheaths — the question a light source is asking."""
-
     def setUp(self):
         super().setUp()
         self.cookie = self._owner()
         self.jc = self.store.create_org_device("ispA", {
-            "name": "JC-A", "ip_address": "", "device_type": "coupler",
+            "name": "JC-A", "ip_address": "", "device_type": "closure",
             "region": None, "parent_device_id": None})
         self.trunk = self._lay("Trunk", 12, self.olt, self.jc)
         self.branch = self._lay("Branch", 4, self.jc, self.spl)
@@ -759,11 +643,6 @@ class FibreTraceTest(_Base):
                          ["HILL-OLT-1", "JC-A"])
 
     def test_a_FORK_CANNOT_BE_RECORDED_in_the_first_place(self):
-        # `fiber.trace` stops at a fork and names it — pinned in unit/test_fiber
-        # against a hand-built graph. Through the API the fork is unreachable,
-        # and that is the stronger statement: one fibre joins exactly one fibre,
-        # enforced on the WRITE so an operator finds out while looking at the
-        # tray rather than as a fault chip discovered later.
         second = self._lay("Branch 2", 4, self.jc, self.spl)
         st, out, _ = self._req("POST", "/api/inventory/fibre/joint", {
             "device_id": self.jc, "a_cable_id": self.trunk, "a_core_no": 1,
@@ -782,18 +661,11 @@ class FibreTraceTest(_Base):
         self.assertEqual(out["fault"], "missing")
 
     def test_the_PLANT_FEED_comes_from_the_glass_when_nothing_is_declared(self):
-        # A box can be recorded with no parent at all — placing one stopped
-        # asking what feeds it — so the chain has to be able to come from fibre.
-        # DECLARED still wins: SPL-1 keeps the parent somebody typed.
         feed = self.store.org_plant_feed_map("ispA")
         self.assertEqual(feed[self.jc], self.olt)
         self.assertEqual(feed[self.spl], self.olt)
 
     def test_a_feed_arriving_through_a_CUSTOMER_is_dropped_not_named(self):
-        # The walk follows a daisy chain correctly, but this map is device to
-        # device and there is no id to name a subscriber with. No feed is the
-        # honest answer, and it is what the map already says for anything
-        # unreached.
         self._onu("AA:BB:CC:00:00:01")
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:01", 17.0, 78.0,
                                  "RAMESH", None, witness=False)
@@ -808,10 +680,6 @@ class FibreTraceTest(_Base):
             "a_mac": "AA:BB:CC:00:00:01", "b_device_id": far}, self.cookie)
         self.assertIsNone(self.store.org_plant_feed_map("ispA").get(far))
 
-
-# ---------------------------------------------------------------------------
-# 3. The drop route: tracing the last hop
-# ---------------------------------------------------------------------------
 
 class DropRouteTest(_Base):
     MAC = "AA:BB:CC:00:00:01"
@@ -838,24 +706,15 @@ class DropRouteTest(_Base):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["points"], 2)
         self.assertEqual(self._stored()["waypoints"], [[17.1, 79.1], [17.2, 79.2]])
-        # Straightening is a real answer, not a failure: the drop goes back to
-        # the dotted chord and stops claiming to be surveyed.
         self.assertEqual(self._trace([])[0], 200)
         self.assertEqual(self._stored()["waypoints"], [])
 
     def test_a_drop_nobody_recorded_has_no_anchor_to_draw_from(self):
-        # 404 rather than a row invented on the spot. Without a recorded
-        # splitter the map draws to the OLT instead, and that line is an ADMITTED
-        # GUESS ("we only know the PON") — tracing it would promote the guess
-        # into surveyed geometry a crew orders drum against.
         self._onu(self.MAC)
         status, body, _ = self._trace([[17.1, 79.1]])
         self.assertEqual(status, 404, body)
 
     def test_re_homing_a_drop_discards_its_traced_route(self):
-        # THE SHARPEST RULE HERE. That path was walked to the box the customer
-        # no longer hangs off, so keeping it would leave a SOLID line — this
-        # map's word for "surveyed" — running to the wrong splitter.
         spl2 = self.store.create_org_device("ispA", {
             "name": "SPL-2", "ip_address": "", "device_type": "splitter",
             "region": None, "parent_device_id": self.olt,
@@ -868,9 +727,6 @@ class DropRouteTest(_Base):
         self.assertEqual(self._stored()["passive_id"], spl2)
 
     def test_re_saving_the_SAME_splitter_keeps_the_route(self):
-        # The other half, and the one a naive "clear on write" would break: the
-        # bulk dialog re-saves its whole set every time it is used, so an
-        # idempotent write must never destroy a traced drop.
         self._onu(self.MAC)
         self._attach(self.spl)
         self._trace([[17.1, 79.1]])
@@ -878,24 +734,14 @@ class DropRouteTest(_Base):
         self.assertEqual(self._stored()["waypoints"], [[17.1, 79.1]])
 
     def test_identity_is_norm_mac_case_insensitive_and_separator_EXACT(self):
-        # The route keys on `onuroster._norm_mac`, so case and surrounding space
-        # collapse...
         self._onu(self.MAC)
         self._attach(self.spl)
         self.assertEqual(self._trace([[17.1, 79.1]], mac=" aa:bb:cc:00:00:01 ")[0], 200)
         self.assertEqual(self._stored()["waypoints"], [[17.1, 79.1]])
-        # ...and SEPARATORS DO NOT. That is deliberate and load-bearing: identity
-        # here stays separator-exact because two OLTs reporting differently
-        # punctuated strings really are two different values, and collapsing them
-        # fabricates duplicate-MAC pages. `search_key` is the punctuation-blind
-        # form and is for SEARCH only — a route must never be keyed on it.
         self.assertEqual(self._trace([[1.0, 2.0]], mac="AABBCC000001")[0], 404)
         self.assertEqual(self._stored()["waypoints"], [[17.1, 79.1]])
 
     def test_the_map_reply_carries_the_traced_path(self):
-        # The geometry and the anchor come off ONE read of the table: fetching
-        # them apart is how a line gets drawn to a splitter its waypoints no
-        # longer lead to.
         self._onu(self.MAC)
         self._attach(self.spl)
         self.store.set_onu_place("ispA", self.MAC, 17.0, 79.0, None, None,
@@ -909,8 +755,6 @@ class DropRouteTest(_Base):
         self.assertEqual(place["drop_waypoints"], [[17.1, 79.1]])
 
     def test_an_untraced_drop_ships_an_empty_list_not_a_null(self):
-        # The map reads `drop_waypoints.length` to decide dotted vs solid; a
-        # null there would be a runtime error on the commonest row there is.
         self._onu(self.MAC)
         self._attach(self.spl)
         self.store.set_onu_place("ispA", self.MAC, 17.0, 79.0, None, None,
@@ -934,34 +778,21 @@ class DropRouteTest(_Base):
             "POST", "/api/inventory/drop-route",
             {"mac": self.MAC, "waypoints": [[17.1, 79.1]], "org_id": "ispA"},
             cookie=self._login("bowner", "bownerpassword"))
-        # ispB may not reach into ispA, and its own scope holds no such drop
         self.assertIn(status, (403, 404))
         self.assertEqual(self._stored()["waypoints"], [])
 
 
-
 class FibreTailTest(_Base):
-    """Taking ONE core out to a box that stands somewhere else.
-
-    The half of "take a core out to a device" that had no route through this
-    record at all. A strand may only be joined where its own sheath is opened —
-    correct physics — so a trunk core could never reach the OLT beside the
-    closure; and the single fibre that physically does reach it could not be laid
-    either, because 1 was not a fibre count. Between the two, the commonest tail
-    in an access network was unsayable.
-    """
 
     def setUp(self):
         super().setUp()
         self.cookie = self._owner()
         self.jc = self.store.create_org_device("ispA", {
-            "name": "JC-A", "ip_address": "", "device_type": "coupler",
+            "name": "JC-A", "ip_address": "", "device_type": "closure",
             "region": None, "parent_device_id": None})
         self.far = self.store.create_org_device("ispA", {
-            "name": "JC-B", "ip_address": "", "device_type": "coupler",
+            "name": "JC-B", "ip_address": "", "device_type": "closure",
             "region": None, "parent_device_id": None})
-        # A trunk that PASSES the closure: neither of its ends is the OLT, which
-        # is the whole situation this gesture exists for.
         _, made, _ = self._req("POST", "/api/inventory/cable", {
             "org_id": "ispA", "name": "Trunk", "cores": 12,
             "a_device_id": self.jc, "b_device_id": self.far}, self.cookie)
@@ -980,8 +811,6 @@ class FibreTailTest(_Base):
                                 a_core_no=7, to_device_id=self.olt)
         self.assertEqual(st, 200, out)
         self.assertTrue(out["ok"], out)
-        # …and the plain termination it replaces is still refused, which is why
-        # this route has to exist rather than the rule being loosened.
         _, direct, _ = self._req("POST", "/api/inventory/fibre/joint", {
             "device_id": self.olt, "a_cable_id": self.trunk, "a_core_no": 8,
             "b_cable_id": None}, self.cookie)
@@ -994,12 +823,8 @@ class FibreTailTest(_Base):
         self.assertEqual(tail["cores"], 1)
         self.assertEqual(tail["a"]["device_id"], self.jc)
         self.assertEqual(tail["b"]["device_id"], self.olt)
-        # UNTRACED on purpose: nobody surveys the metres from a closure to the
-        # rack beside it, and an empty path draws the dashed chord — this map's
-        # own word for "recorded, not walked". A length would be a measurement.
         self.assertEqual(tail["path"], [])
         self.assertIsNone(tail["length_m"])
-        # spliced here, landed there
         _, here, _ = self._req(
             f"GET", f"/api/inventory/fibre?org=ispA&device={self.jc}", None,
             self.cookie)
@@ -1017,20 +842,23 @@ class FibreTailTest(_Base):
             "GET", f"/api/inventory/fibre/trace?org=ispA&cable={self.trunk}&core=7",
             None, self.cookie)
         self.assertIsNone(tr["fault"])
-        self.assertEqual({h["cable_name"] for h in tr["hops"]},
-                         {"Trunk", "Trunk core 7 → HILL-OLT-1"})
+        self.assertEqual(sorted(h["cable_name"] for h in tr["hops"]), ["", "Trunk"])
         self.assertIn("HILL-OLT-1", [e and e["point"]["name"] for e in tr["ends"]])
 
-    def test_eight_tails_to_one_OLT_are_told_apart_by_their_core(self):
-        # An 8-PON OLT fed off one closure. Named for the two POINTS alone all
-        # eight are the same string, and the OLT's own picker offers eight
-        # identical rows — so the source core is in the name.
+    def test_eight_tails_to_one_OLT_are_all_PLUMBING_and_none_is_named(self):
         for core in range(1, 9):
             _, out, _ = self._tail(device_id=self.jc, a_cable_id=self.trunk,
                                    a_core_no=core, to_device_id=self.olt)
             self.assertTrue(out["ok"], out)
-        names = [c["name"] for c in self._cables() if c["cores"] == 1]
-        self.assertEqual(len(set(names)), 8, names)
+        tails = [c for c in self._cables() if c["cores"] == 1]
+        self.assertEqual(len(tails), 8)
+        self.assertEqual({c["name"] for c in tails}, {""})
+        _, at, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={self.jc}", None,
+            self.cookie)
+        self.assertEqual([c["name"] for c in at["cables"] if not c["plumbing"]],
+                         ["Trunk"])
+        self.assertEqual(sum(1 for c in at["cables"] if c["plumbing"]), 8)
 
     def test_a_fibre_already_spoken_for_is_refused_and_lays_NOTHING(self):
         self._tail(device_id=self.jc, a_cable_id=self.trunk, a_core_no=7,
@@ -1041,13 +869,9 @@ class FibreTailTest(_Base):
         self.assertEqual(st, 200)
         self.assertFalse(out["ok"])
         self.assertEqual(out["refused"], "taken")
-        # A refused tail that still laid its cable would leave a line on the map
-        # the operator would reasonably read as the connection having been made.
         self.assertEqual(len(self._cables()), before)
 
     def test_a_core_that_is_not_open_here_is_refused(self):
-        # The trunk does not end at the splitter, so nothing of it can be taken
-        # out there — the same physics the plain termination enforces.
         _, out, _ = self._tail(device_id=self.spl, a_cable_id=self.trunk,
                                a_core_no=3, to_device_id=self.olt)
         self.assertFalse(out["ok"])
@@ -1059,8 +883,6 @@ class FibreTailTest(_Base):
         self.assertEqual(st, 422, out)
 
     def test_a_box_that_is_gone_is_refused_rather_than_cabled_to(self):
-        # The far end is picked from a list the browser may have held for a
-        # while, so the box can be gone by the time the click lands.
         ghost = self.store.create_org_device("ispA", {
             "name": "GONE", "ip_address": "", "device_type": "closure",
             "region": None, "parent_device_id": None})
@@ -1096,16 +918,12 @@ class FibreTailTest(_Base):
                    to_device_id=sw)
         self.assertEqual(self.store.delete_org_device("ispA", sw)["ok"], True)
         self.assertEqual([c["name"] for c in self._cables()], ["Trunk"])
-        # and the splice it made at the closure goes with the cable, or the tray
-        # would show core 7 joined to a sheath that no longer exists
         _, here, _ = self._req(
             "GET", f"/api/inventory/fibre?org=ispA&device={self.jc}", None,
             self.cookie)
         self.assertEqual(here["joints"], [])
 
     def test_undoing_it_is_the_ordinary_clear(self):
-        # No special reverse gesture: the splice it made is a splice, so the
-        # tray's own clear undoes it like any other.
         self._tail(device_id=self.jc, a_cable_id=self.trunk, a_core_no=7,
                    to_device_id=self.olt)
         st, out, _ = self._req("POST", "/api/inventory/fibre/clear", {
@@ -1113,6 +931,490 @@ class FibreTailTest(_Base):
             self.cookie)
         self.assertEqual(st, 200)
         self.assertTrue(out["ok"])
+
+    def test_the_tail_lands_on_the_FAR_boxs_port(self):
+        st, out, _ = self._tail(device_id=self.jc, a_cable_id=self.trunk,
+                                a_core_no=7, to_device_id=self.olt,
+                                port_kind="pon", port_no=3)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+        _, at_olt, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={self.olt}", None,
+            self.cookie)
+        self.assertEqual(
+            [(j["port_kind"], j["port_no"]) for j in at_olt["joints"]],
+            [("pon", 3)])
+        _, at_jc, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={self.jc}", None,
+            self.cookie)
+        self.assertEqual([j["port_kind"] for j in at_jc["joints"]], [None])
+
+
+class PortTest(_Base):
+
+    def setUp(self):
+        super().setUp()
+        self.cookie = self._owner()
+        _, made, _ = self._req("POST", "/api/inventory/cable", {
+            "org_id": "ispA", "name": "Feeder", "cores": 12,
+            "a_device_id": self.olt, "b_device_id": self.spl}, self.cookie)
+        self.cable = made["id"]
+
+    def _join(self, **body):
+        return self._req("POST", "/api/inventory/fibre/joint", body, self.cookie)
+
+    def _at(self, device_id):
+        _, out, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={device_id}", None,
+            self.cookie)
+        return out
+
+    def test_a_fibre_lands_on_a_NAMED_port_and_the_box_reports_it(self):
+        st, out, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                                a_core_no=1, port_kind="pon", port_no=3)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(
+            [(j["port_kind"], j["port_no"]) for j in self._at(self.olt)["joints"]],
+            [("pon", 3)])
+
+    def test_an_OLT_lists_the_PONs_it_reports_and_a_recorded_one_never_vanishes(self):
+        self._onu("AAAA", pon="EPON0/1")
+        self._onu("BBBB", onu_id=2, pon="EPON0/2")
+        self._join(device_id=self.olt, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="pon", port_no=7)
+        self.assertEqual([p["label"] for p in self._at(self.olt)["ports"]],
+                         ["PON 1", "PON 2", "PON 7"])
+
+    def test_an_SNMP_SILENT_OLT_can_still_have_a_port_NAMED(self):
+        out = self._at(self.olt)
+        self.assertEqual(out["ports"], [])
+        self.assertEqual(out["port_add"], "pon")
+        st, made, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                                 a_core_no=1, port_kind="pon", port_no=6)
+        self.assertEqual(st, 200, made)
+        self.assertEqual([p["label"] for p in self._at(self.olt)["ports"]],
+                         ["PON 6"])
+
+    def test_a_box_whose_ports_are_ALREADY_ENUMERATED_offers_none_to_add(self):
+        self.assertIsNone(self._at(self.spl)["port_add"])
+        jc = self.store.create_org_device("ispA", {
+            "name": "JC-8", "ip_address": "", "device_type": "closure",
+            "region": None, "parent_device_id": None})
+        self.assertIsNone(self._at(jc)["port_add"])
+
+    def test_a_splitter_NOBODY_MEASURED_is_unbounded_and_does_get_the_row(self):
+        bare = self.store.create_org_device("ispA", {
+            "name": "SPL-?", "ip_address": "", "device_type": "splitter",
+            "region": None, "parent_device_id": None})
+        self.assertEqual(self._at(bare)["port_add"], "leg")
+
+    def test_a_splitter_lists_its_input_then_its_legs(self):
+        self.assertEqual([p["label"] for p in self._at(self.spl)["ports"]],
+                         ["input"] + [f"leg {n}" for n in range(1, 9)])
+
+    def test_AN_ENCLOSURE_HAS_NO_PORTS_and_keeps_its_splice_schedule(self):
+        jc = self.store.create_org_device("ispA", {
+            "name": "JC-9", "ip_address": "", "device_type": "closure",
+            "region": None, "parent_device_id": None})
+        self.assertEqual(self._at(jc)["ports"], [])
+
+    def test_ONE_port_takes_exactly_ONE_fibre(self):
+        self._join(device_id=self.olt, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="pon", port_no=3)
+        _, out, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                               a_core_no=2, port_kind="pon", port_no=3)
+        self.assertEqual(out["refused"], "port_taken")
+        self.assertIn("one fibre", out["reason"])
+
+    def test_a_port_on_a_SPLICE_is_refused_by_name(self):
+        _, other, _ = self._req("POST", "/api/inventory/cable", {
+            "org_id": "ispA", "name": "Onward", "cores": 12,
+            "a_device_id": self.olt, "b_device_id": self.spl}, self.cookie)
+        _, out, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                               a_core_no=1, b_cable_id=other["id"], b_core_no=1,
+                               port_kind="pon", port_no=3)
+        self.assertEqual(out["refused"], "port_splice")
+
+    def test_a_leg_past_the_split_is_refused_but_a_PON_is_never_bounded(self):
+        st, out, _ = self._join(device_id=self.spl, a_cable_id=self.cable,
+                                a_core_no=1, port_kind="leg", port_no=9)
+        self.assertEqual(st, 422, out)
+        st, out, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                                a_core_no=2, port_kind="pon", port_no=9)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+
+    def test_a_termination_with_NO_port_stays_ordinary(self):
+        st, out, _ = self._join(device_id=self.olt, a_cable_id=self.cable,
+                                a_core_no=1)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(self._at(self.olt)["joints"][0]["port_kind"], None)
+
+    def test_a_DROP_is_reported_on_its_LEG_and_an_unplaced_one_is_SAID(self):
+        self.store.set_onu_drops(
+            "ispA", ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"], self.spl)
+        with self.store._connect() as conn:
+            conn.execute("UPDATE onu_drops SET leg_no=2 WHERE mac=?",
+                         ("aa:bb:cc:dd:ee:01",))
+            conn.commit()
+        out = self._at(self.spl)
+        legs = {p["label"]: [d["mac"] for d in p["drops"]] for p in out["ports"]}
+        self.assertEqual(legs["leg 2"], ["aa:bb:cc:dd:ee:01"])
+        self.assertEqual(legs["leg 1"], [])
+        self.assertEqual([d["mac"] for d in out["unplaced_drops"]],
+                         ["aa:bb:cc:dd:ee:02"])
+
+    def test_the_PON_a_splitter_is_on_comes_from_the_GLASS(self):
+        self._join(device_id=self.olt, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="pon", port_no=3)
+        self._join(device_id=self.spl, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="in", port_no=1)
+        rows = {d["id"]: d for d in self.store.list_org_devices("ispA")}
+        self.assertEqual(rows[self.spl]["fibre_pon"],
+                         {"olt_id": self.olt, "pon_no": 3, "source": "fibre",
+                          "ambiguous": False})
+        self.assertEqual(rows[self.spl]["pon_port"], "EPON0/1")
+
+    def test_the_PON_is_INHERITED_down_the_plant_chain(self):
+        deep = self.store.create_org_device("ispA", {
+            "name": "SPL-2", "ip_address": "", "device_type": "splitter",
+            "region": None, "parent_device_id": self.spl, "split_ratio": 4})
+        self._join(device_id=self.olt, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="pon", port_no=5)
+        self._join(device_id=self.spl, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="in", port_no=1)
+        rows = {d["id"]: d for d in self.store.list_org_devices("ispA")}
+        self.assertEqual(rows[deep]["fibre_pon"]["pon_no"], 5)
+        self.assertEqual(rows[deep]["fibre_pon"]["source"], "inherited")
+
+
+    def _connect(self, **body):
+        return self._req("POST", "/api/inventory/fibre/connect",
+                         {"org_id": "ispA", **body}, self.cookie)
+
+    def test_ONE_call_lays_the_fibre_and_lands_it_at_BOTH_ends(self):
+        st, out, _ = self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                                   to_device_id=self.spl)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(
+            [(j["port_kind"], j["port_no"]) for j in self._at(self.olt)["joints"]],
+            [("pon", 2)])
+        self.assertEqual(
+            [(j["port_kind"], j["port_no"]) for j in self._at(self.spl)["joints"]],
+            [("in", 1)])
+        self.assertEqual(out["far_port"], "input")
+
+    def test_the_cable_it_writes_is_NEVER_NAMED(self):
+        self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                      to_device_id=self.spl)
+        self._connect(device_id=self.olt, port_kind="pon", port_no=3,
+                      to_device_id=self.spl)
+        _, out, _ = self._req("GET", "/api/inventory/cables?org=ispA", None, self.cookie)
+        made = [c["name"] for c in out["cables"] if c["cores"] == 1]
+        self.assertEqual(made, ["", ""])
+
+    def test_a_TWO_INPUT_splitter_is_ambiguous_so_nothing_is_claimed(self):
+        two = self.store.create_org_device("ispA", {
+            "name": "SPL-2IN", "ip_address": "", "device_type": "splitter",
+            "region": None, "parent_device_id": None,
+            "split_ratio": 16, "split_inputs": 2})
+        st, out, _ = self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                                   to_device_id=two)
+        self.assertEqual(st, 200, out)
+        self.assertIsNone(out["far_port"])
+        self.assertEqual([j["port_kind"] for j in self._at(two)["joints"]], [None])
+
+    def test_it_goes_through_the_SAME_refusals_as_the_long_way(self):
+        self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                      to_device_id=self.spl)
+        _, out, _ = self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                                  to_device_id=self.spl)
+        self.assertEqual(out["refused"], "port_taken")
+        st, _, _ = self._connect(device_id=self.olt, port_kind="pon", port_no=4,
+                                 to_device_id=self.olt)
+        self.assertEqual(st, 422)
+
+    def test_it_writes_ONLY_rows_the_long_way_could_have_written(self):
+        self._connect(device_id=self.olt, port_kind="pon", port_no=2,
+                      to_device_id=self.spl)
+        _, cables, _ = self._req("GET", "/api/inventory/cables?org=ispA", None, self.cookie)
+        cid = next(c["id"] for c in cables["cables"] if c["cores"] == 1)
+        _, tr, _ = self._req("GET", f"/api/inventory/fibre/trace?org=ispA&cable={cid}&core=1",
+                             None, self.cookie)
+        self.assertTrue(tr["ok"], tr)
+        self.assertEqual([p["name"] for p in tr["points"]], ["HILL-OLT-1", "SPL-1"])
+        st, out, _ = self._req("POST", "/api/inventory/fibre/clear", {
+            "device_id": self.olt, "cable_id": cid, "core_no": 1}, self.cookie)
+        self.assertEqual(st, 200)
+        self.assertTrue(out["ok"])
+
+    def test_a_customer_can_be_recorded_ON_A_LEG_without_wiping_the_others(self):
+        st, out, _ = self._req("POST", "/api/inventory/drops/set", {
+            "org_id": "ispA", "macs": ["aa:bb:cc:dd:ee:01"],
+            "passive_id": self.spl, "leg_no": 3}, self.cookie)
+        self.assertEqual(st, 200, out)
+        legs = {p["label"]: [d["mac"] for d in p["drops"]]
+                for p in self._at(self.spl)["ports"]}
+        self.assertEqual(legs["leg 3"], ["AA:BB:CC:DD:EE:01"])
+        self._req("POST", "/api/inventory/drops/set", {
+            "org_id": "ispA", "macs": ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"],
+            "passive_id": self.spl}, self.cookie)
+        legs = {p["label"]: [d["mac"] for d in p["drops"]]
+                for p in self._at(self.spl)["ports"]}
+        self.assertEqual(legs["leg 3"], ["AA:BB:CC:DD:EE:01"],
+                         "the bulk write wiped a leg it was never asked about")
+
+    def test_a_leg_past_the_split_is_refused_on_the_DROP_path_too(self):
+        st, _, _ = self._req("POST", "/api/inventory/drops/set", {
+            "org_id": "ispA", "macs": ["aa:bb:cc:dd:ee:01"],
+            "passive_id": self.spl, "leg_no": 99}, self.cookie)
+        self.assertEqual(st, 422)
+
+    def test_recording_a_PORT_NEVER_reaches_the_engine(self):
+        before = self.store.org_device_topology("ispA")
+        self._join(device_id=self.olt, a_cable_id=self.cable, a_core_no=1,
+                   port_kind="pon", port_no=3)
+        self.assertEqual(self.store.org_device_topology("ispA"), before)
+
+
+class TheRecordStartsFullTest(_Base):
+
+    def setUp(self):
+        super().setUp()
+        self.cookie = self._owner()
+
+    def _at(self, device_id):
+        _, out, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={device_id}", None,
+            self.cookie)
+        return out
+
+    def test_the_panel_OPENS_with_the_connection_already_declared(self):
+        out = self._at(self.olt)
+        self.assertEqual([u["far"]["name"] for u in out["undrawn"]], ["SPL-1"])
+        self.assertEqual(out["undrawn"][0]["relation"], "feeds")
+
+    def test_the_box_BELOW_sees_the_same_edge_as_its_feed(self):
+        out = self._at(self.spl)
+        self.assertEqual([(u["far"]["name"], u["relation"]) for u in out["undrawn"]],
+                         [("HILL-OLT-1", "fed by")])
+
+    def test_ONE_CALL_records_it_and_the_draft_row_goes(self):
+        st, out, _ = self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2}, self.cookie)
+        self.assertEqual(st, 200, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(self._at(self.olt)["undrawn"], [])
+
+    def test_the_cable_it_writes_is_PLUMBING_and_says_so(self):
+        self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2}, self.cookie)
+        [c] = self._at(self.olt)["cables"]
+        self.assertEqual(c["name"], "")
+        self.assertTrue(c["plumbing"])
+
+    def test_BOTH_PORTS_are_named_in_ONE_call(self):
+        st, out, _ = self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2,
+            "to_port_kind": "leg", "to_port_no": 5}, self.cookie)
+        self.assertEqual(st, 200, out)
+        ports = {j["port_kind"]: j["port_no"] for j in self._at(self.spl)["joints"]}
+        self.assertEqual(ports, {"leg": 5})
+
+    def test_a_far_port_PAST_THE_SPLIT_is_refused_like_a_near_one(self):
+        st, _, _ = self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2,
+            "to_port_kind": "leg", "to_port_no": 99}, self.cookie)
+        self.assertEqual(st, 422)
+
+    def test_a_far_port_is_OPTIONAL_and_falls_back_to_the_sole_input(self):
+        _, out, _ = self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2}, self.cookie)
+        self.assertEqual(out["far_port"], "input")
+
+    def test_the_DRAFT_IS_NEVER_A_CLAIM(self):
+        before = self.store.org_device_topology("ispA")
+        self._at(self.olt)
+        self._at(self.spl)
+        self.assertEqual(self.store.list_org_cables("ispA"), [])
+        self.assertEqual(self.store.org_device_topology("ispA"), before)
+
+    def test_CONFIRMING_one_never_reaches_the_engine_either(self):
+        before = self.store.org_device_topology("ispA")
+        self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.spl,
+            "port_kind": "pon", "port_no": 2}, self.cookie)
+        self.assertEqual(self.store.org_device_topology("ispA"), before)
+
+
+class EveryBoxHasPortsTest(_Base):
+
+    def setUp(self):
+        super().setUp()
+        self.cookie = self._owner()
+        self.sw = self.store.create_org_device("ispA", {
+            "name": "LAN-SW", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        ts = self.now.isoformat()
+        for idx, name in ((49153, "gigabitEthernet 1/0/1"),
+                          (49157, "gigabitEthernet 1/0/5"),
+                          (1, "Vlan-interface1")):
+            self.store.upsert_switch_port(
+                "ispA", self.sw, idx, name, None, "up", "up", None, 0, False,
+                None, ts)
+
+    def _at(self, device_id):
+        _, out, _ = self._req(
+            "GET", f"/api/inventory/fibre?org=ispA&device={device_id}", None,
+            self.cookie)
+        return out
+
+    def test_a_switch_offers_the_ports_it_WALKS(self):
+        out = self._at(self.sw)
+        self.assertEqual([p["label"] for p in out["ports"]], ["port 1", "port 5"],
+                         "a switch still has nowhere to land a fibre")
+
+    def test_the_number_is_the_one_on_the_METAL_not_the_ifIndex(self):
+        out = self._at(self.sw)
+        self.assertEqual([p["no"] for p in out["ports"]], [1, 5])
+
+    def test_the_box_s_OWN_NAME_rides_along_for_display(self):
+        out = self._at(self.sw)
+        self.assertEqual(out["ports"][1]["device_label"], "gigabitEthernet 1/0/5")
+
+    def test_a_VLAN_is_not_somewhere_to_land_a_fibre(self):
+        self.assertNotIn("Vlan-interface1",
+                         [p.get("device_label") for p in self._at(self.sw)["ports"]])
+
+    def test_a_port_can_be_NAMED_on_a_box_that_walks_nothing(self):
+        self.assertEqual(self._at(self.sw)["port_add"], "port")
+
+    def test_an_ENCLOSURE_still_has_none(self):
+        jc = self.store.create_org_device("ispA", {
+            "name": "JC-A", "ip_address": "", "device_type": "closure",
+            "region": None, "parent_device_id": None})
+        out = self._at(jc)
+        self.assertEqual(out["ports"], [])
+        self.assertIsNone(out["port_add"])
+
+    def test_a_fibre_LANDS_on_a_switch_port_and_the_switch_reports_it(self):
+        st, out, _ = self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.sw,
+            "port_kind": "pon", "port_no": 1,
+            "to_port_kind": "port", "to_port_no": 5}, self.cookie)
+        self.assertEqual(st, 200, out)
+        ports = {(j["port_kind"], j["port_no"]) for j in self._at(self.sw)["joints"]}
+        self.assertEqual(ports, {("port", 5)})
+
+    def test_a_port_NOBODY_WALKED_survives_on_the_list_that_offered_it(self):
+        self._req("POST", "/api/inventory/fibre/connect", {
+            "org_id": "ispA", "device_id": self.olt, "to_device_id": self.sw,
+            "port_kind": "pon", "port_no": 1,
+            "to_port_kind": "port", "to_port_no": 48}, self.cookie)
+        self.assertIn(48, [p["no"] for p in self._at(self.sw)["ports"]])
+
+
+class EveryBoxsPortsAreReadableTest(_Base):
+
+    def setUp(self):
+        super().setUp()
+        self.cookie = self._owner()
+        self.sw = self.store.create_org_device("ispA", {
+            "name": "LAN-SW", "ip_address": "10.0.0.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.jc = self.store.create_org_device("ispA", {
+            "name": "JC-A", "ip_address": "", "device_type": "closure",
+            "region": None, "parent_device_id": None})
+        ts = self.now.isoformat()
+        for did, rows in ((self.sw, ((49153, "gigabitEthernet 1/0/1"),
+                                     (49157, "gigabitEthernet 1/0/5"),
+                                     (1, "Vlan-interface1"))),
+                          (self.olt, ((1, "EPON0/1"), (2, "EPON0/2"),
+                                      (3, "GE0/9")))):
+            for idx, name in rows:
+                self.store.upsert_switch_port("ispA", did, idx, name, None, "up",
+                                              "up", None, 0, False, None, ts)
+
+    def _ports(self):
+        _, out, _ = self._req("GET", "/api/inventory/fibre/ports?org=ispA", None,
+                              self.cookie)
+        return out["ports"]
+
+    def test_it_answers_for_every_box_at_once(self):
+        p = self._ports()
+        self.assertEqual([x["label"] for x in p[str(self.olt)]], ["PON 1", "PON 2"])
+        self.assertEqual([x["label"] for x in p[str(self.sw)]], ["port 1", "port 5"])
+        self.assertEqual(p[str(self.spl)][0]["label"], "input")
+
+    def test_it_carries_the_box_s_OWN_NAME_for_a_numbered_port(self):
+        self.assertEqual(self._ports()[str(self.sw)][1]["device_label"],
+                         "gigabitEthernet 1/0/5")
+
+    def test_an_ENCLOSURE_is_absent_rather_than_empty(self):
+        self.assertNotIn(str(self.jc), self._ports())
+
+    def test_it_agrees_EXACTLY_with_the_panel_it_will_be_offered_beside(self):
+        for did in (self.olt, self.sw, self.spl):
+            _, panel, _ = self._req(
+                f"GET", f"/api/inventory/fibre?org=ispA&device={did}", None,
+                self.cookie)
+            self.assertEqual(
+                [(p["kind"], p["no"]) for p in panel["ports"]],
+                [(p["kind"], p["no"]) for p in self._ports().get(str(did), [])],
+                f"device {did}")
+
+    def test_a_VIRTUAL_interface_is_not_offered_here_either(self):
+        self.assertNotIn("Vlan-interface1",
+                         [x.get("device_label") for x in self._ports()[str(self.sw)]])
+
+    def test_it_is_ORG_SCOPED(self):
+        other = self.store.create_org_device("ispB", {
+            "name": "OTHER", "ip_address": "10.9.9.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.assertNotIn(str(other), self._ports())
+
+
+class CouplersAreClosuresTest(_Base):
+    def test_an_existing_coupler_row_is_renamed_on_open(self):
+        did = self.store.create_org_device("ispA", {
+            "name": "JC-legacy", "ip_address": "", "device_type": "closure",
+            "region": None, "parent_device_id": None})
+        with self.store._connect() as conn:
+            conn.execute("UPDATE org_devices SET device_type='coupler' WHERE id=?",
+                         (did,))
+            conn.commit()
+        reopened = CentralStore(self.cfg.central_db)
+        self.assertEqual(reopened.get_org_device("ispA", did)["device_type"],
+                         "closure")
+
+    def test_the_TYPE_stays_valid_so_a_straggler_can_never_become_gear(self):
+        self.assertIn("coupler", inventory.PASSIVE_TYPES)
+        self.assertIn("coupler", fiber.ENCLOSURE_TYPES)
+        self.assertEqual(fiber.port_slots("coupler", ports=[1, 2]), [])
+
+    def test_opening_a_cable_mid_span_stands_a_CLOSURE(self):
+        cookie = self._owner()
+        self.store.set_org_device_location("ispA", self.olt, 1.0, 1.0)
+        self.store.set_org_device_location("ispA", self.spl, 1.0, 1.4)
+        _, made, _ = self._req("POST", "/api/inventory/cable", {
+            "org_id": "ispA", "name": "Trunk", "cores": 12,
+            "a_device_id": self.olt, "b_device_id": self.spl,
+            "path": [[1.0, 1.0], [1.0, 1.2], [1.0, 1.4]]}, cookie)
+        _, out, _ = self._req("POST", "/api/inventory/cable/split", {
+            "org_id": "ispA", "cable_id": made["id"], "lat": 1.0, "lng": 1.2},
+            cookie)
+        self.assertTrue(out.get("ok"), out)
+        self.assertEqual(
+            self.store.get_org_device("ispA", out["closure_id"])["device_type"],
+            "closure")
 
 
 if __name__ == "__main__":

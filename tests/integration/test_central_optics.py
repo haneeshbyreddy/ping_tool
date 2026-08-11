@@ -49,7 +49,6 @@ class CentralOpticsTest(unittest.TestCase):
         return [s for s in self.notifier.sent]
 
     def _alert_kinds(self):
-        """Kinds of the alerts actually SENT (suppressed rows are logged too)."""
         with self.store._connect() as c:
             return [r["kind"] for r in c.execute(
                 "SELECT kind FROM alert_log WHERE status='sent' ORDER BY id")]
@@ -77,8 +76,6 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(self._pages(), [])
 
     def test_crit_recovers_state_but_does_not_page(self):
-        # Optical crit/recovery is OFF for now (allowlist): the OLT badge state
-        # still transitions crit → clear, but nothing pushes.
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
         self.assertEqual(self._pages(), [])
@@ -90,20 +87,16 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(badge["alarm"], 0)
 
     def test_optical_alerts_are_off_for_now(self):
-        # Optical crit/recovery was PUSH-tier; it's OFF for now (allowlist), so a
-        # flapping ONU writes state but produces no pages at all.
         mon = self._mon()
         t = "2026-01-01T00:0{}:00+00:00"
-        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(0))   # enter
-        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(1))   # leave
-        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(2))   # re-enter
-        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(3))   # leave
+        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(0))
+        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(1))
+        mon.sync_device(self.olt, [_onu("C", -27.1)], t.format(2))
+        mon.sync_device(self.olt, [_onu("C", -26.9)], t.format(3))
         self.assertEqual(self._pages(), [])
-        self.assertEqual(self._alert_kinds(), [])          # nothing 'sent'
+        self.assertEqual(self._alert_kinds(), [])
 
     def test_the_alert_log_carries_a_clean_kind(self):
-        # Even suppressed, the alert_log row must carry a clean kind (this path
-        # used to write kind=NULL, hiding optical alerts from by-type analytics).
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
         mon.sync_device(self.olt, [_onu("C", -20.0)], TS[1])
@@ -120,8 +113,6 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(self._rows()["C"]["severity"], "crit")
 
     def test_ack_clears_badge_alarm(self):
-        # Paging is off for optics, but an ack still clears the OLT badge alarm
-        # while the crit reading itself stays visible.
         mon = self._mon()
         mon.sync_device(self.olt, [_onu("C", -29.8)], TS[0])
         self.assertEqual(self._pages(), [])
@@ -159,22 +150,15 @@ class CentralOpticsTest(unittest.TestCase):
         self.assertEqual(row["onus_crit"], 1)
 
     def test_panel_roster_drops_deleted_onus(self):
-        # onu_optics never deletes removed-ONU rows, so the raw table keeps a
-        # zombie for a deleted ONU. The optical panel shows the CURRENT roster
-        # (freshest walk, stale-blind) — a PON with an ONU deleted between walks
-        # must count only the survivors, not "13/20" against a dead slot.
         mon = self._mon()
         mon.sync_device(self.olt, [
             _onu("A", -19.0, onu_id=1), _onu("B", -20.0, onu_id=2),
             _onu("C", -21.0, onu_id=3),
         ], TS[0])
-        # ONU B deleted from the OLT: the next walk simply omits it
         mon.sync_device(self.olt, [
             _onu("A", -19.0, onu_id=1), _onu("C", -21.0, onu_id=3),
         ], TS[1])
-        # the raw table still carries B's zombie row
         self.assertEqual(len(self.store.list_onu_optics(ORG, self.olt)), 3)
-        # what the panel renders: stale_s=None keeps a stale-but-live OLT visible
         panel = current_roster(self.store.list_onu_optics(ORG, self.olt),
                                datetime.now(timezone.utc), stale_s=None)
         self.assertEqual(sorted(r["onu_key"] for r in panel), ["A", "C"])
@@ -188,17 +172,7 @@ class CentralOpticsTest(unittest.TestCase):
 
 
 class DdmRailOnTheSnmpPathTest(unittest.TestCase):
-    """A railed DDM register must not reach the table as a reading.
 
-    The scrape path has refused these since HILL-OLT-1 (`weboptics._sane_optics`);
-    the SNMP path did not, and the Syrotech GPON fleet is what exposed it — that
-    firmware reports `0.00` across the whole DDM block for a dark ONU, so 114 of
-    badri_fiber's 378 ONUs stored 0.0 dBm and counted as MEASURED in `onus_rx`.
-
-    Its own fixture rather than a subclass of CentralOpticsTest: inheriting the
-    case would re-run all 12 of its tests under this name, which reads as
-    coverage that isn't there.
-    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -221,8 +195,6 @@ class DdmRailOnTheSnmpPathTest(unittest.TestCase):
         return {r["onu_key"]: r for r in self.store.list_onu_optics(ORG, self.olt)}
 
     def test_a_zero_rx_is_not_a_reading(self):
-        # 0.0 dBm received is physically impossible — the OLT emits ~+2..+5 dBm
-        # and every metre of fibre and every splitter only takes power away.
         self._mon().sync_device(self.olt, [_onu("A", 0.0, state="offline")], TS[0])
         self.assertIsNone(self._rows()["A"]["rx_dbm"])
 
@@ -231,7 +203,6 @@ class DdmRailOnTheSnmpPathTest(unittest.TestCase):
         self.assertIsNone(self._rows()["A"]["rx_dbm"])
 
     def test_a_real_reading_survives_including_a_bad_one(self):
-        # The guard rejects RAILS, never merely-bad optics: a crit must still page.
         self._mon().sync_device(self.olt, [
             _onu("A", -23.47), _onu("B", -29.8), _onu("C", -39.9),
         ], TS[0])
@@ -242,19 +213,14 @@ class DdmRailOnTheSnmpPathTest(unittest.TestCase):
         self.assertEqual(rows["B"]["severity"], "crit")
 
     def test_an_ONLINE_onu_on_the_rail_stops_grading_healthy(self):
-        # The false negative nobody goes looking for: 0.0 grades comfortably `ok`
-        # while the drop is actually unmeasured. One such ONU is live on Gpon_08.
         self._mon().sync_device(self.olt, [_onu("A", 0.0, state="online")], TS[0])
         row = self._rows()["A"]
         self.assertIsNone(row["rx_dbm"])
-        self.assertEqual(row["severity"], "ok")   # unmeasured, not healthy
-        # and it must not be counted as a measured drop
+        self.assertEqual(row["severity"], "ok")
         dev = {d["id"]: d for d in self.store.list_org_devices(ORG)}[self.olt]
         self.assertEqual(dev["onus_rx"], 0)
 
     def test_an_ordinary_launch_power_of_zero_dBm_is_kept(self):
-        # The Rx/Tx asymmetry is physics: an ONU TRANSMITS at roughly 0..+5 dBm,
-        # so 0.0 Tx is normal where 0.0 Rx is impossible.
         self._mon().sync_device(self.olt, [dict(_onu("A", -20.0), tx_dbm=0.0)], TS[0])
         self.assertEqual(self._rows()["A"]["tx_dbm"], 0.0)
 

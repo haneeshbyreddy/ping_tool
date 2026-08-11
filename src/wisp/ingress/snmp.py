@@ -130,44 +130,18 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
         ))
     return ports
 
-# GETBULK exception values (not data) that end a column mid-response.
 _END_OF_TABLE = frozenset({"EndOfMibView", "NoSuchObject", "NoSuchInstance"})
-# Each repetition carries one row of every active column, so 8 keeps a PDU near
-# ~80 varbinds instead of a jumbo response a cheap agent might truncate.
 _MAX_REPETITIONS = 8
-# 400 rounds x 8 repetitions = 3200 rows per column; the biggest fleet OLT has
-# ~333 interfaces. Past this the agent is looping, not answering.
 _MAX_ROUNDS = 400
 
-# The combined fast path gets only a SLICE of the port budget (min of this and a
-# third of the cap), so a big/weak OLT that can't serve it (EDGE_HALIYA "timeout"
-# mode) fails over to the per-column net with budget to spare — instead of the
-# combined walk eating the whole cap while the fallback never runs (the daemon's
-# outer port_walk_timeout_s wait_for wraps BOTH paths).
 _FAST_PATH_MAX_S = 15.0
-# Stop the walk this far before the cap so parse+return finish before the daemon's
-# outer wait_for would cancel us: a slow box then yields a partial-but-usable table
-# instead of a bare "timeout".
 _WALK_MARGIN_S = 0.25
-# A per-column walk that gets this many consecutive no-answers with nothing gathered
-# yet is talking to a dead agent — stop and let walk() re-raise so the daemon still
-# classifies it no_response. A merely-flaky agent (answers ANY column) keeps going and
-# skips only the columns it drops — that tolerance is the whole point.
 _DEAD_AGENT_GIVEUP = 3
-# How often a device pinned to a gentler strategy re-probes one rung faster, so a
-# firmware fix or a hardware swap recovers the efficient combined walk on its own —
-# no vendor hardcode, the poller relearns.
 _PROMOTE_INTERVAL_S = 6 * 3600.0
-# Per-column repetition counts down the ladder: the normal net, then a small-packet
-# net for agents that drop even a single-column GETBULK of 25 rows.
 _PERCOLUMN_REPETITIONS = 25
 _PERCOLUMN_SMALL_REPETITIONS = 4
-_MAX_LEVEL = 2  # 0 = combined, 1 = per-column/25, 2 = per-column/4
+_MAX_LEVEL = 2
 
-# Per-column walk order: interface STATUS first (admin/oper decide up/down, name/descr
-# label it), then speed, then byte counters — so a budget-bounded partial walk still
-# yields port up/down for as many interfaces as it reached. A permutation of
-# WALK_COLUMNS; parse_if_table is order-independent.
 _PERCOLUMN_ORDER = (
     OID_IF_ADMIN, OID_IF_OPER, OID_IF_NAME, OID_IF_DESCR, OID_IF_LASTCHANGE,
     OID_IF_HIGHSPEED, OID_IF_SPEED, OID_IF_ALIAS, OID_IF_HCIN, OID_IF_HCOUT,
@@ -177,20 +151,6 @@ def _oid_tuple(oid: str) -> tuple[int, ...]:
     return tuple(int(part) for part in oid.split("."))
 
 class MultiColumnWalk:
-    """Cursor state for walking N table columns in one multi-varbind GETBULK.
-
-    The ten ifTable/ifXTable columns share their ifIndex rows, so a combined
-    walk returns every column per round and cuts round-trips ~10x vs ten serial
-    walks. pysnmp's bulk_walk_cmd accepts exactly ONE varbind — passing the ten
-    columns positionally was the v0.15.3 fleet-wide stale-ports outage — so the
-    combined walk drives raw single-PDU bulk_cmd calls by hand: request() names
-    the next OID for each still-active column, feed() consumes the
-    repetition-major response (varbind i belongs to requested column i % N;
-    GETBULK truncates only at the tail, so the mapping survives short
-    responses). A column retires when it leaves its subtree, hits an exception
-    value, or returns a non-increasing OID (a buggy agent must stall out, not
-    spin forever). Pure — no I/O — so tests drive it with canned rows.
-    """
 
     def __init__(self, columns: Sequence[str]) -> None:
         self._root = {c: _oid_tuple(c) for c in columns}
@@ -206,11 +166,10 @@ class MultiColumnWalk:
         return [".".join(str(x) for x in self._cursor[c]) for c in self._active]
 
     def feed(self, rows: Sequence[tuple[str, str, str]]) -> None:
-        """rows = [(oid, value, value_class_name), ...] in response order."""
         cols = list(self._active)
         if not cols:
             return
-        if not rows:  # empty response with no error: the agent has nothing more
+        if not rows:
             self._active = []
             return
         finished: set[str] = set()
@@ -231,29 +190,12 @@ class MultiColumnWalk:
         self._active = [c for c in cols if c not in finished]
 
 class PysnmpPoller:
-    """Adaptive ifTable poller. Tries the efficient combined GETBULK first, then a
-    TOLERANT per-column net (health-style: skip a dropped column, never zero the
-    table), and remembers per device the gentlest strategy that last worked — so a
-    weak C-Data/DBC agent is never re-hammered with a walk it can't serve. It is
-    vendor-agnostic: weakness is discovered empirically and faster paths are re-probed
-    on a slow clock, so a firmware fix or a hardware swap self-heals. One SnmpEngine
-    per instance (reused across walks — the leak invariant); the daemon reuses one
-    poller, so the learned per-device levels persist across sweeps.
-
-    Strategy ladder, walked from the device's remembered level down until one yields
-    rows (see _combined_walk / _percolumn_walk):
-      0  combined 10-column GETBULK, hard-capped at _FAST_PATH_MAX_S
-      1  per-column bulk_walk, _PERCOLUMN_REPETITIONS rows/packet
-      2  per-column bulk_walk, _PERCOLUMN_SMALL_REPETITIONS rows/packet (weakest agents)
-    """
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self._timeout = cfg.snmp_request_timeout_s or cfg.snmp_timeout_s
         self._retries = max(1, cfg.snmp_request_retries)
         self._budget_s = cfg.port_walk_timeout_s
         self._engine = None
-        # device key -> gentlest strategy level that last SUCCEEDED, and when to next
-        # re-probe one rung faster. Persist across sweeps (one long-lived poller).
         self._device_level: dict[str, int] = {}
         self._promote_at: dict[str, float] = {}
 
@@ -261,7 +203,7 @@ class PysnmpPoller:
         level = self._device_level.get(key, 0)
         if level > 0 and now >= self._promote_at.get(key, 0.0):
             self._promote_at[key] = now + _PROMOTE_INTERVAL_S
-            level -= 1  # periodic re-probe of a faster strategy
+            level -= 1
         return level
 
     def _remember(self, key: str, level: int, now: float) -> None:
@@ -269,7 +211,7 @@ class PysnmpPoller:
         if level > 0:
             self._promote_at.setdefault(key, now + _PROMOTE_INTERVAL_S)
         else:
-            self._promote_at.pop(key, None)  # already fastest; nothing to re-probe
+            self._promote_at.pop(key, None)
 
     async def walk(self, target: SnmpTarget) -> list[PortStatus]:
         try:
@@ -291,16 +233,14 @@ class PysnmpPoller:
         now = loop.time()
         budget = self._budget_s
         if budget and budget > 0:
-            # Reserve a margin under the daemon's outer cap so we return before it
-            # cancels us; box the fast path to a slice so the net always gets airtime.
             hard_deadline: float | None = now + budget - _WALK_MARGIN_S
             fast_budget = min(_FAST_PATH_MAX_S, budget / 3.0)
         else:
-            hard_deadline = None                # no cap: per-column runs to completion
-            fast_budget = _FAST_PATH_MAX_S      # but still never let combined hang forever
+            hard_deadline = None
+            fast_budget = _FAST_PATH_MAX_S
 
         key = f"{target.ip}:{target.port}"
-        answered = False           # any strategy got the agent to respond at all
+        answered = False
         last_exc: Exception | None = None
 
         for level in range(self._start_level(key, now), _MAX_LEVEL + 1):
@@ -308,12 +248,12 @@ class PysnmpPoller:
                 ports = await self._combined_walk(
                     target, community, transport, fast_budget)
                 if ports is None:
-                    continue                    # combined failed -> drop to per-column
+                    continue
                 answered = True
                 if ports:
                     self._remember(key, 0, now)
                     return ports
-                continue                        # answered but empty; let per-column confirm
+                continue
             max_rep = (_PERCOLUMN_REPETITIONS if level == 1
                        else _PERCOLUMN_SMALL_REPETITIONS)
             varbinds, responded, exc = await self._percolumn_walk(
@@ -327,18 +267,11 @@ class PysnmpPoller:
                 return ports
 
         if answered:
-            return []                           # agent answered, no usable ifTable rows
-        # Nothing anywhere answered — re-raise so the daemon classifies it
-        # (no_response/error) rather than a silent "empty".
+            return []
         raise RuntimeError(
             f"SNMP walk of {target.ip} failed: {last_exc}") from last_exc
 
     async def _combined_walk(self, target, community, transport, fast_budget):
-        """Fast path: all ten columns in one multi-varbind GETBULK stream (see
-        MultiColumnWalk), hard-capped at fast_budget. Returns parsed rows, or None if
-        it failed/timed out and the caller should drop to the per-column net — any
-        failure is non-fatal (tooBig from a cheap agent, a stall-guard trip, API
-        drift, or the time box). pysnmp 7: multi-varbind ONLY via bulk_cmd."""
         from pysnmp.hlapi.asyncio import (
             ContextData, ObjectType, ObjectIdentity, bulk_cmd,
         )
@@ -372,14 +305,6 @@ class PysnmpPoller:
 
     async def _percolumn_walk(self, target, community, transport, max_rep,
                               hard_deadline):
-        """Per-column safety net, TOLERANT like the health walk: a dropped or erroring
-        column is skipped, never fatal. The brittle 'one dropped column zeroes the
-        whole ifTable' behavior is exactly why EDGE_HALIYA's small OLTs no_responsed
-        while their health walk — same box, same sweep — succeeded. Status columns
-        walk FIRST (see _PERCOLUMN_ORDER), so a budget-bounded partial still yields
-        port up/down. Returns (varbinds, responded, last_exc); `responded` separates
-        'answered but empty' from 'never answered' so walk() keeps the no_response
-        signal for a genuinely dead agent."""
         from pysnmp.hlapi.asyncio import (
             ContextData, ObjectType, ObjectIdentity, bulk_walk_cmd,
         )
@@ -408,7 +333,7 @@ class PysnmpPoller:
             if hard_deadline is not None:
                 remaining = hard_deadline - loop.time()
                 if remaining <= 0:
-                    break                       # out of budget; keep what we gathered
+                    break
             try:
                 col_binds = (await asyncio.wait_for(one_column(column), remaining)
                              if remaining is not None else await one_column(column))
@@ -418,7 +343,7 @@ class PysnmpPoller:
                 log.debug("ifTable column %s of %s skipped: %s",
                           column, target.ip, exc)
                 if not responded and consecutive_fail >= _DEAD_AGENT_GIVEUP:
-                    break                       # nothing answering — stop, let walk() re-raise
+                    break
                 continue
             responded = True
             consecutive_fail = 0

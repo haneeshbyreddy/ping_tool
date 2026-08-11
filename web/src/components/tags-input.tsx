@@ -3,10 +3,6 @@ import { X } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
 
-/* Chip-style editor for org_devices.tags (free-form, ≤8 per device, ≤32 chars
-   each — the server enforces the same). Enter/comma commits the typed tag;
-   Backspace on an empty input pops the last chip; suggestions are the tags
-   already in use across the caller's device list, filtered as you type. */
 export function TagsInput({ value, onChange, suggestions, placeholder }: {
   value: string[]
   onChange: (tags: string[]) => void
@@ -58,7 +54,6 @@ export function TagsInput({ value, onChange, suggestions, placeholder }: {
           placeholder={value.length === 0 ? (placeholder ?? "add tags…") : ""}
           className="h-6 min-w-24 flex-1 border-0 bg-transparent px-1 shadow-none focus-visible:ring-0 dark:bg-transparent"
           onChange={(e) => {
-            // a pasted/typed comma commits everything before it
             if (e.target.value.includes(",")) add(e.target.value)
             else setDraft(e.target.value)
           }}
@@ -75,7 +70,6 @@ export function TagsInput({ value, onChange, suggestions, placeholder }: {
           {offered.map((t) => (
             <button key={t} type="button"
               className="rounded-full border px-2 py-0.5 text-2xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              // mousedown beats the input's blur, which would commit the draft first
               onMouseDown={(e) => { e.preventDefault(); add(t) }}>
               {t}
             </button>

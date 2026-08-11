@@ -20,30 +20,14 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Skeleton } from "@/components/ui/skeleton"
 
-// The tiles on Home drill into the Network TREE, filtered to the devices behind
-// a number — which answers "which boxes", not "what is wrong". This page is the
-// other half: one row per problem, so the tile's count and the list's length are
-// the same number, and the whole thing exports as a PDF for a shift handover.
-
 const TONE: Record<IssueSeverity, Tone> = {
   critical: "destructive",
   warning: "warning",
   info: "muted",
 }
 
-// ONE grid template for the header strip and every row — declared once so an
-// unrelated edit can't drift them apart.
-//
-// Item and Detail are both FRACTIONAL, not one capped track and one greedy `1fr`.
-// Item carries the thing being looked up — a 17-character MAC plus its PON, in
-// mono — so a fixed 10rem cap truncated the identifier while Detail sat on
-// hundreds of unused pixels. Item leads slightly (mono runs wider per character)
-// and Detail takes the rest; at any width the two shrink together instead of one
-// starving.
 const COLS = "grid grid-cols-[0.5rem_7.5rem_minmax(0,1.15fr)_minmax(0,1.35fr)_5rem] items-center gap-3.5 px-4"
 
-/** `?kind=a,b` — the tiles link here with their own kind, and the chips keep the
- *  URL in step so a filtered list is shareable and survives a reload. */
 function parseKinds(raw: string | null): IssueKind[] {
   return (raw ?? "").split(",").map((k) => k.trim()).filter(Boolean) as IssueKind[]
 }
@@ -57,9 +41,6 @@ export function IssuesPage() {
 
   const kinds = useMemo(() => parseKinds(params.get("kind")), [params])
 
-  // Fetched UNFILTERED and narrowed in the browser: every chip's count comes
-  // from the same payload, so switching filters is instant and can never show a
-  // count that disagrees with the rows underneath it.
   const query = useQuery({
     queryKey: ["issues", scopeOrg],
     queryFn: () => issuesApi.list(scopeOrg),
@@ -82,18 +63,8 @@ export function IssuesPage() {
       i.detail.toLowerCase().includes(needle) ||
       (i.region ?? "").toLowerCase().includes(needle)))
 
-  // Only kinds that actually have rows get a chip: an org with no fiber should
-  // not be offered six empty optical filters.
   const chips = (query.data?.kinds ?? []).filter((k) => (counts[k] ?? 0) > 0)
 
-  // Picking a chip shows ONLY that kind — the chips are a single choice, like the
-  // Logs page's type filter, not an accumulating union. Clicking the active chip
-  // (or "All") clears back to everything.
-  //
-  // A FRESH URLSearchParams every time: mutating the instance `useSearchParams`
-  // handed us edits the router's own memoized object in place, so the value the
-  // render reads can move without the reference the memo is keyed on changing —
-  // which presents as a chip that highlights but never filters.
   const setKind = (kind: IssueKind | null) => {
     const next = new URLSearchParams(params)
     if (kind) next.set("kind", kind)
@@ -104,8 +75,6 @@ export function IssuesPage() {
   const exportAs = async (format: "pdf" | "xlsx") => {
     setDownloading(true)
     try {
-      // Server-rendered, and filtered by the chips you can see — what gets filed
-      // should be the list you were looking at.
       const { blob, filename } = await issuesApi.download(format, scopeOrg, kinds)
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
@@ -121,8 +90,6 @@ export function IssuesPage() {
     }
   }
 
-  // Counted over the VISIBLE rows, not the whole list: with a filter on, "23 of
-  // 92 open · 52 warning" describes two different sets in one sentence.
   const bySeverity = (s: IssueSeverity) => rows.filter((i) => i.severity === s).length
 
   return (
@@ -141,9 +108,6 @@ export function IssuesPage() {
           <Input value={search} onChange={(e) => setSearch(e.target.value)}
             placeholder="device, item, detail…" className="h-8 bg-muted pl-8 text-xs" />
         </div>
-        {/* One button, two formats: a PDF to file or hand over, a spreadsheet to
-            sort and filter. Both are server-rendered from the same rows and
-            honour the chips above, so neither can disagree with the screen. */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="outline" size="sm" className="gap-1.5"
@@ -175,15 +139,6 @@ export function IssuesPage() {
                 : "border-border bg-card text-muted-foreground hover:text-foreground")}>
             All {all.length}
           </button>
-          {/* The plane dot answers a question the counts never could: how much
-              of this list is ONE subsystem talking. Seven of the eleven issue
-              kinds are optical, so a fleet with a real spread of problems and
-              a fleet whose entire backlog is ONUs looked identical here — a row
-              of neutral chips with numbers on them. The dot makes that visible
-              before anything is clicked, and it costs no ink that was carrying
-              information. Reachability (device_down) has no plane by
-              construction and simply gets no dot: it is the alarm itself, not a
-              category of one. */}
           {chips.map((k) => {
             const plane = KIND_PLANE[k] ?? null
             return (
@@ -227,12 +182,6 @@ export function IssuesPage() {
         {groupIssues(rows).map((g) => (
           <div key={g.key}>
             <GroupHead g={g} />
-            {/* The chip appears when the KIND CHANGES, not on every row. Rows
-                come back severity-then-kind ordered, so a group reads as runs —
-                six Critical ONU, six Warning ONU, then the offline tail — and
-                naming each run once turns a column of identical chips into a
-                set of headings you can count down. A single-kind group states it
-                in the header instead and the column disappears entirely. */}
             {g.issues.map((i, idx) => (
               <Row key={`${i.kind}:${i.subject}:${idx}`} issue={i}
                 hideKind={!!g.oneKind || (idx > 0 && g.issues[idx - 1].kind === i.kind)} />
@@ -244,20 +193,6 @@ export function IssuesPage() {
   )
 }
 
-
-/** ONE ROW PER PROBLEM was the right call and stays — but 25 critical ONUs on
- *  one OLT is 25 problems and ONE JOB. Ungrouped, the device column repeated
- *  the same six OLT names down the page, the region repeated on every detail
- *  cell, and the kind chip repeated identically in a filtered view: three
- *  columns of constants around one varying number.
- *
- *  Grouping by DEVICE lifts all three into a header that says them once, and
- *  makes the shape of the backlog visible — "ANGPT-OLT: 6" and "HILL-OLT-1: 7"
- *  is a dispatch list, where sixty undifferentiated rows is not.
- *
- *  Order is preserved from the server, which already ranks by severity then
- *  kind — so the first group is the one with the worst thing in it, and rows
- *  inside a group keep the ranking the API chose. */
 type IssueGroup = {
   key: string
   device: string
@@ -266,7 +201,6 @@ type IssueGroup = {
   issues: Issue[]
   critical: number
   warning: number
-  /** every row in this group is the same kind — so the chip belongs up here */
   oneKind: string | null
 }
 
@@ -291,12 +225,6 @@ function groupIssues(rows: Issue[]): IssueGroup[] {
   return out
 }
 
-
-/** The aggregate header. Says the three constants ONCE — which box, where it is,
- *  and what kind of thing the rows below are — plus the counts, which is the
- *  fact the ungrouped list could never show: how much of the backlog is THIS
- *  box. The counts are the only toned thing here, and they are counts of a
- *  status, so they earn it. */
 function GroupHead({ g }: { g: IssueGroup }) {
   return (
     <div className="flex items-center gap-3 border-t border-border-subtle bg-muted px-4 py-1.5">
@@ -323,25 +251,10 @@ function GroupHead({ g }: { g: IssueGroup }) {
 
 function Row({ issue, hideKind }: { issue: Issue; hideKind?: boolean }) {
   const tone = TONE[issue.severity]
-  // No device cell: the group header above says which box these belong to, once,
-  // and links out. Repeating it per row is what made three of the five columns
-  // constants.
   return (
     <div className={cn(COLS, "h-10 wisp-row transition-colors hover:bg-foreground/5")}>
       <StatusDot tone={tone} />
       <span className="min-w-0">
-        {/* TWO FACTS, ONE EACH. The dot to the left is severity (Axis A); this
-            chip is what KIND of thing the row is about (Axis B). They used to
-            be the same fact twice — a toned StatusDot beside a toned Chip — and
-            since a filtered view repeats one kind down the whole list, the
-            result measured as 19 of 19 chromatic elements on this page being
-            the identical red "Critical ONU" badge. That is 100% of the screen's
-            colour spent on the value that never varies, and none on the Rx that
-            does.
-            An identity chip is NEUTRAL TEXT beside a coloured dot, so it sits at
-            the same structural weight as a status chip and still cannot be
-            mistaken for one. `device_down` has no plane by construction —
-            reachability IS the alarm — so it keeps a plain chip. */}
         {hideKind ? null : KIND_PLANE[issue.kind]
           ? <PlaneChip plane={KIND_PLANE[issue.kind]!} label={issue.kind_label} />
           : <Chip tone="muted">{issue.kind_label}</Chip>}
@@ -349,9 +262,6 @@ function Row({ issue, hideKind }: { issue: Issue; hideKind?: boolean }) {
       <span className="truncate font-mono text-xs text-muted-foreground" title={issue.subject}>
         {issue.subject}
       </span>
-      {/* The region is gone from here — it repeated on every row of a group and
-          now sits once in the group header. What is left is the only thing in
-          the row that VARIES, so it is also the only thing allowed a tone. */}
       <span className={cn("min-w-0 truncate text-xs",
         tone === "destructive" ? "text-destructive"
           : tone === "warning" ? "text-warning" : "text-muted-foreground")}

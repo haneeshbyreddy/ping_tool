@@ -1,8 +1,3 @@
-"""Org rows, role topics, server-wide settings, showcase/global stats.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-"""
 from __future__ import annotations
 
 from wisp.central.store_util import _now_iso
@@ -10,13 +5,6 @@ from wisp.central.store_util import _now_iso
 
 class OrgStoreMixin:
 
-    #: Org-scoped tables that are REFERENCED by another org-scoped table and so
-    #: cannot wait for their turn in `delete_org`'s alphabetical sweep. Both
-    #: entries point at `org_cables`, which sorts between them — `org_cable_cores`
-    #: happens to be safe today and is listed anyway, because relying on where a
-    #: table's NAME falls in the alphabet is not a rule anyone can maintain. The
-    #: list is the mechanism; the alternative is discovering the next one as a
-    #: bare IntegrityError on somebody's real delete.
     _DELETE_FIRST = ("org_fibre_joints", "org_cable_cores")
 
     def set_org(self, org_id: str, name: str | None = None,
@@ -38,11 +26,7 @@ class OrgStoreMixin:
 
 
     def org_colors(self, org_id: str, kind: str) -> dict[str, str]:
-        """Operator colour-coding for one kind ('tag' | 'node'), keyed by name.
 
-        Sparse by design: an uncoloured tag/probe simply has no row, so the
-        default costs nothing and clearing a colour is a DELETE, not a sentinel.
-        """
         with self._connect() as conn:
             return {r["key"]: r["color"] for r in conn.execute(
                 "SELECT key, color FROM org_colors WHERE org_id=? AND kind=?",
@@ -78,7 +62,6 @@ class OrgStoreMixin:
 
 
     def set_setting(self, key: str, value: str | None) -> None:
-        # None/"" deletes — an absent row IS the "not configured" state
         with self._write_lock, self._connect() as conn:
             if value:
                 conn.execute(
@@ -91,11 +74,6 @@ class OrgStoreMixin:
 
 
     def whatsapp_settings(self) -> dict:
-        """The superadmin's live WhatsApp config as a bare {suffix: value} dict
-        (keys `enabled`/`token`/`phone_id`/`template`/`lang`/`api_version`),
-        read fresh by WhatsAppNotifier on each send so a dashboard change applies
-        with no restart. Only present keys are returned — the notifier fills the
-        rest from the Config env-var fallbacks."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT key, value FROM app_settings WHERE key LIKE 'whatsapp_%'"
@@ -104,8 +82,6 @@ class OrgStoreMixin:
 
 
     def set_org_poll_interval(self, org_id: str, seconds: int | None) -> None:
-        # Not folded into set_org: its COALESCE pattern can't write NULL, and
-        # NULL ("automatic") is a legitimate target state here.
         with self._write_lock, self._connect() as conn:
             self._ensure_org(conn, org_id, _now_iso())
             conn.execute("UPDATE orgs SET poll_interval_s=? WHERE org_id=?",
@@ -134,8 +110,6 @@ class OrgStoreMixin:
                                (org_id,)).fetchone()
         return bool(row["auto_update"]) if row else False
 
-
-    # ----- paywall (central/billing.py owns the math) -----------------------
 
     def org_plan(self, org_id: str) -> str:
         with self._connect() as conn:
@@ -174,7 +148,6 @@ class OrgStoreMixin:
 
 
     def billing_orgs(self) -> list[dict]:
-        """Paid-plan orgs + their page targets — the billing sweeper's input."""
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
                 "SELECT org_id, name, plan, ntfy_topic, ntfy_topic_owner FROM orgs"
@@ -203,8 +176,6 @@ class OrgStoreMixin:
 
     def org_monitored_device_count(self, org_id: str,
                                    passive_types: tuple[str, ...] = ()) -> int:
-        """Active probed devices — passive plant (splitters/FDBs) never counts
-        toward the paywall device cap."""
         ph = ",".join("?" for _ in passive_types)
         extra = f" AND (device_type IS NULL OR device_type NOT IN ({ph}))" if ph else ""
         with self._connect() as conn:
@@ -244,7 +215,6 @@ class OrgStoreMixin:
                 " o.ntfy_topic_worker, o.map_region,"
                 " o.poll_interval_s, o.plan, o.web_proxy,"
                 " (SELECT COUNT(*) FROM nodes n WHERE n.org_id=o.org_id) AS node_count,"
-                # what a delete would take with it — the confirmation states it
                 " (SELECT COUNT(*) FROM org_devices d"
                 "   WHERE d.org_id=o.org_id AND d.is_active=1) AS device_count,"
                 " (SELECT COUNT(*) FROM users u WHERE u.org_id=o.org_id) AS user_count"
@@ -252,13 +222,7 @@ class OrgStoreMixin:
 
 
     def showcase_stats(self, limit: int = 40) -> dict:
-        """Public social-proof numbers for the marketing landing ticker.
 
-        `count` is orgs with at least one probe node (real deployments, not
-        empty/test orgs); `names` are the named subset (a customer opts out of
-        the scroll simply by leaving its display name blank), oldest first,
-        capped at `limit` so a huge fleet doesn't bloat the injected payload.
-        """
         with self._connect() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM orgs o"
@@ -279,7 +243,6 @@ class OrgStoreMixin:
 
 
     def org_summary(self, org_id: str) -> dict:
-        """What a delete would destroy — shown on the confirmation, never guessed."""
         with self._connect() as conn:
             def one(sql: str) -> int:
                 return conn.execute(sql, (org_id,)).fetchone()[0]
@@ -293,31 +256,8 @@ class OrgStoreMixin:
 
 
     def delete_org(self, org_id: str) -> dict:
-        """Erase an org and everything scoped to it. Irreversible.
 
-        The org-scoped tables are DISCOVERED (any table carrying an ``org_id``
-        column) rather than listed: this schema grows a table most months, and a
-        hardcoded list silently orphans rows in whatever was added last — an
-        org id is reusable, so those rows would surface inside a LATER org of
-        the same name. Rows with ``org_id IS NULL`` are global by construction
-        (superadmins in `users`, the built-in `snmp_profiles`/`gpon_profiles`)
-        and an equality match already spares them.
 
-        ORDER MATTERS: `_connect` runs with `PRAGMA foreign_keys=ON` and nearly
-        every FK in the schema points at ``org_devices(id)``, so the device table
-        goes LAST — sweeping it alphabetically (before `switch_ports`,
-        `snmp_walks`, …) leaves those rows dangling at statement end and SQLite
-        aborts the whole delete. Constraints stay IMMEDIATE rather than deferred
-        on purpose: a violation surviving this ordering means a row references
-        another org's device, which should fail loudly, not be swept away.
-
-        ``org_cables(id)`` is the referenced table this rule exists for, and the
-        alphabet does NOT satisfy it: `org_fibre_joints` sorts AFTER it, so a
-        plain alphabetical sweep would take the cables out from under live joint
-        rows and abort the whole delete. Hence `_DELETE_FIRST` — the explicit
-        head this docstring predicted would eventually be needed. A new
-        table that is REFERENCED by another org-scoped one belongs in it.
-        """
         deleted: dict[str, int] = {}
         with self._write_lock, self._connect() as conn:
             tables = [r[0] for r in conn.execute(

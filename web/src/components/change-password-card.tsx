@@ -8,10 +8,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
-/** Change your OWN password (no id = self). Self-service for every role — a
- *  worker reaches it from "Your account" too, which is the only password UI it
- *  has now that workers never open Settings. Extracted from settings-page so the
- *  personal "Your account" page and the org Settings page don't share a file. */
 export function ChangePasswordCard() {
   const [current, setCurrent] = useState("")
   const [next, setNext] = useState("")

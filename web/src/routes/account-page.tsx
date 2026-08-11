@@ -11,8 +11,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
-/** The account holder's identity, read-only. Names WHO you're signed in as, so
- *  the personal actions below have an unambiguous owner. */
 function ProfileCard() {
   const { user } = useAuth()
   if (!user) return null
@@ -37,8 +35,6 @@ function ProfileCard() {
   )
 }
 
-/** Your OWN WhatsApp page number (no id = self — self-service, so a worker can
- *  set it too). Re-reads from ["me"] on save so the value survives a refresh. */
 function MyWhatsappCard() {
   const { user } = useAuth()
   const queryClient = useQueryClient()
@@ -93,14 +89,8 @@ function MyWhatsappCard() {
   )
 }
 
-/** "You" — the personal third of the settings split (you / your org / the
- *  platform). Reachable by EVERY role, including a worker, from the account
- *  menu: it's the only password/2FA/WhatsApp surface a worker has, since
- *  workers never open the org Settings page. */
 export function AccountPage() {
   const { user } = useAuth()
-  // TOTP is owner/superadmin only (a worker's account can't enrol), so the card
-  // is hidden rather than shown-then-403 for the field team.
   const canTwoFactor = !!user && (user.is_superadmin || user.role === "owner")
 
   return (

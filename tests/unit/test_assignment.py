@@ -1,9 +1,3 @@
-"""The paging-responsibility rules, as pure math and against a live store.
-
-What these pin, in one sentence each: responsibility flows DOWN the tree, it
-UNIONS rather than overriding, an unassigned device still pages everybody, and a
-malformed parent chain can't hang a page.
-"""
 import os
 import sys
 import tempfile
@@ -19,45 +13,33 @@ from wisp.central.assignment import (PagingAudience, audience_for,
 from wisp.central.store import CentralStore
 
 
-# olt ─ splitter ─ onu, with a wan switch above the olt
 PARENTS = {1: None, 2: 1, 3: 2, 4: 3}
 
 
 class ScopeMathTest(unittest.TestCase):
 
     def test_responsibility_flows_down_the_tree(self):
-        # Assigned on the WAN switch (1) — responsible for everything below it,
-        # which is the whole point: one row covers a region.
         a = {1: {7}}
         for did in (1, 2, 3, 4):
             self.assertEqual(responsible_users(did, PARENTS, a), {7}, did)
 
     def test_it_does_not_flow_up(self):
-        # Assigned on the ONU (4): the switch above is somebody else's problem.
         a = {4: {7}}
         self.assertEqual(responsible_users(4, PARENTS, a), {7})
         for did in (1, 2, 3):
             self.assertEqual(responsible_users(did, PARENTS, a), set(), did)
 
     def test_inheritance_unions_and_never_overrides(self):
-        # THE invariant: naming a second worker on the OLT must not un-page the
-        # worker who owns the region head. Nearest-ancestor-wins would return
-        # {8} here and silently drop 7 off every page below the OLT.
         a = {1: {7}, 2: {8}}
         self.assertEqual(responsible_users(2, PARENTS, a), {7, 8})
         self.assertEqual(responsible_users(4, PARENTS, a), {7, 8})
 
     def test_unassigned_is_none_not_empty(self):
-        # None means "nobody is responsible, so page every worker" — the
-        # pre-feature behaviour. Collapsing it into set() would read as
-        # "page nobody", which is the one failure this must never introduce.
         self.assertIsNone(audience_for(3, PARENTS, {}))
         self.assertIsNone(audience_for(3, PARENTS, {4: {7}}))
         self.assertEqual(audience_for(3, PARENTS, {2: {7}}), {7})
 
     def test_a_cycle_terminates(self):
-        # Inventory validation rejects cycles on the way in, but a page is the
-        # last thing that may spin on a bad row.
         looped = {1: 2, 2: 1}
         self.assertEqual(responsible_users(1, looped, {2: {9}}), {9})
 
@@ -68,8 +50,6 @@ class ScopeMathTest(unittest.TestCase):
         self.assertEqual(scope_of(99, PARENTS, a), set())
 
     def test_scope_keeps_a_row_on_a_dead_device(self):
-        # The device was deactivated but the row survives; a count that dropped
-        # it would hide an assignment the operator can still see and clear.
         self.assertEqual(scope_of(7, PARENTS, {404: {7}}), {404})
 
 
@@ -116,12 +96,9 @@ class AudienceResolverTest(unittest.TestCase):
         self.assertEqual(len(self._numbers(self.olt)), 3)
 
     def test_a_deactivated_assignee_does_not_narrow_to_nobody(self):
-        # The row survives (so the operator can see it) but must not count as
-        # "somebody is responsible" — that would leave the device paging owners
-        # only, silently, because an account was switched off.
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
         self.store.set_user_active(self.w1, False)
-        self.assertEqual(len(self._numbers(self.olt)), 2)  # owner + w2
+        self.assertEqual(len(self._numbers(self.olt)), 2)
         self.assertIn("919000000003", self._numbers(self.olt))
 
     def test_org_level_alert_stays_org_wide(self):
@@ -129,9 +106,6 @@ class AudienceResolverTest(unittest.TestCase):
         self.assertEqual(len(self._numbers(None)), 3)
 
     def test_numberless_assignee_leaves_owners_only(self):
-        # Reported by the assign API as `unreachable`; the resolver does NOT
-        # widen back to the whole team, or an assignment would be undone by the
-        # assignee's own missing profile field.
         self.store.set_user_whatsapp(self.w1, None)
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
         self.assertEqual(self._numbers(self.olt), ["919000000001"])
@@ -182,8 +156,6 @@ class AssignmentStoreTest(unittest.TestCase):
         n = self.store.bulk_assign_devices("ispA", [self.d1, self.d2],
                                            [self.w1], "own")
         self.assertEqual(n, 2)
-        # w2 survives on d1 — a bulk hand-over must not strip an audience it was
-        # never asked about.
         self.assertEqual(self.store.device_assignment_map("ispA"),
                          {self.d1: {w2, self.w1}, self.d2: {self.w1}})
 

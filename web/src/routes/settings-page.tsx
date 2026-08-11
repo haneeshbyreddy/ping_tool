@@ -156,7 +156,6 @@ function RegionsCard({ org, canWrite }: { org: string; canWrite: boolean }) {
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["regions"] })
-    // a rename cascades onto device rows
     queryClient.invalidateQueries({ queryKey: ["inventory"] })
   }
   const add = useMutation({
@@ -291,9 +290,6 @@ function ResetPasswordDialog({ target }: { target: AccountUser }) {
   )
 }
 
-// Per-account WhatsApp page number, saved on blur/Enter. The account list is
-// where an owner sets these for the whole team (workers never reach Settings);
-// each person is then paged on their own number for their role's alerts.
 function WhatsappField({ u }: { u: AccountUser }) {
   const queryClient = useQueryClient()
   const [value, setValue] = useState(u.whatsapp_number || "")
@@ -434,34 +430,13 @@ function UsersCard({ org }: { org: string }) {
   )
 }
 
-/** What the page can show, in nav order.
- *
- *  Settings was ten cards in one scroll — every visit meant re-scanning the
- *  whole page to find the one field you came for, and the ordering had to serve
- *  both "most important" and "where things live" at once. Sections give each
- *  concern a stable address you can learn once and go straight to.
- *
- *  `visible` decides whether the section is offered AT ALL: a section that
- *  renders to nothing must never appear in the nav, or the page teaches you a
- *  destination and then shows you an empty room.
- */
 type SectionCtx = {
   org: string | null
   canWrite: boolean
   isSuperadmin: boolean
-  /** web-proxy capability grant for the scoped org (superadmin-set). The
-   *  Monitoring "Device web UI sessions" panel self-nulls without it, so both
-   *  that panel and its jump-index entry ride this flag — otherwise the index
-   *  would advertise an anchor that scrolls to nothing. */
   hasWebProxy: boolean
 }
 
-/** One card within a section. A section is a LIST of named panels rather than a
- *  single opaque `render`, which is what lets the page offer a per-sub-page "On
- *  this page" jump index: it can name a section's panels and scroll straight to
- *  one instead of the operator hunting down a tall column. `visible` defaults to
- *  shown — only a panel with its OWN extra gate beyond the section's (Web proxy)
- *  needs one. */
 type Panel = {
   id: string
   label: string
@@ -502,19 +477,8 @@ const SECTIONS: Array<{
     id: "monitoring",
     label: "Monitoring",
     icon: Radio,
-    // Vendor profiles: superadmin manages the global set, an org owner adds
-    // org-local ones. A superadmin with no org scoped still manages globals.
-    // The three profile cards render for exactly this predicate, so the section
-    // can't come up empty. (It once needed a `hasWebProxy` data probe to gate
-    // the whole section: a read-only OPERATOR saw nothing here but the proxy
-    // card, so a role-only predicate offered them a blank page. Roles collapsed
-    // to owner+worker on 2026-07-21 and workers never reach the shell — every
-    // visitor here now has canWrite. The probe is back, but ONLY to gate the
-    // proxy PANEL and its index entry, never the whole section.)
     visible: (c) => c.canWrite && (!!c.org || c.isSuperadmin),
     panels: [
-      // Self-nulls until the superadmin grants the org the capability, so both
-      // the card and its index entry ride the grant.
       {
         id: "web-proxy", label: "Device web UI sessions",
         visible: (c) => !!c.org && c.hasWebProxy,
@@ -522,9 +486,6 @@ const SECTIONS: Array<{
       },
       { id: "snmp-profiles", label: "SNMP health profiles", render: (c) => <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
       { id: "gpon-profiles", label: "GPON vendor profiles", render: (c) => <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
-      // The vendors whose per-ONU dBm exists only on the OLT's own web page.
-      // Central-side, so it rides the section predicate rather than the proxy
-      // grant — a recipe is worth writing before the capability is granted.
       { id: "web-optics", label: "Web-UI optics vendors", render: (c) => <WebOpticsCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
     ],
   },
@@ -532,35 +493,15 @@ const SECTIONS: Array<{
     id: "accounts",
     label: "Users",
     icon: Users,
-    // Org member accounts only. Personal password / 2FA / WhatsApp moved to the
-    // "Your account" page (routes/account-page.tsx), reachable by every role
-    // from the account menu — so a worker (who never opens Settings) can still
-    // change its own password.
     visible: (c) => !!c.org && c.canWrite,
     panels: [
       { id: "users", label: "Login accounts", render: (c) => <UsersCard org={c.org!} /> },
-      // Which devices each field account is PAGED for. It belongs beside the
-      // accounts rather than under Monitoring because the thing being configured
-      // is a person's beat, not a probe setting — and since the roles collapsed,
-      // "who works here" IS "who has a login".
       { id: "assignments", label: "Device responsibility", render: (c) => <AssignmentCard org={c.org!} /> },
-      // Provisioning a worker's PHONE with the tracker app. Same section as the
-      // accounts and the paging assignments for the same reason: the thing being
-      // configured is a person, not a probe — and the credential it issues is
-      // per-login-account, so the list this panel works from is exactly the list
-      // directly above it.
       { id: "tracking", label: "Location tracking", render: (c) => <FieldTrackingCard org={c.org!} /> },
     ],
   },
 ]
 
-// The Settings nav order is EXPLICIT, not the array's incidental authoring
-// order: Organization first (the section every role lands on), then plan &
-// billing, monitoring and users. Settings is org-scoped for everyone now — the
-// superadmin's server-wide config moved to its own /platform page — so there is
-// no longer a platform-wide section to sort ahead of the org's own. An id
-// missing from this list sorts last, so adding a section is never silently
-// promoted to the front.
 const SECTION_ORDER = ["organization", "billing", "monitoring", "accounts"]
 const sectionRank = (id: string) => {
   const i = SECTION_ORDER.indexOf(id)
@@ -573,11 +514,6 @@ export function SettingsPage() {
   const { section } = useParams()
   const navigate = useNavigate()
 
-  // web_proxy grant for the scoped org — drives whether the Monitoring "Device
-  // web UI sessions" panel renders (the card self-nulls without it), so the jump
-  // index can gate its entry on the same flag. Same ["orgs", org] query
-  // OrgSettingsCard/WebProxyCard already fetch, so it's a cache hit; gated on
-  // canWrite so a worker's brief hand-typed-URL render doesn't fire a 403.
   const { data: orgsData } = useQuery({
     queryKey: ["orgs", scopeOrg],
     queryFn: () => orgsApi.list(scopeOrg),
@@ -585,8 +521,6 @@ export function SettingsPage() {
   })
   const hasWebProxy = !!orgsData?.orgs.find((o) => o.org_id === scopeOrg)?.web_proxy
 
-  // Settings is owner/superadmin-only. A read-only worker gets no nav entry to
-  // it, so this only catches a hand-typed URL — send them Home.
   if (user && !isSuperadmin && user.role === "worker") {
     return <Navigate to="/" replace />
   }
@@ -595,12 +529,6 @@ export function SettingsPage() {
   const shown = SECTIONS
     .filter((s) => s.visible(ctx))
     .sort((a, b) => sectionRank(a.id) - sectionRank(b.id))
-  // Land on an EXPLICIT home section, never shown[0] (an owner used to sort onto
-  // billing). Settings is org-scoped for every role now — the superadmin's
-  // server-wide config moved to its own /platform page — so both a superadmin
-  // and an owner land on Organization. Falls through to the first shown section
-  // only if that landing isn't visible in this context (e.g. a superadmin at
-  // "All orgs" with no org scoped, who sees only global Monitoring).
   const landingId = "organization"
   const active =
     shown.find((s) => s.id === section) ??
@@ -617,17 +545,12 @@ export function SettingsPage() {
   }
   if (!active) return null
 
-  // The panels this section actually renders in this context — drives both the
-  // cards below and the "On this page" jump index (so the two never disagree).
   const panels = active.panels.filter((p) => (p.visible ? p.visible(ctx) : true))
 
   return (
     <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
 
-      {/* Two-column on desktop, a scrollable rail of chips on mobile — the same
-          section list either way, so the mental model doesn't change with the
-          viewport. */}
       <div className="flex flex-col gap-4 md:grid md:grid-cols-[11rem_minmax(0,1fr)] md:items-start md:gap-6">
         <nav className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 md:sticky md:top-4 md:mx-0 md:flex-col md:overflow-visible md:px-0 md:pb-0">
           {shown.map((s) => {
@@ -652,10 +575,6 @@ export function SettingsPage() {
         </nav>
 
         <div className="flex min-w-0 flex-col gap-4">
-          {/* "On this page" jump index — only worth drawing when a section has
-              more than one panel to jump between; on a single card it's noise.
-              A plain scrollIntoView (not an href="#…" anchor, which HashRouter
-              would hijack) so the router stays out of it. */}
           {panels.length > 1 && (
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
               <span className="text-2xs font-medium tracking-wide text-faint-foreground uppercase">

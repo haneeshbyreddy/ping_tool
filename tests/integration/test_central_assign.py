@@ -1,13 +1,3 @@
-"""Device→worker paging responsibility, end to end.
-
-Two halves: the HTTP surface (owner-only, org-pinned, bulk vs replace) and the
-paging shells actually narrowing — a device page, a port page and a probe page,
-each through the real object that sends it. The rules themselves are pinned as
-pure math in `unit/test_assignment`.
-
-The property every test here defends: assignment may narrow a page, but it must
-never be the reason nobody was told.
-"""
 import http.client
 import json
 import os
@@ -41,10 +31,6 @@ KIRAN = "919000000002"
 
 
 class _Base(unittest.TestCase):
-    """One org, one owner, two field accounts, and a two-level tree:
-
-        WAN-SW  ─  PYLON-OLT  ─  SPLITTER
-    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -84,15 +70,12 @@ class DevicePagingTest(_Base):
         self.engine = central_engine.build_engine(self.store, "ispA", self.cfg)
 
     def _page_down(self, device_id):
-        # A fresh dispatcher per page: one is built per report cycle in
-        # api/edge.py, and the audience resolver caches for exactly that long.
         disp = CentralAlertDispatcher(self.store, "ispA", self.engine,
                                       self.notifier, self.cfg)
         self.store.open_outage_if_absent("ispA", device_id, T0, DOWN)
         disp.dispatch([OutageOpened(device_id, DOWN)], T0)
 
     def test_unassigned_device_still_pages_the_whole_team(self):
-        # The pre-feature behaviour, and the reason switching this on is safe.
         self._page_down(self.olt)
         self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
 
@@ -103,8 +86,6 @@ class DevicePagingTest(_Base):
         self.assertEqual(self._paged(), [RAVI, OWNER])
 
     def test_responsibility_is_inherited_by_the_subtree(self):
-        # Assigned on the WAN switch; the OLT below it pages the same people —
-        # one row covers a region.
         self.store.set_device_assignees("ispA", self.wan, [self._uid("kiran")],
                                         "owner")
         self._page_down(self.olt)
@@ -119,8 +100,6 @@ class DevicePagingTest(_Base):
         self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
 
     def test_the_alert_log_records_the_narrowed_audience(self):
-        # Not the org's full roster: the log is how an operator answers "who was
-        # actually told about this outage".
         self.store.set_device_assignees("ispA", self.olt, [self._uid("ravi")],
                                         "owner")
         self._page_down(self.olt)
@@ -141,9 +120,6 @@ class DevicePagingTest(_Base):
 
 
 class PortPagingTest(_Base):
-    """PORT_DOWN is the other kind that pages today, and it routes through the
-    notification governor rather than dispatch.py — so it needs its own proof."""
-
     def _sync(self, oper_status):
         mon = CentralPortMonitor(self.store, "ispA", self.notifier, self.cfg)
         for _ in range(self.cfg.snmp_down_consecutive):
@@ -175,8 +151,6 @@ class PortPagingTest(_Base):
 
 
 class ProbePagingTest(_Base):
-    """A probe is not a device, so its audience comes from what it carries."""
-
     def _check(self):
         wd = CentralWatchdog(self.store, self.cfg, self.notifier)
         stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
@@ -193,8 +167,6 @@ class ProbePagingTest(_Base):
         self.assertEqual(self._paged(), [RAVI, OWNER])
 
     def test_probe_down_with_nothing_assigned_behind_it_stays_org_wide(self):
-        # A dark probe blinds a whole slice of the fleet — the last alarm to
-        # narrow on a guess.
         self._check()
         self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
 
@@ -243,7 +215,6 @@ class AssignApiTest(_Base):
         conn.close()
         return cookie.split(";")[0] if cookie else None
 
-    # --- reads ---------------------------------------------------------------
 
     def test_the_roster_carries_counts_and_reachability_but_no_numbers(self):
         self.store.set_device_assignees("ispA", self.wan, [self._uid("ravi")],
@@ -252,9 +223,6 @@ class AssignApiTest(_Base):
                                  cookie=self._login())
         self.assertEqual(status, 200)
         ravi = next(a for a in body["accounts"] if a["username"] == "ravi")
-        # One row ticked, two devices covered (the switch and the OLT under it) —
-        # the screen has to be able to say both or a region assignment looks like
-        # it did nothing.
         self.assertEqual(ravi["assigned"], 1)
         self.assertEqual(ravi["devices"], 2)
         self.assertTrue(ravi["has_whatsapp"])
@@ -267,12 +235,10 @@ class AssignApiTest(_Base):
         self.assertEqual(body["unassigned"], 2)
 
     def test_a_worker_cannot_read_the_roster(self):
-        # It enumerates accounts, like /api/users.
         status, _ = self._req("GET", "/api/inventory/assignments",
                               cookie=self._login("ravi", "ravipassword"))
         self.assertEqual(status, 403)
 
-    # --- writes --------------------------------------------------------------
 
     def test_owner_sets_and_clears_a_device_assignment(self):
         cookie = self._login()
@@ -281,8 +247,6 @@ class AssignApiTest(_Base):
         self.assertEqual(status, 200)
         self.assertEqual(self.store.device_assignment_map("ispA"),
                          {self.olt: {self._uid("ravi")}})
-        # An empty list is a real state here — "back to paging every worker" —
-        # unlike outage assignment, where it is refused.
         status, _ = self._req("POST", "/api/inventory/assign", {
             "device_id": self.olt, "user_ids": []}, cookie)
         self.assertEqual(status, 200)
@@ -295,7 +259,6 @@ class AssignApiTest(_Base):
             self._login())
         self.assertEqual(status, 200)
         self.assertEqual(body["unreachable"], ["nonum"])
-        # Stored anyway: an operator fixes the number, they don't re-do the work.
         self.assertEqual(self.store.device_assignment_map("ispA"),
                          {self.olt: {self._uid("nonum")}})
 
@@ -332,8 +295,6 @@ class AssignApiTest(_Base):
         self.assertEqual(self.store.device_assignment_map("ispA"), {})
 
     def test_another_orgs_device_is_refused(self):
-        # org comes from the device's own row, so this fails _can_write rather
-        # than being written into ispB.
         status, _ = self._req("POST", "/api/inventory/assign", {
             "device_id": self.other, "user_ids": [self._uid("ravi")]},
             self._login())
@@ -341,7 +302,6 @@ class AssignApiTest(_Base):
         self.assertEqual(self.store.device_assignment_map("ispB"), {})
 
     def test_an_account_from_another_org_is_refused_loudly(self):
-        # Silently dropping it would show a saved assignment that isn't there.
         bowner = self._uid("bowner", "ispB")
         status, _ = self._req("POST", "/api/inventory/assign", {
             "device_id": self.olt, "user_ids": [bowner]}, self._login())
@@ -362,16 +322,10 @@ class AssignApiTest(_Base):
         status, body = self._req("GET", "/api/inventory?org=ispA", cookie=cookie)
         rows = {d["id"]: d for d in body["devices"]}
         self.assertEqual(rows[self.olt]["assignee_ids"], [self._uid("ravi")])
-        # EXPLICIT rows only — the child does not claim the parent's assignment;
-        # the reader derives inheritance from the tree it already has.
         self.assertEqual(rows[self.wan]["assignee_ids"], [])
 
 
 class VisibilityTest(_Base):
-    """Assignment is a paging rule and NOTHING else: it must not change what any
-    session can read (operator choice 2026-07-26). If a future change starts
-    filtering a view by assignment, this fails."""
-
     def setUp(self):
         super().setUp()
         self.server = make_server(self.cfg, self.store, notifier=self.notifier)

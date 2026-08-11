@@ -1,17 +1,3 @@
-"""ONU-roster hygiene alerts — the paging shell around pure onuroster math.
-
-Transition-only, like ports/optics/ponalert: a fresh verdict pages the operator
-once, a verdict that stays put on the next walk stays silent, and the page
-clears when the condition resolves. Two independent checks share one sweep:
-
-  * per-PON ONU cap  — a PON that has reached its ONU limit pages "at capacity".
-  * redundant MAC    — a MAC on ≥ 2 ONU slots pages "duplicate ONU MAC".
-
-Never opens an outage (SNMP-derived facts don't); state rows are written even
-when the gates (`cfg.onu_limit_alerts` / `cfg.onu_dup_mac_alerts`) are off so the
-dashboard can still render them. Runs off the optics fold in `/report` — the
-roster only changes when a walk lands, so that IS the right cadence.
-"""
 from __future__ import annotations
 
 import logging
@@ -46,7 +32,6 @@ class OnuRosterAlerter:
         self._sweep_capacity(rows, now, ts)
         self._sweep_dup_mac(rows, now, ts)
 
-    # --- per-PON ONU cap -------------------------------------------------------
 
     def _limits(self) -> dict[int, int]:
         default = self.cfg.onu_pon_limit
@@ -75,10 +60,6 @@ class OnuRosterAlerter:
                     f"{f.onus}/{f.limit} ONUs registered",
                     f.device_id, ts, "ONU_LIMIT", gate=self.cfg.onu_limit_alerts)
 
-        # Clearing needs a FRESH walk that actually shows the PON below its
-        # limit. A stale OLT is skipped by the math, so its faults vanish from
-        # `current` — freeze those (skip = no verdict, the ponfault rule) or a
-        # slow C-Data agent turns every stall into a page/clear storm.
         fresh_devs = onuroster.fresh_device_ids(rows, now)
         for key, was in prior.items():
             if key in current or not was["active"]:
@@ -92,25 +73,15 @@ class OnuRosterAlerter:
                        "", key[0], ts, "ONU_LIMIT",
                        gate=self.cfg.onu_limit_alerts)
 
-    # --- redundant MAC ---------------------------------------------------------
 
     def _sweep_dup_mac(self, rows: list[dict], now: datetime, ts: str) -> None:
         dups = onuroster.duplicate_macs(rows, now)
         prior = self.store.onu_dup_mac_states(self.org_id)
         current = {d.mac: d for d in dups}
-        # Staleness-blind view of the same rosters: a MAC absent from `current`
-        # but still duplicated here only "cleared" because an OLT's walk went
-        # stale. Freeze those — clearing (and re-paging when the walk returns)
-        # is exactly the storm this fleet already produced once.
         shadow = {d.mac for d in onuroster.duplicate_macs(rows, now, stale_s=None)}
 
         for mac, d in current.items():
             was = prior.get(mac)
-            # Pages fire only for a LIVE conflict — ≥2 slots online at once
-            # (clone/loop). C-Data reg tables keep every slot an ONU ever
-            # occupied, so a duplicate with dead members is history, not a
-            # fault: state is written (dashboard), the operator's phone stays
-            # quiet. Field census 2026-07-14: 178 duplicates, 2 live.
             live = d.online_members >= 2
             was_live = bool(was and was["active"]
                             and (was["online_members"] or 0) >= 2)
@@ -136,7 +107,7 @@ class OnuRosterAlerter:
             if mac in current or not was["active"]:
                 continue
             if mac in shadow:
-                continue  # absence explained by a stale walk — no verdict
+                continue
             was_live = (was["online_members"] or 0) >= 2
             self.store.upsert_onu_dup_mac_state(
                 self.org_id, mac, members=0, online_members=0, active=False,
@@ -146,7 +117,6 @@ class OnuRosterAlerter:
                     f"✅ Duplicate MAC cleared: {mac}", "",
                     None, ts, "ONU_DUP_MAC", gate=self.cfg.onu_dup_mac_alerts)
 
-    # --- shared plumbing (mirrors ponalert._page) ------------------------------
 
     def _name(self, device_id: int) -> str:
         dev = self.store.get_org_device(self.org_id, device_id)

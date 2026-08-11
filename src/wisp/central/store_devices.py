@@ -1,8 +1,3 @@
-"""Device inventory: org_devices, regions, locations, link routes, topology, backup links and redundancy state.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-"""
 from __future__ import annotations
 
 import json
@@ -14,7 +9,6 @@ from wisp.central.store_util import _now_iso
 
 class DeviceStoreMixin:
 
-    # ----- regions -----------------------------------------------------------
 
     def list_regions(self, org_id: str) -> list[dict]:
         with self._connect() as conn:
@@ -42,8 +36,6 @@ class DeviceStoreMixin:
 
 
     def rename_region(self, org_id: str, old: str, new: str) -> None:
-        # Cascades to devices so a rename can't fragment the org's region set;
-        # the new name lands declared even if `old` never was.
         with self._write_lock, self._connect() as conn:
             conn.execute("DELETE FROM org_regions WHERE org_id=? AND name=?",
                          (org_id, old))
@@ -92,18 +84,6 @@ class DeviceStoreMixin:
                 " g.onus_total AS onus_total, g.onus_online AS onus_online,"
                 " g.warn_count AS onus_warn, g.crit_count AS onus_crit,"
                 " g.updated_at AS optics_updated_at,"
-                # How many roster slots carry a real per-ONU Rx figure. The
-                # optics badge alone can't answer "is dBm working here": a
-                # C-Data/DBC OLT walks a full roster with EVERY rx_dbm NULL, so
-                # the optics icon goes green on a box that reports no optical
-                # power at all. Counted off the live table rather than stored on
-                # olt_optics because the web scrape (central/weboptics.py) folds
-                # Rx in on its OWN clock — a count stamped by the SNMP sweep
-                # would read zero for up to 15 minutes after a scrape landed.
-                # Counted over the raw table (zombie slots included, since
-                # onu_optics never deletes) — this is a CAPABILITY signal, "does
-                # a dBm figure exist for this OLT at all", and the reader pairs
-                # it with optics_updated_at for the freshness half.
                 " (SELECT COUNT(*) FROM onu_optics r WHERE r.device_id = d.id"
                 "  AND r.rx_dbm IS NOT NULL) AS onus_rx,"
                 " (SELECT MAX(p.updated_at) FROM switch_ports p"
@@ -132,38 +112,20 @@ class DeviceStoreMixin:
         backups: dict[int, list[int]] = {}
         for link in links:
             backups.setdefault(link["child_id"], []).append(link["parent_id"])
-        # ONE canonical row per cross-link (lo, hi) expands SYMMETRICALLY here, so
-        # each end lists the other regardless of which device it was declared from
         peer_ids: dict[int, list[int]] = {}
         for link in peers:
             peer_ids.setdefault(link["child_id"], []).append(link["parent_id"])
             peer_ids.setdefault(link["parent_id"], []).append(link["child_id"])
-        # Who is EXPLICITLY on the hook for paging about this device (never the
-        # inherited set — see store_assign.device_assignee_ids). Rides the device
-        # list because the panel that edits it already has the row, and because a
-        # separate fetch would let the two disagree about who is responsible.
-        # PAGING only: nothing reads this to decide what a session may see.
         assignees = self.device_assignee_ids(org_id)
-        # WHAT FEEDS THIS BOX PHYSICALLY, which since 2026-08-09 is no longer the
-        # same question as what its `parent_device_id` says. Placing a box stopped
-        # asking what feeds it — you record the fibre afterwards, which is the
-        # order the work happens in — so the plant chain has to be able to come
-        # from a run. Shipped on the row rather than derived in the browser so the
-        # cumulative split, the PON a splitter sits on and central's own
-        # branch-fault verdict all walk ONE chain; two derivations of "what feeds
-        # this" is how a panel and a page end up naming different boxes.
-        #
-        # It NEVER shadows `parent_device_id`, which rides alongside unchanged:
-        # that column is the declared topology, it is what the engine and cycle
-        # validation read, and a splice must not be able to move it.
         feeds = self.org_plant_feed_map(org_id)
+        fibre_pons = self.org_fibre_pon_map(org_id, feeds)
         out = [dict(r) for r in rows]
         for d in out:
             d["backup_parents"] = backups.get(d["id"], [])
             d["peer_ids"] = sorted(peer_ids.get(d["id"], []))
             d["assignee_ids"] = assignees.get(d["id"], [])
             d["feed_device_id"] = feeds.get(d["id"])
-            # stored comma-joined; the wire carries a real list
+            d["fibre_pon"] = fibre_pons.get(d["id"])
             d["tags"] = [t for t in (d["tags"] or "").split(",") if t]
         return out
 
@@ -191,32 +153,8 @@ class DeviceStoreMixin:
 
 
     def org_plant_feed_map(self, org_id: str) -> dict[int, int | None]:
-        """What feeds each box PHYSICALLY: the declared parent, else the fibre.
 
-        Deliberately NOT `org_device_parent_map`, although it answers a question
-        that sounds like the same one. That map is the DECLARED topology and it
-        is what cycle validation and the engine are checked against — it must
-        keep meaning exactly "what somebody typed", or a recorded splice could
-        start deciding what pages.
 
-        This one is the PLANT chain: the thing a cumulative split, a PON
-        inheritance and a branch-fault verdict walk. Since 2026-08-09 a box can
-        be recorded with no parent at all — placing one stopped asking what feeds
-        it, because the honest answer arrives later, when a core is pulled into
-        it — so the chain has to be able to come from the glass.
-
-        DECLARED WINS. Every splitter on the live fleet was entered under the old
-        flow and carries a parent; reading the fibre first would let a
-        half-finished cable record quietly re-route a chain that was already
-        right. The fibre only fills gaps.
-
-        A feed that arrives THROUGH a customer is dropped rather than reported.
-        Daisy-chaining a lane is real and the walk follows it correctly, but this
-        map is device→device — it is what a cumulative split and a PON
-        inheritance walk — and there is no device id to name a subscriber with.
-        No feed is the honest answer there, and it is the answer that map already
-        has for anything the walk never reached.
-        """
         parents = self.org_device_parent_map(org_id)
         out = dict(parents)
         for point, feed in self._plant_feed_points(org_id).items():
@@ -247,10 +185,6 @@ class DeviceStoreMixin:
     def update_org_device(self, org_id: str, device_id: int, clean: dict) -> bool:
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
-                # tree_detached only means something under a parent, and the row
-                # menu offering it hides once there isn't one — so clearing it
-                # here is what keeps the flag reachable (an operator who parents
-                # the device again gets the plain nested row, not a stale lift)
                 "UPDATE org_devices SET name=?, ip_address=?, device_type=?, region=?,"
                 " tags=?, parent_device_id=?, assigned_node_id=?, gpon_vendor=?,"
                 " pon_port=?, split_ratio=?, split_inputs=?, onu_pon_limit=?,"
@@ -281,14 +215,7 @@ class DeviceStoreMixin:
 
     def set_org_device_location(self, org_id: str, device_id: int,
                                 lat: float | None, lng: float | None) -> bool:
-        """The DESKTOP placement path: a click on the map, a pin drag, or a clear.
 
-        Provenance is WIPED, not preserved. A hand-placed pin carries no accuracy
-        and was not taken anywhere near the device, so keeping a field capture's
-        `accuracy_m` here would leave the map claiming a 9 m GPS fix for a point
-        somebody dragged across a village. Losing the stamp is correct: the owner
-        moving a pin IS the newer claim, and "unknown provenance" is the honest
-        reading of it."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET lat=?, lng=?,"
@@ -302,12 +229,7 @@ class DeviceStoreMixin:
     def place_org_device(self, org_id: str, device_id: int, lat: float, lng: float,
                          *, accuracy_m: float | None, source: str,
                          placed_by: str) -> bool:
-        """The FIELD placement path: somebody standing at the device.
 
-        Deliberately cannot clear a pin — lat/lng are non-optional here, so the
-        worker-facing route has no way to reach the both-null delete branch that
-        `clean_location_payload` allows. Provenance is stamped on every write
-        because that is the entire reason this method exists separately."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET lat=?, lng=?, accuracy_m=?, place_source=?,"
@@ -320,16 +242,8 @@ class DeviceStoreMixin:
 
     @staticmethod
     def _prune_link_route(conn, org_id: str, child_id: int, parent_id: int) -> None:
-        """Drop a row that no longer carries anything.
 
-        "Empty" is every column being empty — clearing the waypoints off a link
-        whose chip somebody dragged must not take that position with it. Every
-        column added here has to join this list or the row survives as an
-        invisible ghost.
 
-        The dead plant columns are NOT tested any more, and could not be: a DB
-        created since the fibre rebuild has never had them. They are cleared by
-        that rebuild in the DBs that do."""
         conn.execute(
             "DELETE FROM link_routes WHERE org_id=? AND child_id=? AND parent_id=?"
             " AND waypoints IN ('', '[]') AND label_pos IS NULL",
@@ -338,7 +252,6 @@ class DeviceStoreMixin:
 
     def set_link_route(self, org_id: str, child_id: int, parent_id: int,
                        waypoints: list[list[float]], updated_by: str | None) -> None:
-        """Upsert the drawn cable path for one link; an empty list clears it."""
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO link_routes (org_id, child_id, parent_id, waypoints,"
@@ -352,29 +265,11 @@ class DeviceStoreMixin:
             conn.commit()
 
 
-    #: everything on a link_routes row that is not its geometry — the cable
-    #: record (what the span physically IS) and the cartography (how it draws).
-    #: One list, used for both halves of the sparse upsert below, so a column
-    #: added to the INSERT can't be forgotten in the UPDATE and silently refuse
-    #: to save on a link that already had a row.
-    #: The cable ROW went first (2026-08-08 — the sheath is `org_cables` and the
-    #: fibre count lives there), and the MEMBERSHIP followed it on 2026-08-09:
-    #: fibre is its own graph now, with its own ends, and it needs no topology
-    #: link at all. What is left here is pure cartography — where the operator
-    #: dragged the chip — which really is a property of the drawn line and of
-    #: nothing else. `color`, `cores`, `cable_id` and `core_no` survive as dead
-    #: columns in upgraded DBs, the ntfy-topics convention.
     _LINK_STYLE_COLS = ("label_pos",)
 
     def set_link_style(self, org_id: str, child_id: int, parent_id: int,
                        fields: dict, updated_by: str | None) -> None:
-        """Upsert a link's map styling.
 
-        A SPARSE update, like the theme overrides: only the keys present in
-        `fields` are written, so moving a label can't straighten a route.
-        Creates the row on a link with no drawn geometry and prunes it back out
-        when nothing is left.
-        """
         sets, vals = [], []
         for col in self._LINK_STYLE_COLS:
             if col in fields:
@@ -399,26 +294,8 @@ class DeviceStoreMixin:
 
 
     def list_link_routes(self, org_id: str) -> list[dict]:
-        """A link's CARTOGRAPHY: where its chip was dragged, and any legacy path.
 
-        Since 2026-08-09 a topology link carries NO plant record. It is the
-        monitoring dependency — what suppression and paging read — and it is not a
-        cable; whether glass runs between those two boxes is `org_cables`, which
-        needs no link to exist and draws itself. A link with no cable recorded
-        therefore draws as a dotted chord, which is the honest state and doubles
-        as the to-do list while a fleet re-lays its plant.
 
-        Only routes whose link still exists: a re-parented child leaves its old
-        route row dangling — invisible here, overwritten or deleted later.
-
-        The `link_routes` key runs parent_id → child_id because that is the
-        WAYPOINT ORDER, and a cross-link has no real parent: the map draws a peer
-        from the lower device id, so its geometry is keyed (child=higher,
-        parent=lower) — the opposite of `org_device_links`' (min, max)
-        canonicalization. Hence the either-order match on peer rows. Keeping
-        "waypoints run parent→child" literally true for every link kind is worth
-        more than key-order agreement between the two tables.
-        """
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT r.child_id, r.parent_id, r.waypoints, r.label_pos,"
@@ -444,28 +321,8 @@ class DeviceStoreMixin:
         return out
 
 
-    # ----- fibre plant -------------------------------------------------------
-    #
-    # A cable is one sheath SEGMENT between two FIBRE POINTS, and a joint is what
-    # one of its cores is attached to at one of those points. Neither is a device:
-    # no state, no FSM, no outage, absent from org_device_topology, read by no
-    # alerting shell — the same standing a splitter's split ratio has. Everything
-    # below is therefore structurally incapable of paging a fleet.
-    #
-    # A POINT is a device OR a subscriber, carried as a nullable pair and handled
-    # here as an opaque key. `fiber.py` never looks inside one, which is what lets
-    # its walks be tested against plain tuples.
-
     def onu_places_exist(self, org_id: str, macs) -> bool:
-        """Every one of these subscribers has a record in this org.
 
-        The scoping check for the subscriber half of a fibre point, and the exact
-        counterpart of `device_org` for the other half: a MAC in a request body is
-        just a string, so this is what stops one org's cable claiming to land on
-        another org's customer. A MISSING record is refused rather than created —
-        a scrape can never add a subscriber and neither can this, and a cable
-        landing on a typo'd sticker would draw to a point with nothing behind it.
-        """
         macs = {m for m in macs if m}
         if not macs:
             return True
@@ -488,19 +345,8 @@ class DeviceStoreMixin:
 
 
     def _point_names(self, org_id: str) -> dict:
-        """Every point in one org: what it is called and where it is.
 
-        ONE read for both kinds, because every surface here needs both and a
-        caller that had to remember to look up subscribers separately would
-        eventually forget on one screen — which is exactly how a typed customer
-        name once reached the DB and rendered nowhere.
 
-        A subscriber's name goes through `onuroster.display_name`, never off
-        `onu_places.label` alone, so a cable end and the Optical tab call the same
-        customer the same thing — and the walked name is joined in through the
-        registered `wisp_norm_mac`, the one normalizer, so SQL identity cannot
-        drift from Python identity and silently stop matching a sticker.
-        """
         from wisp.central import onuroster
         out: dict = {}
         with self._with_norm_mac(self._connect()) as conn:
@@ -525,8 +371,6 @@ class DeviceStoreMixin:
 
 
     def cable_org(self, cable_id: int) -> str | None:
-        """The org a cable belongs to, re-derived from the row like every other
-        `org_devices` write scope — a body's `org_id` is never trusted."""
         with self._connect() as conn:
             row = conn.execute("SELECT org_id FROM org_cables WHERE id=?",
                                (cable_id,)).fetchone()
@@ -561,21 +405,8 @@ class DeviceStoreMixin:
 
 
     def list_org_cables(self, org_id: str) -> list[dict]:
-        """Every cable, with its two ends resolved and its core plan worked out.
 
-        THE CORE PLAN IS THE POINT OF THIS READ. A cable panel's job is to answer
-        "what is on each fibre", and that is per-core AND per-END: core 3 might be
-        spliced onward at one end and land on a splitter at the other. Composing
-        it here rather than in the browser is the same rule the geometry follows —
-        the panel, the tray and the map must not each derive their own version of
-        one sentence.
 
-        `cores_recorded` counts a core that has ANYTHING against it: a joint at
-        either end, or a label. Counting only labels once printed "0 of 12 cores
-        recorded" directly above two cores that were plainly recorded, which is
-        the count-agreement rule broken inside a single card. It stays RECORDED
-        and never "used": the rest are not spare, nobody wrote them down.
-        """
         with self._connect() as conn:
             cables = self._raw_cables(conn, org_id)
             joints = self._raw_joints(conn, org_id)
@@ -587,10 +418,6 @@ class DeviceStoreMixin:
         points = self._point_names(org_id)
         names = {c["id"]: c["name"] for c in cables}
 
-        # Which end of each cable a joint sits at, so the plan can be built in one
-        # pass. A joint's point is one of the cable's own two ends by construction
-        # (`fiber.joint_refusal` → absent), so anything else here is a legacy row
-        # and is simply not placed.
         plans: dict[int, dict[str, dict]] = {c["id"]: {} for c in cables}
         by_id = {c["id"]: c for c in cables}
 
@@ -641,14 +468,7 @@ class DeviceStoreMixin:
 
     def set_cable_core_label(self, org_id: str, cable_id: int, core_no: int,
                              label: str | None, updated_by: str | None) -> None:
-        """What one fibre CARRIES — free text, and sparse: blank deletes the row.
 
-        Deliberately separate from where the core RUNS, which is derived from the
-        joints and can never be typed. One is the operator's claim about purpose
-        ("BSNL leased line"), the other is the record's statement about geometry,
-        and a panel that let them be entered the same way would make a note look
-        like a fact.
-        """
         text = (label or "").strip()
         with self._write_lock, self._connect() as conn:
             if not text:
@@ -670,25 +490,8 @@ class DeviceStoreMixin:
                       cores: int | None, notes: str | None,
                       a: dict | None, b: dict | None,
                       updated_by: str | None) -> int:
-        """Create or update a cable. Returns its id.
 
-        TWO REFUSALS, both about not silently invalidating something already
-        recorded:
 
-        SHRINKING THE COUNT is refused while a joint uses a strand above the new
-        one. A 24F re-recorded as a 12F with core 19 spliced somewhere would leave
-        a joint naming a fibre the cable no longer has — and it would render, with
-        a tube and a colour, in full confidence. Clearing the count entirely is a
-        different statement and clears every joint and label with it, in the same
-        write.
-
-        MOVING AN END discards the joints made at the end that moved. A splice is
-        a fact about a particular closure; the fibres that were joined at the old
-        one are not joined at the new one, and carrying them across would invent a
-        splice nobody made. Guarded on the end actually CHANGING, so re-saving a
-        cable to rename it is idempotent — the same shape as `set_onu_drops`
-        discarding a traced route only on a real re-home.
-        """
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             if cable_id is None:
@@ -753,14 +556,7 @@ class DeviceStoreMixin:
 
     def set_cable_path(self, org_id: str, cable_id: int,
                        path: list[list[float]], updated_by: str | None) -> bool:
-        """Where the glass runs. An empty list clears the route.
 
-        Nothing else has to move with it. Under the model this replaced, retracing
-        a street re-snapped every tap on it and could re-route a dozen spans that
-        had no geometry of their own; now the cable IS the line, so a retrace is
-        one column and the joints at its ends do not care where it went in
-        between.
-        """
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_cables SET path=?, updated_at=?, updated_by=?"
@@ -773,28 +569,8 @@ class DeviceStoreMixin:
 
     def split_org_cable(self, org_id: str, cable_id: int, *, lat: float, lng: float,
                         name: str | None, updated_by: str | None) -> dict:
-        """Open the sheath here: cut the cable in two and splice every core through.
 
-        THIS IS WHAT KEEPS SEGMENT-PER-SPAN FROM BEING A TAX. A cable's ends are
-        recorded now, so a box tapped halfway down a street has to become a real
-        end — and asking an operator to redraw the street to achieve that is how a
-        plant record stops being kept. One click does what the crew does: open the
-        closure, put a coupler in it, and fusion-splice the tray straight through.
 
-        EVERY CORE IS SPLICED, not just the ones with something recorded against
-        them, and that is a deliberate reading of what the gesture means. Splitting
-        a sheath must not change what any fibre does — a trace that ran down this
-        street before must still run down it after — and a core left discontinuous
-        would silently change the answer for every fibre nobody had got round to
-        recording. It is the physical default and it is editable: the tray shows
-        all of them and any one can be cleared. With no fibre count recorded there
-        is nothing to enumerate, so nothing is spliced and the caller is told.
-
-        The new coupler is an ordinary passive `org_devices` row, so it inherits
-        pins, the tree, regions and every other piece of shared machinery — and,
-        being passive, it is excluded from `org_device_topology` and cannot reach
-        the engine.
-        """
         with self._write_lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM org_cables WHERE id=? AND org_id=?",
                                (cable_id, org_id)).fetchone()
@@ -804,12 +580,6 @@ class DeviceStoreMixin:
                 path = json.loads(row["path"]) if row["path"] else []
             except (TypeError, ValueError):
                 path = []
-            if len(path) < cablepath.MIN_PATH_POINTS:
-                raise ValueError("trace this cable before opening a coupler on it")
-            halves = cablepath.split(path, lat, lng)
-            if halves is None:
-                raise ValueError("that point is at the end of the cable, not along it")
-            head, tail = halves
 
             points = self._point_names(org_id)
             a_key = self._pkey(row["a_device_id"], row["a_mac"])
@@ -819,41 +589,49 @@ class DeviceStoreMixin:
                 p = points.get(key) or {}
                 return (p["lat"], p["lng"]) if p.get("lat") is not None else None
 
-            # Which recorded end the HEAD belongs to. Measured, never stored — a
-            # cable's vertices are in the order somebody drew them.
+            traced = len(path) >= cablepath.MIN_PATH_POINTS
+            if not traced:
+                path = [list(p) for p in (pin(a_key), pin(b_key)) if p is not None]
+                if len(path) < cablepath.MIN_PATH_POINTS:
+                    raise ValueError(
+                        "place both ends of this cable, or trace it, before"
+                        " opening a closure in it")
+            halves = cablepath.split(path, lat, lng)
+            if halves is None:
+                raise ValueError("that point is at the end of the cable, not along it")
+            head, tail = halves
+
             a_first = cablepath.orient(path, pin(a_key), pin(b_key))
             head_side, tail_side = ("a", "b") if a_first else ("b", "a")
 
             cut = head[-1]
+            if not traced:
+                head = tail = []
             now = _now_iso()
             cur = conn.execute(
                 "INSERT INTO org_devices (org_id, name, ip_address, device_type,"
                 " region, parent_device_id, lat, lng, created_at)"
-                " VALUES (?,?,'','coupler',NULL,NULL,?,?,?)",
-                (org_id, name or self._next_coupler_name(conn, org_id),
+                " VALUES (?,?,'','closure',NULL,NULL,?,?,?)",
+                (org_id, name or self._next_closure_name(conn, org_id),
                  cut[0], cut[1], now))
-            coupler_id = int(cur.lastrowid)
+            closure_id = int(cur.lastrowid)
 
-            # The original keeps its head-side end and its id, so anything already
-            # pointing at this cable still resolves; the far half becomes a new row.
             conn.execute(
                 f"UPDATE org_cables SET path=?, {tail_side}_device_id=?,"
                 f" {tail_side}_mac=NULL, updated_at=?, updated_by=?"
                 " WHERE id=? AND org_id=?",
-                (json.dumps(head), coupler_id, now, updated_by, cable_id, org_id))
+                (json.dumps(head), closure_id, now, updated_by, cable_id, org_id))
             far = conn.execute(
                 "INSERT INTO org_cables (org_id, name, cores, path, notes,"
                 " a_device_id, a_mac, b_device_id, b_mac,"
                 " created_at, updated_at, updated_by)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (org_id, row["name"], row["cores"], json.dumps(tail), row["notes"],
-                 coupler_id, None,
+                 closure_id, None,
                  row[f"{tail_side}_device_id"], row[f"{tail_side}_mac"],
                  now, now, updated_by))
             far_id = int(far.lastrowid)
 
-            # Joints made at the far end were made on THAT closure and belong to
-            # the half that still reaches it.
             tail_key = b_key if a_first else a_key
             for col in ("a", "b"):
                 conn.execute(
@@ -871,44 +649,31 @@ class DeviceStoreMixin:
                         " a_cable_id, a_core_no, b_cable_id, b_core_no,"
                         " created_at, updated_at, updated_by)"
                         " VALUES (?,?,NULL,?,?,?,?,?,?,?)",
-                        (org_id, coupler_id, *self._canon(
+                        (org_id, closure_id, *self._canon(
                             (cable_id, core), (far_id, core)), now, now, updated_by))
                     spliced += 1
             conn.commit()
         return {"cable_id": cable_id, "new_cable_id": far_id,
-                "coupler_id": coupler_id, "spliced": spliced}
+                "closure_id": closure_id, "spliced": spliced}
 
 
     @staticmethod
-    def _next_coupler_name(conn, org_id: str) -> str:
-        """`JC-n`, counting the couplers that exist rather than the ones ever made.
+    def _next_closure_name(conn, org_id: str) -> str:
 
-        A survey names dozens of these and none of the names mean anything — what
-        an operator wants is for the box to already have one so they can carry on
-        placing the next. Renaming is one field away in the same sheet.
-        """
         n = conn.execute(
             "SELECT COUNT(*) AS n FROM org_devices WHERE org_id=? AND is_active=1"
-            " AND device_type='coupler'", (org_id,)).fetchone()["n"]
+            " AND device_type='closure'", (org_id,)).fetchone()["n"]
         return f"JC-{n + 1}"
 
 
     @staticmethod
     def _canon(a: tuple, b: tuple) -> tuple:
-        """One splice is one row whichever fibre the operator picked up first."""
         lo, hi = (a, b) if a <= b else (b, a)
         return (lo[0], lo[1], hi[0], hi[1])
 
 
     def delete_org_cable(self, org_id: str, cable_id: int) -> bool:
-        """Delete a cable and everything that was only true because of it.
 
-        The joints go because a splice names two fibres and one of them has just
-        stopped existing; the core labels go because a core is a position inside a
-        particular sheath. Nothing else in the schema points here — a cable is not
-        a device and never enters the topology — so this cannot orphan monitoring
-        state or change what pages.
-        """
         with self._write_lock, self._connect() as conn:
             conn.execute("DELETE FROM org_fibre_joints"
                          " WHERE org_id=? AND (a_cable_id=? OR b_cable_id=?)",
@@ -921,27 +686,21 @@ class DeviceStoreMixin:
             return cur.rowcount > 0
 
 
-    # ----- joints ------------------------------------------------------------
-
     def set_fibre_joint(self, org_id: str, clean: dict,
                         updated_by: str | None) -> dict:
-        """Join two fibres at a point, or take one out to the equipment there.
 
-        The physics lives in `fiber.joint_refusal`, read ONCE here, because it
-        needs the cables and the joints already made — and putting half of it in
-        the payload validator is how two callers end up enforcing two different
-        rules. What comes back names the refusal so the tray can say which one it
-        is; a bare 400 on a splice tray is indistinguishable from a broken button.
-        """
         point = self._pkey(clean["device_id"], clean["mac"])
         a = (clean["a_cable_id"], clean["a_core_no"])
         b = ((clean["b_cable_id"], clean["b_core_no"])
              if clean["b_cable_id"] is not None else None)
+        port = ((clean["port_kind"], clean.get("port_no"))
+                if clean.get("port_kind") else None)
         with self._write_lock, self._connect() as conn:
             cables = {c["id"]: c for c in self._raw_cables(conn, org_id)}
             joints = self._raw_joints(conn, org_id)
             why = fiber.joint_refusal(a, b, point, cables,
-                                      fiber.taken_at(joints, point))
+                                      fiber.taken_at(joints, point), port,
+                                      fiber.ports_taken_at(joints, point))
             if why:
                 return {"ok": False, "refused": why,
                         "reason": fiber.JOINT_REFUSAL_TEXT[why]}
@@ -949,9 +708,11 @@ class DeviceStoreMixin:
             cols = self._canon(a, b) if b is not None else (a[0], a[1], None, None)
             cur = conn.execute(
                 "INSERT INTO org_fibre_joints (org_id, device_id, mac, a_cable_id,"
-                " a_core_no, b_cable_id, b_core_no, created_at, updated_at,"
-                " updated_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (org_id, clean["device_id"], clean["mac"], *cols, now, now,
+                " a_core_no, b_cable_id, b_core_no, port_kind, port_no,"
+                " created_at, updated_at, updated_by)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (org_id, clean["device_id"], clean["mac"], *cols,
+                 clean.get("port_kind"), clean.get("port_no"), now, now,
                  updated_by))
             conn.commit()
             return {"ok": True, "id": int(cur.lastrowid)}
@@ -959,30 +720,8 @@ class DeviceStoreMixin:
 
     def take_core_to_box(self, org_id: str, clean: dict,
                          updated_by: str | None) -> dict:
-        """Take one core out of a cable to a box standing somewhere ELSE.
 
-        Lays a single-fibre tail between the two points and joins it at both ends,
-        in ONE transaction: a half-written tail is a cable running to a box with
-        nothing in it, which reads on the map as real plant and in the tray as a
-        free core somebody could splice again.
 
-        IT IS A MACRO OVER THE EXISTING WRITES AND MUST STAY ONE. Every row it
-        makes is a row the tray can already make by hand, so nothing downstream —
-        `trace`, `split_org_cable`, the delete cascade, the tray's own refusals —
-        needs to know this shortcut exists. The moment it writes something the
-        manual path cannot, there are two models of a tail again.
-
-        THE SOURCE FIBRE IS CHECKED BEFORE THE CABLE IS LAID, or a refused splice
-        leaves a tail cable behind as litter — and the operator, seeing a new line
-        on the map, would reasonably believe the connection was made.
-
-        The tail is deliberately 1F and deliberately UNTRACED. One core out is one
-        strand, and nobody surveys the two metres from a closure to the rack beside
-        it: an empty path draws the dashed chord, which is this map's own word for
-        "recorded, not walked". An operator who really has an 8F tail lays it
-        themselves and splices in the tray, which has always worked — this exists
-        for the single strand that had no route through the record at all.
-        """
         point = self._pkey(clean["device_id"], clean["mac"])
         far = self._pkey(clean["to"]["device_id"], clean["to"]["mac"])
         a = (clean["a_cable_id"], clean["a_core_no"])
@@ -991,9 +730,6 @@ class DeviceStoreMixin:
             cables = {c["id"]: c for c in self._raw_cables(conn, org_id)}
             joints = self._raw_joints(conn, org_id)
             taken = fiber.taken_at(joints, point)
-            # `b=None` here asks exactly the right question of the shared rule:
-            # is THIS fibre open at THIS point and still free? The tail's own core
-            # cannot be taken — the cable does not exist yet.
             why = fiber.joint_refusal(a, None, point, cables, taken)
             if why:
                 return {"ok": False, "refused": why,
@@ -1001,79 +737,109 @@ class DeviceStoreMixin:
             if not self._point_exists(conn, org_id, clean["to"]):
                 return {"ok": False, "refused": "missing_point",
                         "reason": "That box is not in this network any more."}
+            far_port = ((clean["port_kind"], clean.get("port_no"))
+                        if clean.get("port_kind") else None)
+            if far_port and far_port in fiber.ports_taken_at(joints, far):
+                return {"ok": False, "refused": "port_taken",
+                        "reason": fiber.JOINT_REFUSAL_TEXT["port_taken"]}
 
-            label = clean["name"] or self._tail_name(
-                org_id, far, cables.get(a[0]), clean["a_core_no"])
+            label = (clean["name"] or "")[:fiber.CABLE_NAME_MAX]
             cur = conn.execute(
                 "INSERT INTO org_cables (org_id, name, cores, notes,"
                 " a_device_id, a_mac, b_device_id, b_mac,"
                 " created_at, updated_at, updated_by)"
                 " VALUES (?,?,1,NULL,?,?,?,?,?,?,?)",
-                (org_id, label[:fiber.CABLE_NAME_MAX],
+                (org_id, label,
                  clean["device_id"], clean["mac"],
                  clean["to"]["device_id"], clean["to"]["mac"], now, now, updated_by))
             tail_id = int(cur.lastrowid)
 
-            # The splice at THIS end, canonicalised like every other joint so one
-            # splice is one row whichever side the caller named first.
             conn.execute(
                 "INSERT INTO org_fibre_joints (org_id, device_id, mac, a_cable_id,"
                 " a_core_no, b_cable_id, b_core_no, created_at, updated_at,"
                 " updated_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (org_id, clean["device_id"], clean["mac"],
                  *self._canon(a, (tail_id, 1)), now, now, updated_by))
-            # …and the termination at the far one: the fibre goes INTO that box.
             conn.execute(
                 "INSERT INTO org_fibre_joints (org_id, device_id, mac, a_cable_id,"
-                " a_core_no, b_cable_id, b_core_no, created_at, updated_at,"
-                " updated_by) VALUES (?,?,?,?,1,NULL,NULL,?,?,?)",
+                " a_core_no, b_cable_id, b_core_no, port_kind, port_no,"
+                " created_at, updated_at, updated_by)"
+                " VALUES (?,?,?,?,1,NULL,NULL,?,?,?,?,?)",
                 (org_id, clean["to"]["device_id"], clean["to"]["mac"], tail_id,
+                 clean.get("port_kind"), clean.get("port_no"),
                  now, now, updated_by))
             conn.commit()
-        return {"ok": True, "cable_id": tail_id,
-                "name": label[:fiber.CABLE_NAME_MAX]}
+        return {"ok": True, "cable_id": tail_id, "name": label or None}
 
 
-    def _tail_name(self, org_id: str, far, source: dict | None, core_no: int) -> str:
-        """What to call a tail nobody will ever name themselves.
+    def connect_points(self, org_id: str, clean: dict,
+                       updated_by: str | None) -> dict:
 
-        THE SOURCE CORE IS IN THE NAME, and it is not decoration. An 8-PON OLT fed
-        off one closure gets eight tails between the same two points, and named
-        for those points alone all eight are the same string — so the OLT's own
-        tray offers eight identical rows in its picker and the operator cannot say
-        which is which. The core is what tells them apart, it is what a splicer
-        would say out loud, and it is stable: a fibre can be tailed only once, so
-        two tails can never claim one core.
 
-        IT NAMES THE SOURCE CABLE, NEVER THE SOURCE POINT. The first cut wrote
-        `JC-1 core 3 → OLT`, and JC-1 is a CLOSURE — so "core 3" had no cable to
-        be a core of, which is the exact half-fact `clean_core_no` refuses to
-        store. `a1 core 3 → OLT` says which strand of which sheath, and it is
-        shorter, which matters because this string has to survive a picker.
+        point = self._pkey(clean["device_id"], clean["mac"])
+        far = self._pkey(clean["to"]["device_id"], clean["to"]["mac"])
+        if point == far:
+            return {"ok": False, "refused": "self",
+                    "reason": "A cable runs between two points, not from a box"
+                              " back to itself."}
+        port = ((clean["port_kind"], clean.get("port_no"))
+                if clean.get("port_kind") else None)
+        stated = ((clean["to_port_kind"], clean.get("to_port_no"))
+                  if clean.get("to_port_kind") else None)
+        now = _now_iso()
+        with self._write_lock, self._connect() as conn:
+            if not self._point_exists(conn, org_id, clean["to"]):
+                return {"ok": False, "refused": "missing_point",
+                        "reason": "That box is not in this network any more."}
+            joints = self._raw_joints(conn, org_id)
+            if port and port in fiber.ports_taken_at(joints, point):
+                return {"ok": False, "refused": "port_taken",
+                        "reason": fiber.JOINT_REFUSAL_TEXT["port_taken"]}
+            taken_far = fiber.ports_taken_at(joints, far)
+            if stated and stated in taken_far:
+                return {"ok": False, "refused": "port_taken",
+                        "reason": fiber.JOINT_REFUSAL_TEXT["port_taken"]}
+            far_port = stated or self._sole_input(conn, org_id, clean["to"])
+            if far_port and far_port in taken_far:
+                far_port = None
+            label = (clean.get("name") or "")[:fiber.CABLE_NAME_MAX]
+            cur = conn.execute(
+                "INSERT INTO org_cables (org_id, name, cores, notes,"
+                " a_device_id, a_mac, b_device_id, b_mac,"
+                " created_at, updated_at, updated_by) VALUES (?,?,1,NULL,?,?,?,?,?,?,?)",
+                (org_id, label,
+                 clean["device_id"], clean["mac"],
+                 clean["to"]["device_id"], clean["to"]["mac"], now, now, updated_by))
+            cable_id = int(cur.lastrowid)
+            for end, p in ((clean, port),
+                           (clean["to"], far_port)):
+                conn.execute(
+                    "INSERT INTO org_fibre_joints (org_id, device_id, mac,"
+                    " a_cable_id, a_core_no, b_cable_id, b_core_no, port_kind,"
+                    " port_no, created_at, updated_at, updated_by)"
+                    " VALUES (?,?,?,?,1,NULL,NULL,?,?,?,?,?)",
+                    (org_id, end["device_id"], end["mac"], cable_id,
+                     p[0] if p else None, p[1] if p else None,
+                     now, now, updated_by))
+            conn.commit()
+        return {"ok": True, "cable_id": cable_id, "name": label or None,
+                "far_port": fiber.port_label(*far_port) if far_port else None}
 
-        The SOURCE CABLE is what gets dropped when the name will not fit: the far
-        box and the core carry the information, and the sheath is named again by
-        the cable's own recorded end.
-        """
-        dst = (self._point_names(org_id).get(far, {}).get("name")) or "box"
-        src = (source or {}).get("name")
-        full = f"{src} core {core_no} → {dst}" if src else f"core {core_no} → {dst}"
-        if len(full) <= fiber.CABLE_NAME_MAX:
-            return full
-        return f"core {core_no} → {dst}"[:fiber.CABLE_NAME_MAX]
+
+    def _sole_input(self, conn, org_id: str, end: dict):
+
+        if end.get("device_id") is None:
+            return None
+        row = conn.execute(
+            "SELECT device_type, split_inputs FROM org_devices"
+            " WHERE id=? AND org_id=?", (end["device_id"], org_id)).fetchone()
+        if row is None or row["device_type"] != "splitter":
+            return None
+        return ("in", 1) if (row["split_inputs"] or 1) == 1 else None
 
 
     def _point_exists(self, conn, org_id: str, end: dict) -> bool:
-        """Is this still a real place in this org?
 
-        The API's own scoping answers a deleted device with a 404 before this is
-        reached, so on that path it is belt and braces. It is here anyway because
-        the guard belongs to whoever LAYS THE CABLE: this method is reachable from
-        the admin CLI and from any route added later, a device end carries a real
-        foreign key but a subscriber end is a bare MAC with nothing to catch it,
-        and the failure it prevents is a sheath recorded as running to a place
-        that does not exist.
-        """
         if end["device_id"] is not None:
             return conn.execute(
                 "SELECT 1 FROM org_devices WHERE id=? AND org_id=? AND is_active=1",
@@ -1085,22 +851,8 @@ class DeviceStoreMixin:
 
     def splice_through(self, org_id: str, clean: dict,
                        updated_by: str | None) -> dict:
-        """Splice every FREE core of one cable straight through to another, 1:1.
 
-        Nine closures in ten are exactly this, and doing it as N separate gestures
-        is the difference between a plant record that gets written and one that
-        does not — the same argument the bulk drops dialog is built on.
 
-        A core already joined here is SKIPPED, never overwritten. So pressing the
-        button twice is safe, and pressing it after some hand-work leaves the
-        hand-work alone: the operator who deliberately crossed core 3 to core 7
-        does not lose it to a convenience.
-
-        1:1 runs to the SMALLER of the two counts, because there is no honest
-        answer for core 13 of a 12F. A cable with no count recorded splices
-        nothing — enumerating cores of a sheath nobody has measured would be
-        inventing the very fact this schema keeps refusing to invent.
-        """
         point = self._pkey(clean["device_id"], clean["mac"])
         with self._write_lock, self._connect() as conn:
             cables = {c["id"]: c for c in self._raw_cables(conn, org_id)}
@@ -1133,12 +885,7 @@ class DeviceStoreMixin:
 
 
     def clear_fibre_joint(self, org_id: str, clean: dict) -> bool:
-        """Undo whatever this fibre is joined to at this point.
 
-        Named by the FIBRE, not by the joint's id, because either side of a splice
-        must be able to undo it — and because what the operator is looking at is a
-        row in a tray, not a database row.
-        """
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "DELETE FROM org_fibre_joints WHERE org_id=?"
@@ -1152,19 +899,98 @@ class DeviceStoreMixin:
             return cur.rowcount > 0
 
 
+    def device_pon_ports(self, conn, org_id: str, device_id: int) -> list[int]:
+
+
+        return fiber.pon_ports(
+            roster=[r["pon_port"] for r in conn.execute(
+                "SELECT DISTINCT pon_port FROM onu_optics WHERE device_id=?",
+                (device_id,))],
+            interfaces=[r["if_name"] for r in conn.execute(
+                "SELECT DISTINCT if_name FROM switch_ports WHERE device_id=?",
+                (device_id,))],
+            recorded=[r["port_no"] for r in conn.execute(
+                "SELECT DISTINCT port_no FROM org_fibre_joints"
+                " WHERE org_id=? AND device_id=? AND port_kind='pon'"
+                " AND port_no IS NOT NULL", (org_id, device_id))])
+
+
+    def device_ports(self, conn, org_id: str, device_id: int) -> tuple[list[int],
+                                                                      dict[int, str]]:
+
+
+        names: dict[int, str] = {}
+        for r in conn.execute(
+                "SELECT if_name FROM switch_ports WHERE device_id=?"
+                " ORDER BY if_index", (device_id,)):
+            n = fiber.if_port_no(r["if_name"])
+            if n is not None:
+                names.setdefault(n, r["if_name"])
+        recorded = {int(r["port_no"]) for r in conn.execute(
+            "SELECT DISTINCT port_no FROM org_fibre_joints"
+            " WHERE org_id=? AND device_id=? AND port_kind='port'"
+            " AND port_no IS NOT NULL", (org_id, device_id))}
+        return sorted(set(names) | recorded), names
+
+
+    def org_device_ports(self, org_id: str) -> dict[int, list[dict]]:
+
+
+        pons: dict[int, list[str]] = {}
+        ifs: dict[int, list[str]] = {}
+        rec: dict[int, list[tuple[str, int]]] = {}
+        with self._connect() as conn:
+            for r in conn.execute(
+                    "SELECT DISTINCT device_id, pon_port FROM onu_optics"
+                    " WHERE org_id=? AND pon_port IS NOT NULL", (org_id,)):
+                pons.setdefault(r["device_id"], []).append(r["pon_port"])
+            for r in conn.execute(
+                    "SELECT device_id, if_name FROM switch_ports"
+                    " WHERE org_id=? AND if_name IS NOT NULL ORDER BY if_index",
+                    (org_id,)):
+                ifs.setdefault(r["device_id"], []).append(r["if_name"])
+            for r in conn.execute(
+                    "SELECT DISTINCT device_id, port_kind, port_no"
+                    " FROM org_fibre_joints WHERE org_id=? AND device_id IS NOT NULL"
+                    " AND port_kind IS NOT NULL AND port_no IS NOT NULL", (org_id,)):
+                rec.setdefault(r["device_id"], []).append(
+                    (r["port_kind"], r["port_no"]))
+            boxes = conn.execute(
+                "SELECT id, device_type, split_ratio, split_inputs FROM org_devices"
+                " WHERE org_id=? AND is_active=1", (org_id,)).fetchall()
+
+        out: dict[int, list[dict]] = {}
+        for b in boxes:
+            dtype, did = b["device_type"], b["id"]
+            names: dict[int, str] = {}
+            numbered: list[int] = []
+            if dtype == "OLT":
+                slots = fiber.port_slots(dtype, pons=fiber.pon_ports(
+                    roster=pons.get(did, []), interfaces=ifs.get(did, []),
+                    recorded=[n for k, n in rec.get(did, []) if k == "pon"]))
+            elif dtype == "splitter" or dtype in fiber.ENCLOSURE_TYPES:
+                slots = fiber.port_slots(dtype, split_ratio=b["split_ratio"],
+                                         split_inputs=b["split_inputs"])
+            else:
+                for name in ifs.get(did, []):
+                    n = fiber.if_port_no(name)
+                    if n is not None:
+                        names.setdefault(n, name)
+                numbered = sorted(set(names) | {n for k, n in rec.get(did, [])
+                                                if k == "port"})
+                slots = fiber.port_slots(dtype, ports=numbered)
+            if not slots:
+                continue
+            out[did] = [{"kind": k, "no": n, "label": fiber.port_label(k, n),
+                         "device_label": names.get(n) if k == "port" else None}
+                        for k, n in slots]
+        return out
+
+
     def point_fibre(self, org_id: str, *, device_id: int | None = None,
                     mac: str | None = None) -> dict:
-        """THE TRAY: every cable end landing at one point, and the joints between.
 
-        One read for both columns and the connectors, so they cannot disagree
-        about what is on the tray — the same reason the optical panel takes its
-        counts from one roster pass.
 
-        `side` is DERIVED and advisory: which way a splicer would hold the tray,
-        with the feed on the left. It decides nothing — any two fibres open here
-        may be joined — and a point the feed walk never reached simply has
-        everything on one side, which is honest rather than broken.
-        """
         point = self._pkey(device_id, mac)
         with self._connect() as conn:
             cables = self._raw_cables(conn, org_id)
@@ -1175,6 +1001,33 @@ class DeviceStoreMixin:
                     "SELECT cable_id, core_no, label FROM org_cable_cores"
                     " WHERE org_id=?", (org_id,)):
                 labels.setdefault(r["cable_id"], {})[str(r["core_no"])] = r["label"]
+            box = conn.execute(
+                "SELECT device_type, split_ratio, split_inputs FROM org_devices"
+                " WHERE id=? AND org_id=?", (device_id, org_id)).fetchone() \
+                if device_id is not None else None
+            dtype = box["device_type"] if box else None
+            port_names: dict[int, str] = {}
+            if box and dtype not in fiber.ENCLOSURE_TYPES and dtype != "splitter" \
+                    and dtype != "OLT":
+                numbered, port_names = self.device_ports(conn, org_id, device_id)
+            else:
+                numbered = []
+            slots = fiber.port_slots(
+                dtype,
+                split_ratio=box["split_ratio"] if box else None,
+                split_inputs=box["split_inputs"] if box else None,
+                pons=(self.device_pon_ports(conn, org_id, device_id)
+                      if box and dtype == "OLT" else None),
+                ports=numbered,
+            ) if box else []
+            drops = {}
+            if box and box["device_type"] == "splitter":
+                for r in conn.execute(
+                        "SELECT d.mac, d.leg_no, p.label FROM onu_drops d"
+                        " LEFT JOIN onu_places p ON p.org_id=d.org_id AND p.mac=d.mac"
+                        " WHERE d.org_id=? AND d.passive_id=?", (org_id, device_id)):
+                    drops.setdefault(r["leg_no"], []).append(
+                        {"mac": r["mac"], "name": r["label"]})
         points = self._point_names(org_id)
         feed = self._plant_feed_points(org_id, cables)
         here = points.get(point) or self._pdict(device_id, mac)
@@ -1189,28 +1042,104 @@ class DeviceStoreMixin:
                 "end": "a" if point == c["a_point"] else "b",
                 "far": points.get(far) or {},
                 "labels": labels.get(c["id"], {}),
-                # The feed side is the cable this point was reached BY.
+                "plumbing": fiber.is_plumbing(c),
                 "side": "feed" if feed.get(point) == far else "onward",
             })
-        landing.sort(key=lambda c: (c["side"] != "feed", c["name"], c["cable_id"]))
+        landing.sort(key=lambda c: (c["side"] != "feed", c["name"] or "",
+                                    c["cable_id"]))
+        unplaced_drops = drops.pop(None, []) if drops else []
         return {
             "point": here,
             "cables": landing,
+            "ports": [{"kind": kind, "no": no,
+                       "label": fiber.port_label(kind, no),
+                       "device_label": port_names.get(no) if kind == "port" else None,
+                       "drops": drops.get(no, []) if kind == "leg" else []}
+                      for kind, no in slots],
+            "port_add": (None if (dtype == "splitter" and box["split_ratio"])
+                         else fiber.port_kind_for(dtype)) if box else None,
+            "undrawn": self._undrawn_here(org_id, point, cables, points),
+            "unplaced_drops": unplaced_drops,
             "joints": [{"id": j["id"], "a_cable_id": j["a_cable_id"],
                         "a_core_no": j["a_core_no"], "b_cable_id": j["b_cable_id"],
-                        "b_core_no": j["b_core_no"]} for j in joints],
+                        "b_core_no": j["b_core_no"],
+                        "port_kind": j["port_kind"], "port_no": j["port_no"]}
+                       for j in joints],
         }
 
 
-    def trace_fibre(self, org_id: str, cable_id: int, core_no: int) -> dict:
-        """The whole optical path this fibre makes, across sheaths and joints.
+    def _undrawn_here(self, org_id: str, point, cables: list[dict],
+                      points: dict) -> list[dict]:
 
-        Answered on the SERVER rather than mirrored into the browser: the walk is
-        an algorithm, not a vocabulary, and this codebase mirrors constants (the
-        strand colours, the fibre counts, the map-detail defaults) precisely
-        because two copies of an algorithm drift where two copies of a list are
-        pinned by a test. The map lights whatever this returns.
-        """
+
+        if point is None or (point[0] if isinstance(point, tuple) else None) != "device":
+            return []
+        device_id = point[1]
+        declared: list[tuple] = []
+        with self._connect() as conn:
+            for r in conn.execute(
+                    "SELECT id, name, device_type FROM org_devices"
+                    " WHERE org_id=? AND parent_device_id=? AND is_active=1"
+                    " ORDER BY name", (org_id, device_id)):
+                declared.append(((("device", device_id)), ("device", r["id"]),
+                                 "feeds"))
+            up = conn.execute(
+                "SELECT parent_device_id FROM org_devices WHERE id=? AND org_id=?",
+                (device_id, org_id)).fetchone()
+            if up and up["parent_device_id"]:
+                declared.append((("device", device_id),
+                                 ("device", up["parent_device_id"]), "fed by"))
+            hops = {("device", r["id"]) for r in conn.execute(
+                "SELECT id FROM org_devices WHERE org_id=? AND device_type IN"
+                f" ({','.join('?' * len(fiber.ENCLOSURE_TYPES))})",
+                (org_id, *fiber.ENCLOSURE_TYPES))}
+        missing = fiber.undrawn([(a, b) for a, b, _ in declared], cables, hops)
+        want = {frozenset(p) for p in missing}
+        out = []
+        for a, b, rel in declared:
+            if frozenset((a, b)) not in want:
+                continue
+            want.discard(frozenset((a, b)))
+            far = points.get(b) or {}
+            out.append({"far": far, "relation": rel})
+        return out
+
+
+    def org_fibre_pon_map(self, org_id: str,
+                          feeds: dict[int, int | None] | None = None) -> dict[int, dict]:
+
+
+        with self._connect() as conn:
+            cables = self._raw_cables(conn, org_id)
+            joints = self._raw_joints(conn, org_id)
+        reached = fiber.pon_of_points(cables, joints)
+        out: dict[int, dict] = {}
+        for point, src in reached.items():
+            if point[0] != "device":
+                continue
+            if src is None:
+                out[point[1]] = {"olt_id": None, "pon_no": None,
+                                 "source": "fibre", "ambiguous": True}
+            elif src[0][0] == "device":
+                out[point[1]] = {"olt_id": src[0][1], "pon_no": src[1],
+                                 "source": "fibre", "ambiguous": False}
+        feeds = self.org_plant_feed_map(org_id) if feeds is None else feeds
+        for device_id in list(feeds):
+            if device_id in out:
+                continue
+            seen, cur = {device_id}, feeds.get(device_id)
+            while cur is not None and cur not in seen:
+                if cur in out:
+                    out[device_id] = {**out[cur], "source": "inherited",
+                                      "via_device_id": cur}
+                    break
+                seen.add(cur)
+                cur = feeds.get(cur)
+        return out
+
+
+    def trace_fibre(self, org_id: str, cable_id: int, core_no: int) -> dict:
+
         with self._connect() as conn:
             cables = self._raw_cables(conn, org_id)
             joints = self._raw_joints(conn, org_id)
@@ -1239,12 +1168,7 @@ class DeviceStoreMixin:
 
 
     def _plant_feed_points(self, org_id: str, cables: list[dict] | None = None) -> dict:
-        """The plant feed over POINTS — the shared half of the feed question.
 
-        Roots are the boxes a feed can only ever come FROM: gear (whose upstream
-        is its own declared parent) and any passive somebody has already parented.
-        Feeding out from those is what gives an undirected cable its direction.
-        """
         if cables is None:
             with self._connect() as conn:
                 cables = self._raw_cables(conn, org_id)
@@ -1276,13 +1200,7 @@ class DeviceStoreMixin:
 
 
     def set_org_device_tree_detached(self, org_id: str, device_id: int, on: bool) -> bool:
-        """Network-tree presentation only — the parent link is NOT touched.
 
-        An aggregation switch with a large subtree buries a device an operator
-        reads often; detaching lifts that row (and its own subtree) to the top
-        level of the tree WITHOUT lying about the plant: parent_device_id stays,
-        so suppression, the map and paging are unchanged.
-        """
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET tree_detached=? WHERE id=? AND org_id=? AND is_active=1",
@@ -1305,9 +1223,6 @@ class DeviceStoreMixin:
     def set_org_device_web_access(self, org_id: str, device_id: int, *,
                                   web_ip: str | None, web_port: int | None,
                                   web_scheme: str | None) -> bool:
-        """Set (or clear) a device's web-UI proxy address override. Each field is
-        independent: NULL ip = proxy the probe IP, NULL port = the scheme default,
-        NULL scheme = infer from port. All three NULL clears the override entirely."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE org_devices SET web_ip=?, web_port=?, web_scheme=?"
@@ -1355,16 +1270,6 @@ class DeviceStoreMixin:
                 "DELETE FROM org_device_links"
                 " WHERE org_id=? AND (child_id=? OR parent_id=?)",
                 (org_id, device_id, device_id))
-            # A CABLE NAMES TWO POINTS AND ONE OF THEM IS GOING. The glass may
-            # well still be in the ground, but "this sheath runs to a box that no
-            # longer exists" is not a record anybody can act on, and leaving it
-            # dangles an FK. Same call `link_routes` makes one line down.
-            #
-            # JOINTS FIRST, and by CABLE as well as by point: a fibre landing here
-            # may be joined at some OTHER closure, so sweeping only this device's
-            # own joints would leave rows pointing at cables about to go. Then the
-            # core register, for the same reason the cable delete takes it — a
-            # core is a position inside a particular sheath.
             conn.execute(
                 "DELETE FROM org_fibre_joints WHERE org_id=? AND (device_id=?"
                 " OR a_cable_id IN (SELECT id FROM org_cables WHERE org_id=?"
@@ -1397,12 +1302,6 @@ class DeviceStoreMixin:
             conn.execute("DELETE FROM web_optics_status WHERE org_id=? AND device_id=?",
                         (org_id, device_id))
             conn.execute("DELETE FROM olt_optics WHERE device_id=?", (device_id,))
-            # Removing a splitter un-records the drops that came off it, rather
-            # than dangling them: the box is gone, so "which passive feeds this
-            # subscriber" genuinely has no answer any more. The subscribers
-            # themselves are untouched (they live in the SNMP roster) and simply
-            # go back to reading "splitter not recorded" — the honest state, and
-            # the one the operator has to correct anyway once the plant moved.
             conn.execute("DELETE FROM onu_drops WHERE org_id=? AND passive_id=?",
                          (org_id, device_id))
             conn.execute("DELETE FROM pon_fault_state WHERE org_id=? AND device_id=?",
@@ -1418,11 +1317,6 @@ class DeviceStoreMixin:
                          (org_id, device_id))
             conn.execute("DELETE FROM snmp_walks WHERE org_id=? AND device_id=?",
                          (org_id, device_id))
-            # Paging responsibility for a device that no longer exists. The
-            # schema says ON DELETE CASCADE, but this is swept explicitly like
-            # every other FK table above: a deferred cascade would leave the
-            # deletion order dependent on a PRAGMA, and the guardrail test
-            # (test_delete_cascade_handles_every_fk_table) reads this source.
             conn.execute("DELETE FROM org_device_workers WHERE device_id=?",
                          (device_id,))
             conn.execute("DELETE FROM org_devices WHERE id=? AND org_id=?",
@@ -1432,10 +1326,6 @@ class DeviceStoreMixin:
 
 
     def org_device_topology(self, org_id: str) -> list[dict]:
-        # Passive plant (splitter/fdb/closure) is filtered HERE, the single choke
-        # point: the engine never builds an FSM for it (and the topology
-        # fingerprint doesn't move when plant is added — no rebuild, no re-page)
-        # and /edge/devices never ships an empty IP for a probe to ping.
         placeholders = ",".join("?" for _ in _PASSIVE_TYPES)
         with self._connect() as conn:
             rows = conn.execute(
@@ -1449,12 +1339,7 @@ class DeviceStoreMixin:
         return [dict(r) for r in rows]
 
 
-    # ----- device web-UI credentials -----------------------------------------
-
     def get_device_webui_credentials(self, org_id: str, device_id: int) -> dict | None:
-        """Raw credential row for a device, INCLUDING the encrypted password blob
-        (``password_enc``). Callers returning data to the browser must drop that
-        field — decode it through the SecretBox instead."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT device_id, username, password_enc, auth_mode, updated_by,"
@@ -1467,11 +1352,6 @@ class DeviceStoreMixin:
                                      username: str, password_enc: str | None,
                                      set_password: bool, auth_mode: str,
                                      updated_by: str) -> bool:
-        """Upsert a device's web-UI login. ``username`` is stored verbatim
-        (``''`` clears it). Password handling is explicit so a username-only edit
-        never wipes a stored password: ``set_password=False`` leaves the existing
-        ciphertext untouched; ``True`` writes ``password_enc`` (``None`` clears
-        it). Returns False if the device isn't an active member of this org."""
         with self._write_lock, self._connect() as conn:
             owned = conn.execute(
                 "SELECT 1 FROM org_devices WHERE id=? AND org_id=? AND is_active=1",
@@ -1551,26 +1431,12 @@ class DeviceStoreMixin:
             return cur.rowcount > 0
 
 
-    # ----- peer (cross) links -------------------------------------------------
-    # Switch-to-switch cabling between boxes at the same level. Rides the SAME
-    # table as backup edges under kind='peer', which is what keeps it invisible to
-    # the engine: every dependency read path (org_device_backup_edges/_map, and so
-    # load_device_meta and the rebuild fingerprint) filters kind='backup'. A peer
-    # link therefore CANNOT rebuild an engine or re-page anyone — the property the
-    # whole design rests on, pinned by test_central_peerlinks.
-    #
-    # A peer edge is UNDIRECTED, so the directional (child_id, parent_id) columns
-    # are canonicalized to (lo, hi) = (min, max) of the pair. One cable = one row
-    # no matter which end the operator declared it from; the UNIQUE index then
-    # makes a duplicate declaration a no-op instead of a second line on the map.
-
     @staticmethod
     def _peer_pair(a_id: int, b_id: int) -> tuple[int, int]:
         return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
 
 
     def org_device_peer_map(self, org_id: str) -> dict[int, set[int]]:
-        """Symmetric adjacency: every device → the peers it cross-links to."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT child_id, parent_id FROM org_device_links"

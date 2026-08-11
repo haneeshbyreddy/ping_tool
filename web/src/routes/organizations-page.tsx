@@ -53,7 +53,6 @@ export function OrganizationsPage() {
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to rename"),
   })
 
-  // web-UI proxy capability — a blast-radius switch, superadmin-granted per org
   const setWebProxy = useMutation({
     mutationFn: ({ id, on }: { id: string; on: boolean }) =>
       orgsApi.save({ org_id: id, web_proxy: on }),
@@ -61,10 +60,6 @@ export function OrganizationsPage() {
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to update"),
   })
 
-  // org deletion — the one action here with no undo: every device, outage,
-  // billing month and login account under it goes at once. Typed confirmation
-  // (server-enforced too), and the scope drops back to all-orgs after, or the
-  // shell would keep querying an org id that no longer exists.
   const [deleting, setDeleting] = useState<Org | null>(null)
   const remove = useMutation({
     mutationFn: (id: string) => orgsApi.remove(id),

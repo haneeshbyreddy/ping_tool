@@ -119,8 +119,6 @@ class HttpCentralClient:
         return self._post("/edge/snmp-walk", env)
 
     def proxy_next(self, hold_s: float) -> dict | None:
-        # Long-poll: central holds this open up to its proxy_poll_hold_s, so the
-        # read timeout must outlast that, NOT ride the short ship_timeout_s.
         client = self._http()
         try:
             resp = client.get(f"{self.base}/edge/proxy/next",

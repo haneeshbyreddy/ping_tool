@@ -17,10 +17,6 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 
-// `assigned` keeps the DESTRUCTIVE tone of `unassigned` on purpose: the owner
-// naming somebody does not make a device less down, and the badge is read at a
-// glance by people deciding what still needs attention. It says what is missing
-// — a reply — rather than pretending the job is under way.
 const STATUS_META: Record<OutageStatus, { label: string; className: string; border: string }> = {
   unassigned: { label: "Unassigned", className: "text-destructive border-destructive/30 bg-destructive-soft", border: "border-l-destructive" },
   assigned: { label: "Down · awaiting response", className: "text-destructive border-destructive/30 bg-destructive-soft", border: "border-l-destructive" },
@@ -39,8 +35,6 @@ function OutageDuration({ outage }: { outage: Outage }) {
 
 export function OutageCard({ outage }: { outage: Outage }) {
   const queryClient = useQueryClient()
-  // The card is shared by Home and the worker view, so it decides per session
-  // what it may offer: dispatch is owner-only, triage is everyone's.
   const { canWrite, user } = useAuth()
   const username = user?.username
   const [closing, setClosing] = useState(false)
@@ -54,8 +48,6 @@ export function OutageCard({ outage }: { outage: Outage }) {
     onSuccess: invalidate,
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed to acknowledge"),
   })
-  // "I'm on it" — the same thing the [✅ I'm on it] button on the WhatsApp
-  // assignment page presses, for whoever is at a desk instead of a pole.
   const accept = useMutation({
     mutationFn: () => outagesApi.accept(outage.id),
     onSuccess: (res) => {
@@ -104,17 +96,7 @@ export function OutageCard({ outage }: { outage: Outage }) {
         <div className="flex items-center justify-between gap-2">
           <OutageDuration outage={outage} />
           <div className="flex flex-wrap justify-end gap-2">
-            {/* Owners get ASSIGN as the primary action — deciding who goes out is
-                the owner's job, and "acknowledge" only ever said that somebody
-                saw it. Acknowledge stays available (an owner handling it alone
-                shouldn't have to assign themselves) but steps back to outline.
-                A worker sees only Acknowledge: it can triage, not dispatch. */}
             {!outage.resolved_at && canWrite && <AssignOutage outage={outage} />}
-            {/* The assignee's own answer. Offered only to somebody actually
-                named on this outage and only until they have answered — a
-                button that everyone can press would make "who accepted" mean
-                nothing, and one that stays after a yes invites a second press
-                that changes nothing. */}
             {mine && !accepted && (
               <Button size="sm" className="gap-1.5" disabled={accept.isPending}
                 onClick={() => accept.mutate()}>
@@ -140,11 +122,6 @@ export function OutageCard({ outage }: { outage: Outage }) {
           <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
             <UserCheck className="size-3 shrink-0" />
             <span>Assigned to</span>
-            {/* Every assignee carries their OWN answer: a tick for a yes, a
-                hollow chip for silence. One chip list rather than two, because
-                "who was asked" and "who is going" are the same question read at
-                different moments — and a name with no tick is the thing an owner
-                needs to see. */}
             {outage.assigned_to.map((who) => {
               const yes = outage.accepted_by.includes(who)
               return (
@@ -166,10 +143,6 @@ export function OutageCard({ outage }: { outage: Outage }) {
           </p>
         )}
 
-        {/* Said plainly under the chips, because the chips answer "who" and this
-            answers "and now what": an assignment nobody has replied to is a job
-            that may not be happening, and that is exactly what the badge above
-            is claiming. */}
         {outage.status === "assigned" && (
           <p className="text-xs text-muted-foreground">
             Waiting for {outage.assigned_to.length === 1 ? "a reply" : "someone"} to
@@ -186,9 +159,6 @@ export function OutageCard({ outage }: { outage: Outage }) {
           </p>
         )}
 
-        {/* Assignment already names who owns it, and stamps the ack — so don't
-            also say "acknowledged by <the owner who assigned it>", which reads as
-            a second, competing claim about who is on the job. */}
         {outage.status === "in_progress" && outage.assigned_to.length === 0 && (
           <p className="text-xs text-muted-foreground">Acknowledged by {outage.acknowledged_by}. Waiting for recovery.</p>
         )}

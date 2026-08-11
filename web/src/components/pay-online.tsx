@@ -6,11 +6,6 @@ import { billingApi, ApiError } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 
-/** "I've paid": once the org has sent the GPay/QR payment, this pings the
- * platform admin's payments channel with the org name so they verify and mark
- * the month. There's no gateway to confirm against — the admin does that by
- * hand — so the button just fires the heads-up and reports it was sent. It
- * stays reachable while the dashboard is locked. */
 export function IvePaidButton({
   org, label = "I've paid", variant = "default", size = "sm", className,
 }: {
@@ -30,8 +25,6 @@ export function IvePaidButton({
       setPhase("sent")
       toast.success("Thanks, we've let the team know. Your dashboard unlocks "
         + "the moment your payment is confirmed.")
-      // billing itself doesn't change yet (the admin marks the month), but a
-      // refetch keeps the card honest if they already did
       queryClient.invalidateQueries({ queryKey: ["billing"] })
     } catch (e) {
       setPhase("idle")
@@ -50,9 +43,6 @@ export function IvePaidButton({
   )
 }
 
-/** Self-serve drop to Free — the only plan change that needs no payment, and
- * the lock screen's escape hatch for an org that won't pay this month.
- * Confirmed first: it's a real downgrade, not a checkout. */
 export function FreePlanButton({
   org, label = "Switch to Free", variant = "outline", size = "sm",
   className, onDone,

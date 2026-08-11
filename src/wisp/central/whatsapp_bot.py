@@ -1,37 +1,3 @@
-"""Inbound WhatsApp lookup bot (v1).
-
-The OUTBOUND half (``egress/notifiers.py`` WhatsAppNotifier, template
-``wisp_alert1``) pages the fleet. This is the INBOUND half: an owner or worker
-messages the business number with a MAC or ONU name and gets a reply card back,
-with reply-buttons for follow-ups ([Refresh dBm] [On map] [Recent]).
-
-**Every dead end offers the menu.** A greeting, a 1–2 char needle, a miss, a
-photo, an unknown button id — all reply with the same tappable
-[Search by MAC] [Search by name] card rather than a bare instruction line, and
-those two buttons only PRINT the format. There is deliberately no per-sender
-"waiting for a MAC" state: one search covers both (`search_key` over serial AND
-name), so nothing can desync from a conversation that went quiet for a day.
-
-**Central-only, org-scoped by construction.** The sender's number resolves to
-exactly ONE ``(user, org, role)`` via ``store.whatsapp_user``; EVERY lookup is
-scoped to THAT org. An unknown/ambiguous/org-less number is IGNORED — no reply,
-no org scoped — the same lateral-move caution ``onu-search`` takes. Owner-only
-actions ([Refresh dBm] spends the OLT's stored web login) gate on the resolved
-role, mirroring ``can_triage`` / ``_WORKER_ROUTES``.
-
-**Honesty.** A NULL ``rx_dbm`` never renders as ``0`` — it says "no dBm reported
-for this OLT/vendor" (when the OLT reports none at all) or "no reading" (when it
-reports Rx for other ONUs but not this one). A down/stale OLT prints a "readings
-are frozen" note with the last-walk age. Same rules the SPA rx-diagnosis follows.
-
-**Reuse, not reimplementation.** Lookup rides ``store.onu_search_device_ids`` +
-``onuroster.current_roster`` — byte-for-byte the ``/api/inventory/onu-search``
-path. Refresh rides the SAME ``WebOpticsSweeper.target()/scrape_device`` the
-dashboard rx-refresh button uses (owner-only, per-OLT lock, recorded outcome).
-
-Deferred (noted, NOT built): the "/" command menu (Conversational Automation),
-Lists, Flows, buttoned alert templates.
-"""
 from __future__ import annotations
 
 import logging
@@ -44,21 +10,15 @@ from wisp.core.state_machine import DOWN_FAMILY
 log = logging.getLogger("wisp.central.whatsapp_bot")
 
 _NOT_YOURS = "That OLT isn't in your network."
-_MIN_NEEDLE = 3       # matches ONU_SEARCH_MIN — a 1–2 char needle is noise
-_MAX_LIST = 8         # cap the lines in a multi-ONU / multi-OLT reply
+_MIN_NEEDLE = 3
+_MAX_LIST = 8
 
-# A greeting is not a needle. Matched on `search_key` (alphanumeric, upper), so
-# "Hi there!" and "hi_there" both land here rather than being searched for and
-# reported missing — a miss reads as a fault when the user only said hello.
 _GREETINGS = frozenset({
     "HI", "HII", "HIII", "HIHI", "HITHERE", "HELLO", "HELLOW", "HEY", "HEYTHERE",
     "HELP", "MENU", "START", "HOLA", "NAMASTE", "NAMASKARAM", "OK", "OKAY",
     "THANKS", "THANKYOU", "THX", "TEST", "TESTING",
     "GOODMORNING", "GOODAFTERNOON", "GOODEVENING", "GM", "GE",
 })
-# Reply-button ids. `ask:*` only prints the format — the lookup itself is
-# format-agnostic (one search covers MAC and name), so there is deliberately NO
-# per-sender "waiting for a MAC" state to keep in sync with a 24h window.
 _ASK_MAC, _ASK_NAME = "ask:mac", "ask:name"
 _MENU_BUTTONS = ((_ASK_MAC, "Search by MAC"), (_ASK_NAME, "Search by name"))
 _FMT_MAC = ("📇 Send the ONU's MAC address.\n\n"
@@ -72,14 +32,6 @@ _FMT_NAME = ("🔖 Send the ONU's name as provisioned on the OLT.\n\n"
 
 
 class _LoggedNotifier:
-    """Wraps the notifier so a REFUSED reply is visible in the log.
-
-    Every send here is best-effort by construction (`NotifyResult(False, …)`,
-    never an exception), and the happy path logs nothing — so a reply Meta
-    rejects (expired 24h window, a number outside the allowed list on an
-    unpublished app, a bad token) presented EXACTLY like a message that was
-    never delivered to us at all. One wrapper rather than ~16 call sites so a
-    reply added later can't forget to check."""
 
     def __init__(self, inner) -> None:
         self._inner = inner
@@ -92,16 +44,12 @@ class _LoggedNotifier:
                             self._inner.send_buttons(to, body, buttons))
 
     def send(self, title, body, priority=3, *, whatsapp=(), facts=None):
-        """The cold-page template. Not a bot REPLY — the one thing the bot sends
-        to somebody who didn't just message us (telling an owner their assignment
-        was accepted), where the 24h window belongs to the wrong person."""
         return self._logged("template", ",".join(whatsapp),
                             self._inner.send(title, body, priority,
                                              whatsapp=list(whatsapp), facts=facts))
 
     @staticmethod
     def _logged(kind: str, to: str, res):
-        # A double may return None; only a real NotifyResult carries `ok`.
         if res is not None and not getattr(res, "ok", True):
             log.warning("whatsapp bot reply (%s) to …%s FAILED: %s",
                         kind, str(to)[-4:], getattr(res, "detail", ""))
@@ -109,21 +57,15 @@ class _LoggedNotifier:
 
 
 class WhatsAppBot:
-    """One-shot handler for an inbound webhook payload. Construct per delivery
-    (cheap) so per-batch caches (`_dm`) don't outlive their org."""
-
     def __init__(self, store, notifier, sweeper=None, *, base_url: str = "") -> None:
         self.store = store
         self.notifier = _LoggedNotifier(notifier)
         self.sweeper = sweeper
         self.base_url = (base_url or "").rstrip("/")
-        self._dm: tuple[str, dict] | None = None   # (org, {id: device_row})
+        self._dm: tuple[str, dict] | None = None
 
-    # -- entry ----------------------------------------------------------------
 
     def handle(self, payload: dict) -> None:
-        """Never raises — this runs on a background thread off the acked webhook;
-        a bug here must not take the thread (or the next message) down."""
         try:
             for msg, sender in self._messages(payload):
                 try:
@@ -135,8 +77,6 @@ class WhatsAppBot:
 
     @staticmethod
     def _messages(payload: dict):
-        """Yield (message, from_number) for every inbound message, skipping the
-        delivery/read STATUS callbacks (which carry `statuses`, not `messages`)."""
         for entry in (payload.get("entry") or []):
             for change in (entry.get("changes") or []):
                 value = change.get("value") or {}
@@ -148,7 +88,6 @@ class WhatsAppBot:
     def _dispatch(self, sender: str, msg: dict) -> None:
         user = self.store.whatsapp_user(sender)
         if not user:
-            # Unknown/ambiguous/org-less number — ignore by design (no reply).
             log.info("whatsapp inbound from unrecognised number; ignored")
             return
         org = user["org_id"]
@@ -162,15 +101,11 @@ class WhatsAppBot:
                 self._handle_button(sender, user, org, bid)
             else:
                 self._menu(sender, user)
-        else:  # image / audio / location / … — not part of v1
+        else:
             self._menu(sender, user)
 
-    # -- the menu -------------------------------------------------------------
 
     def _menu(self, sender: str, user: dict, prefix: str = "") -> None:
-        """The greeting/fallback reply: what the bot can do, as tappable options.
-        Sent for a greeting, a too-short needle, a miss, an unhandled message
-        type and an unknown button id — every dead end offers the way forward."""
         who = (user.get("username") or "").strip()
         body = f"👋 Hi {who}." if who else "👋 Hi."
         body += " What would you like to look up?"
@@ -178,7 +113,6 @@ class WhatsAppBot:
             body = f"{prefix}\n\n{body}"
         self.notifier.send_buttons(sender, body, _MENU_BUTTONS)
 
-    # -- text lookup ----------------------------------------------------------
 
     def _handle_text(self, sender: str, user: dict, org: str, text: str) -> None:
         text = (text or "").strip()
@@ -196,8 +130,6 @@ class WhatsAppBot:
             self.notifier.send_buttons(sender, self._card(dev, hits, now),
                                        self._buttons(dev, onu_id, user.get("role")))
             return
-        # Several OLTs matched — ambiguous which one a button would act on, so no
-        # buttons; list the OLTs and ask for a fuller identifier.
         lines = [f'Matches on {len(matches)} OLTs for "{text[:60]}":']
         for dev, hits in matches[:_MAX_LIST]:
             lines.append(f'• {dev.get("name") or dev.get("id")}: {len(hits)} ONU(s)')
@@ -205,9 +137,6 @@ class WhatsAppBot:
         self.notifier.send_text(sender, "\n".join(lines))
 
     def _search(self, org: str, needle: str):
-        """Mirror /api/inventory/onu-search: org-scoped, CURRENT roster (freshest
-        walk, stale OLTs kept — same as the drill-down), merged rx_dbm. Returns
-        [(device_row, [onu, …]), …] sorted by OLT name, plus `now`."""
         now = datetime.now(timezone.utc)
         out: list[tuple[dict, list[dict]]] = []
         for did in self.store.onu_search_device_ids(org, needle):
@@ -216,8 +145,6 @@ class WhatsAppBot:
                 continue
             roster = onuroster.current_roster(
                 self.store.list_onu_optics(org, did), now, stale_s=None)
-            # the OPERATOR's name is searchable beside the walked one — after a
-            # field survey it is the name the tech texting us actually knows
             hits = [o for o in roster
                     if needle in onuroster.search_key(o.get("serial"))
                     or needle in onuroster.search_key(o.get("name"))
@@ -262,13 +189,12 @@ class WhatsAppBot:
     def _buttons(dev: dict, onu_id, role: str | None):
         did = dev.get("id")
         btns: list[tuple[str, str]] = []
-        if role == "owner":      # spends the OLT's web login — owner-only
+        if role == "owner":
             btns.append((f"refresh:{did}", "Refresh dBm"))
         btns.append((f"map:{did}" + (f":{onu_id}" if onu_id else ""), "On map"))
         btns.append((f"recent:{did}", "Recent"))
         return btns
 
-    # -- button follow-ups ----------------------------------------------------
 
     def _handle_button(self, sender: str, user: dict, org: str, payload: str) -> None:
         action, _, rest = payload.partition(":")
@@ -289,20 +215,10 @@ class WhatsAppBot:
             self._menu(sender, user)
 
     def _accept(self, sender: str, user: dict, org: str, oid: int | None) -> None:
-        """[✅ I'm on it] on an assignment page — the same accept the dashboard
-        button performs, on the same store method and the same rule (only a named
-        assignee may accept). A worker at a pole answers from the notification
-        instead of finding a laptop, which is the whole reason the page carries a
-        button; the dashboard then shows them as accepted like any other yes.
 
-        The reply is always a plain sentence, never a dead end: every outcome
-        (accepted / already / not yours / already resolved) is a fact the tapper
-        needs, and silence would read as a button that did nothing."""
         if oid is None:
             return
         outcome = self.store.accept_outage(org, oid, user.get("username") or "")
-        # `org` came from the sender's own account, so a cross-org outage id is
-        # simply "missing" here — never another org's device name.
         if outcome == "ok":
             row = self._outage(org, oid)
             device = (row or {}).get("device_name") or "the outage"
@@ -321,17 +237,12 @@ class WhatsAppBot:
                         "reassigned). Nothing was changed.")
 
     def _tell_assigner(self, org: str, row: dict | None, who: str) -> None:
-        """Tell whoever assigned it that the answer came in — the same courtesy
-        the dashboard accept sends, since the two buttons must not differ in
-        anything but where they were pressed."""
         by = (row or {}).get("assigned_by")
         if not by:
             return
         device = (row or {}).get("device_name") or "the outage"
         detail = f"{who} accepted the assignment on {device}"
         text = f"✅ {detail}."
-        # The assigner did NOT just message us, so their 24h window is usually
-        # shut — free-form first (it's the nicer message), template for the rest.
         cold = [n for n in self.store.named_whatsapp(org, [by])
                 if not getattr(self.notifier.send_text(n, text), "ok", True)]
         if cold:
@@ -349,12 +260,10 @@ class WhatsAppBot:
     def _refresh(self, sender: str, user: dict, org: str, did: int | None) -> None:
         if did is None:
             return
-        # Owner-gated: same grade as opening a proxy session (it spends the stored
-        # web-UI credential down the tunnel), which a worker never has.
         if user.get("role") != "owner":
             self.notifier.send_text(sender, "🔒 Refresh dBm is owner-only.")
             return
-        dev = self._device(org, did)   # org-scoped: a cross-org id returns None
+        dev = self._device(org, did)
         if not dev:
             self.notifier.send_text(sender, _NOT_YOURS)
             return
@@ -368,7 +277,7 @@ class WhatsAppBot:
                 sender, f"A read of {dev.get('name')} is already running. "
                         "Try again shortly.")
             return
-        target = sweeper.target(org, did)   # the SAME eligibility the button/route use
+        target = sweeper.target(org, did)
         if target is None:
             self.notifier.send_text(
                 sender, f"{dev.get('name')} isn't set up for web-UI optical reads.")
@@ -396,7 +305,6 @@ class WhatsAppBot:
         lat, lng = dev.get("lat"), dev.get("lng")
         lines = [f"🗺️ {dev.get('name') or dev.get('id')}"]
         if lat is not None and lng is not None:
-            # A tappable pin — the useful thing for a tech standing in the field.
             lines.append(f"https://www.google.com/maps?q={lat},{lng}")
         else:
             lines.append("Not placed on the map yet.")
@@ -425,15 +333,12 @@ class WhatsAppBot:
                 lines.append(f"• {when} ago · {r.get('final_state')} · 🔴 ONGOING")
         self.notifier.send_text(sender, "\n".join(lines))
 
-    # -- per-batch device cache (one list_org_devices call, org-scoped) --------
 
     def _device(self, org: str, did) -> dict | None:
         if self._dm is None or self._dm[0] != org:
             self._dm = (org, {d["id"]: d for d in self.store.list_org_devices(org)})
         return self._dm[1].get(did)
 
-
-# --- formatting helpers ------------------------------------------------------
 
 def _int(s) -> int | None:
     try:
@@ -449,8 +354,6 @@ def _state_label(state: str | None) -> str:
 
 
 def _rx(o: dict, olt_has_rx: bool) -> str:
-    """Never a bare 0 for a missing reading — the whole point of the honesty
-    rules. A real figure carries its severity marker; a NULL says WHY."""
     rx = o.get("rx_dbm")
     if rx is not None:
         mark = {"crit": " ⛔", "warn": " ⚠️"}.get(o.get("severity"), "")

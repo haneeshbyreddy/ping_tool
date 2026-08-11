@@ -1,45 +1,7 @@
-// THE TRAY: what every fibre in one cable does at one point.
-//
-// IT IS A SPLICE SCHEDULE — a table, one row per fibre — because that is the
-// document this replaces, and because of what the two-column form could not do.
-//
-// THE TWO-COLUMN TRAY WAS THE WRONG SHAPE AND IT FAILED ON A REAL ASK
-// (2026-08-10, the operator's own case: *core 1 to OLT1, core 2 to OLT2, core 3
-// to a customer*). Facing pages are right for cable↔cable — a real splice tray
-// has two sides — but they make the destination a property of the PANEL, and a
-// closure's terminations fan out to many different boxes. So:
-//
-//   * that arrangement could be ENTERED but never DISPLAYED. With one box on the
-//     right, the cores that went elsewhere drew as EMPTY cells — and empty reads
-//     as "nothing here" when it means "spoken for, elsewhere". The panel hid the
-//     work you had just done, which is the absent-vs-unknown rule this codebase
-//     keeps everywhere else, broken on its own newest screen;
-//   * three destinations meant three trips through a dropdown, setting a MODE
-//     before each click. The promise was "click a fibre, click what it goes to";
-//     the shape could not keep it;
-//   * undo was mode-dependent — a core tailed to OLT2 could only be cleared
-//     while OLT2 happened to be the side on show.
-//
-// So the destination moved ONTO THE ROW, where it always belonged. Mixed
-// destinations now coexist because nothing is modal, and the resting panel shows
-// the truth for every core at once. Two things keep that from becoming a wall of
-// text on a 24F:
-//
-// A STRAIGHT-THROUGH RUN COLLAPSES to one line. Nine closures in ten are 1:1 all
-// the way across, and twenty-four rows saying the same thing is not information.
-// A CROSSING NEVER COLLAPSES — core 3 to core 7 is the one thing at a closure
-// worth reading twice, so it always gets its own row.
-//
-// A RUN NEVER CROSSES A BUFFER TUBE. Past twelve fibres the sequence restarts
-// inside a tube and a crew works tube by tube, so "1–24 straight through" would
-// describe a job nobody does in one go. Two runs of twelve is the truth.
-//
-// THE ARCS ARE GONE, and nothing was lost. Their one real job was showing 1:1
-// across two cables; a collapsed run says that in words AND states the core
-// numbers, which an arc cannot. What they cost was the second column.
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
-  Check, ChevronDown, ChevronRight, Plug, Search, User, Waypoints, X,
+  Check, ChevronDown, ChevronRight, FileText, Plug, Plus, Search, User,
+  Waypoints, X,
 } from "lucide-react"
 import { StrandSwatch } from "@/components/cable-record"
 import { Button } from "@/components/ui/button"
@@ -48,42 +10,36 @@ import {
   DropdownMenuPortal, DropdownMenuSeparator, DropdownMenuSub,
   DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { strandLabel, strandName, TUBE_SIZE } from "@/lib/fiber"
-import type { FibreJoint, PointFibre, TrayCable } from "@/lib/types"
+import { isPlumbing, portLabel, strandLabel, strandName, TUBE_SIZE } from "@/lib/fiber"
+import type {
+  FibreJoint, PointFibre, TrayCable, TrayPort, UndrawnLink,
+} from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 export type Fibre = { cableId: number; coreNo: number }
 
-/** A box a fibre may be taken out to. Supplied by the caller: which boxes are
- *  NEAR this one is a question about the map, not about fibre. */
 export interface TrayBox {
   id: number
   name: string
   device_type?: string | null
-  /** straight-line km from this point; null when unknown */
+  declared?: boolean
+  port_kind?: string | null
+  ports?: TrayPort[]
   km: number | null
 }
 
-/** A subscriber a fibre may be taken out to. The case the two-column tray could
- *  not express AT ALL — the picker was built from devices, so "this core is the
- *  drop to that customer" was not merely awkward, it was unsayable. */
 export interface TrayPerson {
   mac: string
   name: string
   km: number | null
 }
 
-/** Where a fibre goes to on the far side of the tail cable it was joined to. */
 type Reach = { name: string; tail: true } | null
 
 const MIN_RUN = 3
 
-/** Which fibre each fibre is joined to at this point, and by which joint.
- *
- *  Keyed both ways round because a splice is undirected and either side has to
- *  be able to see it and undo it. A TERMINATION maps to null with a joint, which
- *  is a different thing from having no entry at all: one is "taken out to the box
- *  here", the other is "nothing recorded". */
+const MIN_PORT_RUN = 8
+
 function joinIndex(joints: FibreJoint[]) {
   const out = new Map<string, { to: Fibre | null; joint: FibreJoint }>()
   const key = (c: number, n: number) => `${c}:${n}`
@@ -100,14 +56,8 @@ function joinIndex(joints: FibreJoint[]) {
   return out
 }
 
-/** Which cable's schedule to open on.
- *
- *  THE BIGGEST, ties broken by the server's feed hint. It was the feed outright
- *  until tails existed: light at a closure now arrives up a 1F tail, so
- *  feed-first opened the tray on a single strand with the 24F trunk — the thing
- *  you came to work on — hidden behind a dropdown. */
 function defaultCable(cables: TrayCable[]): number | null {
-  const sorted = [...cables].sort((a, b) =>
+  const sorted = cables.filter((c) => !c.plumbing).sort((a, b) =>
     (b.cores ?? 0) - (a.cores ?? 0)
     || (a.side === "feed" ? 0 : 1) - (b.side === "feed" ? 0 : 1))
   return sorted[0]?.cable_id ?? null
@@ -116,30 +66,89 @@ function defaultCable(cables: TrayCable[]): number | null {
 const kmLabel = (km: number | null) =>
   km == null ? "" : km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`
 
-/** One line of the schedule: a core, a straight-through run, or a free run. */
+function askFarPort(resolve: ((id: number) => TrayBox | undefined) | undefined,
+                    deviceId?: number | null): TrayBox | undefined {
+  if (deviceId == null || !resolve) return undefined
+  const box = resolve(deviceId)
+  if (!box || !(box.ports?.length)) return undefined
+  const inputs = box.ports.filter((p) => p.kind === "in")
+  if (box.device_type === "splitter" && inputs.length <= 1) return undefined
+  return box
+}
+
+function BoxItem({ box, onPick }: {
+  box: TrayBox
+  onPick: (port?: TrayPortRef) => void
+}) {
+  const [typed, setTyped] = useState("")
+  const kind = box.port_kind
+  const note = box.declared ? "on the map" : kmLabel(box.km) || box.device_type
+  if (!kind) {
+    return (
+      <DropdownMenuItem onSelect={() => onPick()}>
+        <Plug className="size-3 shrink-0 text-muted-foreground" />
+        <span className="truncate">{box.name}</span>
+        <span className="ml-auto shrink-0 whitespace-nowrap pl-2 text-2xs text-faint-foreground">
+          {note}
+        </span>
+      </DropdownMenuItem>
+    )
+  }
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <Plug className="size-3 shrink-0 text-muted-foreground" />
+        <span className="truncate">{box.name}</span>
+        <span className="ml-auto shrink-0 whitespace-nowrap pl-2 text-2xs text-faint-foreground">
+          {note}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuPortal>
+        <DropdownMenuSubContent className="max-h-80 min-w-44 overflow-y-auto">
+          <DropdownMenuItem onSelect={() => onPick()}>
+            <span className="text-2xs text-faint-foreground">
+              Port not known yet
+            </span>
+          </DropdownMenuItem>
+          {(box.ports?.length ?? 0) > 0 && <DropdownMenuSeparator />}
+          {(box.ports ?? []).map((p) => (
+            <DropdownMenuItem key={`${p.kind}:${p.no}`}
+              onSelect={() => onPick({ kind: p.kind, no: p.no })}>
+              <span className="font-mono text-2xs">{p.label}</span>
+              {p.device_label && (
+                <span className="ml-auto min-w-0 truncate pl-2 text-2xs text-faint-foreground">
+                  {p.device_label}
+                </span>
+              )}
+            </DropdownMenuItem>
+          ))}
+          <DropdownMenuSeparator />
+          <div className="flex items-center gap-1.5 px-2 py-1.5"
+            onKeyDown={(e) => e.stopPropagation()}>
+            <span className="shrink-0 font-mono text-2xs text-faint-foreground">
+              {kind === "pon" ? "PON" : kind}
+            </span>
+            <input value={typed} onChange={(e) => setTyped(e.target.value)}
+              inputMode="numeric" placeholder="no."
+              className="h-6 w-14 rounded border border-border bg-background px-1.5 text-2xs" />
+            <button type="button"
+              disabled={!/^\d+$/.test(typed.trim()) || parseInt(typed, 10) < 1}
+              onClick={() => onPick({ kind, no: parseInt(typed, 10) })}
+              className="rounded px-1.5 py-0.5 text-2xs text-muted-foreground hover:bg-foreground/10 disabled:opacity-40">
+              Connect
+            </button>
+          </div>
+        </DropdownMenuSubContent>
+      </DropdownMenuPortal>
+    </DropdownMenuSub>
+  )
+}
+
 type Row =
   | { kind: "core"; coreNo: number }
   | { kind: "run"; from: number; to: number; cableId: number }
   | { kind: "free"; from: number; to: number }
 
-/** THE SCHEDULE, as it reads.
- *
- *  TWO KINDS OF RUN COLLAPSE, and leaving either one out buries the rows that
- *  matter. A straight-through run, because nine closures in ten are 1:1 and
- *  twenty-four identical lines are not information. And an UNRECORDED run,
- *  because a 96F trunk with four cores in use would otherwise put ninety-two
- *  rows of "+ join" around the four an operator came to read — the same failure
- *  as the first, from the opposite direction.
- *
- *  A CROSSING NEVER COLLAPSES. Core 3 to core 7 is the one thing at a closure
- *  worth reading twice, and a termination is a decision somebody made; both keep
- *  their own row however many neighbours look like them.
- *
- *  RUNS STOP AT EVERY TUBE BOUNDARY. A crew opens one tube at a time, so a line
- *  claiming "1–24" describes a job nobody does in one go.
- *
- *  "Free" here means UNRECORDED, and the row says exactly that — never "spare".
- *  Nobody wrote those down, which is not the same as nothing being in them. */
 function schedule(
   cores: number,
   destOf: (coreNo: number) => { to: Fibre | null } | undefined,
@@ -182,39 +191,24 @@ function schedule(
   return rows
 }
 
-/** The searchable "what does this fibre do" menu — ONE menu for every answer.
- *
- *  Grouped by the three kinds of thing a fibre can end on and searchable across
- *  all of them, because an operator knows the NAME of where they are sending it
- *  and should not have to know which category we filed it under. Splicing takes a
- *  second click for the CORE, and that is deliberate: auto-picking one would be a
- *  capacity claim, and "recorded is never occupied" is the rule this whole
- *  subsystem is built on. */
 function DestMenu({
-  here, cables, boxes, people, joinsOf, onSplice, onHere, onBox, onPerson, children,
+  here, cables, boxes, people, herePorts = [], joinsOf,
+  onSplice, onHere, onBox, onPerson, children,
 }: {
   here: string
   cables: TrayCable[]
   boxes: TrayBox[]
   people: TrayPerson[]
+  herePorts?: TrayPort[]
   joinsOf: (cableId: number, coreNo: number) => { to: Fibre | null } | undefined
   onSplice: (cableId: number, coreNo: number) => void
-  onHere: () => void
-  onBox: (deviceId: number) => void
+  onHere: (port?: TrayPortRef) => void
+  onBox: (deviceId: number, port?: TrayPortRef) => void
   onPerson: (mac: string) => void
   children: React.ReactNode
 }) {
   const [q, setQ] = useState("")
   const hit = (s: string) => s.toLowerCase().includes(q.trim().toLowerCase())
-  /** Has this cable any core still free AT THIS POINT?
-   *
-   *  Not a capacity claim — the "recorded is never occupied" rule bans those —
-   *  but the exactly checkable one: every core of it already carries a joint
-   *  HERE, so there is nothing left to splice onto. It matters because taking a
-   *  core out to a box lays a 1F TAIL that lands at this point too, so a closure
-   *  feeding an 8-PON OLT grows eight one-fibre cables that show up as splice
-   *  targets with nothing to offer. Shown DISABLED rather than hidden, the same
-   *  way a used core is: "full" and "not a cable here" are different answers. */
   const freeIn = (c: TrayCable) =>
     !c.cores || Array.from({ length: c.cores }, (_, i) => i + 1)
       .some((n) => !joinsOf(c.cable_id, n))
@@ -227,10 +221,6 @@ function DestMenu({
       <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
       <DropdownMenuContent align="end" style={{ width: "auto" }}
         className="max-h-96 min-w-64 max-w-80 overflow-y-auto">
-        {/* The filter STOPS KEY EVENTS. A Radix menu runs its own typeahead on
-            printable keys, so without this every character both filtered the
-            list and jumped the highlight to some item starting with that
-            letter. */}
         <div className="sticky top-0 z-10 -mx-1 -mt-1 mb-1 flex items-center gap-1.5 border-b bg-popover px-2 py-1.5">
           <Search className="size-3 shrink-0 text-faint-foreground" />
           <input
@@ -269,10 +259,6 @@ function DestMenu({
                         Record its fibre count first
                       </DropdownMenuItem>
                     ) : Array.from({ length: c.cores }, (_, k) => k + 1).map((n) => {
-                      // A core already spoken for HERE is shown and disabled
-                      // rather than hidden: "taken" and "not a core of this
-                      // cable" are different answers, and only one of them is
-                      // the operator's mistake.
                       const held = joinsOf(c.cable_id, n)
                       return (
                         <DropdownMenuItem key={n} disabled={!!held}
@@ -298,23 +284,41 @@ function DestMenu({
             <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
               Take into
             </DropdownMenuLabel>
-            {hit(here) && (
-              <DropdownMenuItem onSelect={onHere}>
+            {hit(here) && (herePorts.length === 0 ? (
+              <DropdownMenuItem onSelect={() => onHere()}>
                 <Plug className="size-3 shrink-0 text-muted-foreground" />
                 <span className="truncate">{here}</span>
                 <span className="ml-auto shrink-0 pl-2 text-2xs text-faint-foreground">
                   this box
                 </span>
               </DropdownMenuItem>
-            )}
+            ) : (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Plug className="size-3 shrink-0 text-muted-foreground" />
+                  <span className="truncate">{here}</span>
+                  <span className="ml-auto shrink-0 pl-2 text-2xs text-faint-foreground">
+                    this box
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuPortal>
+                  <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+                    <DropdownMenuItem onSelect={() => onHere()}>
+                      <span className="text-muted-foreground">port not recorded</span>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    {herePorts.map((p) => (
+                      <DropdownMenuItem key={`${p.kind}:${p.no}`}
+                        onSelect={() => onHere({ kind: p.kind, no: p.no })}>
+                        <span className="font-mono text-2xs">{p.label}</span>
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuPortal>
+              </DropdownMenuSub>
+            ))}
             {bs.map((b) => (
-              <DropdownMenuItem key={b.id} onSelect={() => onBox(b.id)}>
-                <Plug className="size-3 shrink-0 text-muted-foreground" />
-                <span className="truncate">{b.name}</span>
-                <span className="ml-auto shrink-0 whitespace-nowrap pl-2 text-2xs text-faint-foreground">
-                  {kmLabel(b.km) || b.device_type}
-                </span>
-              </DropdownMenuItem>
+              <BoxItem key={b.id} box={b} onPick={(port) => onBox(b.id, port)} />
             ))}
           </>
         )}
@@ -348,33 +352,217 @@ function DestMenu({
   )
 }
 
-export function CouplerTray({
-  fibre, canWrite, busy, error, boxes = [], people = [], onJoin, onTail, onThrough,
-  onClear, onClearError, onTrace,
+function SourceMenu({
+  cables, boxes = [], people = [], joinsOf, onPick, onConnect, onDrop, children,
 }: {
-  fibre: PointFibre
-  canWrite: boolean
+  cables: TrayCable[]
+  boxes?: TrayBox[]
+  people?: TrayPerson[]
+  joinsOf: (cableId: number, coreNo: number) => { to: Fibre | null } | undefined
+  onPick: (f: Fibre) => void
+  onConnect?: (deviceId: number, port?: TrayPortRef) => void
+  onDrop?: (mac: string) => void
+  children: React.ReactNode
+}) {
+  const [q, setQ] = useState("")
+  const hit = (s: string) => s.toLowerCase().includes(q.trim().toLowerCase())
+  const bs = onConnect ? boxes.filter((b) => hit(b.name)) : []
+  const ps = onDrop ? people.filter((p) => hit(p.name)) : []
+  const cs = cables.filter((c) => hit(c.name))
+  return (
+    <DropdownMenu onOpenChange={(o) => { if (!o) setQ("") }}>
+      <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
+      <DropdownMenuContent align="end" style={{ width: "auto" }}
+        className="max-h-96 min-w-64 max-w-80 overflow-y-auto">
+        {(boxes.length + people.length + cables.length > 6) && (
+          <div className="sticky top-0 z-10 -mx-1 -mt-1 mb-1 flex items-center gap-1.5 border-b bg-popover px-2 py-1.5">
+            <Search className="size-3 shrink-0 text-faint-foreground" />
+            <input autoFocus value={q} onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => { if (e.key !== "Escape") e.stopPropagation() }}
+              placeholder="cable, box or customer…"
+              className="w-full bg-transparent text-xs outline-none placeholder:text-faint-foreground" />
+          </div>
+        )}
+
+        {ps.length > 0 && onDrop && (
+          <>
+            <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+              Customer on this leg
+            </DropdownMenuLabel>
+            {ps.map((p) => (
+              <DropdownMenuItem key={p.mac} onSelect={() => onDrop(p.mac)}>
+                <User className="size-3 shrink-0 text-muted-foreground" />
+                <span className="truncate">{p.name}</span>
+                <span className="ml-auto shrink-0 whitespace-nowrap pl-2 text-2xs text-faint-foreground">
+                  {kmLabel(p.km) || "recorded here"}
+                </span>
+              </DropdownMenuItem>
+            ))}
+          </>
+        )}
+
+        {bs.length > 0 && onConnect && (
+          <>
+            {ps.length > 0 && <DropdownMenuSeparator />}
+            <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+              Connect to
+            </DropdownMenuLabel>
+            {bs.map((b) => (
+              <BoxItem key={b.id} box={b} onPick={(port) => onConnect(b.id, port)} />
+            ))}
+          </>
+        )}
+
+        {cs.length > 0 && (bs.length > 0 || ps.length > 0) && <DropdownMenuSeparator />}
+        {cs.length > 0 && (
+          <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+            A core already landing here
+          </DropdownMenuLabel>
+        )}
+        {cables.length === 0 && bs.length === 0 && ps.length === 0 ? (
+          <p className="px-2 py-3 text-center text-2xs text-faint-foreground">
+            Nothing placed nearby to connect to yet.
+          </p>
+        ) : cs.map((c) => (
+          <DropdownMenuSub key={c.cable_id}>
+            <DropdownMenuSubTrigger>
+              <Waypoints className="size-3 shrink-0 text-muted-foreground" />
+              <span className="truncate">{c.name}</span>
+              <span className="ml-auto shrink-0 pl-2 text-2xs text-faint-foreground">
+                {c.cores ? `${c.cores}F` : "no count"}
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+                {!c.cores ? (
+                  <DropdownMenuItem disabled>
+                    Record its fibre count first
+                  </DropdownMenuItem>
+                ) : Array.from({ length: c.cores }, (_, k) => k + 1).map((n) => {
+                  const held = joinsOf(c.cable_id, n)
+                  return (
+                    <DropdownMenuItem key={n} disabled={!!held}
+                      onSelect={() => onPick({ cableId: c.cable_id, coreNo: n })}>
+                      <StrandSwatch coreNo={n} className="shrink-0" />
+                      <span>core {n}</span>
+                      <span className="ml-auto pl-3 text-2xs text-faint-foreground">
+                        {held ? "in use" : strandName(((n - 1) % TUBE_SIZE) + 1)}
+                      </span>
+                    </DropdownMenuItem>
+                  )
+                })}
+              </DropdownMenuSubContent>
+            </DropdownMenuPortal>
+          </DropdownMenuSub>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+interface TrayActions {
   busy?: boolean
   error?: string | null
   boxes?: TrayBox[]
   people?: TrayPerson[]
-  onJoin: (a: Fibre, b: Fibre | null) => void
-  onTail?: (a: Fibre, to: { deviceId?: number; mac?: string }) => void
+  boxOf?: (id: number) => TrayBox | undefined
+  onJoin: (a: Fibre, b: Fibre | null, port?: TrayPortRef) => void
+  onTail?: (a: Fibre, to: { deviceId?: number; mac?: string },
+            port?: TrayPortRef) => void
+  onConnect?: (deviceId: number, port: TrayPortRef, toPort?: TrayPortRef) => void
+  onDrop?: (mac: string, port: TrayPortRef) => void
   onThrough: (aCableId: number, bCableId: number) => void
   onClear: (f: Fibre) => void
   onClearError?: () => void
   onTrace?: (f: Fibre) => void
-}) {
+}
+
+export type TrayPortRef = { kind: string; no: number | null }
+
+export function FibrePanel({
+  open, onOpen, cables, fibre, loading, canWrite, onOpenCable, todo = 0, ...tray
+}: {
+  open: boolean
+  onOpen: (v: boolean) => void
+  todo?: number
+  cables: Array<{ cable: { id: number; name: string; cores: number | null
+                           path?: Array<[number, number]> } }>
+  fibre?: PointFibre
+  loading?: boolean
+  canWrite: boolean
+  onOpenCable?: (cableId: number) => void
+} & TrayActions) {
+  const ports = fibre?.ports ?? []
+  const wired = new Set((fibre?.joints ?? [])
+    .filter((j) => j.b_cable_id == null && j.port_kind)
+    .map((j) => `${j.port_kind}:${j.port_no ?? ""}`))
+  const left = fibre?.undrawn?.length ?? todo
+  const done = ports.filter((p) => wired.has(`${p.kind}:${p.no ?? ""}`)).length
+  const summary = left > 0
+    ? `${left} to connect`
+    : done > 0 ? `${done} connected`
+    : ports.length > 0 ? `${ports.length} port${ports.length === 1 ? "" : "s"}`
+    : cables.length === 0 ? "nothing recorded yet"
+    : (() => {
+        const real = cables.filter(({ cable }) => !isPlumbing(cable))
+        if (!real.length) return `${cables.length} connected`
+        return [...real]
+          .sort((a, b) => (b.cable.cores ?? 0) - (a.cable.cores ?? 0))
+          .map(({ cable }) => cable.cores ? `${cable.cores}F ${cable.name}` : cable.name)
+          .join(" · ")
+      })()
+
+  return (
+    <div className="flex flex-col rounded-lg border bg-muted/40">
+      <button type="button" onClick={() => onOpen(!open)}
+        className={cn("flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-foreground/5",
+          open ? "rounded-t-lg" : "rounded-lg")}
+        title="Every fibre landing here, and what each one is joined to">
+        <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform",
+          open && "rotate-90")} />
+        <Waypoints className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="shrink-0 text-2xs font-medium text-muted-foreground">Fibre</span>
+        {!open && (
+          <span className="ml-auto min-w-0 truncate text-right text-2xs text-faint-foreground">
+            {summary}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="px-3 pb-3">
+          {cables.length === 0 && !(fibre?.ports?.length || fibre?.port_add) ? (
+            <p className="text-2xs text-faint-foreground">
+              No cable is recorded as ending here. Lay one on the map — that is
+              what joins a box to the network now.
+            </p>
+          ) : loading && !fibre ? (
+            <p className="py-3 text-center text-2xs text-faint-foreground">Reading…</p>
+          ) : fibre ? (
+            <CouplerTray fibre={fibre} canWrite={canWrite}
+              onOpenCable={onOpenCable} {...tray} />
+          ) : null}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function CouplerTray({
+  fibre, canWrite, busy, error, boxes = [], people = [], boxOf,
+  onJoin, onTail, onThrough,
+  onConnect, onDrop, onClear, onClearError, onTrace, onOpenCable,
+}: {
+  fibre: PointFibre
+  canWrite: boolean
+  onOpenCable?: (cableId: number) => void
+} & TrayActions) {
   const cables = fibre.cables
   const here = fibre.point.name ?? "this box"
   const pointKey = `${fibre.point.kind}:${fibre.point.device_id ?? fibre.point.mac}`
   const [openCable, setOpenCable] = useState<number | null>(() => defaultCable(cables))
+  const [schedOpen, setSchedOpen] = useState(false)
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
 
-  /** Re-pick when the tray changes under us, and start over at a DIFFERENT
-   *  point. Membership alone cannot detect a move: one cable's two ends are two
-   *  points, so walking to the far end of the same sheath leaves the pick
-   *  perfectly valid while the schedule on screen is about the wrong end. */
   const wasAt = useRef(pointKey)
   useEffect(() => {
     const moved = wasAt.current !== pointKey
@@ -399,13 +587,6 @@ export function CouplerTray({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [cable, joins, expanded])
 
-  /** WHAT A ROW SAYS ITS FIBRE DOES.
-   *
-   *  A TAIL IS REPORTED AS THE BOX IT REACHES, not as the 1F cable in between.
-   *  Storage-wise a tail is a splice onto a one-fibre sheath whose far end is
-   *  terminated — three rows — but what the operator did was send this core to
-   *  that OLT, and a schedule that answered "→ a1 core 4 → HLY-OLT-2, core 1"
-   *  would be describing its own bookkeeping back at them. */
   const reachOf = (to: Fibre): Reach => {
     const t = byId.get(to.cableId)
     if (t && t.cores === 1 && t.far?.name) return { name: t.far.name, tail: true }
@@ -415,10 +596,14 @@ export function CouplerTray({
   const clearRow = (coreNo: number) =>
     cable && onClear({ cableId: cable.cable_id, coreNo })
 
-  const join = (coreNo: number, b: Fibre | null) =>
-    cable && onJoin({ cableId: cable.cable_id, coreNo }, b)
+  const join = (coreNo: number, b: Fibre | null, port?: TrayPortRef) =>
+    cable && onJoin({ cableId: cable.cable_id, coreNo }, b, port)
 
-  if (!cables.length) {
+  const herePorts = fibre.ports ?? []
+
+  const undrawn = fibre.undrawn ?? []
+  if (!cables.length && herePorts.length === 0 && !fibre.port_add
+      && undrawn.length === 0) {
     return (
       <p className="px-1 py-2 text-xs text-muted-foreground">
         No cable is recorded as ending here yet. Lay one on the map and this
@@ -427,10 +612,24 @@ export function CouplerTray({
     )
   }
 
-  const others = cables.filter((c) => c.cable_id !== cable?.cable_id)
+  const laid = cables.filter((c) => !c.plumbing)
+
+  const others = laid.filter((c) => c.cable_id !== cable?.cable_id)
 
   return (
     <div className="space-y-2">
+      {(herePorts.length > 0 || fibre.port_add || undrawn.length > 0) && (
+        <PortList
+          ports={herePorts} cables={cables} unplaced={fibre.unplaced_drops ?? []}
+          joins={fibre.joints} joinsOf={joinOf} canWrite={canWrite} busy={busy}
+          addKind={fibre.port_add} boxes={boxes} people={people} undrawn={undrawn}
+          boxOf={boxOf}
+          onLand={(f, port) => onJoin(f, null, port)}
+          onConnect={(deviceId, port, toPort) => onConnect?.(deviceId, port, toPort)}
+          onDrop={(mac, port) => onDrop?.(mac, port)}
+          onClear={(f) => onClear(f)} />
+      )}
+
       {error && (
         <p className="flex items-start gap-1.5 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-2xs text-destructive">
           <span className="flex-1">{error}</span>
@@ -442,7 +641,25 @@ export function CouplerTray({
         </p>
       )}
 
+      {herePorts.length > 0 && !schedOpen ? (laid.length === 0 ? null : (
+        <button type="button" onClick={() => setSchedOpen(true)}
+          className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-2xs text-faint-foreground hover:bg-foreground/5">
+          <ChevronRight className="size-3 shrink-0" />
+          <span className="truncate">
+            {laid.length === 1
+              ? `Splices in ${laid[0].cores ? `the ${laid[0].cores}F ` : ""}${laid[0].name}`
+              : `Splices · ${laid.length} cables here`}
+          </span>
+        </button>
+      )) : (<>
       <div className="flex items-center gap-2">
+        {herePorts.length > 0 && (
+          <button type="button" onClick={() => setSchedOpen(false)}
+            className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-foreground/5"
+            title="Fold the core plan away">
+            <ChevronDown className="size-3" />
+          </button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button type="button"
@@ -456,7 +673,7 @@ export function CouplerTray({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" style={{ width: "auto" }}
             className="min-w-60 max-w-80">
-            {cables.map((c) => (
+            {laid.map((c) => (
               <DropdownMenuItem key={c.cable_id}
                 onSelect={() => setOpenCable(c.cable_id)}>
                 <span className="truncate">
@@ -470,11 +687,15 @@ export function CouplerTray({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        {/* SPLICE ALL THROUGH stays one click. Nine closures in ten are 1:1 all
-            the way across, and making that twenty-four gestures is the
-            difference between a record that gets written and one that does not.
-            It SKIPS what is already joined, so pressing it after hand-work
-            leaves the hand-work. */}
+        {cable && onOpenCable && (
+          <Button size="icon" variant="ghost"
+            className="size-6 shrink-0 text-muted-foreground"
+            title={`Open the record for ${cable.name}`}
+            onClick={() => onOpenCable(cable.cable_id)}>
+            <FileText className="size-3.5" />
+          </Button>
+        )}
+
         {canWrite && cable && others.length > 0 && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -518,9 +739,6 @@ export function CouplerTray({
             const newTube = (cable.cores ?? 0) > TUBE_SIZE && tube !== prevTube
             return (
               <div key={row.kind === "core" ? `c${row.coreNo}` : `r${row.from}`}>
-                {/* Past twelve fibres the sequence restarts inside a tube, and
-                    the tube is what a crew opens first — so it is a heading,
-                    not something to infer from the arithmetic. */}
                 {newTube && (
                   <div className="flex items-center gap-1.5 border-b bg-muted/60 px-2 py-1">
                     <StrandSwatch coreNo={tube} className="shrink-0" />
@@ -543,29 +761,18 @@ export function CouplerTray({
                         row.kind === "run" ? "text-muted-foreground" : "text-faint-foreground")}>
                         {row.kind === "run"
                           ? `straight through to ${byId.get(row.cableId)?.name ?? "another cable"}`
-                          /* NEVER "spare". Nobody wrote these down, which is a
-                             different sentence from nothing being in them — the
-                             rule the splitter legs and the core count already
-                             keep, and the one an operator plans capacity on. */
-                          : `${row.to - row.from + 1} cores · nothing recorded`}
+                          : "nothing recorded"}
                       </span>
                     </button>
-                    {/* A COLLAPSED FREE RUN MUST STAY ACTIONABLE, and getting
-                        this wrong made a fresh cable a dead end: every core of a
-                        new 12F is unrecorded, so the whole schedule folded into
-                        one grey line with no visible way to join anything. The
-                        run NAMES the core it will act on, so one click does the
-                        overwhelmingly common thing — join the next free strand —
-                        while the chevron is still there to open the run and pick
-                        a specific one. */}
                     {row.kind === "free" && canWrite && (
                       <DestMenu
                         here={here} cables={others} boxes={boxes} people={people}
-                        joinsOf={joinOf}
+                        herePorts={herePorts} joinsOf={joinOf}
                         onSplice={(cid, n) => join(row.from, { cableId: cid, coreNo: n })}
-                        onHere={() => join(row.from, null)}
-                        onBox={(id) => cable && onTail?.(
-                          { cableId: cable.cable_id, coreNo: row.from }, { deviceId: id })}
+                        onHere={(port) => join(row.from, null, port)}
+                        onBox={(id, port) => cable && onTail?.(
+                          { cableId: cable.cable_id, coreNo: row.from },
+                          { deviceId: id }, port)}
                         onPerson={(mac) => cable && onTail?.(
                           { cableId: cable.cable_id, coreNo: row.from }, { mac })}>
                         <button type="button" disabled={busy}
@@ -594,12 +801,12 @@ export function CouplerTray({
                     menu={(child) => (
                       <DestMenu
                         here={here} cables={others} boxes={boxes} people={people}
-                        joinsOf={joinOf}
+                        herePorts={herePorts} joinsOf={joinOf}
                         onSplice={(cid, n) => join(row.coreNo, { cableId: cid, coreNo: n })}
-                        onHere={() => join(row.coreNo, null)}
-                        onBox={(id) => cable && onTail?.(
+                        onHere={(port) => join(row.coreNo, null, port)}
+                        onBox={(id, port) => cable && onTail?.(
                           { cableId: cable.cable_id, coreNo: row.coreNo },
-                          { deviceId: id })}
+                          { deviceId: id }, port)}
                         onPerson={(mac) => cable && onTail?.(
                           { cableId: cable.cable_id, coreNo: row.coreNo }, { mac })}>
                         {child}
@@ -611,20 +818,363 @@ export function CouplerTray({
           })}
         </div>
       )}
+      </>)}
     </div>
   )
 }
 
-/** ONE FIBRE, AND WHAT IT DOES. The whole row is the story: strand on the left,
- *  destination on the right, and the destination is a CONTROL rather than a
- *  readout — which is the entire correction over the two-column form. */
+function PortList({
+  ports, cables, unplaced, joins, joinsOf, canWrite, busy, addKind, undrawn,
+  boxes, people, boxOf, onLand, onConnect, onDrop, onClear,
+}: {
+  ports: TrayPort[]
+  cables: TrayCable[]
+  boxes: TrayBox[]
+  people: TrayPerson[]
+  unplaced: Array<{ mac: string; name: string | null }>
+  joins: FibreJoint[]
+  joinsOf: (cableId: number, coreNo: number) => { to: Fibre | null } | undefined
+  canWrite: boolean
+  busy?: boolean
+  addKind: string | null
+  undrawn: UndrawnLink[]
+  boxOf?: (id: number) => TrayBox | undefined
+  onLand: (f: Fibre, port: TrayPortRef) => void
+  onConnect: (deviceId: number, port: TrayPortRef, toPort?: TrayPortRef) => void
+  onDrop: (mac: string, port: TrayPortRef) => void
+  onClear: (f: Fibre) => void
+}) {
+  const [adding, setAdding] = useState<string | null>(null)
+  const already = new Set(unplaced.map((d) => d.mac))
+  const legPeople: TrayPerson[] = [
+    ...unplaced.map((d) => ({ mac: d.mac, name: d.name || d.mac, km: null })),
+    ...people.filter((p) => !already.has(p.mac)),
+  ]
+  const onPort = new Map<string, FibreJoint>()
+  for (const j of joins) {
+    if (j.b_cable_id == null && j.port_kind) {
+      onPort.set(`${j.port_kind}:${j.port_no ?? ""}`, j)
+    }
+  }
+  const far = new Map(cables.map((c) => [c.cable_id, c]))
+  const freePorts = ports.filter((p) => !onPort.has(`${p.kind}:${p.no ?? ""}`))
+  const [openRuns, setOpenRuns] = useState<Set<number>>(new Set())
+  const portRows = useMemo(() => {
+    const busyPort = (p: TrayPort) =>
+      onPort.has(`${p.kind}:${p.no ?? ""}`) || p.drops.length > 0
+    const out: Array<
+      | { kind: "port"; port: TrayPort }
+      | { kind: "run"; from: number; to: number; portKind: string }> = []
+    let run: TrayPort[] = []
+    const flush = () => {
+      if (!run.length) return
+      const first = run[0].no
+      const last = run[run.length - 1].no
+      if (run.length >= MIN_PORT_RUN && first != null && last != null
+          && !openRuns.has(first)) {
+        out.push({ kind: "run", from: first, to: last, portKind: run[0].kind })
+      } else {
+        for (const p of run) out.push({ kind: "port", port: p })
+      }
+      run = []
+    }
+    for (const p of ports) {
+      if (busyPort(p) || p.no == null
+          || (run.length && run[0].kind !== p.kind)) {
+        flush()
+        if (busyPort(p) || p.no == null) out.push({ kind: "port", port: p })
+        else run.push(p)
+        continue
+      }
+      run.push(p)
+    }
+    flush()
+    return out
+  }, [ports, onPort, openRuns])
+  return (
+    <>
+    {canWrite && undrawn.length > 0 && (
+      <div className="mb-2 overflow-hidden rounded-md border border-dashed border-border-subtle">
+        <div className="flex items-center gap-1.5 border-b border-border-subtle bg-muted/40 px-2 py-1">
+          <span className="text-2xs text-muted-foreground">
+            On the network map, not yet in the fibre
+          </span>
+          <span className="ml-auto shrink-0 text-2xs text-faint-foreground">
+            {undrawn.length}
+          </span>
+        </div>
+        {undrawn.map((u) => (
+          <div key={`${u.far.device_id ?? u.far.mac}`}
+            className="flex items-center gap-2 border-b border-border-subtle px-2 py-1.5 last:border-b-0 hover:bg-foreground/5">
+            <span className="w-14 shrink-0 truncate font-mono text-2xs text-faint-foreground">
+              {u.relation}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-xs">{u.far.name}</span>
+            <PortPick ports={freePorts} addKind={addKind} disabled={busy}
+              far={askFarPort(boxOf, u.far.device_id)}
+              onPick={(port, toPort) => u.far.device_id != null
+                && onConnect(u.far.device_id, port, toPort)} />
+          </div>
+        ))}
+      </div>
+    )}
+    <div className="overflow-hidden rounded-md border border-border-subtle">
+      {portRows.map((r) => {
+        if (r.kind === "run") {
+          return (
+            <div key={`run${r.from}`}
+              className="flex items-center gap-2 border-b px-2 py-1.5 last:border-b-0 hover:bg-foreground/5">
+              <button type="button"
+                onClick={() => setOpenRuns((s) => new Set(s).add(r.from))}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                <ChevronRight className="size-3 shrink-0 text-faint-foreground" />
+                <span className="font-mono text-2xs text-muted-foreground">
+                  {r.from === r.to ? r.from : `${r.from}–${r.to}`}
+                </span>
+                {!canWrite && (
+                  <span className="min-w-0 flex-1 truncate text-2xs text-faint-foreground">
+                    nothing on them
+                  </span>
+                )}
+              </button>
+              {canWrite && (
+                <SourceMenu cables={cables} joinsOf={joinsOf} boxes={boxes}
+                  people={r.portKind === "leg" ? legPeople : []}
+                  onPick={(f) => onLand(f, { kind: r.portKind, no: r.from })}
+                  onConnect={(id, toPort) =>
+                    onConnect(id, { kind: r.portKind, no: r.from }, toPort)}
+                  onDrop={r.portKind === "leg"
+                    ? (mac) => onDrop(mac, { kind: r.portKind, no: r.from })
+                    : undefined}>
+                  <button type="button" disabled={busy}
+                    className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-border-subtle px-1.5 py-0.5 text-xs text-faint-foreground hover:border-border hover:bg-foreground/5 hover:text-foreground">
+                    <span>Connect {portLabel(r.portKind, r.from)}…</span>
+                    <ChevronDown className="size-3 shrink-0" />
+                  </button>
+                </SourceMenu>
+              )}
+            </div>
+          )
+        }
+        const p = r.port
+        const j = onPort.get(`${p.kind}:${p.no ?? ""}`)
+        const fibre: Fibre | null = j ? { cableId: j.a_cable_id, coreNo: j.a_core_no } : null
+        return (
+          <div key={`${p.kind}:${p.no}`}
+            className="group flex items-center gap-2 border-b px-2 py-1.5 last:border-b-0 hover:bg-foreground/5">
+            <span className="w-14 shrink-0 truncate font-mono text-2xs text-muted-foreground"
+              title={p.device_label ? `${p.label} · ${p.device_label}` : undefined}>
+              {p.label}
+            </span>
+            <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+              {fibre ? (
+                <span className="flex min-w-0 items-center gap-1.5 text-xs"
+                  title={far.get(fibre.cableId)?.name || undefined}>
+                  <span className="truncate">
+                    {far.get(fibre.cableId)?.far?.name ?? "the far end"}
+                  </span>
+                  {!far.get(fibre.cableId)?.plumbing && (<>
+                    <StrandSwatch coreNo={fibre.coreNo} className="shrink-0" />
+                    <span className="shrink-0 font-mono text-2xs text-muted-foreground">
+                      core {fibre.coreNo}
+                    </span>
+                  </>)}
+                </span>
+              ) : p.drops.length ? (
+                <span className="flex min-w-0 items-center gap-1.5 text-xs">
+                  <User className="size-3 shrink-0 text-muted-foreground" />
+                  <span className="truncate">
+                    {p.drops.map((d) => d.name || d.mac).join(", ")}
+                  </span>
+                </span>
+              ) : !canWrite ? (
+                <span className="text-xs text-faint-foreground">nothing on it</span>
+              ) : (
+                <SourceMenu cables={cables} joinsOf={joinsOf}
+                  boxes={boxes} people={p.kind === "leg" ? legPeople : []}
+                  onPick={(f) => onLand(f, { kind: p.kind, no: p.no })}
+                  onConnect={(id, toPort) =>
+                    onConnect(id, { kind: p.kind, no: p.no }, toPort)}
+                  onDrop={p.kind === "leg"
+                    ? (mac) => onDrop(mac, { kind: p.kind, no: p.no }) : undefined}>
+                  <button type="button" disabled={busy}
+                    className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-border-subtle px-1.5 py-0.5 text-xs text-faint-foreground hover:border-border hover:bg-foreground/5 hover:text-foreground">
+                    <span>Connect…</span>
+                    <ChevronDown className="size-3 shrink-0" />
+                  </button>
+                </SourceMenu>
+              )}
+              {canWrite && fibre && (
+                <button type="button" onClick={() => onClear(fibre)} disabled={busy}
+                  title="Take this fibre off the port"
+                  className="shrink-0 rounded p-0.5 text-faint-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100">
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })}
+      {canWrite && addKind && (adding === null ? (
+        <button type="button" onClick={() => setAdding("")}
+          className="flex w-full items-center gap-1.5 border-t bg-muted/40 px-2 py-1.5 text-2xs text-faint-foreground hover:bg-foreground/5">
+          <Plus className="size-3 shrink-0" />
+          <span>Name another {addKind === "pon" ? "PON" : addKind}</span>
+        </button>
+      ) : (
+        <div className="flex items-center gap-2 border-t bg-muted/40 px-2 py-1.5">
+          <span className="w-14 shrink-0 font-mono text-2xs text-faint-foreground">
+            {addKind === "pon" ? "PON" : addKind}
+          </span>
+          <input autoFocus value={adding} onChange={(e) => setAdding(e.target.value)}
+            inputMode="numeric" placeholder="number"
+            onKeyDown={(e) => { if (e.key === "Escape") setAdding(null) }}
+            className="h-6 w-20 rounded border border-border bg-background px-1.5 text-2xs" />
+          <SourceMenu cables={cables} joinsOf={joinsOf} boxes={boxes}
+            onConnect={(id, toPort) => {
+              const no = parseInt(adding, 10)
+              if (!Number.isFinite(no) || no < 1) return
+              onConnect(id, { kind: addKind, no }, toPort)
+              setAdding(null)
+            }}
+            onPick={(f) => {
+              const no = parseInt(adding, 10)
+              if (!Number.isFinite(no) || no < 1) return
+              onLand(f, { kind: addKind, no })
+              setAdding(null)
+            }}>
+            <button type="button" disabled={busy || !adding.trim()}
+              className="flex items-center gap-1 rounded-md border border-dashed border-border-subtle px-1.5 py-0.5 text-2xs text-faint-foreground hover:border-border hover:bg-foreground/5 disabled:opacity-50">
+              <span>land a fibre on it</span>
+              <ChevronDown className="size-3 shrink-0" />
+            </button>
+          </SourceMenu>
+          <button type="button" onClick={() => setAdding(null)}
+            className="shrink-0 rounded p-0.5 text-faint-foreground hover:text-foreground"
+            aria-label="Cancel">
+            <X className="size-3" />
+          </button>
+        </div>
+      ))}
+      {unplaced.length > 0 && (
+        <div className="border-t bg-muted/40 px-2 py-1.5 text-2xs text-faint-foreground">
+          {unplaced.length} recorded {unplaced.length === 1 ? "drop" : "drops"} with
+          no leg noted — {unplaced.map((d) => d.name || d.mac).join(", ")}
+        </div>
+      )}
+    </div>
+    </>
+  )
+}
+
+function PortPick({ ports, addKind, disabled, far, onPick }: {
+  ports: TrayPort[]
+  addKind: string | null
+  disabled?: boolean
+  far?: TrayBox
+  onPick: (port: TrayPortRef, toPort?: TrayPortRef) => void
+}) {
+  const [typed, setTyped] = useState("")
+  const farPorts = far?.ports ?? []
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button type="button" disabled={disabled}
+          className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-border-subtle px-1.5 py-0.5 text-xs text-faint-foreground hover:border-border hover:bg-foreground/5 hover:text-foreground">
+          <span>Connect…</span>
+          <ChevronDown className="size-3 shrink-0" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-48 max-w-72">
+        <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+          on which port here
+        </DropdownMenuLabel>
+        {ports.map((p) => {
+          const here = (
+            <>
+              <span className="shrink-0 font-mono text-2xs">{p.label}</span>
+              {p.device_label && (
+                <span className="ml-auto min-w-0 truncate pl-2 text-2xs text-faint-foreground">
+                  {p.device_label}
+                </span>
+              )}
+            </>
+          )
+          if (!farPorts.length) {
+            return (
+              <DropdownMenuItem key={`${p.kind}:${p.no}`}
+                onSelect={() => onPick({ kind: p.kind, no: p.no })}>
+                {here}
+              </DropdownMenuItem>
+            )
+          }
+          return (
+            <DropdownMenuSub key={`${p.kind}:${p.no}`}>
+              <DropdownMenuSubTrigger>{here}</DropdownMenuSubTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuSubContent className="max-h-80 min-w-44 overflow-y-auto">
+                  <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+                    …into which port on {far?.name}
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onSelect={() => onPick({ kind: p.kind, no: p.no })}>
+                    <span className="text-2xs text-faint-foreground">
+                      Not known yet
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  {farPorts.map((fp) => (
+                    <DropdownMenuItem key={`${fp.kind}:${fp.no}`}
+                      onSelect={() => onPick({ kind: p.kind, no: p.no },
+                                             { kind: fp.kind, no: fp.no })}>
+                      <span className="font-mono text-2xs">{fp.label}</span>
+                      {fp.device_label && (
+                        <span className="ml-auto min-w-0 truncate pl-2 text-2xs text-faint-foreground">
+                          {fp.device_label}
+                        </span>
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuPortal>
+            </DropdownMenuSub>
+          )
+        })}
+        {addKind && (
+          <div className="flex items-center gap-1.5 px-2 py-1.5"
+            onKeyDown={(e) => e.stopPropagation()}>
+            <span className="shrink-0 font-mono text-2xs text-faint-foreground">
+              {addKind === "pon" ? "PON" : addKind}
+            </span>
+            <input value={typed} onChange={(e) => setTyped(e.target.value)}
+              inputMode="numeric" placeholder="number"
+              className="h-6 w-16 rounded border border-border bg-background px-1.5 text-2xs" />
+            <button type="button"
+              disabled={!/^\d+$/.test(typed.trim()) || parseInt(typed, 10) < 1}
+              onClick={() => onPick({ kind: addKind, no: parseInt(typed, 10) })}
+              className="rounded px-1.5 py-0.5 text-2xs text-muted-foreground hover:bg-foreground/10 disabled:opacity-40">
+              Connect
+            </button>
+          </div>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onPick({ kind: "", no: null })}>
+          <span className="text-2xs text-faint-foreground">
+            Record it — port not known yet
+          </span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 function CoreRow({
   coreNo, cores, join, here, reach, farName, label, canWrite, busy,
   onClear, onTrace, menu,
 }: {
   coreNo: number
   cores: number | null
-  join: { to: Fibre | null } | undefined
+  join: { to: Fibre | null; joint?: FibreJoint } | undefined
   here: string
   reach: Reach
   farName: string | null
@@ -636,14 +1186,19 @@ function CoreRow({
   menu: (child: React.ReactElement) => React.ReactNode
 }) {
   const done = !!join
+  const port = portLabel(join?.joint?.port_kind, join?.joint?.port_no)
   const body = !join ? null
     : join.to == null
       ? <><Plug className="size-3 shrink-0 text-muted-foreground" />
-          <span className="truncate">into {here}</span></>
+          <span className="truncate">into {here}</span>
+          {port && (
+            <span className="shrink-0 font-mono text-2xs text-muted-foreground">
+              {port}
+            </span>
+          )}</>
       : reach
         ? <><Plug className="size-3 shrink-0 text-muted-foreground" />
-            <span className="truncate">{reach.name}</span>
-            <span className="shrink-0 text-2xs text-faint-foreground">on a tail</span></>
+            <span className="truncate">{reach.name}</span></>
         : <><span className="truncate">{farName ?? "another cable"}</span>
             <StrandSwatch coreNo={join.to.coreNo} className="shrink-0" />
             <span className="shrink-0 font-mono text-2xs text-muted-foreground">
@@ -660,8 +1215,6 @@ function CoreRow({
         </span>
       </button>
 
-      {/* A core with nothing joined still gets to say what it CARRIES — an
-          operator's note, kept visually apart from anything the record derived. */}
       {!done && label && (
         <span className="min-w-0 flex-1 truncate text-2xs text-faint-foreground">
           {label}
@@ -684,10 +1237,6 @@ function CoreRow({
             <ChevronDown className="size-3 shrink-0 text-faint-foreground" />
           </button>,
         )}
-        {/* Clearing is on the ROW, always, whatever the fibre is joined to —
-            the two-column form could only undo what happened to be the side on
-            show, so a core tailed to another box was un-clearable until you
-            found your way back to it. */}
         {canWrite && done && (
           <button type="button" onClick={onClear} disabled={busy}
             title="Undo this join"

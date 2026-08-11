@@ -23,9 +23,6 @@ def needs_update(current: str | None, target: str | None) -> bool:
 
 
 def consume_restart(request_path: Path, *, stop, restart) -> bool:
-    """One-shot central-driven agent bounce (the agent's heartbeat drops
-    restart_request.json; see apps/daemon _send_heartbeat). The file is
-    removed BEFORE acting so a crash mid-restart can never loop."""
     request_path = Path(request_path)
     if not request_path.is_file():
         return False

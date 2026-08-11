@@ -1,8 +1,3 @@
-"""SNMP-sourced state: switch ports, ONU/OLT optics, PON fault state, device health, snmp status/capabilities, diagnostic walks, vendor profiles, bandwidth alarms, admin coverage overview.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-"""
 from __future__ import annotations
 
 import json
@@ -16,14 +11,6 @@ class SnmpStoreMixin:
 
     def _bandwidth_alarms(self, org_id: str, *, flag_col: str, limit_col: str,
                           limit_key: str, since_col: str) -> list[dict]:
-        # A device that isn't answering ICMP isn't answering SNMP either, so its
-        # bw_alarm flag and in/out_bps are frozen at the last walk before it
-        # dropped. Reporting that as a live bandwidth alarm points a top-bar chip
-        # and a Home tile at a box whose real problem is the outage — the classic
-        # one-fault-two-alarms split this dashboard keeps closing. DISPLAY ONLY:
-        # this feeds /api/summary and nothing else (ports.py owns the paging and
-        # its own transition state, which stays untouched — a suppressed chip must
-        # never mean a suppressed page).
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT sp.id AS port_id, sp.device_id, d.name AS switch_name,"
@@ -65,18 +52,8 @@ class SnmpStoreMixin:
 
 
     def down_ports(self, org_id: str) -> list[dict]:
-        """Every monitored port currently in the port-down alarm, org-wide, with
-        its switch's name and ICMP state.
 
-        Counted off `alarm` (the flap-suppressed flag ports.py owns), NOT a raw
-        `oper_status`, so this list and the `ports_down` count on each device row
-        describe the same thing — a drill-down that disagrees with the tile it
-        was opened from is worse than no drill-down.
 
-        A port on a DOWN/UNREACHABLE switch is KEPT (unlike the bandwidth
-        alarms, which are a rate reading and go stale): the flag itself is still
-        the last thing we knew, and the caller says so on the row rather than
-        dropping it and leaving the tile's count unexplained."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT sp.id AS port_id, sp.device_id, sp.if_index, sp.if_name,"
@@ -185,9 +162,6 @@ class SnmpStoreMixin:
 
 
     def list_link_ports(self, org_id: str) -> list[dict]:
-        """Every port bound to a link, either side: feeds_device_id names the child a
-        parent-side port cables to, uplink_device_id names the parent a child-side
-        port faces. One org-wide list so the map labels every link in one query."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT p.id, p.device_id, p.if_index, p.if_name, p.if_alias,"
@@ -214,12 +188,7 @@ class SnmpStoreMixin:
 
 
     def onu_rx_counts(self, org_id: str, device_id: int) -> dict:
-        """How much of one OLT's roster carries a real Rx figure.
 
-        The two numbers the Rx diagnosis turns into a sentence: "none of 412
-        ONUs report optical power" is a vendor verdict, "3 of 412" is a scrape
-        that half-worked, and they must never render as the same empty column.
-        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS total,"
@@ -229,28 +198,6 @@ class SnmpStoreMixin:
         return {"total": int(row["total"] or 0), "with_rx": int(row["with_rx"] or 0)}
 
 
-    # The operator's own name for a subscriber lives in `onu_places.label`, keyed
-    # on the MAC — never in `onu_optics.name`, which every SNMP walk overwrites
-    # from the OLT (`name=excluded.name`). So a roster row has to be JOINED to it
-    # to carry the name a human typed.
-    #
-    # Joined in the STORE rather than folded in by each caller, because "each
-    # caller remembers" is exactly what failed: a name captured in the field
-    # reached the DB correctly and then rendered nowhere — not the Optical tab,
-    # not ONU search, not the WhatsApp lookup, not the issue list — all four
-    # naming the ONU off the walked column alone. Every roster read now carries
-    # `label`, and `onuroster.display_name` is the one place the order is decided.
-    #
-    # The join key is `onuroster._norm_mac` REGISTERED as a SQL function, not
-    # mirrored as an UPPER(TRIM(...)) expression, for the reason `wisp_search_key`
-    # already exists: one normalizer, so SQL identity and Python identity cannot
-    # drift apart and silently stop matching a sticker.
-    #
-    # That safety is FREE — measured on a 15,580-row / 19-OLT fleet with 2,000
-    # located subscribers: no join 117ms, this join 156ms, the "native" UPPER(TRIM)
-    # version 195ms. Neither form can use an index on a computed key, so the
-    # callback costs less than the expression it would have replaced. Don't
-    # "optimize" it back into a second spelling of identity.
     _LABEL_JOIN = (" LEFT JOIN onu_places pl ON pl.org_id = o.org_id"
                    "   AND pl.mac = wisp_norm_mac(o.serial)")
 
@@ -270,16 +217,8 @@ class SnmpStoreMixin:
         return [dict(r) for r in rows]
 
 
-    # ----- web-UI scraped optics (central/weboptics.py) -----------------------
-
     def upsert_web_optics(self, org_id: str, device_id: int, rows: list[dict],
                           ts: str) -> int:
-        """Store one scrape's readings. UPSERT per row, never delete-then-insert:
-        a scrape is allowed to come back partial (the OLT keeps ONE session slot,
-        so a tech logging in can end ours mid-sweep), and wiping the device's rows
-        first would turn every partial into a blackout of the PONs that didn't get
-        re-read. A row nothing refreshes simply ages past web_optics_max_age_s and
-        stops being merged, which is the honest outcome."""
         if not rows:
             return 0
         with self._write_lock, self._connect() as conn:
@@ -304,10 +243,6 @@ class SnmpStoreMixin:
 
 
     def list_web_optics(self, org_id: str, device_id: int) -> list[dict]:
-        """This OLT's scraped readings, freshest-first. Staleness is judged by the
-        caller (weboptics.merge_scraped) against the report timestamp rather than
-        filtered here — the merge is where the age has meaning, and keeping it
-        there makes it testable without a clock."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT onu_key, serial, rx_dbm, tx_dbm, distance_m, temp_c,"
@@ -319,52 +254,8 @@ class SnmpStoreMixin:
 
     def web_optics_targets(self, vendors=("dbc",),
                            device_id: int | None = None) -> list[dict]:
-        """OLTs the web-optics sweeper should scrape, fleet-wide.
 
-        ``device_id`` narrows the same query to one OLT for the dashboard's
-        manual refresh. It is a FILTER on this query rather than a lookup of its
-        own on purpose: "may this box be scraped, and with what" must have one
-        answer, or a hand-triggered read could reach a device the sweep would
-        have refused (no roster, no credentials, org's tunnel not granted).
 
-        Two ways an OLT qualifies as a scrapable vendor, and the second one is
-        why the subsystem reaches more than one box:
-
-        1. an EXPLICIT ``gpon_vendor`` naming a vendor a web-optics profile
-           covers — the operator named it; or
-        2. the EDGE's own optics sweep matched that vendor's profile from the
-           box's sysObjectID (``device_snmp_status`` subsystem='optics'), with
-           the device's own vendor field left on automatic.
-
-        (2) was written off as impossible — "auto-detection lives on the edge
-        and is never reported to central" — and that was simply out of date:
-        `device_snmp_status` has carried the matched profile name AND the raw
-        sysObjectID up on every report since the SNMP-diagnosis work. It is not
-        a weaker signal than the dropdown, it is a STRONGER one: the dropdown is
-        a human's recollection, this is the box answering with its maker's own
-        PEN arc, which is the exact evidence the human was going on. Requiring
-        `sysobjectid` to be present is what keeps it that: it is only ever
-        stamped on a real auto-detect, so a fleet-wide ``WISP_GPON_VENDOR``
-        default can never launder itself into a detection here.
-
-        A roster is required as well (``onu_optics``). The scrape does not
-        create ONUs — it merges onto slots the SNMP walk already reported — so
-        an OLT with no roster has nothing for a reading to attach to, and
-        scraping it is a login and a page fetch that can only ever be discarded.
-
-        `pon_ports` rides along for the same reason it is needed at all: the
-        scrape is one POST per PON, and the roster is the only honest source of
-        how many an OLT has.
-
-        Also requires stored credentials, an assigned probe (the tunnel's route)
-        and the org's web_proxy grant (without it the edge holds no long-poll,
-        so every request would just eat its timeout).
-
-        WHICH vendors qualify is no longer the literal 'dbc' baked in here: the
-        caller passes the profile set in force (`ProfileSet.names()`), so
-        onboarding an OLT is a dashboard row rather than an edit to this SQL.
-        The vendor token each device resolved to comes back as `vendor`, so the
-        sweeper does not have to re-derive it."""
         names = {str(n or "").strip().lower() for n in (vendors or ())}
         names.discard("")
         if not names:
@@ -378,9 +269,6 @@ class SnmpStoreMixin:
             rows = conn.execute(
                 "SELECT d.id, d.org_id, d.name, d.ip_address, d.assigned_node_id,"
                 " d.web_ip, d.web_port, d.web_scheme, c.username, c.password_enc,"
-                # The vendor this device resolved AS, and which of the two ways
-                # it got there — an explicit dropdown beats a detection, exactly
-                # as GponPollerPool.resolve orders them.
                 " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
                 "      THEN LOWER(d.gpon_vendor) ELSE LOWER(COALESCE(s.profile,''))"
                 " END AS vendor,"
@@ -397,8 +285,6 @@ class SnmpStoreMixin:
                 f"   AND (LOWER(COALESCE(d.gpon_vendor,'')) IN ({marks})"
                 "        OR (COALESCE(d.gpon_vendor,'') = ''"
                 f"            AND LOWER(COALESCE(s.profile,'')) IN ({marks})"
-                # Only ever stamped on a real auto-detect, so a fleet-wide
-                # WISP_GPON_VENDOR default can't launder itself into one.
                 "            AND COALESCE(s.sysobjectid,'') <> ''))"
                 "   AND EXISTS(SELECT 1 FROM onu_optics r WHERE r.device_id = d.id)"
                 "   AND COALESCE(d.assigned_node_id,'') <> ''"
@@ -407,8 +293,6 @@ class SnmpStoreMixin:
                 " ORDER BY d.org_id, d.id", args).fetchall()
         return [dict(r) for r in rows]
 
-
-    # ----- web-optics vendor profiles (central/weboptics_profiles.py) ---------
 
     @staticmethod
     def _web_optics_row(row) -> dict:
@@ -421,7 +305,6 @@ class SnmpStoreMixin:
         return out
 
     def list_web_optics_profiles(self, org_id: str | None) -> list[dict]:
-        # An org sees global profiles + its own; superadmin scope (None) sees all.
         with self._connect() as conn:
             if org_id is None:
                 rows = conn.execute(
@@ -469,13 +352,8 @@ class SnmpStoreMixin:
         return self._web_optics_row(row) if row else None
 
 
-    # ----- web-optics scrape outcome (central/weboptics_sweep.py) -------------
-
     def set_web_optics_status(self, org_id: str, device_id: int, profile: str,
                               state: str, detail: str | None, rows: int) -> None:
-        """Record the last scrape outcome. `last_ok_at` only advances on a state
-        that actually produced readings, so a panel can always say "was working
-        until <ts>" — the same contract device_snmp_status keeps for SNMP."""
         now = _now_iso()
         ok = state in ("ok", "partial")
         with self._write_lock, self._connect() as conn:
@@ -502,24 +380,8 @@ class SnmpStoreMixin:
 
 
     def onu_search_device_ids(self, org_id: str, needle: str) -> list[int]:
-        """OLTs carrying at least one ONU whose serial/MAC **or name** contains
-        `needle` — a tech looks a subscriber up by whichever they happen to have
-        (the MAC off the sticker, or the name the OLT was provisioned with).
 
-        Narrowing step for the Network-page search: the caller only wants a
-        handful of OLTs to load rosters for, and a fleet's onu_optics is far too
-        big to ship wholesale on every keystroke. `needle` MUST already be
-        `onuroster.search_key`-normalized (alphanumeric, upper) — that is what
-        makes it safe to interpolate as a LIKE pattern, since the normalizer
-        strips `%` and `_` along with everything else non-alphanumeric.
 
-        That same normalizer is registered as a SQL function rather than mirrored
-        as a REPLACE chain, so the two sides cannot drift: the chain only knew
-        the four separators MACs use, which silently failed the underscore in a
-        real provisioned name like "hc_kiran". It costs a full scan of the org's
-        ONU rows, which a function of a column would need anyway — and the
-        3-character floor in the API keeps that off the common keystroke.
-        """
         if not needle:
             return []
         with self._connect() as conn:
@@ -530,11 +392,6 @@ class SnmpStoreMixin:
                 "SELECT DISTINCT o.device_id FROM onu_optics o"
                 " JOIN org_devices d ON d.id = o.device_id"
                 + self._LABEL_JOIN
-                # The OPERATOR's name is searched beside the walked one. A tech
-                # types the name they know, and after a field survey that is the
-                # one they typed themselves — matching only the OLT's string
-                # would answer "no such subscriber" about a drop somebody had
-                # just stood at and named.
                 + " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1"
                 " AND (wisp_search_key(o.serial) LIKE ?"
                 "      OR wisp_search_key(o.name) LIKE ?"
@@ -545,15 +402,7 @@ class SnmpStoreMixin:
 
 
     def org_onu_rows(self, org_id: str, device_id: int | None = None) -> list[dict]:
-        """Slim ONU rows for the PON fault detector (central/ponfault.py) and the
-        roster-hygiene checks (central/onuroster.py — serial + onu_id used there,
-        ignored by ponfault).
 
-        `rx_dbm`/`severity` ride along for the org-wide optical rollup
-        (`api/outages.py:pon_summary`), which has to count crit/weak ONUs over
-        the SAME freshest-walk view the fault and capacity checks use — reading
-        them from a second query would let the KPI strip and the drill-down
-        disagree about which walk they are describing."""
         q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.onu_id, o.name, o.serial,"
              " o.state, o.distance_m, o.last_online_at, o.updated_at,"
              " o.rx_dbm, o.severity, pl.label AS label,"
@@ -570,25 +419,13 @@ class SnmpStoreMixin:
         return [dict(r) for r in rows]
 
 
-    # ----- reference ONUs (operator-placed witnesses) -------------------------
-
     _PLACE_COLS = ("mac, lat, lng, label, phone, notes, witness, accuracy_m,"
                    " place_source, placed_by, placed_at, created_at, updated_at")
 
     def list_onu_places(self, org_id: str, *,
                         located_only: bool = False) -> list[dict]:
-        """Every subscriber this org has written anything down about.
 
-        No longer small by design: an ISP vouches for a handful of power-backed
-        subscribers, but the field survey records wherever a tech happens to
-        stand, so this can run to the size of the roster. `witness` is what
-        separates a power claim from a plain location, and every caller that
-        cares must read it.
 
-        Since a record no longer needs a coordinate, a row here may carry a name
-        and a number and NO pin. `located_only=True` is how a caller drawing the
-        MAP asks its narrower question — a row with NULL lat/lng has nothing to
-        draw, and shipping it would put a marker at (null, null)."""
         q = f"SELECT {self._PLACE_COLS} FROM onu_places WHERE org_id=?"
         if located_only:
             q += " AND lat IS NOT NULL AND lng IS NOT NULL"
@@ -597,7 +434,6 @@ class SnmpStoreMixin:
         return [dict(r) for r in rows]
 
     def get_onu_place(self, org_id: str, mac: str) -> dict | None:
-        """One subscriber's record. `mac` is already `_norm_mac`'d by the caller."""
         with self._connect() as conn:
             row = conn.execute(
                 f"SELECT {self._PLACE_COLS} FROM onu_places"
@@ -606,32 +442,8 @@ class SnmpStoreMixin:
 
     def onu_place_macs(self, org_id: str, *, witness_only: bool = True,
                        located_only: bool = False) -> set[str]:
-        """The WITNESS keys only — what ponfault marks power-backed rows with.
 
-        `witness_only=False` asks the other question — "which subscribers do we
-        have a record for" — and with `located_only=True` the narrower "which
-        have a PIN", which is the survey's coverage count. `witness_only`
-        defaults TRUE so that every existing caller (all of them alerting) keeps
-        the narrow meaning: a paging path that accidentally widened to every
-        located drop is exactly the failure the witness column was added to
-        prevent.
 
-        The `witness=1` filter is the whole safety property of letting the field
-        drop location pins on ordinary subscribers. Without it, geo-tagging a
-        street's worth of ONUs would enrol every one of them as a power-backed
-        witness, and the next dark subscriber would read as PROOF of a fibre cut
-        (`ponfault._witness_verdict`: a witness dark silently ⇒ fiber). Locating
-        is an observation; witnessing is a claim about a power supply that
-        nothing can detect — they must never be the same write.
-
-        The witness question deliberately does NOT filter on coordinates: the
-        claim is about a power supply, and a witness whose pin was cleared is
-        still running on the same UPS. `_witness_verdict` matches by MAC inside a
-        PON and never reads lat/lng, so this keeps the verdict identical either
-        way. Coverage is the opposite case and says `located_only` out loud.
-
-        Its own query rather than a comprehension over ``list_onu_places``
-        because this one runs on the report cycle, once per optics fold."""
         q = "SELECT mac FROM onu_places WHERE org_id=?"
         if witness_only:
             q += " AND witness=1"
@@ -642,13 +454,7 @@ class SnmpStoreMixin:
         return {r["mac"] for r in rows}
 
     def onu_interfaces(self, org_id: str, device_ids: set[int]) -> dict:
-        """Per-ONU ifTable rows for these OLTs, keyed (device_id, first token of
-        if_name) — the shape `onuroster.onu_if_token` produces.
 
-        Only the reference-ONU list needs this, and that list is a handful of
-        rows, so it takes the device ids it actually wants rather than scanning
-        a fleet's switch_ports. The first token is the key because a described
-        ONU reads `EPON03ONU5 BSNL-238`."""
         if not device_ids:
             return {}
         marks = ",".join("?" * len(device_ids))
@@ -668,23 +474,8 @@ class SnmpStoreMixin:
     def set_onu_place(self, org_id: str, mac: str, lat: float, lng: float,
                       label: str | None, notes: str | None,
                       *, witness: bool, phone: str | None = None) -> bool:
-        """Place (or move) an ONU on the map. `mac` must already be in
-        ``onuroster._norm_mac`` form — identity is the caller's to normalize, and
-        exactly once, or two spellings of one sticker become two witnesses.
 
-        `witness` is REQUIRED — it used to default True, and that default is
-        exactly how ordinary customers became witnesses: every desktop write
-        (moving a pin, editing a phone number) asserted a power-supply claim
-        nobody had made. The routes now resolve it explicitly, preserving
-        whatever the record already says unless the caller means to change it.
-        Leave it unsayable-by-omission; a default here is a claim made by
-        forgetting.
 
-        A re-place carries the flag it is given, which is deliberate in BOTH
-        directions: a tech recording a location for an ONU somebody had vouched
-        for must not silently strip its witness status, so the field route
-        refuses to downgrade (see `api/devices.field_onu`) rather than relying on
-        the value passed here."""
         if not mac:
             return False
         now = _now_iso()
@@ -695,10 +486,6 @@ class SnmpStoreMixin:
                 " VALUES (?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET lat=excluded.lat,"
                 " lng=excluded.lng, label=excluded.label, notes=excluded.notes,"
-                # The desktop dialog's number is OPTIONAL, so a blank one there
-                # must not erase a number the field recorded — same COALESCE
-                # discipline `place_onu_in_field` keeps for the label. Clearing
-                # a contact detail is nobody's accident to have.
                 " phone=COALESCE(excluded.phone, onu_places.phone),"
                 " witness=excluded.witness, updated_at=excluded.updated_at",
                 (org_id, mac, lat, lng, label or None, phone or None,
@@ -711,13 +498,7 @@ class SnmpStoreMixin:
                            source: str, placed_by: str,
                            label: str | None = None,
                            phone: str | None = None) -> bool:
-        """A subscriber pin taken standing at the drop.
 
-        Separate from `set_onu_place` for the same reason `place_org_device` is
-        separate from `set_org_device_location`: it cannot clear a row (lat/lng
-        are non-optional), and it always stamps provenance. It also leaves
-        `notes` alone — the operator's notes are desk knowledge about the site,
-        and a location capture has no business overwriting them with nothing."""
         if not mac:
             return False
         now = _now_iso()
@@ -743,19 +524,8 @@ class SnmpStoreMixin:
 
     def set_onu_place_contact(self, org_id: str, mac: str, label: str | None,
                               phone: str | None = None) -> bool:
-        """Correct a located subscriber's NAME and NUMBER. Nothing else moves.
 
-        Its own method rather than a `place_onu_in_field` call with the old
-        coordinates, because re-placing would restamp `accuracy_m`/`place_source`
-        /`placed_by` — so correcting a typo in somebody's name would quietly
-        downgrade a real 6 m GPS fix to a hand-placed point with no accuracy, and
-        reattribute the placement to whoever fixed the spelling.
 
-        Both details are written together because they are captured together and
-        the caller (`clean_field_onu_name_payload`) requires both — a partial
-        update spelling would let one door blank what the other door insists on.
-        False = no such placement, which the caller reports as a 404 rather than
-        silently creating a pin-less row."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE onu_places SET label=?, phone=?, updated_at=?"
@@ -765,12 +535,7 @@ class SnmpStoreMixin:
         return cur.rowcount > 0
 
     def onu_place_witness(self, org_id: str, mac: str) -> bool | None:
-        """Is this MAC already placed, and as what? None = not placed at all.
 
-        Exists so the field route can refuse to DOWNGRADE a witness: a tech
-        recording where a box physically is must never quietly cancel the
-        operator's claim that it runs on a UPS, because that claim is invisible
-        on the handset and losing it changes a PON verdict."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT witness FROM onu_places WHERE org_id=? AND mac=?",
@@ -779,24 +544,8 @@ class SnmpStoreMixin:
 
     def set_onu_contact(self, org_id: str, mac: str, label: str | None,
                         phone: str | None, notes: str | None) -> bool:
-        """Record who a subscriber is, from the desk, with no coordinate.
 
-        The write that used to be impossible. Every other path into this table
-        demands lat/lng, so on a fleet with 2,156 subscribers and a handful of
-        pins there was nowhere to put 2,150 names — which is most of why
-        customer data felt scattered: it could not be entered at all. This is
-        also the ONLY writer that may CREATE a pin-less row; the field's
-        `set_onu_place_contact` still refuses to (its caller reports a 404),
-        because a rename arriving for an unlocated MAC is a bug, not a new
-        record.
 
-        `witness` is untouched on an update and 0 on a create: naming somebody is
-        not vouching for their power supply, and that claim is only ever made
-        where the UI states the contract. Blank fields are written as NULL rather
-        than COALESCE'd — this form SHOWS what is stored, so clearing a field is
-        the operator deleting a wrong number on purpose, and silently keeping it
-        would be the same lie the map card's Remove button used to tell. The
-        row is pruned if that empties it."""
         if not mac:
             return False
         now = _now_iso()
@@ -815,28 +564,8 @@ class SnmpStoreMixin:
         return True
 
     def set_onu_witness(self, org_id: str, mac: str, witness: bool) -> bool:
-        """Make or withdraw the power-supply claim. NOTHING else moves.
 
-        The missing half of this table's write surface, and the reason ordinary
-        customers kept becoming witnesses: until 2026-08-04 the only way to make
-        the claim was to place a pin and the only way to withdraw it was to
-        REMOVE that pin, so an operator who wanted "on the map but not vouched
-        for" had no move — and every desktop pin write asserted the claim by
-        default. Now the claim is its own verb.
 
-        Deliberately UPDATE-only. A claim about a subscriber nobody has written
-        down is not a record worth inventing, and the caller reports the miss as
-        a 404 — same discipline as `set_onu_place_contact`. Withdrawing prunes
-        the row if the flag was the only thing on it (a bare reference point with
-        no pin, name or number is exactly the husk `_prune_onu_place` exists to
-        clear).
-
-        Independent of the coordinates ON PURPOSE: `ponfault._witness_verdict`
-        matches by MAC and never reads lat/lng, so a subscriber can be vouched
-        for before anyone has stood at the drop. Note the asymmetry with
-        `clear_onu_place_coords`, which still retracts the claim along with the
-        pin — placing WAS the claim, so unplacing stays its retraction; this
-        route adds a way to say so without touching the map."""
         if not mac:
             return False
         with self._write_lock, self._connect() as conn:
@@ -850,31 +579,8 @@ class SnmpStoreMixin:
         return cur.rowcount > 0
 
     def clear_onu_place_coords(self, org_id: str, mac: str) -> bool:
-        """Take a subscriber off the map WITHOUT forgetting who they are.
 
-        What "Remove" on the map card means, and what it did NOT mean until
-        2026-08-03: it ran `delete_onu_place`, so an eye-off icon that reads as
-        "hide this pin" destroyed the name and the phone number too, with no
-        confirmation. The coordinates and their PROVENANCE go together — an
-        accuracy figure describes a measurement that no longer exists — and
-        everything the operator KNOWS about the subscriber stays.
 
-        THE WITNESS CLAIM IS RETRACTED WITH THE PIN, and that is not an
-        oversight. Everywhere else in this subsystem the claim is deliberately
-        independent of the coordinate — `ponfault._witness_verdict` matches by
-        MAC and never reads lat/lng — so keeping it here looks tempting and is
-        wrong: PLACING IS THE CLAIM, which makes unplacing the retraction. A
-        witness that survived with no pin would be a live input to a fibre-cut
-        verdict that has vanished from the only screen that lists witnesses —
-        the exact inverse of the failure this feature already guards ("a pin
-        that quietly stopped witnessing is the one failure this list must not
-        conceal"). Retracting also keeps alerting BYTE-IDENTICAL to the old
-        delete-everything behaviour, so the honest reading and the conservative
-        one agree.
-
-        Consequence worth stating: a bare reference point — vouched for, never
-        named — prunes away entirely, exactly as it used to. Only what an
-        operator TYPED survives, which is the whole point of the change."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE onu_places SET lat=NULL, lng=NULL, accuracy_m=NULL,"
@@ -887,17 +593,8 @@ class SnmpStoreMixin:
 
     @staticmethod
     def _prune_onu_place(conn, org_id: str, mac: str) -> None:
-        """Drop a record that has become entirely empty.
 
-        The table stays SPARSE now that a row can outlive its pin — "no row" has
-        to keep meaning "nobody wrote anything down", or a cleared pin would
-        leave a husk that the survey counts, the search finds and the operator
-        cannot get rid of. Same rule `_prune_link_route` follows for link
-        styling: delete only when every column the operator can write is empty.
 
-        `witness` counts as content — it is the claim `ponfault` reads, so a
-        power-backed subscriber whose pin was cleared keeps its row and keeps
-        working. Runs inside the caller's transaction; the caller commits."""
         conn.execute(
             "DELETE FROM onu_places WHERE org_id=? AND mac=?"
             " AND lat IS NULL AND lng IS NULL AND witness=0"
@@ -906,12 +603,7 @@ class SnmpStoreMixin:
             " AND (notes IS NULL OR notes='')", (org_id, mac))
 
     def delete_onu_place(self, org_id: str, mac: str) -> bool:
-        """Forget a subscriber outright — pin, name, number and power claim.
 
-        Distinct from `clear_onu_place_coords`, which only unpins. Nothing in the
-        dashboard calls this: the panel offers "remove pin", and the record then
-        prunes itself if it was holding nothing else. Kept for the org/device
-        delete cascades, which really do mean forget."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute("DELETE FROM onu_places WHERE org_id=? AND mac=?",
                                (org_id, mac))
@@ -919,15 +611,8 @@ class SnmpStoreMixin:
         return cur.rowcount > 0
 
 
-    # ----- subscriber drops (which passive feeds an ONU) ----------------------
-
     def list_onu_drops(self, org_id: str) -> list[dict]:
-        """Every recorded drop for this org: MAC -> the passive it comes off.
 
-        Unlike reference points this table is NOT sparse by intent — the goal is
-        one row per subscriber — so callers resolve it against the roster in
-        Python rather than joining in SQL: `_norm_mac` is the one identity
-        normalizer and it does not get a second spelling inside a query."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT mac, passive_id, waypoints, created_at, updated_at"
@@ -936,9 +621,6 @@ class SnmpStoreMixin:
         out = []
         for r in rows:
             d = dict(r)
-            # Same tolerance list_link_routes keeps: a route is presentation, and
-            # a row somebody hand-edited must degrade to "not traced" rather than
-            # take the map down with it.
             try:
                 d["waypoints"] = json.loads(d["waypoints"] or "[]")
             except (TypeError, ValueError):
@@ -948,14 +630,7 @@ class SnmpStoreMixin:
 
     def set_onu_drop_route(self, org_id: str, mac: str,
                            waypoints: list[list[float]]) -> bool:
-        """Trace (or straighten) one subscriber's drop cable.
 
-        Writes ONLY the geometry, onto a drop that must already exist: the row IS
-        the record of which splitter feeds this customer, and a route with no
-        anchor to start from would be a path drawn from nowhere. An empty list
-        straightens it back — the drop reverts to the dotted chord and stops
-        claiming to be surveyed. Returns False when no drop is recorded, which
-        the route reports rather than repairing by inventing an attachment."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE onu_drops SET waypoints=?, updated_at=?"
@@ -965,45 +640,34 @@ class SnmpStoreMixin:
             return cur.rowcount > 0
 
     def onu_drop_map(self, org_id: str) -> dict[str, int]:
-        """Just MAC -> passive_id. The shape every read path actually wants."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT mac, passive_id FROM onu_drops WHERE org_id=?",
                 (org_id,)).fetchall()
         return {r["mac"]: r["passive_id"] for r in rows}
 
-    def set_onu_drops(self, org_id: str, macs: list[str], passive_id: int) -> int:
-        """Attach these ONUs to a passive. `macs` must already be in
-        ``onuroster._norm_mac`` form — identity is the caller's to normalize,
-        exactly once, or one sticker inflates a splitter's recorded load.
+    def set_onu_drops(self, org_id: str, macs: list[str], passive_id: int,
+                      leg_no: int | None = None) -> int:
 
-        Re-attaching MOVES the drop: a subscriber comes off exactly one box, so
-        there is nothing to merge and the newest statement wins.
 
-        …and a move DISCARDS the traced route, because that path was drawn to the
-        box the customer no longer hangs off. Keeping it would leave a solid line
-        — this map's word for "surveyed" — running to the wrong splitter, which
-        is worse than the dotted chord it falls back to. Guarded on the passive
-        actually CHANGING, so re-saving the same box (the bulk dialog's normal
-        idempotent write) never destroys a traced drop."""
         if not macs:
             return 0
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
             conn.executemany(
-                "INSERT INTO onu_drops (org_id, mac, passive_id, waypoints,"
-                " created_at, updated_at) VALUES (?,?,?,'[]',?,?)"
+                "INSERT INTO onu_drops (org_id, mac, passive_id, leg_no,"
+                " waypoints, created_at, updated_at) VALUES (?,?,?,?,'[]',?,?)"
                 " ON CONFLICT(org_id, mac) DO UPDATE SET"
                 " waypoints=CASE WHEN passive_id != excluded.passive_id"
                 "   THEN '[]' ELSE waypoints END,"
+                " leg_no=CASE WHEN passive_id != excluded.passive_id THEN NULL"
+                "   ELSE COALESCE(excluded.leg_no, leg_no) END,"
                 " passive_id=excluded.passive_id, updated_at=excluded.updated_at",
-                [(org_id, m, passive_id, now, now) for m in macs])
+                [(org_id, m, passive_id, leg_no, now, now) for m in macs])
             conn.commit()
         return len(macs)
 
     def clear_onu_drops(self, org_id: str, macs: list[str]) -> int:
-        """Detaching is a DELETE — 'no splitter recorded' is the absence of a
-        row, never a row pointing nowhere."""
         if not macs:
             return 0
         marks = ",".join("?" * len(macs))
@@ -1035,8 +699,6 @@ class SnmpStoreMixin:
                  since, ts))
             conn.commit()
 
-
-    # --- ONU-roster hygiene ladder state (central/onualert.py) -----------------
 
     def pon_capacity_states(self, org_id: str) -> dict[tuple[int, str], dict]:
         with self._connect() as conn:
@@ -1100,8 +762,6 @@ class SnmpStoreMixin:
                 " distance_m=excluded.distance_m, rx_ref_dbm=excluded.rx_ref_dbm,"
                 " rx_ref_at=excluded.rx_ref_at, severity=excluded.severity,"
                 " updated_at=excluded.updated_at,"
-                # freeze the timestamp the moment an ONU goes dark — the fault
-                # detector clusters cohorts on it
                 " last_online_at=CASE WHEN excluded.state='online'"
                 "   THEN excluded.updated_at ELSE onu_optics.last_online_at END",
                 (org_id, device_id, onu_key, pon_port, onu_id, name, serial, state,
@@ -1191,9 +851,6 @@ class SnmpStoreMixin:
 
     def upsert_snmp_statuses(self, org_id: str,
                              rows: list[tuple[int, str, dict]], ts: str) -> None:
-        """Fold one report's per-device sweep diagnoses in a single transaction.
-        Rows outside the closed subsystem/state vocabularies are dropped; string
-        fields are length-bounded — the edge is trusted code but the wire isn't."""
         def _s(v, cap: int) -> str | None:
             return None if v is None else str(v)[:cap]
 
@@ -1254,8 +911,6 @@ class SnmpStoreMixin:
     def set_device_capability(self, org_id: str, device_id: int, subsystem: str,
                               supported: bool, note: str | None = None,
                               updated_by: str | None = None) -> bool:
-        """supported=True deletes the row — supported is the default, and keeping
-        the table to only the exceptions keeps the coverage suppression query O(few)."""
         if subsystem not in SNMP_SUBSYSTEMS:
             return False
         with self._write_lock, self._connect() as conn:
@@ -1286,8 +941,6 @@ class SnmpStoreMixin:
                          requested_by: str | None = None) -> int:
         now = _now_iso()
         with self._write_lock, self._connect() as conn:
-            # One pending walk per device — a re-request supersedes the stale one
-            # instead of queueing behind it.
             conn.execute(
                 "UPDATE snmp_walks SET status='error', error='superseded',"
                 " completed_at=? WHERE org_id=? AND device_id=? AND status='pending'",
@@ -1306,8 +959,6 @@ class SnmpStoreMixin:
 
 
     def pending_snmp_walks(self, org_id: str, node_id: str) -> list[dict]:
-        # Target coordinates come from org_devices at DELIVERY time (not queue time)
-        # so a community/port edit between queue and pickup is honored.
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT w.id, w.root_oid, w.max_varbinds, d.ip_address,"
@@ -1372,7 +1023,6 @@ class SnmpStoreMixin:
 
 
     def list_snmp_profiles(self, org_id: str | None) -> list[dict]:
-        # An org sees global profiles + its own; superadmin scope (None) sees all.
         with self._connect() as conn:
             if org_id is None:
                 rows = conn.execute(
@@ -1444,8 +1094,6 @@ class SnmpStoreMixin:
         return out
 
 
-    # ----- GPON vendor profiles (optics counterpart of snmp_profiles) --------
-
     @staticmethod
     def _gpon_row(row) -> dict:
         out = dict(row)
@@ -1457,7 +1105,6 @@ class SnmpStoreMixin:
         return out
 
     def list_gpon_profiles(self, org_id: str | None) -> list[dict]:
-        # An org sees global profiles + its own; superadmin scope (None) sees all.
         with self._connect() as conn:
             if org_id is None:
                 rows = conn.execute(
@@ -1469,8 +1116,6 @@ class SnmpStoreMixin:
             return [self._gpon_row(r) for r in rows.fetchall()]
 
     def gpon_profiles_for_edge(self, org_id: str) -> list[dict]:
-        # The wire shape IS the spec (name/match riding inside it) — exactly what
-        # ingress/gpon.py's gpon_profile_from_dict validates.
         out = []
         for p in self.list_gpon_profiles(org_id):
             if not p["enabled"]:
@@ -1519,16 +1164,7 @@ class SnmpStoreMixin:
 
     def admin_overview(self, fresh_window_s: int = 900,
                        now: datetime | None = None) -> dict:
-        """Superadmin fleet coverage: per org, how much of the configured
-        SNMP / GPON-optics / port monitoring is actually landing fresh data.
 
-        "Working" means a reading newer than `fresh_window_s` — the edge SNMP
-        cadence is ~90s, so 15 minutes of silence is a broken pipeline, not a
-        gap between walks. Never-reported and gone-stale are distinguished in
-        `problems` because they need different fixes (config vs dead agent).
-        Optics/ports problems are suppressed on a device whose SNMP is dead
-        outright — one root cause, one line.
-        """
         now = now or datetime.now(timezone.utc)
         cutoff = (now - timedelta(seconds=fresh_window_s)).isoformat(timespec="seconds")
         with self._connect() as conn:
@@ -1554,8 +1190,6 @@ class SnmpStoreMixin:
                 "    FROM switch_ports GROUP BY device_id) ps ON ps.device_id = d.id"
                 " WHERE d.is_active=1 ORDER BY d.org_id, d.name",
                 (cutoff,)).fetchall()
-            # Operator-confirmed "this hardware can't do X" — those gaps are facts,
-            # not problems; drop them from both the denominators and the problem list.
             unsupported = {(r["device_id"], r["subsystem"]) for r in conn.execute(
                 "SELECT device_id, subsystem FROM device_capability WHERE supported=0")}
 
@@ -1595,9 +1229,6 @@ class SnmpStoreMixin:
                 if _fresh(r["optics_at"]):
                     o["optics"]["working"] += 1
                     o["optics"]["onus_total"] += r["onus_total"] or 0
-                    # A down OLT has no reachable subscribers — its last walk is
-                    # still fresh, but none of those ONUs are online. Count them
-                    # in the total (blast radius) yet zero for online.
                     if r["dev_state"] not in ("DOWN", "UNREACHABLE"):
                         o["optics"]["onus_online"] += r["onus_online"] or 0
                 elif snmp_ok:

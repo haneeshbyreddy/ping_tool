@@ -22,12 +22,6 @@ import { PlatformPage } from "@/routes/platform-page"
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    // Refetch on focus is the safety net for backgrounded tabs: mobile browsers
-    // freeze the page (killing the SSE stream and pausing poll timers), so on
-    // return the last paint is stale. react-query's focus manager fires on
-    // visibilitychange — this resyncs every live query the moment the tab is
-    // visible again, instead of showing a stale red/green snapshot until a manual
-    // refresh. Pairs with the SSE reopen in use-event-stream.ts.
     queries: { retry: 1, refetchOnWindowFocus: true },
   },
 })
@@ -39,11 +33,6 @@ function App() {
         <AuthProvider>
           <TooltipProvider>
             <HashRouter>
-              {/* Above the routes, not inside AppShell: the shell has to READ
-                  the split state to size itself (a split needs a definite
-                  height, see ShellMain), and a provider it renders itself is one
-                  it cannot read. It sits inside HashRouter because swapping
-                  panes navigates the real router. */}
               <SplitProvider>
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
@@ -52,27 +41,15 @@ function App() {
                     <Route index element={<HomePage />} />
                     <Route path="topology" element={<TopologyPage />} />
                     <Route path="map" element={<MapPage />} />
-                    {/* Probes merged into the Network page — keep old bookmarks working */}
                     <Route path="nodes" element={<Navigate to="/topology" replace />} />
                     <Route path="settings" element={<SettingsPage />} />
-                    {/* Sections are addressable so the account menu, the billing
-                        banner and a bookmark can all land on the right one. */}
                     <Route path="settings/:section" element={<SettingsPage />} />
-                    {/* Personal settings — reachable by every role (workers too),
-                        so it lives outside the owner-only Settings page. */}
                     <Route path="account" element={<AccountPage />} />
-                    {/* The issue plane: what is wrong, one row per
-                        problem. Home tiles link here with ?kind=. */}
                     <Route path="issues" element={<IssuesPage />} />
-                    {/* Field capture: a phone at a pole. Reachable by workers —
-                        the only inventory writes that role has. */}
                     <Route path="survey" element={<SurveyPage />} />
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />
                     <Route path="overview" element={<OverviewPage />} />
-                    {/* Server-wide config (app_settings, not the scoped org) —
-                        lifted out of the org Settings page. Self-guards on
-                        superadmin. */}
                     <Route path="platform" element={<PlatformPage />} />
                   </Route>
                 </Route>

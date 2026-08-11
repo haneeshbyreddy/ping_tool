@@ -9,15 +9,6 @@ import {
   DropdownMenuSeparator, DropdownMenuShortcut, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
-/** Account menu — the sidebar's foot row, and the only place identity-scoped
- *  actions live.
- *
- *  It replaces a top-level "Settings" nav entry on purpose. Settings is not a
- *  *place in the network* the way Home/Network/Map/Logs are; putting it in the
- *  same list implied it was, and cost a permanent slot in the primary nav for
- *  something reached a few times a month. Folding it under "who am I" also gives
- *  the plan, the theme and sign-out one obvious home instead of three.
- */
 export function AccountMenu({ billing }: { billing?: BillingInfo }) {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
@@ -25,8 +16,6 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
   if (!user) return null
 
   const role = user.is_superadmin ? "Superadmin" : user.role
-  // A read-only worker doesn't see Settings or billing at all (the config surface
-  // is owner-only), so its account menu is just theme + sign out.
   const isWorker = !user.is_superadmin && user.role === "worker"
   const plan = !isWorker && billing ? (billing.plans[billing.plan]?.label ?? billing.plan) : null
   const org = user.is_superadmin ? null : user.org_name || user.org_id
@@ -61,8 +50,6 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
         </button>
       </DropdownMenuTrigger>
 
-      {/* side="top": the trigger sits at the bottom of the viewport, so the menu
-          has to grow upward or it opens off-screen. */}
       <DropdownMenuContent side="top" align="start" sideOffset={8} className="w-60">
         <DropdownMenuLabel className="font-normal">
           <div className="truncate text-xs font-medium">{user.username}</div>
@@ -71,9 +58,6 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {/* Personal settings — every role, including a worker (its only
-            password/2FA/WhatsApp surface). Distinct from the org-config Settings
-            page below, which stays owner+. */}
         <DropdownMenuItem onClick={() => navigate("/account")}>
           <UserRound />
           Your account
@@ -89,9 +73,6 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
           {mode === "dark" ? <Sun /> : <Moon />}
           {mode === "dark" ? "Light mode" : "Dark mode"}
         </DropdownMenuItem>
-        {/* Only an org has a plan — a superadmin session is not billed, so the
-            entry would lead to a section that renders nothing for them; a worker
-            doesn't see billing at all. */}
         {!isWorker && billing && (
           <DropdownMenuItem onClick={() => navigate("/settings/billing")}>
             <CreditCard />
@@ -109,8 +90,6 @@ export function AccountMenu({ billing }: { billing?: BillingInfo }) {
   )
 }
 
-/** The hint must match what the handler in app-shell actually binds, or it is a
- *  lie the first keypress exposes. */
 export function shortcutHint(): string {
   return navigator.platform.includes("Mac") ? "⌘," : "Ctrl ,"
 }

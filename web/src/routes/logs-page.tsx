@@ -25,9 +25,6 @@ const FILTERS = [
   { value: "OUTAGE_POSTMORTEM", label: "Post-mortems" },
 ] as const
 
-// ONE grid template shared by the header strip and every row — declared once so
-// the two can't drift apart, which is the classic way a hand-built table starts
-// looking broken after an unrelated edit.
 const COLS = "grid grid-cols-[4.5rem_0.5rem_minmax(0,9rem)_6.5rem_minmax(0,1fr)_3.5rem] items-center gap-3.5 px-4"
 
 function dayLabel(ts: string, now: Date): string {
@@ -116,12 +113,8 @@ export function LogsPage() {
             {events.length === 0 ? "No events yet." : "Nothing matches the current filter."}
           </p>
         )}
-        {/* keyed by first row id, NOT the day label — the label can legitimately
-            repeat across groups and duplicate keys make React leave stale rows */}
         {groups.map((group) => (
           <div key={`${group.day}:${group.events[0].id}`}>
-            {/* The day band is a SIDEBAR-tone stripe rather than another card
-                surface: it has to separate without reading as a row of data. */}
             <p className="wisp-eyebrow sticky top-0 z-10 border-y border-border-subtle bg-sidebar/95 px-4 py-2 backdrop-blur">
               {group.day}
             </p>

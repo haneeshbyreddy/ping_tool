@@ -34,10 +34,6 @@ def _sheet(blob):
 
 
 class PackageTest(unittest.TestCase):
-    """A hand-built OOXML package fails the way a hand-built PDF does — Excel
-    says "needs repair" and names nothing. These pin the parts and the element
-    order that actually decide whether it opens."""
-
     def test_it_is_a_zip_with_every_required_part(self):
         names = set(_parts(_book([{"a": "x"}])).namelist())
         self.assertEqual(names, {
@@ -48,7 +44,7 @@ class PackageTest(unittest.TestCase):
     def test_every_part_is_well_formed_xml(self):
         zf = _parts(_book([{"a": "x", "b": 3, "t": datetime(2026, 7, 26, 10, 3)}]))
         for name in zf.namelist():
-            ElementTree.fromstring(zf.read(name).decode())  # raises if malformed
+            ElementTree.fromstring(zf.read(name).decode())
 
     def test_the_relationships_point_at_the_parts_that_exist(self):
         zf = _parts(_book([{"a": "x"}]))
@@ -57,8 +53,6 @@ class PackageTest(unittest.TestCase):
         self.assertEqual(targets, {"worksheets/sheet1.xml", "styles.xml"})
 
     def test_autofilter_comes_after_sheetdata(self):
-        # Schema element order: before sheetData, Excel reports the file as
-        # needing repair.
         sheet = _sheet(_book([{"a": "x"}]))
         tags = [child.tag.split("}")[1] for child in sheet]
         self.assertLess(tags.index("sheetData"), tags.index("autoFilter"))
@@ -75,15 +69,12 @@ class PackageTest(unittest.TestCase):
         self.assertIsNone(_parts(_book([{"a": "x"}])).testzip())
 
     def test_declared_style_counts_match_the_children(self):
-        # Excel repairs a workbook whose count attribute disagrees with the
-        # element it counts — a silent, easy slip when styles.xml is hand-written.
         root = ElementTree.fromstring(
             _parts(_book([{"a": "x"}])).read("xl/styles.xml").decode())
         for tag in ("numFmts", "fonts", "fills", "borders", "cellStyleXfs",
                     "cellXfs"):
             node = root.find(f"m:{tag}", NS)
             self.assertEqual(int(node.get("count")), len(list(node)), tag)
-        # and the style indices the writer uses all exist
         self.assertGreater(len(list(root.find("m:cellXfs", NS))),
                            max(xlsx._S_BODY, xlsx._S_HEAD, xlsx._S_DATE))
 
@@ -119,26 +110,19 @@ class CellTest(unittest.TestCase):
         self.assertEqual(self._values(blob, 1)[:2], ["one", "two"])
 
     def test_a_timestamp_is_a_real_date_cell_not_text(self):
-        # THE reason to ship xlsx over CSV: sorting by "Since" has to order by
-        # time, and a text stamp sorts alphabetically ("26 Jul" before "3 Aug").
         blob = _book([{"t": datetime(2026, 7, 26, 10, 3)}])
         cell = _sheet(blob).findall(".//m:row", NS)[1][2]
-        self.assertIsNone(cell.get("t"))                    # numeric, not inlineStr
-        self.assertEqual(cell.get("s"), str(xlsx._S_DATE))  # carries a date format
+        self.assertIsNone(cell.get("t"))
+        self.assertEqual(cell.get("s"), str(xlsx._S_DATE))
         self.assertAlmostEqual(float(cell.find("m:v", NS).text),
                                xlsx._serial(datetime(2026, 7, 26, 10, 3)), places=4)
 
     def test_an_aware_timestamp_keeps_its_local_wall_clock(self):
-        # The caller has already converted to the operator's zone; a spreadsheet
-        # has no offset to carry, so the serial must be the wall clock we were
-        # handed and never a silent shift back to UTC.
         aware = datetime(2026, 7, 26, 10, 3, tzinfo=timezone.utc)
         self.assertEqual(xlsx._serial(aware),
                          xlsx._serial(datetime(2026, 7, 26, 10, 3)))
 
     def test_the_epoch_offset_matches_excels(self):
-        # 1899-12-30, not 1900-01-01 — the offset that cancels the format's
-        # 1900-leap-year bug. 2026-07-26 is day 46229.
         self.assertEqual(xlsx._serial(datetime(2026, 7, 26)), 46229.0)
 
     def test_xml_special_characters_are_escaped(self):
@@ -146,8 +130,6 @@ class CellTest(unittest.TestCase):
         self.assertEqual(self._values(blob, 1)[0], 'R&D <switch> "core"')
 
     def test_control_characters_are_stripped(self):
-        # A firmware-sourced if_alias really does carry the odd 0x01, and one of
-        # those makes Excel call the whole workbook corrupt.
         blob = _book([{"a": "Gi1/0/1\x01\x07 uplink"}])
         self.assertEqual(self._values(blob, 1)[0], "Gi1/0/1 uplink")
 
@@ -174,7 +156,6 @@ class CellTest(unittest.TestCase):
 class SheetNameTest(unittest.TestCase):
 
     def test_illegal_characters_and_length_are_fixed_not_trusted(self):
-        # An org id reaches this; Excel refuses []:*?/\ and caps it at 31.
         self.assertEqual(xlsx._sheet_name("Issues a/b:c*d"), "Issues a-b-c-d")
         self.assertEqual(len(xlsx._sheet_name("I" * 60)), 31)
         self.assertEqual(xlsx._sheet_name(""), "Sheet1")

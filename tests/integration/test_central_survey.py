@@ -1,20 +1,3 @@
-"""Field survey: a worker recording where plant physically stands.
-
-The subsystem widens the worker role's write surface for the first time since it
-was created, so the tests here are mostly about what it does NOT open. Three
-properties, each of which is the whole reason the routes are separate from the
-owner's:
-
-  * a worker can place a pin and create passive plant, and nothing else;
-  * a field route can never CLEAR a pin, so a missing UI guard cannot erase a
-    surveyed fleet;
-  * provenance is stamped on every field write and WIPED by a desktop drag —
-    the map must not claim a 9 m GPS fix for a point somebody dragged.
-
-The fourth property is the one that makes handing this to the field acceptable
-at all: a passive created here reaches no engine. `test_a_field_passive_never
-_touches_the_engine_fingerprint` pins it.
-"""
 import http.client
 import json
 import os
@@ -34,13 +17,10 @@ from wisp.central.server import make_server
 from wisp.central.store import CentralStore
 from wisp.config import Config
 
-# Somewhere in Hyderabad, where the fleet this was built for actually lives.
 LAT, LNG = 17.385044, 78.486671
 
 
 class _Base(unittest.TestCase):
-    """One org, an owner and a worker, one placed switch and one unplaced OLT."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -109,8 +89,6 @@ class _Base(unittest.TestCase):
 class FieldLocationTest(_Base):
 
     def test_a_worker_can_place_a_device(self):
-        # The point of the whole feature: the person standing at the pole is the
-        # one who knows where it is.
         status, body = self._req(
             "POST", "/api/inventory/field-location",
             {"id": self.olt, "lat": LAT, "lng": LNG, "accuracy_m": 8.4,
@@ -123,8 +101,6 @@ class FieldLocationTest(_Base):
         self.assertAlmostEqual(row["lng"], LNG, places=6)
 
     def test_the_capture_records_who_when_and_how_well(self):
-        # A 40 m fix and a surveyed point are different claims about the same two
-        # numbers. Losing that distinction is unrecoverable once pins exist.
         self._req("POST", "/api/inventory/field-location",
                   {"id": self.olt, "lat": LAT, "lng": LNG, "accuracy_m": 8.4},
                   cookie=self._login("ravi", "ravipassword"))
@@ -135,9 +111,6 @@ class FieldLocationTest(_Base):
         self.assertTrue(row["placed_at"])
 
     def test_a_gps_claim_with_no_accuracy_is_downgraded_not_rejected(self):
-        # Every browser that can produce a fix produces coords.accuracy with it,
-        # so an absent one means the number came from somewhere else. The
-        # coordinates are still worth keeping — just not as a measurement.
         self._req("POST", "/api/inventory/field-location",
                   {"id": self.olt, "lat": LAT, "lng": LNG, "source": "gps"},
                   cookie=self._login("ravi", "ravipassword"))
@@ -146,9 +119,6 @@ class FieldLocationTest(_Base):
         self.assertIsNone(row["accuracy_m"])
 
     def test_a_field_route_can_never_clear_a_pin(self):
-        # `clean_location_payload` treats both-null as DELETE. The field payload
-        # is a separate function precisely so a worker-facing route is not one
-        # missing UI guard away from erasing a surveyed fleet.
         self.store.set_org_device_location("ispA", self.olt, LAT, LNG)
         status, _ = self._req(
             "POST", "/api/inventory/field-location",
@@ -158,8 +128,6 @@ class FieldLocationTest(_Base):
         self.assertAlmostEqual(self._row(self.olt)["lat"], LAT, places=6)
 
     def test_a_desktop_drag_wipes_the_provenance_it_supersedes(self):
-        # Keeping the stamp would leave the map claiming a tight GPS fix for a
-        # point dragged across a village. "Unknown" is the honest reading.
         self._req("POST", "/api/inventory/field-location",
                   {"id": self.olt, "lat": LAT, "lng": LNG, "accuracy_m": 8.4},
                   cookie=self._login("ravi", "ravipassword"))
@@ -194,10 +162,6 @@ class FieldLocationTest(_Base):
         self.assertEqual(status, 422)
 
     def test_a_poor_but_real_fix_is_accepted(self):
-        # Deliberately NOT a refusal. A worker under dense canopy still needs to
-        # record something, and blocking the save is how coordinates end up in a
-        # WhatsApp message instead of the database. The UI demotes the button;
-        # the server keeps the number and its accuracy.
         status, _ = self._req(
             "POST", "/api/inventory/field-location",
             {"id": self.olt, "lat": LAT, "lng": LNG, "accuracy_m": 78.0},
@@ -216,9 +180,6 @@ class FieldPassiveTest(_Base):
                          cookie=cookie)
 
     def test_a_worker_can_record_plant_it_finds(self):
-        # Most splitters have no row until somebody walks to one. Without this
-        # the passive plant — the thing branch-fault localization runs on —
-        # never gets mapped.
         status, body = self._create(self._login("ravi", "ravipassword"))
         self.assertEqual(status, 200)
         row = self._row(body["id"])
@@ -229,9 +190,6 @@ class FieldPassiveTest(_Base):
         self.assertEqual(row["placed_by"], "ravi")
 
     def test_field_created_plant_has_no_parent_ip_or_probe(self):
-        # The absent fields are what make this safe to hand to the field. The
-        # parent link — the one that would give it consequences — is the owner's
-        # job on the desktop.
         _, body = self._create(self._login("ravi", "ravipassword"),
                                parent_device_id=self.olt,
                                ip_address="10.0.0.55",
@@ -242,25 +200,16 @@ class FieldPassiveTest(_Base):
         self.assertIsNone(row["assigned_node_id"])
 
     def test_a_worker_cannot_create_a_monitored_device(self):
-        # The refusal that keeps this from being an inventory write: a switch has
-        # an FSM, an outage and a page. A splitter has none of the three.
         status, _ = self._create(self._login("ravi", "ravipassword"),
                                  device_type="switch")
         self.assertEqual(status, 422)
 
     def test_a_field_passive_never_touches_the_engine_fingerprint(self):
-        # The property the whole subsystem rests on. `org_device_topology` is the
-        # single choke point the engine, the rebuild fingerprint and /edge/devices
-        # all read — a passive is excluded from it, so recording one cannot
-        # rebuild an engine or re-page a fleet.
         before = self.store.org_device_topology("ispA")
         self._create(self._login("ravi", "ravipassword"))
         self.assertEqual(self.store.org_device_topology("ispA"), before)
 
     def test_the_device_cap_does_not_apply_to_plant(self):
-        # Passives are documentation, never metered — the same rule `create`
-        # applies. A plan limit turning a survey into a half-mapped network is
-        # not a paywall anyone intended.
         self.store.set_org_plan("ispA", "free")
         for i in range(8):
             status, _ = self._create(self._login("ravi", "ravipassword"),
@@ -268,8 +217,6 @@ class FieldPassiveTest(_Base):
             self.assertEqual(status, 200)
 
     def test_a_free_form_split_ratio_is_refused(self):
-        # SPLIT_RATIOS is closed: the ratio feeds the load bar and the cumulative
-        # split down a cascade, so "1:7" produces arithmetic nobody can act on.
         status, _ = self._create(self._login("ravi", "ravipassword"),
                                  split_ratio="1:7")
         self.assertEqual(status, 422)
@@ -280,8 +227,6 @@ class FieldPassiveTest(_Base):
 
 
 class WorkerGateTest(_Base):
-    """The write surface a worker gained, and everything it did not."""
-
     def test_the_survey_routes_are_the_only_inventory_writes_a_worker_has(self):
         cookie = self._login("ravi", "ravipassword")
         for route, body in (
@@ -299,8 +244,6 @@ class WorkerGateTest(_Base):
             self.assertEqual(status, 403, f"{route} should stay owner-only")
 
     def test_a_survey_cannot_rename_the_device_it_places(self):
-        # The payload carries only coordinates by construction — a name in the
-        # body is ignored rather than honoured.
         self._req("POST", "/api/inventory/field-location",
                   {"id": self.olt, "lat": LAT, "lng": LNG, "accuracy_m": 5.0,
                    "name": "OWNED"},
@@ -316,21 +259,9 @@ class WorkerGateTest(_Base):
 
 
 class FieldOnuTest(_Base):
-    """Locating a subscriber, and the witness flag it must not touch.
-
-    This is the sharpest edge in the feature. `onu_places` already existed as the
-    REFERENCE-ONU table, where placing a pin IS the operator's claim that the
-    subscriber's power is reliable — and `ponfault` reads that claim to decide
-    whether a dark PON is an area power cut (no crew) or a fibre cut (roll a
-    splicing van). Letting the field drop location pins into the same table
-    without separating the two would enrol every geo-tagged subscriber as a
-    witness, and the next dark one would read as proof of a cut.
-    """
 
     def setUp(self):
         super().setUp()
-        # Two ONUs on the OLT's roster. `onu_search`/the field route both resolve
-        # against this, so a MAC nobody has walked is not locatable.
         for key, oid, serial, name in (
                 ("1/1", 1, "AA:BB:CC:00:00:01", "hc_kiran"),
                 ("1/2", 2, "AA:BB:CC:00:00:02", "hc_ravi")):
@@ -342,9 +273,6 @@ class FieldOnuTest(_Base):
                 ts="2026-07-28T04:00:00+00:00")
 
     def _locate(self, mac, cookie, **over):
-        # Name, number and location are all REQUIRED by the field route
-        # (operator's call, 2026-07-31), so the happy-path body carries all
-        # three and the refusal tests drop one at a time.
         body = {"mac": mac, "lat": LAT, "lng": LNG, "accuracy_m": 7.0,
                 "label": "Kiran", "phone": "9876543210"}
         body.update(over)
@@ -362,16 +290,10 @@ class FieldOnuTest(_Base):
         self.assertAlmostEqual(p["lat"], LAT, places=6)
         self.assertEqual(p["placed_by"], "ravi")
         self.assertEqual(p["accuracy_m"], 7.0)
-        # All three land in one press — a survey row a crew can act on.
         self.assertEqual(p["label"], "KIRAN")
         self.assertEqual(p["phone"], "9876543210")
 
     def test_name_number_and_location_are_each_required(self):
-        # The operator's rule (2026-07-31), enforced on the SERVER rather than
-        # in the capture sheet alone: a coordinate with nobody's name on it is a
-        # house nobody can ask for, and a name with no number is a visit that
-        # can't be arranged. A SPA that forgets one must not be able to write a
-        # row the field then has to re-walk.
         cookie = self._login("ravi", "ravipassword")
         for missing in ("label", "phone", "lat"):
             with self.subTest(missing=missing):
@@ -381,10 +303,6 @@ class FieldOnuTest(_Base):
         self.assertEqual(self.store.list_onu_places("ispA"), [])
 
     def test_a_number_is_stored_in_one_spelling(self):
-        # Separators are the writer's habit, not data. Storing them would make
-        # one customer read as two and defeat any later lookup by number; a
-        # number a tech CAN'T type the way they wrote it down is a field that
-        # stops being filled in, so they're stripped rather than refused.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"),
                      phone=" +91 98765-43210 ")
         self.assertEqual(self._place("AA:BB:CC:00:00:01")["phone"],
@@ -398,37 +316,27 @@ class FieldOnuTest(_Base):
         self.assertEqual(self.store.list_onu_places("ispA"), [])
 
     def test_locating_does_NOT_create_a_witness(self):
-        # The property the whole split exists for. A located subscriber must be
-        # invisible to ponfault.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         self.assertEqual(self._place("AA:BB:CC:00:00:01")["witness"], 0)
         self.assertEqual(self.store.onu_place_macs("ispA"), set())
 
     def test_locating_a_reference_ONU_does_not_cancel_its_claim(self):
-        # The opposite failure, and the worse one: a tech recording where a box
-        # sits must never silently strip the operator's power claim, because
-        # that claim is invisible on a handset and losing it flips a PON verdict
-        # from "power cut" to "fibre cut" — rolling a crew for the DISCOM.
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:01", 17.0, 78.0,
                                  "UPS site", None, witness=True)
         self.assertEqual(self.store.onu_place_macs("ispA"), {"AA:BB:CC:00:00:01"})
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         p = self._place("AA:BB:CC:00:00:01")
         self.assertEqual(p["witness"], 1)
-        self.assertAlmostEqual(p["lat"], LAT, places=6)   # moved
+        self.assertAlmostEqual(p["lat"], LAT, places=6)
         self.assertEqual(self.store.onu_place_macs("ispA"), {"AA:BB:CC:00:00:01"})
 
     def test_a_witness_flag_cannot_be_asked_for_in_the_payload(self):
-        # Not merely ignored by the handler — the payload has no key for it, so
-        # a future caller cannot smuggle one in.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"),
                      witness=True)
         self.assertEqual(self._place("AA:BB:CC:00:00:01")["witness"], 0)
         self.assertEqual(self.store.onu_place_macs("ispA"), set())
 
     def test_an_unknown_mac_is_refused(self):
-        # A scrape can never add an ONU and neither can this. A pin on a typo'd
-        # sticker would render at a coordinate with nothing behind it.
         status, _ = self._locate("DE:AD:BE:EF:00:00",
                                  self._login("ravi", "ravipassword"))
         self.assertEqual(status, 404)
@@ -443,8 +351,6 @@ class FieldOnuTest(_Base):
         self.assertEqual(len(self.store.list_onu_places("ispA")), 1)
 
     def test_a_worker_cannot_reach_the_reference_ONU_route(self):
-        # Placing a REFERENCE point stays owner-only — it is a claim about a
-        # power supply, not an observation.
         status, _ = self._req(
             "POST", "/api/inventory/onu-place",
             {"mac": "AA:BB:CC:00:00:01", "lat": LAT, "lng": LNG,
@@ -453,19 +359,6 @@ class FieldOnuTest(_Base):
         self.assertEqual(status, 403)
 
     def test_the_owners_reference_dialog_still_means_witness(self):
-        # RENAMED IN MEANING, deliberately (2026-08-04). This used to pin the
-        # onu-place route's DEFAULT, and that default WAS the bug: the desktop
-        # dialog sent no `witness` and the server assumed True, so every other
-        # desktop write — moving a surveyed pin, editing a phone number — made a
-        # witness too. On badri_fiber it turned 30 of one morning's field
-        # captures into power-backed witnesses within a minute of each.
-        #
-        # The operator's call was to take the claim OFF the location route
-        # entirely rather than make it explicit there: adding a location from the
-        # desk is now the same act as recording one from the handset. So the
-        # desktop's claim goes through its own verb, and this test pins that the
-        # feature still works end to end — if it broke, reference ONUs would
-        # quietly stop existing.
         status, _ = self._req(
             "POST", "/api/inventory/onu-place",
             {"mac": "AA:BB:CC:00:00:02", "lat": LAT, "lng": LNG,
@@ -493,13 +386,6 @@ class FieldOnuTest(_Base):
 
 
 class FieldOnuNameTest(FieldOnuTest):
-    """Correcting a subscriber's contact details from the field.
-
-    The name goes to `onu_places.label`, never `onu_optics.name`: the roster's
-    name is walk-owned (`name=excluded.name` on every sweep), so anything typed
-    into it would vanish within ~300s. And this is its own route because
-    re-placing would restamp the pin's provenance.
-    """
 
     def _name(self, mac, label, cookie, phone="9876543210"):
         return self._req("POST", "/api/inventory/field-onu-name",
@@ -511,16 +397,10 @@ class FieldOnuNameTest(FieldOnuTest):
         status, _ = self._name("AA:BB:CC:00:00:01", "Babu — 2nd floor",
                                self._login("ravi", "ravipassword"))
         self.assertEqual(status, 200)
-        # UPPERCASE: a customer name always reads as caps whatever the phone
-        # keyboard produced (operator's call, 2026-07-29) — normalized on the
-        # write path so search and every screen see one spelling.
         self.assertEqual(self._place("AA:BB:CC:00:00:01")["label"],
                          "BABU — 2ND FLOOR")
 
     def test_a_rename_never_restamps_the_pin_or_its_provenance(self):
-        # The reason this is a separate route. Fixing a spelling must not
-        # downgrade a real 6 m GPS fix to a hand-placed point, move the pin, or
-        # reattribute the visit to whoever corrected the typo.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"),
                      accuracy_m=6.0)
         before = self._place("AA:BB:CC:00:00:01")
@@ -531,15 +411,12 @@ class FieldOnuNameTest(FieldOnuTest):
             self.assertEqual(after[field], before[field], field)
 
     def test_a_rename_cannot_create_a_placement(self):
-        # A name with no location is not a placement, and inventing a pin-less
-        # row would put a subscriber in the coverage count nobody has visited.
         status, _ = self._name("AA:BB:CC:00:00:02", "Nobody",
                                self._login("ravi", "ravipassword"))
         self.assertEqual(status, 404)
         self.assertEqual(self.store.list_onu_places("ispA"), [])
 
     def test_a_name_can_ride_the_placement_itself(self):
-        # A first visit records both in one press rather than saving twice.
         status, _ = self._locate("AA:BB:CC:00:00:01",
                                  self._login("ravi", "ravipassword"),
                                  label="Kiran")
@@ -547,11 +424,6 @@ class FieldOnuNameTest(FieldOnuTest):
         self.assertEqual(self._place("AA:BB:CC:00:00:01")["label"], "KIRAN")
 
     def test_details_cannot_be_emptied_by_the_correction_route(self):
-        # Blanking a name USED to be allowed here — descriptive text, unlike a
-        # pin, can honestly be absent. Once the field may not RECORD a nameless
-        # subscriber (2026-07-31), letting it blank one afterwards would leave
-        # the same unusable row by a second door. The details survive the
-        # refusal.
         cookie = self._login("ravi", "ravipassword")
         self._locate("AA:BB:CC:00:00:01", cookie, label="Wrong Person")
         for label, phone in (("", "9876543210"), ("Right Person", "")):
@@ -572,8 +444,6 @@ class FieldOnuNameTest(FieldOnuTest):
         self.assertEqual(p["phone"], "9000000001")
 
     def test_the_roster_name_is_never_touched(self):
-        # The whole reason the label exists. If this ever wrote through to
-        # onu_optics.name, the next SNMP sweep would silently erase it.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         self._name("AA:BB:CC:00:00:01", "Renamed", self._login())
         row = next(r for r in self.store.org_onu_rows("ispA")
@@ -581,11 +451,6 @@ class FieldOnuNameTest(FieldOnuTest):
         self.assertEqual(row["name"], "hc_kiran")
 
     def test_a_placement_without_details_keeps_the_existing_ones(self):
-        # Re-pinning a subscriber whose details somebody already recorded must
-        # not blank them. The field ROUTE can no longer omit either (they are
-        # required), so this pins the store's own COALESCE — which is what the
-        # desktop reference-ONU dialog, whose phone field is optional, still
-        # relies on. Driven at the store because the guarantee lives there.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         self.store.place_onu_in_field(
             "ispA", "AA:BB:CC:00:00:01", 16.0, 75.0, witness=False,
@@ -595,13 +460,6 @@ class FieldOnuNameTest(FieldOnuTest):
         self.assertEqual(p["phone"], "9876543210")
 
     def test_a_name_typed_in_the_field_APPEARS_ON_THE_OLTS_OPTICAL_TAB(self):
-        # The bug this fixes (2026-07-29, reported from a live survey): the name
-        # a worker typed saved correctly into onu_places and then rendered
-        # NOWHERE — the Optical tab named every ONU off `onu_optics.name`, which
-        # is blank on this fleet, so a subscriber somebody had just stood at and
-        # named still read "unnamed" on the OLT that carries it. A name only
-        # visible on the screen that captured it is indistinguishable from a name
-        # that was never saved.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         self._name("AA:BB:CC:00:00:01", "hcs babu",
                    self._login("ravi", "ravipassword"))
@@ -612,14 +470,9 @@ class FieldOnuNameTest(FieldOnuTest):
         row = next(o for o in body["onus"]
                    if o["serial"] == "AA:BB:CC:00:00:01")
         self.assertEqual(row["label"], "HCS BABU")
-        # …and the WALKED name is still there beside it. The operator's name wins
-        # on screen, but "what does the OLT call this" stays answerable.
         self.assertEqual(row["name"], "hc_kiran")
 
     def test_a_name_typed_in_the_field_is_SEARCHABLE(self):
-        # The other half: a tech looks a subscriber up by the name they know,
-        # which after a survey is the one they typed. Matching only the walked
-        # column answered "no such subscriber" about a drop in the roster.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         self._name("AA:BB:CC:00:00:01", "hcs babu",
                    self._login("ravi", "ravipassword"))
@@ -643,10 +496,6 @@ class FieldOnuNameTest(FieldOnuTest):
             {"mac": "AA:BB:CC:00:00:01", "label": "hijacked",
              "phone": "9000000009", "org_id": "ispA"},
             cookie=self._login("bowner", "bownerpassword"))
-        # A WRITE refuses outright rather than silently rescoping (unlike the
-        # coverage GET, which pins a reader to its own org): the body named an
-        # org this caller has no rights in, and answering 404 would imply the
-        # subscriber merely doesn't exist.
         self.assertEqual(status, 403)
         p = self._place("AA:BB:CC:00:00:01")
         self.assertEqual(p["label"], "KIRAN")
@@ -654,13 +503,6 @@ class FieldOnuNameTest(FieldOnuTest):
 
 
 class OnuCoverageTest(FieldOnuTest):
-    """The survey's headline number, and the queue behind it.
-
-    Exists because the first cut counted only `org_devices` and so reported
-    "0 left" the moment the gear was placed — while every subscriber in the
-    roster still had no pin. A coverage figure nobody can see is a survey nobody
-    finishes.
-    """
 
     def _cov(self, cookie, **qs):
         q = "".join(f"&{k}={v}" for k, v in qs.items())
@@ -680,10 +522,6 @@ class OnuCoverageTest(FieldOnuTest):
         self.assertEqual(body["total"], 2)
 
     def test_a_reference_ONU_counts_as_located_too(self):
-        # Coverage asks "does this subscriber have a pin", which a witness does.
-        # `onu_place_macs` defaults to witness-only for the ALERTING callers, so
-        # this is the one place that must pass witness_only=False — getting it
-        # wrong would report a placed subscriber as still needing a visit.
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:02", LAT, LNG, None, None, witness=True)
         _, body = self._cov(self._login())
         self.assertEqual(body["placed"], 1)
@@ -696,8 +534,6 @@ class OnuCoverageTest(FieldOnuTest):
         self.assertEqual(olt["device_name"], "PYLON-OLT")
 
     def test_the_unplaced_list_only_arrives_for_one_named_OLT(self):
-        # The fleet's whole unplaced set is thousands of rows; a handset asks for
-        # the OLT it is standing under.
         _, no_id = self._cov(self._login("ravi", "ravipassword"))
         self.assertEqual(no_id["unplaced"], [])
         _, one = self._cov(self._login("ravi", "ravipassword"), device_id=self.olt)
@@ -712,19 +548,12 @@ class OnuCoverageTest(FieldOnuTest):
                          ["AA:BB:CC:00:00:02"])
 
     def test_a_located_subscriber_is_still_LISTED_as_done(self):
-        # It leaves the queue and joins the other half of the same list. A tech
-        # revisiting a street had no way to see which drops on the pole were
-        # already recorded, and the expanded list disagreed with the
-        # `placed/total` on the row it was opened from.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         _, body = self._cov(self._login("ravi", "ravipassword"), device_id=self.olt)
         self.assertEqual([u["mac"] for u in body["located"]],
                          ["AA:BB:CC:00:00:01"])
 
     def test_the_done_list_is_exactly_the_OLTs_placed_counter(self):
-        # The count-agreement rule: both halves come off ONE roster pass and one
-        # placement set, so a drill-down can never contradict the row it opened
-        # from. Every subscriber is in exactly one of the two.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         _, body = self._cov(self._login("ravi", "ravipassword"), device_id=self.olt)
         olt = next(o for o in body["olts"] if o["device_id"] == self.olt)
@@ -733,11 +562,6 @@ class OnuCoverageTest(FieldOnuTest):
                          olt["total"])
 
     def test_a_done_row_carries_what_correcting_it_needs(self):
-        # The only reason to tap a done row is to fix a name, add a number a
-        # pin predating 2026-07-31 has no room for, or move a pin that went in
-        # from the wrong side of the road. Without the stored pin the sheet
-        # would take a FRESH fix, so a typo correction would restamp a real GPS
-        # placement as a hand-placed point.
         self._locate("AA:BB:CC:00:00:01", self._login("ravi", "ravipassword"))
         _, body = self._cov(self._login("ravi", "ravipassword"), device_id=self.olt)
         row = body["located"][0]
@@ -747,14 +571,9 @@ class OnuCoverageTest(FieldOnuTest):
         self.assertAlmostEqual(row["lng"], LNG, places=6)
         self.assertEqual(row["placed_by"], "ravi")
         self.assertEqual(row["accuracy_m"], 7.0)
-        # …and what the OLT calls it, which the sheet shows as the placeholder.
         self.assertEqual(row["name"], "hc_kiran")
 
     def test_a_reference_ONU_says_so_on_its_done_row(self):
-        # A witness is somebody's claim about a power supply, not just a
-        # location — a tech about to re-pin one has to know that. SQLite hands
-        # the column back as 0/1 and the SPA's type declares a boolean, so the
-        # cast happens at the edge or `w === true` is never true.
         self.store.set_onu_place("ispA", "AA:BB:CC:00:00:02", LAT, LNG, None, None, witness=True)
         _, body = self._cov(self._login(), device_id=self.olt)
         row = next(r for r in body["located"] if r["mac"] == "AA:BB:CC:00:00:02")
@@ -767,8 +586,6 @@ class OnuCoverageTest(FieldOnuTest):
         self.assertEqual(body["placed"], 1)
 
     def test_the_queue_is_in_slot_order_not_whoever_is_up(self):
-        # A tech reads down a stable list; one shuffled by ONU state loses their
-        # place between visits.
         _, body = self._cov(self._login("ravi", "ravipassword"), device_id=self.olt)
         self.assertEqual([u["onu_id"] for u in body["unplaced"]], [1, 2])
 
@@ -777,11 +594,6 @@ class OnuCoverageTest(FieldOnuTest):
         self.assertEqual(status, 200)
 
     def test_another_orgs_roster_is_never_reachable(self):
-        # `_scope_org` pins a non-superadmin to its OWN org and ignores ?org=,
-        # so the answer is ispB's empty coverage rather than a 403. Asserting on
-        # the CONTENT, not the status: the property that matters is that ispA's
-        # subscribers never appear, and a status check would still pass if the
-        # scoping were dropped and the org echoed back.
         status, body = self._req("GET", "/api/inventory/onu-coverage?org=ispA",
                                  cookie=self._login("bowner", "bownerpassword"))
         self.assertEqual(status, 200)
@@ -790,8 +602,6 @@ class OnuCoverageTest(FieldOnuTest):
 
 
 class PayloadTest(unittest.TestCase):
-    """The validation itself, without a server in the way."""
-
     def test_both_coordinates_are_required(self):
         for body in ({"lat": LAT}, {"lng": LNG}, {},
                      {"lat": None, "lng": None}):
@@ -804,19 +614,12 @@ class PayloadTest(unittest.TestCase):
                 {"lat": LAT, "lng": LNG, "accuracy_m": 5, "source": "vibes"})
 
     def test_coordinates_round_to_ten_centimetres(self):
-        # ~1e-6° ≈ 0.1 m; anything longer is float noise from a sensor.
         out = inventory.clean_field_location_payload(
             {"lat": 17.38504412345, "lng": 78.48667198765, "accuracy_m": 5})
         self.assertEqual(out["lat"], 17.385044)
         self.assertEqual(out["lng"], 78.486672)
 
     def test_every_writer_of_a_subscriber_name_uppercases_it(self):
-        # Operator's call (2026-07-29): a customer name reads as CAPS whatever
-        # case it was typed in. Pinned across ALL THREE writers to
-        # onu_places.label — the field capture, the field rename and the desktop
-        # reference-ONU dialog — because one of them normalizing and the others
-        # not is how the same subscriber ends up spelled two ways in one list,
-        # and search then matches only one of them.
         self.assertEqual(inventory.clean_field_onu_payload(
             {"mac": "AA:BB", "lat": LAT, "lng": LNG, "accuracy_m": 5,
              "label": "hcs babu", "phone": "9876543210"})["label"], "HCS BABU")
@@ -828,18 +631,12 @@ class PayloadTest(unittest.TestCase):
              "label": "water tank"})["label"], "WATER TANK")
 
     def test_the_reference_dialog_keeps_a_name_and_number_OPTIONAL(self):
-        # The asymmetry is deliberate. What the desktop dialog writes is the
-        # POWER claim — the input to a fibre-cut-vs-power-cut verdict — so
-        # blocking it on a missing customer record would trade a diagnosis for a
-        # paperwork field. The survey is where the record is enforced.
         out = inventory.clean_onu_place_payload(
             {"mac": "AA:BB", "lat": LAT, "lng": LNG})
         self.assertIsNone(out["label"])
         self.assertIsNone(out["phone"])
 
     def test_a_number_is_compacted_but_a_leading_plus_survives(self):
-        # Looser than the WhatsApp recipient rule on purpose: this is a number a
-        # human dials, and a tech writes down the ten digits they were given.
         for raw, want in (("98765 43210", "9876543210"),
                           ("+91 98765-43210", "+919876543210"),
                           ("(0836) 244 1234", "08362441234")):

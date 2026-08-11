@@ -1,15 +1,3 @@
-"""Web-UI login injection through the proxy (Phase 2 + 2b):
-
-  * auth_mode='basic' -> central adds `Authorization: Basic <user:pass>` to the
-    device fetch; the password never touches the browser.
-  * auth_mode='form'  -> central injects an autofill script into the login HTML so
-    the page pre-fills (the password DOES reach the DOM — inherent to form login).
-
-The edge is SIMULATED with plain http.client against /edge/proxy/next and
-/edge/proxy/reply (the real ProxyTunnel needs httpx, an edge-only dep), so this
-runs in the central-only test env while exercising the real central path:
-session open -> resolve login -> _forward_headers / inject_autofill -> browser.
-"""
 import base64
 import http.client
 import json
@@ -90,9 +78,6 @@ class _ProxyAuthBase(unittest.TestCase):
 
     def _round_trip(self, sid, *, reply_headers=None, reply_body=b"",
                     browser_headers=None):
-        """Fire a browser request (it blocks on the hub), pick the parked request
-        up as the edge would, answer it, and return (forwarded_headers to device,
-        body the browser received)."""
         holder = {}
         def browser():
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=12)
@@ -156,7 +141,7 @@ class BasicAuthInjectionTest(_ProxyAuthBase):
             conn.execute("UPDATE device_webui_credentials SET password_enc='garbage'"
                          " WHERE device_id=?", (self.device_id,))
             conn.commit()
-        headers = self._headers(self._open_session())  # must still open + round-trip
+        headers = self._headers(self._open_session())
         self.assertNotIn("Authorization", headers)
 
 
@@ -180,11 +165,10 @@ class FormAutofillTest(_ProxyAuthBase):
             self._open_session(),
             reply_headers={"Content-Type": "text/html"}, reply_body=_LOGIN_HTML)
         self.assertIn(b"/* wisp-autofill */", body)
-        # the credential-free bootstrap: neither password nor username in the page
         self.assertNotIn(b"sravani@1987", body)
         self.assertNotIn(b'"u":', body)
         self.assertIn(api_proxy.proxy_mod.AUTOFILL_PATH.encode(), body)
-        self.assertNotIn("Authorization", fwd)  # form mode never injects a header
+        self.assertNotIn("Authorization", fwd)
 
     def test_creds_endpoint_returns_login_for_form_session(self):
         self._set_creds(username="admin", password="sravani@1987", auth_mode="form")
@@ -193,8 +177,6 @@ class FormAutofillTest(_ProxyAuthBase):
         self.assertEqual(doc, {"u": "admin", "p": "sravani@1987"})
 
     def test_creds_endpoint_404_for_basic_session(self):
-        # basic mode arms the header, NOT autofill — the reserved path must not
-        # hand out the login
         self._set_creds(username="admin", password="sravani@1987", auth_mode="basic")
         status, _ = self._autofill_endpoint(self._open_session())
         self.assertEqual(status, 404)
@@ -209,7 +191,6 @@ class FormAutofillTest(_ProxyAuthBase):
 
     def test_csp_header_stripped_when_autofill_armed(self):
         self._set_creds(username="admin", password="sravani@1987", auth_mode="form")
-        # capture the browser's response headers via a raw round-trip
         sid = self._open_session()
         holder = {}
         def browser():
@@ -240,8 +221,6 @@ class FormAutofillTest(_ProxyAuthBase):
 
 
 class ResolveLoginUnitTest(unittest.TestCase):
-    """The resolvers in isolation, with a real store + real SecretBox."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db")

@@ -44,14 +44,12 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(n, 1)
 
     def test_showcase_stats_counts_active_named_orgs(self):
-        # Org with a node + display name shows in the ticker; a blank-name org
-        # still counts but stays anonymous; a named org with no node is excluded.
         self.store.touch_node("ispA", "edge-1")
         self.store.set_org("ispA", name="SkyLink Broadband")
-        self.store.touch_node("ispB", "edge-2")       # active, no display name
-        self.store.set_org("ispC", name="Ghost Net")  # named but never reported
+        self.store.touch_node("ispB", "edge-2")
+        self.store.set_org("ispC", name="Ghost Net")
         stats = self.store.showcase_stats()
-        self.assertEqual(stats["count"], 2)            # ispA + ispB
+        self.assertEqual(stats["count"], 2)
         self.assertEqual(stats["names"], ["SkyLink Broadband"])
 
     def test_open_outage_reopens_after_resolve(self):
@@ -67,9 +65,6 @@ class CentralStoreTest(unittest.TestCase):
         self.assertIsNotNone(self.store.open_outage_id("ispA", dev))
 
     def test_triage_outages_status_derivation(self):
-        # Timestamps are relative to NOW, not hardcoded: `triage_outages` keeps a
-        # resolved outage only while it is inside the 30-day post-mortem window,
-        # so fixed dates make this pass until they age out and then fail forever.
         now = datetime.now(timezone.utc)
         started = (now - timedelta(hours=1)).isoformat(timespec="seconds")
         ended = (now - timedelta(minutes=55)).isoformat(timespec="seconds")
@@ -194,8 +189,8 @@ class CentralStoreTest(unittest.TestCase):
             " username TEXT NOT NULL UNIQUE, pw_hash TEXT NOT NULL, pw_salt TEXT NOT NULL,"
             " role TEXT NOT NULL DEFAULT 'operator', is_active INTEGER NOT NULL DEFAULT 1,"
             " created_at TEXT NOT NULL);")
-        rows = [(None, "root", "worker"),      # already damaged by an earlier build
-                (None, "root2", "operator"),   # pre-collapse superadmin
+        rows = [(None, "root", "worker"),
+                (None, "root2", "operator"),
                 ("ispA", "boss", "owner"),
                 ("ispA", "op1", "operator"),
                 ("ispA", "t1", "tech")]
@@ -207,10 +202,8 @@ class CentralStoreTest(unittest.TestCase):
 
         store = CentralStore(path)
         got = {u["username"]: u["role"] for u in store.list_users()}
-        # superadmins land on the one harmless token, never 'worker'
         self.assertEqual(got["root"], "owner")
         self.assertEqual(got["root2"], "owner")
-        # org accounts collapse onto worker
         self.assertEqual(got["boss"], "owner")
         self.assertEqual(got["op1"], "worker")
         self.assertEqual(got["t1"], "worker")
@@ -221,7 +214,6 @@ class CentralStoreTest(unittest.TestCase):
         self.assertEqual(self.store.org_role_topic("ispA", "owner"), "isp-a-owner")
         self.assertEqual(self.store.org_role_topic("ispA", "worker"), "isp-a-worker")
         self.assertIsNone(self.store.org_role_topic("ispA", "bogus"))
-        # the removed roles resolve to nothing, not to a lingering column
         self.assertIsNone(self.store.org_role_topic("ispA", "operator"))
         self.assertIsNone(self.store.org_role_topic("ispA", "tech"))
         self.store.set_org("ispA", ntfy_topic_owner="isp-a-owner-2")
@@ -414,15 +406,10 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertIsNone(self.store.get_org_device("ispA", olt)["gpon_vendor"])
 
     def test_onu_pon_limit_round_trips_through_the_device_write_path(self):
-        # The cap the "PON at capacity" page is judged against. It had a column
-        # and every reader, but no write path a form could reach — so a GPON box
-        # could only ever be capped at the EPON 64.
         olt = self.store.create_org_device("ispA", {
             "name": "OLT-2", "ip_address": "10.0.0.9", "device_type": "OLT",
             "region": None, "parent_device_id": None, "onu_pon_limit": 128})
         row = next(d for d in self.store.list_org_devices("ispA") if d["id"] == olt)
-        # list_org_devices is the read onualert._limits() uses; a cap missing
-        # THERE is a cap that pages nobody differently
         self.assertEqual(row["onu_pon_limit"], 128)
 
         self.store.update_org_device("ispA", olt, {
@@ -435,10 +422,8 @@ class OrgDevicesTest(unittest.TestCase):
             "name": "SW-1", "ip_address": "10.0.0.8", "device_type": "switch",
             "region": None, "parent_device_id": None, "tags": "hill-site,backhaul"})
         row = next(d for d in self.store.list_org_devices("ispA") if d["id"] == dev)
-        self.assertEqual(row["tags"], ["hill-site", "backhaul"])  # list on the wire
+        self.assertEqual(row["tags"], ["hill-site", "backhaul"])
 
-        # cosmetic only: the engine topology fingerprint reads org_device_topology,
-        # so a tag edit must never surface there (no rebuild / re-page)
         topo = {d["id"]: d for d in self.store.org_device_topology("ispA")}
         self.assertNotIn("tags", topo[dev])
 
@@ -516,8 +501,6 @@ class OrgDevicesTest(unittest.TestCase):
         self.store.upsert_switch_port("ispA", switch, 1, "eth1", None, "up", "up",
                                       None, 0, False, None, "t1")
         self.store.set_port_feeds("ispA", self.store.list_switch_ports("ispA", switch)[0]["id"], d)
-        # SNMP-side rows: these FK org_devices and once broke delete with a
-        # FOREIGN KEY constraint (field bug, 2026-07-19 — Epon_8).
         self.store.upsert_device_health("ispA", d, {"cpu_pct": 42.0}, "t1")
         self.store.upsert_pon_capacity_state("ispA", d, "0/1", onus=64, active=True,
                                              since="t1", ts="t1")
@@ -532,11 +515,6 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertTrue(self.store.delete_org_device("ispA", backup)["ok"])
 
     def test_delete_cascade_handles_every_fk_table(self):
-        # Guardrail: every table that FK-references org_devices(id) must be
-        # cleared (DELETE) or detached (UPDATE ... NULL) by delete_org_device, or
-        # a real delete 500s on "FOREIGN KEY constraint failed" (foreign_keys=ON).
-        # A static check so adding a new device-scoped table without wiring the
-        # cascade fails HERE, not in production.
         import inspect, re
         from wisp.central import store as store_mod
         fk_tables = {
@@ -544,7 +522,7 @@ class OrgDevicesTest(unittest.TestCase):
                 r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)\s*\((.*?)\n\s*\);",
                 store_mod._SCHEMA, re.S)
             if "REFERENCES org_devices(id)" in body}
-        fk_tables.discard("org_devices")  # the row itself
+        fk_tables.discard("org_devices")
         src = inspect.getsource(store_mod.CentralStore.delete_org_device)
         missing = [t for t in sorted(fk_tables) if not re.search(rf"\b{t}\b", src)]
         self.assertEqual(missing, [],
@@ -564,8 +542,6 @@ class OrgDevicesTest(unittest.TestCase):
         self.assertEqual(row["snmp_community"], "public")
 
 class PassivePlantTest(unittest.TestCase):
-    """Splitters/FDBs live in org_devices but must NEVER reach the probe path."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
@@ -580,8 +556,6 @@ class PassivePlantTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_topology_excludes_passives(self):
-        # the single choke point: engine FSMs, fingerprint AND /edge/devices all
-        # ride org_device_topology — an empty-IP row here would get pinged
         ids = {d["id"] for d in self.store.org_device_topology("ispA")}
         self.assertIn(self.olt, ids)
         self.assertNotIn(self.splitter, ids)
@@ -608,8 +582,6 @@ class PassivePlantTest(unittest.TestCase):
 
 
 class LinkRouteTest(unittest.TestCase):
-    """Drawn cable paths: geometry survives only while its link exists."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
@@ -700,7 +672,6 @@ class RegionsTest(unittest.TestCase):
         d = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
             "region": "north-dc", "parent_device_id": None})
-        # a same-name region in another org must not be touched
         other = self.store.create_org_device("ispB", {
             "name": "B", "ip_address": "10.0.1.1", "device_type": None,
             "region": "north-dc", "parent_device_id": None})
@@ -833,7 +804,6 @@ class CentralServerTest(unittest.TestCase):
         return resp.status, raw
 
     def test_landing_injects_showcase(self):
-        # A live, named org should surface in the server-injected payload on `/`.
         self.store.touch_node("ispA", "edge-1")
         self.store.set_org("ispA", name="SkyLink Broadband")
         status, raw = self._get_raw("/")
@@ -843,7 +813,6 @@ class CentralServerTest(unittest.TestCase):
         self.assertIn('"enabled": true', text)
         self.assertIn("SkyLink Broadband", text)
         self.assertIn('src="/showcase.js"', text)
-        # And the overlay script itself is served.
         js_status, js_raw = self._get_raw("/showcase.js")
         self.assertEqual(js_status, 200)
         self.assertIn(b"__WISP_SHOWCASE__", js_raw)
@@ -889,8 +858,6 @@ class CentralServerTest(unittest.TestCase):
         conn.close()
 
 class AdminOverviewTest(unittest.TestCase):
-    """GET /api/admin/overview — superadmin fleet coverage rollup."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
@@ -952,22 +919,17 @@ class AdminOverviewTest(unittest.TestCase):
         fresh = now.isoformat(timespec="seconds")
         stale = (now - timedelta(hours=2)).isoformat(timespec="seconds")
 
-        # Fresh switch: health + one monitored fresh port -> fully working.
         sw = self._dev("sw1", "10.0.0.1", "Switch")
         self.store.upsert_device_health("ispA", sw, {"cpu_pct": 12.0}, fresh)
         self.store.upsert_switch_port("ispA", sw, 1, "eth1", None, "up", "up",
                                       None, 0, False, None, fresh)
         pid = self.store.list_switch_ports("ispA", sw)[0]["id"]
         self.store.set_port_monitored("ispA", pid, True)
-        # OLT with fresh health but no optics ever -> optics "never" problem.
         olt = self._dev("olt1", "10.0.0.2", "OLT")
         self.store.upsert_device_health("ispA", olt, {"cpu_pct": 20.0}, fresh)
-        # SNMP-enabled but silent -> snmp "never" problem.
         self._dev("dead1", "10.0.0.3", "Switch")
-        # SNMP data stopped -> snmp "stale" problem.
         gone = self._dev("stale1", "10.0.0.4", "Router")
         self.store.upsert_device_health("ispA", gone, {"cpu_pct": 30.0}, stale)
-        # No SNMP at all -> counted in devices only, never a problem.
         self._dev("plain", "10.0.0.5", "Router", snmp=False)
 
         status, body, _ = self._req("GET", "/api/admin/overview", token="s3cret")
@@ -1042,9 +1004,6 @@ class DownloadRouteTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_download_app_fixed_dir_no_auth(self):
-        # The field-app APK mirror (releasesync.sync_app_release) lands in the
-        # fixed app/ dir and serves through this same route with no store row —
-        # /download/app/<name> is the stable worker install URL.
         (self.cache / "app").mkdir()
         (self.cache / "app" / "wisp-field.apk").write_bytes(b"APK-BYTES")
         status, data = self._raw("/download/app/wisp-field.apk")
@@ -1055,23 +1014,15 @@ class DownloadRouteTest(unittest.TestCase):
 
 
 class JsonReplySafetyTest(unittest.TestCase):
-    """Central must never serve a body a browser cannot parse.
-
-    json.dumps emits bare NaN/Infinity by default and that is not valid JSON:
-    JSON.parse rejects it and the client loses the ENTIRE reply, not the one bad
-    number. A single ONU reporting Tx = -inf took out an OLT's whole Optical tab
-    this way. Ingest cleans device values, but device-derived floats reach the
-    encoder from many paths, so the guarantee is pinned here as well.
-    """
 
     def test_non_finite_floats_are_nulled_not_emitted_raw(self):
         from wisp.central.server import _json_safe
         body = {"onus": [{"rx_dbm": -21.5, "tx_dbm": float("-inf")},
                          {"rx_dbm": float("nan"), "tx_dbm": float("inf")}],
                 "count": 2, "name": "PYLON"}
-        raw = json.dumps(_json_safe(body), allow_nan=False)   # must not raise
+        raw = json.dumps(_json_safe(body), allow_nan=False)
         back = json.loads(raw)
-        self.assertEqual(back["onus"][0]["rx_dbm"], -21.5)    # good value kept
+        self.assertEqual(back["onus"][0]["rx_dbm"], -21.5)
         self.assertIsNone(back["onus"][0]["tx_dbm"])
         self.assertIsNone(back["onus"][1]["rx_dbm"])
         self.assertIsNone(back["onus"][1]["tx_dbm"])

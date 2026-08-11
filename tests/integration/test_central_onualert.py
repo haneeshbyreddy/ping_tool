@@ -17,11 +17,6 @@ from wisp.central.onualert import OnuRosterAlerter
 
 class OnuRosterAlerterTest(unittest.TestCase):
 
-    # NB: current_roster compares each row's updated_at against the REAL
-    # datetime.now() inside sweep(), so walk timestamps must be anchored near
-    # now (captured once so a walk's rows share an identical string). A future
-    # offset for a later "walk" stays fresh; the freshness filter drops the rows
-    # left behind at the earlier stamp.
     def _t(self, min_offset: float = 0) -> str:
         return (self.base + timedelta(minutes=min_offset)).isoformat()
 
@@ -30,7 +25,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.notifier = RecordingNotifier()
-        # low cap so we don't seed 64 rows; both gates on
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db", onu_pon_limit=3)
         self.store.set_org("ispA", ntfy_topic_worker="ops-topic")
         self.olt = self.store.create_org_device("ispA", {
@@ -50,16 +44,11 @@ class OnuRosterAlerterTest(unittest.TestCase):
             severity="ok", ts=ts or self._t(0))
 
     def _titles(self, needle):
-        # ONU cap + dup-MAC alerts are DIGEST-tier: they queue for the hourly
-        # summary, they don't push. Transition-only still holds — one queued row
-        # per change; the queue accumulates (tests never flush).
         return [r for r in self.store.pending_digest("ispA")
                 if needle in (r["title"] or "")]
 
-    # --- per-PON ONU cap -------------------------------------------------------
 
     def test_capacity_writes_state_off(self):
-        # ONU cap alerts are OFF for now (allowlist): state written, no page/queue.
         for i in range(3):
             self._onu(f"0/1.{i}", onu_id=i, serial=f"M{i}")
         self.alerter.sweep(self._t(0))
@@ -67,7 +56,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(self._titles("at capacity"), [])
         state = self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]
         self.assertEqual(state["active"], 1)
-        # re-walk, still full: state stands
         self.alerter.sweep(self._t(1))
         self.assertEqual(
             self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]["active"], 1)
@@ -76,8 +64,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         for i in range(3):
             self._onu(f"0/1.{i}", onu_id=i, serial=f"M{i}", ts=self._t(0))
         self.alerter.sweep(self._t(0))
-        # next walk drops to 2 ONUs (only 2 re-reported with a fresh stamp; the
-        # third falls out of the current roster)
         for i in range(2):
             self._onu(f"0/1.{i}", onu_id=i, serial=f"M{i}", ts=self._t(5))
         self.alerter.sweep(self._t(5))
@@ -86,8 +72,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
             self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]["active"], 0)
 
     def test_per_olt_override_raises_the_cap(self):
-        # a 1:128 OLT: 3 ONUs must NOT read as "at capacity" once its override
-        # is set (verifies _limits() reads the override off list_org_devices)
         self.store.set_olt_optical_thresholds("ispA", self.olt, None, None, 128)
         for i in range(3):
             self._onu(f"0/1.{i}", onu_id=i, serial=f"M{i}")
@@ -95,7 +79,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(self._titles("at capacity"), [])
         self.assertNotIn((self.olt, "0/1"), self.store.pon_capacity_states("ispA"))
 
-    # --- redundant MAC ---------------------------------------------------------
 
     def test_dup_mac_writes_state_off(self):
         self._onu("0/1.0", onu_id=0, serial="AA:BB:CC:00:00:01")
@@ -113,7 +96,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self._onu("0/1.0", onu_id=0, serial="DEAD", ts=self._t(0))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="DEAD", ts=self._t(0))
         self.alerter.sweep(self._t(0))
-        # one slot re-registers under a distinct MAC → no duplicate stands
         self._onu("0/1.0", onu_id=0, serial="DEAD", ts=self._t(5))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="BEEF", ts=self._t(5))
         self.alerter.sweep(self._t(5))
@@ -121,9 +103,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(self.store.onu_dup_mac_states("ispA")["DEAD"]["active"], 0)
 
     def test_ghost_dup_writes_state_but_never_pages(self):
-        # One slot online + one offline ghost = C-Data reg-table history (the
-        # 2026-07-14 storm: 178 duplicates, 176 of them ghosts). Dashboard
-        # state yes; operator's phone no.
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online")
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="CAFE", state="offline")
         self.alerter.sweep(self._t(0))
@@ -131,7 +110,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         st = self.store.onu_dup_mac_states("ispA")["CAFE"]
         self.assertEqual(st["active"], 1)
         self.assertEqual(st["online_members"], 1)
-        # ghost disappears entirely (fresh walk) — deactivates, still no page
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online", ts=self._t(5))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="BEEF",
                   state="offline", ts=self._t(5))
@@ -146,7 +124,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(
             self.store.onu_dup_mac_states("ispA")["CAFE"]["online_members"], 2)
-        # one slot goes dark: the live conflict ended, the ghost row remains
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online", ts=self._t(5))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="CAFE",
                   state="offline", ts=self._t(5))
@@ -155,21 +132,16 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual((st["active"], st["online_members"]), (1, 1))
 
     def test_stale_walk_freezes_dup_state(self):
-        # The storm shape: a slow C-Data agent misses a walk, the OLT goes
-        # stale, every duplicate involving it "vanishes". Freeze — the state must
-        # not flip to cleared, then re-arm when the walk lands again.
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online")
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="CAFE", state="online")
         self.alerter.sweep(self._t(0))
         self.assertEqual(self.store.onu_dup_mac_states("ispA")["CAFE"]["active"], 1)
-        # the OLT's walk goes stale (>15 min old)
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online", ts=self._t(-20))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="CAFE",
                   state="online", ts=self._t(-20))
         self.alerter.sweep(self._t(1))
         self.assertEqual(self._titles("cleared"), [])
         self.assertEqual(self.store.onu_dup_mac_states("ispA")["CAFE"]["active"], 1)
-        # walk lands again, duplicate still there: state stays
         self._onu("0/1.0", onu_id=0, serial="CAFE", state="online", ts=self._t(2))
         self._onu("0/2.0", pon_port="0/2", onu_id=0, serial="CAFE",
                   state="online", ts=self._t(2))
@@ -182,7 +154,6 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.alerter.sweep(self._t(0))
         self.assertEqual(
             self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]["active"], 1)
-        # walk goes stale — the fault must freeze, not clear
         for i in range(3):
             self._onu(f"0/1.{i}", onu_id=i, serial=f"M{i}", ts=self._t(-20))
         self.alerter.sweep(self._t(1))
@@ -190,14 +161,13 @@ class OnuRosterAlerterTest(unittest.TestCase):
         self.assertEqual(
             self.store.pon_capacity_states("ispA")[(self.olt, "0/1")]["active"], 1)
 
-    # --- gates -----------------------------------------------------------------
 
     def test_gates_off_write_state_but_never_page(self):
         cfg = Config(db_path=Path(self.tmp.name) / "wisp2.db", onu_pon_limit=3,
                      onu_limit_alerts=False, onu_dup_mac_alerts=False)
         alerter = OnuRosterAlerter(self.store, "ispA", self.notifier, cfg)
         for i in range(3):
-            self._onu(f"0/1.{i}", onu_id=i, serial="SAME")  # full AND duplicated
+            self._onu(f"0/1.{i}", onu_id=i, serial="SAME")
         alerter.sweep(self._t(0))
         self.assertEqual(self.store.pending_digest("ispA"), [])
         self.assertEqual(

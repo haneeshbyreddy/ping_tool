@@ -1,9 +1,3 @@
-"""Web-UI proxy tunnel — hub parking desk + edge worker, in isolation (no network).
-
-The hub is the cross-thread parking desk (browser thread blocks, edge thread hands
-off); the edge worker is the allow-list gate + device fetch. Full HTTP round-trip
-lives in integration/test_central_proxy.py.
-"""
 import asyncio
 import base64
 import json
@@ -42,11 +36,6 @@ class ParsePortsTest(unittest.TestCase):
 
 
 class ProxyDefaultOnTest(unittest.TestCase):
-    """Activation is central-driven (v0.15.8): a fresh edge with no env var
-    must build the tunnel — the per-edge WISP_PROXY_ENABLED requirement was
-    the field trap (missing flag read as a 504 on every session). =0 stays
-    the explicit kill switch."""
-
     def test_default_on_env_zero_kills(self):
         old = os.environ.pop("WISP_PROXY_ENABLED", None)
         try:
@@ -72,7 +61,7 @@ class ProxyHubTest(unittest.TestCase):
     def test_session_lookup_and_ttl_expiry(self):
         sess = self._open(ttl_s=60)
         self.assertIs(self.hub.get_session(sess.sid), sess)
-        expired = self._open(ttl_s=-1)  # already in the past
+        expired = self._open(ttl_s=-1)
         self.assertIsNone(self.hub.get_session(expired.sid))
 
     def test_round_trip_parks_and_delivers(self):
@@ -115,11 +104,10 @@ class ProxyHubTest(unittest.TestCase):
                                  body=b"", timeout=0.6)))
         t.start()
         payload = self.hub.next_request("o", "n", 2.0)
-        # A credential for a different node must not answer this req_id.
         self.assertFalse(self.hub.deliver(payload["req_id"], "o", "other",
                                           {"status": 200, "headers": {}, "body_b64": ""}))
         t.join(timeout=5)
-        self.assertIsNone(result["r"])  # browser timed out, unanswered
+        self.assertIsNone(result["r"])
 
     def test_next_request_times_out_empty(self):
         self.assertIsNone(self.hub.next_request("o", "n", 0.1))
@@ -133,13 +121,12 @@ class ProxyHubTest(unittest.TestCase):
         sess = self._open(ttl_s=600)
         before = sess.expires_at
         self.assertGreaterEqual(self.hub.extend_session(sess, 600), before)
-        # a shorter ttl must never PULL the expiry closer
         far = self.hub.extend_session(sess, 3600)
         self.assertEqual(self.hub.extend_session(sess, 1), far)
 
     def test_active_sessions_for_reports_relative_ttl(self):
         sess = self._open(ttl_s=120)
-        self._open(ttl_s=-1)  # expired — must not be carried
+        self._open(ttl_s=-1)
         other = self.hub.open_session(
             org_id="o", device_id=2, node_id="OTHER", device_ip="1.2.3.5",
             device_port=80, scheme="http", created_by=7, ttl_s=120)
@@ -151,15 +138,7 @@ class ProxyHubTest(unittest.TestCase):
             [other.sid])
 
     def test_an_idle_window_narrows_active_to_sessions_in_USE(self):
-        """"Is a session open" and "is a human driving it" are different
-        questions, and the web-optics sweeper needs the second one.
 
-        Nothing tells central a browser tab was closed, so an abandoned session
-        stays open for the rest of its TTL — and the sweeper's browse gate is
-        per-NODE, so answering the first question let one forgotten tab suppress
-        the optical read of every OLT behind that probe. The edge path still
-        asks the first (its tunnel should stay up for the whole TTL).
-        """
         idle = self._open(ttl_s=600)
         idle.last_used_at = time.time() - 300
         busy = self.hub.open_session(
@@ -181,10 +160,6 @@ class ProxyHubTest(unittest.TestCase):
             [sess.sid])
 
     def test_has_session_is_expiry_aware(self):
-        # The dashboard's "live" badge and its pulsing globe read this. A plain
-        # membership test kept both claiming a session was open long after it
-        # had timed out — sessions are dropped lazily, and the one thing that
-        # would look this one up (its browser) is what has gone away.
         live, dead = self._open(ttl_s=60), self._open(ttl_s=-1)
         self.assertTrue(self.hub.has_session(live.sid))
         self.assertFalse(self.hub.has_session(dead.sid))
@@ -192,11 +167,10 @@ class ProxyHubTest(unittest.TestCase):
     def test_reap_expired_returns_the_sids_it_dropped(self):
         live, dead = self._open(ttl_s=60), self._open(ttl_s=-1)
         self.assertEqual(self.hub.reap_expired(), [dead.sid])
-        self.assertEqual(self.hub.reap_expired(), [])   # nothing left to retire
+        self.assertEqual(self.hub.reap_expired(), [])
         self.assertTrue(self.hub.has_session(live.sid))
 
     def test_submit_extra_merges_but_keeps_base_fields(self):
-        # the preflight rides extra=; an old edge must still see a plain fetch
         sess = self._open()
         t = threading.Thread(target=lambda: self.hub.submit(
             sess, method="GET", path="/", headers={}, body=b"", timeout=2,
@@ -205,7 +179,7 @@ class ProxyHubTest(unittest.TestCase):
         payload = self.hub.next_request("o", "n", 2.0)
         self.assertEqual(payload["kind"], "preflight")
         self.assertEqual(payload["candidates"], [["1.2.3.4", 443, "https"]])
-        self.assertEqual(payload["device_ip"], "1.2.3.4")   # base fields survive
+        self.assertEqual(payload["device_ip"], "1.2.3.4")
         self.assertEqual(payload["scheme"], "http")
         self.hub.deliver(payload["req_id"], "o", "n",
                          {"status": 200, "headers": {}, "body_b64": ""})
@@ -297,8 +271,6 @@ class RewriteBodyTest(unittest.TestCase):
 
 
 class _FakeClient:
-    """Stands in for HttpCentralClient: yields queued requests, records replies."""
-
     def __init__(self, requests):
         self._requests = list(requests)
         self.replies = []
@@ -351,7 +323,7 @@ class ProxyTunnelTest(unittest.TestCase):
     def test_refuses_ip_not_in_device_list(self):
         client = _FakeClient([_req(device_ip="10.9.9.9")])
         self._run(client, [{"ip_address": "127.0.0.1"}], self._fetcher())
-        self.assertEqual(len(self.fetched), 0)  # never touched the device
+        self.assertEqual(len(self.fetched), 0)
         self.assertEqual(client.replies[0]["status"], 502)
         self.assertIn("not a device this node probes", client.replies[0]["error"])
 
@@ -384,9 +356,6 @@ class ProxyTunnelTest(unittest.TestCase):
         self.assertFalse(self._run(client, [], self._fetcher()))
 
     def test_serves_owner_declared_web_endpoint(self):
-        # OLT web UI is port-forwarded to a DIFFERENT IP on a NON-mgmt port; the
-        # (web_ip, web_port) pair the owner declared is allowed even though the IP
-        # isn't the probe IP and 8080 isn't in proxy_mgmt_ports.
         client = _FakeClient([_req(device_ip="203.0.113.9", device_port=8080)])
         devices = [{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
                     "web_port": 8080, "web_scheme": "http"}]
@@ -395,8 +364,6 @@ class ProxyTunnelTest(unittest.TestCase):
         self.assertEqual(client.replies[0]["status"], 200)
 
     def test_web_override_pair_must_match_exactly(self):
-        # Same declared IP but a port the owner never declared is still refused —
-        # the override is a pair, not a blanket IP allow.
         client = _FakeClient([_req(device_ip="203.0.113.9", device_port=9999)])
         devices = [{"ip_address": "10.0.0.5", "web_ip": "203.0.113.9",
                     "web_port": 8080, "web_scheme": "http"}]
@@ -406,8 +373,6 @@ class ProxyTunnelTest(unittest.TestCase):
 
 
 class WebEndpointsTest(unittest.TestCase):
-    """The edge's owner-declared-endpoint resolution mirrors central's."""
-
     def test_no_override_contributes_nothing(self):
         self.assertEqual(_web_endpoints([{"ip_address": "10.0.0.5"}]), frozenset())
 
@@ -418,7 +383,6 @@ class WebEndpointsTest(unittest.TestCase):
             frozenset({("203.0.113.9", 8080)}))
 
     def test_port_only_uses_probe_ip(self):
-        # a custom mgmt port on the same box (no separate IP)
         self.assertEqual(
             _web_endpoints([{"ip_address": "10.0.0.5", "web_port": 8443}]),
             frozenset({("10.0.0.5", 8443)}))
@@ -434,9 +398,6 @@ class WebEndpointsTest(unittest.TestCase):
 
 
 class PreflightTest(unittest.TestCase):
-    """kind="preflight": connect-probe candidates through the SAME allow-list
-    gate as fetches, never touch the device's HTTP layer."""
-
     def setUp(self):
         self.cfg = Config(proxy_enabled=True, proxy_mgmt_ports="80,443",
                           proxy_poll_hold_s=0.2, proxy_workers=1,
@@ -501,8 +462,6 @@ class PreflightTest(unittest.TestCase):
 
 
 class FriendlyFetchErrorTest(unittest.TestCase):
-    """Fast-failure copy: the 502 string must name the fix, not the httpx class."""
-
     def setUp(self):
         try:
             import httpx  # noqa: F401
@@ -545,9 +504,6 @@ class FriendlyFetchErrorTest(unittest.TestCase):
 
 
 class TunnelStandbyTest(unittest.TestCase):
-    """First-connect fix (2026-07-20): ``proxy_standby`` holds exactly ONE
-    long-poll while idle; a live session scales it to the full pool and back."""
-
     def _cfg(self, workers=3):
         return Config(proxy_enabled=True, proxy_mgmt_ports="80",
                       proxy_poll_hold_s=0.02, proxy_workers=workers,
@@ -561,11 +517,11 @@ class TunnelStandbyTest(unittest.TestCase):
         async def run():
             tunnel = ProxyTunnel(_FakeClient([]), self._cfg(),
                                  devices_provider=lambda: [])
-            tunnel.notify_standby(False)      # org without the proxy: dormant
+            tunnel.notify_standby(False)
             self.assertEqual(tunnel._tasks, [])
             tunnel.notify_standby(True)
             self.assertEqual(self._live(tunnel), 1)
-            tunnel.notify_standby(True)       # refresh must not add workers
+            tunnel.notify_standby(True)
             self.assertEqual(self._live(tunnel), 1)
             await tunnel.aclose()
 
@@ -578,7 +534,7 @@ class TunnelStandbyTest(unittest.TestCase):
             tunnel._STANDBY_TTL_S = 0.15
             tunnel.notify_standby(True)
             self.assertEqual(self._live(tunnel), 1)
-            await asyncio.sleep(0.5)          # central stopped sending the key
+            await asyncio.sleep(0.5)
             self.assertEqual(self._live(tunnel), 0)
             await tunnel.aclose()
 
@@ -593,7 +549,7 @@ class TunnelStandbyTest(unittest.TestCase):
             self.assertEqual(self._live(tunnel), 1)
             tunnel.notify_sessions([{"sid": "s1", "ttl_s": 0.3}])
             self.assertEqual(self._live(tunnel), 3)
-            await asyncio.sleep(0.7)          # session lapsed, standby still armed
+            await asyncio.sleep(0.7)
             self.assertEqual(self._live(tunnel), 1)
             await tunnel.aclose()
 
@@ -601,9 +557,6 @@ class TunnelStandbyTest(unittest.TestCase):
 
 
 class TunnelDormancyTest(unittest.TestCase):
-    """Activation model: zero long-polls while no session is live AND the org
-    hasn't enabled the web proxy (no ``proxy_standby`` refresh)."""
-
     def test_workers_spin_up_on_sessions_and_stand_down(self):
         cfg = Config(proxy_enabled=True, proxy_mgmt_ports="80",
                      proxy_poll_hold_s=0.02, proxy_workers=2,
@@ -612,17 +565,17 @@ class TunnelDormancyTest(unittest.TestCase):
 
         async def run():
             tunnel = ProxyTunnel(client, cfg, devices_provider=lambda: [])
-            tunnel._GRACE_S = 0.0  # test-only: don't wait the real 30s grace
-            self.assertEqual(tunnel._tasks, [])   # dormant at construction
-            tunnel.notify_sessions(None)          # idle reply: still dormant
+            tunnel._GRACE_S = 0.0
+            self.assertEqual(tunnel._tasks, [])
+            tunnel.notify_sessions(None)
             tunnel.notify_sessions([])
             self.assertEqual(tunnel._tasks, [])
             tunnel.notify_sessions([{"sid": "s1", "ttl_s": 0.3},
                                     {"sid": "junk", "ttl_s": "x"}])
             self.assertTrue(any(not t.done() for t in tunnel._tasks))
-            await asyncio.sleep(0.6)              # deadline passed, no refresh
+            await asyncio.sleep(0.6)
             self.assertTrue(all(t.done() for t in tunnel._tasks))
-            tunnel.notify_sessions([{"sid": "s1", "ttl_s": 0.3}])  # re-arms
+            tunnel.notify_sessions([{"sid": "s1", "ttl_s": 0.3}])
             self.assertTrue(any(not t.done() for t in tunnel._tasks))
             await tunnel.aclose()
 
@@ -644,18 +597,13 @@ class TunnelDormancyTest(unittest.TestCase):
 
 
 class AssetCacheTest(unittest.TestCase):
-    """The per-session memo that took 44% of the tunnel's traffic off the wire.
-    What it REFUSES to remember is the whole safety story."""
-
     def test_cacheable_path_is_a_closed_extension_list(self):
         self.assertTrue(cacheable_path("GET", "/js/jquery-1.7.1.min.js"))
         self.assertTrue(cacheable_path("GET", "/i18N/main_en_US.properties"))
         self.assertTrue(cacheable_path("get", "/images/logo.png?v=2"))
-        # this vendor's DYNAMIC pages are .html — never inferred as static
         self.assertFalse(cacheable_path("GET", "/action/onuauthinfo.html"))
         self.assertFalse(cacheable_path("GET", "/action/main.html"))
         self.assertFalse(cacheable_path("GET", "/status"))
-        # a POST changes something on the box, by definition
         self.assertFalse(cacheable_path("POST", "/js/app.js"))
 
     def test_a_reply_carrying_state_is_refused(self):
@@ -666,22 +614,13 @@ class AssetCacheTest(unittest.TestCase):
         self.assertFalse(cacheable_reply(200, [("Set-Cookie", "S=1; Path=/")]))
         self.assertFalse(cacheable_reply(200, [("Cache-Control", "no-store")]))
         self.assertFalse(cacheable_reply(200, [("Vary", "Cookie")]))
-        # max-age alone is a device saying "yes, cache me"
         self.assertTrue(cacheable_reply(200, [("Cache-Control", "max-age=600")]))
-        # the one Vary we can honour: the edge hands central decoded bytes
         self.assertTrue(cacheable_reply(200, [("Vary", "Accept-Encoding")]))
 
     def test_no_cache_and_private_are_deliberately_defied(self):
-        """`private` addresses SHARED caches and this one is per-session by
-        construction; `no-cache` means store-then-revalidate and this firmware
-        ships no validator to revalidate with. Honouring either literally means
-        the cache never works on the whole fleet — which is how a 2011 jQuery
-        got fetched 553 times in one session. The vendor's own `?rand=` busting
-        is what keeps the genuinely volatile files missing."""
         self.assertTrue(cacheable_reply(200, [("Cache-Control", "no-cache")]))
         self.assertTrue(cacheable_reply(200, [("Pragma", "no-cache")]))
         self.assertTrue(cacheable_reply(200, [("Cache-Control", "private, max-age=0")]))
-        # but the one that means "do not write this down" still means it
         self.assertFalse(cacheable_reply(200, [("Cache-Control", "no-cache, no-store")]))
 
     def test_no_store_matches_a_token_not_a_substring(self):
@@ -690,8 +629,6 @@ class AssetCacheTest(unittest.TestCase):
             200, [("Content-Disposition", "inline; filename=no-store.js")]))
 
     def test_the_refusal_reason_is_reportable(self):
-        """An empty cache and a working one look identical from outside — the
-        reason has to be reachable without a debugger in production."""
         self.assertIsNone(cache_refusal(200, [("Content-Type", "text/css")]))
         self.assertEqual(cache_refusal(404, []), "status 404")
         self.assertEqual(cache_refusal(200, [("Set-Cookie", "a=b")]),
@@ -700,18 +637,11 @@ class AssetCacheTest(unittest.TestCase):
         self.assertIn("Cookie", cache_refusal(200, [("Vary", "Cookie")]))
 
     def test_jquery_own_cache_buster_is_stripped_but_the_vendors_is_not(self):
-        """`_=<ts>` is what `$.ajax({cache:false})` appends to everything — a
-        CLIENT LIBRARY statement about the browser cache, not a vendor statement
-        about the resource. 20% of this tunnel's traffic is a static .properties
-        translation table wearing one. `rand=` is written by the firmware's own
-        HTML per script tag and stays keyed."""
         self.assertEqual(cache_key("/i18N/error_en_US.properties?_=1785323171532"),
                          "/i18N/error_en_US.properties")
         self.assertEqual(cache_key("/js/misc.js?rand=15959"), "/js/misc.js?rand=15959")
         self.assertEqual(cache_key("/js/app.js"), "/js/app.js")
-        # a `_` alongside real parameters loses only itself
         self.assertEqual(cache_key("/a.js?lang=en&_=99&v=2"), "/a.js?lang=en&v=2")
-        # and a parameter that merely STARTS with _ is somebody else's
         self.assertEqual(cache_key("/a.js?_token=x"), "/a.js?_token=x")
 
     def test_round_trip_and_ttl_expiry(self):
@@ -724,8 +654,6 @@ class AssetCacheTest(unittest.TestCase):
         self.assertIsNone(expired.get("/a.js"))
 
     def test_a_returned_header_list_cannot_be_mutated_back_into_the_cache(self):
-        """The caller filters and rewrites the pairs in place; handing out the
-        stored list would let one request's rewrite leak into the next."""
         c = AssetCache()
         c.put("/a.js", 200, [("Content-Type", "text/javascript")], b"x")
         _, pairs, _ = c.get("/a.js")
@@ -755,11 +683,6 @@ class AssetCacheTest(unittest.TestCase):
 
 
 class CentralDeviceThrottleTest(unittest.TestCase):
-    """The fix for the PROVEN cause: SRPL-OLT's every failure logged `connect
-    timeout` — the TCP connect never completed, which is a box dropping SYNs
-    because its accept queue is full. Central caps what one DEVICE is asked to
-    accept at once, and needs no fleet rollout to start doing it."""
-
     def _hub(self, top=4):
         return ProxyHub(device_max_inflight=top)
 
@@ -784,8 +707,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
             t.start()
         for _ in holders:
             started.acquire()
-        # both slots are taken by requests nobody will answer; a third must not
-        # reach the device at all — it waits, then reads as a timeout
         def third():
             blocked.set()
             self.assertIsNone(
@@ -797,8 +718,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
         t3.start()
         self.assertTrue(blocked.wait(2))
         self.assertTrue(done.wait(3), "the third request was not gated")
-        # the gated one never got parked, so the edge — and the device — never
-        # saw it: exactly the connection that was being dropped before
         parked = []
         while True:
             req = hub.next_request("o", "n", 0.05)
@@ -813,7 +732,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
         sess = self._sess(hub)
         self.assertIsNone(hub.submit(sess, method="GET", path="/a.js",
                                      headers={}, body=b"", timeout=0.2))
-        # the failed request must not have leaked its slot
         self.assertIsNone(hub.submit(sess, method="GET", path="/b.js",
                                      headers={}, body=b"", timeout=0.2))
         self.assertEqual(hub.device_limit("o", 1), 1)
@@ -821,7 +739,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
     def test_it_narrows_only_on_a_connect_failure(self):
         hub = self._hub(top=4)
         self.assertEqual(hub.device_limit("o", 1), 4)
-        # a bad answer over a good connection says nothing about capacity
         self.assertIsNone(hub.note_failure("o", 1, "404 not found"))
         self.assertIsNone(hub.note_failure(
             "o", 1, "TLS handshake failed on 1.2.3.4:443 — "
@@ -832,10 +749,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
                              "connect timeout to 1.2.3.4:443 — nothing answering there"),
             2)
         self.assertEqual(hub.device_limit("o", 1), 2)
-        # 2 is the FLOOR, measured: at 1 the tunnel stops overlapping the WAN
-        # legs and every asset pays for that dead air (median gap 1.50s at 1,
-        # 0.00s at 2). Curing the failures by serialising costs more than the
-        # failures did.
         self.assertIsNone(hub.note_failure("o", 1, "could not connect to 1.2.3.4:443: x"))
         self.assertEqual(hub.device_limit("o", 1), 2)
 
@@ -853,8 +766,6 @@ class CentralDeviceThrottleTest(unittest.TestCase):
         self.assertEqual(hub.device_limit("other-org", 1), 4)
 
     def test_the_rung_outlives_the_session(self):
-        """Keyed on the DEVICE: reopening a tab must inherit what we already
-        learned about the box, not restart the ladder."""
         hub = self._hub(top=4)
         first = self._sess(hub)
         hub.note_failure("o", first.device_id, "connect timeout to 1.2.3.4:443")
@@ -868,16 +779,11 @@ class CentralDeviceThrottleTest(unittest.TestCase):
         hub._throttle("o", 1)._promote_at = time.monotonic() - 1
         sess = self._sess(hub)
         hub.submit(sess, method="GET", path="/a.js", headers={}, body=b"",
-                   timeout=0.1)   # an acquire is what re-probes
+                   timeout=0.1)
         self.assertEqual(hub.device_limit("o", 1), 4)
 
 
 class ConnectFailureWordingTest(unittest.TestCase):
-    """Central classifies the EDGE's failure prose, because the fleet cannot be
-    updated in the same breath as central. That is a coupling across two
-    modules, so it gets pinned to the real function rather than to a copy of
-    its wording."""
-
     def _sentence(self, exc):
         return _friendly_fetch_error(exc, "1.2.3.4", 443, "https")
 
@@ -907,9 +813,6 @@ class ConnectFailureWordingTest(unittest.TestCase):
 
 
 class _RecordingClient:
-    """Stands in for an httpx.AsyncClient: counts requests and can be told to
-    fail the first one the way a device closing a pooled connection does."""
-
     def __init__(self, fail_first: Exception | None = None):
         self.calls: list[tuple[str, str]] = []
         self.fail_first = fail_first
@@ -938,10 +841,6 @@ class _FakeResponse:
 
 
 class ClientPoolTest(unittest.TestCase):
-    """Connection reuse — the root cause of 'laggy through the tunnel, instant
-    on the LAN'. One handshake per asset, on a box with no crypto acceleration,
-    IS the page load."""
-
     def _cfg(self):
         return Config(proxy_enabled=True, proxy_mgmt_ports="80",
                       proxy_request_timeout_s=5.0, proxy_keepalive_idle_s=90.0,
@@ -965,8 +864,6 @@ class ClientPoolTest(unittest.TestCase):
         asyncio.run(run())
 
     def test_a_stale_pooled_connection_costs_one_silent_retry_on_a_GET(self):
-        """Embedded servers reap idle sockets aggressively; reusing one they
-        just closed is normal and must never surface as a 502 to the tech."""
         import httpx
         cfg = self._cfg()
 
@@ -992,8 +889,6 @@ class ClientPoolTest(unittest.TestCase):
         asyncio.run(run())
 
     def test_a_POST_is_never_silently_replayed(self):
-        """A write that died without a reply may still have been applied.
-        Re-submitting a config change is worse than the 502."""
         import httpx
         cfg = self._cfg()
 
@@ -1019,10 +914,6 @@ class ClientPoolTest(unittest.TestCase):
 
 
 class DeviceGateTest(unittest.TestCase):
-    """Two of twenty devices on this fleet answer ~1 request at a time and
-    refused 4-5% of what we sent, while peers on the SAME probe took 8-9 in
-    parallel and refused 0.1%. No vendor hardcode: walk down, heal up."""
-
     def _gate(self, top=4):
         return _DeviceGate(Config(proxy_device_max_inflight=top))
 
@@ -1033,7 +924,6 @@ class DeviceGateTest(unittest.TestCase):
         self.assertEqual(g.limit("1.2.3.4", 443), 2)
         self.assertTrue(g.demote("1.2.3.4", 443))
         self.assertEqual(g.limit("1.2.3.4", 443), 1)
-        # floor: there is no such thing as half a connection
         self.assertFalse(g.demote("1.2.3.4", 443))
         self.assertEqual(g.limit("1.2.3.4", 443), 1)
 
@@ -1045,14 +935,12 @@ class DeviceGateTest(unittest.TestCase):
         self.assertEqual(g.limit("5.6.7.8", 443), 4)
 
     def test_a_narrowed_box_re_probes_one_rung_faster_later(self):
-        """A firmware fix or a reboot must heal without anyone noticing it
-        happened — the same instinct as PysnmpPoller's ladder."""
         g = self._gate()
         g.demote("1.2.3.4", 443)
         g.demote("1.2.3.4", 443)
         self.assertEqual(g.limit("1.2.3.4", 443), 1)
         g._promote_at[("1.2.3.4", 443)] = time.monotonic() - 1
-        self.assertEqual(g.limit("1.2.3.4", 443), 1)  # limit() does not promote
+        self.assertEqual(g.limit("1.2.3.4", 443), 1)
         g.semaphore("1.2.3.4", 443)
         self.assertEqual(g.limit("1.2.3.4", 443), 2)
 
@@ -1076,9 +964,6 @@ class DeviceGateTest(unittest.TestCase):
 
 
 class ConnectFailureClassificationTest(unittest.TestCase):
-    """Only a failure to GET A CONNECTION says anything about how many the box
-    can take. A 404 or a slow page proves nothing about capacity."""
-
     def test_classification(self):
         import httpx
         self.assertTrue(_is_connect_failure(httpx.ConnectError("refused")))
@@ -1089,7 +974,7 @@ class ConnectFailureClassificationTest(unittest.TestCase):
 
     def test_the_error_carries_its_classification_to_the_caller(self):
         err = DeviceFetchError("connect timeout to x", connect_failure=True)
-        self.assertIsInstance(err, RuntimeError)   # existing handlers untouched
+        self.assertIsInstance(err, RuntimeError)
         self.assertTrue(err.connect_failure)
         self.assertEqual(str(err), "connect timeout to x")
         self.assertFalse(DeviceFetchError("404").connect_failure)

@@ -21,16 +21,7 @@ def _on_target_alive(node: dict, target: str, now: datetime, fresh_s: int) -> bo
 
 def maybe_auto_rollout(store, org_id: str, node_id: str,
                        reported_version: str | None) -> bool:
-    """Auto-update trigger (orgs.auto_update): when the mirror's newest release
-    is ahead of a heartbeating node and no rollout is live, start one with THAT
-    node as canary — the same staged, health-gated machinery the dashboard's
-    manual Update uses, just without the click. Returns True when it armed one.
 
-    A HALTED rollout for the same target is never auto-retried — halting means
-    the build failed its health gate, and only a human (dashboard Retry) should
-    re-arm a failed build. A DONE rollout re-arms freely: a node reporting an
-    older version after "done" is a fresh/reinstalled box that missed it.
-    """
     if not store.org_auto_update(org_id):
         return False
     releases = store.list_releases()

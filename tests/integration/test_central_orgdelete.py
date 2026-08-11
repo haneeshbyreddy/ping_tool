@@ -1,9 +1,3 @@
-"""Superadmin org deletion — the one dashboard action with no undo.
-
-Pins the two things that make it safe (superadmin-only, echoed-id confirmation)
-and the two that make it complete (every org-scoped table is swept, global
-rows survive).
-"""
 import http.client
 import json
 import os
@@ -41,7 +35,6 @@ class OrgDeleteTest(unittest.TestCase):
         auth.create_user(self.store, "ispA", "aowner", "ownerpassword", "owner")
         auth.create_user(self.store, "ispB", "bowner", "ownerpassword", "owner")
 
-        # ispA gets a row in a spread of org-scoped tables
         self.dev_a = self.store.create_org_device("ispA", _device("swA", "10.0.0.1"))
         self.store.open_outage_if_absent("ispA", self.dev_a, "2026-07-21T00:00:00+00:00", "DOWN")
         self.store.touch_node("ispA", "edge-a")
@@ -50,11 +43,9 @@ class OrgDeleteTest(unittest.TestCase):
         self.store.set_org(orgA := "ispA", name="ISP A")
         self.assertTrue(orgA)
 
-        # ispB is the bystander; it must survive untouched
         self.dev_b = self.store.create_org_device("ispB", _device("swB", "10.0.1.1"))
         self.store.touch_node("ispB", "edge-b")
 
-        # a GLOBAL profile (org_id NULL) — deleting an org must not take it
         self.profile = self.store.create_snmp_profile(None, {
             "name": "global-vendor", "match_sysobjectid": "1.3.6.1.4.1.9",
             "metrics": {}, "enabled": True})
@@ -107,7 +98,6 @@ class OrgDeleteTest(unittest.TestCase):
         status, body = self._delete("ispA", cookie)
         self.assertEqual(status, 200)
         self.assertFalse(self.store.org_exists("ispA"))
-        # the sweep is discovered, not listed — assert on the tables, not the count
         with self.store._connect() as conn:
             for table in ("org_devices", "outages", "nodes", "node_tokens",
                           "users", "org_billing_months"):
@@ -121,8 +111,6 @@ class OrgDeleteTest(unittest.TestCase):
         self._delete("ispA", cookie)
         self.assertTrue(self.store.org_exists("ispB"))
         self.assertEqual(len(self.store.list_org_devices("ispB")), 1)
-        # org_id IS NULL is global by construction: the superadmin login and the
-        # built-in vendor profiles must never ride an org delete out
         self.assertIsNotNone(self.store.get_user_by_username("root"))
         names = [p["name"] for p in self.store.list_snmp_profiles(None)]
         self.assertIn("global-vendor", names)
@@ -155,8 +143,6 @@ class OrgDeleteTest(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_registry_forgets_the_deleted_org(self):
-        # org ids are reusable: a stale engine would hand a later org of the
-        # same name this org's FSM state
         registry = self.server.registry if hasattr(self.server, "registry") else None
         from wisp.central.engine import EngineRegistry
         reg = registry or EngineRegistry(self.store, self.cfg)

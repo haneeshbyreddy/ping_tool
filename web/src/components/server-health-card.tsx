@@ -6,7 +6,6 @@ import { Meter } from "@/components/meter"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 
-/** Host health of the central server itself — superadmin-only (the endpoint 403s otherwise). */
 export function ServerHealthCard() {
   const { data, isLoading, isError } = useQuery({
     queryKey: ["system"],

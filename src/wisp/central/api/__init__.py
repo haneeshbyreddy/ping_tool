@@ -1,10 +1,3 @@
-"""Route tables for central's HTTP handler.
-
-``server.py`` owns transport, auth plumbing and the edge-ingest special cases;
-everything routable by exact path lives here. GET handlers are called as
-``fn(h, qs)``; dashboard POST handlers as ``fn(h, user, body)`` after the
-session check (and with AuthError/InventoryError mapped to 422 by the caller).
-"""
 from __future__ import annotations
 
 from wisp.central.api import devices, edge, field, fleet, orgs, outages, proxy, users
@@ -27,6 +20,7 @@ GET = {
     "/api/inventory/routes": devices.routes,
     "/api/inventory/cables": devices.cables,
     "/api/inventory/fibre": devices.device_fibre,
+    "/api/inventory/fibre/ports": devices.device_ports,
     "/api/inventory/fibre/trace": devices.fibre_trace,
     "/api/inventory/ports": devices.ports,
     "/api/inventory/link-ports": devices.link_ports,
@@ -59,10 +53,6 @@ GET = {
     "/api/issues/pdf": outages.issues_pdf,
     "/api/issues/xlsx": outages.issues_xlsx,
     "/api/logs": outages.logs,
-    # Worker location tracking. `shift` is the caller's own state (worker-
-    # readable); `workers`/`tokens` are the owner's view of the crew. The INGEST
-    # is not here — /field/track is public and machine-credentialed, handled in
-    # server.py beside /whatsapp/webhook.
     "/api/field/shift": field.shift,
     "/api/field/workers": field.workers,
     "/api/field/tokens": field.tokens,
@@ -120,14 +110,10 @@ POST = {
     "/api/inventory/cable/split": devices.cable_split,
     "/api/inventory/cable/delete": devices.cable_delete,
     "/api/inventory/fibre/joint": devices.fibre_joint,
+    "/api/inventory/fibre/connect": devices.fibre_connect,
     "/api/inventory/fibre/tail": devices.fibre_tail,
     "/api/inventory/fibre/through": devices.fibre_through,
     "/api/inventory/fibre/clear": devices.fibre_clear,
-    # RETIRED with the run/tap model (2026-08-09), and answering a sentence
-    # rather than a 404. The SPA deploys the instant it is built while central
-    # needs a restart, so a browser holding the old bundle against the new server
-    # is routine — and a bare 404 there reads as "the button is broken" instead
-    # of "reload the page".
     "/api/inventory/cable/run": devices.cable_gone,
     "/api/inventory/cable/tap": devices.cable_gone,
     "/api/inventory/cable/splice": devices.cable_gone,

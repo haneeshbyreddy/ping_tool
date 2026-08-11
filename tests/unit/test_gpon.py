@@ -34,9 +34,6 @@ def _vb(profile: GponProfile, idx: str, *, rx=None, state=None, serial=None,
         out.append((f"{profile.oid_name}.{idx}", name))
     return out
 
-# The shipping DBC profile carries NO Rx column (the .28 cache was field-debunked —
-# fake ~-15 dBm). The roster+optical JOIN machinery must stay tested for the day a
-# real Rx OID is validated, so these tests use a fixture with the columns restored.
 DBC_RX = dataclasses.replace(
     DBC,
     oid_rx="1.3.6.1.4.1.37950.1.1.5.12.1.28.1.3",
@@ -45,8 +42,6 @@ DBC_RX = dataclasses.replace(
 
 class ParseTest(unittest.TestCase):
     def test_shipping_dbc_profile_has_no_rx_column(self):
-        # Locked decision: never fabricate a dBm. The debunked .28 optical-cache
-        # columns must stay out of the live profile until a real OID is validated.
         self.assertEqual(DBC.oid_rx, "")
         self.assertEqual(DBC.oid_serial, "")
 
@@ -66,19 +61,12 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(onus["10.2"].rx_dbm, -29.8)
 
     def test_the_slot_index_is_the_onu_key_even_when_a_serial_is_walked(self):
-        # The metric path keys on the table index, exactly as the registration
-        # path keys on pon.onu — the serial is reported, never used as identity.
         onus = parse_onu_table(_vb(HUAWEI, "12.5", rx=-2000, state=1, serial="HWTC5"),
                                HUAWEI)
         self.assertEqual(onus[0].onu_key, "12.5")
         self.assertEqual(onus[0].serial, "HWTC5")
 
     def test_one_serial_on_two_slots_stays_two_rows(self):
-        # THE reason the key is the slot. These OLTs never drop a vacated
-        # registration, so a re-registered ONU is reported twice — live on the new
-        # slot, dark on the old. Real shape from badri_fiber's Gpon_08, where 9 of
-        # 194 serials sit on 2-3 slots: keying on the serial collapsed the pair and
-        # the last write won, storing a LIVE ONU as offline at 0.00 dBm.
         vbs = (_vb(HUAWEI, "6.34", rx=-2210, state=1, serial="ALCLb3fa1294")
                + _vb(HUAWEI, "7.64", rx=0, state=2, serial="ALCLb3fa1294"))
         onus = {o.onu_key: o for o in parse_onu_table(vbs, HUAWEI)}
@@ -86,7 +74,6 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(onus["6.34"].state, STATE_ONLINE)
         self.assertEqual(onus["6.34"].rx_dbm, -22.1)
         self.assertEqual(onus["7.64"].state, STATE_OFFLINE)
-        # ...and both still report the serial a tech reads off the sticker.
         self.assertEqual({o.serial for o in onus.values()}, {"ALCLb3fa1294"})
 
     def test_state_decode_and_offline_without_rx(self):
@@ -95,9 +82,6 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(onus["10.9"].state, STATE_OFFLINE)
         self.assertIsNone(onus["10.9"].rx_dbm)
 
-    # The live badri_fiber profile, verbatim from gpon_profiles id 1 — these
-    # cases only bite on a profile whose state_default is `offline` (the HUAWEI
-    # built-in already defaults to unknown), and that is the shape in the field.
     SYROTECH = gpon_profile_from_dict({
         "name": "syrotech_gpon",
         "oids": {"state": "1.3.6.1.4.1.37950.1.1.6.1.1.1.1.5",
@@ -110,34 +94,19 @@ class ParseTest(unittest.TestCase):
     })
 
     def test_a_row_with_NO_state_cell_is_unknown_never_offline(self):
-        # A truncated state column is the live failure mode on the C-Data /
-        # Syrotech agents: they end a GETBULK mid-table while pysnmp reports a
-        # clean finish, so the tail ONUs arrive carrying rx and serial but no
-        # state. Folding that into state_default rendered LIVE subscribers dark
-        # and handed ponfault a fabricated mass-drop cohort — with nothing
-        # anywhere reporting an error. ponfault.DARK_STATES already excludes
-        # `unknown` for exactly this reason; the edge just never produced it.
         p = self.SYROTECH
-        vbs = _vb(p, "7.41", rx="-21.00", serial="ZTEGcbd6530f")  # no state cell
+        vbs = _vb(p, "7.41", rx="-21.00", serial="ZTEGcbd6530f")
         onus = {o.onu_key: o for o in parse_onu_table(vbs, p)}
         self.assertEqual(onus["7.41"].state, "unknown")
-        # the readings it DID send are still reported — this is not a drop
         self.assertEqual(onus["7.41"].rx_dbm, -21.0)
         self.assertEqual(onus["7.41"].serial, "ZTEGcbd6530f")
 
     def test_an_UNRECOGNISED_state_value_still_takes_the_profile_default(self):
-        # The other half of the distinction: a column that ANSWERED with a code
-        # we have not mapped is a fact about the ONU, and the profile's default
-        # is the operator's stated reading of it. Syrotech's 4/6/7/8 are all
-        # dereg reasons and all mean offline.
         onus = {o.onu_key: o for o in parse_onu_table(
             _vb(self.SYROTECH, "7.42", state=7, serial="X"), self.SYROTECH)}
         self.assertEqual(onus["7.42"].state, STATE_OFFLINE)
 
     def test_a_profile_mapping_NO_state_column_keeps_its_default(self):
-        # An ABSENT column is a fact about the firmware, so a profile that never
-        # asks for state must not have every ONU turn `unknown` — that would
-        # silently blank a working vendor.
         stateless = dataclasses.replace(self.SYROTECH, oid_state="")
         onus = parse_onu_table([(f"{stateless.oid_rx}.3.1", "-20.00")], stateless)
         self.assertEqual(onus[0].state, STATE_OFFLINE)
@@ -154,8 +123,6 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(o.state, STATE_ONLINE)
 
     def test_dbc_enumerates_whole_roster_and_joins_rx_by_mac(self):
-        # The .12 roster lists every ONU on every PON; the sparse .28 optical table
-        # only measured one of them. Both ONUs must show; Rx attaches to its MAC.
         vbs = [
             (f"{DBC_RX.oid_serial}.2", "98:2F:3C:B9:42:F8"),
             (f"{DBC_RX.oid_rx}.2", "-14.62"),
@@ -179,13 +146,10 @@ class ParseTest(unittest.TestCase):
         dark = onus["3.9"]
         self.assertEqual(dark.pon_port, "EPON0/3")
         self.assertEqual(dark.state, STATE_OFFLINE)
-        self.assertIsNone(dark.rx_dbm)  # not in the optical table
+        self.assertIsNone(dark.rx_dbm)
 
     def test_dbc_walks_description_and_filters_null_sentinel(self):
-        # col10 is the web-UI "Description" (validated 2026-07-13: EPON0/2:1 set to
-        # HCS_RAMPRASAD showed at ...12.1.12.1.10.29). An unset ONU reports the
-        # literal string 'NULL' — it must render as no-name, never the word NULL.
-        self.assertTrue(DBC.oid_ident_name)  # the shipping profile carries it
+        self.assertTrue(DBC.oid_ident_name)
         vbs = [
             (f"{DBC.oid_ident_key}.29", "00:d3:9e:14:35:84"),
             (f"{DBC.oid_ident_pon}.29", "2"),
@@ -200,11 +164,9 @@ class ParseTest(unittest.TestCase):
         ]
         onus = {o.onu_key: o for o in parse_onu_table(vbs, DBC)}
         self.assertEqual(onus["2.1"].name, "HCS_RAMPRASAD")
-        self.assertIsNone(onus["2.2"].name)  # 'NULL' sentinel filtered to no-name
+        self.assertIsNone(onus["2.2"].name)
 
     def test_dbc_reregistered_mac_stays_two_distinct_slots(self):
-        # Same MAC on two PONs (an ONU moved, leaving a stale ghost) must remain two
-        # rows keyed by slot, and the single Rx reading lands on the matching onu-id.
         vbs = [
             (f"{DBC_RX.oid_serial}.23", "80:B5:75:20:98:BA"),
             (f"{DBC_RX.oid_rx}.23", "-14.53"),
@@ -217,7 +179,7 @@ class ParseTest(unittest.TestCase):
         ]
         onus = {o.onu_key: o for o in parse_onu_table(vbs, DBC_RX)}
         self.assertEqual(set(onus), {"1.23", "3.51"})
-        self.assertEqual(onus["1.23"].rx_dbm, -14.53)   # onu-id 23 matches .28 idx 23
+        self.assertEqual(onus["1.23"].rx_dbm, -14.53)
         self.assertIsNone(onus["3.51"].rx_dbm)
 
     def test_dbc_without_master_row_falls_back_to_index(self):
@@ -232,18 +194,15 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(w["pon_port"], "0/6")
 
 class MatchProfileTest(unittest.TestCase):
-    """Vendor auto-detect: longest sysObjectID prefix wins; no claim = None (optics off)."""
-
     def test_known_arcs_match(self):
         self.assertIs(match_gpon_profile("1.3.6.1.4.1.2011.2.184"), HUAWEI)
         self.assertIs(match_gpon_profile("1.3.6.1.4.1.37950.1.1.5"), DBC)
-        self.assertIs(match_gpon_profile("1.3.6.1.4.1.37950"), DBC)  # exact arc
+        self.assertIs(match_gpon_profile("1.3.6.1.4.1.37950"), DBC)
 
     def test_unclaimed_arc_and_empty_yield_none(self):
-        self.assertIsNone(match_gpon_profile("1.3.6.1.4.1.9.1.1"))  # cisco: no profile
+        self.assertIsNone(match_gpon_profile("1.3.6.1.4.1.9.1.1"))
         self.assertIsNone(match_gpon_profile(""))
         self.assertIsNone(match_gpon_profile(None))
-        # A prefix must match on arc boundaries, not string prefix (2011 != 20112).
         self.assertIsNone(match_gpon_profile("1.3.6.1.4.1.20112.1"))
 
     def test_longest_prefix_wins_model_specific_beats_vendor_wide(self):
@@ -320,8 +279,6 @@ class _FakeDetector:
         return self.soid
 
 class ResolveTest(unittest.TestCase):
-    """Auto-detect precedence: device override > cfg fallback > sysObjectID match > off."""
-
     _T = SnmpTarget(ip="10.0.0.1", community="public")
 
     def _resolve(self, pool, device):
@@ -344,7 +301,7 @@ class ResolveTest(unittest.TestCase):
 
     def test_unmatched_sysobjectid_means_optics_off(self):
         f = _RecordingFactory()
-        det = _FakeDetector("1.3.6.1.4.1.9.1.1")  # no profile claims cisco
+        det = _FakeDetector("1.3.6.1.4.1.9.1.1")
         pool = GponPollerPool(Config(gpon_vendor=""), factory=f, detector=det)
         self.assertIsNone(self._resolve(pool, {"id": 7}))
         self.assertEqual(f.calls, [])
@@ -363,7 +320,6 @@ class ResolveTest(unittest.TestCase):
         pool = GponPollerPool(Config(gpon_vendor=""), factory=_RecordingFactory(),
                               detector=det)
         self.assertIsNone(self._resolve(pool, {"id": 7}))
-        # failure is cached too (retried on the shorter TTL, not per cycle)
         self.assertIsNone(self._resolve(pool, {"id": 7}))
         self.assertEqual(det.reads, 1)
 
@@ -435,7 +391,7 @@ class GatherTest(unittest.TestCase):
         self.assertEqual(poller.walked, ["10.0.0.1"])
         self.assertEqual(out[1][0]["onu_key"], "K1")
         self.assertEqual(status[1]["state"], "ok")
-        self.assertNotIn(2, status)  # snmp off: no diagnosis, not "broken"
+        self.assertNotIn(2, status)
 
     def test_one_dead_olt_never_sinks_the_others(self):
         class Flaky(_FakePoller):
@@ -476,9 +432,6 @@ class GatherTest(unittest.TestCase):
         self.assertEqual(zte.walked, ["10.0.0.2"])
 
     def test_slow_olt_rides_the_gpon_cap_not_the_snmp_cap(self):
-        # A slow EPON agent (PYLON/NDN class) blows the generic 20s walk cap but
-        # must still land under the dedicated GPON budget — the 2026-07-09 stale-
-        # optics regression: roster walks starved by snmp_walk_timeout_s.
         class Slow(_FakePoller):
             async def walk(self, target):
                 await asyncio.sleep(0.1)
@@ -527,54 +480,39 @@ def _central_spec(name="vsol", match="1.3.6.1.4.1.999", **over):
     return spec
 
 class CentralProfileTest(unittest.TestCase):
-    """Central-served GPON profiles: the data channel that replaces a rollout."""
-
     def test_from_dict_builds_a_working_profile(self):
         p = gpon_profile_from_dict(_central_spec())
         self.assertEqual(p.name, "vsol")
         self.assertEqual(p.rx_scale, 0.1)
         self.assertEqual(p.decode_state("1"), STATE_ONLINE)
-        self.assertEqual(p.decode_state("weird"), STATE_OFFLINE)  # state_default
-        self.assertEqual(p.format_pon("3.7"), "3")                # first_segment
+        self.assertEqual(p.decode_state("weird"), STATE_OFFLINE)
+        self.assertEqual(p.format_pon("3.7"), "3")
         self.assertEqual(p.format_pon_label("2"), "EPON0/2")
 
     def test_packed_ifindex_reads_pon_and_onu_off_ONE_integer(self):
-        # The STGP08X (PEN 50224) indexes its ONU roster by a byte-packed
-        # ifIndex, not by pon.onu: chassis<<24 | slot<<16 | pon<<8 | onu. Values
-        # and the pon/onu they must yield are taken from walk 284 of
-        # chandana-network's MAIN_OLT4, where the OLT's own text column
-        # ("ONT01/000") agreed with this decode on all 310 rows.
         p = gpon_profile_from_dict(_central_spec(
             pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
-        for idx, pon, onu in (("16777472", "1", 0),      # ONT01/000
-                              ("16777473", "1", 1),      # ONT01/001
-                              ("16777728", "2", 0),      # ONT02/000
-                              ("16779357", "8", 93)):    # ONT08/093
+        for idx, pon, onu in (("16777472", "1", 0),
+                              ("16777473", "1", 1),
+                              ("16777728", "2", 0),
+                              ("16779357", "8", 93)):
             self.assertEqual(p.format_pon(idx), pon, idx)
             self.assertEqual(p.derive_onu_id(idx), onu, idx)
 
     def test_packed_ifindex_never_reports_a_confident_pon_zero(self):
-        # A profile pointed at an index that is NOT packed must read as "cannot
-        # tell", never group every ONU on the box onto one fabricated port.
         p = gpon_profile_from_dict(_central_spec(
             pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
         self.assertEqual(p.format_pon("not-a-number"), "not-a-number")
         self.assertIsNone(p.derive_onu_id("not-a-number"))
 
     def test_the_two_halves_of_a_packed_index_travel_together(self):
-        # Deriving the PON from a packed index while reading the onu id off the
-        # same index UNPACKED would report ONU 16777472 on PON 1. Any strategy
-        # without its own onu reading must keep the default.
         packed = gpon_profile_from_dict(_central_spec(
             pon_index="packed_ifindex", pon_label="", oids={"state": "1.2.3.4"}))
         self.assertIsNotNone(packed.derive_onu_id)
         plain = gpon_profile_from_dict(_central_spec(pon_index="first_segment"))
-        self.assertIsNone(plain.derive_onu_id)   # falls back to _derive_onu_id
+        self.assertIsNone(plain.derive_onu_id)
 
     def test_packed_ifindex_survives_the_whole_parse(self):
-        # End to end through parse_onu_table: the roster column is the OLT's
-        # own, and one of these rows is a never-registered authorisation entry
-        # (state '0'), which must NOT come back offline.
         p = gpon_profile_from_dict(_central_spec(
             pon_index="packed_ifindex", pon_label="",
             oids={"state": "1.3.6.1.4.1.50224.3.12.2.1.4",
@@ -592,24 +530,20 @@ class CentralProfileTest(unittest.TestCase):
         self.assertEqual(by_key["16777473"].state, STATE_ONLINE)
         self.assertEqual(by_key["16779357"].pon_port, "8")
         self.assertEqual(by_key["16779357"].state, STATE_OFFLINE)
-        # The 68 unprovisioned slots on this box: never registered, no vendor,
-        # distance 0. Dark-by-default would have invented an outage cohort.
         self.assertEqual(by_key["16777728"].state, STATE_UNKNOWN)
 
     def test_from_dict_rejects_anything_outside_the_vocabulary(self):
-        # A half-understood profile guessing at an OLT is the fabricated-reading
-        # trap — every reject drops the WHOLE profile.
         bad = [
-            _central_spec(name=""),                                # no name
-            _central_spec(oids={"rx": "not-an-oid"}),              # bad OID
-            _central_spec(oids={"bogus_field": "1.2.3"}),          # unknown column
-            _central_spec(oids={}),                                # no OIDs at all
-            _central_spec(state_map={"1": "sleeping"}),            # unknown state
+            _central_spec(name=""),
+            _central_spec(oids={"rx": "not-an-oid"}),
+            _central_spec(oids={"bogus_field": "1.2.3"}),
+            _central_spec(oids={}),
+            _central_spec(state_map={"1": "sleeping"}),
             _central_spec(state_default="sleeping"),
-            _central_spec(pon_index="regex_magic"),                # unknown strategy
-            _central_spec(pon_label="EPON0/1"),                    # no {pon} slot
+            _central_spec(pon_index="regex_magic"),
+            _central_spec(pon_label="EPON0/1"),
             _central_spec(scales={"rx": -1}),
-            _central_spec(match="mikrotik"),                       # non-numeric prefix
+            _central_spec(match="mikrotik"),
         ]
         for raw in bad:
             self.assertIsNone(gpon_profile_from_dict(raw), raw)
@@ -617,10 +551,8 @@ class CentralProfileTest(unittest.TestCase):
     def test_central_profile_joins_auto_detect_and_wins_ties(self):
         p = gpon_profile_from_dict(_central_spec())
         self.assertIs(match_gpon_profile("1.3.6.1.4.1.999.5", {"vsol": p}), p)
-        # Same-name central profile shadows the built-in outright.
         dbc2 = gpon_profile_from_dict(_central_spec(name="dbc", match="1.3.6.1.4.1.37950"))
         self.assertIs(match_gpon_profile("1.3.6.1.4.1.37950.1", {"dbc": dbc2}), dbc2)
-        # Built-ins still match when no central profile claims the arc.
         self.assertIs(match_gpon_profile("1.3.6.1.4.1.2011.2", {"dbc": dbc2}), HUAWEI)
 
     def test_set_profiles_shadows_builtin_and_falls_back_on_delete(self):
@@ -629,13 +561,11 @@ class CentralProfileTest(unittest.TestCase):
         pool.set_profiles([_central_spec(name="dbc", match="1.3.6.1.4.1.37950")])
         pool.for_vendor("dbc")
         self.assertEqual(f.calls[-1][0].oid_ident_key, "1.3.6.1.4.1.999.1.6")
-        pool.set_profiles([])  # central rows deleted -> built-in returns
+        pool.set_profiles([])
         pool.for_vendor("dbc")
         self.assertIs(f.calls[-1][0], DBC)
 
     def test_unchanged_payload_never_rebuilds_pollers(self):
-        # A rebuilt poller is a fresh SnmpEngine (leak invariant) — the payload
-        # rides EVERY topology refresh, so same-bytes must be a no-op.
         f = _RecordingFactory()
         pool = GponPollerPool(Config(), factory=f)
         payload = [_central_spec()]
@@ -644,7 +574,6 @@ class CentralProfileTest(unittest.TestCase):
         pool.set_profiles(json.loads(json.dumps(payload)))
         self.assertIs(pool.for_vendor("vsol"), a)
         self.assertEqual(len(f.calls), 1)
-        # An actual edit rebuilds exactly that poller.
         pool.set_profiles([_central_spec(pon_label="GPON0/{pon}")])
         self.assertIsNot(pool.for_vendor("vsol"), a)
         self.assertEqual(len(f.calls), 2)
@@ -652,7 +581,7 @@ class CentralProfileTest(unittest.TestCase):
     def test_none_payload_is_a_no_op_for_older_centrals(self):
         pool = GponPollerPool(Config(), factory=_RecordingFactory())
         pool.set_profiles([_central_spec()])
-        pool.set_profiles(None)  # old central: key absent -> keep last-known
+        pool.set_profiles(None)
         self.assertIsNotNone(pool._profile_named("vsol"))
 
     def test_rejected_profile_is_skipped_but_valid_siblings_install(self):

@@ -41,7 +41,7 @@ class OrgRoleWhatsappTest(unittest.TestCase):
         self.store.set_user_whatsapp(o2, "919000000002")
         self.store.set_user_whatsapp(w1, "919000000009")
         self.store.set_user_whatsapp(off, "919000000000")
-        self.store.set_user_active(off, False)              # deactivated → excluded
+        self.store.set_user_active(off, False)
 
         self.assertEqual(self.store.org_role_whatsapp("ispA", "owner"),
                          ["919000000001", "919000000002"])
@@ -81,7 +81,7 @@ class WhatsappSettingsTest(unittest.TestCase):
     def test_reads_only_whatsapp_prefixed_keys_stripped(self):
         self.store.set_setting("whatsapp_enabled", "1")
         self.store.set_setting("whatsapp_token", "TOK")
-        self.store.set_setting("google_maps_key", "AIza")   # must not leak in
+        self.store.set_setting("google_maps_key", "AIza")
         self.assertEqual(self.store.whatsapp_settings(),
                          {"enabled": "1", "token": "TOK"})
 
@@ -98,8 +98,8 @@ class DispatchFanoutTest(unittest.TestCase):
                            ntfy_topic_worker="a-worker")
         o = self.store.add_user("ispA", "own1", "h", "s", "owner")
         w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
-        self.store.set_user_whatsapp(o, "919000000001")     # owner number
-        self.store.set_user_whatsapp(w, "919000000009")     # worker number
+        self.store.set_user_whatsapp(o, "919000000001")
+        self.store.set_user_whatsapp(w, "919000000009")
         self.engine = central_engine.build_engine(self.store, "ispA", self.cfg)
         self.notifier = RecordingNotifier()
         self.disp = CentralAlertDispatcher(self.store, "ispA", self.engine,
@@ -111,12 +111,9 @@ class DispatchFanoutTest(unittest.TestCase):
     def test_device_down_fans_the_whole_audience(self):
         self.store.open_outage_if_absent("ispA", self.dev, T0, DOWN)
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
-        # ONE send to the de-duped org audience (owner + worker numbers) — no
-        # per-role routing since ntfy was removed (2026-07-24)
         self.assertEqual(len(self.notifier.sent), 1)
         self.assertEqual(sorted(self.notifier.sent[0]["whatsapp"]),
                          ["919000000001", "919000000009"])
-        # structured facts ride the ICMP page
         self.assertEqual(self.notifier.sent[0]["facts"].status, "DOWN")
 
     def test_resolve_broadcast_fans_the_audience(self):
@@ -131,7 +128,6 @@ class DispatchFanoutTest(unittest.TestCase):
         self.assertEqual(self.notifier.sent[0]["facts"].status, "UP")
 
     def test_no_numbers_no_page(self):
-        # WhatsApp is the only channel now — an org with no numbers can't be paged
         self.store.set_user_whatsapp(
             self.store.get_user_by_username("own1")["id"], None)
         self.store.set_user_whatsapp(
@@ -156,15 +152,12 @@ class RouterPushFanoutTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_push_resolves_org_numbers(self):
-        # emit pages the whole org audience; here only a worker number is set
         self.router.emit("PORT_DOWN", title="port down",
                          body="if 3", priority=3, ts=T0, device_id=7, cooldown_min=0)
         self.assertEqual(len(self.notifier.sent), 1)
         self.assertEqual(self.notifier.sent[0]["whatsapp"], ["919000000009"])
 
     def test_digest_flush_fans_org_numbers(self):
-        # the digest tier is dormant; queue directly, then the summary carries
-        # the org's numbers
         self.store.queue_digest("ispA", 7, "PON_FAULT", "cut", "x", T0)
         self.assertEqual(self.notifier.sent, [])
         flush_digests(self.store, "ispA", self.notifier, self.cfg,
@@ -190,17 +183,15 @@ def _button(frm, bid):
 
 
 def _status_only():
-    # Meta delivery/read receipts arrive shaped like this — no `messages`.
     return {"entry": [{"changes": [{"value": {"statuses": [
         {"id": "wamid", "status": "delivered"}]}}]}]}
 
 
 class _RecBot:
-    """Recording notifier double for the bot — captures the free-form replies."""
     def __init__(self):
-        self.texts = []      # list[(to, body)]
-        self.buttons = []    # list[(to, body, [(id, title), …])]
-        self.sent = []       # list[([to], title, body)] — template pages
+        self.texts = []
+        self.buttons = []
+        self.sent = []
 
     def send_text(self, to, body):
         self.texts.append((to, body))
@@ -209,13 +200,10 @@ class _RecBot:
         self.buttons.append((to, body, list(buttons)))
 
     def send(self, title, body, priority=3, *, whatsapp=(), facts=None):
-        # The one cold page the bot sends (telling an assigner their assignment
-        # was accepted) — the template, because that window is somebody else's.
         self.sent.append((list(whatsapp), title, body))
 
 
 class _FakeSweeper:
-    """Stand-in for WebOpticsSweeper — same three methods the bot/route call."""
     def __init__(self, eligible=(), busy=()):
         self.eligible = set(eligible)
         self.busy_ids = set(busy)
@@ -245,7 +233,7 @@ class WhatsappResolverTest(unittest.TestCase):
     def test_number_resolves_to_its_single_account(self):
         uid = self.store.add_user("ispA", "own1", "h", "s", "owner")
         self.store.set_user_whatsapp(uid, "919000000001")
-        u = self.store.whatsapp_user("+91 90000-00001")     # punctuation-blind
+        u = self.store.whatsapp_user("+91 90000-00001")
         self.assertIsNotNone(u)
         self.assertEqual((u["org_id"], u["role"]), ("ispA", "owner"))
 
@@ -262,7 +250,7 @@ class WhatsappResolverTest(unittest.TestCase):
         a = self.store.add_user("ispA", "own1", "h", "s", "owner")
         b = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(a, "919000000001")
-        self.store.set_user_whatsapp(b, "919000000001")     # same number, two logins
+        self.store.set_user_whatsapp(b, "919000000001")
         self.assertIsNone(self.store.whatsapp_user("919000000001"))
 
 
@@ -271,7 +259,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = CentralStore(Path(self.tmp.name) / "central.db")
         self.now = datetime.now(timezone.utc)
-        # two orgs — proves scoping. Owner + worker in ispA with numbers.
         self.owner = self.store.add_user("ispA", "own1", "h", "s", "owner")
         self.worker = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(self.owner, "919000000001")
@@ -282,8 +269,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.olt = self.store.create_org_device("ispA", {
             "name": "HILL-OLT-1", "ip_address": "10.0.0.1", "device_type": "OLT",
             "region": None, "parent_device_id": None,
-            # monitored by a probe: triage_outages only lists devices something
-            # is actually watching, and the accept-button tests read that view
             "assigned_node_id": "probe1"})
         self.olt_b = self.store.create_org_device("ispB", {
             "name": "B-OLT", "ip_address": "10.9.9.9", "device_type": "OLT",
@@ -305,7 +290,6 @@ class WhatsappBotTest(unittest.TestCase):
         return WhatsAppBot(self.store, notifier or _RecBot(), sweeper,
                            base_url="https://hansanet.in")
 
-    # -- resolver gate --------------------------------------------------------
 
     def test_unknown_number_gets_no_reply(self):
         rec = _RecBot()
@@ -317,7 +301,6 @@ class WhatsappBotTest(unittest.TestCase):
         self._bot(rec).handle(_status_only())
         self.assertEqual((rec.texts, rec.buttons), ([], []))
 
-    # -- lookup + reply card --------------------------------------------------
 
     def test_owner_lookup_returns_card_with_three_buttons(self):
         self._onu("ispA", self.olt, "onu-1", "a4:f2:1b:00:11:22", name="hc_kiran")
@@ -327,7 +310,7 @@ class WhatsappBotTest(unittest.TestCase):
         to, body, btns = rec.buttons[0]
         self.assertEqual(to, "919000000001")
         self.assertIn("HILL-OLT-1", body)
-        self.assertIn("-21.00 dBm", body)                    # real Rx, not 0
+        self.assertIn("-21.00 dBm", body)
         ids = [b[0] for b in btns]
         self.assertEqual(ids, [f"refresh:{self.olt}", f"map:{self.olt}:1",
                                f"recent:{self.olt}"])
@@ -335,14 +318,13 @@ class WhatsappBotTest(unittest.TestCase):
     def test_worker_lookup_omits_refresh_button(self):
         self._onu("ispA", self.olt, "onu-1", "a4:f2:1b:00:11:22")
         rec = _RecBot()
-        self._bot(rec).handle(_text("919000000009", "a4f2"))       # worker's number
+        self._bot(rec).handle(_text("919000000009", "a4f2"))
         _, _, btns = rec.buttons[0]
         ids = [b[0] for b in btns]
         self.assertNotIn(f"refresh:{self.olt}", ids)
         self.assertEqual(ids, [f"map:{self.olt}:1", f"recent:{self.olt}"])
 
     def test_null_rx_says_no_dbm_never_zero(self):
-        # A C-Data/DBC OLT: full roster, every rx_dbm NULL → must NOT read "0".
         self._onu("ispA", self.olt, "onu-1", "a4:f2:1b:00:11:22", rx=None)
         rec = _RecBot()
         self._bot(rec).handle(_text("919000000001", "a4f2"))
@@ -359,8 +341,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertIn("frozen", rec.buttons[0][1])
 
     def test_no_match_says_so_and_offers_the_menu(self):
-        # A miss is a dead end, so it must carry the way forward — the same
-        # tappable menu a greeting gets, prefixed with what wasn't found.
         rec = _RecBot()
         self._bot(rec).handle(_text("919000000001", "zzzznope"))
         self.assertEqual(rec.texts, [])
@@ -368,7 +348,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertIn("No ONU found", body)
         self.assertEqual([b[0] for b in btns], ["ask:mac", "ask:name"])
 
-    # -- the greeting menu ----------------------------------------------------
 
     def test_greeting_offers_the_two_search_options(self):
         rec = _RecBot()
@@ -376,13 +355,11 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertEqual(rec.texts, [])
         to, body, btns = rec.buttons[0]
         self.assertEqual(to, "919000000001")
-        self.assertIn("own1", body)                   # greets by username
+        self.assertIn("own1", body)
         self.assertEqual(btns, [("ask:mac", "Search by MAC"),
                                 ("ask:name", "Search by name")])
 
     def test_a_greeting_is_never_searched_for(self):
-        # "hello" is 5 chars — long enough to be a needle — but a greeting must
-        # not come back as "No ONU found matching hello", which reads as a fault.
         for greeting in ("hello", "Hi there!", "good morning", "Menu", "?"):
             rec = _RecBot()
             self._bot(rec).handle(_text("919000000001", greeting))
@@ -400,14 +377,12 @@ class WhatsappBotTest(unittest.TestCase):
 
     def test_search_by_name_button_prints_the_format(self):
         rec = _RecBot()
-        self._bot(rec).handle(_button("919000000009", "ask:name"))   # worker too
+        self._bot(rec).handle(_button("919000000009", "ask:name"))
         body = rec.texts[0][1]
         self.assertIn("name", body.lower())
         self.assertIn("3 characters", body)
 
     def test_asking_the_format_needs_no_state_a_lookup_follows_directly(self):
-        # The ask buttons only PRINT the format — there is no per-sender "waiting
-        # for a MAC" mode, so the very next message searches as it always does.
         self._onu("ispA", self.olt, "onu-1", "a4:f2:1b:00:11:22", name="hc_kiran")
         rec = _RecBot()
         self._bot(rec).handle(_button("919000000001", "ask:mac"))
@@ -421,35 +396,31 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertEqual([b[0] for b in rec.buttons[0][2]], ["ask:mac", "ask:name"])
 
     def test_an_unknown_button_id_offers_the_menu(self):
-        # A card from an older build (or a mangled payload) must not dead-end.
         rec = _RecBot()
         self._bot(rec).handle(_button("919000000001", "bogus:7"))
         self.assertEqual(rec.texts, [])
         self.assertEqual([b[0] for b in rec.buttons[0][2]], ["ask:mac", "ask:name"])
 
     def test_a_greeting_from_an_unknown_number_stays_silent(self):
-        # The menu must not become a way to learn the bot exists.
         rec = _RecBot()
         self._bot(rec).handle(_text("910000000000", "hi"))
         self.assertEqual((rec.texts, rec.buttons), ([], []))
 
     def test_lookup_is_scoped_to_the_senders_org(self):
-        # An ispB ONU exists; an ispA owner searching its serial finds NOTHING.
         self._onu("ispB", self.olt_b, "b-onu", "de:ad:be:ef:00:01")
         rec = _RecBot()
-        self._bot(rec).handle(_text("919000000001", "deadbeef"))   # ispA owner
+        self._bot(rec).handle(_text("919000000001", "deadbeef"))
         self.assertEqual(rec.texts, [])
         body, btns = rec.buttons[0][1], rec.buttons[0][2]
-        self.assertIn("No ONU found", body)                 # a miss, not the card
+        self.assertIn("No ONU found", body)
         self.assertEqual([b[0] for b in btns], ["ask:mac", "ask:name"])
 
-    # -- button follow-ups ----------------------------------------------------
 
     def test_owner_refresh_drives_the_scrape(self):
         sw = _FakeSweeper(eligible=[self.olt])
         rec = _RecBot()
         self._bot(rec, sw).handle(_button("919000000001", f"refresh:{self.olt}"))
-        self.assertTrue(sw.done.wait(timeout=3))                # scrape ran on its thread
+        self.assertTrue(sw.done.wait(timeout=3))
         self.assertEqual([d["id"] for d in sw.scraped], [self.olt])
         self.assertIn("Reading", rec.texts[0][1])
 
@@ -462,7 +433,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertIn("owner-only", rec.texts[0][1])
 
     def test_refresh_cross_org_id_is_refused(self):
-        # ispA owner tapping a refresh for ispB's OLT id — scoping refuses it.
         sw = _FakeSweeper(eligible=[self.olt_b])
         rec = _RecBot()
         self._bot(rec, sw).handle(_button("919000000001", f"refresh:{self.olt_b}"))
@@ -482,10 +452,6 @@ class WhatsappBotTest(unittest.TestCase):
         self._bot(rec).handle(_button("919000000001", f"recent:{self.olt}"))
         self.assertIn("Recent outages", rec.texts[0][1])
 
-    # -- [✅ I'm on it] on an assignment page ----------------------------------
-    # The reason the page carries a button at all: a worker at a pole answers
-    # from the notification. It is the SAME accept the dashboard performs, on the
-    # same store method and the same rule, so the two can't drift apart.
 
     def _assigned_outage(self, to=("wkr1",), org="ispA", device=None):
         device = self.olt if device is None else device
@@ -513,7 +479,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertIn("wkr1", told[0][1])
 
     def test_accepting_a_job_that_is_not_yours_changes_nothing(self):
-        # The owner tapping a stale button on somebody else's assignment.
         oid = self._assigned_outage(to=("wkr1",))
         rec = _RecBot()
         self._bot(rec).handle(_button("919000000001", f"acc:{oid}"))
@@ -522,8 +487,6 @@ class WhatsappBotTest(unittest.TestCase):
         self.assertIn("isn't assigned to you", rec.texts[0][1])
 
     def test_a_cross_org_outage_id_is_not_acceptable(self):
-        # `org` comes from the sender's own account, so ispB's outage is simply
-        # not there — never another org's device name in the reply.
         oid = self._assigned_outage(to=("bown",), org="ispB", device=self.olt_b)
         rec = _RecBot()
         self._bot(rec).handle(_button("919000000009", f"acc:{oid}"))

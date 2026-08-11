@@ -24,12 +24,6 @@ def _iso(dt):
 
 
 class IssueListTest(unittest.TestCase):
-    """The issue plane: one row per PROBLEM, not per device.
-
-    The property that matters is agreement — a tile's count and the length of the
-    list it opens have to be the same number, or the drill-down is worse than no
-    drill-down. So these tests pin the SHAPE (a switch with two dark ports is two
-    rows) and the gates (maintenance, unregistered probe, org scope)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -54,7 +48,6 @@ class IssueListTest(unittest.TestCase):
         self.server.server_close()
         self.tmp.cleanup()
 
-    # --- harness --------------------------------------------------------------
 
     def _device(self, name, ip, *, org="ispA", node="probe1", **extra):
         return self.store.create_org_device(org, {
@@ -110,11 +103,8 @@ class IssueListTest(unittest.TestCase):
     def _collect(self, org="ispA"):
         return issues.collect(self.store, self.cfg, org, now=self.now)
 
-    # --- shape ----------------------------------------------------------------
 
     def test_a_switch_with_two_dark_ports_is_two_rows(self):
-        # THE reason this page exists: in the device tree that switch is one row
-        # carrying a "2 ports down" chip, which is not a list of the two jobs.
         sw = self._device("CH-SW", "10.0.0.2")
         self._state(sw, "UP")
         self._port(sw, 1, name="Gi1/0/1")
@@ -140,8 +130,6 @@ class IssueListTest(unittest.TestCase):
         self.assertEqual(row["severity"], "warning")
 
     def test_maintenance_and_unmonitored_devices_are_not_issues(self):
-        # Same exclusions the KPI tile makes: neither is a fault, and a muted row
-        # in a fault list is how a fault list stops being read.
         maint = self._device("MAINT-SW", "10.0.0.7")
         self._state(maint, "DOWN")
         self.store.set_org_device_maintenance("ispA", maint, True)
@@ -154,8 +142,6 @@ class IssueListTest(unittest.TestCase):
         self.assertNotIn("NO-PROBE", names)
 
     def test_a_device_behind_an_unregistered_probe_is_not_counted(self):
-        # "Monitored" has to mean exactly what the tile means, or the count and
-        # the list disagree the moment a probe is revoked.
         d = self._device("ORPHAN", "10.0.0.9", node="ghost")
         self._state(d, "DOWN")
         self.assertNotIn("ORPHAN", {r["device_name"] for r in self._collect()})
@@ -168,8 +154,6 @@ class IssueListTest(unittest.TestCase):
         self.assertEqual([r for r in self._collect() if r["kind"] == "port_down"], [])
 
     def test_a_port_on_an_unreachable_switch_is_kept_but_marked_frozen(self):
-        # Kept because the tile counts it; demoted and annotated because an
-        # unreachable box's SNMP reading is a memory, not a second live fault.
         sw = self._device("DARK-SW", "10.0.0.4")
         self._state(sw, "UNREACHABLE")
         self._port(sw, 1)
@@ -203,7 +187,6 @@ class IssueListTest(unittest.TestCase):
                          sorted((r["severity"] for r in rows),
                                 key=lambda s: issues.SEVERITY_RANK[s]))
 
-    # --- the API --------------------------------------------------------------
 
     def test_endpoint_carries_rows_counts_and_the_kind_vocabulary(self):
         sw = self._device("CH-SW", "10.0.0.2")
@@ -215,12 +198,9 @@ class IssueListTest(unittest.TestCase):
         self.assertEqual(body["counts"]["port_down"], 1)
         self.assertEqual(body["total"], len(body["issues"]))
         self.assertEqual(list(body["kinds"]), list(issues.KINDS))
-        # a live list must never be served from the HTTP cache
         self.assertEqual(head.get("Cache-Control"), "no-store")
 
     def test_kind_filter_narrows_rows_but_never_the_counts(self):
-        # The counts feed the filter chips, so they have to describe the WHOLE
-        # list — a chip that reports the filtered total says 0 for every other kind.
         sw = self._device("CH-SW", "10.0.0.2")
         self._state(sw, "UP")
         self._port(sw, 1)
@@ -240,9 +220,6 @@ class IssueListTest(unittest.TestCase):
         self.assertEqual(len(body["issues"]), 1)
 
     def test_an_org_owner_is_pinned_to_its_own_org_whatever_it_asks_for(self):
-        # `?org=` is a superadmin scope switch; for everyone else the server
-        # ignores it and answers from the session's own org, so a hand-edited URL
-        # can't reach another ISP's fleet.
         other = self._device("B-SW", "10.9.9.9", org="ispB", node="bprobe")
         self._state(other, "DOWN", org="ispB")
         mine = self._device("A-SW", "10.0.0.1")
@@ -256,9 +233,6 @@ class IssueListTest(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_a_worker_can_read_the_issue_list(self):
-        # Deliberately allowed: a worker gets the full shell and the sidebar
-        # offers Issues on mobile, so a 403 here rendered a nav entry that
-        # dead-ended. Read-side only — nothing here writes or pages.
         status, _, _ = self._req("GET", "/api/issues?org=ispA",
                                  cookie=self._login("field", "fieldpassword"))
         self.assertEqual(status, 200)
@@ -272,7 +246,6 @@ class IssueListTest(unittest.TestCase):
                                cookie=self._login("field", "fieldpassword"))
         self.assertEqual({r["device_name"] for r in body["issues"]}, {"A-SW"})
 
-    # --- the PDF --------------------------------------------------------------
 
     def test_pdf_export_is_a_pdf_attachment(self):
         sw = self._device("CH-SW", "10.0.0.2")
@@ -285,7 +258,6 @@ class IssueListTest(unittest.TestCase):
         self.assertIn("attachment; filename=\"issues-ispA-", head["Content-Disposition"])
         self.assertTrue(blob.startswith(b"%PDF"))
         self.assertIn(b"CH-SW", blob)
-        # the ')' in a real if_alias must not corrupt the content stream
         self.assertIn(rb"uplink \(main\)", blob)
 
     def test_pdf_export_respects_the_kind_filter(self):
@@ -300,24 +272,21 @@ class IssueListTest(unittest.TestCase):
         self.assertNotIn(b"CH-SW", blob)
 
     def test_pdf_times_are_rendered_in_the_operators_zone(self):
-        # A filed report is read beside a wall clock, never beside a timezone —
-        # the same reason the WhatsApp "Time Logged" fix exists. Same choke point.
         sw = self._device("CH-SW", "10.0.0.2")
         self._state(sw, "UP")
         self._port(sw, 1)
         _, blob, _ = self._req("GET", "/api/issues/pdf?org=ispA",
                                cookie=self._login(), raw=True)
-        self.assertIn(b"IST", blob)          # cfg.display_tz default Asia/Kolkata
-        self.assertNotIn(b"+00:00", blob)    # no raw stored stamp survives
+        self.assertIn(b"IST", blob)
+        self.assertNotIn(b"+00:00", blob)
 
     def test_pdf_export_of_a_healthy_org_is_still_a_valid_file(self):
         status, blob, _ = self._req("GET", "/api/issues/pdf?org=ispA",
                                     cookie=self._login(), raw=True)
         self.assertEqual(status, 200)
         self.assertTrue(blob.startswith(b"%PDF"))
-        self.assertIn(rb"0 issue\(s\)", blob)  # escaped in the stream
+        self.assertIn(rb"0 issue\(s\)", blob)
 
-    # --- the spreadsheet ------------------------------------------------------
 
     def test_xlsx_export_is_a_real_workbook(self):
         import io, zipfile
@@ -337,12 +306,10 @@ class IssueListTest(unittest.TestCase):
         self.assertIsNone(zf.testzip())
         sheet = zf.read("xl/worksheets/sheet1.xml").decode()
         self.assertIn("CH-SW", sheet)
-        # a real ')' in an if_alias is XML-safe here, unlike in the PDF stream
         self.assertIn("uplink (main)", sheet)
         ElementTree.fromstring(sheet)
 
     def test_xlsx_since_is_a_date_cell_not_text(self):
-        # The point of the spreadsheet: sorting by Since orders by time.
         import io, zipfile
         from xml.etree import ElementTree
         ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -385,8 +352,6 @@ class IssueListTest(unittest.TestCase):
         self.assertNotIn("B-SW", sheet)
 
     def test_a_worker_can_download_either_export(self):
-        # Same rows the worker can already see on screen, filtered by the same
-        # chips — filing what it drove out to fix is the point of the exports.
         cookie = self._login("field", "fieldpassword")
         for path in ("/api/issues/pdf?org=ispA", "/api/issues/xlsx?org=ispA"):
             self.assertEqual(self._req("GET", path, cookie=cookie, raw=True)[0], 200, path)

@@ -80,12 +80,7 @@ class EngineRegistry:
             return self._engines[org_id]
 
     def forget(self, org_id: str) -> None:
-        """Drop a deleted org's live engine (flap streaks, uplink flag, FSMs).
 
-        Org ids are reusable, so a stale engine would hand a NEW org of the same
-        name the old one's in-memory state. Deletion wipes device_states too, so
-        nothing rehydrates it — this is the only copy left.
-        """
         with self._lock:
             self._engines.pop(org_id, None)
             self._fingerprints.pop(org_id, None)

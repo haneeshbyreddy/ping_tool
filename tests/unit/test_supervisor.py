@@ -62,7 +62,6 @@ class ConsumeRestartTest(unittest.TestCase):
                           self.calls.append("stop")),
             restart=lambda: self.calls.append("start")))
         self.assertEqual(self.calls, ["stop", "start"])
-        # removed BEFORE acting — a crash mid-restart can't loop
         self.assertEqual(seen_at_stop, [False])
         self.assertFalse(self.path.exists())
 

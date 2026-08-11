@@ -2,14 +2,6 @@ import type { QueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { snmpApi, ApiError } from "@/lib/api"
 
-/* "Test SNMP" — a tiny system-subtree walk (1.3.6.1.2.1.1, 10 varbinds) queued
-   through the EXISTING remote-walk pipeline, so the verdict is the real probe
-   talking to the real device with the SAVED community/port (pending_snmp_walks
-   joins org_devices at pickup, so save-then-test reads the fresh settings).
-   The whole flow lives in one sonner toast keyed per device, so it survives the
-   device form closing on save. No backend change — this is pure interpretation
-   of the walk result the dialog already shows. */
-
 const SYSTEM_OID = "1.3.6.1.2.1.1"
 const POLL_MS = 5_000       // matches the walk dialog's while-pending cadence
 const MAX_WAIT_MS = 180_000 // ~3 report cycles; past that the probe isn't picking up
@@ -84,7 +76,6 @@ export async function runSnmpTest(
         }
         return
       }
-      // status === "error"
       const err = walk.error || "walk failed"
       const noAnswer = /timeout|no (snmp )?response/i.test(err)
       toast.error(`SNMP test failed on ${device.name}`, {

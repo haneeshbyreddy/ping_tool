@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -14,7 +15,7 @@ from wisp.central.store_field import FieldStoreMixin
 from wisp.central.store_outages import OutageStoreMixin
 from wisp.central.store_proxy import ProxyStoreMixin
 from wisp.central.store_snmp import SnmpStoreMixin
-from wisp.central.store_util import (  # noqa: F401 — re-exported
+from wisp.central.store_util import (  # noqa: F401
     SNMP_STATUS_STATES, SNMP_SUBSYSTEMS, SNMP_WALKS_KEEP,
     _now_iso,
 )
@@ -935,22 +936,6 @@ CREATE INDEX IF NOT EXISTS idx_worker_locations_ts
     ON worker_locations(org_id, user_id, ts);
 """
 
-# THE FIBRE PLANT, kept apart from `_SCHEMA` because `_rebuild_fibre_plant` has to
-# re-execute exactly this after dropping it. Two statements of one DDL is how a
-# rebuilt table silently ends up one column behind the one a fresh install gets.
-#
-# THE MODEL (2026-08-09, the ISPs' own words): *fibre runs between two couplers, and
-# at a coupler you join cable to cable, or take a core out to a device on a single
-# fibre* — plus *any core may carry anything, including a customer line*, and so *a
-# customer point is a coupler too*.
-#
-# What that replaced was a graph nothing stored. A `run` was (cable, core, device A,
-# device B), so glass could only be recorded between two BOXES; the closure where the
-# sheath is actually opened was a derived projection (`org_cable_taps`); and a cable
-# had no ends of its own. `org_cable_runs`, `org_cable_taps` and `org_splices` are
-# GONE, and with them `fiber.core_path` — a core of a segment has exactly two ends,
-# so the double booking that checker existed to catch is now unrepresentable rather
-# than merely absent.
 _FIBRE_SCHEMA = """
 -- A CABLE: one sheath SEGMENT, with two ENDS THAT ARE RECORDED.
 --
@@ -1085,90 +1070,36 @@ class CentralStore(
         with self._connect() as conn:
             self._migrate_tenant_to_org(conn)
             conn.executescript(_SCHEMA)
-            # BEFORE the fibre DDL, not after: on an upgraded DB `org_cables`
-            # still has its old shape, so `CREATE TABLE IF NOT EXISTS` is a no-op
-            # and the indexes beside it name columns that do not exist yet. The
-            # rebuild drops the old table and runs the same script itself; the
-            # second call is then the idempotent safety net for every DB that has
-            # already been through it.
             self._rebuild_fibre_plant(conn)
             conn.executescript(_FIBRE_SCHEMA)
+            self._ensure_columns(conn, "org_fibre_joints", (
+                ("port_kind", "TEXT"), ("port_no", "INTEGER")))
+            self._unname_plumbing(conn)
+            self._couplers_are_closures(conn)
             self._ensure_columns(conn, "orgs", (
                 ("ntfy_topic_owner", "TEXT"), ("ntfy_topic_worker", "TEXT"),
-                # Map view viewport lock; a key from the dashboard's region list
-                # (web/src/lib/map-regions.ts), e.g. "telangana". NULL = all-India.
-                # (google_maps_key briefly lived here too — moved to app_settings
-                # 2026-07-11, one superadmin key for every org; the org column may
-                # linger in older DBs, dead.)
                 ("map_region", "TEXT"),
-                # Dashboard-set probe cadence for this org's edges, seconds.
-                # NULL = automatic (edge env/adaptive default). API clamps to
-                # 10–120s: past 120s the fleet watchdog's 180s stale threshold
-                # would page NODE_STALE for a healthy probe.
                 ("poll_interval_s", "INTEGER"),
-                # Paywall tier: free | pro | vip (central/billing.py PLANS).
-                # Superadmin-set only; drives the device cap and the monthly
-                # payment lock (org_billing_months).
                 ("plan", "TEXT NOT NULL DEFAULT 'free'"),
-                # Web-UI proxy capability (webplan.md §6.7): opt-in per org,
-                # superadmin-set — THE activation gate since v0.15.8
-                # (cfg.proxy_enabled defaults on; =0 is the emergency kill
-                # switch, per side).
                 ("web_proxy", "INTEGER NOT NULL DEFAULT 0"),
-                # Fleet auto-update: when a newer release lands in the mirror,
-                # central starts the (staged, health-gated) rollout itself —
-                # first stale heartbeat becomes the canary (central/rollout.py:
-                # maybe_auto_rollout). Off = updates stay dashboard-clicked.
                 ("auto_update", "INTEGER NOT NULL DEFAULT 0")))
             self._ensure_columns(conn, "nodes", (
                 ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
-            # Per-login-account WhatsApp number (E.164), the recipient half of the
-            # experimental WhatsApp channel (2026-07-23). Numbers are per-account,
-            # not per-org — every login adds its own; pages fan out per org+role
-            # via store.org_role_whatsapp, the analog of org_role_topic. Purely
-            # additive: absent = that account gets no WhatsApp, exactly as today.
             self._ensure_columns(conn, "users", (
                 ("whatsapp_number", "TEXT"),
-                # Session generation for single-active-session enforcement
-                # (2026-07-23). A newer login / a logout bumps it; every cookie
-                # signed with an older value then fails resolve_session. 0 on
-                # rows that predate the column, matching a fresh account.
                 ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
-                # TOTP second factor (2026-07-23), owner/superadmin only. The
-                # shared secret is secretbox-ENCRYPTED (never plaintext); enabled
-                # flips to 1 only once a code is confirmed (a set secret with
-                # enabled=0 is an abandoned enrollment and is NOT enforced).
-                # last_step is the replay guard (last accepted counter); recovery
-                # holds a JSON list of unused recovery-code SHA-256 hashes.
                 ("totp_secret", "TEXT"),
                 ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
                 ("totp_last_step", "INTEGER"),
                 ("totp_recovery", "TEXT"),))
-            # Pre-2026-07-22 walks predate the flag; 0 reads as "not known to be
-            # partial", which is what they were already being treated as.
             self._ensure_columns(conn, "snmp_walks", (
                 ("truncated", "INTEGER NOT NULL DEFAULT 0"),))
-            # Who the owner sent to this outage. A JSON list of usernames rather
-            # than a join table: assignment is one small fact about one outage,
-            # always read whole with it (triage_outages), never queried across
-            # outages. NULL on pre-2026-07-26 rows and on an outage nobody
-            # assigned — distinct from "[]", which never gets written (an empty
-            # assignment is refused, so clearing means naming someone else).
-            # `accepted_by` is the other half: which of those people have said
-            # yes. Same shape and same reason (read whole with the outage), and
-            # it is what separates "the owner asked" from "somebody is going" —
-            # assignment alone leaves the outage DOWN. `accepted_at` is the FIRST
-            # acceptance, so the card can say how long an answer took.
             self._ensure_columns(conn, "outages", (
                 ("assigned_to", "TEXT"), ("assigned_at", "TEXT"),
                 ("assigned_by", "TEXT"), ("accepted_by", "TEXT"),
                 ("accepted_at", "TEXT")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
-            # clean classification token for the notification governor + honest
-            # by-type analytics (the free-text `payload` mixes codes with outage
-            # titles). NULL on pre-governor rows. Index built here (not in
-            # _SCHEMA) so an older DB has the column before the index needs it.
             self._ensure_columns(conn, "alert_log", (("kind", "TEXT"),))
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alert_log_cooldown"
@@ -1192,117 +1123,35 @@ class CentralStore(
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
                 ("gpon_vendor", "TEXT"),
                 ("lat", "REAL"), ("lng", "REAL"),
-                # passive plant only (splitter/fdb/closure): which PON it serves
                 ("pon_port", "TEXT"),
-                # passive plant only: how many ways this box splits the fibre —
-                # inventory.SPLIT_RATIOS, the 1:2 … 1:16 the field actually
-                # stocks. NULL = not recorded (an FDB or closure that only
-                # splices). Drives the recorded-load bar and the cumulative
-                # split down a cascade; NOT an occupancy claim on its own, since
-                # a leg nobody recorded is unknown, not free.
                 ("split_ratio", "INTEGER"),
-                # passive plant only: how many fibres FEED the box — 2 for a
-                # protection-input splitter (a 2:16), NULL for the ordinary
-                # single-input form. NULL means ONE here, not "unrecorded": every
-                # splitter predating this column was already rendered "1:N" by a
-                # label that assumed one input, so a gap reading would mark the
-                # whole live plant record incomplete overnight. Says nothing
-                # about whether that input is CONNECTED — that is
-                # org_device_links, and keeping the two apart is what lets a
-                # panel say "two inputs, one feed recorded".
                 ("split_inputs", "INTEGER"),
-                # OLT only: per-PON ONU cap override (NULL = cfg.onu_pon_limit, the
-                # EPON 1:64 default); a 1:128 GPON box raises it so it never
-                # false-pages "at capacity" (central/onualert.py)
                 ("onu_pon_limit", "INTEGER"),
-                # Web-UI proxy address override: when a device's admin page isn't
-                # at ip_address:80/443 (port-forwarding / a separate mgmt IP), the
-                # owner declares where it actually lives. Any of these set = the
-                # proxy targets (web_ip or ip_address):(web_port or scheme default)
-                # over web_scheme, bypassing the fleet-wide proxy_mgmt_ports list —
-                # an owner-declared endpoint, re-validated on the edge against the
-                # SAME device fields (no arbitrary-pivot). All NULL = classic
-                # behavior (proxy the probe IP on 80/443).
                 ("web_ip", "TEXT"),
                 ("web_port", "INTEGER"),
                 ("web_scheme", "TEXT"),
-                # comma-separated free-form tags (Network page filtering);
-                # cosmetic — deliberately NOT part of org_device_topology, so
-                # editing them never rebuilds/re-pages an engine. (A dev DB may
-                # also carry a dead group_name column from the tags feature's
-                # one-day single-group predecessor — harmless.)
                 ("tags", "TEXT"),
-                # Network TREE presentation only: render this device at the top
-                # level instead of inside its parent's subtree. The parent link
-                # itself is untouched — suppression, the map, and paging all
-                # still see it. Same discipline as tags: read ONLY by
-                # list_org_devices, never by org_device_topology.
                 ("tree_detached", "INTEGER NOT NULL DEFAULT 0"),
-                # Where the pin CAME FROM. A phone's first fix is a cell/wifi
-                # estimate at 30-80 m that converges over ~10 s, so a field
-                # capture and a surveyed desktop placement are different claims
-                # about the same two numbers — and a splitter pinned 40 m off is
-                # a crew walking the wrong side of a road. Recording provenance
-                # is the same rule as "nothing is wrong" vs "nothing is
-                # measured": the map may not render an estimate and a survey
-                # alike. All NULL = placed before this shipped, or dragged on
-                # the desktop; the UI says "unknown", never "surveyed".
                 ("accuracy_m", "REAL"),
-                ("place_source", "TEXT"),   # 'gps' | 'manual' | NULL
+                ("place_source", "TEXT"),
                 ("placed_by", "TEXT"),
                 ("placed_at", "TEXT")))
-            # when this ONU was last seen online — central/ponfault.py reads it to
-            # spot a mass drop ("N ONUs dark within one walk") without a history table
             self._ensure_columns(conn, "onu_optics", (
                 ("last_online_at", "TEXT"),))
-            # auth_mode landed after the credentials table's first cut — a DB
-            # that already created it (Phase 1) needs the column backfilled.
             self._ensure_columns(conn, "device_webui_credentials", (
                 ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
-            # `label_pos` is the operator's cartography — where the chip rides
-            # along the rendered path — and it is all that is left of what this
-            # row once tried to say about plant. `color`/`cores`/`core_no`/
-            # `cable_id` were the three earlier answers to "which glass is this
-            # span"; a DB that already has them keeps them, unread, but a fresh
-            # one is NOT given them. That is the one departure from the
-            # park-the-column convention, and `cable_id` is why: a dead column
-            # carrying a REFERENCES clause still pins its parent row, which is
-            # exactly how a cable became undeletable in the field.
             self._ensure_columns(conn, "link_routes", (
                 ("color", "TEXT"), ("label_pos", "REAL")))
-            # A subscriber's drop got geometry the same day the cable did. Same
-            # shape as link_routes.waypoints — intermediate vertices only, JSON,
-            # running SPLITTER → ONU — and the same payoff: a traced drop stops
-            # being drawn dotted, because the dash on this map means "nobody
-            # surveyed this" and somebody just did.
             self._ensure_columns(conn, "onu_drops", (
-                ("waypoints", "TEXT NOT NULL DEFAULT '[]'"),))
-            # LOCATING an ONU and VOUCHING for its power supply became two
-            # different claims when the field survey shipped (2026-07-28). Until
-            # then the table held only the latter, so placing WAS the claim and
-            # every existing row means witness — hence DEFAULT 1, which backfills
-            # them correctly. New plain locations write 0 explicitly; the write
-            # path never relies on the default.
+                ("waypoints", "TEXT NOT NULL DEFAULT '[]'"),
+                ("leg_no", "INTEGER")))
             self._ensure_columns(conn, "onu_places", (
                 ("witness", "INTEGER NOT NULL DEFAULT 1"),
-                # Same provenance the device survey records, for the same reason
-                # — a subscriber pin taken at 60 m and one taken at 8 m are
-                # different claims, and a drop is the finest-grained thing on the
-                # map. NULL = placed from the desktop reference-ONU dialog, which
-                # is a click on a map and carries no measurement.
                 ("accuracy_m", "REAL"),
                 ("place_source", "TEXT"),
                 ("placed_by", "TEXT"),
                 ("placed_at", "TEXT"),
-                # The subscriber's contact number (operator's call, 2026-07-31).
-                # NULLABLE although the field capture now REQUIRES it: every row
-                # placed before today has no number, and a NOT NULL column would
-                # have to invent one. The mandate lives on the write path, so a
-                # tech reopening an old pin fills it in then — which is how the
-                # backfill actually happens. Same shape as `label`: operator-
-                # owned, no walk touches it.
                 ("phone", "TEXT")))
-            # …and only once those columns exist, since the rebuild copies them.
             self._relax_onu_place_coords(conn)
             self._seed_google_key(conn)
             self._collapse_roles(conn)
@@ -1312,35 +1161,11 @@ class CentralStore(
 
     @staticmethod
     def _relax_onu_place_coords(conn) -> None:
-        """A subscriber's record stops needing a coordinate (2026-08-03).
 
-        `onu_places` shipped as a reference-POINT table, so lat/lng were NOT NULL
-        and clearing a point was a DELETE. Once the field survey hung `label` and
-        `phone` on the same row that made the customer record a passenger on a
-        map pin: a name and a number could not be recorded without standing at
-        the house, and the map card's "Remove" deleted the contact details along
-        with the pin. Both are the same missing degree of freedom, so both are
-        fixed by relaxing the columns — see the table comment for what replaces
-        "clearing is a DELETE".
 
-        SQLite cannot drop a NOT NULL in place, so this is the documented
-        12-step rebuild: create, copy, drop, rename. Guarded on lat's own
-        `notnull` flag, which makes it a no-op on every start after the first and
-        on a DB created from the current `_SCHEMA`.
-
-        It runs INSIDE `__init__`'s open transaction (as `_ensure_columns` does)
-        so a crash mid-rebuild rolls back to the old table rather than leaving
-        the org's subscriber records half-copied. `onu_places` is referenced by
-        no foreign key — `onu_drops` points at `org_devices`, not at this — so
-        dropping it cannot dangle anything, which is what makes the rebuild safe
-        with `PRAGMA foreign_keys=ON` still set.
-        """
         info = list(conn.execute("PRAGMA table_info(onu_places)"))
         if not any(r["name"] == "lat" and r["notnull"] for r in info):
             return
-        # Copy by NAME, and only the names both tables share: an older DB that
-        # never reached one of the `_ensure_columns` above would otherwise fail
-        # the INSERT on a column the SELECT can't supply.
         cols = [r["name"] for r in info if r["name"] != "id"]
         names = ", ".join(cols)
         conn.execute("""
@@ -1372,101 +1197,79 @@ class CentralStore(
 
     @staticmethod
     def _upper_onu_labels(conn) -> None:
-        """Subscriber names read as CAPS (operator's call, 2026-07-29).
 
-        `inventory._onu_label` uppercases on the way in, which fixes every name
-        typed from now on. This carries the ones already recorded across, so the
-        rule doesn't present as "the survey started shouting halfway through" —
-        a list where the first fifty drops are lower-case and the rest are not
-        looks like a bug in whichever screen is showing it.
 
-        Idempotent by its own WHERE clause and touches nothing else in the table:
-        a pin, its provenance and its witness flag all survive a rename that
-        changes only case. SQLite's UPPER is ASCII-only where Python's `.upper()`
-        is not, so a non-ASCII name written before today keeps its case here and
-        is normalized the next time somebody saves it — harmless, and the
-        alternative (reading and rewriting every row in Python at startup) buys
-        nothing for a field nobody has typed non-ASCII into."""
         conn.execute("UPDATE onu_places SET label = UPPER(label)"
                      " WHERE label IS NOT NULL AND label <> UPPER(label)")
 
     @staticmethod
     def _collapse_roles(conn) -> None:
-        """Roles collapsed to owner+worker (2026-07-21): the org has owners and
-        field workers, nothing in between.
 
-        Two one-shot moves, both idempotent:
 
-        * **The operator TOPIC becomes the worker topic, value and all.** That
-          column was where nearly every page actually landed (ponalert,
-          onualert, ports, perf, redundancy, the hourly escalation) — dropping
-          it would have silenced a live fleet until every phone re-subscribed.
-          Copying the string across means the same ntfy topic keeps paging the
-          same handsets; only the name central calls it changed. The tech topic
-          is genuinely gone (it only ever took the all-hands resolve
-          broadcast, which the worker channel now carries).
-        * **operator/tech accounts become workers.** Both were read-only bar
-          the owner-gated writes, and `worker` is the closest live role — an
-          account left holding a role outside ROLES would fail every
-          `_can_write`/`can_triage` check and read as a broken login.
-
-        The dead columns stay put: dropping a column rewrites the table, and a
-        lingering unread one is harmless (same call as the razorpay/upigateway
-        leftovers).
-        """
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(orgs)")}
         if "ntfy_topic_operator" in cols:
             conn.execute(
                 "UPDATE orgs SET ntfy_topic_worker=ntfy_topic_operator"
                 " WHERE ntfy_topic_worker IS NULL AND ntfy_topic_operator IS NOT NULL")
-        # ORG accounts only. A superadmin is org_id IS NULL and its role column
-        # is meaningless, but it must never READ as 'worker': the SPA's
-        # require-auth hands any worker the stripped field view, so flipping the
-        # platform admin's row locked it out of its own dashboard.
         conn.execute(
             "UPDATE users SET role='worker'"
             " WHERE org_id IS NOT NULL AND role IN ('operator','tech')")
-        # …and normalise every superadmin onto the one harmless token, repairing
-        # rows an earlier build already flipped (create_user's default became
-        # 'worker' with the collapse, so a bare `admin create-user` wrote it too).
         conn.execute(
             "UPDATE users SET role='owner' WHERE org_id IS NULL AND role!='owner'")
 
 
     @staticmethod
+    def _couplers_are_closures(conn) -> None:
+
+
+        try:
+            conn.execute("UPDATE org_devices SET device_type='closure'"
+                         " WHERE device_type='coupler'")
+        except sqlite3.OperationalError:
+            pass
+
+
+    @staticmethod
+    def _unname_plumbing(conn) -> None:
+
+
+        try:
+            rows = conn.execute(
+                "SELECT c.id, c.name, c.a_device_id, c.b_device_id,"
+                "       j.port_kind, j.port_no"
+                "  FROM org_cables c"
+                "  LEFT JOIN org_fibre_joints j"
+                "         ON j.a_cable_id=c.id AND j.b_cable_id IS NULL"
+                "        AND j.device_id=c.a_device_id"
+                " WHERE c.cores=1 AND c.path IS NULL AND c.name<>''").fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not rows:
+            return
+        names = {r["id"]: r["name"] for r in conn.execute(
+            "SELECT id, name FROM org_devices")}
+        clear: list[int] = []
+        for r in rows:
+            here = names.get(r["a_device_id"]) or "box"
+            there = names.get(r["b_device_id"]) or "box"
+            label = fiber.port_label(r["port_kind"], r["port_no"])
+            built = {f"{here} → {there}"}
+            if label:
+                built.add(f"{here} {label} → {there}")
+            m = re.fullmatch(r"(?:(.+) )?core (\d+) → (.+)", r["name"])
+            if m and m.group(3) == there:
+                built.add(r["name"])
+            if r["name"] in built:
+                clear.append(r["id"])
+        if clear:
+            conn.executemany("UPDATE org_cables SET name='' WHERE id=?",
+                             [(i,) for i in clear])
+
+
+    @staticmethod
     def _rebuild_fibre_plant(conn) -> None:
-        """Throw the recorded cable away and rebuild the table around the coupler.
 
-        THIS IS A DELIBERATE, ONE-TIME DATA LOSS, and it is the operators' own
-        decision (2026-08-09). They corrected the model — fibre runs between two
-        couplers, a core may carry anything including a customer, so a customer
-        point is a coupler too — and when told that carrying the old span-based
-        logic alongside the new one would leave the module twice the size, they
-        said to clear it and lay it again. Every reader here should know that the
-        alternative was considered: a migration could have guessed a cable's ends
-        from the runs on it, but a guessed end is a closure a crew drives to, and
-        that is the one thing this subsystem must never invent.
 
-        What is destroyed is the fibre RECORD: cables, runs, taps, splices, core
-        labels, and the span geometry that only ever existed to draw them. What is
-        NOT touched, because it is what a survey actually costs to collect:
-        `org_devices` (every pin, ratio, parent and tag), `onu_places` (every
-        customer pin, name and number) and `onu_drops` (which splitter leg feeds
-        which customer — a different fact from which glass carries it, and the
-        input branch-fault localization runs on).
-
-        ORDER IS EVERYTHING, because `_connect` runs `PRAGMA foreign_keys=ON` and
-        every one of these points at `org_cables(id)`. `link_routes.cable_id` is in
-        that list although the column is DEAD — a dead column with a REFERENCES
-        clause still pins its parent, which is exactly how a migrated cable became
-        undeletable in the field. So: children, then the pointer in `link_routes`,
-        then the table itself.
-
-        Guarded by a marker in `app_settings` rather than by "are there any cables
-        yet", for the reason every migration here is: the operator's next act is to
-        record cables, and a data-shaped guard would wipe them again on the next
-        restart.
-        """
         done = conn.execute(
             "SELECT 1 FROM app_settings WHERE key='fibre_plant_rebuilt'").fetchone()
         if done:
@@ -1475,8 +1278,6 @@ class CentralStore(
                      " VALUES ('fibre_plant_rebuilt', ?)", (_now_iso(),))
         have = {r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        # Children first — including the two that only ever existed to reconstruct
-        # a graph the cable now stores itself.
         for table in ("org_splices", "org_cable_runs", "org_cable_taps",
                       "org_cable_cores", "org_fibre_joints"):
             if table in have:
@@ -1488,9 +1289,6 @@ class CentralStore(
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(link_routes)")}
             if "cable_id" in cols:
                 conn.execute("UPDATE link_routes SET cable_id=NULL")
-            # The per-span route editor went in the same session the cable got a
-            # route of its own, so any waypoints left here are geometry with no
-            # way to edit them. Cartography (`label_pos`) is kept.
             conn.execute("UPDATE link_routes SET waypoints='[]'")
         if "org_cables" in have:
             conn.execute("DROP TABLE org_cables")
@@ -1499,12 +1297,6 @@ class CentralStore(
 
     @staticmethod
     def _seed_google_key(conn) -> None:
-        # The Google Maps key moved from the per-org orgs.google_maps_key column
-        # to the server-wide app_settings table (2026-07-11). A DB that set the
-        # key BEFORE that move still carries it only in the now-dead column, and
-        # app_settings is empty — so the map silently drops to the CARTO
-        # fallback. Promote the lingering key ONCE so Google stays the default
-        # across the upgrade. Superadmin Settings still overrides it any time.
         has = conn.execute(
             "SELECT 1 FROM app_settings WHERE key='google_maps_key'").fetchone()
         if has:
@@ -1543,6 +1335,7 @@ class CentralStore(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA cache_size=-512;")
         return conn
 
 
@@ -1575,8 +1368,6 @@ class CentralStore(
                 "SELECT COALESCE(MAX(g.updated_at),'') FROM onu_optics g"
                 " WHERE 1=1" + gscope, gargs).fetchone()[0]
             wscope, wargs = self._scope(org_id, prefix="w.")
-            # MAX(id) moves on queue, MAX(completed_at) on a result landing — both
-            # must bump the fingerprint or the walk dialog needs a hard refresh.
             w = conn.execute(
                 "SELECT COALESCE(MAX(w.id),0) || ':' || COALESCE(MAX(w.completed_at),'')"
                 " FROM snmp_walks w WHERE 1=1" + wscope, wargs).fetchone()[0]

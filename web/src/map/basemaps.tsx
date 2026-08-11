@@ -1,11 +1,3 @@
-// Basemaps are Google's Map Tiles API only (2026-07-11: operator dropped the
-// CARTO/Esri menu entries) — the sanctioned third-party-renderer API, not the
-// SDK-only Maps tiles. The menu shows nothing without an org key in Settings
-// (orgs.google_maps_key, referrer-restricted, ships to the browser by design).
-// CARTO Voyager survives NOT as a choice but as the keyless safety net: it
-// renders for orgs with no key, under a still-creating session, and after a
-// Google failure — the map is never blank. Browser-fetched throughout;
-// central needs no egress.
 import { useCallback, useEffect, useRef, useState } from "react"
 import { TileLayer, useMap } from "react-leaflet"
 import {
@@ -19,19 +11,6 @@ export const BASEMAP_KEY = "wisp:map:basemap"
 export const BASEMAP_LABEL: Record<Basemap, string> = { google: "Google", gsat: "Google Satellite" }
 export const GOOGLE_BASEMAPS: Record<Basemap, GoogleMapType> = { google: "roadmap", gsat: "satellite" }
 
-/** Drops Leaflet's own "Leaflet" courtesy link from the attribution box, leaving
- *  only the DATA attribution.
- *
- *  The distinction is the point: Google's line is REQUIRED by the Map Tiles API
- *  terms (and CARTO/OSM's by theirs), so it stays on every map. Leaflet's prefix
- *  is a courtesy to the renderer, not a licence condition — BSD-2-Clause asks for
- *  the notice in the distributed source, which the bundle keeps, not on screen.
- *  Naming the renderer beside "Map data ©Google" also just reads as confusion
- *  about who supplies what.
- *
- *  A `useMap()` child rather than a MapContainer prop because react-leaflet
- *  exposes no prefix option — and it must not run when `attributionControl` is
- *  false, which is why every map here keeps the control ON. */
 export function AttributionPrefix() {
   const map = useMap()
   useEffect(() => {
@@ -46,25 +25,16 @@ const CARTO_ATTR =
 export function loadBasemap(): Basemap {
   try {
     const v = localStorage.getItem(BASEMAP_KEY)
-    // legacy "sat" picks stay on imagery; everything else lands on roadmap
     return v === "gsat" || v === "sat" ? "gsat" : "google"
   } catch {
     return "google"
   }
 }
 
-// The keyless fallback layer, never in the menu: shown while a Google session
-// is being created, when the org has no key, or after a Google failure.
-//
-// It follows the app theme too (dark_matter / voyager, both keyless on the same
-// CDN). Not cosmetics: this layer is what a no-key org actually looks at all
-// day, and it's what a Google failure drops onto mid-session — snapping to a
-// bright map under a dark dashboard reads as the map breaking.
 export function StreetsTiles({ dark = false }: { dark?: boolean }) {
   const style = dark ? "dark_all" : "voyager"
   return (
     <TileLayer
-      // the style is in the key: a TileLayer won't re-fetch on a url prop change
       key={`streets-${style}`}
       url={`https://{s}.basemaps.cartocdn.com/rastertiles/${style}/{z}/{x}/{y}{r}.png`}
       attribution={CARTO_ATTR}
@@ -74,11 +44,6 @@ export function StreetsTiles({ dark = false }: { dark?: boolean }) {
   )
 }
 
-// ToS-required dynamic attribution: Google's viewport endpoint names the data
-// providers for what's on screen. Debounced off moveend, swapped in and out of
-// Leaflet's attribution control (react-leaflet's static `attribution` prop
-// can't change per-move). Best-effort — a failed lookup keeps the generic
-// "Map data ©Google" line, tiles keep working.
 function GoogleAttribution({ session, apiKey }: { session: string; apiKey: string }) {
   const map = useMap()
   const shown = useRef<string | null>(null)
@@ -113,15 +78,6 @@ function GoogleAttribution({ session, apiKey }: { session: string; apiKey: strin
   return null
 }
 
-// Google Map Tiles API layer: create/reuse a ~2-week session token (cached in
-// localStorage), render tiles, keep the viewport attribution fresh. Failure
-// ladder: an expired/revoked session shows up as a burst of tile errors →
-// recreate the session once; if createSession fails or the fresh session still
-// can't load tiles (bad key, quota out), onFail drops the map back to Streets.
-// `dark` requests the styled (night) roadmap and `labels={false}` the one with
-// Google's own place names and POI markers stripped. Satellite ignores both —
-// the Tile API only styles roadmap — so a satellite session is simply the normal
-// one, and it carries no labels to begin with.
 export function GoogleLayer({ apiKey, mapType, dark = false, labels = true, onFail }: {
   apiKey: string
   mapType: GoogleMapType
@@ -138,8 +94,6 @@ export function GoogleLayer({ apiKey, mapType, dark = false, labels = true, onFa
 
   useEffect(() => {
     let alive = true
-    // A theme (or label) flip needs a DIFFERENT token, so drop the stale one
-    // first — otherwise the old session's tiles keep painting until it resolves.
     setSession(loadGoogleSession(mapType, dark, labels))
     createGoogleSession(apiKey, mapType, dark, labels).then(
       (s) => { if (alive) setSession(s) },
@@ -148,9 +102,6 @@ export function GoogleLayer({ apiKey, mapType, dark = false, labels = true, onFa
     return () => { alive = false }
   }, [apiKey, mapType, dark, labels, gen, onFail])
 
-  // A stray single 404 (deep-zoom satellite gap, flaky link) must not nuke the
-  // basemap: act only on a burst — 3 failed tiles inside 5s — and only once per
-  // session token (one burst floods the handler with every tile on screen).
   const onTileError = useCallback(() => {
     const now = Date.now()
     errTimes.current = [...errTimes.current.filter((ts) => now - ts < 5000), now]
@@ -174,8 +125,6 @@ export function GoogleLayer({ apiKey, mapType, dark = false, labels = true, onFa
       <TileLayer
         key={`g-${mapType}-${session}`}
         url={googleTileUrl(session, apiKey)}
-        // satellite coverage thins out past z20 in rural areas; upscale instead
-        // of requesting tiles that would 404 into the error handler
         maxNativeZoom={mapType === "satellite" ? 20 : 22}
         maxZoom={22}
         eventHandlers={{ tileerror: onTileError }}

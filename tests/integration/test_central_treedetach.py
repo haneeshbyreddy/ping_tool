@@ -1,12 +1,3 @@
-"""`tree_detached`: lift a device to the top level of the Network tree.
-
-An aggregation switch can carry a subtree big enough that a device the operator
-reads every day is buried inside it. This flag moves that ROW — and its own
-subtree — to the top level of the tree view, and does nothing else: the parent
-link stays exactly where it was, so suppression, the map, `/edge/devices` and
-paging are all untouched. Same discipline as tags. This module pins that
-separation; a regression here would mean a presentation click re-paged a fleet.
-"""
 import http.client
 import json
 import os
@@ -80,12 +71,8 @@ class TreeDetachTest(unittest.TestCase):
     def _row(self, device_id, org="ispA"):
         return next(d for d in self.store.list_org_devices(org) if d["id"] == device_id)
 
-    # --- the safety property -------------------------------------------------
 
     def test_detaching_never_rebuilds_the_engine(self):
-        # THE invariant. A rebuild rehydrates every FSM and can re-page a fleet,
-        # so a view preference must be inert to the engine. Same object identity
-        # before and after proves the topology fingerprint never moved.
         registry = EngineRegistry(self.store, self.cfg)
         before = registry.get("ispA")
         self.store.set_org_device_tree_detached("ispA", self.tvsw, True)
@@ -95,18 +82,13 @@ class TreeDetachTest(unittest.TestCase):
 
     def test_the_parent_link_survives_everywhere_that_matters(self):
         self.store.set_org_device_tree_detached("ispA", self.tvsw, True)
-        # the dependency graph still folds TV-SW under CH-SW: an outage on the
-        # parent must still suppress it, and the row must still ship to the edge
         meta = {m.id: m for m in load_device_meta(self.store, "ispA")}
         self.assertEqual(meta[self.tvsw].parent_device_id, self.chsw)
         self.assertEqual(meta[self.leaf].parent_device_id, self.tvsw)
         topo = {d["id"]: d for d in self.store.org_device_topology("ispA")}
         self.assertEqual(topo[self.tvsw]["parent_device_id"], self.chsw)
-        # and the dashboard row still carries it — the tree renders the marker
-        # ("under CH-SW") off exactly this, so a lifted row never hides the truth
         self.assertEqual(self._row(self.tvsw)["parent_device_id"], self.chsw)
 
-    # --- the flag itself -----------------------------------------------------
 
     def test_flag_round_trips_through_the_api(self):
         cookie = self._login()
@@ -121,8 +103,6 @@ class TreeDetachTest(unittest.TestCase):
         self.assertEqual(self._row(self.tvsw)["tree_detached"], 0)
 
     def test_an_ordinary_edit_leaves_the_flag_alone(self):
-        # renaming/re-IPing a device must not silently drop the operator's
-        # placement — update_org_device doesn't list the column, keep it so
         self.store.set_org_device_tree_detached("ispA", self.tvsw, True)
         self.store.update_org_device("ispA", self.tvsw, {
             "name": "TV-SW-2", "ip_address": "10.0.0.33", "device_type": "switch",
@@ -130,15 +110,12 @@ class TreeDetachTest(unittest.TestCase):
         self.assertEqual(self._row(self.tvsw)["tree_detached"], 1)
 
     def test_clearing_the_parent_clears_the_flag(self):
-        # the row menu hides the toggle once there's no parent, so a flag left
-        # set here would be unreachable — and would surprise whoever re-parents
         self.store.set_org_device_tree_detached("ispA", self.tvsw, True)
         self.store.update_org_device("ispA", self.tvsw, {
             "name": "TV-SW", "ip_address": "10.0.0.3", "device_type": "switch",
             "region": None, "parent_device_id": None})
         self.assertEqual(self._row(self.tvsw)["tree_detached"], 0)
 
-    # --- scoping -------------------------------------------------------------
 
     def test_another_orgs_device_is_refused(self):
         cookie = self._login()

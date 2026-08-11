@@ -27,26 +27,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryFn: authApi.me,
     retry: false,
     staleTime: Infinity,
-    // Re-check the session whenever the tab regains focus so a restored/backgrounded
-    // tab whose session lapsed lands on the login page, not a stale dashboard —
-    // "always" because staleTime:Infinity would otherwise skip the refetch.
     refetchOnWindowFocus: "always",
   })
   const [superadminScope, setSuperadminScope] = useState<string | null>(
     () => localStorage.getItem(SCOPE_STORAGE_KEY),
   )
-  // A superadmin has no home org, so the scope starts null — "All orgs" — where
-  // Home/Network/Map/Logs each early-return <NeedsOrg/> and a fresh session lands
-  // on four dead pages. We resolve a concrete default (the first org) ONCE per
-  // session, and only when nothing is stored; this ref records that we've done
-  // so, so an explicit "All orgs" pick afterwards is respected for the rest of
-  // the session (a reload re-defaults, which is the whole point).
   const scopeResolved = useRef(false)
 
   useEffect(() => {
     const handler = () => {
-      // Only a 401 that kills a live session is an "expiry" — a cold visit
-      // hitting /api/me unauthenticated is just the normal login flow.
       if (queryClient.getQueryData<MeResponse>(["me"])?.user) {
         sessionStorage.setItem(SESSION_EXPIRED_KEY, "1")
       }
@@ -71,7 +60,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryClient.setQueryData(["me"], null)
     setSuperadminScope(null)
     localStorage.removeItem(SCOPE_STORAGE_KEY)
-    // A different account logging in on this same tab must re-resolve its default.
     scopeResolved.current = false
   }
 
@@ -81,10 +69,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     else localStorage.removeItem(SCOPE_STORAGE_KEY)
   }
 
-  // Superadmin only: fetch the org list so the scope can default to the first
-  // org. Shares the ["orgs"] query cache with the workspace switcher, so it is
-  // not an extra round trip. Owners/workers take their scope from user.org_id
-  // and never reach this.
   const orgsQuery = useQuery({
     queryKey: ["orgs"],
     queryFn: () => orgsApi.list(),
@@ -92,7 +76,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   })
   useEffect(() => {
     if (!user?.is_superadmin || scopeResolved.current) return
-    // Something already stored (a previous pick) — honour it, don't re-default.
     if (localStorage.getItem(SCOPE_STORAGE_KEY)) {
       scopeResolved.current = true
       return
@@ -102,8 +85,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       scopeResolved.current = true
       setScopeOrg(first)
     }
-    // The platform pages (/overview, /orgs) don't read scope, so seeding it never
-    // hides them — it only rescues the four org-scoped pages from <NeedsOrg/>.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, orgsQuery.data])
 

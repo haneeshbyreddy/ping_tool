@@ -136,8 +136,6 @@ class AutoRolloutTest(unittest.TestCase):
         self.assertEqual(self.store.get_rollout("ispA")["canary"], ["edge-9"])
 
     def test_halted_same_target_needs_a_human(self):
-        # halting means the build failed its health gate — auto-retrying it
-        # would loop a broken build through the fleet forever
         self.store.set_rollout("ispA", "v2", ["edge-1"], state="halted")
         self.assertFalse(self._arm())
         self.assertEqual(self.store.get_rollout("ispA")["state"], "halted")

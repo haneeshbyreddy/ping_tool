@@ -1,12 +1,3 @@
-"""Central host health snapshot — CPU, memory, disk — pure stdlib.
-
-Linux-first: CPU and memory come from /proc (the deployment target); every field
-degrades to None elsewhere or on read failure so the endpoint never 500s over a
-missing pseudo-file. CPU% is a delta between successive calls (the dashboard's
-poll cadence is the sampling window), with a short two-point sample on the very
-first call so it never reports a meaningless since-boot average.
-"""
-
 from __future__ import annotations
 
 import os
@@ -20,14 +11,14 @@ _MIN_CPU_WINDOW_S = 1.0
 _FIRST_SAMPLE_S = 0.15
 
 _lock = threading.Lock()
-_last_cpu: tuple[float, float, float] | None = None  # (busy, total, monotonic)
+_last_cpu: tuple[float, float, float] | None = None
 _last_pct: float | None = None
 
 
 def _read_cpu_times() -> tuple[float, float]:
     with open("/proc/stat") as fh:
         fields = [float(x) for x in fh.readline().split()[1:]]
-    idle = fields[3] + (fields[4] if len(fields) > 4 else 0.0)  # idle + iowait
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0.0)
     return sum(fields) - idle, sum(fields)
 
 
@@ -45,7 +36,7 @@ def _cpu_percent() -> float | None:
             return None
         now = time.monotonic()
         if _last_cpu is not None and (now - prev[2] < _MIN_CPU_WINDOW_S or total <= prev[1]):
-            return _last_pct  # window too small to be meaningful; reuse last
+            return _last_pct
         dt = total - prev[1]
         if dt > 0:
             _last_pct = round(min(100.0, max(0.0, 100.0 * (busy - prev[0]) / dt)), 1)
@@ -59,7 +50,7 @@ def _meminfo() -> dict | None:
             kv = {}
             for line in fh:
                 name, _, rest = line.partition(":")
-                kv[name] = int(rest.split()[0]) * 1024  # kB -> bytes
+                kv[name] = int(rest.split()[0]) * 1024
     except (OSError, ValueError, IndexError):
         return None
     total = kv.get("MemTotal")

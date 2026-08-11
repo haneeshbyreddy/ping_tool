@@ -1,16 +1,3 @@
-"""One subscriber, whole — `GET /api/inventory/subscriber`.
-
-A subscriber was the only first-class object in this product with no home. A
-device has one panel that the tree, the map and an issue row all open; a
-subscriber had six partial projections across six screens, none complete and
-none addressable, so an operator had to know which screen held which fact.
-
-This endpoint is deliberately a JOIN of readers that already exist rather than a
-new source of truth, and that is most of what this file pins: it must agree with
-the Optical tab about a slot, with the map about identity, and with the splitter
-panel about plant — because a drill-down that disagrees with the surface it was
-opened from is worse than not having one.
-"""
 import http.client
 import json
 import os
@@ -48,7 +35,6 @@ class SubscriberTest(unittest.TestCase):
             "name": "HILL-OLT-1", "ip_address": "10.0.0.1", "device_type": "OLT",
             "region": None, "parent_device_id": None,
             "optical_warn_dbm": -24.0, "optical_crit_dbm": -27.0})
-        # A real cascade: the drop hangs off a 1:8 that hangs off a 1:4.
         self.feeder = self.store.create_org_device("ispA", {
             "name": "SPL-FEEDER", "ip_address": "", "device_type": "splitter",
             "region": None, "parent_device_id": self.olt,
@@ -113,10 +99,8 @@ class SubscriberTest(unittest.TestCase):
         return self._req("GET", f"/api/inventory/subscriber?mac={mac}",
                          cookie=cookie or self._owner())
 
-    # --- the whole object ----------------------------------------------------
 
     def test_it_returns_the_record_the_roster_row_and_the_olt_together(self):
-        # The point of the endpoint: four screens' worth of facts in one answer.
         self._onu("A4:F2:1B:9C:44:01", name="walked-name", rx=-25.5)
         self.store.set_onu_place("ispA", "A4:F2:1B:9C:44:01", 15.85, 74.5,
                                  "RAMESH", None, phone="9876543210", witness=True)
@@ -133,7 +117,6 @@ class SubscriberTest(unittest.TestCase):
         self.assertEqual(body["roster"]["onu_id"], 3)
         self.assertEqual(body["roster"]["state"], "online")
         self.assertAlmostEqual(body["roster"]["rx_dbm"], -25.5)
-        # the walked name survives beside the operator's, never replaced by it
         self.assertEqual(body["roster"]["name"], "walked-name")
         self.assertEqual(body["roster"]["label"], "RAMESH")
 
@@ -141,27 +124,18 @@ class SubscriberTest(unittest.TestCase):
         self.assertEqual(body["olt"]["name"], "HILL-OLT-1")
 
     def test_the_mac_is_punctuation_exact_but_case_blind(self):
-        # Identity, not search: `_norm_mac`, so two spellings of one sticker are
-        # one subscriber, but two genuinely different serials never collapse.
         self._onu("A4:F2:1B")
         self.assertTrue(self._get("a4:f2:1b")[1]["matched"])
         self.assertFalse(self._get("A4F21B")[1]["matched"])
 
     def test_thresholds_come_from_the_OLT_not_from_the_global_default(self):
-        # Rx is graded against the box's own numbers. A panel that re-derived a
-        # verdict from the dBm would call a drop healthy that the Optical tab
-        # calls critical.
         self._onu("AA:BB")
         body = self._get("AA:BB")[1]
         self.assertEqual(body["thresholds"]["warn_dbm"], -24.0)
         self.assertEqual(body["thresholds"]["crit_dbm"], -27.0)
 
-    # --- the two identity refusals -------------------------------------------
 
     def test_a_swapped_box_reports_matched_false_rather_than_a_blank_panel(self):
-        # An RMA'd ONU changes MAC, so the record survives pointing at nothing.
-        # Reported, never hidden: a record that quietly stopped describing
-        # anything is what this must not conceal.
         self.store.set_onu_place("ispA", "DE:AD:BE:EF", 15.85, 74.5, "RAMESH",
                                  None, phone="9876543210", witness=True)
         status, body = self._get("DE:AD:BE:EF")
@@ -169,14 +143,10 @@ class SubscriberTest(unittest.TestCase):
         self.assertFalse(body["matched"])
         self.assertIsNone(body["roster"])
         self.assertIsNone(body["olt"])
-        # …and the contact record still answers, which is the whole reason a
-        # tech opens this panel about a box that vanished
         self.assertEqual(body["record"]["label"], "RAMESH")
         self.assertEqual(body["record"]["phone"], "9876543210")
 
     def test_a_mac_on_two_live_slots_refuses_to_pick_one(self):
-        # C-Data reg tables keep every slot an ONU ever occupied. Choosing a
-        # winner would send a tech to the wrong house.
         self._onu("AA:BB", onu_key="0/1.3", pon="EPON0/1", onu_id=3)
         self._onu("AA:BB", onu_key="0/2.7", pon="EPON0/2", onu_id=7)
         body = self._get("AA:BB")[1]
@@ -185,8 +155,6 @@ class SubscriberTest(unittest.TestCase):
         self.assertIsNone(body["roster"])
 
     def test_an_unknown_mac_answers_an_empty_object_not_a_404(self):
-        # The panel opens from a search box and a map pin; "nobody has recorded
-        # anything about this sticker" is an answer, not an error.
         status, body = self._get("00:00:00")
         self.assertEqual(status, 200)
         self.assertIsNone(body["record"])
@@ -197,11 +165,8 @@ class SubscriberTest(unittest.TestCase):
                               cookie=self._owner())
         self.assertEqual(status, 400)
 
-    # --- where it hangs ------------------------------------------------------
 
     def test_the_plant_chain_runs_from_the_splitter_up_to_the_olt(self):
-        # The straight line to the OLT was never the network. This is the plant a
-        # crew works on, cascade included.
         self._onu("AA:BB")
         self.store.set_onu_drops("ispA", ["AA:BB"], self.spl)
         body = self._get("AA:BB")[1]
@@ -209,8 +174,6 @@ class SubscriberTest(unittest.TestCase):
         chain = body["drop"]["chain"]
         self.assertEqual([c["name"] for c in chain],
                          ["SPL-KOTA-1", "SPL-FEEDER", "HILL-OLT-1"])
-        # ratios ride along so the panel can state the cumulative split (1:32)
-        # without a second round trip
         self.assertEqual([c["split_ratio"] for c in chain[:2]], [8, 4])
 
     def test_an_unrecorded_drop_says_so_rather_than_inventing_a_splitter(self):
@@ -218,8 +181,6 @@ class SubscriberTest(unittest.TestCase):
         self.assertIsNone(self._get("AA:BB")[1]["drop"])
 
     def test_the_chain_cannot_spin_on_a_cycle(self):
-        # Validation rejects cycles on the way in, but a read is the last thing
-        # that may hang on a bad row.
         a = self.store.create_org_device("ispA", {
             "name": "SPL-A", "ip_address": "", "device_type": "splitter",
             "region": None, "parent_device_id": None})
@@ -236,20 +197,14 @@ class SubscriberTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertLessEqual(len(body["drop"]["chain"]), 12)
 
-    # --- the frozen rule -----------------------------------------------------
 
     def test_a_down_olt_ships_its_state_so_the_panel_can_freeze(self):
-        # An unreachable box proves its readings are stale up to 15 minutes
-        # before staleness would notice. `get_org_device` doesn't join
-        # device_states, so reading the state from there would silently answer
-        # None and the panel would render a dead OLT's last walk as live.
         self._onu("AA:BB")
         self.store.write_device_states(
             "ispA", [(self.olt, "DOWN", None, 100.0, None)], _iso(self.now))
         body = self._get("AA:BB")[1]
         self.assertEqual(body["olt"]["state"], "DOWN")
 
-    # --- scope ---------------------------------------------------------------
 
     def test_another_orgs_subscriber_is_invisible(self):
         oltb = self.store.create_org_device("ispB", {
@@ -262,8 +217,6 @@ class SubscriberTest(unittest.TestCase):
         self.assertIsNone(body["record"])
 
     def test_a_worker_may_read_it(self):
-        # The screen a site visit is actually about. Read-side only, and it adds
-        # no fact a worker could not already reach by opening four screens.
         self._onu("AA:BB")
         status, body = self._get("AA:BB",
                                  cookie=self._login("field", "fieldpassword"))

@@ -1,34 +1,6 @@
 #!/usr/bin/env python3
-"""Make the `cdata_54824` OLTs eligible for the OPM-Diag Rx scrape.
 
-The web-optics sweeper picks its targets by VENDOR TOKEN
-(`store_snmp.web_optics_targets(vendors=ProfileSet.names())`), and that token is
-deliberately the same one `gpon_profiles.name` / `org_devices.gpon_vendor` use.
-So an OLT moved onto the `cdata_54824` GPON profile (tools/gpon_add_cdata_54824.py)
-stops being a `dbc` box as far as the scrape is concerned, and its Rx column would
-stay blank for a reason that has nothing to do with the OLT — which is precisely
-the failure `rx-status` exists to stop being invisible.
 
-THE RECIPE IS THE DBC ONE, REUSED RATHER THAN RETYPED. chandana-network's
-MAIN_OLT5 answers a different PEN over SNMP but serves the SAME C-Data web UI:
-`proxy_audit` records /action/login.html, /action/login_first.html,
-/action/main.html and /action/systeminfo.html on that box, the exact page set the
-built-in drives. Copying `BUILTIN_SPECS["dbc"]` by reference is the point — a
-hand-retyped column map is how "TX Power" gets read as "RX Power", and these two
-recipes must never drift apart while the firmware is one firmware.
-
-What this does NOT assume: it never claims the scrape will succeed. Eligibility
-is only permission to try. If that build turns out to gate OPM Diag differently,
-the outcome lands in `web_optics_status` under its own name (no_profile /
-no_credentials / login / unreachable / error) and the panel says which — the
-whole reason that table exists.
-
-    PYTHONPATH=src .venv/bin/python tools/weboptics_add_cdata_54824.py \
-        --org chandana-network
-
-Takes effect on the next sweep (`web_optics_interval_s`, 900s) or immediately via
-the device panel's Rx refresh button. No restart, no rollout.
-"""
 from __future__ import annotations
 
 import argparse
@@ -44,7 +16,7 @@ NAME = "cdata_54824"
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description='Make the cdata_54824 OLTs eligible for the OPM-Diag Rx scrape.')
     ap.add_argument("--org", default=None,
                     help="org_id to scope the profile to (default: global)")
     ap.add_argument("--dry-run", action="store_true")

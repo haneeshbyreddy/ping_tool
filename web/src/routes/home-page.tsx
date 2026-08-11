@@ -29,9 +29,6 @@ function severityRank(d: OrgDevice): number {
   return 4
 }
 
-// Home panels are a glanceable preview: the three most-urgent rows each, with a
-// "view all" link into the full page. Ranking floats trouble to the top so the
-// three shown are the three worth looking at.
 const PANEL_ROW_CAP = 3
 
 function fmtUptime(pct: number): string {
@@ -67,9 +64,6 @@ function PanelEmpty({ children }: { children: React.ReactNode }) {
   return <p className="px-4 py-8 text-center text-xs text-faint-foreground">{children}</p>
 }
 
-// A row is a fixed-height rail so three panels stacked beside each other line up
-// on the same baselines — that alignment is most of why a dense dashboard reads
-// as calm rather than busy.
 const ROW = "flex h-11 items-center gap-3 px-4 wisp-row"
 
 function PanelMore({ to, children }: { to: string; children: React.ReactNode }) {
@@ -89,41 +83,17 @@ type Stat = {
   detail: string
   tone?: "destructive" | "warning"
   to?: string
-  /** Present when this stat names a specific set of devices — clicking filters
-   *  the Network page down to just them (a clearable chip there) instead of
-   *  landing on the full unfiltered tree. Absent for a healthy metric, where
-   *  there's nothing to filter to. */
   filter?: { label: string; ids: number[] }
-  /** The issue kind this tile counts. The tile body drills into the DEVICES
-   *  behind the number; the corner action drills into the PROBLEMS themselves —
-   *  one row per port/ONU/PON/probe on the Issues page. Both are offered because
-   *  they answer different questions ("which boxes" vs "what is wrong"), and a
-   *  switch with four dark ports is one row in the tree and four in the list. */
   issueKind?: IssueKind
 }
 
-// undefined (no filter) when there's nothing to show — a healthy metric's
-// tile should still land on the full tree, not a guaranteed-empty list.
 function filterFor(label: string, ids: number[]): Stat["filter"] {
   return ids.length > 0 ? { label, ids } : undefined
 }
 
-// The whole point of the strip is that a healthy metric costs you NO attention.
-// A quiet tile is plain; only a tile with something wrong picks up a tinted
-// value and edge, so scanning is a search for color, not a read of eight numbers.
 function StatTile({ s }: { s: Stat }) {
   const body = (
     <>
-      {/* NOT `.wisp-eyebrow`. An eyebrow is a micro-label above a GROUP, and
-          that is still what the other 13 uses of it are. This one names the
-          number directly under it — it is the half of the tile you read to know
-          what the figure means — and it was set as the quietest thing on the
-          card: 12px, uppercase, letterspaced, --faint-foreground at 4.80:1
-          against a 30px figure. That is the giant-number-over-tiny-label
-          pattern, and it makes a wall of ten tiles unreadable without leaning
-          in. Now 13px, sentence case, --muted-foreground at 7.27:1. It stays
-          BELOW the figure in rank (the number is the live state, the label is
-          reference) — readable, not loud. */}
       <p className="truncate pr-7 text-xs font-medium text-muted-foreground">{s.label}</p>
       {s.loading ? <Skeleton className="mt-3.5 h-7 w-14" /> : (
         <p className={cn(
@@ -144,15 +114,9 @@ function StatTile({ s }: { s: Stat }) {
     s.to && "hover:bg-foreground/[0.03]",
   )
   const state = s.filter ? { statusFilter: s.filter } : undefined
-  // The list action only appears when there is something to list — `filter` is
-  // already the "this tile names actual trouble" signal, so a healthy tile stays
-  // a plain number with nothing to click twice.
   const listable = s.issueKind && s.filter
   if (!s.to) return <div className={shell}>{body}</div>
   return (
-    // The whole tile stays one click target via a STRETCHED link rather than an
-    // <a> wrapping everything: a second interactive control nested inside an
-    // anchor is invalid, and the corner action has to sit above it.
     <div className={cn(shell, "relative")}>
       <Link to={s.to} state={state} aria-label={`${s.label} · filter the network`}
         className="absolute inset-0 z-0 rounded-[inherit]" />
@@ -227,15 +191,11 @@ export function HomePage() {
     (d) => d.assigned_node_id && registeredNodeIds.has(d.assigned_node_id),
   )
 
-  // Kept as the device list, not just a count: the "Devices online" tile drills
-  // into exactly these devices on click.
   const notUpDevices = monitored.filter(
     (d) => !(d.state === "UP" && !isStale(d.state_updated_at)),
   )
   const online = monitored.length - notUpDevices.length
   const outageList = outages.data?.outages ?? []
-  // urgent cards (open outages) always render; resolved-awaiting-post-mortem is
-  // paperwork and folds behind a toggle so a backlog can't bury the emergencies
   const activeOutages = outageList.filter((o) => o.status !== "pending_postmortem")
   const postmortemList = outageList.filter((o) => o.status === "pending_postmortem")
   const pendingPostmortems = postmortemList.length
@@ -250,8 +210,6 @@ export function HomePage() {
 
   const activeNodes = (nodes.data?.nodes ?? []).filter((n) => n.registered && !n.revoked_at)
   const staleNodes = activeNodes.filter((n) => n.last_seen && isStale(n.last_seen))
-  // Devices behind a dark probe — what the "Stale probes" tile actually drills
-  // into, since a probe id isn't a row on the Network page but its devices are.
   const staleNodeIds = new Set(staleNodes.map((n) => n.node_id))
   const staleProbeDeviceIds = deviceList
     .filter((d) => d.assigned_node_id && staleNodeIds.has(d.assigned_node_id))
@@ -259,9 +217,6 @@ export function HomePage() {
   const triageCount = outageList.length + staleNodes.length
   const triageLoading = outages.isLoading || nodes.isLoading
 
-  // "Live" is only honest if it names the freshest thing that actually reported.
-  // The newest probe heartbeat is that clock — a dashboard claiming live while
-  // every probe is stale is the one lie a NOC tool cannot afford.
   const lastSeen = activeNodes
     .map((n) => n.last_seen)
     .filter((t): t is string => !!t)
@@ -269,8 +224,6 @@ export function HomePage() {
     .at(-1)
   const feedStale = !lastSeen || isStale(lastSeen)
 
-  // when nothing is on fire, preview a couple of post-mortems instead of an
-  // empty queue with a bare button; the rest stay behind the toggle
   const urgentCount = staleNodes.length + activeOutages.length
   const postmortemPreview = urgentCount === 0 ? Math.min(2, pendingPostmortems) : 0
   const visiblePostmortems = showPostmortems
@@ -281,8 +234,6 @@ export function HomePage() {
   const uptimeByDevice = new Map(
     (reliability.data?.devices ?? []).map((r) => [r.device_id, r.uptime_pct]),
   )
-  // Within a severity band (e.g. all UP), surface the least-reliable device first
-  // so the weakest link gets attention; fall back to name for a stable order.
   const rankedDevices = [...deviceList].sort(
     (a, b) =>
       severityRank(a) - severityRank(b) ||
@@ -303,8 +254,6 @@ export function HomePage() {
       label: "Devices online",
       loading: devices.isLoading,
       value: monitored.length ? `${online}/${monitored.length}` : "—",
-      // "— / all up" reads as a healthy network when it actually means nothing
-      // is being watched at all. Name that case instead of implying health.
       detail: !monitored.length ? "no probe assigned"
         : online < monitored.length ? `${notUpDevices.length} not up` : "all up",
       tone: online < monitored.length ? "destructive" : undefined,
@@ -347,30 +296,15 @@ export function HomePage() {
     },
   ]
 
-  // Second strip — optical/PON plane. Only rendered once the org actually runs
-  // OLTs (a network with no fiber shouldn't stare at four zeros). All counts
-  // ride the freshest walk per OLT, so a stale C-Data box never inflates them.
   const pon = ponSummary.data
   const hasOptics = (pon?.olts ?? 0) > 0
   const dupStale = pon ? pon.dup_macs_total - pon.dup_macs_live : 0
-  // Is anything actually MEASURING optical power? A C-Data/DBC OLT walks a full
-  // roster with every Rx NULL, so "0 critical ONUs" on that fleet means "no ONU
-  // is measured", not "every ONU is healthy" — and those two render identically
-  // as a green zero. The dBm tiles below say which, because reading the first
-  // as the second is the whole failure mode the optical plane has to avoid.
   const rxCount = pon?.onus_rx ?? 0
   const noRx = hasOptics && rxCount === 0
   const partialRx = hasOptics && rxCount > 0 && rxCount < (pon?.onus_total ?? 0)
-  // Shown under a dBm tile: never let a count stand alone when only part of the
-  // fleet is measured.
   const rxCoverage = partialRx
     ? `${rxCount} of ${pon!.onus_total} ONUs measured`
     : `${rxCount} ONUs measured`
-  // Per-OLT drill-down sets for the tiles below — sourced from the same rows
-  // list_org_devices already stamps on each device, so they can't disagree with
-  // the row chips (DeviceChips) a tech would land on next. PONs at capacity is
-  // the one exception: that verdict lives per-PON, not per-device, so it rides
-  // pon_summary's own device id list instead.
   const onusCritIds = deviceList.filter((d) => (d.onus_crit ?? 0) > 0).map((d) => d.id)
   const onusWarnIds = deviceList.filter((d) => (d.onus_warn ?? 0) > 0).map((d) => d.id)
   const dupMacIds = deviceList.filter((d) => (d.dup_macs ?? 0) > 0).map((d) => d.id)
@@ -383,7 +317,6 @@ export function HomePage() {
       key: "onus-crit",
       label: "Critical ONUs",
       loading: ponSummary.isLoading,
-      // An em dash, not a 0: nothing was measured, so there is no count to give.
       value: noRx ? "—" : (pon?.onus_crit ?? 0),
       detail: noRx ? "no OLT reports dBm"
         : (pon?.onus_crit ?? 0) > 0 ? "below the Rx floor" : rxCoverage,
@@ -454,26 +387,11 @@ export function HomePage() {
 
   const allStats = hasOptics ? [...stats, ...opticalStats] : stats
 
-  // A tile reading ZERO is the absence of news, and ten equal cards is what you
-  // get when nobody has decided what matters. Split them: anything with a
-  // non-zero count or a status tone keeps a card, the rest collapse into one
-  // strip. `24/24` and `1007/1579` are NOT zero — they are the fleet's two
-  // denominators and stay loud — so the test is on the leading number, not on
-  // the tone.
   const isZero = (s: Stat) =>
     !s.tone && (s.value === 0 || s.value === "0") && !s.loading
   const loudStats = allStats.filter((s) => !isZero(s))
   const quietStats = allStats.filter(isZero)
 
-  // THE VERDICT HAS TO COVER THE WHOLE PAGE, or it must not use the words "all
-  // clear". It used to read "All clear. No open outages, every probe reporting."
-  // directly BELOW tiles saying 85 critical ONUs and 128 warning — true
-  // sentence, false impression, and the one claim a NOC screen may never make
-  // wrongly. `triageCount` only ever counted outages and stale probes, i.e. the
-  // REACHABILITY plane; the optical plane was never in it.
-  // So the verdict now grades on everything the page shows, and the middle case
-  // gets its own words: nothing is DOWN, and that is not the same as nothing
-  // being WRONG.
   const troubled = allStats.filter((s) => s.tone && !s.loading)
   const verdict = triageCount > 0
     ? null                                  // the triage queue speaks for itself
@@ -482,11 +400,6 @@ export function HomePage() {
           rest: "No open outages, every probe reporting." }
       : { tone: "warning" as const,
           head: "Nothing is down.",
-          // Names the two worst and COUNTS the rest. Listing all four produced a
-          // sentence that ran the width of the page, and lower-casing the labels
-          // to make it read as prose turned "Critical ONUs" into "critical onus"
-          // — the acronyms in this domain are most of the nouns, so they are left
-          // exactly as the tiles spell them.
           rest: `Every device is up and every probe reporting, but ${
             [...troubled]
               .sort((a, b) => (a.tone === "destructive" ? 0 : 1) - (b.tone === "destructive" ? 0 : 1))
@@ -498,8 +411,6 @@ export function HomePage() {
   return (
     <div className="wisp-page @container flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div className="flex items-center justify-between gap-4">
-        {/* "Home", not "Overview": the superadmin's /overview platform page owns
-            that word, and both were in the sidebar at once. */}
         <h1 className="text-lg font-semibold tracking-tight">Home</h1>
         <div className="flex items-center gap-2 text-xs text-faint-foreground">
           <StatusDot tone={feedStale ? "destructive" : "success"} />
@@ -523,21 +434,6 @@ export function HomePage() {
         </div>
       )}
 
-      {/* BAND 2 — only the tiles that are SAYING something.
-          Ten equal tiles is what you produce when you have not decided what
-          matters: on a healthy fleet four of them read 0 and still spend a full
-          card each, so the two that are shouting have to compete with eight that
-          are not. A tile reading zero is not news — it is the ABSENCE of news —
-          so it collapses into one quiet strip below, where it remains readable
-          and clickable but costs no attention.
-
-          The grid is sized by CONTAINER queries, not viewport ones: it is as
-          likely to be living in half a window (split view) as in a whole one,
-          and `md:` asks the wrong box. The steps reproduce the old widths
-          exactly at every viewport — the container is the page box, so a 768px
-          `md:` viewport is a ~448px container — with ONE step added at @md,
-          because three tiles across 4 columns of a 600px pane truncate their
-          own titles. */}
       {loudStats.length > 0 && (
         <div className={cn("grid grid-cols-2 gap-3 @md:grid-cols-3 @2xl:grid-cols-4",
           loudStats.length >= 5 && "@4xl:grid-cols-5")}>
@@ -545,9 +441,6 @@ export function HomePage() {
         </div>
       )}
 
-      {/* BAND 3 — the all-clear strip. Every one of these reads zero, and a zero
-          is worth SEEING (it is the difference between "no fiber cuts" and "we
-          are not looking for fiber cuts") but not worth a card. */}
       {quietStats.length > 0 && (
         <div className="wisp-panel flex flex-wrap items-center gap-x-5 gap-y-2 px-5 py-3">
           {quietStats.map((s) => (
@@ -559,8 +452,6 @@ export function HomePage() {
         </div>
       )}
 
-      {/* Triage only claims screen space when something actually needs triage — a
-          healthy network gets one quiet all-clear line, not a large empty box. */}
       {!triageLoading && triageCount > 0 && (
         <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between">
@@ -634,15 +525,6 @@ export function HomePage() {
                   {!unassigned && !stale && d.state === "UP" && d.packet_loss != null && d.packet_loss > 0 && (
                     <span className="font-mono text-xs text-warning">{Math.round(d.packet_loss)}% loss</span>
                   )}
-                  {/* A 30-DAY ROLLUP IS REFERENCE, NOT STATE. This was drawn in
-                      --warning below 99%, which made it one of only six
-                      chromatic elements on a healthy Home — a historical
-                      average wearing an alarm tone while the device's LIVE
-                      verdict was a 6px dot beside its name. Reference outranking
-                      state is the inversion this pass exists to remove. It stays
-                      readable and still sorts the panel; it just stops
-                      shouting. A device that is actually in trouble says so
-                      through the dot, the state word, and the loss figure. */}
                   {uptime != null && (
                     <span className="hidden w-16 font-mono text-xs text-faint-foreground sm:inline"
                       title={`${fmtUptime(uptime)} uptime over the last 7 days`}>

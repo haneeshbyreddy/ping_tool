@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
-"""Bound `data/releases/`, which nothing else prunes (~174 MB per version, forever).
 
-The rule is derived from LIVE FLEET STATE, not a fixed count. "Keep current + previous"
-sounds equivalent and is not: a node that has not updated in a month can be running
-something older than "previous", and deleting the build a probe is actually running turns
-its next self-update health-check rollback into a 404. So a version is kept when ANY of:
 
-  * a node in `nodes` reports running it            — deleting it breaks that node's rollback
-  * it is the rollback floor (v0.14.0)              — CLAUDE.md: no artifact exists below it
-  * it is one of the newest --keep versions         — what a fresh install / rollout needs
-  * it is not a version at all (`app/`)             — the field-app APK mirror, fixed path
-
-Everything else is a cached copy of a GitHub artifact that can be re-fetched by
-`wisp-release-sync`, so deleting it costs a re-download and nothing more.
-
-    .venv/bin/python tools/prune_releases.py            # report only
-    .venv/bin/python tools/prune_releases.py --apply
-"""
 from __future__ import annotations
 
 import argparse
@@ -27,12 +11,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
-# CLAUDE.md: "v0.14.0 is the rollback floor — there is no artifact below it, so an edge on
-# an older build can only roll forward." Deleting it removes the only floor a bad rollout
-# has to land on.
 ROLLBACK_FLOOR = "0.14.0"
 
-# Not a version — the store-less APK mirror serves from this fixed path.
 NON_VERSION_DIRS = {"app"}
 
 
@@ -78,7 +58,7 @@ def plan(releases: Path, db: Path, keep: int) -> tuple[list, list]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(description='Bound data/releases/, which nothing else prunes.',
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--releases", default=str(REPO / "data" / "releases"))
     ap.add_argument("--db", default=str(REPO / "data" / "central.db"))

@@ -166,7 +166,6 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
     decodes: data?.decodes ?? [],
     selects: data?.selects ?? [],
   }
-  // A global profile (org_id null) is only editable by a superadmin.
   const canEdit = (p: SnmpProfile) => (p.org_id === null ? isSuperadmin : true)
 
   return (

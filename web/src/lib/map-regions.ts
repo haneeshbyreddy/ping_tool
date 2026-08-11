@@ -1,13 +1,6 @@
-// Map-view viewport areas: the org picks one in Settings (orgs.map_region) and
-// the Map page locks pan/zoom to it. Bounds are [south, west, north, east]
-// eyeball bounding boxes — view framing, not survey data; the RegionLock pads
-// them anyway. Keys are what the DB stores; never rename one without a
-// fallback (an unknown key falls back to all-India).
-
 export interface MapRegion {
   key: string
   name: string
-  /** [south, west, north, east]; null = no viewport lock (worldwide) */
   bounds: [number, number, number, number] | null
 }
 

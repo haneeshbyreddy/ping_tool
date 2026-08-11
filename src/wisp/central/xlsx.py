@@ -1,41 +1,13 @@
-"""A minimal, dependency-free .xlsx table writer.
-
-Same reasoning as `central/pdf.py`: central is pure stdlib, so rather than add
-openpyxl for one export button this writes the OOXML package by hand —
-`zipfile` and string formatting are all it takes. A REAL .xlsx, not a CSV wearing
-the name: an operator who asks for Excel wants to sort, filter and pivot, and a
-CSV gives them a re-import dialog and text-typed dates.
-
-What it produces: one sheet, a bold frozen header row, an autofilter over the
-whole table, per-column widths measured from the content, and **real date cells**
-for timestamps — so sorting by "Since" orders by time instead of alphabetically,
-which is the entire reason to hand someone a spreadsheet.
-
-Deliberately absent: shared strings (inline strings cost a few bytes and remove a
-whole index to keep consistent), merged cells, formulas, charts, multiple sheets.
-
-Cell values may be `str`, `int`, `float`, `datetime` or None. A `datetime` is
-written as an Excel serial with a date format; everything else is an inline
-string. Nothing here may raise on real-world content — a name with a `&`, a
-control character out of a firmware string, or a 40k-character detail all have to
-come out as a file that opens.
-"""
 from __future__ import annotations
 
 import zipfile
 from datetime import date, datetime
 from io import BytesIO
 
-# Excel's day-zero. 1899-12-30, not 1900-01-01, because the format carries the
-# 1900-leap-year bug and this offset is what cancels it for every date after
-# 1900-03-01 — every timestamp this app produces.
 _EPOCH = datetime(1899, 12, 30)
 
-# Excel caps a cell at 32767 characters; past that the file is rejected outright
-# rather than truncated, so the truncation happens here.
 _CELL_MAX = 32767
 
-# Style indices into the cellXfs table written by `_styles`.
 _S_BODY, _S_HEAD, _S_DATE = 0, 1, 2
 
 _NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -47,9 +19,6 @@ _DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 
 
 def _text(value) -> str:
-    """XML-safe cell text. Strips the control characters XML 1.0 forbids — a
-    firmware-sourced `if_alias` really does carry the odd 0x01, and one of those
-    makes Excel call the whole workbook corrupt."""
     s = str(value)
     s = "".join(ch for ch in s
                 if ch in "\t\n\r" or ord(ch) >= 0x20)
@@ -60,7 +29,6 @@ def _text(value) -> str:
 
 
 def _col_name(index: int) -> str:
-    """0 → A, 25 → Z, 26 → AA."""
     name = ""
     index += 1
     while index:
@@ -70,9 +38,6 @@ def _col_name(index: int) -> str:
 
 
 def _serial(value: datetime | date) -> float:
-    """An Excel date serial. A tz-aware value is converted to naive first — the
-    caller has already put it in the operator's zone (notifiers._wa_local), and a
-    spreadsheet has no concept of an offset to carry."""
     if isinstance(value, datetime):
         dt = value.replace(tzinfo=None) if value.tzinfo else value
     else:
@@ -81,10 +46,6 @@ def _serial(value: datetime | date) -> float:
 
 
 class Column:
-    """One column: which key to read, what to head it, and how wide to let it
-    grow. `width_cap` is in Excel's character units — a Detail column of free
-    text would otherwise stretch to a screen and a half."""
-
     def __init__(self, key: str, title: str, *, width_cap: float = 60.0) -> None:
         self.key = key
         self.title = title
@@ -92,8 +53,6 @@ class Column:
 
 
 def _sheet_name(raw: str) -> str:
-    """Excel refuses `[]:*?/\\` in a sheet name and caps it at 31 characters. An
-    org id reaches this, so it is sanitised rather than trusted."""
     name = "".join("-" if ch in "[]:*?/\\" else ch for ch in str(raw or ""))
     return name.strip()[:31] or "Sheet1"
 
@@ -101,7 +60,7 @@ def _sheet_name(raw: str) -> str:
 def _cell(ref: str, value, style: int) -> str:
     if isinstance(value, (datetime, date)):
         return f'<c r="{ref}" s="{_S_DATE}"><v>{_serial(value):.6f}</v></c>'
-    if isinstance(value, bool):  # before int — bool IS an int in Python
+    if isinstance(value, bool):
         value = "yes" if value else "no"
     elif isinstance(value, (int, float)):
         return f'<c r="{ref}" s="{style}"><v>{value}</v></c>'
@@ -113,16 +72,13 @@ def _cell(ref: str, value, style: int) -> str:
 
 
 def _widths(columns: list[Column], rows: list[dict]) -> list[float]:
-    """Column widths in Excel character units, measured from content like the PDF
-    does — the same lesson: a fixed width truncates the identifier someone opened
-    the file to read while a short column sits on empty space."""
     out = []
     for c in columns:
         widest = len(c.title)
         for r in rows:
             val = r.get(c.key)
             if isinstance(val, (datetime, date)):
-                widest = max(widest, 22)      # "26 Jul 2026 10:03 AM"
+                widest = max(widest, 22)
             elif val is not None:
                 widest = max(widest, len(str(val)))
         out.append(min(max(widest + 2.0, 8.0), c.width_cap))
@@ -130,8 +86,6 @@ def _widths(columns: list[Column], rows: list[dict]) -> list[float]:
 
 
 def _styles() -> str:
-    # The two default fills (none, gray125) are mandatory — Excel repairs a file
-    # that omits them. numFmtId 164 is the first id available to a custom format.
     return (
         f'{_DECL}<styleSheet xmlns="{_NS}">'
         '<numFmts count="1">'
@@ -164,7 +118,6 @@ def _sheet(columns: list[Column], rows: list[dict]) -> str:
     parts = [
         _DECL, f'<worksheet xmlns="{_NS}">',
         f'<dimension ref="A1:{last_col}{last_row}"/>',
-        # Freeze the header so scrolling 900 ONU rows keeps the column names.
         '<sheetViews><sheetView workbookViewId="0">'
         '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
         '</sheetView></sheetViews>',
@@ -181,8 +134,6 @@ def _sheet(columns: list[Column], rows: list[dict]) -> str:
             _cell(f"{_col_name(i)}{n}", row.get(c.key), _S_BODY)
             for i, c in enumerate(columns)) + '</row>')
     parts.append('</sheetData>')
-    # autoFilter belongs AFTER sheetData in the schema's element order; before it,
-    # Excel reports the file as needing repair. Only when there is data to filter.
     if rows:
         parts.append(f'<autoFilter ref="A1:{last_col}{last_row}"/>')
     parts.append('</worksheet>')
@@ -191,9 +142,6 @@ def _sheet(columns: list[Column], rows: list[dict]) -> str:
 
 def table_xlsx(*, sheet_name: str, columns: list[Column],
                rows: list[dict]) -> bytes:
-    """One sheet of `rows`, keyed by column. Deterministic: the same rows produce
-    the same bytes (fixed zip timestamps), so re-exporting an unchanged fleet
-    doesn't look like a changed report."""
     sheet = _sheet_name(sheet_name)
     parts = {
         "[Content_Types].xml":

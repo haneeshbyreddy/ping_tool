@@ -1,5 +1,3 @@
-// The per-device drill-down panel (Health / Optical / Ports tabs) shared by the
-// Network tree rows and the Map pin popover — one implementation, two surfaces.
 import { useEffect, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -119,46 +117,26 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   if (isLoading) return <Skeleton className="h-16 w-full" />
   const ports = data?.ports ?? []
   if (ports.length === 0) {
-    // Not a dead end: the edge diagnoses WHY each SNMP sweep came back empty.
     return <SnmpDiagnosis device={device} subsystem="ports" />
   }
 
-  // alarmed first (a down port that's alarming is the urgent one), then open/up
-  // ports, then quiet monitored ports, then everything else; if_index as tie-break.
   const rank = (p: SwitchPort) =>
     portAlarmed(p) ? 0 : p.oper_status === "up" ? 1 : p.monitored ? 2 : 3
   const sorted = [...ports].sort((a, b) => rank(a) - rank(b) || a.if_index - b.if_index)
   const watched = ports.filter((p) => p.monitored).length
   const down = ports.filter((p) => p.monitored && p.alarm === 1).length
   const bwAlarms = ports.filter((p) => p.monitored && (p.bw_alarm === 1 || p.bw_high_alarm === 1)).length
-  // Newest port row = last successful SNMP port walk. These rows persist, so without
-  // this stamp a walk that quietly stopped weeks ago still looks live. Matches the
-  // dim/green capability icon on the row (same 900s freshness rule).
   const lastWalk = ports.reduce<string | null>(
     (a, p) => (p.updated_at && (!a || p.updated_at > a) ? p.updated_at : a), null)
   const portsStale = !isFresh(lastWalk)
-  // A device that isn't answering ICMP isn't answering SNMP either, so every row
-  // below is the last walk before it dropped — frozen the INSTANT it went down,
-  // which is up to 15 minutes before the 900s staleness rule would notice. The
-  // per-port alarm counts go with it: "3 down" off a frozen table is a claim
-  // about now, and "0 down" would be just as false, so the header states the
-  // one thing that IS true (the box is unreachable) instead of counting.
   const isDown = isDownState(device.state)
 
   return (
-    // @container, not viewport breakpoints: this table renders inside a ~380–420px
-    // side panel on a wide screen, where every `sm:` guard passes and the row
-    // overflows its own panel (the documented trap — see CLAUDE.md "Viewport
-    // breakpoints are wrong inside the device panel"). The rate column is what
-    // gives way when it's tight: the toggle is the row's action and the limits
-    // button is how you reach the form, while the same throughput is already on
-    // the tree row's bandwidth chip and in this panel's own header counts.
     <div className="@container overflow-hidden rounded-lg border bg-muted/40">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-2xs text-muted-foreground">
         <span className="font-medium">{ports.length} ports · {watched} watched</span>
         {!isDown && down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
         {!isDown && bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
-        {/* stale is a data-freshness note, not an alarm — neutral, never amber */}
         {isDown
           ? <span className="font-semibold text-foreground" title="This device is unreachable, so its port table can't refresh. These rows are the last walk before it went down.">device offline · last walk {ago(lastWalk)}</span>
           : portsStale
@@ -213,9 +191,6 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
 }
 
 export function DeviceMetrics({ device }: { device: OrgDevice }) {
-  // Passive plant is never probed BY DESIGN, so "not monitored" reads as a
-  // config gap that isn't one. The row already carries a `passive` chip and the
-  // panel names the type — there is no reading to stand in for.
   if (isPassiveType(device.device_type)) return null
   if (!device.assigned_node_id) return <span className="text-xs text-faint-foreground">not monitored</span>
   if (!device.state) return <span className="text-xs text-faint-foreground">no data</span>
@@ -230,7 +205,6 @@ export function DeviceMetrics({ device }: { device: OrgDevice }) {
   if (device.state === "DEGRADED") {
     return (
       <span className="text-xs font-semibold text-warning">
-        {/* detail hides on narrow screens so a long readout never truncates the name */}
         DEGRADED<span className="hidden font-mono font-normal sm:inline"> · {latency}{loss}</span>
       </span>
     )
@@ -241,8 +215,6 @@ export function DeviceMetrics({ device }: { device: OrgDevice }) {
 const median = (xs: number[]): number | null =>
   xs.length ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] : null
 
-// SNMP device vitals (CPU / RAM / temperature) — display-only, never alarms.
-// Warn/crit tints only; the thresholds are conventional NOC eyeball values.
 export const VITAL_CPU_WARN = 80, VITAL_CPU_CRIT = 95
 export const VITAL_MEM_WARN = 80, VITAL_MEM_CRIT = 95
 export const VITAL_TEMP_WARN = 70, VITAL_TEMP_CRIT = 85
@@ -255,8 +227,6 @@ function hasVitals(device: OrgDevice): boolean {
 function DeviceVitals({ device }: { device: OrgDevice }) {
   const { health_cpu_pct: cpu, health_mem_pct: mem, health_temp_c: temp } = device
   if (!hasVitals(device)) {
-    // SNMP is on but no CPU/RAM/temp ever landed — say why instead of hiding the
-    // section (an SNMP-less device stays quiet; there's nothing to diagnose).
     if (device.snmp_enabled === 1) {
       return (
         <div className="flex flex-col gap-2">
@@ -267,10 +237,6 @@ function DeviceVitals({ device }: { device: OrgDevice }) {
     }
     return null
   }
-  // Unreachable box ⇒ these vitals are the last successful health walk, not the
-  // machine's condition now. Stamp the reading unconditionally (not just past the
-  // staleness threshold) and gray the meters: a warn/crit tint here is otherwise
-  // an alarm about a device that isn't there to be hot.
   const isDown = isDownState(device.state)
   return (
     <div className="flex flex-col gap-2">
@@ -346,7 +312,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
 
   return (
     <div className="flex flex-col gap-2.5 rounded-lg border bg-muted/40 p-3">
-      {/* now + verdict --------------------------------------------------------- */}
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         {isDown ? (
           <span className="text-sm font-semibold text-destructive">{device.state}</span>
@@ -368,7 +333,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
             <span className="font-semibold text-warning">
               {perfRow.metric ?? "latency"} {(perfRow.current_ms / Math.max(perfRow.baseline_ms, 0.1)).toFixed(1)}×
               its normal {fmtMs(perfRow.baseline_ms)} ms
-              {/* first token only — "1h 5m" → "1h": a verdict wants a magnitude, not a stopwatch */}
               {perfRow.since && <span className="font-normal"> · for {durationSince(perfRow.since).split(" ")[0]}</span>}
             </span>
           ) : !isDown && typical != null ? (
@@ -377,10 +341,8 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
         </span>
       </div>
 
-      {/* device internals, same freshness rules as the port/optics sweeps -------- */}
       <DeviceVitals device={device} />
 
-      {/* when was it bad, last 24 clock hours ----------------------------------- */}
       <div>
         <div className="mb-1 flex items-baseline justify-between text-2xs text-muted-foreground">
           <span className="font-medium">Last 24 h</span>
@@ -390,8 +352,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
               : roughHours > 0 ? `${roughHours} rough hour${roughHours === 1 ? "" : "s"}` : "clean"}
           </span>
         </div>
-        {/* the SHAPE, then the VERDICT — same grid, same 24 slots, so a rising
-            line and the hour it finally went rough line up vertically */}
         <TrendSpark buckets={buckets} />
         <HourStrip buckets={buckets} />
         <div className="mt-0.5 flex justify-between text-2xs text-muted-foreground">
@@ -399,7 +359,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
         </div>
       </div>
 
-      {/* can I trust it --------------------------------------------------------- */}
       {rel && (
         <p className="border-t pt-2 text-2xs text-muted-foreground">
           Last 7 days ·{" "}
@@ -414,14 +373,6 @@ export function DevicePerfPanel({ device }: { device: OrgDevice }) {
     </div>
   )
 }
-
-// ----- physical connection (which port carries each uplink) ------------------
-// The closest-to-reality model of the plant: a link isn't just parent→child, it
-// leaves a specific port on each box. The child side writes
-// switch_ports.uplink_device_id, the parent side writes feeds_device_id — the
-// SAME column ports.py folds a port-down into the child's outage through, so
-// declaring the cabling here also arms that (once the port is watched). The map
-// reads both to hang a live bandwidth label on the link line.
 
 function UplinkPortSelect({ owner, bound, onPick, busy }: {
   owner: OrgDevice
@@ -469,12 +420,6 @@ function UplinkPortSelect({ owner, bound, onPick, busy }: {
   )
 }
 
-// One link, from the point of view of the panel we're in: `near` is this device,
-// `far` is the other end. The only thing the kind changes is how the FAR end's
-// port is bound — a dependency link uses feeds_device_id (which ports.py also
-// folds a port-down through), while an undirected cross-link uses uplink_device_id
-// on BOTH ends, deliberately: feeds_device_id would tell ports.py this port feeds
-// the peer, and a cross-link cable dropping is not the peer's outage cause.
 function LinkRow({ near, far, kind }: {
   near: OrgDevice; far: OrgDevice; kind: "primary" | "backup" | "peer"
 }) {
@@ -502,7 +447,6 @@ function LinkRow({ near, far, kind }: {
     queryClient.invalidateQueries({ queryKey: ["link-ports"] })
   }
   const setNearPort = useMutation({
-    // re-picking moves the binding: clear the old port, then bind the new one
     mutationFn: async (portId: number | null) => {
       if (nearBound && nearBound.id !== portId) await inventoryApi.setPortUplink(nearBound.id, null)
       if (portId != null) await inventoryApi.setPortUplink(portId, far.id)
@@ -531,16 +475,9 @@ function LinkRow({ near, far, kind }: {
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to remove the link"),
   })
 
-  // live rates read off the FAR end's port when bound (its egress is this link's
-  // forward direction), normalized to this device's point of view
   const rateSrc = farBound ?? nearBound
   const down = farBound ? farBound.out_bps : nearBound?.in_bps ?? null
   const up = farBound ? farBound.in_bps : nearBound?.out_bps ?? null
-  // Whichever END we read the counters off has to be reachable. A frozen
-  // "↓450 Mb/s" on a dead link is worse than no figure at all — it's the number
-  // an operator uses to rule the link OUT. Note this is the rate SOURCE, not
-  // both ends: if the far end is up, its port genuinely still counts this link
-  // (and reports the drop to zero), which is a real reading worth showing.
   const rateOwnerDown = isDownState(farBound ? far.state : near.state)
   const hasRates = !!rateSrc && !rateOwnerDown
     && isFresh(rateSrc.updated_at) && (down != null || up != null)
@@ -591,16 +528,7 @@ function LinkRow({ near, far, kind }: {
 export function ConnectionPanel({ device }: { device: OrgDevice }) {
   const { scopeOrg, canWrite } = useAuth()
   const queryClient = useQueryClient()
-  // revealed by the "+" next to Uplinks; a device with no cross-links shows no
-  // Cross-links section at all. Resets when the panel moves to another device,
-  // so an abandoned picker never follows you around the tree.
   const [addingPeer, setAddingPeer] = useState(false)
-  // Cabling is reference material, not status: an operator opens this to wire up
-  // ports or read a link's rate, and otherwise wants the tabs below it. So the
-  // whole block folds, closed by default, with a summary on the header so the
-  // fold still answers "what is this hanging off". Nothing ALARM-shaped hides in
-  // here — a down uplink port is already a chip on the tree row and a row in the
-  // Ports tab; this only ever hid the port pickers.
   const [open, setOpen] = useState(false)
   useEffect(() => { setAddingPeer(false); setOpen(false) }, [device.id])
   const { data } = useQuery({
@@ -621,46 +549,33 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
     mutationFn: (peerId: number) => inventoryApi.addPeerLink(device.id, peerId),
     onSuccess: () => {
       toast.success("Cross-link added")
-      // the section now stands on its own rows; drop the "asked for it" flag so
-      // removing the last cross-link collapses it again
       setAddingPeer(false)
       queryClient.invalidateQueries({ queryKey: ["inventory"] })
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to add the cross-link"),
   })
 
-  // passive plant (splitters/FDBs) has no ports and no uplink of its own
   if (isPassiveType(device.device_type)) return null
 
   const devices = data?.devices ?? []
   const byId = new Map(devices.map((d) => [d.id, d]))
-  // the fresh inventory row — `device` may predate a just-added link
   const self = byId.get(device.id) ?? device
   const parent = self.parent_device_id != null ? byId.get(self.parent_device_id) : undefined
   const backups = (self.backup_parents ?? [])
     .map((id) => byId.get(id)).filter((d): d is OrgDevice => !!d)
   const peers = (self.peer_ids ?? [])
     .map((id) => byId.get(id)).filter((d): d is OrgDevice => !!d)
-  // anything already joined to this device — by any kind of edge — is off both
-  // menus: the server refuses a second edge between one pair, so offering it
-  // would just be an error waiting to happen
   const taken = new Set<number>([
     self.id, ...(self.parent_device_id != null ? [self.parent_device_id] : []),
     ...self.backup_parents, ...(self.peer_ids ?? []),
   ])
   const candidates = devices.filter(
     (d) => !taken.has(d.id) && !isPassiveType(d.device_type))
-  // a device shouldn't back up its own descendant — that's the loop the server
-  // rejects anyway; peers have no such rule (a ring of cross-links IS the point)
   const backupCandidates = candidates.filter((d) => d.parent_device_id !== self.id)
-  // most plant is a plain tree: the section earns its space only once a
-  // cross-link exists (or the operator asked for the picker)
   const showPeers = peers.length > 0 || addingPeer
 
   if (!parent && backups.length === 0 && peers.length === 0 && !canWrite) return null
 
-  // What the closed header says instead of nothing: where this box hangs, and
-  // whether there's more than the one plain uplink under the fold.
   const summary = [
     parent ? parent.name : backups.length === 0 ? "root device" : null,
     backups.length > 0 ? `+${backups.length} backup` : null,
@@ -683,9 +598,6 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
       {open && (
         <div className="flex flex-col gap-3 px-3 pb-3">
           <div className="flex flex-col gap-1">
-            {/* the ONLY cross-link affordance until one exists — most plant is a
-                plain tree, so an operator who never cross-links never sees the
-                section, just this one quiet button */}
             {!showPeers && canWrite && candidates.length > 0 && (
               <Button variant="ghost" size="sm"
                 className="-mt-1 h-6 self-start px-1.5 text-2xs text-faint-foreground hover:text-foreground"
@@ -717,10 +629,6 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
             )}
           </div>
 
-          {/* Cross-links: cabling between boxes at the same level. Deliberately NOT
-              part of the dependency graph — whether traffic actually reroutes over
-              one depends on STP/routing state we can't see, so these describe the
-              plant (and carry bandwidth) without ever changing what pages. */}
           {showPeers && (
             <div className="flex flex-col gap-1 border-t pt-2.5">
               <div className="flex items-center gap-2">
@@ -761,37 +669,17 @@ export function ConnectionPanel({ device }: { device: OrgDevice }) {
   )
 }
 
-/** The inline chip carried by a Network tree row, an ONU row and a map search
- *  hit. It IS `Chip` (status-badge.tsx) — same box, same tone formula — with
- *  two additions that only a row needs: a click target that deep-links into the
- *  panel tab telling its story, and the operator-palette paint path.
- *
- *  IT USED TO BE ITS OWN GRAMMAR and that was the whole reason the Network page
- *  read as noise: UPPERCASE + `tracking-wide` + `font-semibold` with a fill and
- *  NO edge. That is the loudest type in this system, and it was spent equally
- *  on "7 FIBER CUTS" and on "MAINT" — so the loud style stopped meaning
- *  anything, and a busy OLT row was four shouting blocks with no rank between
- *  them. Sentence case with a 30% edge is the documented formula and the one
- *  Home and /issues already use; the Network page was the screen that never
- *  got it. Severity is carried by TONE, which is the only channel that ranks. */
 export function RowTag({ tone, children, onClick, title, color, icon: Icon }: {
   tone: "warning" | "success" | "muted" | "destructive"
   children: ReactNode
   onClick?: (e: MouseEvent) => void
   title?: string
-  /** An operator palette name (lib/palette.ts) — only ever reaches a chip that
-   *  carries no status meaning (today: tags). It renders at the SAME weight the
-   *  tone classes do, so a coloured tag can't outshout a real alarm chip. */
   color?: string | null
-  /** A mark for the one chip worth identifying BEFORE it is read. Deliberately
-   *  rare: an icon on every chip is the uppercase problem in another channel. */
   icon?: LucideIcon
 }) {
   const painted = paletteVarOf(color)
   return (
     <span title={title} onClick={onClick}
-      // the tone is DATA, so it rides a custom property into .wisp-tag, which
-      // owns the light/dark readability correction (index.css)
       style={painted ? ({ "--tag": painted } as CSSProperties) : undefined}
       className={cn(CHIP_BOX, "gap-1 px-1.5",
         onClick && "cursor-pointer hover:brightness-125",
@@ -802,18 +690,11 @@ export function RowTag({ tone, children, onClick, title, color, icon: Icon }: {
   )
 }
 
-// Identity block for a device side panel — dot, name, address line, live
-// metrics. Shared by the Map's pin panel and the Network page's drill-in panel
-// for the same reason DeviceDetail itself is: two panels naming the same device
-// two different ways is how the surfaces drift. `tone` is a prop because the map
-// mutes a pin under maintenance (pinTone) while the tree shows the real state;
-// `children` are the surface's own header buttons (close, unpin, show-in-tree).
 export function DevicePanelHeader({
   device, tone, downstream = 0, downstreamDown = 0, children,
 }: {
   device: OrgDevice
   tone: "success" | "warning" | "destructive" | "muted"
-  /** devices fed by this one — the map counts them, the tree already shows them */
   downstream?: number
   downstreamDown?: number
   children?: ReactNode
@@ -858,9 +739,6 @@ export function isOpticalOlt(device: OrgDevice): boolean {
   return (device.device_type ?? "").toUpperCase() === "OLT" && device.snmp_enabled === 1
 }
 export function deviceTabs(device: OrgDevice): DeviceTab[] {
-  // Optical leads for an OLT — it's the tab an operator actually wants first,
-  // both as the leftmost tab and (see the drill-in callers) the one that opens
-  // by default.
   const tabs: DeviceTab[] = []
   if (isOpticalOlt(device)) tabs.push("optical")
   tabs.push("health")
@@ -868,35 +746,22 @@ export function deviceTabs(device: OrgDevice): DeviceTab[] {
   return tabs
 }
 const TAB_LABEL: Record<DeviceTab, string> = { health: "Health", optical: "Optical", ports: "Ports" }
-/** Which measurement plane each tab reads from. "Health" is the vitals plane —
- *  the tab is named for what an operator calls it, the plane for what produces
- *  it, and those do not have to be the same word. */
 const TAB_PLANE: Record<DeviceTab, Plane> = { health: "vitals", optical: "optical", ports: "traffic" }
 
 export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
   device: OrgDevice; tab: DeviceTab; onTab: (t: DeviceTab) => void
-  /** ONU row to reveal in the Optical tab — set when a map PON spoke is clicked */
   focusOnuId?: number | null
-  /** the same, by MAC — how a placed reference ONU is keyed (see OpticalPanel) */
   focusOnuMac?: string | null
 }) {
   const tabs = deviceTabs(device)
   const webUi = useWebProxy() && canOpenWebUi(device)
   const manageCreds = useCanManageCreds() && canOpenWebUi(device)
-  // Passive plant gets a panel of its own rather than the monitoring one with
-  // every reading blank. A splitter is never probed, has no ports, no vitals, no
-  // uptime and no outage, and it can't page anybody — so latency, the 24 h strip,
-  // the reliability line and the paging roster aren't "no data yet", they're
-  // questions this box will never have an answer to, and rendering them empty is
-  // the same lie as a green badge on an OLT that measures nothing. What it
-  // carries and what feeds it IS the panel.
   if (isPassiveType(device.device_type)) {
     return <DistributionPanel device={device} />
   }
   if (tabs.length === 1) {
     return (
       <>
-        {/* no tab row to anchor to — the buttons get their own row */}
         {(webUi || manageCreds) && (
           <div className="mb-2 flex justify-start gap-1.5">
             {webUi && <WebUiButton device={device} />}
@@ -915,16 +780,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
   const active = tabs.includes(tab) ? tab : tabs[0]
   return (
     <Tabs value={active} onValueChange={(v) => onTab(v as DeviceTab)}>
-      {/* the line TabsList is w-full (its hairline spans the panel), so the
-          button rides INSIDE it, right after the last tab — a flex sibling
-          outside would always end up at the far edge */}
       <TabsList variant="line" className="mb-2">
-        {/* The tab strip IS the identity axis, and has been since before there
-            was one: Optical / Health / Ports are three MEASUREMENT PLANES, on
-            three separate SNMP clocks, with three separate freshness stamps on
-            the same device row — told apart by nothing but a word. The dot is
-            the plane's own hue (lib/planes.ts), so the same three colours mean
-            the same three things wherever they appear next. */}
         {tabs.map((t) => (
           <TabsTrigger key={t} value={t}>
             <PlaneDot plane={TAB_PLANE[t]} />

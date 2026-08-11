@@ -1,23 +1,3 @@
-"""Where one span's chip rides, and which links may carry cartography at all.
-
-This file has been narrowed twice by the same movement. The per-link COLOUR it
-was originally written for went on 2026-08-08 — its real job was saying "these
-spans are one physical cable", which six palette names in one org-wide namespace
-could never do (`magenta` named one cable at HALIYA and a different one at SAGAR
-on the live fleet), and `org_cables` says it properly.
-
-Then MEMBERSHIP itself went on 2026-08-09. `cable_id`/`core_no` sat here because
-a link was the only thing in the schema that could hold them — which is exactly
-why placing a box had to ask what fed it before any glass could be recorded. A
-RUN names its own two ends and needs no link, so those rules moved wholesale to
-`test_central_cableplant`, and what is left here really is a property of the
-drawn line: where somebody dragged its label.
-
-Also pins the cross-link fix: a peer's presentation is keyed (child=higher,
-parent=lower) so waypoints still run parent→child, and the write path used to
-reject that pair outright — the map offered a route editor whose every save
-400'd.
-"""
 import http.client
 import json
 import os
@@ -99,12 +79,8 @@ class LinkStyleApiTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         return body["id"]
 
-    # --- cartography, and the row it shares with geometry --------------------
 
     def test_a_chip_position_survives_the_route_being_straightened(self):
-        # The prune rule: "empty" means every column on the row, not just the
-        # geometry. Straightening a drawn path must not throw away a label
-        # somebody positioned by hand.
         cookie = self._login()
         self._req("POST", "/api/inventory/link-style",
                   {"child_id": self.edge, "parent_id": self.core, "label_pos": 0.25},
@@ -121,10 +97,6 @@ class LinkStyleApiTest(unittest.TestCase):
         self.assertEqual(row["waypoints"], [])
 
     def test_a_write_naming_a_CABLE_is_refused_here(self):
-        # The one thing this endpoint must NOT quietly accept. Membership moved
-        # to `/api/inventory/cable/run`, and a body still sending `cable_id`
-        # comes from a stale bundle — silently ignoring it would leave an
-        # operator watching a cable they think they just recorded fail to appear.
         cookie = self._login()
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": self.edge, "parent_id": self.core,
@@ -139,13 +111,8 @@ class LinkStyleApiTest(unittest.TestCase):
                                          "label_pos": bad}, cookie=cookie)
             self.assertEqual(status, 422, f"{bad} was accepted: {body}")
 
-    # --- which links can be styled at all ------------------------------------
 
     def test_a_cross_link_can_be_styled_and_routed(self):
-        # Peers are canonicalized (min, max) in org_device_links but keyed
-        # (child=higher, parent=lower) here so waypoints run parent→child. The
-        # write path used to know only about primary and backup edges, so this
-        # pair 400'd even though the map offered the editor.
         cookie = self._login()
         lo, hi = min(self.core, self.far), max(self.core, self.far)
         status, body, _ = self._req("POST", "/api/inventory/peers",
@@ -171,7 +138,6 @@ class LinkStyleApiTest(unittest.TestCase):
         self.assertEqual(status, 422, body)
 
     def test_styling_is_an_owner_write(self):
-        # Plant is inventory, and a worker triages rather than reconfigures.
         cookie = self._login("hand", "handpassword")
         status, body, _ = self._req("POST", "/api/inventory/link-style",
                                     {"child_id": self.edge, "parent_id": self.core,

@@ -1,6 +1,3 @@
-// Installers are served by central from its private-repo mirror, not GitHub —
-// the source repo is private, so nobody but central holds a token. Same-origin
-// path keeps it working behind Caddy/any hostname without hardcoding one.
 export const releaseAsset = (name: string) =>
   `${window.location.origin}/download/latest/${name}`
 

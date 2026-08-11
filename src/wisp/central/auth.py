@@ -17,10 +17,6 @@ log = logging.getLogger("wisp.central.auth")
 
 SESSION_COOKIE = "wisp_central_session"
 MIN_PASSWORD_LEN = 8
-# Two roles since 2026-07-21: the org has owners (full write) and field workers
-# (triage — ack/post-mortem — via api/common.can_triage, routed to the stripped
-# worker view). The read-only `operator`/`tech` roles were removed; existing
-# accounts holding one were migrated to `worker` (store._collapse_roles).
 ROLES = ("owner", "worker")
 
 class AuthError(ValueError):
@@ -55,18 +51,10 @@ def get_session_secret(cfg: Config = CONFIG) -> bytes:
         _secret_cache[key] = secret
         return secret
 
-# --- password hashing --------------------------------------------------------
-# Passwords are stored scrypt-hashed (memory-hard: a leaked central.db can't be
-# cracked at GPU speed the way single-round SHA-256 could). The stored string is
-# SELF-DESCRIBING — "scrypt$N$r$p$salt_hex$digest_hex" — so the cost parameters
-# can be tuned later without a schema flag day; the separate `pw_salt` column is
-# legacy and unused by scrypt (new rows store ""). Accounts created before the
-# migration hold a legacy salted-SHA-256 hash (64 hex chars, no "$") and are
-# transparently UPGRADED to scrypt on their next correct login — see verify_login.
-_SCRYPT_N = 2 ** 14          # 16384 — ~70 ms/hash on the prod box
+_SCRYPT_N = 2 ** 14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
-_SCRYPT_MAXMEM = 64 * 1024 * 1024   # 64 MiB ceiling (these params need ~16 MiB)
+_SCRYPT_MAXMEM = 64 * 1024 * 1024
 
 def _scrypt(password: str, salt: bytes, n: int, r: int, p: int, dklen: int) -> bytes:
     return hashlib.scrypt((password or "").encode("utf-8"), salt=salt, n=n, r=r,
@@ -78,12 +66,8 @@ def hash_password(password: str) -> str:
     return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${dk.hex()}"
 
 def _legacy_hash(password: str, salt: str) -> str:
-    """The pre-migration scheme: one round of salted SHA-256. Kept ONLY to verify
-    (and then upgrade) accounts that predate scrypt."""
     return hashlib.sha256((salt + (password or "")).encode("utf-8")).hexdigest()
 
-# Old name, retained so any external caller keeps working; it is the legacy
-# scheme by definition and must never be used to write a NEW password.
 hash_pw = _legacy_hash
 
 def _verify_scrypt(password: str, stored: str) -> bool:
@@ -99,17 +83,11 @@ def _verify_scrypt(password: str, stored: str) -> bool:
     return hmac.compare_digest(got, expected)
 
 def verify_password(password: str, pw_hash: str, pw_salt: str) -> tuple[bool, bool]:
-    """Returns (ok, needs_upgrade). A correct login against a legacy SHA-256 hash
-    asks to be re-hashed with scrypt; a scrypt hash never needs upgrading."""
     if pw_hash and pw_hash.startswith("scrypt$"):
         return _verify_scrypt(password, pw_hash), False
     ok = hmac.compare_digest(pw_hash or "", _legacy_hash(password, pw_salt or ""))
     return ok, ok
 
-# A fixed dummy hash so a login for a NON-existent (or deactivated) account still
-# spends a full scrypt verification — otherwise "unknown user" returns instantly
-# while "known user, wrong password" costs ~70 ms, a timing oracle for which
-# usernames exist. Computed once at import.
 _DUMMY_HASH = hash_password(secrets.token_hex(16))
 
 def _validate_password(password: str) -> str:
@@ -124,16 +102,12 @@ def create_user(store, org_id: str | None, username: str, password: str,
     if not username:
         raise AuthError("username required")
     if org_id is None:
-        # A SUPERADMIN's role column is meaningless (identity is org_id IS NULL)
-        # — but it must not be left on the org default, which is 'worker' and
-        # would make the SPA serve the platform admin the field-worker view.
         role = "owner"
     elif role not in ROLES:
         raise AuthError(f"role must be one of {ROLES}")
     _validate_password(password)
     if store.get_user_by_username(username):
         raise AuthError(f"username {username!r} already exists")
-    # pw_salt is legacy — scrypt embeds its own salt in the hash string.
     return store.add_user(org_id, username, hash_password(password), "", role)
 
 def set_password(store, user_id: int, password: str) -> None:
@@ -143,16 +117,12 @@ def set_password(store, user_id: int, password: str) -> None:
 def verify_login(store, username: str, password: str) -> dict | None:
     user = store.get_user_by_username((username or "").strip())
     if not user or not user["is_active"]:
-        # Equalise timing with the found-user path so the response time doesn't
-        # betray whether the account exists.
         verify_password(password or "", _DUMMY_HASH, "")
         return None
     ok, upgrade = verify_password(password or "", user["pw_hash"], user["pw_salt"])
     if not ok:
         return None
     if upgrade:
-        # Re-hash the now-verified password with scrypt. Best-effort: a hiccup
-        # here must never fail an otherwise-valid login (it retries next login).
         try:
             store.set_user_password(user["id"], hash_password(password or ""), "")
         except Exception:
@@ -160,16 +130,6 @@ def verify_login(store, username: str, password: str) -> dict | None:
                         exc_info=True)
     return user
 
-# --- sessions ----------------------------------------------------------------
-# Stateless signed cookie. The token carries FIVE facts so verification needs no
-# server state beyond the account's session_epoch:
-#   user_id — who
-#   hard    — absolute expiry (epoch seconds); the session dies here no matter what
-#   seen    — last-activity time; slid forward on use (this is the IDLE clock)
-#   idle    — idle window in seconds (0 = disabled, for "remember this device")
-#   epoch   — the account's session generation. A newer login (or a logout) bumps
-#             users.session_epoch, which instantly invalidates every older cookie
-#             — that is what enforces ONE active session and makes logout real.
 
 @dataclass(frozen=True)
 class Session:
@@ -199,9 +159,9 @@ def _decode(token: str | None, *, cfg: Config = CONFIG,
     except ValueError:
         return None
     t = time.time() if now is None else now
-    if t > s.hard:                        # absolute cap
+    if t > s.hard:
         return None
-    if s.idle > 0 and t > s.seen + s.idle:   # idle cap
+    if s.idle > 0 and t > s.seen + s.idle:
         return None
     return s
 
@@ -210,15 +170,9 @@ def issue_session(user_id: int, cfg: Config = CONFIG, *, remember: bool = False,
                   epoch: int = 0, now: float | None = None) -> str:
     t = int(time.time() if now is None else now)
     if trusted_admin:
-        # Owner/superadmin "trust this device": a longer absolute cap than the
-        # normal 12h so a privileged operator's own box isn't bounced every shift,
-        # but SHORTER than the worker 30-day tier — and, per operator choice, no
-        # idle logout for the window (idle=0). The server, not this function,
-        # decides a role is eligible (see server.py login handler).
         hard = t + cfg.session_trusted_admin_hours * 3600
         idle = 0
     elif remember:
-        # Trusted device (worker): long absolute life, and NO idle logout (idle=0).
         hard = t + cfg.session_remember_days * 86400
         idle = 0
     else:
@@ -233,9 +187,6 @@ def verify_session(token: str | None, *, cfg: Config = CONFIG,
 
 def session_cookie_max_age(cfg: Config = CONFIG, *, remember: bool = False,
                            trusted_admin: bool = False) -> int:
-    """Browser retention hint for a freshly issued cookie. Set to the ABSOLUTE
-    cap (not the idle window) so an active session's cookie survives across the
-    idle window while the token's own seen+idle enforces idle expiry server-side."""
     if trusted_admin:
         return cfg.session_trusted_admin_hours * 3600
     if remember:
@@ -245,10 +196,6 @@ def session_cookie_max_age(cfg: Config = CONFIG, *, remember: bool = False,
 def slide_session(token: str | None, cfg: Config = CONFIG, *,
                   now: float | None = None, min_interval: int = 60
                   ) -> tuple[str, int] | None:
-    """Advance a still-valid, idle-limited session's activity clock. Returns
-    (new_token, cookie_max_age) when it should be re-issued (idle enabled AND at
-    least `min_interval` seconds since the last slide, and not past the absolute
-    cap), else None. Remember-me sessions (idle==0) never slide."""
     s = _decode(token, cfg=cfg, now=now)
     if s is None or s.idle <= 0:
         return None
@@ -285,14 +232,9 @@ def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict |
     user = store.get_user(s.user_id)
     if not user or not user["is_active"]:
         return None
-    # Single active session: a cookie whose epoch trails the account's current
-    # session_epoch was superseded by a newer login (or killed by a logout).
     if int(user.get("session_epoch") or 0) != s.epoch:
         return None
     user = dict(user)
-    # Strip secrets before the row travels anywhere: password material, the
-    # session generation, and the TOTP secret/replay-cursor/recovery hashes.
-    # totp_enabled STAYS — public_user surfaces it and it isn't sensitive.
     for k in ("pw_hash", "pw_salt", "session_epoch", "totp_secret",
               "totp_last_step", "totp_recovery"):
         user.pop(k, None)
@@ -300,13 +242,6 @@ def resolve_session(store, token: str | None, *, cfg: Config = CONFIG) -> dict |
     return user
 
 class LoginThrottle:
-    """Generic keyed exponential backoff. The login path feeds it BOTH the client
-    IP and a ``user:<name>`` key, so a guess-storm is slowed whether it comes from
-    one box against many accounts (IP key) or many boxes against one account (user
-    key). Counters DECAY after ``window`` idle seconds, so a burst self-heals and
-    the per-account key can't be weaponised to lock a victim out indefinitely —
-    the worst it can do is impose the capped delay while the attack is sustained."""
-
     def __init__(self, lock_after: int = 5, base_delay: float = 2.0,
                  cap: float = 300.0, window: float = 900.0) -> None:
         self.lock_after = lock_after

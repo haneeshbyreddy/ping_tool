@@ -36,13 +36,11 @@ class CurrentRosterTest(unittest.TestCase):
 
     def test_stale_olt_dropped(self):
         rows = _pon(1, "0/1", 2, updated_min_ago=1)
-        rows += _pon(2, "0/2", 2, updated_min_ago=20)  # >15 min stale
+        rows += _pon(2, "0/2", 2, updated_min_ago=20)
         keep = current_roster(rows, NOW)
         self.assertTrue(all(r["device_id"] == 1 for r in keep))
 
     def test_zombie_rows_from_an_older_walk_excluded(self):
-        # OLT 1's latest walk is 1 min ago; a leftover row from an older walk
-        # (5 min ago) is a removed-ONU zombie and must not count
         rows = _pon(1, "0/1", 3, updated_min_ago=1)
         rows.append(_onu("0/1.9", device_id=1, onu_id=9, updated_min_ago=5,
                          serial="ZZ"))
@@ -70,7 +68,6 @@ class CapacityTest(unittest.TestCase):
     def test_per_olt_limit_override(self):
         rows = _pon(1, "0/1", 6) + _pon(2, "0/2", 6, device_name="OLT-B",
                                         serial_prefix="DD:00:00:00:00:")
-        # OLT 1 cap 5 (over), OLT 2 cap 128 (fine)
         caps = capacity_faults(rows, NOW, lambda d: 5 if d == 1 else 128)
         self.assertEqual([c.device_id for c in caps], [1])
 
@@ -80,25 +77,24 @@ class CapacityTest(unittest.TestCase):
 
     def test_zombie_rows_do_not_inflate_the_count(self):
         rows = _pon(1, "0/1", 5, updated_min_ago=1)
-        # two removed-ONU zombies from an old walk share the port
         rows += [_onu("0/1.90", device_id=1, onu_id=90, updated_min_ago=6,
                       serial="X1"),
                  _onu("0/1.91", device_id=1, onu_id=91, updated_min_ago=6,
                       serial="X2")]
         caps = capacity_faults(rows, NOW, lambda d: 6)
-        self.assertEqual(caps, [])  # 5 current, not 7
+        self.assertEqual(caps, [])
 
 
 class DuplicateMacTest(unittest.TestCase):
 
     def test_single_slot_mac_never_flagged(self):
-        rows = _pon(1, "0/1", 3)  # all distinct serials
+        rows = _pon(1, "0/1", 3)
         self.assertEqual(duplicate_macs(rows, NOW), [])
 
     def test_dup_across_two_olts(self):
         rows = [_onu("0/1.0", device_id=1, serial="AA:BB:CC:00:00:00"),
                 _onu("0/2.0", device_id=2, device_name="OLT-B", pon_port="0/2",
-                     serial="aa:bb:cc:00:00:00")]  # case-insensitive match
+                     serial="aa:bb:cc:00:00:00")]
         dups = duplicate_macs(rows, NOW)
         self.assertEqual(len(dups), 1)
         self.assertEqual(dups[0].mac, "AA:BB:CC:00:00:00")
@@ -118,16 +114,12 @@ class DuplicateMacTest(unittest.TestCase):
         self.assertEqual(duplicate_macs(rows, NOW), [])
 
     def test_zombie_dup_excluded_by_freshness(self):
-        # a live ONU and an old zombie sharing a MAC (the re-registration ghost) —
-        # the zombie fell out of the current roster, so no duplicate stands
         rows = [_onu("0/1.0", device_id=1, updated_min_ago=1, serial="CAFE"),
                 _onu("0/2.0", device_id=1, pon_port="0/2", updated_min_ago=20,
                      serial="CAFE")]
         self.assertEqual(duplicate_macs(rows, NOW), [])
 
     def test_online_members_counts_live_slots_only(self):
-        # C-Data reg tables keep every slot an ONU ever occupied; an offline
-        # ghost row makes members=2 but online_members=1 — history, not a fault
         rows = [_onu("0/1.0", device_id=1, serial="CAFE", state="online"),
                 _onu("0/2.0", device_id=1, pon_port="0/2", serial="CAFE",
                      state="offline")]
@@ -138,8 +130,6 @@ class DuplicateMacTest(unittest.TestCase):
         self.assertEqual(duplicate_macs(rows, NOW)[0].online_members, 2)
 
     def test_stale_blind_view_keeps_stale_olts(self):
-        # stale_s=None is the shadow view alerting uses to tell "genuinely
-        # gone" from "walk went stale" — the stale OLT's dup must still show
         rows = [_onu("0/1.0", device_id=1, serial="CAFE"),
                 _onu("0/2.0", device_id=2, device_name="OLT-B", pon_port="0/2",
                      serial="CAFE", updated_min_ago=30)]
@@ -161,9 +151,6 @@ class FreshDeviceIdsTest(unittest.TestCase):
 
 
 class SearchKeyTest(unittest.TestCase):
-    """`search_key` is the SEARCH normalizer for the Network page's MAC lookup —
-    punctuation-blind, unlike the separator-exact identity `_norm_mac` uses."""
-
     def test_punctuation_and_case_collapse(self):
         for raw in ("A4:F2:1B:9C:44:01", "a4-f2-1b-9c-44-01", "a4f2.1b9c.4401",
                     " A4 F2 1B 9C 44 01 "):
@@ -177,11 +164,9 @@ class SearchKeyTest(unittest.TestCase):
                 self.assertIn(search_key(typed), key)
 
     def test_ascii_serials_survive_intact(self):
-        # a Huawei GPON serial is not hex; stripping must not mangle it
         self.assertEqual(search_key("HWTC1234ABCD"), "HWTC1234ABCD")
 
     def test_like_wildcards_are_stripped(self):
-        # this is what lets the store interpolate the needle into a LIKE pattern
         self.assertEqual(search_key("%_%"), "")
         self.assertEqual(search_key("AA%BB_CC"), "AABBCC")
 

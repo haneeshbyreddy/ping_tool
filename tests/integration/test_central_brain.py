@@ -176,9 +176,6 @@ class CentralAlertDispatcherTest(unittest.TestCase):
             "region": "Rampur", "parent_device_id": None})
         self.store.set_org("ispA", ntfy_topic_owner="a-owner",
                            ntfy_topic_worker="a-worker")
-        # WhatsApp is the only channel now: seed owner + worker numbers so a page
-        # has an audience (org_alert_recipients). ispB in the noop test stays
-        # numberless on purpose.
         o = self.store.add_user("ispA", "own1", "h", "s", "owner")
         w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(o, "919000000001")
@@ -198,7 +195,6 @@ class CentralAlertDispatcherTest(unittest.TestCase):
     def test_fresh_down_pages_owner_and_worker_and_schedules_hourly(self):
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
-        # ONE send to the de-duped audience (owner + worker numbers)
         self.assertEqual(len(self.notifier.sent), 1)
         self.assertEqual(sorted(self.notifier.sent[0]["whatsapp"]),
                          ["919000000001", "919000000009"])
@@ -215,7 +211,6 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
-        # one send; the second dispatch is deduped per-outage
         self.assertEqual(len(self.notifier.sent), 1)
 
     def test_new_outage_after_recovery_pages_again(self):
@@ -229,8 +224,6 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.assertEqual(len(self.notifier.sent), 1)
 
     def test_resolved_broadcasts_to_every_channel(self):
-        # "all three" until roles collapsed to owner+worker (2026-07-21) — the
-        # tech channel went, the operator channel became the worker one.
         self._open_outage()
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.notifier.sent.clear()
@@ -252,11 +245,8 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.disp.dispatch([OutageOpened(self.dev, DOWN)], T0)
         self.notifier.sent.clear()
         self.disp.sweep(T_LATER)
-        # The initial DOWN pushed; the hourly re-nag is OFF for now (allowlist) —
-        # nothing pushed or queued to the dormant digest.
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.store.pending_digest("ispA"), [])
-        # but the escalation still reschedules for the next hour
         pending = self.store.due_escalations("ispA", "2026-01-01T09:00:00+00:00")
         self.assertEqual(len(pending), 1)
 
@@ -266,8 +256,6 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.assertTrue(self.disp.acknowledge(oid, "Suresh"))
         self.notifier.sent.clear()
         self.disp.sweep(T_LATER)
-        # escalation still fires while acked (it just doesn't page now) — it
-        # reschedules for the next hour
         self.assertTrue(
             self.store.due_escalations("ispA", "2026-01-01T09:00:00+00:00"))
 
@@ -275,7 +263,7 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         self.disp.dispatch([OutageResolved(self.dev)], T_LATER)
         self.notifier.sent.clear()
         self.disp.sweep("2026-01-01T03:00:00+00:00")
-        self.assertEqual(self.notifier.sent, [])   # recovery stops it
+        self.assertEqual(self.notifier.sent, [])
 
     def test_missing_topic_is_a_soft_noop(self):
         self.store.set_org("ispB")
@@ -316,9 +304,6 @@ class ReportEndpointTest(unittest.TestCase):
                           central_bind="127.0.0.1", central_port=0, central_token="tok",
                           down_consecutive=3, recover_consecutive=2)
         self.store = CentralStore(self.cfg.central_db)
-        # WhatsApp-only: an owner number gives ispA an audience for pages. (The
-        # admin number is no longer an org recipient — 2026-07-25 — so it can't
-        # stand in as the audience here.)
         _o = self.store.add_user("ispA", "own1", "h", "s", "owner")
         self.store.set_user_whatsapp(_o, "919000000001")
         self.notifier = RecordingNotifier()
@@ -456,7 +441,7 @@ class ReportEndpointTest(unittest.TestCase):
             status, body = self._report(100.0)
             self.assertEqual(status, 200)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], DOWN)
-        self.assertTrue(self.notifier.sent)   # paged the org audience
+        self.assertTrue(self.notifier.sent)
 
         self.notifier.sent.clear()
         for _ in range(2):
@@ -506,7 +491,7 @@ class ReportEndpointTest(unittest.TestCase):
         status, body = self._recheck("10.0.0.1", 100.0)
         self.assertEqual(self.store.device_states("ispA")[1]["state"], DOWN)
         self.assertNotIn("recheck", body)
-        self.assertTrue(self.notifier.sent)   # paged the org audience
+        self.assertTrue(self.notifier.sent)
 
     def test_recheck_blip_clears_hint_without_confirming(self):
         self.store.create_org_device("ispA", {
@@ -580,8 +565,8 @@ class ReportEndpointTest(unittest.TestCase):
                 "health": {str(dev): {"cpu_pct": 37.5, "mem_used_bytes": 96_000_000,
                                       "mem_total_bytes": 256_000_000, "mem_pct": 37.5,
                                       "temp_c": 54.0},
-                           "9999": {"cpu_pct": 1.0},          # unknown device: ignored
-                           "junk": {"cpu_pct": 1.0}}}         # bad id: ignored
+                           "9999": {"cpu_pct": 1.0},
+                           "junk": {"cpu_pct": 1.0}}}
         status, _ = self._req("POST", "/report", body)
         self.assertEqual(status, 200)
         row = {d["id"]: d for d in self.store.list_org_devices("ispA")}[dev]
@@ -591,7 +576,6 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(row["health_temp_c"], 54.0)
         self.assertIsNotNone(row["health_updated_at"])
 
-        # a later sweep with fewer facts overwrites in place (latest reading only)
         body["health"] = {str(dev): {"cpu_pct": 90.0, "temp_c": "not-a-number"}}
         self._req("POST", "/report", body)
         row = {d["id"]: d for d in self.store.list_org_devices("ispA")}[dev]
@@ -700,8 +684,6 @@ class ReportEndpointTest(unittest.TestCase):
                                  token="tok")
         self.assertEqual(status, 200)
         self.assertEqual(body["redundancy"]["on_backup"], 1)
-        # on-backup is OFF for now (allowlist): the badge is written end-to-end
-        # but nothing pushes or queues to the dormant digest.
         self.assertEqual(self.store.pending_digest("ispA"), [])
 
 if __name__ == "__main__":

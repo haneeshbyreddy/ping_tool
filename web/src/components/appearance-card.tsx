@@ -1,15 +1,3 @@
-/* Settings -> Platform -> Appearance. Superadmin-only, server-wide.
- *
- * Server-wide rather than per-org, matching the Google Maps key: this is the
- * product's look, not a tenant preference, and per-org palettes would mean the
- * screenshots in a support conversation no longer match what anyone else sees.
- *
- * The editing model is SEEDS, not a grid of raw tokens — see the header of
- * lib/theme-tokens.ts for why (short version: the ladder steps and the
- * measured ink choice are worth more than the freedom to set 44 hex codes by
- * hand, and hand-setting them loses those on the first save). Advanced is
- * there for the handful of tokens no seed reaches.
- */
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Palette, RotateCcw } from "lucide-react"
@@ -30,10 +18,6 @@ import { Skeleton } from "@/components/ui/skeleton"
 
 type SeedMap = Partial<Record<SeedId, string>>
 
-/** Recover the seed values from a stored token map. The store holds the
- *  DERIVED tokens (that is what the page needs), so each seed reads back off
- *  the one token it owns, falling back to the shipped value when absent —
- *  which is also how an untouched seed stays untouched across a save. */
 function seedsFrom(tokens: TokenMap, mode: ThemeMode): SeedMap {
   const out: SeedMap = {}
   for (const seed of SEEDS) out[seed.id] = tokens[seed.token] ?? seed.base[mode]
@@ -46,9 +30,6 @@ function advancedFrom(tokens: TokenMap, mode: ThemeMode): TokenMap {
   return out
 }
 
-/** Colour swatch + hex field. The native picker is the fast path (drag and the
- *  whole app repaints live); the text field is how you paste a hex from a
- *  brand doc, which is the other half of how this actually gets used. */
 function SwatchField({ value, onChange, id }: {
   value: string
   onChange: (v: string) => void
@@ -81,14 +62,6 @@ function SwatchField({ value, onChange, id }: {
   )
 }
 
-/** Live contrast readout for the tone seeds.
- *
- *  Not decoration: the whole reason a colour picker is safe to hand over is
- *  that the consequences are visible while choosing. A tone dragged pale enough
- *  to fail against the panel behind it is the one mistake that actually hurts —
- *  it is how an outage row stops being legible — so it gets called out here
- *  rather than discovered on a wall display during an incident. 4.5:1 is the
- *  WCAG AA floor for body text. */
 function ContrastNote({ tone, panel }: { tone: string; panel: string }) {
   if (!parseHex(tone) || !parseHex(panel)) return null
   const onPanel = contrast(tone, panel)
@@ -111,7 +84,6 @@ export function AppearanceCard() {
     queryFn: adminApi.settings,
   })
 
-  // Edit the mode you are actually looking at, or the preview is meaningless.
   const [mode, setMode] = useState<ThemeMode>(() => getStoredTheme())
   const [seeds, setSeeds] = useState<Record<ThemeMode, SeedMap>>({ dark: {}, light: {} })
   const [advanced, setAdvanced] = useState<Record<ThemeMode, TokenMap>>({ dark: {}, light: {} })
@@ -137,25 +109,11 @@ export function AppearanceCard() {
     light: buildOverrides(seeds.light, advanced.light, "light"),
   }), [seeds, advanced])
 
-  // Repaint the real app as they drag. BOTH modes go in every time: the
-  // preview is mode-scoped CSS, so the inactive mode's tokens sit harmlessly
-  // behind the theme class until it is switched on. Previewing only the
-  // on-screen mode is what made a saved light palette leak into dark mode.
   useEffect(() => { applyPreview(overrides) }, [overrides])
 
-  // What is actually stored server-side, tracked in a ref so the unmount
-  // cleanup below reads the current value rather than the one captured when
-  // the effect was created.
   const savedRef = useRef<ThemeOverrides>({})
   useEffect(() => { if (data) savedRef.current = data.theme_overrides ?? {} }, [data])
 
-  // On unmount, fall back to the SAVED palette rather than clearing outright.
-  // Both halves matter: abandoned edits must not outlive this card (a preview
-  // left standing is indistinguishable from a saved theme, and the next save
-  // would be judged against a palette that was never stored), but a save that
-  // just succeeded must not visually revert the moment you navigate away — the
-  // server's injected block was rendered at page load and still holds the old
-  // colours until a reload, so the preview element is what keeps them agreeing.
   useEffect(() => () => applyPreview(savedRef.current), [])
 
   const save = useMutation({
@@ -179,9 +137,6 @@ export function AppearanceCard() {
     setDirty(true)
   }
 
-  /** Back to the shipped palette for THIS mode — clears the seeds rather than
-   *  writing the defaults in as overrides, so these tokens resume following
-   *  index.css and pick up any future design work. */
   function resetMode() {
     setSeeds((s) => ({
       ...s,
@@ -209,10 +164,6 @@ export function AppearanceCard() {
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          {/* Switching which palette you edit also switches the app into it.
-              A theme editor where the tab and the visible theme can disagree is
-              how you end up tuning light mode, flipping to dark, and finding it
-              wrong — keeping them locked together removes that state entirely. */}
           <Segmented
             value={mode}
             onChange={(m) => { setMode(m as ThemeMode); applyTheme(m as ThemeMode) }}

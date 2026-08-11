@@ -55,16 +55,12 @@ class RedundancySweepTest(unittest.TestCase):
                                  self.notifier, ts, self.cfg)
 
     def _queued(self):
-        # On-backup alerts are DIGEST-tier: they queue, they don't push. The
-        # transition-only contract still holds — one queued row per change.
         return self.store.pending_digest(ORG)
 
     def _clear_queue(self):
         self.store.mark_digests_sent(ORG, TS)
 
     def test_enter_writes_badge_off(self):
-        # On-backup is OFF for now (allowlist): the badge is written, but nothing
-        # pushes or queues to the dormant digest.
         self._sweep({self.child: True}, {self.child: UP})
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self._queued(), [])

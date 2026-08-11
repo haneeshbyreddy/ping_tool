@@ -1,14 +1,3 @@
-"""The web-optics sweeper: which OLTs get scraped, how often, and what happens
-when it goes wrong.
-
-Most of these tests are about RESTRAINT rather than function. The scrape makes
-a weak C-Data OLT interrogate every ONU on a PON over EPON-OAM, and it competes
-for the single web session that firmware offers, so the interesting question is
-almost never "did it fetch the readings" — it is "did it correctly decide not
-to". A sweeper that scrapes an OLT an operator is logged into, or that pages
-someone when a scrape fails, is worse than no sweeper at all.
-"""
-
 import base64
 import json
 import sys
@@ -25,8 +14,6 @@ from wisp.config import Config
 
 
 class FakeProxy:
-    """A hub that is polling and idle unless a test says otherwise."""
-
     def __init__(self, polling=True, sessions=(), replies=None, expired=()):
         self.polling = polling
         self.sessions = list(sessions)
@@ -39,9 +26,6 @@ class FakeProxy:
         return self.polling
 
     def active_sessions_for(self, org_id, node_id, idle_s=None):
-        # Recorded, not honoured: the real hub decides what "in use" means from
-        # each session's last request. What matters here is that the sweeper
-        # ASKS about use rather than mere existence.
         self.idle_windows.append(idle_s)
         return list(self.sessions)
 
@@ -69,9 +53,6 @@ class FakeStore:
         return list(self._profiles)
 
     def web_optics_targets(self, vendors=("dbc",), device_id=None):
-        # The real store filters on the profile set; the double records what it
-        # was ASKED for, so a test can pin that a disabled vendor stops
-        # producing targets at all rather than being skipped later.
         self.asked_vendors = set(vendors)
         rows = [t for t in self._targets
                 if str(t.get("vendor") or "dbc") in self.asked_vendors]
@@ -145,49 +126,29 @@ class EndpointTest(unittest.TestCase):
 
 
 class PonsForTest(unittest.TestCase):
-    """The PON list the sweeper asks a given OLT for.
-
-    `pon_ports` rides the target row as the roster's GROUP_CONCAT, so this is
-    the seam where "how many PONs does this box have" stops being a constant
-    copied off PYLON and starts being the OLT's own answer.
-    """
 
     def test_the_roster_decides(self):
         self.assertEqual(
             _pons_for(target(pon_ports="EPON0/1,EPON0/3,EPON0/8")), (1, 3, 8))
 
     def test_an_olt_with_no_roster_labels_falls_back_to_the_common_four(self):
-        # Kept deliberately: a walk that labels its ports in a shape we have
-        # not seen should still scrape the first four PONs, not none of them.
         self.assertEqual(_pons_for(target(pon_ports=None)), DEFAULT_PONS)
         self.assertEqual(_pons_for(target(pon_ports="")), DEFAULT_PONS)
         self.assertEqual(_pons_for(target(pon_ports="?,??")), DEFAULT_PONS)
 
 
 class SweeperGateTest(unittest.TestCase):
-    """Each of these returns None — skipped before a single request was sent."""
-
     def test_a_dormant_tunnel_is_skipped(self):
-        # The edge only long-polls for web_proxy orgs; without that, every
-        # request would sit there and expire.
         proxy = FakeProxy(polling=False)
         self.assertIsNone(sweeper(FakeStore(creds=CREDS), proxy).scrape_device(target()))
         self.assertEqual(proxy.submits, [])
 
     def test_an_olt_someone_is_browsing_is_left_alone(self):
-        # THE gate that matters. This firmware keeps no cookie and holds one
-        # session slot, so scraping mid-browse logs the operator out of the box
-        # they are working on. A human at a keyboard wins.
         proxy = FakeProxy(sessions=[{"sid": "abc", "ttl_s": 300}])
         self.assertIsNone(sweeper(FakeStore(creds=CREDS), proxy).scrape_device(target()))
         self.assertEqual(proxy.submits, [])
 
     def test_the_browse_gate_asks_about_USE_not_existence(self):
-        # A session outlives its browser tab by the whole session TTL — nothing
-        # tells central a tab was closed — and this gate is per-NODE, so keying
-        # it on "a session exists" let one forgotten tab mute the optical read
-        # of every OLT behind that probe. The sweeper must ask the hub for
-        # sessions used recently, with a window well short of that TTL.
         proxy = FakeProxy()
         s = sweeper(FakeStore(creds=CREDS), proxy, web_optics_browse_idle_s=180)
         with self.assertLogs("wisp.central.weboptics", level="WARNING"):
@@ -201,7 +162,6 @@ class SweeperGateTest(unittest.TestCase):
         self.assertEqual(proxy.submits, [])
 
     def test_a_password_that_will_not_decrypt_skips_the_olt(self):
-        # A rotated secret key must cost this OLT its scrape, not the sweep.
         proxy = FakeProxy()
         s = sweeper(FakeStore(creds=CREDS), proxy, FakeBox(raises=True))
         with self.assertLogs("wisp.central.weboptics", level="WARNING") as logs:
@@ -216,7 +176,6 @@ class SweeperGateTest(unittest.TestCase):
         self.assertEqual(proxy.submits, [])
 
     def test_a_scrape_already_running_on_this_olt_is_not_joined(self):
-        # Two overlapping scrapes would knock each other's session out.
         proxy = FakeProxy()
         s = sweeper(FakeStore(creds=CREDS), proxy)
         s._lock_for(8).acquire()
@@ -225,19 +184,12 @@ class SweeperGateTest(unittest.TestCase):
 
 
 def preflight_reply(results):
-    """The edge's endpoint-probe report: [[ip, port, scheme, answered], ...]."""
     doc = json.dumps({"preflight": True, "results": results}).encode()
     return {"status": 200, "headers": [],
             "body_b64": base64.b64encode(doc).decode()}
 
 
 class PreflightTest(unittest.TestCase):
-    """The sweeper must ASK which endpoint answers, never assume :80.
-
-    Learned live: the first real sweep reported "login failed: could not
-    connect to <ip>:80" for an OLT whose web UI a browser had been using
-    minutes earlier — the session-open path preflights, and this one didn't.
-    """
 
     def test_the_scrape_follows_the_endpoint_the_edge_confirms(self):
         proxy = FakeProxy(replies=[
@@ -246,17 +198,14 @@ class PreflightTest(unittest.TestCase):
         ])
         s = sweeper(FakeStore(creds=CREDS), proxy)
         with self.assertLogs("wisp.central.weboptics", level="WARNING"):
-            s.scrape_device(target())      # login itself then times out
+            s.scrape_device(target())
         probe, login = proxy.submits[0], proxy.submits[1]
         self.assertEqual(probe["sid"], "preflight")
         self.assertEqual(probe["extra"]["kind"], "preflight")
-        # The login must go to the endpoint that ANSWERED, not the guess.
         self.assertEqual((login["ip"], login["port"], login["scheme"]),
                          ("172.168.107.242", 443, "https"))
 
     def test_no_credentials_are_sent_when_nothing_answers(self):
-        # The edge positively confirmed every candidate is dead. Posting an
-        # admin login into that would be pointless and indiscreet.
         proxy = FakeProxy(replies=[
             preflight_reply([["172.168.107.242", 443, "https", False],
                              ["172.168.107.242", 80, "http", False]]),
@@ -269,8 +218,6 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual([x["sid"] for x in proxy.submits], ["preflight"])
 
     def test_an_inconclusive_probe_keeps_the_heuristic(self):
-        # Old edge, timeout, or a non-preflight-shaped reply: fall back to the
-        # guess rather than refusing to scrape.
         proxy = FakeProxy(replies=[{"status": 200, "headers": [],
                                     "body_b64": ""}])
         s = sweeper(FakeStore(creds=CREDS), proxy)
@@ -280,7 +227,6 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual((login["port"], login["scheme"]), (80, "http"))
 
     def test_the_preflight_costs_nothing_for_a_device_we_cannot_scrape(self):
-        # Network work goes last: no password means not one packet at the OLT.
         proxy = FakeProxy()
         sweeper(FakeStore(creds=None), proxy).scrape_device(target())
         self.assertEqual(proxy.submits, [])
@@ -289,8 +235,7 @@ class PreflightTest(unittest.TestCase):
 class SweeperRunTest(unittest.TestCase):
 
     def test_a_failed_scrape_logs_and_returns_the_error(self):
-        # No notifier is even reachable from here — a scrape can page nobody.
-        proxy = FakeProxy(replies=[])          # the login page never answers
+        proxy = FakeProxy(replies=[])
         s = sweeper(FakeStore(creds=CREDS), proxy)
         with self.assertLogs("wisp.central.weboptics", level="WARNING"):
             res = s.scrape_device(target())
@@ -329,8 +274,6 @@ class SweeperRunTest(unittest.TestCase):
         self.assertIs(s._lock_for(8), s._lock_for(8))
 
     def test_lock_creation_is_threadsafe(self):
-        # Two report-path callers arriving at once must not end up holding two
-        # different locks for the same OLT, which would defeat the point.
         s = sweeper()
         seen, barrier = [], threading.Barrier(8)
 
@@ -347,14 +290,6 @@ class SweeperRunTest(unittest.TestCase):
 
 
 class SessionReapTest(unittest.TestCase):
-    """Abandoned web-UI sessions are retired, not left to rot.
-
-    Nothing ever told central a browser tab was closed, and a session is only
-    dropped from the hub when something happens to look it up — which the gone
-    tab is exactly what stopped doing. So they piled up, went on being drawn as
-    live pulsing globes, and (before the idle window above) went on suppressing
-    the optical read of every OLT on their probe.
-    """
 
     def test_the_sweep_retires_timed_out_sessions_in_both_places(self):
         store = FakeStore()
@@ -377,12 +312,6 @@ class SessionReapTest(unittest.TestCase):
 
 
 class ScrapeOneTest(unittest.TestCase):
-    """The dashboard's manual read (api/devices.py:rx_refresh).
-
-    The button widens WHO may ask for a read; it must not widen what a read is
-    allowed to do. Eligibility is re-resolved through the sweep's own target
-    query so a click can never reach a box the sweep would have refused.
-    """
 
     def test_it_scrapes_the_named_olt_only(self):
         store = FakeStore(targets=[target(id=8), target(id=9, name="HILL-OLT")],
@@ -393,10 +322,6 @@ class ScrapeOneTest(unittest.TestCase):
         self.assertEqual(res[0], 9)
 
     def test_an_ineligible_device_records_NOTHING(self):
-        # Not in the target list at all — no recipe, no roster, no login, no
-        # probe, or the org has no tunnel. A status row reports an ATTEMPT, so
-        # writing "you can't read this" would erase the last thing that really
-        # happened on this OLT. The route refuses such a device up front.
         store = FakeStore(targets=[target(id=8)], creds=CREDS)
         self.assertIsNone(sweeper(store, FakeProxy()).scrape_one("byreddy", 99))
         self.assertEqual(store.status, [])
@@ -411,7 +336,6 @@ class ScrapeOneTest(unittest.TestCase):
         self.assertFalse(s.busy(8))
         s._lock_for(8).acquire()
         self.assertTrue(s.busy(8))
-        # ...and reading it did not take the lock away from whoever holds it
         self.assertTrue(s.busy(8))
 
 

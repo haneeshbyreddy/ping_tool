@@ -1,7 +1,3 @@
-"""Live-server tests for the inbound WhatsApp webhook (server.py transport
-special-case). Covers the Meta GET handshake and the POST signature gate — the
-two things Meta itself checks. The bot dispatcher is a separate follow-up; here
-a signed POST need only ack 200."""
 import hashlib
 import hmac
 import http.client
@@ -32,7 +28,6 @@ class WhatsappWebhookTest(unittest.TestCase):
             central_db=Path(self.tmp.name) / "central.db",
             central_bind="127.0.0.1", central_port=0)
         self.store = CentralStore(self.cfg.central_db)
-        # config lives in app_settings, read fresh per request (no restart)
         self.store.set_setting("whatsapp_verify_token", VERIFY)
         self.store.set_setting("whatsapp_app_secret", SECRET)
 
@@ -66,14 +61,13 @@ class WhatsappWebhookTest(unittest.TestCase):
         conn.close()
         return resp.status, body
 
-    # -- GET handshake --------------------------------------------------------
 
     def test_verify_echoes_challenge_on_match(self):
         status, body = self._get(
             "/whatsapp/webhook?hub.mode=subscribe"
             "&hub.challenge=CHALLENGE_42&hub.verify_token=" + VERIFY)
         self.assertEqual(status, 200)
-        self.assertEqual(body, b"CHALLENGE_42")   # RAW challenge, plain text
+        self.assertEqual(body, b"CHALLENGE_42")
 
     def test_verify_rejects_wrong_token(self):
         status, body = self._get(
@@ -88,7 +82,6 @@ class WhatsappWebhookTest(unittest.TestCase):
             "&hub.challenge=X&hub.verify_token=" + VERIFY)
         self.assertEqual(status, 403)
 
-    # -- POST signature gate --------------------------------------------------
 
     def _sign(self, raw: bytes) -> str:
         return "sha256=" + hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest()
@@ -112,14 +105,12 @@ class WhatsappWebhookTest(unittest.TestCase):
 
 
 class WhatsappWebhookNoSecretTest(unittest.TestCase):
-    """With no app_secret configured the signature check is SKIPPED (open-ingest
-    convention) so the operator can smoke-test before wiring the secret."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
                           central_bind="127.0.0.1", central_port=0)
         self.store = CentralStore(self.cfg.central_db)
-        self.store.set_setting("whatsapp_verify_token", VERIFY)  # but NOT app_secret
+        self.store.set_setting("whatsapp_verify_token", VERIFY)
         self.server = make_server(self.cfg, self.store)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

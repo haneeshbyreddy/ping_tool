@@ -39,25 +39,14 @@ class CentralAlertDispatcher:
                                   audience=self.audience)
 
     def _recipients(self, device_id: int | None = None) -> list[str]:
-        # Owners plus the WORKERS RESPONSIBLE for this device — its own assignees
-        # or those inherited from an ancestor (central/assignment.py). A device
-        # nobody has been assigned reaches every worker, exactly as before that
-        # feature existed, so this can only ever narrow a page deliberately.
-        # No device (an uplink freeze) means the whole org audience.
-        # The superadmin ops number is in neither: it carries only platform-level
-        # pings, not each org's device pages (2026-07-25).
         return self.audience.for_device(device_id)
 
     def _label(self, device_id: int | None = None) -> str | None:
-        # What alert_log.recipient records — the numbers actually paged, so the
-        # log shows a narrowed audience rather than the org's full roster.
         return ",".join(self._recipients(device_id)) or None
 
     def _publish(self, role: str, title: str, body: str, priority: int, *,
                  device_id: int | None = None,
                  facts: WhatsAppFacts | None = None) -> NotifyResult:
-        # `role` is kept for call-site clarity but no longer routes — an alert
-        # reaches owners plus whoever is responsible for the device.
         return self._broadcast(title, body, priority, device_id=device_id,
                                facts=facts)
 
@@ -129,8 +118,6 @@ class CentralAlertDispatcher:
             self.org_id, ev.device_id) == UNREACHABLE
 
         if not was_suppressed:
-            # Same audience the DOWN page went to — whoever was told it broke is
-            # who gets told it's back.
             self._broadcast(
                 f"✅ Restored: {dev.name} ({dev.region})", "", 3,
                 device_id=ev.device_id,
@@ -174,9 +161,6 @@ class CentralAlertDispatcher:
         elapsed = self._fmt_elapsed(row["started_at"], ts)
         ack = (f"acked by {row['acknowledged_by']}"
                if row["acknowledged_by"] else "unacked")
-        # The initial DOWN already pushed to the phone; the hourly re-nag folds
-        # into the digest (kept off the push tier by operator choice) so a long
-        # outage resurfaces once an hour without buzzing all night.
         self.router.emit(
             "HOURLY_ESCALATION",
             title=f"⏰ STILL DOWN ({elapsed}): {dev.name} ({dev.region})",

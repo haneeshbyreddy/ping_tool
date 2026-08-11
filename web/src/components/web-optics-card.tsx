@@ -1,19 +1,3 @@
-// Web-UI optics vendor recipes — the third profile card, and the one that
-// decides whether an OLT whose per-ONU Rx exists in NO SNMP OID can be read at
-// all.
-//
-// Its sibling cards teach the EDGE new OIDs. This one teaches CENTRAL a page:
-// some firmware (C-Data/DBC EPON, proven by sweeping the whole vendor ONU tree
-// twice) answers optical diagnostics only by querying each ONU live when you
-// open its web page, and stores nothing an SNMP walk could reach. Central reads
-// that page over the probe's existing tunnel, so a recipe here needs no probe
-// update — it takes effect on the next sweep.
-//
-// The form is deliberately long and deliberately literal. Every field is a
-// thing you can SEE in a browser's network tab while logging into the box once,
-// and the server refuses the whole profile rather than accepting a plausible
-// half of it: a recipe that parses the wrong column produces a confident,
-// wrong dBm, which sends a splicing crew to a house whose fibre is fine.
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -31,7 +15,6 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 
-// What each scraped column means, in the tech's words rather than the schema's.
 const FIELD_HELP: Record<string, string> = {
   onu_ref: "required · the cell holding the ONU's identity, how a data row is told from a heading",
   serial: "required · MAC address, what a reading is matched to a subscriber by",
@@ -100,9 +83,6 @@ function ProfileForm({ org, editing, vocab, example, onDone }: {
   const setCol = (i: number, patch: Partial<ColRow>) =>
     setCols((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)))
 
-  // Prefill from the one worked example. Far more useful than an empty form:
-  // it is a real, field-verified recipe, so "what does a correct one look
-  // like?" is answerable without leaving the page.
   const loadExample = () => {
     if (!example.optics_path) return
     setLoginPage(example.login_page_path ?? "")

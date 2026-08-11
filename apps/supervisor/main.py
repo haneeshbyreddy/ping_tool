@@ -31,10 +31,6 @@ def _current_version() -> str:
 
 def _download(url: str) -> Path:
     import httpx
-    # Central now mirrors release binaries and hands back a central-relative URL
-    # (/download/<ver>/<name>) so the private GitHub repo stays out of the fleet's
-    # reach. Resolve it against the same central this edge already reports to.
-    # Absolute URLs (legacy directives, or a CDN) still pass through untouched.
     if url.startswith("/"):
         url = CONFIG.central_url.rstrip("/") + url
     dest = Path(CONFIG.db_path).parent / "agent.download"

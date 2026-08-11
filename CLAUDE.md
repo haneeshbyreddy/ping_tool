@@ -1551,8 +1551,9 @@ construction: it rides the web-proxy tunnel the edge already serves — no edge 
 
 ### Topology extras
 
-- **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` = splitter/coupler/fdb/
-  closure — `coupler` is the ISPs' own word for a joint box and is what a cable end lands on),
+- **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` = splitter/closure/fdb —
+  a `closure` is the joint box a cable end lands on; `coupler` lingers in the tuple, unused and
+  uncreatable, because removing a type promotes any surviving row to gear that can page),
   NOT a second registry — parent chains, map pins and routes all come free. `ip_address` stays
   `''`; validation rejects an IP/probe on a passive and a PASSIVE PARENT for a monitored device
   (passive-under-passive is fine — plant hangs below gear). Containment is
@@ -2800,11 +2801,13 @@ the old model creeps back.
   `onu_places` is keyed (org, mac) and has no stable id to point at. `fiber.py` treats a
   point as an opaque hashable and never looks inside one, which is what lets its walks be
   tested against plain tuples.
-- **`coupler` joined `PASSIVE_TYPES`, and it is the ISPs' OWN WORD** for the joint box.
-  Not a synonym for `closure` bolted on for taste: a cable end has to land on something,
-  laying one creates a coupler at each end that lands on empty ground, and a vocabulary an
-  operator has to translate their own plant into is the first place a survey stalls.
-- **A cable ends on WHATEVER IT IS DROPPED ON** — a coupler, an OLT, a splitter, a
+- **THE JOINT BOX IS A `closure`.** This line used to read *"`coupler` is the ISPs' OWN
+  WORD"* — it was not, it was ours, and it was corrected on 2026-08-11; see THE RECORD STARTS
+  FULL below for the rename and why the type is nevertheless kept in the tuple. The reasoning
+  around it survives intact: a cable end has to land on something, laying one creates a box at
+  each end that lands on empty ground, and a vocabulary an operator has to translate their own
+  plant into is the first place a survey stalls. Only the word was wrong.
+- **A cable ends on WHATEVER IT IS DROPPED ON** — a closure, an OLT, a splitter, a
   customer (operator's call). Taken literally, "always between two couplers" would mean a
   second pin beside every OLT, splitter and customer: 76 extra marks on the current fleet.
   The rule it was really protecting — *a line must never appear because of a setting* — is
@@ -2820,18 +2823,322 @@ the old model creeps back.
   THROUGH a customer is dropped rather than reported: the walk follows a daisy chain
   correctly, but that map is device→device and there is no id to name a subscriber with.
 
+**A FIBRE LANDS ON A PORT** (2026-08-10, the ISPs' second correction, on first contact
+with the map: *"when I select an OLT it should show me ports, that's what we connect"*).
+A termination said only "into the box standing here", so an 8-PON OLT with eight fibres
+on it drew eight identical rows and the record could not name a single PON. It is the
+noun the segment model was missing, and the ISPs' two points — this, and opening a
+closure mid-span — turned out to be one point: **what you connect to is a port**.
+
+- **A PORT IS AN ATTRIBUTE, NOT A TABLE** (`fiber.PORT_KINDS` = `pon | leg | in`, two
+  nullable columns on `org_fibre_joints` + `onu_drops.leg_no`). The enumeration is
+  DERIVED (`fiber.port_slots`) — a splitter's ports are its `split_inputs` and
+  `split_ratio`, an OLT's are the PONs it reports — so a registry of rows nobody creates
+  would be `org_cable_runs`/`org_cable_taps`/`org_splices` for a fourth time. **Additive:
+  nothing rebuilt, nothing wiped**, and every joint written before it reads "port not
+  recorded", which is what it is.
+- **IT IS NOT AN INTERFACE, and must never become a `switch_ports` row.** That table is
+  the WALK's view of an ifTable row — upserted every sweep, keyed on `if_index`, and read
+  by `ports.py`, **which pages**. Ports here exist on boxes with no SNMP at all (three
+  OLTs on the live fleet walk nothing, and no splitter ever will) and may never alarm.
+  Where a box does walk its PONs the two are matched for display and never merged.
+- **AN ENCLOSURE HAS NO PORTS, and that is what kept this change small.** A coupler, a
+  closure and an FDB are boxes where sheaths are OPENED: every fibre in one is a splice,
+  and the schedule already answers for them. **So the tray has TWO ORDERINGS of one
+  read** — at a coupler the rows are CORES (*what does each fibre do*), at a box they are
+  PORTS (*what is on each one*). A SECTION, never a mode: a box can genuinely have both,
+  and a view you must choose before you can ask a question is what the two-column tray
+  was retired for. The panel that was wrong was never the coupler's.
+- **BOUNDED WHERE WE HOLD THE FACT, UNBOUNDED WHERE WE DO NOT** (`fiber.port_bound`).
+  `leg`/`in` are bounded by the ratio — leg 9 of a 1:8 is a typo we can prove — and
+  **`pon` is deliberately unbounded**, because nothing tells us how many PONs a box has
+  and refusing PON 9 would be refusing the operator's own sight of it. So an SNMP-silent
+  OLT gets a row to NAME a port (`port_add`), or that promise lives only in a docstring.
+- **NAMING A PORT IS PROMPTED, NEVER REQUIRED** (operator's call). A tech at a closure
+  routinely cannot see which PON the far end took, and refusing the write would trade the
+  connection we could record for a port number we cannot. `port_taken` (one port, one
+  fibre) and `port_splice` (a port belongs to a termination, not to a splice inside the
+  sheath) are the two new named refusals.
+- **THE PON A BOX IS ON IS NOW WALKED, NOT TYPED** (`fiber.pon_of_points` →
+  `store.org_fibre_pon_map` → `OrgDevice.fibre_pon`). This is what the port PAYS BACK and
+  the reason the record stops being write-only documentation: `org_devices.pon_port` is
+  free text filled in on THREE of the forty-seven splitters on the live fleet, and a fibre
+  landed on PON 3 answers the same question for every box below it, inherited down the
+  plant chain. **It never overwrites the typed field** — one is the operator's claim, one
+  is the record's, and the splitter panel shows BOTH when they differ, because a
+  disagreement is a mis-recorded splice or a re-patched port, i.e. a finding rather than a
+  conflict to resolve silently. Two PONs reaching one box reads `ambiguous`, never a pick.
+- **A ROSTER LABEL AND AN INTERFACE NAME ARE PARSED BY DIFFERENT RULES**
+  (`fiber.pon_index` vs `pon_index_of_interface`), and this was found by rehearsing
+  against production rather than by review: read permissively, `GE0/9`, `GE016` and
+  `VLAN10` are PON ports — so two 8-PON OLTs offered SIXTEEN and an Ethernet uplink became
+  somewhere to land a subscriber's fibre. **The source decides the rule**: every row of
+  `onu_optics` is an ONU on a PON, so a bare `3` there is one (the Syrotech build writes
+  it that way); an interface name is one only if it SAYS so. The list is a SET, never a
+  range — HILL-OLT-1 really runs 1,3,4,…8, and a stray `60` from a partial walk costs one
+  odd row instead of fifty-two invented ones.
+- **A DROP IS A FIBRE ON A LEG, and `onu_drops` is not being merged into anything.** It is
+  live, it carries the map's drop geometry and branch-fault localization runs on it — so
+  the leg rows REPORT it (read-only; recording stays the splitter's bulk dialog, or one
+  drop gets two ways to be written) and `leg_no` is sparse and optional. A drop with no leg
+  is stated outright on the panel rather than left to be inferred from legs that look empty.
+- Tests: `unit/test_fiber:PortTest`/`PonReachTest`, `integration/test_central_cableplant:
+  PortTest` (both orderings, both refusals, the unbounded PON, the SNMP-silent OLT, the
+  drop-on-a-leg, the derived PON and its inheritance, and the engine-fingerprint guard).
+
+**CONNECT A PORT STRAIGHT TO A BOX — the gesture the whole subsystem was missing**
+(2026-08-10, the operator's third correction and the sharpest: *"first we had to create
+couplers, then connect, then go to that device and configure the usage — way too round
+about"*). Recording *"Gpon_04 PON 2 feeds SPL-5"* took **EIGHTEEN interactions across three
+panels**: trace a route, name it, pick a fibre count, then open each box in turn and pick a
+cable and a core on each. Every one of those existed because every write started from a
+CABLE — correct about plant, backwards about work. It is now **four**: open the box, click
+the port, pick the box, done.
+
+- **ONE MENU ON THE PORT ROW, TWO WAYS TO ANSWER IT** (`SourceMenu`). *A core of a cable
+  already landing here* — right at a closure with a 24F in it — or *a box*, and the cable is
+  laid and landed at both ends in one write (`POST /api/inventory/fibre/connect` →
+  `store.connect_points`). Nearest-first with the distance printed, refusing nothing, exactly
+  as the tail picker does.
+- **A MACRO, AND IT MUST STAY ONE.** It writes the rows a patient operator could write by
+  hand — a cable between the two points, a termination at each end — so `trace`,
+  `split_org_cable`, the delete cascade and the tray's own refusals need no knowledge that a
+  shortcut exists. The moment it records something the tray cannot, there are two models of a
+  connection again.
+- **THE CABLE IS 1F AND NAMED FOR THE CONNECTION** (`Gpon_04 PON 2 → SPL-5`). One core out to
+  a box is one strand; an operator with a real 12F feeder raises the count on the cable panel
+  and the other eleven cores become available to the port rows at both ends, which is one
+  sheath carrying eight PONs. Naming it for the PORT is what tells eight of them apart — the
+  lesson `_tail_name` already paid for.
+- **THE FAR END LANDS ON THE ONLY PORT IT COULD** (`_sole_input`). A feed into a splitter with
+  ONE input has exactly one place to go, so recording it there is not a guess — it is the only
+  port that exists, and leaving it blank would make the operator open a second panel to state
+  something the schema already fixes. A 2:N splitter has a real choice and gets nothing.
+- **A LEG CONNECTS STRAIGHT TO A CUSTOMER, through the drop `onu_drops` already owns**
+  (`leg_no`, sparse). One drop keeps exactly one home — the map's drop line and branch-fault
+  localization are untouched — this is a second door to it, not a second store. **The bulk
+  dialog sends no leg at all, so a leg is only ever SET by that write and never cleared**, or
+  re-saving the whole set (the idempotent case it depends on) would wipe what was recorded a
+  leg at a time. A RE-HOME does clear it, for the reason it clears the traced route.
+- **THE LIKELIEST ANSWER GOES FIRST, and what that is depends on the PORT.** On a leg it is a
+  customer — and the splitter's OWN legless drops before any other, because that is the list
+  the panel is complaining about two lines below. On a PON or an input it is a box.
+- **THREE PLACES THE OLD ORDERING WAS STILL HIDING THE NEW GESTURE**, all found in a browser
+  and none visible in review: the fold defaulted CLOSED on gear and its closed line read *"no
+  cable recorded"* (a sentence about plant, on the one control that connects a PON without
+  any — an operator has no reason to open that); and BOTH the panel and the tray short-
+  circuited an empty cable list to *"Lay one on the map"*, rendering that instead of the port
+  list. The closed line now counts PORTS, the fold opens on a box that has them, and the
+  empty-cable message only speaks where there is neither a cable nor a port.
+- **A PORT ROW NAMES WHERE THE FIBRE GOES, NOT THE SHEATH IT GOES IN.** Standing at Gpon_04
+  on PON 1, "Gpon_04 PON 1 → RAJINI HOSPITAL" repeats the row back at you and truncates the
+  only new word in it. Same rule the schedule keeps for a tail; the cable's name stays one
+  hover away.
+- **THE CORE SCHEDULE FOLDS AWAY ON A BOX** and opens where there are no ports — the
+  enclosures it was built for. At an OLT the port list is the answer, and a second table open
+  underneath made the operator read two of them to find which question they had asked.
+- Tests: `integration/test_central_cableplant:PortTest` (one call landing both ends, the
+  ambiguous 2-input splitter, the shared refusals, that it writes only rows the long way
+  could, and that a bulk drops write never wipes a leg).
+
+### THE RECORD STARTS FULL (2026-08-11) — why five correct fixes changed nothing
+
+Between 2026-08-08 and 2026-08-10 this surface was corrected FIVE times, each time
+correctly, and the fifth ended *"we have been working on this small thing for way too
+long."* The reason none of them worked is in production, not in the code:
+
+- **badri_fiber laid FOUR cables in 36 minutes on 2026-08-10 and recorded ZERO fibre.**
+  Every one produced two phantom couplers (`Syrotech JC1`/`JC2`, …); one was deleted;
+  all eight were near-misses on real boxes (3.3 m from Gpon_04, 2.8 m from the striker
+  splitter, 8.2 m from SPL-Pon2, 13 m from customer ARUN G). They were drawing cables
+  BETWEEN BOXES ALREADY ON THE MAP.
+- **The only fibre joints that have ever existed in prod are the two Haneesh made
+  testing, seven minutes before writing the brief** — both with `port_kind` NULL.
+- **Under the previous model it was the same**: every ISP-visible cable row came from a
+  migration; the only hand-made ones were four abandoned tests.
+- Meanwhile `parent_device_id` already held **all 44** of badri_fiber's splitter feeds
+  and all 15 of byreddy's.
+
+**The diagnosis: we were asking the operator to build their network a SECOND TIME, in
+glass, in a vocabulary they did not have — when they had already built it once, in
+`parent_device_id`, in one they did.** `Gpon_04 feeds SPL-5` was recorded weeks ago; the
+only genuinely missing fact was WHICH PON, and we were asking for three. Every previous
+fix made the second act of recording cheaper. None asked why there was a second act.
+
+- **So the panel OPENS FULL** (`fiber.undrawn`, `store._undrawn_here`, `PointFibre.undrawn`).
+  A box lists the connections its own topology claims and has no fibre for, each asking the
+  one open question, under the heading *"On the network map, not yet in the fibre"*.
+  Confirming one is **two clicks** (Connect… → PON 2) and writes the cable and both
+  terminations. Measured on prod's own data: Gpon_04 opens with 8 rows, HALIYA-LAN-SW with 1.
+- **A DRAFT, NEVER A CLAIM.** Nothing is stored until a row is confirmed; `parent_device_id`
+  is READ and never written, by this or by anything downstream of it. Same standing as the
+  outage-assign dialog marking accounts already responsible: a suggestion, never a filter and
+  never an auto-assignment. A declared edge may equally be copper or a rack patch, which is
+  why the heading says whose claim it is. `test_the_DRAFT_IS_NEVER_A_CLAIM`,
+  `test_CONFIRMING_one_never_reaches_the_engine_either`.
+- **The picker is ordered by the DECLARED TOPOLOGY, then distance** (`TrayBox.declared`,
+  rendered as "on the map"). Nearest-first alone put the three junk couplers left over from
+  the abandoned traces at the TOP of Gpon_04's menu while SPL-Pon2, SPL-5 and SPL-4 — the
+  boxes the operator had already recorded as fed by it — sat scattered below by metres.
+- **GLASS RECORDED THROUGH A CLOSURE IS RECORDED** (`fiber.connected_points(cables, through)`).
+  `Gpon_04 → JC-1 → SPL-5` IS the fibre between those two boxes — a closure is where the
+  sheath is opened, not another place the light stops — so a draft that only subtracted DIRECT
+  cables would ask for a pair somebody had just finished recording, and clicking it would lay
+  a second parallel cable. **The hop set is ENCLOSURES, never gear**, and that bound is the
+  whole safety of it: plain reachability would mark every splitter under an OLT connected the
+  moment its trunk was recorded, dropping every genuine last hop — over-suppression, which is
+  worse than the duplicate it prevents.
+- The closed fold counts it too (`FibrePanel.todo`, computed by map-page from the device and
+  cable lists it already holds). The fold's own read is gated on being OPEN, and a closed fold
+  reading "nothing recorded yet" on a box owing eight connections is the documented failure
+  that hid this feature once already — nobody opens a control that advertises emptiness.
+
+**EVERY BOX HAS PORTS** (`PORT_KINDS` gains `port`; `fiber.port_slots`/`port_kind_for`,
+`store.device_ports`). `port_slots` returned `[]` for a switch, a router, a gateway and a
+CPE, so a fibre walked all the way to one had nowhere to land — *"go and set the port on
+that device"* was a **dead end on the very gesture that had just become one click**. A port
+is a thing on the box, not a property of which of our tables the box came from.
+
+- **A switch's ports are the interfaces it already walks**, read through `fiber.if_port_no`,
+  which takes the number off the END of the name because that is what is silkscreened on the
+  metal. **NOT the ifIndex** — `gigabitEthernet 1/0/5` is 49157 on HALIYA-LAN-SW, a number
+  written on nothing. The walk's own string rides along as `device_label` for display, matched
+  and never merged, the rule a PON already keeps.
+- A VLAN, loopback, bridge or port-channel is REFUSED (`_VIRTUAL_IF`) — the same failure
+  `pon_index_of_interface` was fixed for, where a permissive read made `VLAN10` somewhere to
+  terminate a subscriber.
+- **An ENCLOSURE still has none**, and that half is unchanged: a coupler is where sheaths are
+  OPENED, every fibre in one is a splice, and the schedule answers for them.
+- **`port` and `pon` are both UNBOUNDED**: a walk listing 28 interfaces is a floor, not a
+  ceiling, and four OLTs on this fleet report none at all. A number is refused for being
+  impossible (leg 9 of a 1:8), never for being unusual.
+
+**BOTH PORTS IN ONE GESTURE** (`to_port_kind`/`to_port_no`, `BoxItem`'s submenu, `PortPick`'s).
+Naming only the near port left a second trip to the far box's panel — the exact complaint that
+had just been fixed, reported straight back in the other direction within a day. Optional at
+every layer, because a tech at a closure routinely cannot see which PON the far end took, and
+refusing the write would trade the fact we can record for one we cannot.
+
+- **A FAR PORT IS ASKED ABOUT ONLY WHERE THERE IS A CHOICE** (`askFarPort`). The commonest
+  draft by far is an OLT feeding a 1-input splitter, and there the far end is not a question —
+  `_sole_input` lands it on the only port that exists. A submenu there would be one more click
+  to confirm the only possible answer, on the gesture this surface has been corrected five
+  times for being too long. A switch, an OLT or a 2-input splitter gets the submenu.
+- **`boxOf` resolves ANY box, not the capped nearest-first `boxes`.** The cap keeps a picker a
+  menu; a drafted connection routinely names a box well outside the twelve nearest, and its
+  ports still have to be offerable.
+
+**EVERY BOX'S PORTS ARE ONE ORG-WIDE READ** (`store.org_device_ports`, `GET
+/api/inventory/fibre/ports`). `point_fibre` answers for the box you are STANDING AT, and every
+gesture on that panel also names a box somewhere else — so the SPA was deriving what it could
+(a splitter's legs, from its ratio) and offering a bare number field for everything else. At a
+closure taking a core out to an OLT that is **"ports are not being detected"**, reported
+2026-08-11. A port list is a fact about a box, so it is available wherever a box is named. Four
+queries, same derivation as `point_fibre` — a second rule would offer a port the panel refuses.
+
+- **NOT `/api/inventory/ports`, and that near-miss is the lesson.** That path had been the
+  per-device SNMP port list for weeks, and **a duplicate key in a dict literal loses SILENTLY**
+  — the new route was in the source, reviewed, typechecked and shipped while answering somebody
+  else's handler, three layers from the symptom. `unit/test_routes` parses `api/__init__.py`'s
+  SOURCE (the built dict has already collapsed) and fails on any repeat; all three of its
+  assertions fire on the real bug.
+
+**THE JOINT BOX IS A `closure`, NOT A `coupler`** (operator, 2026-08-11). `coupler` entered on
+2026-08-09 under a note in this file claiming it was *"THE ISPs' OWN WORD"*. It was not — it was
+ours, and every cable traced on the map stood two of them at its ends, so the word was on screen
+constantly. The whole argument for choosing it was that a vocabulary an operator has to
+translate their own plant into is the first place a survey stalls; the argument was right and
+the word was wrong. **A claim in a comment that a word is theirs is not evidence that it is** —
+the same failure as the night-style comment that claimed highway geometry had been neutralised
+when it was still stock tan.
+
+- Nothing creates a coupler now (`split_org_cable`, the trace's end-creation) and no surface
+  says it; `store._couplers_are_closures` renames the rows. Provably safe rather than
+  apparently: every coupler row that ever existed in production was auto-created by a cable
+  trace — four of them, all `<cable> JC1`/`JC2` — so nobody's choice is overridden. Nothing is
+  deleted, both words were already enclosures, and one column changes.
+- **`coupler` STAYS in `PASSIVE_TYPES`/`PASSIVE_DEVICE_TYPES` FOREVER, and that is not
+  tidiness — it is the safety property those lists exist for.** Removing a type PROMOTES any
+  surviving row of it to monitored gear: into `org_device_topology`, with an FSM and the
+  ability to page. A DB restored from an older backup is exactly that row. The word is retired
+  from what an operator ever sees; the type is kept so a straggler stays silent plant.
+  `plantmenu.PASSIVE_WORD` maps it to "closure" so such a row still renders honestly.
+
+**A CABLE NOBODY LAID IS NOT A CABLE** (`fiber.is_plumbing`, `TrayCable.plumbing`) — the
+vocabulary fix, made ONCE instead of at each of the six call sites that print a cable. The
+connect and tail macros write a real 1F cable, because a fibre between two points IS one.
+What was wrong is that they NAMED it, and a name has to be shown: so the panel of the box
+called HALIYA-LAN-SW read **`1F a1 core 1 → HALIYA-LAN-SW`**, a coupler's schedule read
+**`on a tail`**, and the operator asked what a tail was. Every one of those strings is this
+codebase's bookkeeping read aloud to somebody who asked about their network.
+
+- Plumbing = **unnamed AND ≤1 core AND untraced**. It is never listed as a cable, never
+  labelled on the map, never offered in a picker, never counted; the connection is reported
+  as **the box at the far end**, which is what the operator said. Its core number is dropped
+  too — "core 1 of 1" is our row numbering, not a strand a splicer picks out of a tube.
+- It stops being plumbing the instant somebody makes it an object — names it, raises the
+  count, traces it — and NO DATA CHANGES when that happens.
+- `_connect_name`/`_tail_name` are **DELETED** and must not come back.
+  `store._unname_plumbing` clears the names they already wrote: **not a migration and not a
+  deletion** — every cable, end and joint survives, one column this code wrote goes back to
+  empty. It **rebuilds the template from the row's own ends and clears only on an EXACT
+  match**, because an operator may legitimately name a cable `JC1 → OLT` and a heuristic on
+  the arrow would erase it. Verified on a copy of prod: 1 machine name cleared, all 4
+  operator-laid names kept.
+- **MIND THAT `path` IS `None` IN PYTHON AND `[]` IN THE SPA.** `![]` is `false`, so the
+  obvious mirror marked every cable a sheath and the whole rule silently did nothing. It
+  shipped that way and was caught in a browser, on a coupler reading `6F a1 · 1F`. A
+  `TrayCable` carries no `path` at all, which is why the server ships the `plumbing` FLAG and
+  no surface re-derives it.
+
+**A RUN OF EMPTY PORTS COLLAPSES**, exactly as a run of free cores does one table down and
+for the reason the schedule already states: twenty-four identical lines are not information.
+Found only in a browser — an OLT has 4 PONs and enumerating them is the ISPs' own ask, but
+HALIYA-LAN-SW walks **28**, and giving each its own "Connect…" turned the dead end into a
+wall. A port with something on it never collapses; the collapsed row still carries its own
+Connect and names the port it acts on.
+
+**VOCABULARY: whose word is it?** Kept because a splicer says them — *coupler, closure,
+splice, straight through, core, tube, 24F, leg, PON, drop*. Removed because only we said
+them — *"on a tail"* (gone with the naming), *"not recorded"* on a port (now the verb,
+**"Connect…"** — a row describing its own emptiness invites nothing), *"Core plan · 0 cables
+here"* (a count of nothing in our filing word, on a panel whose whole point is that no cable
+is needed → **"Splices in the 24F trunk"**, and absent when there is no sheath).
+
+Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`),
+`integration/test_central_cableplant` (`TheRecordStartsFullTest`, `EveryBoxHasPortsTest`).
+
 **THE FIVE GESTURES.** Each is one action; there are no create-then-attach chains.
 
 1. **Lay a cable.** Right-click → *Trace a cable from here*, or *Lay a cable* in the cable
-   list. Click along the street; a click within `SNAP_PX` (24, the same screen-space budget
-   the edit-pins drag uses) snaps onto a pin and RECORDS WHICH — `RouteEdit.endA`/`endB`,
-   set as they are clicked and never inferred afterwards from coordinates, because two
-   boxes racked at one point would be indistinguishable and "near enough" is the kind of
-   threshold this map has been wrong about three times. One sheet then asks for a name and
-   a fibre count (a row of chips, not a select — the count is read off a drum tag). **An
-   end that landed on open ground becomes a COUPLER**, which is what makes "a cable runs
-   between two couplers" true by CONSTRUCTION rather than by a rule.
-2. **Open a coupler mid-span** (`cablepath.split`, `POST /api/inventory/cable/split`). The
+   list. Click along the street; a click that lands on a pin snaps to it and RECORDS WHICH
+   — `RouteEdit.endA`/`endB`, set as they are clicked and never inferred afterwards from
+   coordinates, because two boxes racked at one point would be indistinguishable. One
+   sheet then asks for a name and a fibre count (a row of chips, not a select — the count
+   is read off a drum tag). **An end that landed on open ground becomes a COUPLER**, which
+   is what makes "a cable runs between two couplers" true by CONSTRUCTION rather than by a
+   rule.
+   - **THE SNAP HAS TWO BUDGETS AND THE LARGER WINS** (`SNAP_PX` 24 / `SNAP_M` 8), and one
+     budget cost this feature its first two real users. On 2026-08-10 badri_fiber traced
+     two cables and abandoned both within minutes: `Syrotech JC1` was written **3.3 m from
+     the Gpon_04 OLT** and `Dbc JC1` **2.8 m from the striker splitter**. They were
+     starting the cable AT the box; what they got was a junk joint box beside it and a
+     cable attached to nothing. Two defects, both silent: the budget was measured from the
+     pin's ANCHOR while the operator aims at the DOT ~12 px above it (`MARK_DY_PX` — the
+     offset `linkhover` had already measured and nothing else used), and a pixel budget
+     shrinks in ground terms as you zoom IN, so at z21 — where you zoom to trace a street
+     properly — 24 px is 1.7 m. Pixels are right for a cursor affordance; whether a cable
+     ENDS ON A BOX is a fact about the ground. Taking the larger keeps both and can only
+     ever widen, so no zoom that snapped before stops snapping.
+   - **THE BANNER NAMES WHAT EACH END CAUGHT, WHILE THERE IS STILL TIME TO UNDO.** It used
+     to name neither: the first and only mention was the naming sheet, after the geometry
+     was drawn and the operator was already in "name it and be done" mode. Plain words
+     ("open ground"), never a warning tone — ending mid-street is the ordinary case.
+   - **A NEAR MISS IS ASKED ABOUT, NOT GUESSED** (`NEAR_MISS_M` 25). An end on open ground
+     with a box within 25 m offers *"Starts 3 m from Gpon_04 — land it there"*. Widening a
+     threshold always has a wrong side; noticing does not. Accepting moves the END and
+     **never the geometry** — the route stays where it was walked.
+2. **Open a closure mid-span** (`cablepath.split`, `POST /api/inventory/cable/split`). The
    segment is cut at the click, a coupler stands at the cut, **every core is spliced
    straight through**, and the joints at each far end move to the half that still reaches
    them. This is what keeps segment-per-span from being a tax: a crew tapping a street does
@@ -2840,6 +3147,19 @@ the old model creeps back.
    the answer for every fibre nobody had got round to recording. It is the physical default
    and every one of them is clearable in the tray. Both halves keep the drum's NAME; the
    ends tell them apart. Cutting at an extreme end is refused rather than making a stub.
+   - **IT IS OFFERED WHERE THE OPERATOR IS POINTING** (the map's right-click menu,
+     `CUT_SLACK_PX`), and named for the JOB rather than for the row it writes. The ISPs
+     asked for this and it was ALREADY BUILT — as the cable panel's "Open a coupler" — but
+     the polyline is `interactive={false}` (it must stay so, or it swallows the placement
+     clicks this map is also for), so reaching it meant knowing to click the cable's name
+     chip first. A capability nobody can find is indistinguishable from one that is
+     missing. "Coupler" is the row; "closure" is what a crew straps to a pole.
+   - **AN UNTRACED CABLE CAN BE OPENED TOO.** The cut needs a line, so with no route the
+     honest line is the CHORD between the two recorded ends — the dashed line the map is
+     already drawing, and the one that was just pointed at. Refusing made "put a closure
+     in this cable" depend on somebody having walked the street first, which is the wrong
+     way round: the closure is usually why they went. Both halves stay UNTRACED, so
+     neither inherits a surveyed look it has not earned.
 3. **Splice** (`components/coupler-tray.tsx`) — **A SPLICE SCHEDULE: ONE ROW PER FIBRE, and
    the destination lives ON THE ROW.** The two-column facing-pages tray is GONE (2026-08-10),
    and the reason is a real ask it could not serve: *core 1 to OLT1, core 2 to OLT2, core 3 to

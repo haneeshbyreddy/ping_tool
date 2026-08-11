@@ -13,10 +13,6 @@ import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog"
 
-// A curated shortlist for the "walk this branch" picker — the whole point is that
-// an operator onboarding a new vendor doesn't need to know OIDs by heart. Enterprise
-// = the vendor's private tree (where cheap gear hides CPU/temp); system = the identity
-// leaves you always want when starting cold.
 const ROOT_PRESETS: Array<{ label: string; oid: string; hint: string }> = [
   { label: "System", oid: "1.3.6.1.2.1.1", hint: "name, descr, sysObjectID (who made it)" },
   { label: "Enterprise (private)", oid: "1.3.6.1.4.1", hint: "vendor tree; CPU/temp/RAM live here" },
@@ -35,9 +31,6 @@ function StatusPill({ w }: { w: SnmpWalk }) {
   if (w.status === "error") {
     return <span className="text-2xs font-semibold text-destructive" title={w.error ?? ""}>failed</span>
   }
-  // A truncated walk reads as a complete one unless we say so — and "that OID
-  // holds nothing" concluded from a partial dump is a false negative that costs
-  // a whole onboarding session. Warning tone, not success.
   if (w.truncated) {
     return (
       <span className="inline-flex items-center gap-1 text-2xs font-semibold text-warning"

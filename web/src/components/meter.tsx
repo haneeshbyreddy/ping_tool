@@ -1,8 +1,5 @@
 import { cn } from "@/lib/utils"
 
-/** Horizontal utilization meter — slim bar + right-aligned reading, tinted by
- * threshold (default 75/90, the central-server card's convention). `pct` drives
- * the fill; pass `value` when the reading isn't a percentage (e.g. "71°C"). */
 export function Meter({ label, pct, value, detail, warn = 75, crit = 90 }: {
   label: string
   pct: number | null

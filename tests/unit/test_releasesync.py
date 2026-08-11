@@ -41,10 +41,8 @@ class VersionTupleTest(unittest.TestCase):
 
 
 class _FakeGh:
-    """Stands in for GithubReleases: serves in-memory bytes, writes to disk on download."""
-
     def __init__(self, tag, files, *, manifest_override=None):
-        self.files = dict(files)  # name -> bytes
+        self.files = dict(files)
         if manifest_override is not None:
             self.files["manifest.json"] = manifest_override
         self.tag = tag
@@ -64,7 +62,6 @@ class _FakeGh:
 
 def _scenario(version="0.13.0", plats=("linux-amd64", "win-amd64"), *, corrupt=None,
               installers=("wisp-edge-linux-amd64.deb", "wisp-edge-setup-win-amd64.exe")):
-    """Build (files, manifest_bytes) for a release with matching sha256s."""
     files, artifacts = {}, {}
     for p in plats:
         name = f"wisp-edge-{p}"
@@ -72,7 +69,7 @@ def _scenario(version="0.13.0", plats=("linux-amd64", "win-amd64"), *, corrupt=N
         files[name] = body
         sha = hashlib.sha256(body).hexdigest()
         if corrupt == p:
-            sha = "0" * 64  # manifest claims a hash the bytes don't match
+            sha = "0" * 64
         artifacts[p] = {"url": f"https://gh/v{version}/{name}", "sha256": sha}
     for inst in installers:
         files[inst] = f"INSTALLER::{inst}".encode()
@@ -103,11 +100,9 @@ class SyncReleaseTest(unittest.TestCase):
         self.assertEqual(self.store.list_releases()[0]["version"], "0.13.0")
         rel = self.store.get_release("0.13.0")
         self.assertEqual(sorted(rel["artifacts"]), ["linux-amd64", "win-amd64"])
-        # URLs are rewritten to central-relative /download paths, sha256 preserved.
         self.assertEqual(rel["artifacts"]["linux-amd64"]["url"],
                          "/download/0.13.0/wisp-edge-linux-amd64")
         self.assertEqual(len(rel["artifacts"]["linux-amd64"]["sha256"]), 64)
-        # Binaries + installers landed on disk under the version dir.
         vdir = self.cache / "0.13.0"
         self.assertTrue((vdir / "wisp-edge-linux-amd64").is_file())
         self.assertTrue((vdir / "wisp-edge-setup-win-amd64.exe").is_file())
@@ -125,7 +120,7 @@ class SyncReleaseTest(unittest.TestCase):
 
     def test_manifest_lists_missing_asset_raises(self):
         files = _scenario("0.13.0", plats=("linux-amd64",))
-        del files["wisp-edge-linux-amd64"]  # manifest references it, but it's gone
+        del files["wisp-edge-linux-amd64"]
         with self.assertRaises(releasesync.ReleaseSyncError):
             self._sync(files)
         self.assertEqual(self.store.list_releases(), [])
@@ -156,10 +151,9 @@ class SyncReleaseTest(unittest.TestCase):
 
         gh.download = flaky
         version, n = releasesync.sync_release(self.store, cfg=self.cfg, gh=gh)
-        self.assertEqual((version, n), ("0.13.0", 1))  # publish still succeeds
+        self.assertEqual((version, n), ("0.13.0", 1))
 
     def test_missing_token_is_fine_public_repo(self):
-        # Public repo: no token = unauthenticated sync, no Authorization header.
         gh = releasesync.GithubReleases("o/r")
         self.assertNotIn("Authorization", gh._headers("application/vnd.github+json"))
 
@@ -174,14 +168,12 @@ class _RecordingNotifier:
 
     def send(self, title, body, priority=3, *, whatsapp=(), facts=None):
         self.sent.append((title, body, priority, list(whatsapp)))
-        class R:  # matches NotifyResult's .ok surface
+        class R:
             ok = True
         return R()
 
 
 class SyncAndRecordTest(unittest.TestCase):
-    """Monitor-the-monitor: sync outcome is stamped, pages fire on transitions only."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -203,11 +195,11 @@ class SyncAndRecordTest(unittest.TestCase):
         st = self.store.release_sync_status()
         self.assertTrue(st["ok"])
         self.assertEqual(st["detail"], "0.13.0")
-        self.assertEqual(self.notifier.sent, [])  # healthy from the start: no page
+        self.assertEqual(self.notifier.sent, [])
 
     def test_failure_pages_once_then_recovery_pages_once(self):
-        broken = _FakeGh("v0.13.0", {})  # no manifest.json asset
-        for _ in range(3):  # timer fires repeatedly; page only on the transition
+        broken = _FakeGh("v0.13.0", {})
+        for _ in range(3):
             with self.assertRaises(releasesync.ReleaseSyncError):
                 self._run(broken)
         self.assertFalse(self.store.release_sync_status()["ok"])
@@ -221,8 +213,6 @@ class SyncAndRecordTest(unittest.TestCase):
 
 
 class AppSyncTest(unittest.TestCase):
-    """Field-app APK mirror: fixed /download/app/ dir, store never touched."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -240,12 +230,9 @@ class AppSyncTest(unittest.TestCase):
                                 "SHA256SUMS": b"sums"})
         tag, names = releasesync.sync_app_release(cfg=self.cfg, gh=gh)
         self.assertEqual((tag, names), ("v0.1.0", ["wisp-field.apk"]))
-        # asset name preserved in a FIXED dir — the stable worker URL —
-        # and only the .apk mirrored, not every asset
         self.assertEqual((self.cache / "app" / "wisp-field.apk").read_bytes(),
                          b"apk-bytes")
         self.assertFalse((self.cache / "app" / "SHA256SUMS").exists())
-        # the store's release table (edge self-update "latest") stays untouched
         self.assertEqual(self.store.list_releases(), [])
 
     def test_unconfigured_is_a_no_op(self):
@@ -258,8 +245,6 @@ class AppSyncTest(unittest.TestCase):
             releasesync.sync_app_release(cfg=self.cfg, gh=gh)
 
     def test_app_failure_never_sinks_the_edge_sync(self):
-        # sync_and_record must publish the edge release and report success even
-        # when the app mirror is broken (here: a release with no .apk).
         broken_app = _FakeGh("v0.1.0", {"notes.txt": b"x"})
         version, n = releasesync.sync_and_record(
             self.store, cfg=self.cfg, gh=_FakeGh("v0.13.0", _scenario()),
@@ -269,8 +254,6 @@ class AppSyncTest(unittest.TestCase):
 
 
 class GithubDownloadRedirectTest(unittest.TestCase):
-    """The riskiest bit: the token must be dropped when following GitHub's 302 to S3."""
-
     def test_redirect_refetches_without_authorization(self):
         import urllib.error, urllib.request
 
@@ -289,14 +272,12 @@ class GithubDownloadRedirectTest(unittest.TestCase):
 
         class FakeOpener:
             def open(self, req, timeout=None):
-                # First hop: asset API returns a 302 to the signed blob URL.
                 seen_headers["hop1"] = dict(req.headers)
                 raise urllib.error.HTTPError(
                     req.full_url, 302, "Found",
                     {"Location": "https://blob.example/signed"}, None)
 
         def fake_urlopen(req, timeout=None):
-            # Second hop: must NOT carry Authorization.
             seen_headers["hop2"] = dict(req.headers)
             return FakeResp(payload)
 
@@ -309,7 +290,6 @@ class GithubDownloadRedirectTest(unittest.TestCase):
                 gh.download("api://asset", dest)
                 self.assertEqual(dest.read_bytes(), payload)
 
-        # header keys are title-cased by urllib
         self.assertIn("Authorization", seen_headers["hop1"])
         self.assertNotIn("Authorization", seen_headers["hop2"])
 

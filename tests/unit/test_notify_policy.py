@@ -24,8 +24,6 @@ def _ts(min_offset: float = 0.0) -> str:
 
 
 class TierTest(unittest.TestCase):
-    # tier_for still classifies every kind (the PUSH/DIGEST machinery is intact
-    # but dormant — see _ACTIVE_KINDS); these pin that classification unchanged.
     def test_snmp_kinds_digest(self):
         for k in ("PON_FAULT", "ONU_DUP_MAC", "ONU_LIMIT",
                   "PERF_DEGRADED", "ON_BACKUP", "HOURLY_ESCALATION"):
@@ -51,9 +49,6 @@ class RouterTest(unittest.TestCase):
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
         self.store.set_org("ispA", name="A")
-        # WhatsApp is the only channel; a worker number gives the org an audience
-        # so a PUSH kind has someone to page. (The admin number is deliberately
-        # NOT an org recipient — 2026-07-25 — so it can't stand in here.)
         self.wkr = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(self.wkr, "919000000009")
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
@@ -67,8 +62,6 @@ class RouterTest(unittest.TestCase):
                 "SELECT status, payload, kind FROM alert_log ORDER BY id")]
 
     def test_inactive_kind_suppressed(self):
-        # Everything but port up/down is OFF for now — PON_FAULT neither pushes
-        # nor queues to the (dormant) digest; the shell still wrote its state row.
         self.router.emit("PON_FAULT", title="fiber cut", body="x",
                          priority=3, ts=_ts(), device_id=7)
         self.assertEqual(self.notifier.sent, [])
@@ -89,8 +82,6 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(self._log_rows()[0]["status"], "suppressed")
 
     def test_no_recipients_suppresses(self):
-        # an org with no owner/worker numbers can't be paged (the admin number is
-        # not an org recipient, so clearing the team's numbers empties the audience)
         self.store.set_user_whatsapp(self.wkr, None)
         self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(), device_id=7, cooldown_min=0)
@@ -99,9 +90,9 @@ class RouterTest(unittest.TestCase):
 
     def test_cooldown_suppresses_repeat(self):
         self.router.emit("PORT_DOWN", title="t", body="x",
-                         priority=3, ts=_ts(0), device_id=7)   # cfg cooldown 30m
+                         priority=3, ts=_ts(0), device_id=7)
         self.router.emit("PORT_DOWN", title="t", body="x",
-                         priority=3, ts=_ts(10), device_id=7)  # within window
+                         priority=3, ts=_ts(10), device_id=7)
         self.assertEqual(len(self.notifier.sent), 1)
         statuses = [r["status"] for r in self._log_rows()]
         self.assertEqual(statuses, ["sent", "suppressed"])
@@ -110,14 +101,14 @@ class RouterTest(unittest.TestCase):
         self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(0), device_id=7)
         self.router.emit("PORT_DOWN", title="t", body="x",
-                         priority=3, ts=_ts(1), device_id=8)   # different device
+                         priority=3, ts=_ts(1), device_id=8)
         self.assertEqual(len(self.notifier.sent), 2)
 
     def test_cooldown_expires(self):
         self.router.emit("PORT_DOWN", title="t", body="x",
                          priority=3, ts=_ts(0), device_id=7)
         self.router.emit("PORT_DOWN", title="t", body="x",
-                         priority=3, ts=_ts(45), device_id=7)  # past 30m window
+                         priority=3, ts=_ts(45), device_id=7)
         self.assertEqual(len(self.notifier.sent), 2)
 
 
@@ -128,7 +119,6 @@ class DigestFlushTest(unittest.TestCase):
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
         self.store.set_org("ispA", name="A")
-        # a worker number gives the org an audience for the flushed digest
         w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(w, "919000000009")
 
@@ -136,8 +126,6 @@ class DigestFlushTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _queue(self, kind, title, at):
-        # The digest tier is dormant (emit no longer routes any active kind to
-        # it), so queue directly to exercise flush_digests / compose_digest.
         self.store.queue_digest("ispA", 1, kind, title, "", _ts(at))
 
     def test_not_flushed_before_interval(self):
@@ -155,7 +143,7 @@ class DigestFlushTest(unittest.TestCase):
         msg = self.notifier.sent[0]
         self.assertIn("3 events", msg["title"])
         self.assertIn("PON faults", msg["body"])
-        self.assertEqual(self.store.pending_digest("ispA"), [])   # marked sent
+        self.assertEqual(self.store.pending_digest("ispA"), [])
 
     def test_flush_noop_when_empty(self):
         flush_digests(self.store, "ispA", self.notifier, self.cfg, _ts(120))
@@ -165,7 +153,6 @@ class DigestFlushTest(unittest.TestCase):
         self.notifier.ok = False
         self._queue("PON_FAULT", "cut A", 0)
         flush_digests(self.store, "ispA", self.notifier, self.cfg, _ts(65))
-        # send failed -> rows stay pending for next cycle
         self.assertEqual(len(self.store.pending_digest("ispA")), 1)
         self.notifier.ok = True
         flush_digests(self.store, "ispA", self.notifier, self.cfg, _ts(70))
@@ -179,7 +166,7 @@ class ComposeTest(unittest.TestCase):
         title, body = compose_digest(rows)
         self.assertIn("6 events", title)
         self.assertIn("🔦 PON faults (5)", body)
-        self.assertIn("… +2 more", body)          # 5 shown-capped at 3
+        self.assertIn("… +2 more", body)
         self.assertIn("Low bandwidth (1)", body)
 
 

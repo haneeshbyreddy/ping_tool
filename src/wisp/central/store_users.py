@@ -1,11 +1,3 @@
-"""Dashboard login accounts.
-
-Mixin half of ``CentralStore`` — composed in ``store.py``, which owns the
-schema, ``__init__`` and connection plumbing (``self._connect``/``self._scope``).
-
-The credential-less worker roster + attendance that used to live here went with
-the Team page (2026-07-21): who works for the org is now just who has a login.
-"""
 from __future__ import annotations
 
 import re
@@ -63,8 +55,6 @@ class UserStoreMixin:
 
 
     def set_user_whatsapp(self, user_id: int, number: str | None) -> None:
-        # None/"" clears — an absent number IS the "no WhatsApp for this account"
-        # state, so org_role_whatsapp simply skips the row.
         with self._write_lock, self._connect() as conn:
             conn.execute("UPDATE users SET whatsapp_number=? WHERE id=?",
                          (number or None, user_id))
@@ -72,10 +62,6 @@ class UserStoreMixin:
 
 
     def org_role_whatsapp(self, org_id: str, role: str) -> list[str]:
-        """WhatsApp numbers to page for one org+role. Every ACTIVE login of that
-        role in the org that has set a number contributes one; an account without
-        a number is simply absent. Deactivated accounts never page. Kept as the
-        building block for `org_alert_recipients` and per-role test alerts."""
         if role not in ("owner", "worker"):
             return []
         with self._connect() as conn:
@@ -86,31 +72,14 @@ class UserStoreMixin:
                 " ORDER BY username", (org_id, role))]
 
     def org_alert_recipients(self, org_id: str) -> list[str]:
-        """Every WhatsApp number paged for an org's alerts. Roles do NOT route
-        separately (operator choice 2026-07-24): owner AND worker accounts both
-        get every alert, all at once. Raw de-dup here; the notifier normalises to
-        digits and de-dups again.
 
-        The superadmin ops number is DELIBERATELY NOT here (2026-07-25): the
-        platform admin can't be buried under every org's device/uplink/port/probe
-        pings. The admin number carries only the platform-level pings that have no
-        org role — 'I've paid', self-downgrade churn, release-sync failing — via
-        the separate `_admin_whatsapp`/`_admin_numbers` resolvers, never this one."""
         nums: list[str] = []
         for role in ("owner", "worker"):
             nums.extend(self.org_role_whatsapp(org_id, role))
         return list(dict.fromkeys(nums))
 
     def named_whatsapp(self, org_id: str, usernames: list[str]) -> list[str]:
-        """The WhatsApp numbers of NAMED accounts in one org — the audience for a
-        page that is about a specific person's job, not about the org.
 
-        Assignment is the only such page today: the point of handing an outage to
-        two workers is that exactly those two hear about it, so this deliberately
-        does NOT go through `org_alert_recipients` (which is the whole team, by
-        design). Same discipline otherwise: active accounts only, numberless
-        accounts simply absent — the caller reports how many were reached, since
-        "assigned but unreachable" is a fact the owner needs, not an error."""
         names = [str(u) for u in (usernames or []) if str(u or "").strip()]
         if not names:
             return []
@@ -124,17 +93,7 @@ class UserStoreMixin:
         return list(dict.fromkeys(r["whatsapp_number"] for r in rows))
 
     def whatsapp_user(self, number: str) -> dict | None:
-        """Reverse of `org_alert_recipients`: the single ACTIVE login that owns
-        this WhatsApp number, as {id, username, org_id, role}. This is what the
-        inbound bot uses to scope every lookup to ONE org — the org-scoping
-        invariant, mirroring onu-search's lateral-move caution.
 
-        Numbers match on DIGITS ONLY (the same normalisation the notifier sends
-        with), so a stored '+9190…' matches an inbound '9190…'. Returns None for:
-        an unknown number, an org-less account (a superadmin, whose role/org can't
-        scope a lookup), OR a number shared by two accounts — the bot ignores all
-        three, because guessing which org to scope to is exactly the lateral move
-        we refuse elsewhere."""
         digits = re.sub(r"\D", "", str(number or ""))
         if len(digits) < 8:
             return None
@@ -151,15 +110,7 @@ class UserStoreMixin:
         return hits[0] if len(hits) == 1 else None
 
 
-    # --- TOTP second factor -------------------------------------------------
-    # get_user()'s SELECT * already returns the totp_* columns for reads; these
-    # are the writes. See central/totp.py for the crypto and api/users.py / the
-    # login handler for the flow.
-
     def set_totp_pending(self, user_id: int, secret_enc: str) -> None:
-        """Store an ENCRYPTED secret and reset the account to a fresh, NOT-yet-
-        enforced enrollment (enabled=0). Restarting enrollment overwrites cleanly
-        and drops any stale recovery codes / replay cursor."""
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "UPDATE users SET totp_secret=?, totp_enabled=0,"
@@ -168,7 +119,6 @@ class UserStoreMixin:
             conn.commit()
 
     def activate_totp(self, user_id: int, recovery_json: str) -> None:
-        """Flip a confirmed enrollment on and store its recovery-code hashes."""
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "UPDATE users SET totp_enabled=1, totp_recovery=? WHERE id=?",
@@ -189,10 +139,6 @@ class UserStoreMixin:
             conn.commit()
 
     def claim_totp_step(self, user_id: int, step: int) -> bool:
-        """Atomically advance the replay cursor to ``step``, but ONLY if it is
-        newer than the stored one. Returns True if this call claimed it — the
-        login proceeds only on True, so two requests presenting the same fresh
-        code can never both succeed (single-use, race-free)."""
         with self._write_lock, self._connect() as conn:
             cur = conn.execute(
                 "UPDATE users SET totp_last_step=? WHERE id=?"
@@ -202,8 +148,6 @@ class UserStoreMixin:
             return cur.rowcount == 1
 
     def consume_recovery_code(self, user_id: int, code_hash: str) -> bool:
-        """Remove one recovery-code hash if present (single-use). Read-modify-
-        write under the write lock so two requests can't spend the same code."""
         import json
         with self._write_lock, self._connect() as conn:
             row = conn.execute("SELECT totp_recovery FROM users WHERE id=?",
@@ -223,11 +167,6 @@ class UserStoreMixin:
             return True
 
     def bump_session_epoch(self, user_id: int) -> int:
-        """Advance an account's session generation and return the new value. A
-        freshly issued cookie signs in this number; every older cookie (a lower
-        epoch) then fails auth.resolve_session — so a new login, or a logout, ends
-        any OTHER active session for the account. This is the whole of the
-        single-active-session mechanism; there is no session table to sweep."""
         with self._write_lock, self._connect() as conn:
             conn.execute(
                 "UPDATE users SET session_epoch = COALESCE(session_epoch, 0) + 1"

@@ -11,17 +11,6 @@ import { responsibilityFor } from "@/lib/assignment"
 import type { OrgDevice } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-// Who gets PAGED about this device — and only that. Assignment changes no view:
-// every account still sees the whole fleet, so this panel is careful to talk about
-// notifications and never about access.
-//
-// Two things it must always answer, because getting either wrong is how a page
-// goes missing without anyone noticing:
-//   * "nobody assigned" is NOT a gap — it means every worker is paged, the safe
-//     default, and the panel says so in words rather than showing an empty list.
-//   * a device can be covered from ABOVE. Responsibility flows down the tree, so
-//     the panel names the ancestor it was inherited from instead of rendering an
-//     empty set on a device that is in fact somebody's job.
 export function AssignmentPanel({ device }: { device: OrgDevice }) {
   const { scopeOrg, canWrite } = useAuth()
   const queryClient = useQueryClient()
@@ -35,8 +24,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
     enabled: !!scopeOrg,
     staleTime: 30_000,
   })
-  // Owner-only endpoint (it enumerates accounts), so a worker session never asks
-  // — it reads the panel without the editor.
   const roster = useQuery({
     queryKey: ["assignments", scopeOrg],
     queryFn: () => inventoryApi.assignments(scopeOrg),
@@ -46,7 +33,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
 
   const devices = inventory.data?.devices ?? []
   const byId = useMemo(() => new Map(devices.map((d) => [d.id, d])), [devices])
-  // the fresh row — `device` may predate a save
   const self = byId.get(device.id) ?? device
   const { own, inherited, effective } = useMemo(
     () => responsibilityFor(self, byId), [self, byId])
@@ -55,9 +41,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
     mutationFn: (userIds: number[]) => inventoryApi.setAssignees(device.id, userIds),
     onSuccess: (res) => {
       setDraft(null)
-      // An assignee with no WhatsApp number is stored, not refused — they have
-      // been made responsible for something nothing will tell them about, which
-      // is a fact to surface rather than a reason to reject the operator's edit.
       if (res.unreachable?.length) {
         toast.warning(
           `Saved, but ${res.unreachable.join(", ")} ${res.unreachable.length === 1 ? "has" : "have"} no WhatsApp number, so no page reaches them`)
@@ -70,17 +53,11 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to save"),
   })
 
-  // Workers only. An owner is paged for everything by definition, so a checkbox
-  // beside their name is a control that changes nothing — and a no-op control in
-  // a notification screen invites the operator to believe they've narrowed
-  // something. (The API still accepts an owner id; this is a UI choice.)
   const accounts = (roster.data?.accounts ?? []).filter((a) => a.role === "worker")
   const nameFor = (uid: number) =>
     accounts.find((a) => a.user_id === uid)?.username ??
     roster.data?.assignments.find((a) => a.user_id === uid)?.username ?? `#${uid}`
 
-  // Closed-header summary: the answer to "who hears about this box" without
-  // opening anything.
   const summary = effective.length === 0
     ? "every worker"
     : effective.map(nameFor).join(", ")
@@ -107,9 +84,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
 
       {open && (
         <div className="flex flex-col gap-3 px-3 pb-3">
-          {/* Always state the CURRENT rule in words first. An empty checkbox list
-              on its own reads as "nobody is being told", which is the opposite of
-              what an unassigned device does. */}
           <p className="text-xs text-faint-foreground">
             {effective.length === 0 ? (
               <>Not assigned, so <span className="text-muted-foreground">every worker</span> is paged
@@ -120,8 +94,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
             )}
           </p>
 
-          {/* Inherited coverage, named with its source. Without this a device
-              covered from its region head looks unassigned. */}
           {inherited.length > 0 && (
             <div className="flex flex-col gap-1">
               {inherited.map(({ user_id, from }) => (
@@ -160,7 +132,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
                         setDraft([...next])
                       }} />
                     <span className="font-mono">{a.username}</span>
-                    {/* the one thing that makes an assignment a lie */}
                     {!a.has_whatsapp && <Chip tone="warning">no number</Chip>}
                     {covered && !on && (
                       <span className="text-faint-foreground">already covers this</span>
@@ -198,7 +169,6 @@ export function AssignmentPanel({ device }: { device: OrgDevice }) {
             )
           )}
 
-          {/* Responsibility flows DOWN, so say what this row actually costs. */}
           {self.child_count > 0 && (
             <p className="border-t pt-2 text-2xs text-faint-foreground">
               Also covers everything below this device: {self.child_count} direct

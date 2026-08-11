@@ -12,9 +12,6 @@ export function eventTone(ev: LogEvent): "success" | "warning" | "destructive" |
   switch (ev.type) {
     case "OUTAGE_OPENED": return stateTone(ev.state) === "warning" ? "warning" : "destructive"
     case "OUTAGE_RESOLVED": return "success"
-    // Acked is NOT the same as a filed post-mortem: it means a human has taken
-    // ownership and the outage is still live. Rendering both muted hid the one
-    // distinction an operator scanning the log actually needs.
     case "OUTAGE_ACKNOWLEDGED": return "info"
     default: return "muted"
   }

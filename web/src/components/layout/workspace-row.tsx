@@ -14,10 +14,6 @@ function planLabel(plan?: Plan | null): string {
   return plan === "vip" ? "VIP" : plan.charAt(0).toUpperCase() + plan.slice(1)
 }
 
-/** The org avatar — a squared brand tile. Deliberately a square: the person's
- *  avatar in the foot AccountMenu is a circle, so shape alone says "workspace"
- *  vs "you" (the conventional Slack/Linear split). "All orgs" gets a neutral
- *  glyph tile instead of a letter, because it isn't one org. */
 function OrgTile({ letter, all, className }: { letter: string; all: boolean; className?: string }) {
   return (
     <span
@@ -32,13 +28,6 @@ function OrgTile({ letter, all, className }: { letter: string; all: boolean; cla
   )
 }
 
-/** The sidebar's top-left slot (and the mobile header's identity slot). Names
- *  the SCOPED org — avatar + name + plan — where the old build hard-coded
- *  "WISP Central" for superadmins and never named the org they were looking at.
- *
- *  For a superadmin it IS the org switcher (this folds in the old
- *  layout/org-switcher.tsx). For an owner/worker it is the same row rendered
- *  static — same slot, same shape, one product. */
 export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "topbar" }) {
   const { user, scopeOrg, setScopeOrg } = useAuth()
   const isSuperadmin = !!user?.is_superadmin
@@ -49,9 +38,7 @@ export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "t
   })
   const orgs = data?.orgs ?? []
 
-  // Superadmin at "All orgs" has no scoped org; the platform pages own that view.
   const isAllOrgs = isSuperadmin && !scopeOrg
-  // Owners/workers get only their own org back from the API, so orgs[0] is it.
   const current = isSuperadmin ? orgs.find((o) => o.org_id === scopeOrg) : orgs[0]
 
   const name = isAllOrgs
@@ -66,8 +53,6 @@ export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "t
   const sidebar = variant === "sidebar"
   const tile = sidebar ? "size-7 text-xs" : "size-6 text-2xs"
 
-  // Shared inner content, so the superadmin (button) and owner (static) rows are
-  // byte-identical apart from the chevron and the hover affordance.
   const inner = (
     <>
       <OrgTile letter={name} all={isAllOrgs} className={tile} />
@@ -93,7 +78,6 @@ export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "t
     : "flex items-center gap-2 rounded-lg px-1.5 py-1 text-left"
   const topbarWidth = sidebar ? "" : "max-w-[9rem] sm:max-w-[13rem]"
 
-  // Owner / worker: the same row, non-interactive.
   if (!isSuperadmin) {
     return <div className={cn(base, topbarWidth)}>{inner}</div>
   }

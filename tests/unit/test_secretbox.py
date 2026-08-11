@@ -22,7 +22,6 @@ class RoundTripTest(unittest.TestCase):
             self.assertEqual(self.box.decrypt(self.box.encrypt(pt)), pt)
 
     def test_nonce_is_random(self):
-        # same plaintext, different ciphertext each time (no nonce reuse)
         a = self.box.encrypt("same")
         b = self.box.encrypt("same")
         self.assertNotEqual(a, b)
@@ -36,14 +35,14 @@ class RoundTripTest(unittest.TestCase):
     def test_tamper_detected(self):
         import base64
         raw = bytearray(base64.b64decode(self.box.encrypt("secret")))
-        raw[-1] ^= 0x01  # flip a tag bit
+        raw[-1] ^= 0x01
         with self.assertRaises(DecryptError):
             self.box.decrypt(base64.b64encode(bytes(raw)).decode())
 
     def test_ciphertext_body_tamper_detected(self):
         import base64
         raw = bytearray(base64.b64decode(self.box.encrypt("secretpw")))
-        raw[20] ^= 0x01  # flip a ciphertext bit (past version+nonce)
+        raw[20] ^= 0x01
         with self.assertRaises(DecryptError):
             self.box.decrypt(base64.b64encode(bytes(raw)).decode())
 
@@ -68,7 +67,6 @@ class KeyLoadTest(unittest.TestCase):
     def test_env_passphrase_stretched(self):
         key = secretbox.load_key(Path("/nonexistent/x"), "a short passphrase")
         self.assertEqual(len(key), 32)
-        # deterministic: same passphrase -> same key -> round-trips across boxes
         key2 = secretbox.load_key(Path("/nonexistent/y"), "a short passphrase")
         self.assertEqual(key, key2)
         token = SecretBox(key).encrypt("pw")
@@ -80,9 +78,7 @@ class KeyLoadTest(unittest.TestCase):
             k1 = secretbox.load_key(kf, "")
             self.assertTrue(kf.exists())
             self.assertEqual(len(k1), 32)
-            # 0600 perms
             self.assertEqual(kf.stat().st_mode & 0o777, 0o600)
-            # a second load reuses the same key (secrets survive restart)
             k2 = secretbox.load_key(kf, "")
             self.assertEqual(k1, k2)
 
@@ -90,7 +86,6 @@ class KeyLoadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             kf = Path(d) / "secret.key"
             token = SecretBox(secretbox.load_key(kf, "")).encrypt("sravani@1987")
-            # simulate a restart: rebuild the box from the persisted key file
             reloaded = SecretBox(secretbox.load_key(kf, ""))
             self.assertEqual(reloaded.decrypt(token), "sravani@1987")
 

@@ -2,15 +2,6 @@ import { useEffect, useState } from "react"
 import { Maximize2, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 
-/** A payment QR that enlarges to a full-screen lightbox on click — the inline
- * render is only a preview, so a tech can always tap to get a big, scannable
- * code (a phone camera needs real size). Rendered via <img> throughout (never
- * inlined as markup), so an uploaded SVG is safe: browsers don't execute
- * scripts in image-loaded SVGs, and SVG scales crisply at any lightbox size.
- *
- * `className` styles the trigger button, `imgClassName` the thumbnail image —
- * callers need both because the lock screen wants a full-width aspect render
- * while the billing card wants a fixed letterboxed square. */
 export function QrImage({ src, className, imgClassName }: {
   src: string
   className?: string
@@ -22,7 +13,6 @@ export function QrImage({ src, className, imgClassName }: {
     if (!open) return
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false) }
     window.addEventListener("keydown", onKey)
-    // don't let the page scroll behind the lightbox
     const prev = document.body.style.overflow
     document.body.style.overflow = "hidden"
     return () => {

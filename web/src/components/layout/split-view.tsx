@@ -1,8 +1,3 @@
-// The two-pane layout, its draggable divider and the secondary pane's own bar.
-//
-// Rendered ONLY when a split is open and there is room for it — with no split
-// the shell's <main> keeps exactly the markup it always had, so the ordinary
-// single-page path is byte-identical to before this feature and cannot regress.
 import { useCallback, useEffect, useMemo, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react"
 import { ArrowLeftRight, Check, ChevronDown, Columns2, Rows2, X } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -17,10 +12,6 @@ import {
   DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
-/** How far one arrow-key press moves the divider. A separator that can only be
- *  dragged is unreachable without a pointer, and this one carries a real layout
- *  decision — 2% is fine enough to land on a column boundary and coarse enough
- *  to cross a pane in a couple of seconds of held key. */
 const KEY_STEP = 0.02
 
 export function SplitView({ children }: { children: React.ReactNode }) {
@@ -30,30 +21,13 @@ export function SplitView({ children }: { children: React.ReactNode }) {
 
   const side = split.axis === "side"
 
-  // The split OUTLIVES the session that opened it (localStorage), so the pane
-  // can be holding a view this account may not have: log in as a worker on a
-  // browser an owner left on /orgs. Those pages self-guard, but two of them do
-  // it by returning null — which renders an EMPTY pane, and an empty pane reads
-  // as a broken feature rather than as a page being withheld. Fall back to Home,
-  // the one view every role has.
   usePaneViewGuard(split)
 
-  // The divider may not be dragged past either floor. Derived from the LIVE box
-  // rather than stored, so a window resize re-solves it: a fraction saved on a
-  // wide monitor would otherwise starve a pane below its minimum on a laptop,
-  // and the pane would render at a size this feature refuses to open at.
-  // The two panes divide what is left AFTER the divider, so every number here
-  // is against `span - SPLIT_GRIP`. Measured with the grip left in, a pane
-  // dragged to its floor lands a couple of px under it — small, but it is the
-  // floor being wrong rather than the drag, and the same 8px would show up
-  // again in whatever is derived from it next.
   const span = Math.max(0, (side ? split.box.w : split.box.h) - SPLIT_GRIP)
   const floor = side ? MIN_PANE_W : MIN_PANE_H
   const minF = span ? Math.min(0.5, floor / span) : 0.2
   const maxF = span ? Math.max(0.5, 1 - floor / span) : 0.8
   const fraction = Math.max(minF, Math.min(maxF, split.fraction))
-  /** Exact px, not a bare percentage: `50%` of the HOST is half a divider too
-   *  wide for each pane, and flex then shrinks them by an uneven remainder. */
   const basis = (f: number) => `calc((100% - ${SPLIT_GRIP}px) * ${f})`
 
   const setFrom = useCallback((clientX: number, clientY: number) => {
@@ -80,16 +54,8 @@ export function SplitView({ children }: { children: React.ReactNode }) {
     e.currentTarget.releasePointerCapture(e.pointerId)
   }
 
-  // The host stays MOUNTED even when the layout doesn't fit, and that is what
-  // makes "restrict if there isn't room" recoverable: the ResizeObserver hangs
-  // off this element, so unmounting it when room runs out would freeze the last
-  // measurement and the split could never come back when the window grew again.
   const hasRoom = split.roomFor(split.axis)
 
-  // STABLE, never an inline arrow. React calls a ref callback with null and then
-  // the node on every render where the callback's identity changed — which, for
-  // a callback that measures and setStates, is an infinite loop rather than a
-  // performance note. `split.hostRef` is itself stable, so this is too.
   const attachHost = useCallback((el: HTMLDivElement | null) => {
     hostEl.current = el
     split.hostRef(el)
@@ -102,10 +68,6 @@ export function SplitView({ children }: { children: React.ReactNode }) {
         ref={attachHost}
         className={cn("flex min-h-0 flex-1", side ? "flex-row" : "flex-col")}
       >
-        {/* PRIMARY — the URL. No bar of its own: the sidebar's active nav item
-            already says what is in it, and 36px of chrome to repeat that is
-            36px the page it names doesn't get. The secondary pane has no such
-            teller, which is exactly why it gets one. */}
         <Pane style={hasRoom ? { flexBasis: basis(fraction), flexGrow: 0, flexShrink: 0 } : { flex: "1 1 100%" }}>
           {children}
         </Pane>
@@ -136,10 +98,6 @@ export function SplitView({ children }: { children: React.ReactNode }) {
             }}
             style={{ flex: `0 0 ${SPLIT_GRIP}px` }}
             className={cn(
-              // Drawn at rest, like `PanelResizeGrip` and for the same reason:
-              // an invisible edge is a thing you have to already know about. The
-              // strip IS the border between the panes, so it carries the border
-              // token and the pill sits on top of it.
               "group relative z-20 flex shrink-0 touch-none items-center justify-center bg-border/60",
               "outline-none focus-visible:bg-primary/60",
               side ? "cursor-col-resize" : "cursor-row-resize",
@@ -152,8 +110,6 @@ export function SplitView({ children }: { children: React.ReactNode }) {
           </div>
         )}
 
-        {/* SECONDARY — its own router, its own bar. Unmounted while there is no
-            room, so a collapsed split costs nothing to keep open. */}
         {hasRoom && split.entry && (
           <Pane style={{ flexBasis: basis(1 - fraction), flexGrow: 0, flexShrink: 0 }} bar={<PaneBar />}>
             <PaneRouter key={split.epoch} entry={split.entry} />
@@ -164,8 +120,6 @@ export function SplitView({ children }: { children: React.ReactNode }) {
   )
 }
 
-/** Which views this session may hold in a pane. One helper so the guard, the
- *  pane bar's picker and the header menu can't disagree about the vocabulary. */
 function usePaneViews() {
   const { user } = useAuth()
   const isWorker = !!user && !user.is_superadmin && user.role === "worker"
@@ -187,18 +141,6 @@ function usePaneViewGuard(split: ReturnType<typeof useSplit>) {
   }, [view, views, open])
 }
 
-/** One pane.
- *
- *  Two boxes, not one, and the nesting is load-bearing: the OUTER box is
- *  `relative` and does NOT scroll, the inner one scrolls. Pages float their
- *  device panel with `position: absolute` (see index.css `[data-pane]`), and an
- *  absolutely-positioned child of a SCROLL container scrolls away with the
- *  content — which is precisely what a pinned panel must not do. Splitting the
- *  two gives the panel a still box to anchor to.
- *
- *  `--wisp-pane-h` is what lets a page that sized itself against the viewport
- *  (the map) fill a pane instead. It is unset outside a split, so those pages
- *  keep their original height expression exactly. */
 function Pane({ children, style, bar }: {
   children: React.ReactNode
   style?: CSSProperties
@@ -211,18 +153,11 @@ function Pane({ children, style, bar }: {
       className="relative flex min-h-0 min-w-0 flex-col overflow-hidden"
     >
       {bar}
-      {/* flex-1 + min-h-0, never h-full: with a bar above it, `height: 100%`
-          would be the pane's FULL height and push the scroller's foot out of
-          sight. The flex height is definite either way, which is what lets a
-          page inside ask for `height: 100%` and get the pane. */}
       <div className="min-h-0 flex-1 overflow-y-auto">{children}</div>
     </div>
   )
 }
 
-/** The secondary pane's bar: what is in it, and the three things you can do to
- *  it. Deliberately thin (h-9) and quiet — it is chrome about a view, not part
- *  of the view. */
 function PaneBar() {
   const split = useSplit()
   const views = usePaneViews()
@@ -270,22 +205,12 @@ function PaneBar() {
   )
 }
 
-/** The header control that opens a split. Lives beside the search box.
- *
- *  Hidden outright when the window can hold neither layout — a control whose
- *  every path is disabled is worse than one that isn't there. It reappears the
- *  moment the window grows, because the room test runs off a live measurement
- *  of the pane host. */
 export function SplitControl() {
   const split = useSplit()
   const views = usePaneViews()
 
   const canSide = split.roomFor("side")
   const canStacked = split.roomFor("stacked")
-  // Nothing has been measured until a split host exists, so before the first
-  // split the room test has no answer. Fall back to the window, which is what
-  // the host will be minus the sidebar — good enough to decide whether to
-  // OFFER the control, while the exact test still gates the layout itself.
   const measured = split.box.w > 0
   const roughSide = measured ? canSide : window.innerWidth >= MIN_PANE_W * 2 + SPLIT_GRIP + 220
   const roughStacked = measured ? canStacked : window.innerHeight >= MIN_PANE_H * 2 + SPLIT_GRIP + 56
@@ -347,10 +272,6 @@ export function SplitControl() {
   )
 }
 
-/** Shown in place of the split when the window is too small to hold the layout
- *  the operator chose. The split is KEPT, not discarded — a laptop lid closing
- *  a sidebar or a dragged-narrow window must not silently throw away a workspace
- *  that comes straight back at the old size. */
 export function SplitTooSmallNote() {
   const split = useSplit()
   const other: SplitAxis = split.axis === "side" ? "stacked" : "side"

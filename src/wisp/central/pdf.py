@@ -1,39 +1,15 @@
-"""A minimal, dependency-free PDF table writer.
-
-Central is pure stdlib (see CLAUDE.md) and that is not negotiable for a report
-button, so this writes the PDF by hand rather than pulling in reportlab. It does
-exactly one thing: a paginated landscape table with a title block, column
-headings and a page footer — enough for "export this list", nothing more.
-
-Scope, deliberately small:
-  * three base-14 fonts (Helvetica, Helvetica-Bold, Courier) so nothing is
-    embedded and the file stays a few KB;
-  * WinAnsi (cp1252) text only — anything outside it degrades to '?' rather than
-    writing a byte the viewer would render as mojibake (see `_winansi`);
-  * no wrapping: a cell too wide for its column is truncated with an ellipsis,
-    because a table whose row height varies is a layout engine, and this isn't
-    one. Columns are sized by the caller, who knows which one deserves the room.
-
-The one thing that must be exactly right is the xref table: every object's byte
-offset is recorded as it is written, so `build` assembles the file in one pass
-and no offset is ever guessed.
-"""
 from __future__ import annotations
 
-# A4 landscape, in points.
 PAGE_W, PAGE_H = 842.0, 595.0
 MARGIN = 36.0
 
-# Helvetica advance widths, per 1000 units of font size, for the printable ASCII
-# range — the real metrics, so truncation lands where the viewer draws it rather
-# than a character or two off. Non-ASCII falls back to the average.
 _W = (
-    "278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278 "  # 32-47
-    "556 556 556 556 556 556 556 556 556 556 278 278 584 584 584 556 "  # 48-63
-    "1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778 "  # 64-79
-    "667 778 722 667 611 722 667 944 667 667 611 278 278 278 469 556 "   # 80-95
-    "333 556 556 500 556 556 278 556 556 222 222 500 222 833 556 556 "   # 96-111
-    "556 556 333 500 278 556 500 722 500 500 500 334 260 334 584"        # 112-126
+    "278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278 "
+    "556 556 556 556 556 556 556 556 556 556 278 278 584 584 584 556 "
+    "1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778 "
+    "667 778 722 667 611 722 667 944 667 667 611 278 278 278 469 556 "
+    "333 556 556 500 556 556 278 556 556 222 222 500 222 833 556 556 "
+    "556 556 333 500 278 556 500 722 500 500 500 334 260 334 584"
 ).split()
 _WIDTHS = {chr(32 + i): int(w) for i, w in enumerate(_W)}
 _FALLBACK_W = 556
@@ -44,15 +20,7 @@ def text_width(s: str, size: float) -> float:
 
 
 def _winansi(s: str) -> str:
-    """Fold to WinAnsi — cp1252, which is what the fonts above declare, NOT
-    latin-1. The difference is the 0x80–0x9F band: cp1252 has the typographic
-    characters this app's own strings are full of (em dash, middot, ellipsis,
-    curly quotes) and latin-1 does not, so folding to latin-1 printed a report
-    titled "Open issues ? ispA".
 
-    A device name carrying a genuinely unencodable glyph still degrades to '?' —
-    visibly missing beats a corrupt file or an exception raised inside a
-    download."""
     out = []
     for ch in str(s):
         try:
@@ -70,11 +38,7 @@ def _esc(s: str) -> str:
 
 
 def fit(s: str, size: float, width: float, *, mono: bool = False) -> str:
-    """`s` truncated with an ellipsis so it draws inside `width`.
 
-    `mono` measures against Courier's single advance — a mono cell measured with
-    the Helvetica table fits a couple of characters too many and overruns its
-    column, which on a MAC address means a report that looks subtly wrong."""
     s = str(s or "")
     char_w = (lambda ch: _MONO_W * size) if mono else \
         (lambda ch: _WIDTHS.get(ch, _FALLBACK_W) * size / 1000.0)
@@ -96,11 +60,6 @@ def fit(s: str, size: float, width: float, *, mono: bool = False) -> str:
 
 
 class Column:
-    """One table column.
-
-    `weight` is NOT the width. Widths are measured from the actual content (see
-    `_solve_widths`); weight only decides who wins when the content doesn't fit,
-    i.e. which column keeps its room and which gets truncated."""
 
     def __init__(self, key: str, title: str, weight: float, *,
                  mono: bool = False) -> None:
@@ -110,14 +69,11 @@ class Column:
         self.mono = mono
 
 
-# Courier is 600/1000 for every glyph — one number, no table needed.
 _MONO_W = 600 / 1000.0
-_PAD = 6.0  # 3pt of breathing room each side of a cell
+_PAD = 6.0
 
 
 def _cell(row: dict, col: Column) -> str:
-    """The string a cell renders. Used by BOTH the measuring pass and the drawing
-    pass, so a column can never be sized against text it doesn't end up showing."""
     val = row.get(col.key)
     return "-" if val is None or val == "" else str(val)
 
@@ -128,25 +84,10 @@ def _measure(s: str, col: Column, size: float) -> float:
 
 def _solve_widths(columns: list[Column], rows: list[dict], avail: float,
                   size: float) -> list[float]:
-    """Give every column the width its widest cell actually needs, and share out
-    what's left (or what's missing) from there.
 
-    Proportional-to-weight sizing — the obvious approach — gets a report exactly
-    wrong: it hands a fixed share to a column whose values are all short (a `Rx
-    -28.86 dBm` detail sitting on 180pt of white) while truncating the identifier
-    a tech is reading the report FOR (a 17-character MAC plus its PON). Both
-    happened in the first cut of the issues export.
 
-    So: measure first. When everything fits, the surplus is shared in proportion
-    to need, which keeps a wide column wide without letting it hoard. When it
-    doesn't fit, small columns are satisfied outright and only the genuinely
-    hungry ones (`weight` breaks that tie) absorb the shortfall — a
-    water-filling pass, so one long free-text column can never starve five
-    narrow ones."""
     need = []
     for c in columns:
-        # the heading is drawn BOLD, which runs a little wider than the metrics
-        # table above (they're the regular face) — hence the small allowance
         widest = text_width(c.title, size) * 1.06
         for r in rows:
             widest = max(widest, _measure(_cell(r, c), c, size))
@@ -158,8 +99,6 @@ def _solve_widths(columns: list[Column], rows: list[dict], avail: float,
         extra = avail - total
         return [n + extra * n / total for n in need]
 
-    # Contended: satisfy what fits inside a fair share, then split the rest by
-    # weight among the columns that are still hungry.
     widths = [0.0] * len(columns)
     left = set(range(len(columns)))
     remaining = avail
@@ -181,9 +120,6 @@ def _solve_widths(columns: list[Column], rows: list[dict], avail: float,
 def table_pdf(*, title: str, subtitle: str, columns: list[Column],
               rows: list[dict], footer: str = "",
               title_size: float = 15.0, body_size: float = 8.5) -> bytes:
-    """Render `rows` as a paginated table. Cell values are read by column key and
-    stringified; an absent or empty value renders as "-", so a blank cell reads as
-    deliberately empty rather than as a rendering slip."""
     avail = PAGE_W - 2 * MARGIN
     widths = _solve_widths(columns, rows, avail, body_size)
     xs, x = [], MARGIN
@@ -194,7 +130,7 @@ def table_pdf(*, title: str, subtitle: str, columns: list[Column],
     row_h = body_size + 6.0
     head_h = 16.0
     top = PAGE_H - MARGIN
-    first_body_top = top - 46.0      # title block only exists on page 1
+    first_body_top = top - 46.0
     later_body_top = top - 18.0
     bottom = MARGIN + 16.0
 
@@ -209,7 +145,7 @@ def table_pdf(*, title: str, subtitle: str, columns: list[Column],
             body_top = later_body_top
             room = int((body_top - head_h - bottom) // row_h)
         cur.append(r)
-    pages.append(cur)  # always at least one page, even with no rows
+    pages.append(cur)
 
     streams = []
     for page_no, page_rows in enumerate(pages, start=1):
@@ -221,8 +157,6 @@ def table_pdf(*, title: str, subtitle: str, columns: list[Column],
             if subtitle:
                 ops.append("BT /F1 9 Tf %.1f %.1f Td (%s) Tj ET"
                            % (MARGIN, top - title_size - 14, _esc(subtitle)))
-        # heading band: a filled rule under the labels, matching the app's
-        # "the header frames the rows" table treatment
         ops.append("0.90 0.90 0.90 rg %.1f %.1f %.1f %.1f re f"
                    % (MARGIN, y - head_h + 3, avail, head_h - 2))
         ops.append("0.10 0.10 0.10 rg")
@@ -254,12 +188,7 @@ def table_pdf(*, title: str, subtitle: str, columns: list[Column],
 
 
 def _build(streams: list[bytes]) -> bytes:
-    """Assemble page content streams into a PDF file.
 
-    Object layout: 1 Catalog, 2 Pages, 3 Font(Helvetica), 4 Font(Helvetica-Bold),
-    5 Font(Courier), then a Page + Contents pair per page. Offsets are captured as
-    each object is appended — the xref must describe the bytes we actually wrote,
-    and computing it any other way is how a hand-built PDF ends up unopenable."""
     n_pages = len(streams)
     first_page_obj = 6
     kids = " ".join(f"{first_page_obj + 2 * i} 0 R" for i in range(n_pages))

@@ -13,10 +13,6 @@ import {
   Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
 } from "@/components/ui/dialog"
 
-// Owner/superadmin second factor. Everyone who reaches Settings is an owner or a
-// superadmin (workers get the stripped view), so this always renders for someone
-// eligible; the server also rejects a worker on every /api/users/totp/* route.
-
 function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => void }) {
   return (
     <div className="flex flex-col gap-3">

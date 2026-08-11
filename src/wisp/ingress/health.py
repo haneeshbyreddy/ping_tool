@@ -1,12 +1,3 @@
-"""Device health over SNMP — CPU load, RAM, temperature.
-
-Standard MIBs first: HOST-RESOURCES for CPU (hrProcessorLoad, one row per core)
-and RAM (hrStorage rows typed hrStorageRam), ENTITY-SENSOR for temperature,
-plus the MikroTik health subtree (RouterOS keeps temperature in its enterprise
-tree). Everything is walked in one pass and folded best-effort — whatever a box
-doesn't expose just stays None, so a switch with no sensors still reports CPU.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -19,36 +10,25 @@ from wisp.config import CONFIG, Config
 
 log = logging.getLogger("wisp.health")
 
-# sysObjectID — "who made you". Its value is an OID inside the maker's enterprise
-# arc (…4.1.14988 = MikroTik, …4.1.5651 = Fiberhome); central-served profiles match
-# on a prefix of it, so one profile row lights up every device of that vendor.
 OID_SYS_OBJECT_ID = "1.3.6.1.2.1.1.2"
 
-OID_HR_CPU_LOAD = "1.3.6.1.2.1.25.3.3.1.2"       # hrProcessorLoad, 0-100 per core
-OID_HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"   # hrStorageType
-OID_HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"  # hrStorageAllocationUnits (bytes)
-OID_HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"   # hrStorageSize (in units)
-OID_HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"   # hrStorageUsed (in units)
-HR_STORAGE_RAM_SUFFIX = "25.2.1.2"               # hrStorageRam type OID tail
+OID_HR_CPU_LOAD = "1.3.6.1.2.1.25.3.3.1.2"
+OID_HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
+OID_HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
+OID_HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
+OID_HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"
+HR_STORAGE_RAM_SUFFIX = "25.2.1.2"
 
-OID_ENT_SENSOR_TYPE = "1.3.6.1.2.1.99.1.1.1.1"   # entPhySensorType (8 = celsius)
-OID_ENT_SENSOR_SCALE = "1.3.6.1.2.1.99.1.1.1.2"  # EntitySensorDataScale (9 = units)
+OID_ENT_SENSOR_TYPE = "1.3.6.1.2.1.99.1.1.1.1"
+OID_ENT_SENSOR_SCALE = "1.3.6.1.2.1.99.1.1.1.2"
 OID_ENT_SENSOR_PRECISION = "1.3.6.1.2.1.99.1.1.1.3"
 OID_ENT_SENSOR_VALUE = "1.3.6.1.2.1.99.1.1.1.4"
 
-OID_MTXR_HEALTH = "1.3.6.1.4.1.14988.1.1.3"      # MikroTik health subtree
-_MTXR_TEMP_TAILS = ("10", "11")                  # mtxrHlTemperature, mtxrHlProcessorTemperature
+OID_MTXR_HEALTH = "1.3.6.1.4.1.14988.1.1.3"
+_MTXR_TEMP_TAILS = ("10", "11")
 
-# Fiberhome (enterprise 5651) keeps host stats in its OWN tree, not HOST-RESOURCES or
-# ENTITY-SENSOR — an S3330-class switch answers neither. A compact summary scalar group
-# carries CPU/mem/temp; a separate group carries the raw RAM bytes (so the meter shows
-# used/total, not just a percent). Both are walked best-effort like every other column
-# and only fill fields the standard MIBs left None, so a non-Fiberhome box that returns
-# nothing here costs one dead subtree and changes no reading. Confirmed on a real
-# S3330-12TXF walk (2026-07); CPU-vs-temp column order (.2 vs .3) is field-inferred — if
-# the switch web GUI disagrees, swap _FH_CPU_TAIL/_FH_TEMP_TAIL.
-OID_FH_HEALTH = "1.3.6.1.4.1.5651.3.901"         # .1.0 mem %, .2.0 CPU %, .3.0 temp C
-OID_FH_MEM = "1.3.6.1.4.1.5651.3.20.1.1.1"       # .8.0 total bytes, .5.0 used bytes
+OID_FH_HEALTH = "1.3.6.1.4.1.5651.3.901"
+OID_FH_MEM = "1.3.6.1.4.1.5651.3.20.1.1.1"
 _FH_CPU_TAIL, _FH_TEMP_TAIL = "2.0", "3.0"
 _FH_MEM_TOTAL_TAIL, _FH_MEM_USED_TAIL = "8.0", "5.0"
 
@@ -60,7 +40,6 @@ WALK_COLUMNS = (
     OID_FH_HEALTH, OID_FH_MEM,
 )
 
-# EntitySensorDataScale -> multiplier (units=9 is 1.0; milli=8 is 1e-3, ...)
 _SENSOR_SCALE = {7: 1e-6, 8: 1e-3, 9: 1.0, 10: 1e3}
 _TEMP_MIN_C, _TEMP_MAX_C = -10.0, 130.0
 
@@ -71,8 +50,6 @@ class DeviceHealth:
     mem_used_bytes: int | None = None
     mem_total_bytes: int | None = None
     temp_c: float | None = None
-    # Some vendors expose memory only as a ready-made percent — a profile can map
-    # that directly when the raw byte counters aren't on the wire.
     mem_pct_direct: float | None = None
 
     @property
@@ -93,11 +70,6 @@ class DeviceHealth:
 
 @dataclass(frozen=True)
 class HealthReading:
-    """One device's health sweep result PLUS the facts needed to say WHY it's
-    empty when it is. `responded` (any varbind came back, sysObjectID included)
-    splits "agent silent — fix the device/community/ACL" from "agent alive but
-    exposes no health OIDs — needs a vendor profile"; the dashboard's guided
-    troubleshooting is built on that distinction, so keep it honest."""
     health: DeviceHealth
     sysobjectid: str | None = None
     profile_name: str | None = None
@@ -172,7 +144,7 @@ def _parse_entity_temp(varbinds) -> float | None:
     values = _fold_column(varbinds, OID_ENT_SENSOR_VALUE)
     hottest: float | None = None
     for idx, stype in types.items():
-        if _to_num(stype) != 8:  # celsius
+        if _to_num(stype) != 8:
             continue
         raw = _to_num(values.get(idx))
         if raw is None:
@@ -194,8 +166,6 @@ def _parse_mikrotik_temp(varbinds) -> float | None:
         raw = _to_num(value)
         if raw is None:
             continue
-        # RouterOS reports some models in tenths of a degree, others in whole
-        # degrees; anything above the plausible ceiling is read as tenths.
         temp = _plausible_temp(raw if raw <= _TEMP_MAX_C else raw / 10.0)
         if temp is not None and (hottest is None or temp > hottest):
             hottest = temp
@@ -219,18 +189,10 @@ def _parse_fiberhome_memory(varbinds) -> tuple[int | None, int | None]:
     return (int(used), int(total))
 
 
-# --- central-served vendor profiles (data, not code — see CLAUDE.md) ---------------
-# A profile maps health metrics to vendor OIDs plus a decode rule from this CLOSED
-# vocabulary. Standard MIBs still parse first; profile values only fill fields the
-# standards left None (same discipline as the hardcoded MikroTik/Fiberhome fallbacks,
-# which remain in code for fleets running an older central).
-
 _DECODES = {
     "as_is": lambda v: v,
     "div10": lambda v: v / 10.0,
     "div100": lambda v: v / 100.0,
-    # Signed 16-bit in hundredths — the classic optical/temperature encoding
-    # (63021 -> -25.15).
     "signed_div100": lambda v: (v - 65536.0 if v > 32767 else v) / 100.0,
 }
 
@@ -239,8 +201,6 @@ _NUM_OID_RE = re.compile(r"^\d+(\.\d+)*$")
 
 
 def _norm_oid_value(raw) -> str | None:
-    """Normalise a sysObjectID VALUE to dotted-numeric — pysnmp may render it
-    either numeric or as SNMPv2-SMI::enterprises.<tail> depending on loaded MIBs."""
     s = str(raw or "").strip().strip(".")
     if not s:
         return None
@@ -261,8 +221,6 @@ def sys_object_id(varbinds: list[tuple[str, str]]) -> str | None:
 
 
 def match_profile(profiles: list[dict] | None, sysobjectid: str | None) -> dict | None:
-    """Longest matching sysObjectID prefix wins (a model-specific profile beats a
-    vendor-wide one)."""
     if not profiles or not sysobjectid:
         return None
     best: dict | None = None
@@ -278,8 +236,6 @@ def match_profile(profiles: list[dict] | None, sysobjectid: str | None) -> dict 
 
 
 def profile_walk_roots(profile: dict | None) -> list[str]:
-    """Subtree roots the poller must walk for a profile. A metric OID ending in .0
-    is a scalar leaf — GETNEXT under it yields nothing, so walk its parent."""
     roots: list[str] = []
     for spec in (profile or {}).get("metrics", {}).values():
         oid = str(spec.get("oid") or "").strip().strip(".")
@@ -360,18 +316,10 @@ def parse_health(varbinds: list[tuple[str, str]],
 
 
 class PysnmpHealthPoller:
-    """One SnmpEngine per poller instance, NEVER one per walk (see CLAUDE.md —
-    a per-walk engine leaks its UDP transport registration forever).
-
-    Columns are walked BEST-EFFORT under one shared deadline: real fleets mix
-    agents that answer HOST-RESOURCES but ignore ENTITY-SENSOR (each ignored
-    subtree burns timeout x retries), so a dead subtree must cost only its own
-    slice — never the device's whole reading. Whatever answered still parses."""
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self._timeout = cfg.snmp_request_timeout_s or cfg.snmp_timeout_s
         self._retries = max(1, cfg.snmp_request_retries)
-        # Stay inside the edge sweep's per-device cap with headroom to parse.
         self._budget_s = max(5.0, cfg.snmp_walk_timeout_s - 2.0)
         self._engine = None
 
@@ -429,11 +377,6 @@ class PysnmpHealthPoller:
                     continue
                 varbinds.extend(column_binds)
 
-        # sysObjectID first, ALWAYS (one varbind): it picks the vendor profile up
-        # front AND doubles as the "agent is alive" probe the empty-vs-silent
-        # diagnosis needs. Profile columns walk BEFORE the standard MIBs — on the
-        # boxes that need a profile the standard subtrees are usually the dead
-        # ones, and a dead column burns timeout x retries of the shared budget.
         profile: dict | None = None
         await walk_columns((OID_SYS_OBJECT_ID,))
         soid = sys_object_id(varbinds)

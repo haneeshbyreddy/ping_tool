@@ -33,8 +33,6 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(evaluate(rows, NOW), [])
 
     def test_tight_multi_branch_wave_reads_as_power(self):
-        # three independent feeds (no down parent in common), all inside ~1 km,
-        # all within one window — a feeder outage, not three fiber cuts
         rows = [
             _dev(1, lat=17.400, lng=78.400, started_min_ago=6),
             _dev(2, lat=17.404, lng=78.402, started_min_ago=5),
@@ -59,7 +57,6 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(found[0].root_name, "Backhaul-N")
 
     def test_scattered_multi_branch_wave_stays_silent(self):
-        # three branches but 30+ km apart — no verdict beats a wrong one
         rows = [
             _dev(1, lat=17.40, lng=78.40),
             _dev(2, lat=17.70, lng=78.70),
@@ -68,7 +65,6 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(evaluate(rows, NOW), [])
 
     def test_waves_split_on_the_time_gap(self):
-        # an hour-old chain plus a fresh tight cluster = two separate stories
         rows = [
             _dev(1, started_min_ago=90),
             _dev(2, state="UNREACHABLE", parent=1, started_min_ago=90),
@@ -85,8 +81,6 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(evaluate(rows, NOW), [])
 
     def test_victims_of_an_older_outage_are_not_roots(self):
-        # parent went down an hour ago; three children drop now — they're one
-        # branch behind that parent, not three independent feeds
         rows = [
             _dev(1, started_min_ago=90),
             _dev(2, state="UNREACHABLE", parent=1, started_min_ago=5,

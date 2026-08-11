@@ -1,6 +1,3 @@
-"""Superadmin colour overrides end-to-end: who may set them, and the fact that
-they reach the page as injected CSS rather than as an API call the SPA has to
-make after mount."""
 import http.client
 import json
 import os
@@ -69,11 +66,8 @@ class CentralThemeHttpTest(unittest.TestCase):
         conn.close()
         return cookie
 
-    # ----- access ------------------------------------------------------------
 
     def test_org_owner_cannot_set_colours(self):
-        """The look is server-wide, so an org owner must not reach it — this is
-        the same boundary as the Google Maps key, not an org preference."""
         cookie = self._login("owner", "ownerpassword")
         status, _ = self._req("POST", "/api/admin/settings",
                               {"theme_overrides": {"dark": {"--card": "#ff0000"}}},
@@ -81,7 +75,6 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(self.store.get_setting("theme_overrides"), None)
 
-    # ----- round trip --------------------------------------------------------
 
     def test_superadmin_round_trip(self):
         cookie = self._login("root", "rootpassword")
@@ -96,9 +89,6 @@ class CentralThemeHttpTest(unittest.TestCase):
                          {"dark": {"--card": "#222831", "--primary": "#8ec5d6"}})
 
     def test_omitting_the_key_leaves_colours_alone(self):
-        """Saving the Google Maps key must not wipe the palette — the two live
-        on the same endpoint, and every other field there is 'absent = leave
-        it', so colours have to behave the same way."""
         cookie = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/settings",
                   {"theme_overrides": {"dark": {"--card": "#222831"}}}, cookie=cookie)
@@ -108,7 +98,6 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertEqual(body["theme_overrides"], {"dark": {"--card": "#222831"}})
 
     def test_empty_dict_resets_to_the_shipped_palette(self):
-        """`{}` is the reset button and must be distinguishable from absent."""
         cookie = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/settings",
                   {"theme_overrides": {"dark": {"--card": "#222831"}}}, cookie=cookie)
@@ -118,15 +107,9 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertEqual(body["theme_overrides"], {})
         self.assertIsNone(self.store.get_setting("theme_overrides"))
 
-    # ----- delivery ----------------------------------------------------------
 
     def test_colours_are_injected_into_the_spa_head_without_a_session(self):
-        """The whole delivery argument in one test.
 
-        Injected (not fetched) so there is no flash of the default palette on
-        load, and reachable with NO cookie so the login and billing-lock
-        screens — which render before any session exists — are themed too.
-        """
         cookie = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/settings",
                   {"theme_overrides": {"dark": {"--card": "#222831"}}}, cookie=cookie)
@@ -135,7 +118,6 @@ class CentralThemeHttpTest(unittest.TestCase):
         html = raw.decode("utf-8") if isinstance(raw, bytes) else json.dumps(raw)
         self.assertIn('<style id="wisp-theme">', html)
         self.assertIn(":root.dark{--card:#222831;}", html)
-        # before </head>, so it beats the bundle stylesheet on source order
         self.assertLess(html.index('id="wisp-theme"'), html.index("</head>"))
 
     def test_stock_install_injects_nothing(self):
@@ -146,10 +128,6 @@ class CentralThemeHttpTest(unittest.TestCase):
             self.assertNotIn('<style id="wisp-theme">', html, path)
 
     def test_the_marketing_page_is_themed_too(self):
-        """`/` shipped its own hardcoded palette, so repainting the product left
-        the front door on the old colours. It reads the same injected block the
-        SPA does — see landing.html's --lp-* layer for the consuming half, and
-        test_theme.py:LandingArtifactTest for what keeps that half honest."""
         cookie = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/settings",
                   {"theme_overrides": {"dark": {"--background": "#141414",
@@ -164,10 +142,6 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertLess(html.index('id="wisp-theme"'), html.index("</head>"))
 
     def test_a_light_only_palette_leaves_the_marketing_page_alone(self):
-        """The page is `<html class="dark">`, so it takes the dark half and only
-        the dark half. Getting this backwards is the regression that blew out
-        dark mode in the SPA — there it showed as light text on white, here it
-        would be a black-on-black front door."""
         cookie = self._login("root", "rootpassword")
         self._req("POST", "/api/admin/settings",
                   {"theme_overrides": {"light": {"--background": "#ffffff"}}},
@@ -179,9 +153,6 @@ class CentralThemeHttpTest(unittest.TestCase):
         self.assertNotIn(":root.dark{", html)
 
     def test_hostile_stored_value_cannot_escape_the_style_element(self):
-        """Defence in depth: even with a bad row written straight to the DB
-        (bypassing the API's validation entirely), nothing that could close the
-        <style> element or inject markup may reach the page."""
         self.store.set_setting("theme_overrides", json.dumps(
             {"dark": {"--card": "#fff</style><script>alert(1)</script>"}}))
         status, raw = self._req("GET", "/app")

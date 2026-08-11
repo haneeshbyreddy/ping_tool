@@ -1,19 +1,3 @@
-// Why an OLT shows no per-ONU dBm, in a sentence an operator can act on.
-//
-// The optical counterpart of SnmpDiagnosis, and it exists for the same reason:
-// a blank column is not a diagnosis. Several completely different causes render
-// identically as an empty Rx column, and they take OPPOSITE actions —
-//
-//   * the vendor publishes no per-ONU Rx over SNMP at all (C-Data/DBC, proven
-//     exhaustively twice) and no web-UI recipe covers it yet -> write a profile;
-//   * a recipe exists but nobody has stored the OLT's web login -> type it;
-//   * everything is configured and the scrape is failing -> read the detail;
-//   * it works fine and this PON's ONUs are simply dark -> nothing to do.
-//
-// Reading the first as "this hardware has no optics" is the exact false
-// negative the whole web-scrape subsystem was built to kill, and it is worth
-// noticing that the way it used to get made was a human looking at a blank
-// column. Facts come from the server; the sentence is composed here.
 import { useEffect, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -27,13 +11,11 @@ import { Button } from "@/components/ui/button"
 interface Verdict {
   cause: string
   steps: string[]
-  /** how loud to be: a coverage gap is not an alarm */
   tone?: "muted" | "warning"
 }
 
 function verdict(rx: RxStatusResponse): Verdict {
   const scrape = rx.scrape
-  // The vendor is the hinge: without one, nothing downstream can even be asked.
   if (!rx.vendor) {
     return {
       cause: "This OLT's vendor hasn't been identified, so neither the SNMP "
@@ -63,7 +45,6 @@ function verdict(rx: RxStatusResponse): Verdict {
       ],
     }
   }
-  // A recipe exists — so from here on, everything is a configuration or a fault.
   if (!rx.has_node) {
     return {
       cause: "No probe is assigned to this OLT, and the reading is fetched "
@@ -101,9 +82,6 @@ function verdict(rx: RxStatusResponse): Verdict {
   switch (scrape.state) {
     case "ok":
     case "partial":
-      // The scrape worked, yet nothing landed on the roster. Almost always the
-      // merge, not the read: readings attach to ONLINE slots by MAC, and a MAC
-      // on two live slots is dropped rather than pinned to the wrong drop.
       return {
         cause: `The last read of this OLT's optical page succeeded `
           + `(${scrape.rows} row${scrape.rows === 1 ? "" : "s"}, ${ago(scrape.updated_at)}) `
@@ -161,45 +139,19 @@ function verdict(rx: RxStatusResponse): Verdict {
   }
 }
 
-/** How long a manual read is given before we stop watching for its outcome.
-    Comfortably past the server's own per-OLT budget (120s) — the spinner has
-    to outlive the work, or a slow 8-PON box looks like a failure it isn't. */
 const REFRESH_WATCH_MS = 150_000
 
-/** Last web-UI read of this OLT, plus the button that asks for another.
- *
- * Two facts the Optical panel could not show before, and the first is the one
- * that makes the second safe: a dBm on screen carries no date, so "these are
- * yesterday's numbers" and "this was measured four minutes ago" looked
- * identical while a tech decided whether a splice had helped.
- *
- * The read itself stays exactly as restrained as the sweep — same eligibility,
- * same per-OLT lock, same standing down for an operator who is browsing the
- * box. What the button changes is only WHO may ask and WHEN, because the
- * quarter-hour clock is right for a value that drifts over days and wrong for
- * the ten minutes someone is standing at a pole with the fibre in their hand.
- */
 export function RxFreshness({ device, canWrite }: {
   device: OrgDevice
-  /** owner/superadmin: the read spends the OLT's stored admin login */
   canWrite: boolean
 }) {
   const queryClient = useQueryClient()
-  // The scrape stamp we started from. A read is "landed" when the recorded
-  // outcome moves off it — the SAME status the sweep writes, so a manual read
-  // and a swept one are reported through one channel rather than the button
-  // owning a private notion of success.
   const [awaiting, setAwaiting] = useState<string | null>(null)
   const startedAt = useRef(0)
   const pending = awaiting !== null
   const q = useQuery({
     queryKey: ["rx-status", device.id],
     queryFn: () => webOpticsApi.rxStatus(device.id),
-    // Idle, this shares RxDiagnosis's slow poll — the scrape's own clock is
-    // ~15 minutes and anything faster watches a value that cannot have moved.
-    // While a read we asked for is in flight, watch properly: the operator is
-    // standing there waiting for it. (react-query keys the cache, not the
-    // interval, so the two observers coexist without a second fetch.)
     refetchInterval: pending ? 3_000 : 120_000,
   })
   const rx = q.data
@@ -209,9 +161,6 @@ export function RxFreshness({ device, canWrite }: {
     if (!pending) return
     if (scrape?.updated_at && scrape.updated_at !== awaiting) {
       setAwaiting(null)
-      // New readings only reach the roster through the optics fold, so the
-      // panel's own data has to be re-fetched — a landed scrape that leaves
-      // the dBm column showing the old numbers is worse than no button.
       queryClient.invalidateQueries({ queryKey: ["optics", device.id] })
       queryClient.invalidateQueries({ queryKey: ["inventory"] })
       const ok = scrape.state === "ok" || scrape.state === "partial"
@@ -224,10 +173,6 @@ export function RxFreshness({ device, canWrite }: {
       }
       return
     }
-    // A read that never records an outcome (central restarted mid-scrape, say)
-    // must not leave a spinner turning forever. Armed against the ELAPSED time,
-    // not a fresh full delay: the poll above re-runs this effect every few
-    // seconds, and a timer restarted each pass would never fire at all.
     const left = REFRESH_WATCH_MS - (Date.now() - startedAt.current)
     const t = setTimeout(() => {
       setAwaiting(null)
@@ -248,8 +193,6 @@ export function RxFreshness({ device, canWrite }: {
     },
   })
   if (!rx) return null
-  // The server is the authority on "a read is running" — the sweep's own pass
-  // counts, and it is not this browser that started it.
   const busy = pending || rx.refreshing || start.isPending
   if (!rx.can_refresh && !scrape) return null   // nothing true to say yet
 
@@ -271,9 +214,6 @@ export function RxFreshness({ device, canWrite }: {
   )
 }
 
-/** When the dBm on screen was last actually measured.
-    Three states, never collapsed: a good read, a read that USED to work (the
-    single most useful line on a broken pipeline), and one that never has. */
 function RxReadStamp({ rx, busy }: { rx: RxStatusResponse; busy: boolean }) {
   const scrape = rx.scrape
   if (busy) return <span className="text-faint-foreground">reading…</span>
@@ -298,22 +238,17 @@ function RxReadStamp({ rx, busy }: { rx: RxStatusResponse; busy: boolean }) {
   return <span className="text-faint-foreground">dBm never read</span>
 }
 
-/** Rendered by the Optical panel when an OLT reports no per-ONU Rx. */
 export function RxDiagnosis({ device, compact }: {
   device: OrgDevice
-  /** inline note inside a PON drill-down rather than a standalone block */
   compact?: boolean
 }) {
   const q = useQuery({
     queryKey: ["rx-status", device.id],
     queryFn: () => webOpticsApi.rxStatus(device.id),
-    // Slower than the SNMP diagnosis: the scrape's own clock is ~15 minutes, so
-    // anything faster is polling a value that cannot have changed.
     refetchInterval: 120_000,
   })
   if (q.isLoading || q.error || !q.data) return null
   const rx = q.data
-  // Readings ARE landing — this component has nothing to explain.
   if (rx.onus_rx > 0 && !compact) return null
   const v = verdict(rx)
 
@@ -342,8 +277,6 @@ export function RxDiagnosis({ device, compact }: {
           {v.steps.map((s, i) => <li key={i}>{s}</li>)}
         </ol>
       )}
-      {/* The facts behind the sentence, so an operator can check our reasoning
-          rather than take the verdict on trust. */}
       <p className="pl-8 font-mono text-[0.6875rem] text-faint-foreground">
         {rx.vendor
           ? <>vendor {rx.vendor} ({rx.vendor_source})</>

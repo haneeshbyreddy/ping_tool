@@ -28,8 +28,6 @@ class EngineReuseTest(unittest.TestCase):
     def test_one_engine_across_walks(self):
         from pysnmp.hlapi import asyncio as hlapi
         real_engine_cls = hlapi.SnmpEngine
-        # Fast + deterministic: snmp_request_timeout_s now shadows snmp_timeout_s, so
-        # set it (and one retry) or the dead-target walk waits the 5s default x3.
         poller = PysnmpPoller(Config(snmp_request_timeout_s=0.05, snmp_request_retries=1,
                                      snmp_timeout_s=0.05))
 
@@ -108,10 +106,6 @@ class ParseIfTable(unittest.TestCase):
         self.assertEqual((p.in_octets, p.out_octets, p.speed_bps), (None, None, None))
 
 class MultiColumnWalkTest(unittest.TestCase):
-    """The combined GETBULK cursor: response rows map to requested columns by
-    position (repetition-major), and a column retires on subtree exit, an
-    exception value, or a non-increasing OID."""
-
     A, B = "1.2.1", "1.2.2"
 
     def test_interleaved_rows_map_by_position(self):
@@ -125,8 +119,6 @@ class MultiColumnWalkTest(unittest.TestCase):
 
     def test_column_retires_on_subtree_exit_and_stops_collecting(self):
         w = MultiColumnWalk([self.A, self.B])
-        # A's agent-side successor crossed into B's subtree: A is finished, and
-        # its later repetitions in the same response must be dropped too.
         w.feed([("1.2.2.1", "x", "OctetString"), ("1.2.2.1", "b1", "OctetString"),
                 ("1.2.2.2", "x", "OctetString"), ("1.2.2.2", "b2", "OctetString")])
         self.assertEqual(w.varbinds, [("1.2.2.1", "b1"), ("1.2.2.2", "b2")])
@@ -141,14 +133,12 @@ class MultiColumnWalkTest(unittest.TestCase):
     def test_non_increasing_oid_retires_column(self):
         w = MultiColumnWalk([self.A])
         w.feed([("1.2.1.5", "a5", "OctetString")])
-        # A buggy agent replays the same OID: the column must stall out, not loop.
         w.feed([("1.2.1.5", "a5", "OctetString")])
         self.assertTrue(w.done)
         self.assertEqual(w.varbinds, [("1.2.1.5", "a5")])
 
     def test_truncated_response_maps_partial_tail(self):
         w = MultiColumnWalk([self.A, self.B])
-        # Agent truncated mid-repetition: the odd row still lands on column A.
         w.feed([("1.2.1.1", "a1", "OctetString"), ("1.2.2.1", "b1", "OctetString"),
                 ("1.2.1.2", "a2", "OctetString")])
         self.assertEqual(w.request(), ["1.2.1.2", "1.2.2.1"])
@@ -160,22 +150,16 @@ class MultiColumnWalkTest(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_PYSNMP, "pysnmp not installed")
 class CombinedWalkDriverTest(unittest.TestCase):
-    """walk() against fakes that enforce the pysnmp 7 call shape: multi-varbind
-    only via bulk_cmd (a coroutine per PDU), bulk_walk_cmd strictly ONE varbind.
-    Calling bulk_walk_cmd with ten columns was the v0.15.3 stale-ports outage —
-    these signatures pin the constraint."""
-
     class _Val:
         def __init__(self, s):
             self._s = s
         def prettyPrint(self):
             return str(self._s)
 
-    class EndOfMibView(_Val):  # the class NAME is what walk() inspects
+    class EndOfMibView(_Val):
         def __init__(self):
             super().__init__("")
 
-    # A 2-interface agent: enough columns to prove interleaving + subtree exits.
     _TABLE = {
         f"{OID_IF_DESCR}.1": "Gi0/1", f"{OID_IF_DESCR}.2": "Gi0/2",
         f"{OID_IF_ADMIN}.1": "1", f"{OID_IF_ADMIN}.2": "1",
@@ -227,7 +211,7 @@ class CombinedWalkDriverTest(unittest.TestCase):
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertEqual(ports[0].if_name, "Gi0/1")
         self.assertEqual((ports[1].oper_status, ports[1].in_octets), ("down", 2000))
-        self.assertGreater(calls[0], 1)  # genuinely multi-varbind
+        self.assertGreater(calls[0], 1)
         forbidden.assert_not_called()
 
     def test_failed_combined_walk_falls_back_to_single_varbind_walks(self):
@@ -236,8 +220,6 @@ class CombinedWalkDriverTest(unittest.TestCase):
 
         table = self._TABLE
 
-        # pysnmp 7 shape: exactly ONE positional varbind. A regression back to
-        # multi-varbind bulk_walk_cmd fails this signature outright.
         async def bulk_walk_cmd(engine, authData, transport, ctx,
                                 nonRepeaters, maxRepetitions, varBind, **options):
             prefix = str(varBind) + "."
@@ -251,12 +233,6 @@ class CombinedWalkDriverTest(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_PYSNMP, "pysnmp not installed")
 class AdaptivePortWalkTest(unittest.TestCase):
-    """The adaptive ladder: a TOLERANT per-column net that survives a dropped column
-    (the EDGE_HALIYA fix — one drop must not zero the table), status columns first,
-    per-device memory that stops re-hammering a weak agent with the combined walk, a
-    time-boxed fast path that hands the budget to the net, and a preserved no_response
-    signal for a genuinely dead agent."""
-
     _TABLE = {
         f"{OID_IF_ADMIN}.1": "1", f"{OID_IF_ADMIN}.2": "1",
         f"{OID_IF_OPER}.1": "1", f"{OID_IF_OPER}.2": "2",
@@ -272,7 +248,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
         def prettyPrint(self):
             return self._s
 
-    class EndOfMibView(_Val):  # NAME matters: MultiColumnWalk inspects type().__name__
+    class EndOfMibView(_Val):
         def __init__(self):
             super().__init__("")
 
@@ -285,8 +261,6 @@ class AdaptivePortWalkTest(unittest.TestCase):
         raise RuntimeError("tooBig")
 
     def _percolumn(self, drop=frozenset(), record=None):
-        """A per-column bulk_walk fake: yields the table rows for the requested column,
-        raises (a dropped request) for any column in `drop`, records call order."""
         table, oid_key, Val = self._TABLE, self._oid_key, self._Val
 
         async def bulk_walk_cmd(engine, authData, transport, ctx,
@@ -320,9 +294,6 @@ class AdaptivePortWalkTest(unittest.TestCase):
                 SnmpTarget(ip="127.0.0.1", community="public", port=1)))
 
     def test_percolumn_tolerates_a_dropped_column(self):
-        # Combined fails, then one enrichment column (HCIN) drops mid-walk. The old
-        # brittle fallback raised on that and returned NOTHING; the tolerant net skips
-        # it and still delivers every port's up/down.
         poller = self._new_poller()
         ports = self._run(poller, bulk_cmd=self._broken_bulk_cmd,
                           bulk_walk_cmd=self._percolumn(drop={OID_IF_HCIN}))
@@ -330,27 +301,22 @@ class AdaptivePortWalkTest(unittest.TestCase):
         self.assertEqual(ports[0].if_name, "Gi0/1")
         self.assertEqual((ports[1].admin_status, ports[1].oper_status), ("up", "down"))
         self.assertTrue(ports[1].is_down())
-        self.assertIsNone(ports[1].in_octets)  # dropped column — port survives anyway
+        self.assertIsNone(ports[1].in_octets)
 
     def test_status_columns_walk_first(self):
         poller = self._new_poller()
         order: list[str] = []
         self._run(poller, bulk_cmd=self._broken_bulk_cmd,
                   bulk_walk_cmd=self._percolumn(record=order))
-        # admin/oper decide up/down, so a budget-truncated partial is still useful.
         self.assertEqual(order[:2], [OID_IF_ADMIN, OID_IF_OPER])
 
     def test_dead_agent_reraises_so_daemon_sees_no_response(self):
-        # Combined fails AND every per-column request drops: nothing answered, so walk
-        # must RE-RAISE (the daemon classifies no_response) rather than a silent empty.
         poller = self._new_poller()
         with self.assertRaises(RuntimeError):
             self._run(poller, bulk_cmd=self._broken_bulk_cmd,
                       bulk_walk_cmd=self._percolumn(drop=frozenset(WALK_COLUMNS)))
 
     def test_empty_combined_falls_through_to_percolumn(self):
-        # An empty combined response (a weak agent can return one) is NOT trusted as
-        # "table empty" — the per-column net confirms.
         used: list[str] = []
 
         async def empty_combined(engine, auth, transport, ctx, nonRep, maxRep,
@@ -364,9 +330,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
         self.assertTrue(used)
 
     def test_combined_time_box_hands_budget_to_the_net(self):
-        # A combined walk that hangs must be abandoned at the fast-path box so the
-        # per-column net still runs inside the port budget — not eat the whole cap.
-        poller = self._new_poller(port_walk_timeout_s=1.2)  # fast box = min(15, 0.4)
+        poller = self._new_poller(port_walk_timeout_s=1.2)
         used: list[str] = []
 
         async def hanging_combined(*a, **o):
@@ -375,12 +339,10 @@ class AdaptivePortWalkTest(unittest.TestCase):
 
         ports = self._run(poller, bulk_cmd=hanging_combined,
                           bulk_walk_cmd=self._percolumn(record=used))
-        self.assertEqual([p.if_index for p in ports], [1, 2])  # recovered via the net
+        self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertTrue(used)
 
     def test_learns_to_skip_combined_after_it_fails(self):
-        # First sweep: combined fails, per-column succeeds -> device pinned to the net.
-        # Second sweep: combined must NOT be retried (no wasted airtime on a weak box).
         import pysnmp.hlapi.asyncio as hlapi
         poller = self._new_poller()
         target = SnmpTarget(ip="127.0.0.1", community="public", port=1)
@@ -403,7 +365,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
         results = asyncio.run(body())
         self.assertEqual([p.if_index for p in results[0]], [1, 2])
         self.assertEqual([p.if_index for p in results[1]], [1, 2])
-        self.assertEqual(len(combined_calls), 1)  # tried once, then skipped
+        self.assertEqual(len(combined_calls), 1)
 
 class ThroughputBps(unittest.TestCase):
     def test_normal_rate(self):

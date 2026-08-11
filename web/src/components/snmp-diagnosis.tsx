@@ -1,7 +1,3 @@
-// Guided SNMP troubleshooting: turns the edge's per-subsystem sweep diagnosis
-// ("snmp_status") into a plain-language WHY + the next concrete step, so a blank
-// Ports/Optical/vitals panel is never a dead end. Rendered by those panels' empty
-// states — it owns its own dialogs (walk, profile wizard, not-supported).
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -31,7 +27,6 @@ const SUBSYSTEM_NOUN: Record<SnmpSubsystem, string> = {
 interface Diagnosis {
   cause: string
   steps: string[]
-  /** which actions make sense for this state */
   walk?: boolean
   wizard?: boolean
   notSupported?: boolean
@@ -256,8 +251,6 @@ export function SnmpDiagnosis({ device, subsystem }: {
       )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-          {/* quick reachability verdict through the probe — same walk pipeline,
-              tiny system subtree, result lands in a toast in ~a report cycle */}
           <Button variant="outline" size="sm" className="h-7 text-xs"
             onClick={() => void runSnmpTest(device, queryClient)}>
             <Zap className="size-3" /> Test SNMP

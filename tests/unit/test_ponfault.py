@@ -47,7 +47,6 @@ class EvaluateOltTest(unittest.TestCase):
         self.assertEqual(f.kind, "fiber")
         self.assertEqual(f.dark, 3)
         self.assertEqual(f.onus_total, 4)
-        # cut sits past the last survivor, at or before the nearest dark ONU
         self.assertEqual(f.cut_low_m, 800)
         self.assertEqual(f.cut_high_m, 1700)
 
@@ -65,7 +64,6 @@ class EvaluateOltTest(unittest.TestCase):
         self.assertIsNone(faults[0].cut_high_m)
 
     def test_long_dark_onus_are_not_a_fresh_cohort(self):
-        # dark for days = chronic offline subscribers, not an event
         rows = [_onu(f"o{i}", state="offline", last_online_min_ago=60 * 24)
                 for i in range(5)]
         self.assertEqual(evaluate_olt(rows, NOW), [])
@@ -96,12 +94,6 @@ class EvaluateOltTest(unittest.TestCase):
 
 
 class WitnessTest(unittest.TestCase):
-    """Operator-placed reference ONUs — the only power/fiber discriminator that
-    works on a build reporting neither dying_gasp nor LOS (most of this fleet).
-    Placing one IS the claim that its supply is reliable; nothing detects it."""
-
-    # The DBC shape: everything arrives as a bare `offline`, so the gasp cross
-    # collapses and every mass drop reads "fiber" by assumption.
     def _silent_drop(self, **kw):
         return [
             _onu("near", state="online", distance=400, serial="AA:00"),
@@ -113,7 +105,6 @@ class WitnessTest(unittest.TestCase):
     def test_without_witnesses_a_silent_drop_is_fiber_by_ASSUMPTION(self):
         f = evaluate_olt(self._silent_drop(), NOW)[0]
         self.assertEqual(f.kind, "fiber")
-        # the honest name for "we had nothing to go on"
         self.assertEqual(f.evidence, "silence")
         self.assertEqual((f.witness_dark, f.witness_alive), (0, 0))
 
@@ -126,8 +117,6 @@ class WitnessTest(unittest.TestCase):
         self.assertEqual(f.witness_dark, 1)
 
     def test_a_surviving_witness_BEYOND_the_dark_set_calls_it_power(self):
-        # the crew-roll this whole feature exists to prevent: light is reaching
-        # past the dark ONUs, so what stopped at their doors was the DISCOM
         rows = self._silent_drop()
         rows.append(_onu("ups", state="online", distance=2000, serial="UPS:1"))
         f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
@@ -136,8 +125,6 @@ class WitnessTest(unittest.TestCase):
         self.assertEqual((f.witness_dark, f.witness_alive), (0, 1))
 
     def test_a_surviving_witness_SHORT_of_the_dark_set_does_not_flip_it(self):
-        # a cut in a distribution branch leaves everything closer in lit, so an
-        # upstream survivor proves nothing about the branch that went dark
         rows = self._silent_drop()
         rows.append(_onu("ups", state="online", distance=200, serial="UPS:1"))
         f = evaluate_olt(rows, NOW, witness_macs={"UPS:1"})[0]
@@ -146,8 +133,6 @@ class WitnessTest(unittest.TestCase):
         self.assertEqual(f.witness_alive, 1)
 
     def test_a_GASPING_witness_is_not_evidence_of_anything(self):
-        # the ONU testified that it lost power — hardware outranks the
-        # operator's label, so this is a failed backup, not a cut
         rows = self._silent_drop()
         rows[2]["serial"] = "UPS:1"
         rows[2]["state"] = "dying_gasp"
@@ -156,8 +141,6 @@ class WitnessTest(unittest.TestCase):
         self.assertNotEqual(f.evidence, "witness")
 
     def test_witness_outranks_a_dying_gasp_majority(self):
-        # most of the cohort lost power, but a backed-up subscriber went dark
-        # SILENTLY alongside them — power cannot explain that one
         rows = [
             _onu("a", state="dying_gasp", distance=1000),
             _onu("b", state="dying_gasp", distance=1100),
@@ -168,8 +151,6 @@ class WitnessTest(unittest.TestCase):
         self.assertEqual(f.evidence, "witness")
 
     def test_ordering_is_scale_invariant(self):
-        # dbc's distance_m is EPON time quanta, ~39% short of metres. Only the
-        # ORDER is read here, so the verdict must not move when the unit does.
         rows = self._silent_drop()
         rows.append(_onu("ups", state="online", distance=2000, serial="UPS:1"))
         scaled = [{**r, "distance_m": (None if r["distance_m"] is None
@@ -202,7 +183,6 @@ class WitnessTest(unittest.TestCase):
 class EvaluateOrgTest(unittest.TestCase):
 
     def test_stale_olt_is_skipped_entirely(self):
-        # walk frozen 20 min ago — the OLT itself is down; the ICMP outage owns it
         rows = [_onu(f"o{i}", state="los", updated_min_ago=20, last_online_min_ago=21)
                 for i in range(5)]
         self.assertEqual(evaluate_org(rows, NOW), [])
@@ -226,7 +206,6 @@ def _pdev(did, dtype, parent=None, lat=None, lng=None, port=None, name=None):
 
 
 class PassiveDistanceTest(unittest.TestCase):
-    # ~0.009° latitude ≈ 1 km; keep geometry on one meridian so chord math is obvious
 
     def test_chord_distance_when_no_route_drawn(self):
         devs = [
@@ -240,7 +219,6 @@ class PassiveDistanceTest(unittest.TestCase):
         self.assertAlmostEqual(cands[0]["dist_m"], 1001, delta=15)
 
     def test_drawn_route_beats_the_chord(self):
-        # detour waypoint doubles the path vs the straight chord
         devs = [
             _pdev(7, "OLT", lat=17.000, lng=78.4),
             _pdev(8, "splitter", parent=7, lat=17.009, lng=78.4, port="0/6"),
@@ -255,7 +233,7 @@ class PassiveDistanceTest(unittest.TestCase):
         devs = [
             _pdev(7, "OLT", lat=17.000, lng=78.4),
             _pdev(8, "splitter", parent=7, lat=17.009, lng=78.4, port="0/6"),
-            _pdev(9, "fdb", parent=8, lat=17.018, lng=78.4),  # port blank
+            _pdev(9, "fdb", parent=8, lat=17.018, lng=78.4),
         ]
         cands = passive_distances(devs, [])[(7, "0/6")]
         self.assertEqual(len(cands), 2)
@@ -266,7 +244,7 @@ class PassiveDistanceTest(unittest.TestCase):
     def test_unplaced_link_never_fabricates_a_distance(self):
         devs = [
             _pdev(7, "OLT", lat=17.000, lng=78.4),
-            _pdev(8, "splitter", parent=7, port="0/6"),   # no pin
+            _pdev(8, "splitter", parent=7, port="0/6"),
         ]
         self.assertEqual(passive_distances(devs, []), {})
 
@@ -283,7 +261,6 @@ class SuspectBindingTest(unittest.TestCase):
         dists = {(7, "0/6"): [{"id": 9, "name": "FDB-14", "dist_m": 1500},
                               {"id": 10, "name": "S-9", "dist_m": 600}]}
         f = evaluate_olt(rows, NOW, passive_dists=dists)[0]
-        # interval is (800, 1900]; FDB-14 at 1500 sits inside, S-9 is upstream
         self.assertEqual(f.suspect, "FDB-14")
 
     def test_no_passive_in_interval_means_no_suspect(self):

@@ -50,13 +50,6 @@ export function fmtPct(n: number | null | undefined): string {
   return n == null ? "—" : `${Number(n).toFixed(1)}%`
 }
 
-/** A round trip, WITHOUT its unit — callers place "ms" themselves (the map's
- *  hover card renders it as a separate faint span).
- *
- *  A tenth of a millisecond is meaningful on a LAN hop and noise on a 40 ms
- *  backhaul, so the precision follows the magnitude. Shared rather than
- *  re-derived per screen: the device panel and a map card printing the same
- *  round trip to different precision reads as two different measurements. */
 export function fmtMs(v: number): string {
   return v < 10 ? v.toFixed(1) : String(Math.round(v))
 }
@@ -80,11 +73,6 @@ export function stateTone(state: DeviceState | string | null | undefined):
   }
 }
 
-// "The box is not answering" — DOWN is the FSM's verdict, UNREACHABLE the
-// topology override for a device orphaned behind a down parent. Mirrors
-// DOWN_FAMILY in core/state_machine.py; keep the two in step.
-// Load-bearing beyond tone: a device in this family cannot be walked, so every
-// SNMP reading still on screen for it is a frozen snapshot (see .wisp-frozen).
 export function isDownState(state: DeviceState | string | null | undefined): boolean {
   return state === "DOWN" || state === "UNREACHABLE"
 }
@@ -96,8 +84,6 @@ export function isStale(ts: string | null | undefined): boolean {
   return (Date.now() - toUtcDate(ts).getTime()) / 1000 > STALE_AFTER_S
 }
 
-// SNMP optics/port sweeps run far slower than the ICMP cadence, so "working"
-// mirrors the superadmin Overview: a reading fresher than 900s counts as live.
 export const SNMP_FRESH_AFTER_S = 900
 
 export function isFresh(ts: string | null | undefined, withinS = SNMP_FRESH_AFTER_S): boolean {
@@ -105,16 +91,6 @@ export function isFresh(ts: string | null | undefined, withinS = SNMP_FRESH_AFTE
   return (Date.now() - toUtcDate(ts).getTime()) / 1000 <= withinS
 }
 
-/** What to CALL one ONU. Mirrors `central/onuroster.py:display_name` — keep the
- *  two in step, since a WhatsApp lookup and the Optical tab naming the same
- *  subscriber differently is a support call.
- *
- *  `label` is the operator's own name, typed in the field survey or the
- *  reference-ONU dialog and stored in `onu_places` (uppercase). It WINS over
- *  `name`, which is whatever the OLT reports and which every SNMP walk
- *  overwrites — on the C-Data fleet that column is blank, so the operator's name
- *  is usually the only one there is. Rendering `o.name` alone is what made a
- *  freshly-surveyed drop read "unnamed" on the very OLT that carries it. */
 export function onuName(o: {
   label?: string | null; name?: string | null
   serial?: string | null; onu_key?: string | null
@@ -122,16 +98,6 @@ export function onuName(o: {
   return o.label || o.name || o.serial || o.onu_key || ""
 }
 
-/** How BAD one ONU's light is. Lives here rather than in the Optical panel that
- *  first needed it, because four screens now grade the same subscriber — the
- *  panel, the Network page's ONU search, the topology tree and the map — and a
- *  second copy of this rule is how one of them ends up calling a drop healthy
- *  while another calls it critical.
- *
- *  STRUCTURALLY typed on the two fields it reads, so a slim projection (a search
- *  hit, an `OnuPlace`) grades by the same rule as a full roster row. `severity`
- *  is the OLT's own threshold verdict computed by the optics monitor — never
- *  re-derive one from `rx_dbm` here, since the thresholds are per-OLT. */
 export type OnuSev = "ok" | "warn" | "crit" | "offline"
 
 export function onuSev(
@@ -143,14 +109,6 @@ export function onuSev(
   return "ok"
 }
 
-/** How to COMPARE one ONU string against a typed needle. Mirrors
- *  `central/onuroster.py:search_key` — alphanumerics only, upper — so a client
- *  filter and the server's `onu-search` agree about what matches: "a4:f2",
- *  "A4-F2" and "a4f2" are one sticker, and "hc_kiran" is found by "hc kiran".
- *
- *  SEARCH ONLY. Identity stays separator-exact (`onuroster._norm_mac`): two
- *  differently-punctuated strings collapsing into one here is a convenience,
- *  collapsing them on the write path fabricates duplicate-MAC pages. */
 export const onuSearchKey = (s: string | null | undefined): string =>
   (s ?? "").replace(/[^a-z0-9]/gi, "").toUpperCase()
 
