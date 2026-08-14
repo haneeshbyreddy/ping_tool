@@ -156,5 +156,37 @@ class OnuPlaceCoordRelaxTest(unittest.TestCase):
         self.assertIsNone(rec["phone"])
 
 
+class NoMigrateOpenTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "central.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_no_migrate_open_refuses_to_create_a_database(self):
+        with self.assertRaises(FileNotFoundError):
+            CentralStore(self.db, migrate=False)
+        self.assertFalse(self.db.exists())
+
+    def test_a_no_migrate_open_runs_no_ddl_at_all(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE not_a_wisp_table (x INTEGER)")
+        conn.commit()
+        conn.close()
+        CentralStore(self.db, migrate=False)
+        conn = sqlite3.connect(self.db)
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        self.assertEqual(names, {"not_a_wisp_table"})
+
+    def test_sync_releases_can_still_read_and_write_through_it(self):
+        CentralStore(self.db)
+        store = CentralStore(self.db, migrate=False)
+        store.set_release("9.9.9", {"linux-amd64": {"url": "u", "sha256": "s"}})
+        self.assertEqual(store.list_releases()[0]["version"], "9.9.9")
+
+
 if __name__ == "__main__":
     unittest.main()

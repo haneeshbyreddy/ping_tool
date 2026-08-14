@@ -75,7 +75,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="directory to write <node>.key/<node>.crt to (default: --pki-dir)")
 
     args = ap.parse_args(argv)
-    store = CentralStore(CONFIG.central_db)
+    if args.cmd in ("init-ca", "enroll-edge"):
+        store = None
+    elif args.cmd == "sync-releases":
+        try:
+            store = CentralStore(CONFIG.central_db, migrate=False)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        store = CentralStore(CONFIG.central_db)
 
     try:
         if args.cmd == "create-superadmin":

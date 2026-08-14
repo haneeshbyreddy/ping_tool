@@ -1537,10 +1537,16 @@ class CentralStore(
 
     _CENTRAL_NODE = "central"
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, migrate: bool = True) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.Lock()
+        if not migrate:
+            if not self.db_path.exists():
+                raise FileNotFoundError(
+                    f"{self.db_path} does not exist — a migrate=False open never creates "
+                    f"or alters the schema; start central once to build it")
+            return
         with self._connect() as conn:
             self._migrate_tenant_to_org(conn)
             self._radius_panels_are_many(conn)
