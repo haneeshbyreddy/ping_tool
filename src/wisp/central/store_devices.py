@@ -98,28 +98,38 @@ class DeviceStoreMixin:
                 " d.tree_detached,"
                 " d.web_ip, d.web_port, d.web_scheme,"
                 " (SELECT COUNT(*) FROM org_devices c"
-                "  WHERE c.parent_device_id = d.id AND c.is_active = 1) AS child_count,"
-                " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
+                "  WHERE c.org_id = d.org_id AND c.parent_device_id = d.id"
+                "  AND c.is_active = 1) AS child_count,"
+                " (SELECT COUNT(*) FROM switch_ports p"
+                "  WHERE p.org_id = d.org_id AND p.device_id = d.id"
                 "  AND p.monitored = 1 AND p.alarm = 1) AS ports_down,"
-                " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
+                " (SELECT COUNT(*) FROM switch_ports p"
+                "  WHERE p.org_id = d.org_id AND p.device_id = d.id"
                 "  AND p.monitored = 1 AND p.bw_alarm = 1) AS ports_bw_low,"
-                " (SELECT COUNT(*) FROM switch_ports p WHERE p.device_id = d.id"
+                " (SELECT COUNT(*) FROM switch_ports p"
+                "  WHERE p.org_id = d.org_id AND p.device_id = d.id"
                 "  AND p.monitored = 1 AND p.bw_high_alarm = 1) AS ports_bw_high,"
                 " g.onus_total AS onus_total, g.onus_online AS onus_online,"
                 " g.warn_count AS onus_warn, g.crit_count AS onus_crit,"
                 " g.updated_at AS optics_updated_at,"
-                " (SELECT COUNT(*) FROM onu_optics r WHERE r.device_id = d.id"
+                " (SELECT COUNT(*) FROM onu_optics r"
+                "  WHERE r.org_id = d.org_id AND r.device_id = d.id"
                 "  AND r.rx_dbm IS NOT NULL) AS onus_rx,"
                 " (SELECT MAX(p.updated_at) FROM switch_ports p"
-                "  WHERE p.device_id = d.id) AS ports_updated_at,"
-                " (SELECT COUNT(*) FROM nvr_channels n WHERE n.device_id = d.id)"
+                "  WHERE p.org_id = d.org_id AND p.device_id = d.id)"
+                "  AS ports_updated_at,"
+                " (SELECT COUNT(*) FROM nvr_channels n"
+                "  WHERE n.org_id = d.org_id AND n.device_id = d.id)"
                 "  AS cameras_total,"
-                " (SELECT COUNT(*) FROM nvr_channels n WHERE n.device_id = d.id"
+                " (SELECT COUNT(*) FROM nvr_channels n"
+                "  WHERE n.org_id = d.org_id AND n.device_id = d.id"
                 "  AND n.enabled = 1 AND n.monitored = 1"
                 "  AND n.state = 'offline') AS cameras_down,"
                 " (SELECT MAX(n.updated_at) FROM nvr_channels n"
-                "  WHERE n.device_id = d.id) AS cameras_updated_at,"
-                " (SELECT MAX(o.started_at) FROM outages o WHERE o.device_id = d.id"
+                "  WHERE n.org_id = d.org_id AND n.device_id = d.id)"
+                "  AS cameras_updated_at,"
+                " (SELECT MAX(o.started_at) FROM outages o"
+                "  WHERE o.org_id = d.org_id AND o.device_id = d.id"
                 "  AND o.resolved_at IS NULL) AS outage_started_at,"
                 " s.state AS state, s.latency_ms AS latency_ms, s.packet_loss AS packet_loss,"
                 " s.jitter_ms AS jitter_ms, s.updated_at AS state_updated_at,"
@@ -180,6 +190,20 @@ class DeviceStoreMixin:
         with self._connect() as conn:
             return {r["id"]: r["parent_device_id"] for r in conn.execute(
                 "SELECT id, parent_device_id FROM org_devices"
+                " WHERE org_id=? AND is_active=1", (org_id,))}
+
+
+    def org_device_names(self, org_id: str) -> dict[int, str]:
+        with self._connect() as conn:
+            return {r["id"]: (r["name"] or "") for r in conn.execute(
+                "SELECT id, name FROM org_devices"
+                " WHERE org_id=? AND is_active=1", (org_id,))}
+
+
+    def org_device_pon_limits(self, org_id: str) -> dict[int, int | None]:
+        with self._connect() as conn:
+            return {r["id"]: r["onu_pon_limit"] for r in conn.execute(
+                "SELECT id, onu_pon_limit FROM org_devices"
                 " WHERE org_id=? AND is_active=1", (org_id,))}
 
 

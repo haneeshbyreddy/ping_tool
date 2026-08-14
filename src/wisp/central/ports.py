@@ -104,6 +104,7 @@ class CentralPortMonitor:
                    self.store.list_switch_ports(self.org_id, device_id)}
         events: list[PortEvent] = []
         hist_rows: list[tuple] = []
+        port_rows: list[dict] = []
         for raw in raw_ports:
             p = _to_port_status(raw)
             if p is None:
@@ -181,11 +182,15 @@ class CentralPortMonitor:
                             else (prior["bw_high_alarm_since"]
                                  if (prior and bw_high_alarm) else None))
 
-            self.store.upsert_switch_port(
-                self.org_id, device_id, p.if_index, p.if_name, p.if_alias,
-                p.admin_status, p.oper_status, p.last_change, streak, alarm, since, ts,
-                bw=(p.in_octets, p.out_octets, ts, in_bps, out_bps, bw_streak, bw_alarm,
-                   bw_since, bw_high_streak, bw_high_alarm, bw_high_since))
+            port_rows.append({
+                "if_index": p.if_index, "if_name": p.if_name,
+                "if_alias": p.if_alias, "admin_status": p.admin_status,
+                "oper_status": p.oper_status, "last_change": p.last_change,
+                "down_streak": streak, "alarm": alarm, "alarm_since": since,
+                "ts": ts,
+                "bw": (p.in_octets, p.out_octets, ts, in_bps, out_bps, bw_streak,
+                       bw_alarm, bw_since, bw_high_streak, bw_high_alarm,
+                       bw_high_since)})
             if history.port_eligible(prior):
                 hist_rows.append((p.if_index, in_bps, out_bps,
                                   p.oper_status == "up"))
@@ -204,6 +209,7 @@ class CentralPortMonitor:
                                                max_threshold, direction, ts))
             elif prior_bw_high_alarm and not bw_high_alarm and high_eligible:
                 events.append(self._on_bw_normal(device_id, p, feeds, in_bps, out_bps, ts))
+        self.store.upsert_switch_ports_many(self.org_id, device_id, port_rows)
         history.record_ports(self.store, cfg, self.org_id, device_id, ts,
                              hist_rows)
         return events

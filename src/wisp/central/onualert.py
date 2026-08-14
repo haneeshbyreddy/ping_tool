@@ -36,9 +36,8 @@ class OnuRosterAlerter:
     def _limits(self) -> dict[int, int]:
         default = self.cfg.onu_pon_limit
         out: dict[int, int] = {}
-        for d in self.store.list_org_devices(self.org_id):
-            override = d.get("onu_pon_limit")
-            out[d["id"]] = int(override) if override is not None else default
+        for dev_id, override in self.store.org_device_pon_limits(self.org_id).items():
+            out[dev_id] = int(override) if override is not None else default
         return out
 
     def _sweep_capacity(self, rows: list[dict], now: datetime, ts: str) -> None:

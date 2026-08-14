@@ -120,6 +120,41 @@ def _sqlval(v) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
+def _dirty_paths() -> list[str]:
+    rels = set()
+    for cmd in (("git", "diff", "HEAD", "--name-only", "-z"),
+                ("git", "ls-files", "-o", "--exclude-standard", "-z")):
+        rels.update(p for p in _run(*cmd).split("\0") if p)
+    return sorted(rels)
+
+
+def _dirty_source(dest: Path) -> dict:
+    kept: list[str] = []
+    vanished: list[str] = []
+    total = 0
+    with tarfile.open(dest, "w:gz", compresslevel=9) as tar:
+        for rel in _dirty_paths():
+            src = REPO / rel
+            try:
+                if not (src.is_symlink() or src.is_file()):
+                    vanished.append(rel)
+                    continue
+                size = 0 if src.is_symlink() else src.stat().st_size
+                tar.add(src, arcname=rel)
+            except OSError:
+                vanished.append(rel)
+                continue
+            kept.append(rel)
+            total += size
+
+    if not kept:
+        dest.unlink()
+        return {"present": False, "files": 0, "vanished": vanished}
+    return {"present": True, "files": len(kept), "paths": kept,
+            "vanished": vanished, "bytes_raw": total,
+            "bytes_gz": dest.stat().st_size, "sha256": _sha256(dest)}
+
+
 def backup(out_dir: Path, db_path: Path, keep: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -151,6 +186,10 @@ def backup(out_dir: Path, db_path: Path, keep: int) -> Path:
                 entry["sha256"] = _sha256(src)
             secret_state.append(entry)
 
+        status = _run("git", "status", "--porcelain")
+        dirty_state = (_dirty_source(tmp / "dirty-source.tar.gz") if status
+                       else {"present": False, "files": 0})
+
         manifest = {
             "taken_at": datetime.now(timezone.utc).isoformat(),
             "host": os.uname().nodename,
@@ -160,7 +199,9 @@ def backup(out_dir: Path, db_path: Path, keep: int) -> Path:
             "db_sha256": _sha256(raw),
             "precious_rows": rows,
             "git_commit": _run("git", "rev-parse", "HEAD"),
-            "git_dirty": bool(_run("git", "status", "--porcelain")),
+            "git_dirty": bool(status),
+            "git_status": status,
+            "dirty_source": dirty_state,
             "secrets": secret_state,
             **meta,
         }
@@ -211,9 +252,22 @@ def verify(bundle: Path) -> dict:
         finally:
             conn.close()
 
+        dirty = man.get("dirty_source") or {"present": False, "files": 0}
+        if dirty.get("present"):
+            src = tmp / "dirty-source.tar.gz"
+            if not src.exists():
+                raise RuntimeError("manifest claims dirty source, bundle has no tar")
+            if _sha256(src) != dirty["sha256"]:
+                raise RuntimeError("dirty-source.tar.gz sha256 mismatch — bundle is corrupt")
+            with tarfile.open(src, "r:gz") as srctar:
+                if len(srctar.getnames()) != dirty["files"]:
+                    raise RuntimeError("dirty-source.tar.gz is short of its manifest")
+
         missing = [s["path"] for s in man["secrets"] if not s["present"]]
         return {"bundle": bundle.name, "integrity": "ok", "rows": live,
-                "missing_secrets": missing, "taken_at": man["taken_at"]}
+                "missing_secrets": missing, "taken_at": man["taken_at"],
+                "dirty_files": dirty.get("files", 0),
+                "git_commit": man.get("git_commit", "")}
 
 
 def main() -> int:
@@ -248,6 +302,9 @@ def main() -> int:
         for t, n in sorted(r["rows"].items()):
             if n:
                 print(f"    {t:24} {n:>7,}")
+        if r["dirty_files"]:
+            print(f"    dirty source: {r['dirty_files']} files on top of "
+                  f"{r['git_commit'][:12] or 'an unknown commit'}")
         if r["missing_secrets"]:
             print(f"    WARNING missing secrets: {', '.join(r['missing_secrets'])}")
         return 0

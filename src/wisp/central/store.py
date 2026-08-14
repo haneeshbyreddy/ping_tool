@@ -1541,6 +1541,7 @@ class CentralStore(
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.Lock()
+        self._local = threading.local()
         if not migrate:
             if not self.db_path.exists():
                 raise FileNotFoundError(
@@ -1604,6 +1605,12 @@ class CentralStore(
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_switch_ports_uplink"
                 " ON switch_ports(org_id, uplink_device_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_switch_ports_updated"
+                " ON switch_ports(org_id, updated_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_onu_optics_updated"
+                " ON onu_optics(org_id, updated_at)")
             self._ensure_columns(conn, "org_devices", (
                 ("assigned_node_id", "TEXT"),
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
@@ -1943,11 +1950,16 @@ class CentralStore(
 
 
     def _connect(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA cache_size=-512;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA cache_size=-16000;")
+        self._local.conn = conn
         return conn
 
 
@@ -1961,7 +1973,6 @@ class CentralStore(
         escope, eargs = self._scope(org_id, prefix="e.")
         oscope, oargs = self._scope(org_id, prefix="o.")
         sscope, sargs = self._scope(org_id, prefix="sp.")
-        nscope, nargs = self._scope(org_id, prefix="n.")
         gscope, gargs = self._scope(org_id, prefix="g.")
         with self._connect() as conn:
             e = conn.execute(
@@ -1973,9 +1984,6 @@ class CentralStore(
             s = conn.execute(
                 "SELECT COALESCE(MAX(sp.updated_at),'') FROM switch_ports sp"
                 " WHERE 1=1" + sscope, sargs).fetchone()[0]
-            n = conn.execute(
-                "SELECT COALESCE(MAX(n.last_seen),'') FROM nodes n"
-                " WHERE 1=1" + nscope, nargs).fetchone()[0]
             g = conn.execute(
                 "SELECT COALESCE(MAX(g.updated_at),'') FROM onu_optics g"
                 " WHERE 1=1" + gscope, gargs).fetchone()[0]
@@ -1983,4 +1991,4 @@ class CentralStore(
             w = conn.execute(
                 "SELECT COALESCE(MAX(w.id),0) || ':' || COALESCE(MAX(w.completed_at),'')"
                 " FROM snmp_walks w WHERE 1=1" + wscope, wargs).fetchone()[0]
-        return f"{e}.{o}.{s}.{n}.{g}.{w}"
+        return f"{e}.{o}.{s}.{g}.{w}"

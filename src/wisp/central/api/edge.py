@@ -94,17 +94,18 @@ def report(h, org: str, env: dict) -> dict:
         for ip, v in pings.items()
     }
     h.store.touch_node(org, env.get("node_id", ""))
-    eng = h.registry.get(org)
     mode = env.get("mode") or "full"
-    if mode == "recheck":
-        ip_to_id = {d.ip_address: d.id for d in eng.meta.values()}
-        subset = {ip_to_id[ip] for ip in results if ip in ip_to_id}
-        cycle = central_engine.run_cycle(h.store, org, eng, results, ts,
-                                         subset=subset)
-    else:
-        expected = h.store.node_expected_ips(org, env.get("node_id", ""))
-        cycle = central_engine.run_cycle(h.store, org, eng, results, ts,
-                                         expected_ips=expected)
+    with h.registry.org_lock(org):
+        eng = h.registry.get(org)
+        if mode == "recheck":
+            ip_to_id = {d.ip_address: d.id for d in eng.meta.values()}
+            subset = {ip_to_id[ip] for ip in results if ip in ip_to_id}
+            cycle = central_engine.run_cycle(h.store, org, eng, results, ts,
+                                             subset=subset)
+        else:
+            expected = h.store.node_expected_ips(org, env.get("node_id", ""))
+            cycle = central_engine.run_cycle(h.store, org, eng, results, ts,
+                                             expected_ips=expected)
 
     disp = CentralAlertDispatcher(h.store, org, eng, h.notifier, h.cfg)
     disp.dispatch(cycle.events, ts)

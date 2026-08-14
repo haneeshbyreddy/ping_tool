@@ -266,9 +266,19 @@ class LoginThrottle:
         delay = min(self.cap, self.base_delay * (2 ** (n - self.lock_after)))
         return max(0.0, (last + delay) - t)
 
+    _MAX_KEYS = 4096
+
     def fail(self, key: str, *, now: float | None = None) -> None:
         t = time.time() if now is None else now
         with self._lock:
+            if key not in self._fails and len(self._fails) >= self._MAX_KEYS:
+                expired = [k for k, (_, last) in self._fails.items()
+                           if (t - last) > self.window]
+                for k in expired:
+                    del self._fails[k]
+                while len(self._fails) >= self._MAX_KEYS:
+                    oldest = min(self._fails, key=lambda k: self._fails[k][1])
+                    del self._fails[oldest]
             n, _ = self._count(key, t)
             self._fails[key] = (n + 1, t)
 

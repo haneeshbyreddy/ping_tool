@@ -716,5 +716,67 @@ class ReportEndpointTest(unittest.TestCase):
         self.assertEqual(body["redundancy"]["on_backup"], 1)
         self.assertEqual(self.store.pending_digest("ispA"), [])
 
+class RegistrySerializationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          down_consecutive=3, recover_consecutive=2)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.create_org_device("ispA", {
+            "name": "Router", "ip_address": "10.0.0.1", "device_type": "core",
+            "region": None, "parent_device_id": None})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_org_lock_is_one_lock_per_org(self):
+        reg = EngineRegistry(self.store, self.cfg)
+        self.assertIs(reg.org_lock("ispA"), reg.org_lock("ispA"))
+        self.assertIsNot(reg.org_lock("ispA"), reg.org_lock("ispB"))
+
+    def test_concurrent_cycles_for_one_org_serialize(self):
+        import time as _time
+        reg = EngineRegistry(self.store, self.cfg)
+        active, peak = [0], [0]
+        gauge = threading.Lock()
+        errors = []
+
+        def one_cycle(i):
+            try:
+                with reg.org_lock("ispA"):
+                    eng = reg.get("ispA")
+                    with gauge:
+                        active[0] += 1
+                        peak[0] = max(peak[0], active[0])
+                    _time.sleep(0.01)
+                    central_engine.run_cycle(
+                        self.store, "ispA", eng,
+                        {"10.0.0.1": _up()}, f"2026-01-01T00:00:{i:02d}+00:00")
+                    with gauge:
+                        active[0] -= 1
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=one_cycle, args=(i,))
+                   for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(peak[0], 1)
+        self.assertIs(reg.get("ispA"), reg.get("ispA"))
+
+    def test_the_report_route_takes_the_org_lock(self):
+        import inspect
+        from wisp.central.api import edge as edge_api
+        src = inspect.getsource(edge_api.report)
+        lock_at = src.index("with h.registry.org_lock(org):")
+        get_at = src.index("h.registry.get(org)")
+        cycle_at = src.index("run_cycle")
+        self.assertLess(lock_at, get_at)
+        self.assertLess(get_at, cycle_at)
+
+
 if __name__ == "__main__":
     unittest.main()

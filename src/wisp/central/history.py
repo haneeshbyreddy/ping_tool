@@ -3,13 +3,29 @@ from __future__ import annotations
 import logging
 import threading
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from wisp.central.store_history import DAY_S, HOUR_S
+from wisp.central.store_proxy import PROXY_AUDIT_KEEP_DAYS
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
 
 log = logging.getLogger("wisp.central.history")
+
+# The ISO8601-stamped ledgers that had no prune at all. Retention is ops-side
+# (disk + nightly backup size), like the hist_* ones. The floor everywhere is
+# the longest live window a reader measures: the notification cooldown is
+# minutes (cfg.alert_cooldown_min, 30) and the escalation ladder an hour, so
+# these are ~3 orders of magnitude clear of anything that could re-page.
+# proxy_audit is per-request and by far the heaviest, hence the shortest.
+RETENTION_DAYS = {
+    "proxy_audit": PROXY_AUDIT_KEEP_DAYS,
+    "events": 90,
+    "alert_log": 90,
+    "escalations": 90,
+    "alert_digest": 30,
+    "node_alerts": 30,
+}
 
 # The maintenance thread folds complete UTC days and prunes. 6h, not 24h, so
 # yesterday's fold lands within hours of midnight instead of up to a day late;
@@ -219,11 +235,49 @@ def run_maintenance(store, cfg: Config = CONFIG, now_s: int | None = None) -> No
     if removed:
         log.info("history: pruned %s",
                  ", ".join(f"{t}={n}" for t, n in sorted(removed.items())))
+    prune_ledgers(store, now_s=now_s)
+
+
+def ledger_cutoffs(now_s: int | None = None,
+                   days: dict[str, int] = RETENTION_DAYS) -> dict[str, str]:
+    now = (datetime.fromtimestamp(int(now_s), tz=timezone.utc)
+           if now_s is not None else datetime.now(timezone.utc))
+    return {t: (now - timedelta(days=n)).isoformat(timespec="seconds")
+            for t, n in days.items()}
+
+
+def prune_ledgers(store, now_s: int | None = None,
+                  days: dict[str, int] = RETENTION_DAYS) -> dict[str, int]:
+    # proxy_audit used to prune only inside create_proxy_session, so an org
+    # that stopped opening tunnels never pruned again — it rides the same
+    # maintenance clock as everything else now. Guarded on its own so a
+    # failure here can't cost the fold above its logging, on top of the
+    # loop's per-tick guard.
+    cutoffs = ledger_cutoffs(now_s, days)
+    removed: dict[str, int] = {}
+    if cutoffs.get("proxy_audit"):
+        try:
+            n = store.prune_proxy_audit(cutoffs["proxy_audit"])
+            if n:
+                removed["proxy_audit"] = n
+        except Exception:
+            log.exception("history: proxy_audit prune failed; retry next tick")
+    try:
+        removed.update(store.prune_alert_tables(cutoffs))
+    except Exception:
+        log.exception("history: alert ledger prune failed; retry next tick")
+    if removed:
+        log.info("history: pruned %s",
+                 ", ".join(f"{t}={n}" for t, n in sorted(removed.items())))
+    return removed
 
 
 def start_history_thread(cfg: Config = CONFIG, store=None) -> threading.Thread | None:
-    if not cfg.hist_enabled:
-        return None
+    # Starts even with hist_enabled off: sampling is gated at the record_*
+    # calls, but RETENTION is what bounds the disk, and hanging it off a
+    # feature flag is the same shape as the bug that left proxy_audit pruning
+    # only when somebody opened a tunnel. Config already promises existing
+    # rows "keep pruning on their own age either way".
     from wisp.central.store import CentralStore
     store = store or CentralStore(cfg.central_db)
 

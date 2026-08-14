@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from wisp.central.store_util import _now_iso
 
-PROXY_AUDIT_KEEP_DAYS = 60
+PROXY_AUDIT_KEEP_DAYS = 14
 
 
 class ProxyStoreMixin:
@@ -17,10 +17,15 @@ class ProxyStoreMixin:
                 " created_by, created_at, expires_at, status, last_active_at)"
                 " VALUES (?,?,?,?,?,?,?, 'open', ?)",
                 (sid, org_id, device_id, node_id, created_by, now, expires_at, now))
-            conn.execute(
-                "DELETE FROM proxy_audit WHERE ts < datetime('now', ?)",
-                (f"-{PROXY_AUDIT_KEEP_DAYS} days",))
             conn.commit()
+
+    def prune_proxy_audit(self, cutoff_iso: str) -> int:
+        # Rides the history maintenance loop, not session creation: an org that
+        # stops opening tunnels used to stop pruning while its rows stayed.
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM proxy_audit WHERE ts < ?", (cutoff_iso,))
+            conn.commit()
+            return cur.rowcount
 
     def touch_proxy_session(self, sid: str, expires_at: str) -> None:
         with self._write_lock, self._connect() as conn:

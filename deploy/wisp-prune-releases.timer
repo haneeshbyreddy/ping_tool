@@ -1,0 +1,21 @@
+# Weekly prune, plus one shortly after boot.
+#
+# Weekly rather than daily because the thing it bounds grows by a version per RELEASE, not
+# per day — and a prune that runs constantly is a rmtree racing the release sync for no
+# gain. Persistent=true so a week the VM spent off is caught up rather than skipped.
+#
+# Sunday 03:30 UTC = 09:00 IST — deliberately clear of wisp-backup.timer's 02:30 (+5min
+# jitter) and of the 15-minute release-sync tick, so the prune never runs while a snapshot
+# is being taken or a fresh version is landing.
+[Unit]
+Description=WISP central — weekly release-cache prune
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+OnBootSec=15min
+Persistent=true
+# Keep it off the exact minute every other cron-shaped thing fires.
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

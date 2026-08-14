@@ -122,14 +122,14 @@ class WhatsappWebhookNoSecretTest(unittest.TestCase):
         self.server.server_close()
         self.tmp.cleanup()
 
-    def test_unsigned_post_acked_when_no_secret(self):
+    def test_unsigned_post_rejected_when_no_secret(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("POST", "/whatsapp/webhook", body=b'{"object":"x"}',
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         resp.read()
         conn.close()
-        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.status, 403)
 
 
 if __name__ == "__main__":

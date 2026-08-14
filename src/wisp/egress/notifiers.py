@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +14,58 @@ from wisp.config import CONFIG, Config
 log = logging.getLogger("wisp.egress.notifiers")
 
 _WA_MAXLEN = 900
+
+
+class SendPool:
+    def __init__(self, workers: int = 3, capacity: int = 256) -> None:
+        self._q: queue.Queue = queue.Queue(maxsize=capacity)
+        self._workers = workers
+        self._started = False
+        self._lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+        for i in range(self._workers):
+            threading.Thread(target=self._loop, name=f"wa-send-{i}",
+                             daemon=True).start()
+
+    def _loop(self) -> None:
+        while True:
+            job = self._q.get()
+            try:
+                job()
+            except Exception:
+                log.exception("queued send failed")
+
+    def submit(self, job: Callable[[], None]) -> bool:
+        self._ensure_started()
+        try:
+            self._q.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+
+_SEND_POOL = SendPool()
+
+
+def queue_send(notifier, title: str, body: str, priority: int = 3, *,
+               whatsapp: Sequence[str] = (), facts=None,
+               on_result: Callable | None = None) -> "NotifyResult":
+    fn = getattr(notifier, "send_queued", None)
+    if fn is not None:
+        return fn(title, body, priority, whatsapp=whatsapp, facts=facts,
+                  on_result=on_result)
+    res = notifier.send(title, body, priority, whatsapp=whatsapp, facts=facts)
+    if on_result is not None:
+        try:
+            on_result(res)
+        except Exception:
+            log.exception("send completion callback failed")
+    return res
 
 
 @dataclass(frozen=True)
@@ -186,6 +240,31 @@ class WhatsAppNotifier:
         except Exception as exc:
             log.exception("whatsapp send raised; ignored")
             return NotifyResult(False, f"whatsapp raised: {exc}")
+
+    def send_queued(self, title: str, body: str, priority: int = 3, *,
+                    whatsapp: Sequence[str] = (),
+                    facts: WhatsAppFacts | None = None,
+                    on_result: Callable | None = None) -> NotifyResult:
+        recipients = list(whatsapp)
+
+        def job() -> None:
+            res = self.send(title, body, priority, whatsapp=recipients,
+                            facts=facts)
+            if on_result is not None:
+                try:
+                    on_result(res)
+                except Exception:
+                    log.exception("send completion callback failed")
+
+        if _SEND_POOL.submit(job):
+            return NotifyResult(True, "queued")
+        res = self.send(title, body, priority, whatsapp=recipients, facts=facts)
+        if on_result is not None:
+            try:
+                on_result(res)
+            except Exception:
+                log.exception("send completion callback failed")
+        return res
 
     def _send(self, whatsapp, title, body, facts) -> NotifyResult:
         s = self._settings()

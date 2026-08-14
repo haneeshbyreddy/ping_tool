@@ -47,10 +47,15 @@ class OutageStoreMixin:
     def uplink_active(self, org_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT payload FROM alert_log WHERE org_id=? AND"
-                " (payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%')"
+                "SELECT kind, payload FROM alert_log WHERE org_id=? AND"
+                " (kind IN ('UPLINK_DOWN','UPLINK_RESTORED')"
+                "  OR payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%')"
                 " ORDER BY id DESC LIMIT 1", (org_id,)).fetchone()
-        return bool(row and "UPLINK_DOWN" in (row["payload"] or ""))
+        if not row:
+            return False
+        if row["kind"] in ("UPLINK_DOWN", "UPLINK_RESTORED"):
+            return row["kind"] == "UPLINK_DOWN"
+        return "UPLINK_DOWN" in (row["payload"] or "")
 
 
     def _insert_org_event(self, conn, org_id: str, device_id: int | None,
@@ -544,6 +549,57 @@ class OutageStoreMixin:
         with self._write_lock, self._connect() as conn:
             conn.execute("UPDATE escalations SET due_at=? WHERE id=?", (due_at, esc_id))
             conn.commit()
+
+
+    def prune_alert_tables(self, cutoffs: dict[str, str]) -> dict[str, int]:
+        # cutoffs: {table: ISO8601 stamp} — rows strictly older go, EXCEPT the
+        # rows each table's live reader still rehydrates from. Every guard here
+        # protects a transition-only alarm: dropping the row it reads doesn't
+        # lose history, it re-pages. One lock+commit per table so a big first
+        # sweep never holds the write lock across all five.
+        removed: dict[str, int] = {}
+        for table, sql in (
+            # edge_id is allocated as MAX(edge_id)+1, so ageing rows out is safe.
+            ("events", "DELETE FROM events WHERE received_at < ?"),
+            # already_paged() is the per-outage dedupe and uplink_active() reads
+            # the newest UPLINK payload per org with no time bound of its own.
+            ("alert_log",
+             "DELETE FROM alert_log WHERE sent_at < ?"
+             " AND (outage_id IS NULL OR outage_id NOT IN"
+             "  (SELECT id FROM outages WHERE resolved_at IS NULL))"
+             " AND id NOT IN (SELECT MAX(id) FROM alert_log WHERE"
+             "  payload LIKE '%UPLINK%' OR payload LIKE '%Uplink%'"
+             "  GROUP BY org_id)"),
+            # schedule_escalation is INSERT OR IGNORE on (outage_id, kind), so
+            # deleting a row for a still-open outage re-arms the hourly ladder.
+            ("escalations",
+             "DELETE FROM escalations WHERE due_at < ?"
+             " AND outage_id NOT IN"
+             "  (SELECT id FROM outages WHERE resolved_at IS NULL)"),
+            # sent_at NULL is the pending queue the flush anchors on.
+            ("alert_digest",
+             "DELETE FROM alert_digest WHERE created_at < ?"
+             " AND sent_at IS NOT NULL"),
+            # node_stale_active() rehydrates the watchdog from the newest 'sent'
+            # STALE/OK row per node; on this fleet most nodes' newest row is
+            # already months old, so an age-only prune would blank that state.
+            ("node_alerts",
+             "DELETE FROM node_alerts WHERE created_at < ?"
+             " AND id NOT IN (SELECT MAX(id) FROM node_alerts WHERE"
+             "  status='sent' AND kind IN ('NODE_STALE','NODE_OK')"
+             "  GROUP BY org_id, node_id)"
+             " AND id NOT IN (SELECT MAX(id) FROM node_alerts"
+             "  GROUP BY org_id, node_id)"),
+        ):
+            cutoff = cutoffs.get(table)
+            if not cutoff:
+                continue
+            with self._write_lock, self._connect() as conn:
+                cur = conn.execute(sql, (cutoff,))
+                if cur.rowcount:
+                    removed[table] = cur.rowcount
+                conn.commit()
+        return removed
 
 
     def record_perf_sample(self, org_id: str, device_id: int, ts: str,

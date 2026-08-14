@@ -208,6 +208,12 @@ class OrgStoreMixin:
         return row[col] if row else None
 
 
+    def org_ids(self) -> list[str]:
+        with self._connect() as conn:
+            return [r["org_id"] for r in
+                    conn.execute("SELECT org_id FROM orgs ORDER BY org_id")]
+
+
     def orgs(self) -> list[dict]:
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(

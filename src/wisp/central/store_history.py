@@ -302,25 +302,38 @@ class HistoryStoreMixin:
 
     # -- prune + caps --------------------------------------------------------
 
+    @staticmethod
+    def _ensure_hist_prune_indexes(conn) -> None:
+        # The ONE secondary-index exception on the hist_* tables, and it is for
+        # the WRITE path: every prune scans and (over cap) sorts by the time
+        # column. Reads stay on the primary keys. IF NOT EXISTS makes this a
+        # no-op after the first run, so it costs one catalogue lookup per
+        # 6-hourly prune rather than a migration.
+        for table, col in _HIST_TIME_COL.items():
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_prune"
+                         f" ON {table}({col})")
+
     def prune_history(self, cutoffs: dict[str, int],
                       caps: dict[str, int] = HIST_CAPS) -> dict[str, int]:
         # cutoffs: {table: epoch_s} — rows strictly older are deleted. Caps
-        # delete oldest-beyond-N afterwards; the OFFSET subquery yields NULL
-        # when the table is under its cap, and NULL comparisons delete nothing.
+        # delete oldest-beyond-N afterwards, and only once a COUNT says the
+        # table is actually over: the OFFSET subquery walks the index to the
+        # cap-th row, which is the expensive half and pointless under the cap.
         removed: dict[str, int] = {}
         with self._write_lock, self._connect() as conn:
+            self._ensure_hist_prune_indexes(conn)
             for table, cutoff in cutoffs.items():
                 col = _HIST_TIME_COL[table]
                 cur = conn.execute(
                     f"DELETE FROM {table} WHERE {col} < ?", (int(cutoff),))
                 n = cur.rowcount
                 cap = caps.get(table)
-                if cap:
+                if cap and conn.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0] > cap:
                     # The subquery names the cap-th newest time value; deleting
                     # strictly older keeps the newest `cap` rows (more when
                     # several rows share the boundary value — a bound, not an
-                    # exact count). Under the cap it yields NULL and the
-                    # NULL comparison deletes nothing.
+                    # exact count).
                     cur = conn.execute(
                         f"DELETE FROM {table} WHERE {col} < ("
                         f" SELECT {col} FROM {table} ORDER BY {col} DESC"

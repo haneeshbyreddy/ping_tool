@@ -71,6 +71,55 @@ _WORKER_POST = {
     "/api/field/shift",
 }
 
+class _VersionCache:
+    def __init__(self, store: CentralStore, tick: float = 3.0) -> None:
+        self.store = store
+        self.tick = tick
+        self._cond = threading.Condition()
+        self._versions: dict = {}
+        self._started = False
+
+    def _compute(self) -> dict:
+        vers = {org: self.store.data_version(org)
+                for org in self.store.org_ids()}
+        vers[None] = "|".join(f"{o}={v}" for o, v in sorted(vers.items()))
+        return vers
+
+    def ensure_started(self) -> None:
+        with self._cond:
+            if self._started:
+                return
+            self._started = True
+            try:
+                self._versions = self._compute()
+            except Exception:
+                self._versions = {}
+        threading.Thread(target=self._loop, name="sse-versions",
+                         daemon=True).start()
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(self.tick)
+            try:
+                vers = self._compute()
+            except Exception:
+                log.debug("sse version tick failed", exc_info=True)
+                continue
+            with self._cond:
+                if vers != self._versions:
+                    self._versions = vers
+                    self._cond.notify_all()
+
+    def wait_change(self, org: str | None, last: str | None,
+                    timeout: float) -> str | None:
+        with self._cond:
+            cur = self._versions.get(org)
+            if cur is not None and cur != last:
+                return cur
+            self._cond.wait(timeout)
+            return self._versions.get(org)
+
+
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
                   engine_registry: EngineRegistry | None = None,
                   secret_box=None):
@@ -79,9 +128,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     notifier = notifier or build_notifier(cfg, store)
     registry = engine_registry or EngineRegistry(store, cfg)
     secret_box = secret_box or secretbox.from_config(cfg)
+    versions = _VersionCache(store)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "wisp-central"
+        timeout = 30
+        _showcase_cache: tuple[float, dict] | None = None
 
         def log_message(self, fmt, *args):
             log.debug("%s - %s", self.address_string(), fmt % args)
@@ -216,8 +268,10 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             secret = (store.whatsapp_settings().get("app_secret")
                       or cfg.whatsapp_app_secret or "").strip()
             if not secret:
-                log.warning("whatsapp webhook: no app_secret set — signature UNVERIFIED")
-                return True
+                log.warning("whatsapp webhook: no app_secret set — REJECTING "
+                            "unsigned webhook (set the app secret in "
+                            "Settings -> Platform)")
+                return False
             sent = self.headers.get("X-Hub-Signature-256", "")
             if not sent.startswith("sha256="):
                 return False
@@ -267,6 +321,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         form = {}
                     for k, v in form.items():
                         params.setdefault(k, v)
+            if not self.field_ip_rate.allow(f"ip:{self._client_ip()}"):
+                self._send_text(429, "too many requests")
+                return
             identity = store.resolve_field_token(
                 field.param(params, "id", "deviceid", "device_id"))
             if identity is None:
@@ -418,26 +475,27 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
+            versions.ensure_started()
+            tok = auth.cookie_token(self.headers.get("Cookie"))
+            by_session = tok and auth.resolve_session(store, tok,
+                                                      cfg=cfg) is not None
+            last_check = time.monotonic()
             last: str | None = None
-            idle = 0
             while True:
+                version = versions.wait_change(org, last, timeout=15.0)
+                if by_session and time.monotonic() - last_check >= 60.0:
+                    last_check = time.monotonic()
+                    if auth.resolve_session(store, tok, cfg=cfg) is None:
+                        return
                 try:
-                    version = store.data_version(org)
-                except Exception:
-                    version = last
-                try:
-                    if version != last:
+                    if version is not None and version != last:
                         last = version
                         self.wfile.write(f"event: changed\ndata: {version}\n\n".encode())
-                        idle = 0
                     else:
-                        idle += 1
-                        if idle % 15 == 0:
-                            self.wfile.write(b": keepalive\n\n")
+                        self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
-                time.sleep(1.0)
 
         def _serve_static(self, route: str) -> bool:
             if route in ("/", ""):
@@ -458,7 +516,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-cache")
+            if rel.startswith("assets/"):
+                self.send_header("Cache-Control",
+                                 "public, max-age=31536000, immutable")
+            else:
+                self.send_header("Cache-Control", "no-cache")
             self._security_headers()
             self.end_headers()
             self.wfile.write(data)
@@ -483,7 +545,12 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
 
         def _inject_showcase(self, html: bytes) -> bytes:
             try:
-                stats = store.showcase_stats()
+                cached = Handler._showcase_cache
+                if cached is not None and time.monotonic() - cached[0] < 60.0:
+                    stats = cached[1]
+                else:
+                    stats = store.showcase_stats()
+                    Handler._showcase_cache = (time.monotonic(), stats)
             except Exception:
                 logging.exception("showcase stats failed")
                 return html
@@ -700,18 +767,50 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.secretbox = secret_box
     Handler.proxy = ProxyHub(device_max_inflight=cfg.proxy_device_max_inflight)
     Handler.field_rate = field.TrackRate(cfg.field_track_rate_per_min)
+    Handler.field_ip_rate = field.TrackRate(cfg.field_track_rate_per_min * 20)
     from wisp.central.weboptics_sweep import build_sweeper
     Handler.weboptics = build_sweeper(cfg, store, Handler.proxy, secret_box,
                                       notifier)
     return Handler
 
-class _TLSThreadingHTTPServer(ThreadingHTTPServer):
+class _CentralHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 512
+    max_workers = 512
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._worker_slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+
+class _TLSThreadingHTTPServer(_CentralHTTPServer):
 
     def __init__(self, addr, handler, ssl_context: ssl.SSLContext) -> None:
         super().__init__(addr, handler)
         self._ssl_context = ssl_context
 
     def finish_request(self, request, client_address) -> None:
+        request.settimeout(15.0)
         request = self._ssl_context.wrap_socket(request, server_side=True)
         self.RequestHandlerClass(request, client_address, self)
 
@@ -753,7 +852,7 @@ def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
     if tls_context is not None:
         httpd = _TLSThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler, tls_context)
     else:
-        httpd = ThreadingHTTPServer((cfg.central_bind, cfg.central_port), handler)
+        httpd = _CentralHTTPServer((cfg.central_bind, cfg.central_port), handler)
     httpd.store = store
     httpd.proxy = handler.proxy
     httpd.secretbox = handler.secretbox

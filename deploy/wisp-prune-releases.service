@@ -1,0 +1,33 @@
+# WISP central — bound data/releases/, which nothing else prunes.
+#
+# Central mirrors every published release so edges never touch GitHub, and each version is
+# ~174 MB FOREVER: `releasesync.py` only ever adds. Left alone the directory grows by a
+# version every tag, and the box it grows on is the one holding the database.
+#
+# tools/prune_releases.py keeps, in this order: the APK mirror (fixed path, never a
+# version), any version A NODE IS ACTUALLY RUNNING (read from the live DB read-only), the
+# rollback floor 0.14.0 (there is no artifact below it, so an older edge could only roll
+# forward), and the newest --keep versions regardless of fleet use. Everything else goes.
+#
+#   sudo cp deploy/wisp-prune-releases.service deploy/wisp-prune-releases.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wisp-prune-releases.timer
+#   # one-off now:   sudo systemctl start wisp-prune-releases.service
+#   # dry run first: .venv/bin/python3 tools/prune_releases.py
+#
+# Safe against a live server: the DB is opened `mode=ro` purely to ask which versions the
+# fleet reports, and the only writes are rmtree of version directories nothing is serving.
+# It does NOT stop or pause central.
+[Unit]
+Description=WISP central — prune cached release artifacts
+After=wisp-central.service
+
+[Service]
+Type=oneshot
+User=haneeshbyreddy
+WorkingDirectory=/home/haneeshbyreddy/ping_tool
+Environment=PYTHONPATH=/home/haneeshbyreddy/ping_tool/src
+EnvironmentFile=/home/haneeshbyreddy/ping_tool/deploy/central.env
+ExecStart=/home/haneeshbyreddy/ping_tool/.venv/bin/python3 tools/prune_releases.py --apply
+# Housekeeping must never be the thing that starves the server it is tidying up after.
+Nice=10
+IOSchedulingClass=idle

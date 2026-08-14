@@ -89,11 +89,30 @@ class SnmpStoreMixin:
         return row["org_id"] if row else None
 
 
-    def upsert_switch_port(self, org_id: str, device_id: int, if_index: int,
-                           if_name: str | None, if_alias: str | None, admin_status: str,
-                           oper_status: str, last_change: str | None, down_streak: int,
-                           alarm: bool, alarm_since: str | None, ts: str, *,
-                           bw: tuple | None = None) -> None:
+    _PORT_UPSERT_SQL = (
+        "INSERT INTO switch_ports (org_id, device_id, if_index, if_name,"
+        " if_alias, admin_status, oper_status, last_change, down_streak, alarm,"
+        " alarm_since, updated_at, in_octets, out_octets, counters_at, in_bps,"
+        " out_bps, bw_low_streak, bw_alarm, bw_alarm_since, bw_high_streak,"
+        " bw_high_alarm, bw_high_alarm_since)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(org_id, device_id, if_index) DO UPDATE SET"
+        " if_name=excluded.if_name, if_alias=excluded.if_alias,"
+        " admin_status=excluded.admin_status, oper_status=excluded.oper_status,"
+        " last_change=excluded.last_change, down_streak=excluded.down_streak,"
+        " alarm=excluded.alarm, alarm_since=excluded.alarm_since,"
+        " updated_at=excluded.updated_at, in_octets=excluded.in_octets,"
+        " out_octets=excluded.out_octets, counters_at=excluded.counters_at,"
+        " in_bps=excluded.in_bps, out_bps=excluded.out_bps,"
+        " bw_low_streak=excluded.bw_low_streak, bw_alarm=excluded.bw_alarm,"
+        " bw_alarm_since=excluded.bw_alarm_since,"
+        " bw_high_streak=excluded.bw_high_streak,"
+        " bw_high_alarm=excluded.bw_high_alarm,"
+        " bw_high_alarm_since=excluded.bw_high_alarm_since")
+
+    @staticmethod
+    def _port_upsert_params(org_id: str, device_id: int, row: dict) -> tuple:
+        bw = row.get("bw")
         in_octets = out_octets = counters_at = in_bps = out_bps = None
         bw_low_streak, bw_alarm, bw_alarm_since = 0, False, None
         bw_high_streak, bw_high_alarm, bw_high_alarm_since = 0, False, None
@@ -101,35 +120,35 @@ class SnmpStoreMixin:
             (in_octets, out_octets, counters_at, in_bps, out_bps,
              bw_low_streak, bw_alarm, bw_alarm_since,
              bw_high_streak, bw_high_alarm, bw_high_alarm_since) = bw
+        return (org_id, device_id, row["if_index"], row.get("if_name"),
+                row.get("if_alias"), row["admin_status"], row["oper_status"],
+                row.get("last_change"), row["down_streak"],
+                1 if row["alarm"] else 0, row.get("alarm_since"), row["ts"],
+                str(in_octets) if in_octets is not None else None,
+                str(out_octets) if out_octets is not None else None,
+                counters_at, in_bps, out_bps, bw_low_streak, 1 if bw_alarm else 0,
+                bw_alarm_since, bw_high_streak, 1 if bw_high_alarm else 0,
+                bw_high_alarm_since)
+
+    def upsert_switch_ports_many(self, org_id: str, device_id: int,
+                                 rows: list[dict]) -> None:
+        if not rows:
+            return
+        params = [self._port_upsert_params(org_id, device_id, r) for r in rows]
         with self._write_lock, self._connect() as conn:
-            conn.execute(
-                "INSERT INTO switch_ports (org_id, device_id, if_index, if_name,"
-                " if_alias, admin_status, oper_status, last_change, down_streak, alarm,"
-                " alarm_since, updated_at, in_octets, out_octets, counters_at, in_bps,"
-                " out_bps, bw_low_streak, bw_alarm, bw_alarm_since, bw_high_streak,"
-                " bw_high_alarm, bw_high_alarm_since)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(org_id, device_id, if_index) DO UPDATE SET"
-                " if_name=excluded.if_name, if_alias=excluded.if_alias,"
-                " admin_status=excluded.admin_status, oper_status=excluded.oper_status,"
-                " last_change=excluded.last_change, down_streak=excluded.down_streak,"
-                " alarm=excluded.alarm, alarm_since=excluded.alarm_since,"
-                " updated_at=excluded.updated_at, in_octets=excluded.in_octets,"
-                " out_octets=excluded.out_octets, counters_at=excluded.counters_at,"
-                " in_bps=excluded.in_bps, out_bps=excluded.out_bps,"
-                " bw_low_streak=excluded.bw_low_streak, bw_alarm=excluded.bw_alarm,"
-                " bw_alarm_since=excluded.bw_alarm_since,"
-                " bw_high_streak=excluded.bw_high_streak,"
-                " bw_high_alarm=excluded.bw_high_alarm,"
-                " bw_high_alarm_since=excluded.bw_high_alarm_since",
-                (org_id, device_id, if_index, if_name, if_alias, admin_status,
-                 oper_status, last_change, down_streak, 1 if alarm else 0, alarm_since, ts,
-                 str(in_octets) if in_octets is not None else None,
-                 str(out_octets) if out_octets is not None else None,
-                 counters_at, in_bps, out_bps, bw_low_streak, 1 if bw_alarm else 0,
-                 bw_alarm_since, bw_high_streak, 1 if bw_high_alarm else 0,
-                 bw_high_alarm_since))
+            conn.executemany(self._PORT_UPSERT_SQL, params)
             conn.commit()
+
+    def upsert_switch_port(self, org_id: str, device_id: int, if_index: int,
+                           if_name: str | None, if_alias: str | None, admin_status: str,
+                           oper_status: str, last_change: str | None, down_streak: int,
+                           alarm: bool, alarm_since: str | None, ts: str, *,
+                           bw: tuple | None = None) -> None:
+        self.upsert_switch_ports_many(org_id, device_id, [{
+            "if_index": if_index, "if_name": if_name, "if_alias": if_alias,
+            "admin_status": admin_status, "oper_status": oper_status,
+            "last_change": last_change, "down_streak": down_streak,
+            "alarm": alarm, "alarm_since": alarm_since, "ts": ts, "bw": bw}])
 
 
     def set_port_monitored(self, org_id: str, port_id: int, on: bool) -> bool:
@@ -227,6 +246,26 @@ class SnmpStoreMixin:
         return [dict(r) for r in rows]
 
 
+    def list_onu_optics_by_device(self, org_id: str,
+                                  device_ids) -> dict[int, list[dict]]:
+        ids = [int(d) for d in dict.fromkeys(device_ids or ())]
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        with self._connect() as conn:
+            rows = self._with_norm_mac(conn).execute(
+                "SELECT o.*, pl.label AS label," + self._RADIUS_COLS
+                + " FROM onu_optics o"
+                + self._LABEL_JOIN
+                + f" WHERE o.org_id=? AND o.device_id IN ({marks})"
+                " ORDER BY o.rx_dbm IS NULL, o.rx_dbm ASC, o.onu_key",
+                [org_id] + ids).fetchall()
+        out: dict[int, list[dict]] = {}
+        for r in rows:
+            out.setdefault(r["device_id"], []).append(dict(r))
+        return out
+
+
     def upsert_web_optics(self, org_id: str, device_id: int, rows: list[dict],
                           ts: str) -> int:
         if not rows:
@@ -285,7 +324,7 @@ class SnmpStoreMixin:
                 " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
                 "      THEN 'declared' ELSE 'detected' END AS vendor_source,"
                 " (SELECT GROUP_CONCAT(DISTINCT r.pon_port) FROM onu_optics r"
-                "   WHERE r.device_id = d.id) AS pon_ports"
+                "   WHERE r.org_id = d.org_id AND r.device_id = d.id) AS pon_ports"
                 " FROM org_devices d"
                 " JOIN device_webui_credentials c ON c.device_id = d.id"
                 " JOIN orgs g ON g.org_id = d.org_id"
@@ -296,7 +335,8 @@ class SnmpStoreMixin:
                 "        OR (COALESCE(d.gpon_vendor,'') = ''"
                 f"            AND LOWER(COALESCE(s.profile,'')) IN ({marks})"
                 "            AND COALESCE(s.sysobjectid,'') <> ''))"
-                "   AND EXISTS(SELECT 1 FROM onu_optics r WHERE r.device_id = d.id)"
+                "   AND EXISTS(SELECT 1 FROM onu_optics r"
+                "               WHERE r.org_id = d.org_id AND r.device_id = d.id)"
                 "   AND COALESCE(d.assigned_node_id,'') <> ''"
                 "   AND COALESCE(c.username,'') <> '' AND c.password_enc IS NOT NULL"
                 "   AND g.web_proxy=1" + only +
@@ -395,26 +435,27 @@ class SnmpStoreMixin:
 
         if not rows:
             return 0
-        kept = 0
+        params = []
+        for r in rows:
+            key = str(r.get("onu_key") or "").strip()
+            mac = str(r.get("mac") or "").strip().upper()
+            if not key or not mac:
+                continue
+            params.append((org_id, device_id, key, mac, r.get("vlan"),
+                           r.get("kind"), r.get("port_label"), ts, ts))
+        if not params:
+            return 0
         with self._write_lock, self._connect() as conn:
-            for r in rows:
-                key = str(r.get("onu_key") or "").strip()
-                mac = str(r.get("mac") or "").strip().upper()
-                if not key or not mac:
-                    continue
-                conn.execute(
-                    "INSERT INTO onu_user_macs (org_id, device_id, onu_key, mac,"
-                    " vlan, kind, port_label, first_seen_at, last_seen_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?)"
-                    " ON CONFLICT(device_id, onu_key, mac) DO UPDATE SET"
-                    "   org_id=excluded.org_id, vlan=excluded.vlan,"
-                    "   kind=excluded.kind, port_label=excluded.port_label,"
-                    "   last_seen_at=excluded.last_seen_at",
-                    (org_id, device_id, key, mac, r.get("vlan"), r.get("kind"),
-                     r.get("port_label"), ts, ts))
-                kept += 1
+            conn.executemany(
+                "INSERT INTO onu_user_macs (org_id, device_id, onu_key, mac,"
+                " vlan, kind, port_label, first_seen_at, last_seen_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id, onu_key, mac) DO UPDATE SET"
+                "   org_id=excluded.org_id, vlan=excluded.vlan,"
+                "   kind=excluded.kind, port_label=excluded.port_label,"
+                "   last_seen_at=excluded.last_seen_at", params)
             conn.commit()
-        return kept
+        return len(params)
 
     def list_user_macs(self, org_id: str, device_id: int) -> list[dict]:
         with self._connect() as conn:
@@ -518,7 +559,8 @@ class SnmpStoreMixin:
                 "        OR (COALESCE(d.gpon_vendor,'') = ''"
                 f"            AND LOWER(COALESCE(s.profile,'')) IN ({marks})"
                 "            AND COALESCE(s.sysobjectid,'') <> ''))"
-                "   AND EXISTS(SELECT 1 FROM onu_optics r WHERE r.device_id = d.id)"
+                "   AND EXISTS(SELECT 1 FROM onu_optics r"
+                "               WHERE r.org_id = d.org_id AND r.device_id = d.id)"
                 "   AND COALESCE(d.assigned_node_id,'') <> ''"
                 "   AND COALESCE(c.username,'') <> '' AND c.password_enc IS NOT NULL"
                 "   AND g.web_proxy=1" + only +
@@ -1065,31 +1107,47 @@ class SnmpStoreMixin:
             conn.commit()
 
 
+    _ONU_UPSERT_SQL = (
+        "INSERT INTO onu_optics (org_id, device_id, onu_key, pon_port, onu_id,"
+        " name, serial, state, rx_dbm, tx_dbm, olt_rx_dbm, distance_m,"
+        " rx_ref_dbm, rx_ref_at, severity, updated_at, last_online_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(org_id, device_id, onu_key) DO UPDATE SET"
+        " pon_port=excluded.pon_port, onu_id=excluded.onu_id, name=excluded.name,"
+        " serial=excluded.serial, state=excluded.state, rx_dbm=excluded.rx_dbm,"
+        " tx_dbm=excluded.tx_dbm, olt_rx_dbm=excluded.olt_rx_dbm,"
+        " distance_m=excluded.distance_m, rx_ref_dbm=excluded.rx_ref_dbm,"
+        " rx_ref_at=excluded.rx_ref_at, severity=excluded.severity,"
+        " updated_at=excluded.updated_at,"
+        " last_online_at=CASE WHEN excluded.state='online'"
+        "   THEN excluded.updated_at ELSE onu_optics.last_online_at END")
+
+    def upsert_onu_optics_many(self, org_id: str, device_id: int,
+                               rows: list[dict], ts: str) -> None:
+        if not rows:
+            return
+        params = [(org_id, device_id, r["onu_key"], r.get("pon_port"),
+                   r.get("onu_id"), r.get("name"), r.get("serial"), r.get("state"),
+                   r.get("rx_dbm"), r.get("tx_dbm"), r.get("olt_rx_dbm"),
+                   r.get("distance_m"), r.get("rx_ref_dbm"), r.get("rx_ref_at"),
+                   r["severity"], ts, ts if r.get("state") == "online" else None)
+                  for r in rows]
+        with self._write_lock, self._connect() as conn:
+            conn.executemany(self._ONU_UPSERT_SQL, params)
+            conn.commit()
+
     def upsert_onu_optics(self, org_id: str, device_id: int, onu_key: str, *,
                           pon_port: str | None, onu_id: int | None, name: str | None,
                           serial: str | None, state: str | None, rx_dbm: float | None,
                           tx_dbm: float | None, olt_rx_dbm: float | None,
                           distance_m: int | None, rx_ref_dbm: float | None,
                           rx_ref_at: str | None, severity: str, ts: str) -> None:
-        with self._write_lock, self._connect() as conn:
-            conn.execute(
-                "INSERT INTO onu_optics (org_id, device_id, onu_key, pon_port, onu_id,"
-                " name, serial, state, rx_dbm, tx_dbm, olt_rx_dbm, distance_m,"
-                " rx_ref_dbm, rx_ref_at, severity, updated_at, last_online_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(org_id, device_id, onu_key) DO UPDATE SET"
-                " pon_port=excluded.pon_port, onu_id=excluded.onu_id, name=excluded.name,"
-                " serial=excluded.serial, state=excluded.state, rx_dbm=excluded.rx_dbm,"
-                " tx_dbm=excluded.tx_dbm, olt_rx_dbm=excluded.olt_rx_dbm,"
-                " distance_m=excluded.distance_m, rx_ref_dbm=excluded.rx_ref_dbm,"
-                " rx_ref_at=excluded.rx_ref_at, severity=excluded.severity,"
-                " updated_at=excluded.updated_at,"
-                " last_online_at=CASE WHEN excluded.state='online'"
-                "   THEN excluded.updated_at ELSE onu_optics.last_online_at END",
-                (org_id, device_id, onu_key, pon_port, onu_id, name, serial, state,
-                 rx_dbm, tx_dbm, olt_rx_dbm, distance_m, rx_ref_dbm, rx_ref_at,
-                 severity, ts, ts if state == "online" else None))
-            conn.commit()
+        self.upsert_onu_optics_many(org_id, device_id, [{
+            "onu_key": onu_key, "pon_port": pon_port, "onu_id": onu_id,
+            "name": name, "serial": serial, "state": state, "rx_dbm": rx_dbm,
+            "tx_dbm": tx_dbm, "olt_rx_dbm": olt_rx_dbm, "distance_m": distance_m,
+            "rx_ref_dbm": rx_ref_dbm, "rx_ref_at": rx_ref_at,
+            "severity": severity}], ts)
 
 
     def get_olt_optics(self, org_id: str, device_id: int) -> dict | None:

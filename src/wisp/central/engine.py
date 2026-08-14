@@ -57,6 +57,14 @@ class EngineRegistry:
         self._lock = threading.Lock()
         self._engines: dict[str, MonitorEngine] = {}
         self._fingerprints: dict[str, tuple] = {}
+        self._org_locks: dict[str, threading.Lock] = {}
+
+    def org_lock(self, org_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._org_locks.get(org_id)
+            if lock is None:
+                lock = self._org_locks[org_id] = threading.Lock()
+            return lock
 
     @staticmethod
     def _fingerprint(devices: list[DeviceMeta]) -> tuple:
@@ -67,18 +75,20 @@ class EngineRegistry:
         devices = load_device_meta(self.store, org_id)
         fp = self._fingerprint(devices)
         with self._lock:
-            if self._fingerprints.get(org_id) != fp:
-                engine = MonitorEngine(devices, self.cfg)
-                states = self.store.device_states(org_id)
-                for dev_id, fsm in engine.fsm.items():
-                    row = states.get(dev_id)
-                    if row:
-                        fsm.prime(row["state"])
-                if self.store.uplink_active(org_id):
-                    engine._uplink_active = True
-                self._engines[org_id] = engine
-                self._fingerprints[org_id] = fp
-            return self._engines[org_id]
+            if self._fingerprints.get(org_id) == fp:
+                return self._engines[org_id]
+        engine = MonitorEngine(devices, self.cfg)
+        states = self.store.device_states(org_id)
+        for dev_id, fsm in engine.fsm.items():
+            row = states.get(dev_id)
+            if row:
+                fsm.prime(row["state"])
+        if self.store.uplink_active(org_id):
+            engine._uplink_active = True
+        with self._lock:
+            self._engines[org_id] = engine
+            self._fingerprints[org_id] = fp
+        return engine
 
     def forget(self, org_id: str) -> None:
 

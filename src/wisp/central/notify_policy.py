@@ -6,7 +6,7 @@ from collections import defaultdict
 from wisp.central.assignment import PagingAudience
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
-from wisp.egress.notifiers import NotifyResult, WhatsAppFacts
+from wisp.egress.notifiers import NotifyResult, WhatsAppFacts, queue_send
 
 log = logging.getLogger(__name__)
 
@@ -103,10 +103,9 @@ class AlertRouter:
             return NotifyResult(False, "cooldown")
 
         facts = wa_facts or WhatsAppFacts.derive(title, body, kind, ts)
-        res = self.notifier.send(title, body, priority,
-                                 whatsapp=numbers, facts=facts)
-        _log("sent" if res.ok else "failed", recipient)
-        return res
+        return queue_send(
+            self.notifier, title, body, priority, whatsapp=numbers, facts=facts,
+            on_result=lambda res: _log("sent" if res.ok else "failed", recipient))
 
 
 def compose_digest(rows: list[dict]) -> tuple[str, str]:
@@ -137,13 +136,20 @@ def flush_digests(store, org_id: str, notifier, cfg: Config, now_ts: str) -> Non
     numbers = list(store.org_alert_recipients(org_id))
     recipient = ",".join(numbers) or None
     title, body = compose_digest(rows)
-    if numbers:
-        res = notifier.send(title, body, 2, whatsapp=numbers,
-                            facts=WhatsAppFacts.derive(title, body, "DIGEST", now_ts))
-        status = "sent" if res.ok else "failed"
-    else:
-        status = "suppressed"
-    store.log_alert(org_id, None, None, notifier.channel, recipient, status,
-                    "DIGEST", now_ts, kind="DIGEST")
-    if status != "failed":
+    channel = notifier.channel
+    if not numbers:
+        store.log_alert(org_id, None, None, channel, recipient, "suppressed",
+                        "DIGEST", now_ts, kind="DIGEST")
         store.mark_digests_sent(org_id, now_ts)
+        return
+
+    def _done(res) -> None:
+        status = "sent" if res.ok else "failed"
+        store.log_alert(org_id, None, None, channel, recipient, status,
+                        "DIGEST", now_ts, kind="DIGEST")
+        if status != "failed":
+            store.mark_digests_sent(org_id, now_ts)
+
+    queue_send(notifier, title, body, 2, whatsapp=numbers,
+               facts=WhatsAppFacts.derive(title, body, "DIGEST", now_ts),
+               on_result=_done)

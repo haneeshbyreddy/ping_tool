@@ -170,13 +170,12 @@ def onu_search(h, qs):
     matches: list[dict] = []
     shipped = 0
     truncated = False
-    for did in h.store.onu_search_device_ids(org, needle):
-        if not in_scope(scope, did):
-            continue
-        dev = h.store.get_org_device(org, did)
-        if not dev:
-            continue
-        roster = onuroster.current_roster(h.store.list_onu_optics(org, did), now,
+    names = h.store.org_device_names(org)
+    candidates = [did for did in h.store.onu_search_device_ids(org, needle)
+                  if in_scope(scope, did) and did in names]
+    rosters = h.store.list_onu_optics_by_device(org, candidates)
+    for did in candidates:
+        roster = onuroster.current_roster(rosters.get(did, []), now,
                                           stale_s=None)
         hits = [o for o in roster
                 if needle in onuroster.search_key(o.get("serial"))
@@ -196,7 +195,7 @@ def onu_search(h, qs):
         shipped += len(hits)
         matches.append({
             "device_id": did,
-            "device_name": dev.get("name") or "",
+            "device_name": names.get(did) or "",
             "onus": [{
                 "id": o.get("id"),
                 "onu_key": o.get("onu_key"),

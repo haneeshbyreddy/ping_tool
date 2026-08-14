@@ -16,7 +16,7 @@ from wisp.core.state_machine import (
     UplinkDown,
     UplinkRestored,
 )
-from wisp.egress.notifiers import NotifyResult, WhatsAppFacts
+from wisp.egress.notifiers import NotifyResult, WhatsAppFacts, queue_send
 
 _DOWN_PRIORITY = 4
 
@@ -46,18 +46,23 @@ class CentralAlertDispatcher:
 
     def _publish(self, role: str, title: str, body: str, priority: int, *,
                  device_id: int | None = None,
-                 facts: WhatsAppFacts | None = None) -> NotifyResult:
+                 facts: WhatsAppFacts | None = None,
+                 on_result=None) -> NotifyResult:
         return self._broadcast(title, body, priority, device_id=device_id,
-                               facts=facts)
+                               facts=facts, on_result=on_result)
 
     def _broadcast(self, title: str, body: str, priority: int, *,
                    device_id: int | None = None,
-                   facts: WhatsAppFacts | None = None) -> NotifyResult:
+                   facts: WhatsAppFacts | None = None,
+                   on_result=None) -> NotifyResult:
         numbers = self._recipients(device_id)
         if not numbers:
-            return NotifyResult(False, "no recipients")
-        return self.notifier.send(title, body, priority,
-                                  whatsapp=numbers, facts=facts)
+            res = NotifyResult(False, "no recipients")
+            if on_result is not None:
+                on_result(res)
+            return res
+        return queue_send(self.notifier, title, body, priority,
+                          whatsapp=numbers, facts=facts, on_result=on_result)
 
     def _log(self, outage_id, device_id, recipient, status, payload, ts,
              kind=None) -> None:
@@ -104,10 +109,12 @@ class CentralAlertDispatcher:
         body = dev.ip_address
         facts = WhatsAppFacts(subject=f"{dev.name} ({dev.region})", status="DOWN",
                               detail=dev.ip_address, timestamp=ts)
-        res = self._publish("owner", title, body, _DOWN_PRIORITY,
-                            device_id=ev.device_id, facts=facts)
-        self._log(oid, ev.device_id, recipient, "sent" if res.ok else "failed", body,
-                  ts, kind="DEVICE_DOWN")
+        self._publish("owner", title, body, _DOWN_PRIORITY,
+                      device_id=ev.device_id, facts=facts,
+                      on_result=lambda res: self._log(
+                          oid, ev.device_id, recipient,
+                          "sent" if res.ok else "failed", body, ts,
+                          kind="DEVICE_DOWN"))
         self.store.schedule_escalation(self.org_id, oid, "hourly",
                                        _plus_minutes(ts, self.cfg.escalate_every_min))
 
@@ -131,10 +138,12 @@ class CentralAlertDispatcher:
 
     def _send_owner(self, title: str, body: str, ts: str, priority: int, *,
                     payload: str | None = None, kind: str | None = None) -> None:
-        res = self._publish("owner", title, body, priority)
         logged = payload if payload is not None else title
-        self._log(None, None, self._label(),
-                  "sent" if res.ok else "failed", logged, ts, kind=kind)
+        label = self._label()
+        self._publish("owner", title, body, priority,
+                      on_result=lambda res: self._log(
+                          None, None, label, "sent" if res.ok else "failed",
+                          logged, ts, kind=kind))
 
     def sweep(self, now_ts: str) -> None:
         for row in self.store.due_escalations(self.org_id, now_ts):

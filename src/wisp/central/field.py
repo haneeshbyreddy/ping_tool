@@ -112,15 +112,28 @@ def clean_fix(params: dict, cfg: Config = CONFIG,
 class TrackRate:
 
 
-    def __init__(self, per_min: int = 60, burst_factor: float = 2.0) -> None:
+    def __init__(self, per_min: int = 60, burst_factor: float = 2.0,
+                 max_keys: int = 4096) -> None:
         self.rate = max(per_min, 1) / 60.0
         self.capacity = max(per_min, 1) * burst_factor
+        self.max_keys = max_keys
         self._buckets: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
+
+    def _evict(self, t: float) -> None:
+        full = [k for k, (tokens, last) in self._buckets.items()
+                if tokens + (t - last) * self.rate >= self.capacity]
+        for k in full:
+            del self._buckets[k]
+        while len(self._buckets) >= self.max_keys:
+            oldest = min(self._buckets, key=lambda k: self._buckets[k][1])
+            del self._buckets[oldest]
 
     def allow(self, key: str, *, now: float | None = None) -> bool:
         t = _time.time() if now is None else now
         with self._lock:
+            if key not in self._buckets and len(self._buckets) >= self.max_keys:
+                self._evict(t)
             tokens, last = self._buckets.get(key, (self.capacity, t))
             tokens = min(self.capacity, tokens + (t - last) * self.rate)
             if tokens < 1.0:

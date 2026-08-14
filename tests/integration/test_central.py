@@ -344,15 +344,23 @@ class NodeTokenTest(unittest.TestCase):
         watched = {r["node_id"] for r in self.store.node_liveness()}
         self.assertEqual(watched, {"edge-1"})
 
-    def test_data_version_moves_on_heartbeat(self):
+    def test_data_version_ignores_a_bare_heartbeat(self):
         before = self.store.data_version("ispA")
         self.store.record_heartbeat("ispA", "edge-1", {},
                                     now="2099-01-01T00:00:00+00:00")
-        self.assertNotEqual(self.store.data_version("ispA"), before)
-        other = self.store.data_version("ispB")
-        self.store.record_heartbeat("ispA", "edge-1", {},
-                                    now="2099-01-01T00:01:00+00:00")
-        self.assertEqual(self.store.data_version("ispB"), other)
+        self.assertEqual(self.store.data_version("ispA"), before)
+
+    def test_data_version_moves_on_data_and_stays_org_scoped(self):
+        before_a = self.store.data_version("ispA")
+        before_b = self.store.data_version("ispB")
+        dev = self.store.create_org_device("ispA", {
+            "name": "SW", "ip_address": "10.9.9.9", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.store.upsert_switch_port("ispA", dev, 1, "Gi0/1", None, "up", "up",
+                                      None, 0, False, None,
+                                      "2099-01-01T00:00:00+00:00")
+        self.assertNotEqual(self.store.data_version("ispA"), before_a)
+        self.assertEqual(self.store.data_version("ispB"), before_b)
 
 class OrgDevicesTest(unittest.TestCase):
 
@@ -841,8 +849,25 @@ class CentralServerTest(unittest.TestCase):
         self.assertEqual(body["low_bandwidth"][0]["switch_name"], "Core Switch")
         self.assertEqual(body["high_bandwidth"], [])
 
+    def test_a_saturated_server_answers_503_instead_of_hanging(self):
+        taken = 0
+        while self.server._worker_slots.acquire(blocking=False):
+            taken += 1
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("GET", "/healthz")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 503)
+            conn.close()
+        finally:
+            for _ in range(taken):
+                self.server._worker_slots.release()
+        status, _ = self._req("GET", "/healthz")
+        self.assertEqual(status, 200)
+
     def test_events_stream_emits_changed_on_new_data(self):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self._req("POST", "/heartbeat", _hb(), token="s3cret")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("GET", "/api/events", headers={"Authorization": "Bearer s3cret"})
         resp = conn.getresponse()
         self.assertEqual(resp.status, 200)
@@ -852,7 +877,12 @@ class CentralServerTest(unittest.TestCase):
         self.assertEqual(resp.readline(), b"event: changed\n")
         version_before = resp.readline()
         resp.readline()
-        self._req("POST", "/heartbeat", _hb(), token="s3cret")
+        dev = self.store.create_org_device("ispA", {
+            "name": "SW", "ip_address": "10.9.9.8", "device_type": "switch",
+            "region": None, "parent_device_id": None})
+        self.store.upsert_switch_port("ispA", dev, 1, "Gi0/1", None, "up", "up",
+                                      None, 0, False, None,
+                                      "2099-01-01T00:00:00+00:00")
         self.assertEqual(resp.readline(), b"event: changed\n")
         version_after = resp.readline()
         self.assertNotEqual(version_before, version_after)

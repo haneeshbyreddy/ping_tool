@@ -91,6 +91,7 @@ class CentralOpticsMonitor:
 
         total = online = warn_count = crit_count = crit_unacked = 0
         acc = history.OpticsAccumulator()
+        pending: list[dict] = []
         for raw in raw_onus:
             onu_key = str(raw.get("onu_key") or "").strip()
             if not onu_key:
@@ -115,15 +116,17 @@ class CentralOpticsMonitor:
             if sev == SEV_CRIT and not _ack_active(ack_until, ts):
                 crit_unacked += 1
 
-            self.store.upsert_onu_optics(
-                self.org_id, device_id, onu_key,
-                pon_port=raw.get("pon_port"), onu_id=_to_int(raw.get("onu_id")),
-                name=(raw.get("name") or None), serial=(raw.get("serial") or None),
-                state=state, rx_dbm=rx, tx_dbm=sane_tx(_to_float(raw.get("tx_dbm"))),
-                olt_rx_dbm=_to_float(raw.get("olt_rx_dbm")),
-                distance_m=_to_int(raw.get("distance_m")),
-                rx_ref_dbm=ref, rx_ref_at=ref_at, severity=sev, ts=ts)
+            pending.append({
+                "onu_key": onu_key, "pon_port": raw.get("pon_port"),
+                "onu_id": _to_int(raw.get("onu_id")),
+                "name": (raw.get("name") or None),
+                "serial": (raw.get("serial") or None), "state": state,
+                "rx_dbm": rx, "tx_dbm": sane_tx(_to_float(raw.get("tx_dbm"))),
+                "olt_rx_dbm": _to_float(raw.get("olt_rx_dbm")),
+                "distance_m": _to_int(raw.get("distance_m")),
+                "rx_ref_dbm": ref, "rx_ref_at": ref_at, "severity": sev})
 
+        self.store.upsert_onu_optics_many(self.org_id, device_id, pending, ts)
         self._update_badge(device_id, total, online, warn_count, crit_count,
                            crit_unacked, ts)
         history.record_optics(self.store, self.cfg, self.org_id, device_id,
