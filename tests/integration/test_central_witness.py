@@ -37,6 +37,10 @@ class WitnessClaimTest(unittest.TestCase):
         self.olt = self.store.create_org_device("ispA", {
             "name": "HILL-OLT-1", "ip_address": "10.0.0.1", "device_type": "OLT",
             "region": None, "parent_device_id": None})
+        self.store.set_device_assignees(
+            "ispA", self.olt,
+            [next(u["id"] for u in self.store.list_users("ispA")
+                  if u["username"] == "ravi")], "owner")
         self.now = datetime.now(timezone.utc)
         self._onu(MAC)
         self.server = make_server(self.cfg, self.store)

@@ -151,6 +151,42 @@ class OutageStoreMixin:
         return [dict(r) for r in rows]
 
 
+    def first_outage_at(self, org_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(started_at) AS t FROM outages WHERE org_id=?",
+                (org_id,)).fetchone()
+        return row["t"] if row else None
+
+
+    def first_alert_at(self, org_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(sent_at) AS t FROM alert_log WHERE org_id=?",
+                (org_id,)).fetchone()
+        return row["t"] if row else None
+
+
+    def alert_counts_by_day(self, org_id: str, since: str,
+                            until: str) -> list[dict]:
+        # The governor's ledger: one row per (UTC day, kind, status) with a
+        # count — the aggregation happens here so the reply is bounded however
+        # long the log gets. substr(_,1,10) is the ISO date prefix, valid for
+        # both stamp formats in the wild. kind NULL rows predate the column
+        # and are shipped as '' so the chart can label the untagged era rather
+        # than silently dropping it.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT substr(sent_at, 1, 10) AS day,"
+                " COALESCE(kind, '') AS kind, COALESCE(status, '') AS status,"
+                " COUNT(*) AS n"
+                " FROM alert_log"
+                " WHERE org_id=? AND sent_at >= ? AND sent_at <= ?"
+                " GROUP BY day, kind, status ORDER BY day",
+                (org_id, since, until)).fetchall()
+        return [dict(r) for r in rows]
+
+
     def fold_device_rollups(self, entries: list[tuple]) -> None:
         if not entries:
             return
@@ -303,6 +339,20 @@ class OutageStoreMixin:
             row = conn.execute("SELECT org_id FROM outages WHERE id=?",
                                (outage_id,)).fetchone()
         return row["org_id"] if row else None
+
+
+    def outage_device(self, outage_id: int) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT device_id FROM outages WHERE id=?",
+                               (outage_id,)).fetchone()
+        return int(row["device_id"]) if row and row["device_id"] is not None else None
+
+
+    def outage_assignees(self, outage_id: int) -> list[str]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT assigned_to FROM outages WHERE id=?",
+                               (outage_id,)).fetchone()
+        return _assignees(row["assigned_to"]) if row else []
 
 
     def triage_outages(self, org_id: str, postmortem_days: int = 30) -> list[dict]:

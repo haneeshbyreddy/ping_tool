@@ -41,16 +41,35 @@ class FakeProxy:
 
 
 class FakeStore:
-    def __init__(self, targets=(), creds=None, profiles=()):
+    def __init__(self, targets=(), creds=None, profiles=(), mac_profiles=()):
         self._targets = list(targets)
         self._creds = creds
         self._profiles = list(profiles)
+        self._mac_profiles = list(mac_profiles)
         self.stored = []
         self.status = []
         self.retired = []
+        self.macs = []
+        self.mac_status = []
 
     def list_web_optics_profiles(self, org_id):
         return list(self._profiles)
+
+    def list_web_mac_profiles(self, org_id):
+        return list(self._mac_profiles)
+
+    def user_mac_targets(self, vendors=("dbc",), device_id=None):
+        return []
+
+    def upsert_user_macs(self, org_id, device_id, rows, ts):
+        self.macs.append((org_id, device_id, list(rows), ts))
+        return len(rows)
+
+    def set_web_mac_status(self, org_id, device_id, profile, state, detail,
+                           rows, declared=None):
+        self.mac_status.append({"device_id": device_id, "profile": profile,
+                                "state": state, "detail": detail, "rows": rows,
+                                "declared": declared})
 
     def web_optics_targets(self, vendors=("dbc",), device_id=None):
         self.asked_vendors = set(vendors)

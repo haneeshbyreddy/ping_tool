@@ -2,13 +2,13 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import { Link, useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ArrowUpFromLine, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, MoreVertical, Palette, Pencil, Plus, Radio, ScanSearch, Scissors, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ArrowUpFromLine, Cctv, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, MoreVertical, Palette, Pencil, Plus, Radio, ScanSearch, Scissors, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
 import { usePonOptions } from "@/hooks/use-pon-options"
 import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
-import { billingApi, gponApi, inventoryApi, nodesApi, ApiError } from "@/lib/api"
+import { billingApi, gponApi, inventoryApi, nodesApi, nvrApi, ApiError } from "@/lib/api"
 import { DEVICE_TYPES, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
 import { SplitRatioField } from "@/components/split-ratio-field"
 import { oltHead, ponOptions } from "@/map/plant"
@@ -32,7 +32,8 @@ import { StatusDot } from "@/components/status-badge"
 import { OnuHealth } from "@/components/onu-bar"
 import { ColorSwatches } from "@/components/color-swatches"
 import {
-  ago, deviceTone, durationSince, isDownState, isFresh, isStale, onuName, onuSearchKey,
+  ago, deviceTone, durationSince, isDownState, isFresh, isStale,
+  NO_ASSIGNED_DEVICES, onuName, onuSearchKey,
 } from "@/lib/format"
 import { paletteVarOf, type PaletteColor } from "@/lib/palette"
 import { cn } from "@/lib/utils"
@@ -213,6 +214,7 @@ interface DeviceFormState {
   snmp_community: string
   snmp_port: string
   gpon_vendor: string
+  nvr_vendor: string
   pon_port: string
   split_ratio: string
   split_inputs: string
@@ -230,7 +232,8 @@ const EMPTY_FORM: DeviceFormState = {
   name: "", ip_address: "", device_type: "", region: "", tags: [],
   parent_device_id: "",
   assigned_node_id: "", snmp_enabled: false, snmp_community: "", snmp_port: "161",
-  gpon_vendor: "", pon_port: "", split_ratio: "", split_inputs: "", onu_pon_limit: "",
+  gpon_vendor: "", nvr_vendor: "", pon_port: "", split_ratio: "",
+  split_inputs: "", onu_pon_limit: "",
 }
 
 function DeviceForm({
@@ -251,6 +254,7 @@ function DeviceForm({
     snmp_enabled: !!editing.snmp_enabled, snmp_community: editing.snmp_community ?? "",
     snmp_port: String(editing.snmp_port || 161),
     gpon_vendor: editing.gpon_vendor ?? "",
+    nvr_vendor: editing.nvr_vendor ?? "",
     pon_port: editing.pon_port ?? "",
     split_ratio: editing.split_ratio ? String(editing.split_ratio) : "",
     split_inputs: editing.split_inputs ? String(editing.split_inputs) : "",
@@ -267,6 +271,16 @@ function DeviceForm({
     ...GPON_VENDORS,
     ...(gponProfiles.data?.profiles.filter((p) => p.enabled).map((p) => p.name) ?? []),
     ...(form.gpon_vendor ? [form.gpon_vendor] : []),
+  ])].sort()
+
+  const nvrProfiles = useQuery({
+    queryKey: ["nvr-profiles", org],
+    queryFn: () => nvrApi.profiles(org),
+    enabled: form.device_type === "nvr",
+  })
+  const nvrVendors = [...new Set([
+    ...(nvrProfiles.data?.names ?? []),
+    ...(form.nvr_vendor ? [form.nvr_vendor] : []),
   ])].sort()
 
   const cardRef = useRef<HTMLDivElement>(null)
@@ -302,6 +316,7 @@ function DeviceForm({
         assigned_node_id: passive ? null : (form.assigned_node_id || null),
 
         gpon_vendor: form.device_type === "OLT" ? (form.gpon_vendor || null) : null,
+        nvr_vendor: form.device_type === "nvr" ? (form.nvr_vendor || null) : null,
         onu_pon_limit: form.device_type === "OLT" && form.onu_pon_limit
           ? Number(form.onu_pon_limit) : null,
         pon_port: passive ? (form.pon_port.trim() || null) : null,
@@ -473,6 +488,19 @@ function DeviceForm({
               <Input placeholder="port" className="w-20" value={form.snmp_port}
                 onChange={(e) => setForm({ ...form, snmp_port: e.target.value })} />
             </>
+          )}
+          {form.device_type === "nvr" && (
+            <div className="flex items-center gap-2 text-sm">
+              <Label className="text-muted-foreground">NVR brand</Label>
+              <Select value={form.nvr_vendor || "none"}
+                onValueChange={(v) => setForm({ ...form, nvr_vendor: v === "none" ? "" : v })}>
+                <SelectTrigger className="w-52"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">not set (camera read off)</SelectItem>
+                  {nvrVendors.map((v) => <SelectItem key={v} value={v}>{v}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
           )}
           {form.device_type === "OLT" && (
             <div className="flex items-center gap-2 text-sm">
@@ -663,6 +691,13 @@ function DeviceAlarmChips({ device, hasOptics, openTab, dupMac = true }: {
           {device.ports_down === 1 ? "port down" : `${device.ports_down} ports down`}
         </RowTag>
       )}
+      {liveSnmp && isFresh(device.cameras_updated_at)
+        && (device.cameras_down ?? 0) > 0 && (
+        <RowTag tone="destructive" title="A camera is dark. Click for cameras"
+          onClick={(e) => { e.stopPropagation(); openTab("cameras") }}>
+          {device.cameras_down === 1 ? "cam dark" : `${device.cameras_down} cams dark`}
+        </RowTag>
+      )}
       {liveSnmp && (device.health_temp_c ?? 0) >= VITAL_TEMP_CRIT && (
         <RowTag tone="destructive" title="Device temperature critical. Click for health"
           onClick={(e) => { e.stopPropagation(); openTab("health") }}>
@@ -744,13 +779,30 @@ function CardOnuHealth({ device, hasOptics, openTab, className }: {
 function DeviceCapabilityIcons({ device, hasOptics, hasPorts }: {
   device: OrgDevice; hasOptics: boolean; hasPorts: boolean
 }) {
-  if (!hasOptics && !hasPorts) return null
+  const hasCameras = (device.device_type ?? "").toLowerCase() === "nvr"
+  if (!hasOptics && !hasPorts && !hasCameras) return null
   const opticsFresh = isFresh(device.optics_updated_at)
   const portsFresh = isFresh(device.ports_updated_at)
+  const camerasFresh = isFresh(device.cameras_updated_at)
+  const camCount = device.cameras_total ?? 0
   const rxCount = device.onus_rx ?? 0
   const hasRx = rxCount > 0 && opticsFresh
   return (
     <div className="flex items-center gap-1.5">
+      {hasCameras && (
+        <span title={(device.cameras_down ?? 0) > 0
+          ? `Cameras: ${device.cameras_down} of ${camCount} dark`
+          : camCount > 0 && camerasFresh
+            ? `Cameras: ${camCount} channels reporting`
+            : camCount > 0
+              ? "Cameras: the channel read has gone stale"
+              : "Cameras: no channel read yet. Open the Cameras tab for why."}>
+          <Cctv className={cn("size-3.5",
+            (device.cameras_down ?? 0) > 0 ? "text-destructive"
+              : camCount > 0 && camerasFresh ? "text-success"
+              : "text-faint-foreground")} />
+        </span>
+      )}
       {hasOptics && (
         <span title={device.onus_crit ? `Optical: ${device.onus_crit} ONU(s) critical`
           : device.onus_warn ? `Optical: ${device.onus_warn} ONU(s) weak`
@@ -1061,7 +1113,7 @@ function loadSort(): SortMode {
 }
 
 export function TopologyPage() {
-  const { scopeOrg, canWrite } = useAuth()
+  const { scopeOrg, canWrite, isWorker } = useAuth()
   const location = useLocation()
   const navState = location.state as
     { deviceId?: number; probeId?: string; tab?: DeviceTab; onuId?: number
@@ -1456,6 +1508,7 @@ export function TopologyPage() {
               : tagFilter.size > 0 ? "No devices carry all the selected tags."
               : probeFilter ? `No devices assigned to ${probeFilter}.`
               : statusFilter ? `No devices match “${statusFilter.label}”.`
+              : isWorker ? NO_ASSIGNED_DEVICES
               : "No devices yet. Add one above."}
           </p>
         )}

@@ -199,7 +199,16 @@ class SnmpStoreMixin:
 
 
     _LABEL_JOIN = (" LEFT JOIN onu_places pl ON pl.org_id = o.org_id"
-                   "   AND pl.mac = wisp_norm_mac(o.serial)")
+                   "   AND pl.mac = wisp_norm_mac(o.serial)"
+                   " LEFT JOIN radius_links rl ON rl.org_id = o.org_id"
+                   "   AND rl.device_id = o.device_id AND rl.onu_key = o.onu_key"
+                   " LEFT JOIN radius_customers rc ON rc.org_id = rl.org_id"
+                   "   AND rc.username = rl.username"
+                   "   AND rc.account_id = rl.account_id")
+
+    _RADIUS_COLS = (" rc.name AS radius_name, rc.username AS radius_username,"
+                    " rc.mobile AS radius_mobile, rc.status AS radius_status,"
+                    " rl.match_by AS radius_match")
 
     def _with_norm_mac(self, conn):
         conn.create_function("wisp_norm_mac", 1, onuroster._norm_mac,
@@ -209,7 +218,8 @@ class SnmpStoreMixin:
     def list_onu_optics(self, org_id: str, device_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = self._with_norm_mac(conn).execute(
-                "SELECT o.*, pl.label AS label FROM onu_optics o"
+                "SELECT o.*, pl.label AS label," + self._RADIUS_COLS
+                + " FROM onu_optics o"
                 + self._LABEL_JOIN
                 + " WHERE o.org_id=? AND o.device_id=?"
                 " ORDER BY o.rx_dbm IS NULL, o.rx_dbm ASC, o.onu_key",
@@ -379,6 +389,302 @@ class SnmpStoreMixin:
         return dict(row) if row else None
 
 
+    def upsert_user_macs(self, org_id: str, device_id: int, rows: list[dict],
+                         ts: str) -> int:
+
+
+        if not rows:
+            return 0
+        kept = 0
+        with self._write_lock, self._connect() as conn:
+            for r in rows:
+                key = str(r.get("onu_key") or "").strip()
+                mac = str(r.get("mac") or "").strip().upper()
+                if not key or not mac:
+                    continue
+                conn.execute(
+                    "INSERT INTO onu_user_macs (org_id, device_id, onu_key, mac,"
+                    " vlan, kind, port_label, first_seen_at, last_seen_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(device_id, onu_key, mac) DO UPDATE SET"
+                    "   org_id=excluded.org_id, vlan=excluded.vlan,"
+                    "   kind=excluded.kind, port_label=excluded.port_label,"
+                    "   last_seen_at=excluded.last_seen_at",
+                    (org_id, device_id, key, mac, r.get("vlan"), r.get("kind"),
+                     r.get("port_label"), ts, ts))
+                kept += 1
+            conn.commit()
+        return kept
+
+    def list_user_macs(self, org_id: str, device_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT onu_key, mac, vlan, kind, port_label, first_seen_at,"
+                " last_seen_at FROM onu_user_macs WHERE org_id=? AND device_id=?"
+                " ORDER BY onu_key, last_seen_at DESC, mac",
+                (org_id, device_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def user_macs_for_slot(self, org_id: str, device_id: int,
+                           onu_key: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT mac, vlan, kind, port_label, first_seen_at, last_seen_at"
+                " FROM onu_user_macs WHERE org_id=? AND device_id=? AND onu_key=?"
+                " ORDER BY last_seen_at DESC, mac",
+                (org_id, device_id, str(onu_key or ""))).fetchall()
+        return [dict(r) for r in rows]
+
+    def user_mac_counts(self, org_id: str) -> dict[int, int]:
+
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id, COUNT(DISTINCT onu_key) n FROM onu_user_macs"
+                " WHERE org_id=? GROUP BY device_id", (org_id,)).fetchall()
+        return {int(r["device_id"]): int(r["n"]) for r in rows}
+
+    def set_web_mac_status(self, org_id: str, device_id: int, profile: str,
+                           state: str, detail: str | None, rows: int,
+                           declared: int | None = None) -> None:
+        now = _now_iso()
+        ok = state in ("ok", "partial")
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO web_mac_status (device_id, org_id, profile, state,"
+                " detail, rows, declared, updated_at, last_ok_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET org_id=excluded.org_id,"
+                " profile=excluded.profile, state=excluded.state,"
+                " detail=excluded.detail, rows=excluded.rows,"
+                " declared=excluded.declared, updated_at=excluded.updated_at,"
+                " last_ok_at=CASE WHEN excluded.last_ok_at IS NOT NULL"
+                "   THEN excluded.last_ok_at ELSE web_mac_status.last_ok_at END",
+                (device_id, org_id, profile or "", state,
+                 (detail[:400] if detail else None), int(rows),
+                 (int(declared) if declared is not None else None), now,
+                 now if ok else None))
+            conn.commit()
+
+    def get_web_mac_status(self, org_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM web_mac_status WHERE org_id=? AND device_id=?",
+                (org_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def list_web_mac_profiles(self, org_id: str | None) -> list[dict]:
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM web_mac_profiles ORDER BY"
+                    " IFNULL(org_id,''), name").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM web_mac_profiles WHERE org_id IS NULL"
+                    " OR org_id=? ORDER BY IFNULL(org_id,''), name",
+                    (org_id,)).fetchall()
+        return [self._web_optics_row(r) for r in rows]
+
+    def user_mac_targets(self, vendors=("dbc",),
+                         device_id: int | None = None) -> list[dict]:
+
+
+        names = {str(n or "").strip().lower() for n in (vendors or ())}
+        names.discard("")
+        if not names:
+            return []
+        marks = ",".join("?" * len(names))
+        args = sorted(names) * 2
+        only = "" if device_id is None else " AND d.id = ?"
+        if device_id is not None:
+            args = args + [int(device_id)]
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.id, d.org_id, d.name, d.ip_address, d.assigned_node_id,"
+                " d.web_ip, d.web_port, d.web_scheme, c.username, c.password_enc,"
+                " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
+                "      THEN LOWER(d.gpon_vendor) ELSE LOWER(COALESCE(s.profile,''))"
+                " END AS vendor,"
+                " CASE WHEN LOWER(COALESCE(d.gpon_vendor,'')) <> ''"
+                "      THEN 'declared' ELSE 'detected' END AS vendor_source"
+                " FROM org_devices d"
+                " JOIN device_webui_credentials c ON c.device_id = d.id"
+                " JOIN orgs g ON g.org_id = d.org_id"
+                " LEFT JOIN device_snmp_status s"
+                "   ON s.device_id = d.id AND s.subsystem = 'optics'"
+                " WHERE d.is_active=1 AND d.maintenance=0"
+                f"   AND (LOWER(COALESCE(d.gpon_vendor,'')) IN ({marks})"
+                "        OR (COALESCE(d.gpon_vendor,'') = ''"
+                f"            AND LOWER(COALESCE(s.profile,'')) IN ({marks})"
+                "            AND COALESCE(s.sysobjectid,'') <> ''))"
+                "   AND EXISTS(SELECT 1 FROM onu_optics r WHERE r.device_id = d.id)"
+                "   AND COALESCE(d.assigned_node_id,'') <> ''"
+                "   AND COALESCE(c.username,'') <> '' AND c.password_enc IS NOT NULL"
+                "   AND g.web_proxy=1" + only +
+                " ORDER BY d.org_id, d.id", args).fetchall()
+        return [dict(r) for r in rows]
+
+
+    def upsert_nvr_channels(self, org_id: str, device_id: int, rows: list[dict],
+                            ts: str, prune: bool = True) -> dict:
+        with self._write_lock, self._connect() as conn:
+            prior: dict[int, str] = {}
+            unwatched: set[int] = set()
+            for r in conn.execute(
+                    "SELECT channel_no, state, monitored FROM nvr_channels"
+                    " WHERE org_id=? AND device_id=?", (org_id, device_id)):
+                prior[int(r["channel_no"])] = str(r["state"])
+                if not r["monitored"]:
+                    unwatched.add(int(r["channel_no"]))
+            kept = 0
+            seen: set[int] = set()
+            for r in rows or ():
+                try:
+                    chan = int(r["channel_no"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                state = str(r.get("state") or "unknown")
+                if state not in ("online", "offline", "unknown"):
+                    state = "unknown"
+                seen.add(chan)
+                conn.execute(
+                    "INSERT INTO nvr_channels (org_id, device_id, channel_no,"
+                    " name, ip_address, port, camera_kind, enabled, state,"
+                    " last_online_at, first_seen_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(device_id, channel_no) DO UPDATE SET"
+                    "   org_id=excluded.org_id, name=excluded.name,"
+                    "   ip_address=excluded.ip_address, port=excluded.port,"
+                    "   camera_kind=excluded.camera_kind,"
+                    "   enabled=excluded.enabled, state=excluded.state,"
+                    "   last_online_at=CASE WHEN excluded.state='online'"
+                    "     THEN excluded.last_online_at"
+                    "     ELSE nvr_channels.last_online_at END,"
+                    "   updated_at=excluded.updated_at",
+                    (org_id, device_id, chan, r.get("name"), r.get("ip_address"),
+                     r.get("port"), r.get("camera_kind"),
+                     1 if r.get("enabled", True) else 0, state,
+                     ts if state == "online" else None, ts, ts))
+                kept += 1
+            if prune and seen:
+                marks = ",".join("?" * len(seen))
+                conn.execute(
+                    f"DELETE FROM nvr_channels WHERE org_id=? AND device_id=?"
+                    f" AND channel_no NOT IN ({marks})",
+                    (org_id, device_id, *sorted(seen)))
+            elif prune and not rows:
+                conn.execute(
+                    "DELETE FROM nvr_channels WHERE org_id=? AND device_id=?",
+                    (org_id, device_id))
+            conn.commit()
+        return {"kept": kept, "prior": prior, "unwatched": unwatched}
+
+    def list_nvr_channels(self, org_id: str, device_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT channel_no, name, ip_address, port, camera_kind,"
+                " enabled, monitored, state, last_online_at, first_seen_at,"
+                " updated_at"
+                " FROM nvr_channels WHERE org_id=? AND device_id=?"
+                " ORDER BY channel_no", (org_id, device_id)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["enabled"] = bool(d["enabled"])
+            d["monitored"] = bool(d["monitored"])
+            out.append(d)
+        return out
+
+    def dark_cameras(self, org_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT nc.device_id, nc.channel_no, nc.name, nc.ip_address,"
+                " nc.last_online_at, d.name AS nvr_name, d.region"
+                " FROM nvr_channels nc JOIN org_devices d ON d.id = nc.device_id"
+                " WHERE nc.org_id=? AND nc.enabled=1 AND nc.monitored=1"
+                "   AND nc.state='offline' AND d.is_active=1"
+                " ORDER BY d.name, nc.channel_no", (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_nvr_channel_watch(self, org_id: str, device_id: int,
+                              channel_no: int, monitored: bool) -> bool:
+        with self._write_lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE nvr_channels SET monitored=?"
+                " WHERE org_id=? AND device_id=? AND channel_no=?",
+                (1 if monitored else 0, org_id, device_id, int(channel_no)))
+            conn.commit()
+        return cur.rowcount > 0
+
+    def set_nvr_status(self, org_id: str, device_id: int, profile: str,
+                       state: str, detail: str | None, channels: int = 0) -> None:
+        now = _now_iso()
+        ok = state in ("ok", "partial")
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO nvr_status (device_id, org_id, profile, state,"
+                " detail, channels, updated_at, last_ok_at)"
+                " VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET org_id=excluded.org_id,"
+                " profile=excluded.profile, state=excluded.state,"
+                " detail=excluded.detail, channels=excluded.channels,"
+                " updated_at=excluded.updated_at,"
+                " last_ok_at=CASE WHEN excluded.last_ok_at IS NOT NULL"
+                "   THEN excluded.last_ok_at ELSE nvr_status.last_ok_at END",
+                (device_id, org_id, profile or "", state,
+                 (detail[:400] if detail else None), int(channels), now,
+                 now if ok else None))
+            conn.commit()
+
+    def get_nvr_status(self, org_id: str, device_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM nvr_status WHERE org_id=? AND device_id=?",
+                (org_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def list_nvr_profiles(self, org_id: str | None) -> list[dict]:
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM nvr_profiles ORDER BY"
+                    " IFNULL(org_id,''), name").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM nvr_profiles WHERE org_id IS NULL"
+                    " OR org_id=? ORDER BY IFNULL(org_id,''), name",
+                    (org_id,)).fetchall()
+        return [self._web_optics_row(r) for r in rows]
+
+    def nvr_targets(self, vendors=("cpplus",),
+                    device_id: int | None = None) -> list[dict]:
+        names = {str(n or "").strip().lower() for n in (vendors or ())}
+        names.discard("")
+        if not names:
+            return []
+        marks = ",".join("?" * len(names))
+        args: list = sorted(names)
+        only = "" if device_id is None else " AND d.id = ?"
+        if device_id is not None:
+            args = args + [int(device_id)]
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT d.id, d.org_id, d.name, d.ip_address, d.assigned_node_id,"
+                " d.web_ip, d.web_port, d.web_scheme, c.username, c.password_enc,"
+                " LOWER(d.nvr_vendor) AS vendor"
+                " FROM org_devices d"
+                " JOIN device_webui_credentials c ON c.device_id = d.id"
+                " JOIN orgs g ON g.org_id = d.org_id"
+                " WHERE d.is_active=1 AND d.maintenance=0"
+                "   AND d.device_type='nvr'"
+                f"  AND LOWER(COALESCE(d.nvr_vendor,'')) IN ({marks})"
+                "   AND COALESCE(d.assigned_node_id,'') <> ''"
+                "   AND COALESCE(c.username,'') <> '' AND c.password_enc IS NOT NULL"
+                "   AND g.web_proxy=1" + only +
+                " ORDER BY d.org_id, d.id", args).fetchall()
+        return [dict(r) for r in rows]
+
     def onu_search_device_ids(self, org_id: str, needle: str) -> list[int]:
 
 
@@ -395,9 +701,12 @@ class SnmpStoreMixin:
                 + " WHERE o.org_id=? AND d.org_id=? AND d.is_active=1"
                 " AND (wisp_search_key(o.serial) LIKE ?"
                 "      OR wisp_search_key(o.name) LIKE ?"
-                "      OR wisp_search_key(pl.label) LIKE ?)",
-                (org_id, org_id, f"%{needle}%", f"%{needle}%",
-                 f"%{needle}%")).fetchall()
+                "      OR wisp_search_key(pl.label) LIKE ?"
+                "      OR wisp_search_key(rc.name) LIKE ?"
+                "      OR wisp_search_key(rc.username) LIKE ?"
+                "      OR wisp_search_key(rc.mobile) LIKE ?)",
+                (org_id, org_id, f"%{needle}%", f"%{needle}%", f"%{needle}%",
+                 f"%{needle}%", f"%{needle}%", f"%{needle}%")).fetchall()
         return [r["device_id"] for r in rows]
 
 
@@ -406,6 +715,7 @@ class SnmpStoreMixin:
         q = ("SELECT o.device_id, o.onu_key, o.pon_port, o.onu_id, o.name, o.serial,"
              " o.state, o.distance_m, o.last_online_at, o.updated_at,"
              " o.rx_dbm, o.severity, pl.label AS label,"
+             + self._RADIUS_COLS + ","
              " d.name AS device_name"
              " FROM onu_optics o JOIN org_devices d ON d.id = o.device_id"
              + self._LABEL_JOIN
@@ -422,15 +732,27 @@ class SnmpStoreMixin:
     _PLACE_COLS = ("mac, lat, lng, label, phone, notes, witness, accuracy_m,"
                    " place_source, placed_by, placed_at, created_at, updated_at")
 
+    _PLACE_RADIUS = (
+        ", (SELECT CASE WHEN COUNT(DISTINCT rc.name) = 1 THEN MIN(rc.name) END"
+        "   FROM onu_optics o"
+        "   JOIN radius_links rl ON rl.org_id = o.org_id"
+        "     AND rl.device_id = o.device_id AND rl.onu_key = o.onu_key"
+        "   JOIN radius_customers rc ON rc.org_id = rl.org_id"
+        "     AND rc.username = rl.username AND rc.account_id = rl.account_id"
+        "   WHERE o.org_id = onu_places.org_id"
+        "     AND wisp_norm_mac(o.serial) = onu_places.mac) AS radius_name")
+
     def list_onu_places(self, org_id: str, *,
                         located_only: bool = False) -> list[dict]:
 
 
-        q = f"SELECT {self._PLACE_COLS} FROM onu_places WHERE org_id=?"
+        q = (f"SELECT {self._PLACE_COLS}{self._PLACE_RADIUS}"
+             " FROM onu_places WHERE org_id=?")
         if located_only:
             q += " AND lat IS NOT NULL AND lng IS NOT NULL"
         with self._connect() as conn:
-            rows = conn.execute(q + " ORDER BY label, mac", (org_id,)).fetchall()
+            rows = self._with_norm_mac(conn).execute(
+                q + " ORDER BY label, mac", (org_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def get_onu_place(self, org_id: str, mac: str) -> dict | None:

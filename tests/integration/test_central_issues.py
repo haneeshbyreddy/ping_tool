@@ -242,6 +242,10 @@ class IssueListTest(unittest.TestCase):
         self._state(other, "DOWN", org="ispB")
         mine = self._device("A-SW", "10.0.0.1")
         self._state(mine, "DOWN")
+        self.store.set_device_assignees(
+            "ispA", mine,
+            [next(u["id"] for u in self.store.list_users("ispA")
+                  if u["username"] == "field")], "owner")
         _, body, _ = self._req("GET", "/api/issues?org=ispB",
                                cookie=self._login("field", "fieldpassword"))
         self.assertEqual({r["device_name"] for r in body["issues"]}, {"A-SW"})

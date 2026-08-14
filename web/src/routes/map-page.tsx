@@ -10,7 +10,7 @@ import "leaflet/dist/leaflet.css"
 import {
   ArrowLeft, Check, ChevronDown, ChevronRight, Copy, Crosshair,
   Expand, EyeOff, Layers, ListTree, LocateFixed, MapPin, MapPinOff, Maximize2, Navigation,
-  Pencil, Plus, Route, Scissors, Shrink, Slash, Spline, Trash2, Undo2, Users, X,
+  PanelRight, Pencil, Plus, Route, Scissors, Shrink, Slash, Spline, Trash2, Undo2, Users, X,
   Cable as CableIcon,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
@@ -24,8 +24,9 @@ import { isPassiveType, type Cable, type FibrePoint, type OnuPlace, type OrgDevi
 import {
   DeviceDetail, DevicePanelHeader, RowTag, deviceTabs, type DeviceTab,
 } from "@/components/device-detail"
-import { CableForm, CableList, CablePanel } from "@/components/cable-record"
-import { FibrePanel } from "@/components/coupler-tray"
+import { CableForm, CableList, CablePanel,
+         type MoveTarget } from "@/components/cable-record"
+import { FibrePanel, type FarLanding } from "@/components/coupler-tray"
 import {
   CABLE_DASH, cableIcon, cableLabelPos, cablePolyline, cableTraced,
 } from "@/map/cables"
@@ -36,8 +37,8 @@ import {
 import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import { NeedsOrg } from "@/components/needs-org"
 import { StatusDot } from "@/components/status-badge"
-import { isPlumbing, portKindFor } from "@/lib/fiber"
-import { durationSince, onuName } from "@/lib/format"
+import { isPlumbing, portKindsFor } from "@/lib/fiber"
+import { durationSince, NO_ASSIGNED_DEVICES, onuName } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
@@ -55,10 +56,11 @@ import { buildClusters, clusterIcon, project, toneRank, type SiteCluster } from 
 import { cutIcon, pointAlong, ponPath, subPath } from "@/map/cut"
 import { DevHoverCard } from "@/map/devhover"
 import { alongKm, distanceKm, fmtKm, nearestOnPath, pointAt, polyKm } from "@/map/geometry"
-import { LinkHoverProbe, hoverIcon, projectLinks, type LinkHover } from "@/map/linkhover"
-import { bindLinkPorts, bwRank, linkBwIcon, linkKey, linkLabelPos, type LinkBinding } from "@/map/linklabel"
+import { LinkHoverProbe, hoverIcon, projectLinks, type HoverLink, type LinkHover } from "@/map/linkhover"
+import { bindLinkPorts, bwRank, linkBwIcon, linkKey, linkLabelPos, linkRateBody, linkTone, type LinkBinding } from "@/map/linklabel"
 import {
-  isDownState, isPlaced, isTrouble, meIcon, pinIcon, pinTone, vertexIcon, type Placed,
+  MARK_Z_DOWN, MARK_Z_GEAR, MARK_Z_SELECTED, isDownState, isPlaced, isTrouble,
+  markZIndex, meIcon, pinIcon, pinTone, vertexIcon, type Placed,
 } from "@/map/pins"
 import {
   REF_DASH, REF_HOVER_BOOST, REF_NAME_DY, isRefDark, isRefEvidence, refBwIcon,
@@ -127,7 +129,7 @@ const foldedTogether = (a: [number, number], b: [number, number]): boolean =>
   a[0] === b[0] && a[1] === b[1]
 
 export function MapPage() {
-  const { scopeOrg, canWrite } = useAuth()
+  const { scopeOrg, canWrite, isWorker } = useAuth()
   const dark = useDarkMode()
   const navigate = useNavigate()
   const navLocation = useNavLocation()
@@ -135,6 +137,16 @@ export function MapPage() {
   const queryClient = useQueryClient()
   const mapRef = useRef<L.Map | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  // Selecting a device and OPENING ITS PANEL are two different things. A pin click, a
+  // placement or a link chip still means both (`selectDevice`); the list-driven paths — a
+  // search hit, a site-card row — select the pin WITHOUT the panel and put up the PON focus
+  // bar instead, because the answer they were reaching for is usually on the map, not in a
+  // panel covering it. The panel is one click away either way: its row carries the button,
+  // and clicking the pin still opens it.
+  const [panelFor, setPanelFor] = useState<number | null>(null)
+  const selectDevice = useCallback((id: number | null) => {
+    setSelectedId(id); setPanelFor(id)
+  }, [])
   const [cableOpen, setCableOpenRaw] = useState<number | null>(null)
   const [traceCore, setTraceCore] = useState<number | null>(null)
   const cableDelete = useConfirm()
@@ -274,10 +286,17 @@ export function MapPage() {
     enabled: !!scopeOrg,
     staleTime: 60_000,
   })
+  // A FIBRE POINT IS A DEVICE OR A CUSTOMER. The ISPs settled on 2026-08-09 that a
+  // customer point is a coupler too — core 1 out to this house, cores 2-4 carrying on
+  // to the next three — which is how a lane of daisy-chained houses is recorded. The
+  // types, the joints table and `store.point_fibre` all carried a mac already; only
+  // the callers that OPEN the panel were device-only.
   const trayPoint = useMemo(
-    () => (selectedId != null ? { device_id: selectedId } : null), [selectedId])
+    () => (selectedOnuMac ? { mac: selectedOnuMac }
+           : selectedId != null ? { device_id: selectedId } : null),
+    [selectedId, selectedOnuMac])
   const fibreQ = useQuery({
-    queryKey: ["point-fibre", scopeOrg, selectedId],
+    queryKey: ["point-fibre", scopeOrg, selectedId, selectedOnuMac],
     queryFn: () => inventoryApi.pointFibre(trayPoint!, scopeOrg),
     enabled: trayPoint != null && fibreOpen,
   })
@@ -289,11 +308,10 @@ export function MapPage() {
     enabled: traceFrom != null,
   })
   const routeByKey = useMemo(() => {
-    const m = new Map<string, { pts: Array<[number, number]>; fromCable: boolean }>()
+    const m = new Map<string, { pts: Array<[number, number]> }>()
     for (const r of routesQ.data?.routes ?? [])
       if (r.waypoints.length > 0)
-        m.set(`${r.child_id}:${r.parent_id}`,
-              { pts: r.waypoints, fromCable: r.from_cable })
+        m.set(`${r.child_id}:${r.parent_id}`, { pts: r.waypoints })
     return m
   }, [routesQ.data])
   const styleByKey = useMemo(() => {
@@ -403,18 +421,24 @@ export function MapPage() {
   const selected = selectedId != null ? byId.get(selectedId) ?? null : null
   const placing = placingId != null ? byId.get(placingId) ?? null : null
 
-  const fibreDefaulted = useRef<number | null>(null)
-  useEffect(() => {
-    if (fibreDefaulted.current === selectedId) return
-    const d = selectedId != null ? byId.get(selectedId) : null
-    if (selectedId != null && (!d || !cablesQ.data)) return
-    fibreDefaulted.current = selectedId
-    const cabled = !!d && (cablesQ.data?.cables ?? []).some(
-      (c) => c.a.device_id === d.id || c.b.device_id === d.id)
-    const hasPorts = !!d && ((d.device_type ?? "").toUpperCase() === "OLT"
-                             || d.device_type === "splitter")
-    setFibreOpen(!!d && (hasPorts || (isPassiveType(d.device_type) && cabled)))
-  }, [selectedId, byId, cablesQ.data])
+  useEffect(() => { setFibreOpen(false) }, [selectedId, selectedOnuMac])
+
+  // The cables opened at a box, with the cores still FREE at that end. An enclosure
+  // has no ports, so this is what a connect must ask for there. `cable.plan` already
+  // carries which cores are used at which END, so no extra read is needed — and a
+  // core we get wrong is refused by name at the server anyway.
+  const cablesAt = useCallback((deviceId: number) =>
+    (cablesQ.data?.cables ?? [])
+      .filter((c) => !isPlumbing(c)
+        && (c.a.device_id === deviceId || c.b.device_id === deviceId))
+      .map((c) => {
+        const side = c.a.device_id === deviceId ? "a" : "b"
+        return {
+          cable_id: c.id, name: c.name, cores: c.cores,
+          freeCores: Array.from({ length: c.cores ?? 0 }, (_, i) => i + 1)
+            .filter((n) => !c.plan[String(n)]?.[side]),
+        }
+      }), [cablesQ.data])
 
   const trayBoxes = useMemo(() => {
     const here = fibreQ.data?.point
@@ -430,23 +454,36 @@ export function MapPage() {
       .map((d) => ({
         id: d.id, name: d.name, device_type: d.device_type,
         declared: declared.has(d.id),
-        port_kind: portKindFor(d.device_type),
+        port_kinds: portKindsFor(d.device_type),
         ports: portsQ.data?.ports?.[String(d.id)] ?? [],
+        cables: cablesAt(d.id),
         km: distanceKm(lat, lng, d.lat!, d.lng!),
       }))
       .sort((a, b) => Number(b.declared) - Number(a.declared) || a.km - b.km)
-      .slice(0, 12)
-  }, [fibreQ.data?.point, placed, devices, portsQ.data])
+  }, [fibreQ.data?.point, placed, devices, portsQ.data, cablesAt])
 
   const boxOf = useCallback((id: number) => {
     const d = byId.get(id)
     if (!d) return undefined
     return {
       id: d.id, name: d.name, device_type: d.device_type, km: null,
-      port_kind: portKindFor(d.device_type),
+      port_kinds: portKindsFor(d.device_type),
       ports: portsQ.data?.ports?.[String(id)] ?? [],
+      cables: cablesAt(id),
     }
-  }, [byId, portsQ.data])
+  }, [byId, portsQ.data, cablesAt])
+
+  const cableMoveTargets = useMemo(() => {
+    const c = cablesQ.data?.cables.find((x) => x.id === cableOpen)
+    if (!c) return []
+    const at = [c.a, c.b].find((e) => e.lat != null && e.lng != null)
+    return placed
+      .map((d) => ({
+        device_id: d.id, name: d.name,
+        km: at?.lat != null ? distanceKm(at.lat, at.lng!, d.lat!, d.lng!) : null,
+      }))
+      .sort((x, y) => (x.km ?? 0) - (y.km ?? 0))
+  }, [cablesQ.data, cableOpen, placed])
 
   const trayPeople = useMemo(() => {
     const here = fibreQ.data?.point
@@ -459,7 +496,6 @@ export function MapPage() {
         km: distanceKm(lat, lng, p.lat!, p.lng!),
       }))
       .sort((a, b) => a.km - b.km)
-      .slice(0, 12)
   }, [fibreQ.data?.point, places])
 
   const menuFeeder = useMemo(
@@ -494,27 +530,13 @@ export function MapPage() {
       return out
     }
     if (zoom >= detail.passives) return out
-    const passives = placed.filter((d) => isPassiveType(d.device_type))
-    const keep = new Set<number>(branchFaults.map((f) => f.passive_id))
-    for (const d of passives) {
-      const load = loadByPassive.get(d.id)
-      const olt = load?.olt_id != null ? byId.get(load.olt_id) : undefined
-      if (dropTone(load, !!olt && isDownState(olt)) === "dark") keep.add(d.id)
-    }
-    for (const id of [...keep]) {
-      let cur = byId.get(id)?.parent_device_id ?? null
-      for (let hop = 0; cur != null && hop < 32; hop++) {
-        const p = byId.get(cur)
-        if (!p || !isPassiveType(p.device_type) || keep.has(p.id)) break
-        keep.add(p.id)
-        cur = p.parent_device_id ?? null
-      }
-    }
-    for (const d of passives)
-      if (!keep.has(d.id) && d.id !== selectedId) out.add(d.id)
+    // ONE floor for every passive type — a splitter, a closure and an FDB stand down
+    // together. Trouble on a splitter's drops says so in TONE and buys it no extra
+    // zoom, or plant appears and disappears by a rule nobody can predict.
+    for (const d of placed)
+      if (isPassiveType(d.device_type) && d.id !== selectedId) out.add(d.id)
     return out
-  }, [placed, zoom, detail.passives, plantPinned, scopePlant, branchFaults,
-      loadByPassive, byId, selectedId])
+  }, [placed, zoom, detail.passives, plantPinned, scopePlant, selectedId])
   const drawnDevices = useMemo(
     () => (hiddenPlant.size === 0
       ? placed : placed.filter((d) => !hiddenPlant.has(d.id))),
@@ -540,6 +562,16 @@ export function MapPage() {
     && (zoom >= detail.drop_lines || onuScope != null || placingOnu != null)
   const refNamesVisible = refVisible
     && (zoom >= detail.subscriber_names || onuScope != null || placingOnu != null)
+  // Hovering a passive reveals the customers recorded on it, layer and zoom floors
+  // alike — the same override an OLT focus takes, but pointer-bound.
+  const hoverDropMacs = useMemo(() => {
+    const out = new Set<string>()
+    if (hoverId == null) return out
+    for (const p of shownPlaces)
+      if (p.drop_passive_id === hoverId) out.add(p.mac)
+    return out
+  }, [hoverId, shownPlaces])
+  const refShown = refVisible || hoverDropMacs.size > 0
   const placedByOlt = useMemo(() => {
     const m = new Map<number, number>()
     for (const p of places)
@@ -842,14 +874,66 @@ export function MapPage() {
       if (v.id == null) {
         setRouteEdit(null)
         setCableList(false)
-        setCableOpen(id)
         toast.success(`${v.name} laid`, {
-          description: "Open a tray at either end to say which cores go where.",
+          action: { label: "Open", onClick: () => setCableOpen(id) },
         })
       }
     },
     onError: (e) => toast.error(`Couldn't save${e instanceof ApiError ? `: ${e.message}` : ""}`),
   })
+
+  // Moving a cable end is PREVIEWED first: a splice is a fact about a particular
+  // closure, and the operator has already lost some to a blanket discard once.
+  const [moveAsk, setMoveAsk] = useState<
+    { cableId: number; end: "a" | "b"; from: FibrePoint & { name?: string | null }
+      to: MoveTarget
+      discards: number; carries: number; unported: number
+      collapses: number } | null>(null)
+
+  const moveEnd = useMutation({
+    mutationFn: (v: { cableId: number; from: FibrePoint; to: number
+                      preview?: boolean }) =>
+      inventoryApi.moveCableEnd({
+        org_id: scopeOrg,
+        from_device_id: v.from.device_id ?? null, from_mac: v.from.mac ?? null,
+        to_device_id: v.to, cable_ids: [v.cableId], preview: v.preview }),
+    onError: (e) => toast.error(
+      `Couldn't move that end${e instanceof ApiError ? `: ${e.message}` : ""}`),
+  })
+
+  const askMoveEnd = useCallback((cableId: number, end: "a" | "b",
+                                  from: FibrePoint & { name?: string | null },
+                                  to: MoveTarget) => {
+    moveEnd.mutate({ cableId, from, to: to.device_id, preview: true }, {
+      onSuccess: (out) => {
+        if (!out.ok) { toast.error(out.reason ?? "That move was refused"); return }
+        setMoveAsk({ cableId, end, from, to, discards: out.discards ?? 0,
+                     carries: out.carries ?? 0, unported: out.unported ?? 0,
+                     collapses: out.collapses ?? 0 })
+      },
+    })
+  }, [moveEnd])
+
+  const doMoveEnd = useCallback(() => {
+    if (!moveAsk) return
+    moveEnd.mutate({ cableId: moveAsk.cableId, from: moveAsk.from,
+                     to: moveAsk.to.device_id }, {
+      onSuccess: (out) => {
+        setMoveAsk(null)
+        if (!out.ok) { toast.error(out.reason ?? "That move was refused"); return }
+        for (const key of ["cables", "routes", "point-fibre", "fibre-trace",
+                           "inventory"]) {
+          queryClient.invalidateQueries({ queryKey: [key] })
+        }
+        toast.success(`End moved to ${moveAsk.to.name}`, {
+          description: out.discarded
+            ? `${out.discarded} splice${out.discarded === 1 ? "" : "s"} discarded — `
+              + "their fibres no longer meet."
+            : "The traced route is unchanged.",
+        })
+      },
+    })
+  }, [moveAsk, moveEnd, queryClient])
 
   const splitCable = useMutation({
     mutationFn: (v: { cableId: number; lat: number; lng: number }) =>
@@ -859,11 +943,11 @@ export function MapPage() {
       queryClient.invalidateQueries({ queryKey: ["routes"] })
       queryClient.invalidateQueries({ queryKey: ["inventory"] })
       setSplitAt(null)
-      setCableOpen(out.cable_id)
       toast.success("Closure opened", {
         description: out.spliced
           ? `${out.spliced} cores spliced straight through — clear any you actually cut.`
           : "Record a fibre count on the cable to splice its cores through.",
+        action: { label: "Open", onClick: () => setCableOpen(out.cable_id) },
       })
     },
     onError: (e) => toast.error(
@@ -875,12 +959,12 @@ export function MapPage() {
       point: { device_id?: number | null; mac?: string | null }
       a: { cableId: number; coreNo: number }
       b: { cableId: number; coreNo: number } | null
-      port?: { kind: string; no: number | null }
+      port?: { kind: string; ref: string | null }
     }) => inventoryApi.setFibreJoint({
       ...v.point,
       a_cable_id: v.a.cableId, a_core_no: v.a.coreNo,
       b_cable_id: v.b?.cableId ?? null, b_core_no: v.b?.coreNo ?? null,
-      port_kind: v.port?.kind ?? null, port_no: v.port?.no ?? null }),
+      port_kind: v.port?.kind ?? null, port_ref: v.port?.ref ?? null }),
     onSuccess: (out) => {
       if (!out.ok) { setTrayError(out.reason ?? "That join was refused"); return }
       setTrayError(null)
@@ -896,12 +980,16 @@ export function MapPage() {
     mutationFn: (v: {
       point: { device_id?: number | null; mac?: string | null }
       deviceId: number
-      port: { kind: string; no: number | null }
-      toPort?: { kind: string; no: number | null }
+      port: { kind: string; ref: string | null }
+      far?: FarLanding
     }) => inventoryApi.connectPort({
       ...v.point, to_device_id: v.deviceId, org_id: scopeOrg,
-      port_kind: v.port.kind || null, port_no: v.port.no,
-      to_port_kind: v.toPort?.kind || null, to_port_no: v.toPort?.no ?? null }),
+      port_kind: v.port.kind || null, port_ref: v.port.ref,
+      // The far end is a PORT, or — at a closure, which has none — a CORE.
+      ...(v.far && "cableId" in v.far
+          ? { to_cable_id: v.far.cableId, to_core_no: v.far.coreNo }
+          : { to_port_kind: v.far?.port.kind || null,
+              to_port_ref: v.far?.port.ref ?? null }) }),
     onSuccess: (out) => {
       if (!out.ok) { setTrayError(out.reason ?? "That connection was refused"); return }
       setTrayError(null)
@@ -917,7 +1005,7 @@ export function MapPage() {
   })
 
   const dropOnLeg = useMutation({
-    mutationFn: (v: { mac: string; passiveId: number; legNo: number | null }) =>
+    mutationFn: (v: { mac: string; passiveId: number; legNo: string | null }) =>
       inventoryApi.setDrops({ macs: [v.mac], passive_id: v.passiveId,
                               leg_no: v.legNo, org_id: scopeOrg }),
     onSuccess: () => {
@@ -935,11 +1023,15 @@ export function MapPage() {
       point: { device_id?: number | null; mac?: string | null }
       a: { cableId: number; coreNo: number }
       to: { deviceId?: number; mac?: string }
-      port?: { kind: string; no: number | null }
+      far?: FarLanding
     }) => inventoryApi.takeCoreToBox({
       ...v.point, a_cable_id: v.a.cableId, a_core_no: v.a.coreNo,
       to_device_id: v.to.deviceId ?? null, to_mac: v.to.mac ?? null,
-      port_kind: v.port?.kind ?? null, port_no: v.port?.no ?? null }),
+      // The far end is a PORT, or — at a closure, which has none — a CORE.
+      ...(v.far && "cableId" in v.far
+          ? { to_cable_id: v.far.cableId, to_core_no: v.far.coreNo }
+          : { port_kind: v.far?.port.kind ?? null,
+              port_ref: v.far?.port.ref ?? null }) }),
     onSuccess: (out) => {
       if (!out.ok) { setTrayError(out.reason ?? "That tail was refused"); return }
       setTrayError(null)
@@ -1019,7 +1111,7 @@ export function MapPage() {
         queryClient.invalidateQueries({ queryKey: [key] })
       }
       setPlantDelete(null)
-      if (selectedId === id) setSelectedId(null)
+      if (selectedId === id) selectDevice(null)
       setTrayError(null)
     },
     onError: (e) => toast.error(
@@ -1039,15 +1131,19 @@ export function MapPage() {
     }
   }, [plantDelete, devices, loadByPassive, cablesQ.data])
 
-  const searchDevice = (d: OrgDevice) => {
+  const searchDevice = (d: OrgDevice, openPanel = false) => {
     const map = mapRef.current
     if (isPlaced(d)) {
-      map?.flyTo([d.lat, d.lng], Math.max(map.getZoom(), 15))
       setDetailTab(deviceTabs(d)[0])
-      setSelectedId(d.id)
-      setSiteAnchor(d.id)
+      setSiteAnchor(d.id) // a pin folded into a cluster must not land hidden
+      if (openPanel) {
+        map?.flyTo([d.lat, d.lng], Math.max(map.getZoom(), 15))
+        selectDevice(d.id)
+      } else {
+        focusDevice(d, { fly: true })
+      }
     } else if (canWrite) {
-      setSelectedId(null)
+      selectDevice(null)
       setPlaceOpen(false)
       setPlacingId(d.id)
     } else {
@@ -1075,10 +1171,10 @@ export function MapPage() {
       placeOnu?: { mac: string; label: string } } | null)?.placeOnu
     if (!armed?.mac) return
     setPlacingOnu({ mac: armed.mac, label: armed.label ?? "" })
-    setSelectedId(null)
+    selectDevice(null)
     setPlaceOpen(false)
     navigate(navLocation.pathname, { replace: true, state: null })
-  }, [navLocation.state, navLocation.pathname, navigate])
+  }, [navLocation.state, navLocation.pathname, navigate, selectDevice])
 
   const onuParam = searchParams.get("onu")
   useEffect(() => {
@@ -1093,7 +1189,11 @@ export function MapPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onuParam, setSearchParams])
 
-  const scopeOnus = useCallback((deviceId: number, pons: string[]) => {
+  // `pan: false` is for a caller that is already flying somewhere: the flight is animated, so
+  // getBounds() still reports the viewport being LEFT, and the reveal test would pan against
+  // the flight.
+  const scopeOnus = useCallback((deviceId: number, pons: string[],
+                                 opts?: { pan?: boolean }) => {
     setOnuScope({ deviceId, pons })
     setSelectedOnuMac(null)
     const pts = places.filter((p) => p.device_id === deviceId
@@ -1104,7 +1204,7 @@ export function MapPage() {
       if (box && isPlaced(box)) shown.push([box.lat, box.lng])
     }
     const map = mapRef.current
-    if (!map || shown.length === 0) return
+    if (!map || shown.length === 0 || opts?.pan === false) return
     const view = map.getBounds()
     if (shown.some(([lat, lng]) => view.contains(L.latLng(lat, lng)))) return
     map.panTo(L.latLngBounds(shown).getCenter())
@@ -1115,14 +1215,31 @@ export function MapPage() {
     scopeOnus(deviceId, cur.includes(pon) ? cur.filter((x) => x !== pon) : [...cur, pon])
   }, [onuScope, scopeOnus])
 
+  // Go to a device without opening its panel: select the pin, then focus the map on its
+  // located subscribers and the plant feeding them. A device nobody has surveyed has no PON
+  // list and no customers, and scoping to it would hide the org's plant to reveal nothing —
+  // so there we just go there and select the pin, which is what the operator asked for.
+  const focusDevice = useCallback((d: OrgDevice, opts?: { fly?: boolean }) => {
+    if (!isPlaced(d)) return
+    if (opts?.fly) {
+      const map = mapRef.current
+      map?.flyTo([d.lat, d.lng], Math.max(map.getZoom(), 15))
+    }
+    setSelectedId(d.id)
+    setPanelFor(null)
+    setSelectedOnuMac(null)
+    if ((placedByOlt.get(d.id) ?? 0) > 0) scopeOnus(d.id, [], { pan: !opts?.fly })
+    else setOnuScope(null)
+  }, [placedByOlt, scopeOnus])
+
   const flyToOnu = useCallback((p: OnuPlace) => {
     setOnuScope(null)
     const map = mapRef.current
     map?.flyTo([p.lat, p.lng], Math.max(map.getZoom(), detail.drop_lines + 1))
     setFocusFlying(true)
-    setSelectedId(null)
+    selectDevice(null)
     setSelectedOnuMac(p.mac)
-  }, [detail.drop_lines])
+  }, [detail.drop_lines, selectDevice])
 
   useEffect(() => {
     if (!focusOnuMac || places.length === 0) return
@@ -1243,10 +1360,10 @@ export function MapPage() {
       setPlacingOnu(null)
     } else if (placingId != null) {
       setLocation.mutate({ id: placingId, lat: ll.lat, lng: ll.lng })
-      setSelectedId(placingId)
+      selectDevice(placingId)
       setPlacingId(null)
     } else {
-      setSelectedId(null)
+      selectDevice(null)
       setSelectedOnuMac(null)
       setSiteAnchor(null)
     }
@@ -1268,14 +1385,14 @@ export function MapPage() {
       toast.success(`${created.name} recorded`, {
         description: "Pull a core in to say what feeds it.",
       })
-      setSelectedId(created.id)
+      selectDevice(created.id)
     }
-  }, [plantDraft])
+  }, [plantDraft, selectDevice])
 
   const onCustomerAttached = useCallback((mac: string) => {
     setCustomerDraft(null)
     if (!refOnus) toggleRefOnus()
-    setSelectedId(null)
+    selectDevice(null)
     setSelectedOnuMac(mac)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refOnus])
@@ -1326,7 +1443,7 @@ export function MapPage() {
     troubleIdx.current += 1
     mapRef.current?.flyTo([d.lat, d.lng], Math.max(mapRef.current.getZoom(), 14))
     setDetailTab(deviceTabs(d)[0])
-    setSelectedId(d.id)
+    selectDevice(d.id)
     setSiteAnchor(d.id) // a folded trouble pin surfaces in the site card
   }
 
@@ -1344,6 +1461,11 @@ export function MapPage() {
     setZoom(z); setFocusFlying(false)
   }, [])
   const lowZoom = zoom < detail.labels
+  // A WRAPPER CLASS, never a per-pin decision — icons are cached by their html
+  // string, so folding this into `pinIcon` would swap every plant pin's DOM node
+  // on the threshold crossing and replay its mount. Two classes because the two
+  // floors are independent; the CSS pairs them.
+  const lowPlant = zoom < detail.passive_names
   const lineK = lineScale(zoom)
 
   const onClusterClick = (c: SiteCluster) => {
@@ -1354,7 +1476,7 @@ export function MapPage() {
           < distanceKm(best.lat, best.lng, c.center[0], c.center[1]) ? m : best)
       setLocation.mutate({ id: placingId, lat: t.lat, lng: t.lng })
       toast.success(`Placed at ${t.name} (same site)`)
-      setSelectedId(placingId)
+      selectDevice(placingId)
       setPlacingId(null)
       return
     }
@@ -1383,7 +1505,7 @@ export function MapPage() {
     setLocation.mutate({ id: selected.id, lat: null, lng: null }, {
       onSuccess: () => toast.success(`${name} taken off the map. The device is unchanged.`),
     })
-    setSelectedId(null)
+    selectDevice(null)
   }
 
   const links = useMemo(() => {
@@ -1391,12 +1513,15 @@ export function MapPage() {
       key: string; from: Placed; to: Placed; tone: string
       kind: "primary" | "backup" | "peer" | "run"
       childId: number; parentId: number
-      route?: { pts: Array<[number, number]>; fromCable: boolean }
+      route?: { pts: Array<[number, number]> }
       labelPos?: number | null
       cableId: number | null
       cableName: string | null
       cores: number | null
       coreNo: number | null
+      cabled: boolean
+      plantCableId: number | null
+      plantRun: number[]
       binding?: LinkBinding
     }> = []
     const placedById = new Map(drawnDevices.map((d) => [d.id, d]))
@@ -1409,12 +1534,25 @@ export function MapPage() {
         if (!cur || (cur.cores == null && c.cores != null)) cableByPair.set(k, c)
       }
     }
+    // WHICH SHEATH CARRIES THIS PAIR, if the fibre record joins them at all — direct,
+    // or on through a closure. Server-derived (`fiber.connected_spans`), the same walk
+    // the `undrawn` draft reads, so the map and the draft cannot disagree about what
+    // counts as recorded. `null` means joined but by nothing worth labelling.
+    const cabled = new Map<string, { label: number | null; path: number[] }>()
+    for (const p of cablesQ.data?.cabled_pairs ?? [])
+      cabled.set(linkKey(p.a, p.b), { label: p.cable_id, path: p.cable_ids ?? [] })
     const styled = (childId: number, parentId: number) => {
       const s = styleByKey.get(`${childId}:${parentId}`)
       const c = cableByPair.get(`${childId}:${parentId}`)
+      const key = linkKey(childId, parentId)
       return { childId, parentId, labelPos: s?.label_pos,
                cableId: c?.id ?? null, cableName: c?.name ?? null,
-               cores: c?.cores ?? null, coreNo: null }
+               cores: c?.cores ?? null, coreNo: null,
+               // RECORDED GLASS WINS: this chord stands down for good, `plantCableId`
+               // says which sheath inherits its rate chip, and `plantRun` is every
+               // sheath that must be lit in its place.
+               cabled: cabled.has(key), plantCableId: cabled.get(key)?.label ?? null,
+               plantRun: cabled.get(key)?.path ?? [] }
     }
     for (const d of drawnDevices) {
       const tone = pinTone(d)
@@ -1451,9 +1589,50 @@ export function MapPage() {
     const wp = l.route?.pts
     const drawn = !!wp?.length && !foldedTogether(from, to)
     const pts: Array<[number, number]> = drawn ? [from, ...wp!, to] : [from, to]
-    return { ...l, from3: from, to3: to, pts, drawn,
-             fromCable: drawn && !!l.route?.fromCable }
+    return { ...l, from3: from, to3: to, pts, drawn }
   }), [links, pinPos])
+
+  // THE RATE A SHEATH INHERITED from the chord that stood down for it. Keyed on the
+  // cable `connected_spans` picked — the biggest on the run — so an 8-PON OLT fed off
+  // one trunk cannot stack eight readings on one line: the last one in wins and the
+  // rest keep no chip, which is the honest outcome of asking one label to answer for
+  // several links. Rank picks the loudest so the one that survives is worth reading.
+  const cableRate = useMemo(() => {
+    const m = new Map<number, ReturnType<typeof linkRateBody> & { rank: number }>()
+    if (!bwLabels) return m
+    for (const l of links) {
+      if (!l.cabled || l.plantCableId == null || !l.binding) continue
+      const body = linkRateBody(l.binding, l.from, l.to)
+      // ONLY A REAL READING MOVES. With no fresh counter the chord's fallback is the
+      // PORT NAME, and `main 6F · GE0/1` on a sheath reads as though the cable were
+      // called GE0/1 — the label belongs to a line between two boxes, not to the glass
+      // in the ground. The plain cable chip is the honest mark then; where the reading
+      // went is the device panel's Ports tab, which is where a date exists to explain
+      // it. Same rule the map keeps for a dBm it cannot stand behind: print nothing.
+      if (!body.hasRates) continue
+      const rank = bwRank(l.binding, l.from.id, l.to.id, l.cores)
+      const cur = m.get(l.plantCableId)
+      if (cur && cur.rank >= rank) continue
+      m.set(l.plantCableId, { ...body, rank })
+    }
+    return m
+  }, [links, bwLabels])
+
+  // A SHEATH THAT REPLACED A CHORD INHERITS THE CHORD'S VISIBILITY, NOT PLANT'S — so
+  // it draws at EVERY zoom (operator, 2026-08-12: "I don't want dotted line at any
+  // zoom level"). The passives floor exists to stop dense plant smearing at low zoom;
+  // these lines cost nothing extra, because each one stands in for a dependency line
+  // that was already drawn there. It is the WHOLE RUN, not just the labelled sheath —
+  // lighting `main` alone would leave the 1F tails dark and the line would stop at a
+  // closure. Same shape as the floor's existing dark-splitter exemption.
+  const standsDown = useCallback(
+    (l: { cabled: boolean; plantCableId: number | null }) =>
+      l.cabled && l.plantCableId != null, [])
+  const exemptCables = useMemo(() => {
+    const s = new Set<number>()
+    for (const l of links) if (standsDown(l)) for (const id of l.plantRun) s.add(id)
+    return s
+  }, [links, standsDown])
 
   const pinOfPoint = useCallback((pt: FibrePoint): [number, number] | null => {
     if (pt.device_id != null) {
@@ -1466,13 +1645,15 @@ export function MapPage() {
   }, [byId, places])
 
   const cableLines = useMemo(() => {
-    if (zoom < detail.passives) return []
+    const below = zoom < detail.passives
     return (cablesQ.data?.cables ?? []).flatMap((cable) => {
+      // Below the plant floor, only the runs standing in for a dependency chord draw.
+      if (below && !exemptCables.has(cable.id)) return []
       if (routeEdit?.kind === "cable" && routeEdit.cableId === cable.id) return []
       const pts = cablePolyline(cable, pinOfPoint)
       return pts.length < 2 ? [] : [{ cable, pts }]
     })
-  }, [cablesQ.data, pinOfPoint, zoom, detail.passives, routeEdit])
+  }, [cablesQ.data, pinOfPoint, zoom, detail.passives, routeEdit, exemptCables])
 
   const cableUnder = useCallback((ll: L.LatLng) => {
     const map = mapRef.current
@@ -1503,7 +1684,14 @@ export function MapPage() {
     const refs = new Set<string>()
     const names = new Set<string>()
     const taken: Array<[number, number, number]> = []
-    const CHIP_HALF = { link: 48, cable: 68, ref: 28, name: 44 }
+    // MEASURED IN A BROWSER, not estimated — a claim carries its own half-width, and
+    // two wide chips reserved at a narrow one pass the collision test and visibly
+    // overlap. `cableRate` is the cable chip once it inherits a stood-down chord's
+    // reading: a bare `main 6F` is 65px and the same chip with `↓70M ↑5.3M` is 175,
+    // so a 14ch name at the clamp plus a four-figure rate lands near 244. Re-measure
+    // on ANY content change to either chip.
+    const CHIP_HALF = { link: 48, cable: 68, cableRate: 122, cableBare: 56,
+                        ref: 28, name: 44 }
     const fits = (x: number, y: number, half: number) =>
       !taken.some(([tx, ty, th]) =>
         Math.abs(tx - x) < th + half && Math.abs(ty - y) < 24)
@@ -1511,44 +1699,91 @@ export function MapPage() {
       taken.push([x, y, half])
     }
 
-    const cands: Array<{ key: string; x: number; y: number; rank: number }> = []
+    // ONE PASS FOR EVERY RATE, wherever it is drawn. A reading that moved from a
+    // stood-down chord onto its sheath is the SAME claim relocated, so it keeps the
+    // rank it had (`bwRank`) instead of inheriting the cable pass's fibre-count order.
+    // Left in the later pass it competed at 244px against every link chip claimed
+    // first and lost outright — the busiest link on the map going quiet the moment its
+    // plant was recorded, which is the opposite of what recording plant should do.
+    //
+    // THE ZOOM FLOOR IS TAKEN HERE, NOT AT THE RENDER (Map detail → Cable & rate
+    // labels). The budget must read the same predicate the render does, or a chip
+    // nobody draws goes on reserving pixels away from a subscriber name that would
+    // have — the rule the drop-line chips already keep. Every family below asks
+    // `chipFloor || <worth shouting about>`: a port that is DOWN or over its bandwidth
+    // is an ALARM on this map and no density setting may hide one, and a selected path
+    // or a traced core is the operator pointing at that line. The same "down or
+    // selected keeps its name at every zoom" exemption the device-name floor makes.
+    const chipFloor = zoom >= detail.line_labels
+    const cands: Array<{ key: string; cable?: number; x: number; y: number
+                         rank: number; half: number }> = []
     for (const l of bwLabels ? drawnLinks : []) {
       if (!l.binding && !l.cores) continue
       const emphasized = selectedId != null
         && (l.to.id === selectedId || downstream.has(l.to.id))
       if (troubleOnly && l.tone !== "destructive" && l.tone !== "warning" && !emphasized)
         continue
-      if (!showUncabled && l.cableId == null) continue
+      // A chord that stands down reserves no pixels — the budget must read the same
+      // predicate as the render, or an absent line goes on crowding out a chip that
+      // really is drawn. Its rate is claimed by the sheath below instead.
+      if (standsDown(l) || !showUncabled) continue
+      if (!chipFloor && !emphasized && !(l.binding && linkTone(l.binding))) continue
       const [ax, ay] = project(l.from3[0], l.from3[1], zoom)
       const [bx, by] = project(l.to3[0], l.to3[1], zoom)
       if (Math.hypot(bx - ax, by - ay) < 90) continue
       const [plat, plng] = linkLabelPos(l.pts, l.labelPos)
       const [x, y] = project(plat, plng, zoom)
-      cands.push({ key: l.key, x, y,
+      cands.push({ key: l.key, x, y, half: CHIP_HALF.link,
         rank: bwRank(l.binding, l.from.id, l.to.id, l.cores) })
+    }
+    for (const { cable, pts } of bwLabels ? cableLines : []) {
+      const rate = cableRate.get(cable.id)
+      if (!rate) continue
+      // The reading relocated onto this sheath keeps the tone it had on the chord,
+      // so an alarming port stays readable below the floor wherever its chip ended up.
+      if (!chipFloor && !rate.tone && !tracedCables.has(cable.id)) continue
+      const [plat, plng] = cableLabelPos(pts)
+      const [x, y] = project(plat, plng, zoom)
+      // A plumbing sheath draws the rate ALONE (no name, no `1F`), so it claims close
+      // to a link chip's pixels rather than a cable chip's — measured at 103px against
+      // a link chip's 88, the difference being this chip's own chrome.
+      cands.push({ key: `c${cable.id}`, cable: cable.id, x, y, rank: rate.rank,
+                   half: isPlumbing(cable) ? CHIP_HALF.cableBare : CHIP_HALF.cableRate })
     }
     cands.sort((a, b) => b.rank - a.rank)
     for (const c of cands) {
-      if (!fits(c.x, c.y, CHIP_HALF.link)) continue
-      claim(c.x, c.y, CHIP_HALF.link)
-      links.add(c.key)
+      if (!fits(c.x, c.y, c.half)) continue
+      claim(c.x, c.y, c.half)
+      if (c.cable != null) cables.add(c.cable)
+      else links.add(c.key)
     }
 
-    const cableCands: Array<{ id: number; x: number; y: number; cores: number }> = []
+    const cableCands: Array<{ id: number; x: number; y: number; cores: number
+                              half: number }> = []
     for (const c of cableLines) {
+      // A rate-carrying sheath was already offered pixels above, at its own rank —
+      // and if it lost there it may not try again at a narrower claim, or the budget
+      // would reserve one box and draw a wider one.
+      if (cableRate.has(c.cable.id)) continue
+      // Plumbing is never LISTED as a cable and never labelled for its own sake. It
+      // reaches the map only by inheriting a rate, which the line above has handled.
       if (isPlumbing(c.cable)) continue
+      // A plain name chip carries no alarm — a cable has no state — so the only
+      // thing that outranks the floor here is a core somebody is tracing.
+      if (!chipFloor && !tracedCables.has(c.cable.id)) continue
       const [plat, plng] = cableLabelPos(c.pts)
       const [x, y] = project(plat, plng, zoom)
       const [ax, ay] = project(c.pts[0][0], c.pts[0][1], zoom)
       const [bx, by] = project(c.pts[c.pts.length - 1][0],
                                c.pts[c.pts.length - 1][1], zoom)
       if (Math.hypot(bx - ax, by - ay) < 90) continue
-      cableCands.push({ id: c.cable.id, x, y, cores: c.cable.cores ?? 0 })
+      cableCands.push({ id: c.cable.id, x, y, cores: c.cable.cores ?? 0,
+                        half: CHIP_HALF.cable })
     }
     cableCands.sort((a, b) => b.cores - a.cores)
     for (const c of cableCands) {
-      if (!fits(c.x, c.y, CHIP_HALF.cable)) continue
-      claim(c.x, c.y, CHIP_HALF.cable)
+      if (!fits(c.x, c.y, c.half)) continue
+      claim(c.x, c.y, c.half)
       cables.add(c.id)
     }
 
@@ -1588,15 +1823,40 @@ export function MapPage() {
     }
     return { links, cables, refs, names }
   }, [drawnLinks, bwLabels, showUncabled, zoom, troubleOnly, selectedId, downstream,
-      refLinesVisible, refNamesVisible, refVisible, shownPlaces, byId, cableLines])
+      refLinesVisible, refNamesVisible, refVisible, shownPlaces, byId, cableLines,
+      cableRate, standsDown, detail.line_labels, tracedCables])
 
   const hoverEnabled = placingId == null && routeEdit == null && !editPins
     && splitAt == null
     && selectedId == null && siteCluster == null && selectedOnuMac == null
     && hoverPlace == null && hoverDevice == null && hoverSite == null
+  // THE PROBE READS WHAT THE MAP DRAWS — the rule the chip budget already keeps, and
+  // the same failure when it doesn't. A chord that stood down for its fibre is not on
+  // screen, so measuring it put the readout (and its `straight-line` note) over empty
+  // ground beside the sheath that replaced it; so did every chord hidden by switching
+  // Dependency links off. Reported 2026-08-13.
+  //
+  // THE QUESTION DID NOT GO AWAY WITH THE LINE, so the sheath inherits the measure
+  // exactly as it inherited the rate chip: the operator laid that cable to BE the
+  // connection, and a TRACED one finally answers in drum metres instead of a chord.
+  // The readout names the cable's OWN ends — the closures a crew drives to and orders
+  // drum between — never the run's, which is a sum this line cannot show. It names no
+  // cable, so plumbing is measurable here without being labelled.
+  const hoverLines = useMemo<HoverLink[]>(() => {
+    if (!hoverEnabled) return []
+    const out: HoverLink[] = []
+    for (const l of drawnLinks) {
+      if (standsDown(l) || !showUncabled) continue
+      out.push({ key: l.key, pts: l.pts, from: l.from, to: l.to, straight: !l.drawn })
+    }
+    for (const { cable, pts } of cableLines)
+      out.push({ key: `cable:${cable.id}`, pts,
+                 from: { name: cable.a.name ?? "?" }, to: { name: cable.b.name ?? "?" },
+                 straight: !cableTraced(cable) })
+    return out
+  }, [drawnLinks, cableLines, standsDown, showUncabled, hoverEnabled])
   const hoverable = useMemo(
-    () => (hoverEnabled ? projectLinks(drawnLinks, zoom) : []),
-    [drawnLinks, zoom, hoverEnabled])
+    () => projectLinks(hoverLines, zoom), [hoverLines, zoom])
   const hoverKeepOut = useMemo(() => {
     if (!hoverEnabled) return []
     return clusters.map((c) => {
@@ -1617,6 +1877,16 @@ export function MapPage() {
       }))
   }, [selected, cablesQ.data])
 
+  const refCables = useMemo(() => {
+    if (!selectedOnuMac) return []
+    return (cablesQ.data?.cables ?? [])
+      .filter((c) => c.a.mac === selectedOnuMac || c.b.mac === selectedOnuMac)
+      .map((c) => ({
+        cable: c,
+        far: c.a.mac === selectedOnuMac ? c.b : c.a,
+      }))
+  }, [selectedOnuMac, cablesQ.data])
+
   const fibreTodo = useMemo(() => {
     if (!selected) return 0
     const joined = new Set<number>()
@@ -1630,6 +1900,18 @@ export function MapPage() {
     if (selected.parent_device_id) declared.add(selected.parent_device_id)
     return [...declared].filter((id) => !joined.has(id)).length
   }, [selected, devices, deviceCables])
+
+  // EVERY hook has to run before the early return below. A render that bails out
+  // here calls fewer hooks than the one after scopeOrg arrives, and React counts
+  // hooks by position — that mismatch is error #310, which takes the whole map
+  // down with "Something went wrong". It broke intermittently and only on the
+  // largest org, because it needs scopeOrg to flip between two renders.
+  const railOpen = (!!selected || !!selectedRef || cableOpen != null || cableList)
+    && !routeEdit
+  const panel = useResizablePanel({
+    storageKey: "wisp:map:panelw", defaultWidth: 380, min: 320, max: 620,
+    open: railOpen,
+  })
 
   if (!scopeOrg) return <NeedsOrg />
 
@@ -1659,18 +1941,12 @@ export function MapPage() {
   const editingDropAnchor = editingDrop
     ? dropAnchor(editingDrop.drop_passive_id, editingDrop.device_id, byId) : null
 
-  const railOpen = (!!selected || !!selectedRef || cableOpen != null || cableList)
-    && !routeEdit
-  const panel = useResizablePanel({
-    storageKey: "wisp:map:panelw", defaultWidth: 380, min: 320, max: 620,
-    open: railOpen,
-  })
-
   return (
     <div ref={wrapRef} style={panel.vars} className={cn(
       "wisp-map-wrap relative h-[var(--wisp-pane-h,calc(100svh-3.5rem-4rem))] md:h-[var(--wisp-pane-h,calc(100svh-3.5rem))]",
       (placingId != null || placingOnu != null) && "wisp-map-placing",
       lowZoom && "wisp-map-lowzoom",
+      lowPlant && "wisp-map-lowplant",
     )}>
       <MapContainer
         ref={mapRef}
@@ -1725,7 +2001,8 @@ export function MapPage() {
                   ...strokeAt(lineK, w),
                   ...(traced ? {} : { dashArray: CABLE_DASH }) }} />
               {chipShown.cables.has(c.id) && (
-                <Marker position={cableLabelPos(pts)} icon={cableIcon(c)}
+                <Marker position={cableLabelPos(pts)}
+                  icon={cableIcon(c, cableRate.get(c.id))}
                   zIndexOffset={550}
                   eventHandlers={{ click: () => { setCableList(false)
                                                   setCableOpen(c.id) } }} />
@@ -1734,7 +2011,15 @@ export function MapPage() {
           )
         })}
                 {drawnLinks.map((l) => {
-          if (!showUncabled && l.cableId == null) return null
+          // RECORDED GLASS WINS, and it wins automatically. A dependency chord is a
+          // claim about what depends on what, drawn straight because nobody surveyed
+          // it; once the fibre between the pair IS written down, the sheath says the
+          // same thing along the route a van drives. Two lines for one connection, one
+          // of them a straight line through ground nothing runs under, is the thing
+          // this map is most careful about. What stays dashed is the to-do list, and
+          // that is what "Dependency links" governs now.
+          if (standsDown(l)) return null
+          if (!showUncabled) return null
           const emphasized = selectedId != null
             && (l.to.id === selectedId || downstream.has(l.to.id))
           const dimmed = troubleOnly && l.tone !== "destructive" && l.tone !== "warning" && !emphasized
@@ -1755,9 +2040,14 @@ export function MapPage() {
             : distribution ? 2.1 : 2.5)
             + (hovered && !emphasized && !traced ? 0.75 : 0)
             + fiberBoost(l.cores)
+          // A CHORD REACHING THE SCREEN IS ALWAYS UNSURVEYED NOW. It used to go solid
+          // when a cable joined the pair directly — but such a pair stands down the
+          // moment its sheath is drawn, so the only way this line survives is that no
+          // cable is on screen to be the surveyed one. Solid there is a straight line
+          // through ground nothing runs under, claiming somebody walked it.
           const dashArray = l.kind === "backup" ? "5 8"
             : l.kind === "peer" ? "1.5 7"
-            : l.cableId == null ? UNCABLED_DASH : undefined
+            : !hovered ? UNCABLED_DASH : undefined
           const casingOver = l.kind === "peer" ? CASING_OVER_FINE : CASING_OVER
           return (
             <Fragment key={l.key}>
@@ -1766,7 +2056,8 @@ export function MapPage() {
                   interactive={false}
                   positions={pts}
                   pathOptions={{
-                    color: "#000", opacity: CASING_OPACITY,
+                    color: "#000",
+                    opacity: hovered ? CASING_OPACITY_HOVER : CASING_OPACITY,
                     ...casingAt(lineK, weight, casingOver, dashArray),
                   }}
                 />
@@ -1813,9 +2104,9 @@ export function MapPage() {
                       if (placingId != null || routeEdit != null || editPins) return
                       if (l.binding) {
                         setDetailTab("ports")
-                        setSelectedId([...l.binding.keys()][0])
+                        selectDevice([...l.binding.keys()][0])
                       } else {
-                        setSelectedId(l.to.id)
+                        selectDevice(l.to.id)
                       }
                     },
                   }}
@@ -1857,7 +2148,7 @@ export function MapPage() {
                 click: () => {
                   if (placingId != null || routeEdit != null) return
                   setDetailTab("optical")
-                  setSelectedId(s.fault.device_id)
+                  selectDevice(s.fault.device_id)
                 },
               }}
             />
@@ -1924,7 +2215,8 @@ export function MapPage() {
                   mouseout: () => setHoverSiteId((h) =>
                     (c.members.some((m) => m.id === h) ? null : h)),
                 }}
-                zIndexOffset={sel ? 1000 : anyDown ? 500 : 100}
+                zIndexOffset={sel ? MARK_Z_SELECTED
+                  : anyDown ? MARK_Z_DOWN : MARK_Z_GEAR}
               />
             )
           }
@@ -1984,13 +2276,17 @@ export function MapPage() {
                     if (placingId !== d.id) {
                       setLocation.mutate({ id: placingId, lat: d.lat, lng: d.lng })
                       toast.success(`Placed at ${d.name} (same site)`)
-                      setSelectedId(placingId)
+                      selectDevice(placingId)
                     }
                     setPlacingId(null)
                     return
                   }
                   setDetailTab(deviceTabs(d)[0])
-                  setSelectedId(d.id === selectedId ? null : d.id)
+                  // A pin click still opens the panel — including on a device already
+                  // pin-selected from a search hit or a site-card row, where closing the
+                  // selection instead would leave the panel unreachable from the map.
+                  if (d.id === selectedId && panelFor === d.id) selectDevice(null)
+                  else selectDevice(d.id)
                 },
                 dragend: (e) => {
                   const ll = (e.target as L.Marker).getLatLng()
@@ -2003,13 +2299,17 @@ export function MapPage() {
                   })
                 },
               }}
-              zIndexOffset={d.id === selectedId ? 1000
-                : pinTone(d) === "destructive" ? 500 : impact ? 300 : 0}
+              zIndexOffset={markZIndex(d, {
+                selected: d.id === selectedId, impact, plant: passive,
+              })}
             />
           )
         })}
-        {refVisible && shownPlaces.map((p) => {
-          const hovered = p.mac === hoverOnuMac
+        {refShown && shownPlaces.map((p) => {
+          // Its OWN hover goes solid (one line, narrated by its card); revealing a
+          // whole splitter's worth stays DOTTED — none of those spans was surveyed.
+          const own = p.mac === hoverOnuMac
+          const hovered = own || hoverDropMacs.has(p.mac)
           if (!refLinesVisible && !hovered) return null
           if (routeEdit?.kind === "drop" && routeEdit.mac === p.mac) return null
           const anchor = dropAnchor(p.drop_passive_id, p.device_id, byId)
@@ -2024,7 +2324,7 @@ export function MapPage() {
           const tone = refLineTone(p)
           const refWeight = (tone === "dark" ? 4.5 : viaSplitter ? 3.5 : 2.5)
             + (hovered ? REF_HOVER_BOOST : 0)
-          const refDash = traced || hovered ? undefined
+          const refDash = traced || own ? undefined
             : viaSplitter ? DROP_DASH : REF_DASH
           const bwIcon = chipShown.refs.has(p.mac) ? refBwIcon(p) : null
           return (
@@ -2094,21 +2394,24 @@ export function MapPage() {
             </Fragment>
           )
         })}
-        {refVisible && shownPlaces.map((p) => (
+        {refShown && shownPlaces.map((p) => {
+          const onHovered = hoverDropMacs.has(p.mac)
+          if (!refVisible && !onHovered) return null
+          return (
           <Marker
             key={`ref:${p.mac}`}
             position={[p.lat, p.lng]}
             icon={refOnuIcon(p, {
               selected: p.mac === selectedOnuMac,
-              dim: troubleOnly && !isRefDark(p),
+              dim: troubleOnly && !isRefDark(p) && !onHovered,
             })}
             zIndexOffset={refZIndex(p, p.mac === selectedOnuMac,
-                                    p.mac === hoverOnuMac)}
+                                    p.mac === hoverOnuMac || onHovered)}
             eventHandlers={{
               click: () => {
                 if (routeEdit != null || placingId != null || placingOnu != null) return
                 setSelectedOnuMac(p.mac === selectedOnuMac ? null : p.mac)
-                setSelectedId(null)
+                selectDevice(null)
               },
               mouseover: () => {
                 if (routeEdit != null || placingId != null || placingOnu != null) return
@@ -2117,7 +2420,8 @@ export function MapPage() {
               mouseout: () => setHoverOnuMac((m) => (m === p.mac ? null : m)),
             }}
           />
-        ))}
+          )
+        })}
         {hoverPlace && (
           <RefHoverCard place={hoverPlace} ctx={hoverCtx(hoverPlace)} />
         )}
@@ -2480,7 +2784,7 @@ export function MapPage() {
               )}
               <button
                 className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
-                title="The parent → child lines the monitoring tree draws. They are dashed because they are a dependency, not a surveyed cable — fibre is recorded on the cable itself now, so none of them ever carries glass. Switch off for a plant-only map where every line is a sheath somebody wrote down."
+                title="The parent → child lines the monitoring tree draws, dashed because they are a dependency and nobody surveyed them. A pair whose fibre IS recorded drops its line on its own — the sheath says the same thing along the route a van drives, and takes the link's ↓/↑ rate with it. So what stays dashed here is the plant nobody has written down yet. Switch off to hide those too."
                 onClick={toggleUncabled}>
                 <span>Dependency links</span>
                 <span className={cn("text-2xs font-medium", showUncabled ? "text-success" : "text-muted-foreground")}>
@@ -2489,11 +2793,17 @@ export function MapPage() {
               </button>
               <button
                 className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
-                title="Live ↓/↑ rate chips on links with a bound port (device panel → Uplinks)"
+                title="Live ↓/↑ rate chips on links with a bound port (device panel → Uplinks). The zoom these and the cable name chips start drawing at is Settings → Platform → Map detail."
                 onClick={toggleBwLabels}>
                 <span>Bandwidth labels</span>
-                <span className={cn("text-2xs font-medium", bwLabels ? "text-success" : "text-muted-foreground")}>
-                  {bwLabels ? "on" : "off"}
+                {/* SAY WHEN THE FLOOR IS WHAT IS HIDING THEM, exactly as the
+                    Subscribers row does. A toggle reading "on" over a map drawing
+                    no chips reads as a broken feature rather than as a setting. */}
+                <span className={cn("text-2xs font-medium",
+                  bwLabels && zoom >= detail.line_labels
+                    ? "text-success" : "text-muted-foreground")}>
+                  {!bwLabels ? "off"
+                    : zoom >= detail.line_labels ? "on" : "on · zoom in"}
                 </span>
               </button>
               <button
@@ -2698,13 +3008,45 @@ export function MapPage() {
                   onSplit={() => setSplitAt({
                     cableId: cable.id, cableName: cable.name })}
                   onLabel={(coreNo, label) =>
-                    setCoreLabel.mutate({ cableId: cable.id, coreNo, label: label ?? "" })} />
+                    setCoreLabel.mutate({ cableId: cable.id, coreNo, label: label ?? "" })}
+                  moveTargets={cableMoveTargets.filter(
+                    (t) => t.device_id !== cable.a.device_id
+                        && t.device_id !== cable.b.device_id)}
+                  onMoveEnd={(end, to) =>
+                    askMoveEnd(cable.id, end, cable[end], to)} />
               )}
             </div>
             )}
           </Card>
         )
       })()}
+
+      {moveAsk && (
+        <ConfirmDialog open onOpenChange={(v) => { if (!v) setMoveAsk(null) }}
+          title={`Move this end to ${moveAsk.to.name}?`}
+          description={[
+            moveAsk.discards
+              ? `${moveAsk.discards} splice${moveAsk.discards === 1 ? "" : "s"} made at `
+                + `${moveAsk.from.name ?? "the old point"} ${moveAsk.discards === 1 ? "is" : "are"} `
+                + "discarded — those fibres stop meeting anywhere."
+              : "No splice is lost.",
+            moveAsk.carries
+              ? `${moveAsk.carries} travel${moveAsk.carries === 1 ? "s" : ""} with the cable.`
+              : "",
+            moveAsk.unported
+              ? `${moveAsk.unported} land${moveAsk.unported === 1 ? "s" : ""} on a port `
+                + "already taken there, so the port is left unrecorded."
+              : "",
+            moveAsk.collapses
+              ? `${moveAsk.collapses} single fibre${moveAsk.collapses === 1 ? "" : "s"} `
+                + `connecting the two boxes ${moveAsk.collapses === 1 ? "is" : "are"} `
+                + "removed — they would run from that box back to itself."
+              : "",
+            "The traced route is kept.",
+          ].filter(Boolean).join(" ")}
+          confirmLabel="Move end"
+          onConfirm={doMoveEnd} />
+      )}
 
       {cableOpen != null && (() => {
         const cable = cablesQ.data?.cables.find((c) => c.id === cableOpen)
@@ -2783,7 +3125,7 @@ export function MapPage() {
             {unplaced.map((d) => (
               <button key={d.id}
                 className="flex h-9 w-full items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-foreground/5"
-                onClick={() => { setPlacingId(d.id); setPlaceOpen(false); setSelectedId(null) }}>
+                onClick={() => { setPlacingId(d.id); setPlaceOpen(false); selectDevice(null) }}>
                 <StatusDot tone={pinTone(d)} />
                 <span className="min-w-0 truncate font-mono text-xs font-medium">{d.name}</span>
                 {d.device_type && <span className="text-2xs text-muted-foreground">{d.device_type}</span>}
@@ -2825,9 +3167,9 @@ export function MapPage() {
                     "flex h-9 w-full cursor-pointer items-center gap-2 border-b px-3 text-left last:border-b-0",
                     m.id === selectedId ? "bg-accent" : "hover:bg-foreground/5",
                   )}
-                  onClick={() => { setDetailTab(deviceTabs(m)[0]); setSelectedId(m.id) }}
+                  onClick={() => { setDetailTab(deviceTabs(m)[0]); focusDevice(m) }}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") { setDetailTab(deviceTabs(m)[0]); setSelectedId(m.id) }
+                    if (e.key === "Enter") { setDetailTab(deviceTabs(m)[0]); focusDevice(m) }
                   }}>
                   <StatusDot tone={pinTone(m)} />
                   <span className="min-w-0 truncate font-mono text-xs font-medium">{m.name}</span>
@@ -2840,13 +3182,22 @@ export function MapPage() {
                     ) : m.maintenance ? (
                       <RowTag tone="muted">maint</RowTag>
                     ) : null}
+                    <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
+                      title={`Open ${m.name}'s panel`}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setDetailTab(deviceTabs(m)[0])
+                        selectDevice(m.id)
+                      }}>
+                      <PanelRight className="size-3.5" />
+                    </Button>
                     {canWrite && editPins && (
                       <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
                         title={`Move ${m.name}: click its new spot on the map`}
                         onClick={(e) => {
                           e.stopPropagation()
                           setSiteAnchor(null)
-                          setSelectedId(null)
+                          selectDevice(null)
                           setPlaceOpen(false)
                           setPlacingId(m.id)
                         }}>
@@ -2875,11 +3226,11 @@ export function MapPage() {
               onOpenOlt: (deviceId, mac) => {
                 setDetailTab("optical")
                 setDetailOnu({ deviceId, mac })
-                setSelectedId(deviceId)
+                selectDevice(deviceId)
                 setSelectedOnuMac(null)
               },
               onOpenPassive: (deviceId) => {
-                setSelectedId(deviceId)
+                selectDevice(deviceId)
                 setSelectedOnuMac(null)
               },
               onTraceDrop: (m) => {
@@ -2887,11 +3238,43 @@ export function MapPage() {
                 if (place) startDropRouteEdit(place)
                 setSelectedOnuMac(null)
               },
-            }} />
+            }}
+            fibre={canWrite || (fibreQ.data?.cables?.length ?? 0) > 0 ? (
+              <FibrePanel
+                open={fibreOpen}
+                onOpen={(v) => { setFibreOpen(v); if (!v) setTrayError(null) }}
+                cables={refCables}
+                todo={0}
+                fibre={fibreQ.data}
+                loading={fibreQ.isLoading}
+                canWrite={canWrite}
+                busy={setFibreJoint.isPending || spliceThrough.isPending
+                      || clearFibreJoint.isPending || takeCoreToBox.isPending}
+                error={trayError}
+                boxes={trayBoxes}
+                boxOf={boxOf}
+                people={trayPeople}
+                onClearError={() => setTrayError(null)}
+                onOpenCable={(id) => { setCableList(false); setCableOpen(id) }}
+                onJoin={(a, b, port) => trayPoint
+                  && setFibreJoint.mutate({ point: trayPoint, a, b, port })}
+                onTail={(a, to, far) => trayPoint
+                  && takeCoreToBox.mutate({ point: trayPoint, a, to, far })}
+                onConnect={(deviceId, port, far) => trayPoint
+                  && connectPort.mutate({ point: trayPoint, deviceId, port, far })}
+                onThrough={(a, b) => trayPoint
+                  && spliceThrough.mutate({ point: trayPoint, a, b })}
+                onClear={(f) => trayPoint && clearFibreJoint.mutate({
+                  point: trayPoint, cableId: f.cableId, coreNo: f.coreNo })}
+                onTrace={(f) => {
+                  setTraceCore(null)
+                  setTraceFrom({ cableId: f.cableId, coreNo: f.coreNo })
+                }} />
+            ) : null} />
         </Card>
       )}
 
-      {selected && !routeEdit && cableOpen == null && !cableList && (
+      {selected && panelFor === selected.id && !routeEdit && cableOpen == null && !cableList && (
         <Card className="wisp-device-panel absolute inset-x-2 bottom-2 z-[1000] flex max-h-[55%] flex-col gap-0 overflow-hidden border-border-strong bg-popover py-0 md:inset-x-auto md:top-14 md:right-3 md:bottom-auto md:max-h-[calc(100%-4.5rem)]">
           <PanelResizeGrip grip={panel.grip} />
           <DevicePanelHeader device={selected} tone={pinTone(selected)}
@@ -2902,7 +3285,7 @@ export function MapPage() {
               <ListTree className="size-3.5" />
             </Button>
             <Button variant="ghost" size="icon" className="size-6 text-muted-foreground"
-              onClick={() => setSelectedId(null)}>
+              onClick={() => selectDevice(null)}>
               <X className="size-3.5" />
             </Button>
           </DevicePanelHeader>
@@ -3098,13 +3481,13 @@ export function MapPage() {
                 onOpenCable={(id) => { setCableList(false); setCableOpen(id) }}
                 onJoin={(a, b, port) => trayPoint
                   && setFibreJoint.mutate({ point: trayPoint, a, b, port })}
-                onTail={(a, to, port) => trayPoint
-                  && takeCoreToBox.mutate({ point: trayPoint, a, to, port })}
-                onConnect={(deviceId, port, toPort) => trayPoint
-                  && connectPort.mutate({ point: trayPoint, deviceId, port, toPort })}
+                onTail={(a, to, far) => trayPoint
+                  && takeCoreToBox.mutate({ point: trayPoint, a, to, far })}
+                onConnect={(deviceId, port, far) => trayPoint
+                  && connectPort.mutate({ point: trayPoint, deviceId, port, far })}
                 onDrop={(mac, port) => trayPoint?.device_id != null
                   && dropOnLeg.mutate({ mac, passiveId: trayPoint.device_id,
-                                        legNo: port.no })}
+                                        legNo: port.ref })}
                 onThrough={(a, b) => trayPoint
                   && spliceThrough.mutate({ point: trayPoint, a, b })}
                 onClear={(f) => trayPoint && clearFibreJoint.mutate({
@@ -3116,6 +3499,7 @@ export function MapPage() {
             )}
             <DeviceDetail device={selected} tab={detailTab}
               onTab={(t) => { setDetailTab(t); setDetailOnu(null) }}
+              onOpenFibre={() => setFibreOpen(true)}
               focusOnuMac={detailOnu?.deviceId === selected.id ? detailOnu.mac : null} />
           </div>
           <ConfirmDialog {...confirmUnpin.props}
@@ -3130,7 +3514,13 @@ export function MapPage() {
         <div className="pointer-events-none absolute inset-0 z-[999] flex items-center justify-center">
           <div className="pointer-events-auto flex flex-col items-center gap-2 rounded-xl border border-border-strong bg-popover/95 dark:bg-popover/95 px-6 py-5 text-center backdrop-blur">
             <MapPin className="size-5 text-muted-foreground" />
-            <p className="text-sm font-medium">No devices on the map yet</p>
+            <p className="text-sm font-medium">
+              {isWorker && devices.length === 0 ? "Nothing assigned to you yet"
+                : "No devices on the map yet"}
+            </p>
+            {isWorker && devices.length === 0 && (
+              <p className="max-w-64 text-xs text-muted-foreground">{NO_ASSIGNED_DEVICES}</p>
+            )}
             {canWrite && devices.length > 0 ? (
               <>
                 <p className="max-w-64 text-xs text-muted-foreground">
@@ -3170,11 +3560,11 @@ export function MapPage() {
           onArm={(kind, passiveId) => {
             setArmed({ kind, passiveId })
             setPlantMenu(null)
-            setSelectedId(null)
+            selectDevice(null)
           }}
           onCable={(lat, lng, on) => {
             setPlantMenu(null)
-            setSelectedId(null)
+            selectDevice(null)
             setPlacingId(null)
             setRouteEdit({
               kind: "cable", cableId: null, name: "New cable",
@@ -3187,7 +3577,7 @@ export function MapPage() {
           }}
           onOpenDevice={(d) => {
             setDetailTab(deviceTabs(d)[0])
-            setSelectedId(d.id)
+            selectDevice(d.id)
             setPlantMenu(null)
           }}
           onDelete={(d) => {

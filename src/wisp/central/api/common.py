@@ -46,6 +46,21 @@ def can_triage(user: dict, org: str | None) -> bool:
     return user["org_id"] == org and user["role"] in ("owner", "worker")
 
 
+def triage_outage_org(h, user, outage_id: int):
+    org = h.store.outage_org(outage_id)
+    if not can_triage(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return DENIED
+
+    if in_scope(visible_device_ids(h, user, org),
+                h.store.outage_device(outage_id)):
+        return org
+    if user["username"] in h.store.outage_assignees(outage_id):
+        return org
+    h._reply(403, {"error": "forbidden"})
+    return DENIED
+
+
 def reader_or_401(h) -> dict | None:
     user = h._reader()
     if not user:
@@ -85,12 +100,34 @@ def q_int_or(qs, key: str, fallback: int) -> int:
         return fallback
 
 
+def visible_device_ids(h, user, org: str | None) -> set[int] | None:
+
+    if user["is_superadmin"] or user.get("role") != "worker":
+        return None
+    if org is None or user.get("org_id") != org:
+        return set()
+    return h.store.worker_device_scope(org, user["id"])
+
+
+def in_scope(scope: set[int] | None, device_id) -> bool:
+    return scope is None or device_id in scope
+
+
+def keep_visible(rows, scope: set[int] | None, key: str = "device_id"):
+    if scope is None:
+        return rows
+    return [r for r in rows if r.get(key) in scope]
+
+
 def device_read_scope(h, user, qs) -> tuple[int, str] | None:
     did = q_int_required(h, qs, "device_id")
     if did is None:
         return None
     org = h.store.device_org(did)
     if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+        h._reply(403, {"error": "forbidden"})
+        return None
+    if not in_scope(visible_device_ids(h, user, org), did):
         h._reply(403, {"error": "forbidden"})
         return None
     return did, org
@@ -116,6 +153,9 @@ def can_survey(user, org: str | None) -> bool:
 def survey_write_org(h, user, device_id: int):
     org = h.store.device_org(device_id)
     if not can_survey(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return DENIED
+    if not in_scope(visible_device_ids(h, user, org), device_id):
         h._reply(403, {"error": "forbidden"})
         return DENIED
     return org

@@ -218,6 +218,10 @@ class SubscriberTest(unittest.TestCase):
 
     def test_a_worker_may_read_it(self):
         self._onu("AA:BB")
+        self.store.set_device_assignees(
+            "ispA", self.olt,
+            [next(u["id"] for u in self.store.list_users("ispA")
+                  if u["username"] == "field")], "owner")
         status, body = self._get("AA:BB",
                                  cookie=self._login("field", "fieldpassword"))
         self.assertEqual(status, 200, body)

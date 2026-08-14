@@ -13,6 +13,7 @@ interface AuthContextValue {
           second?: { totp?: string; recovery?: string }) => Promise<void>
   logout: () => Promise<void>
   canWrite: boolean
+  isWorker: boolean
 
   scopeOrg: string | null
   setScopeOrg: (org: string | null) => void
@@ -96,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     login,
     logout,
     canWrite: !!user && (user.is_superadmin || user.role === "owner"),
+    isWorker: !!user && !user.is_superadmin && user.role === "worker",
     scopeOrg,
     setScopeOrg,
   }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from wisp.central import history
 from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
@@ -102,6 +103,7 @@ class CentralPortMonitor:
         existing = {r["if_index"]: r for r in
                    self.store.list_switch_ports(self.org_id, device_id)}
         events: list[PortEvent] = []
+        hist_rows: list[tuple] = []
         for raw in raw_ports:
             p = _to_port_status(raw)
             if p is None:
@@ -184,6 +186,9 @@ class CentralPortMonitor:
                 p.admin_status, p.oper_status, p.last_change, streak, alarm, since, ts,
                 bw=(p.in_octets, p.out_octets, ts, in_bps, out_bps, bw_streak, bw_alarm,
                    bw_since, bw_high_streak, bw_high_alarm, bw_high_since))
+            if history.port_eligible(prior):
+                hist_rows.append((p.if_index, in_bps, out_bps,
+                                  p.oper_status == "up"))
 
             if alarm != prior_alarm:
                 ev = (self._on_down(device_id, p, feeds, ts) if alarm
@@ -199,6 +204,8 @@ class CentralPortMonitor:
                                                max_threshold, direction, ts))
             elif prior_bw_high_alarm and not bw_high_alarm and high_eligible:
                 events.append(self._on_bw_normal(device_id, p, feeds, in_bps, out_bps, ts))
+        history.record_ports(self.store, cfg, self.org_id, device_id, ts,
+                             hist_rows)
         return events
 
     def _on_down(self, device_id: int, p: PortStatus, feeds: int | None, ts: str) -> PortEvent:

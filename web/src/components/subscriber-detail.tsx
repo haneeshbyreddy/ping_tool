@@ -6,8 +6,12 @@ import {
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { ApiError, inventoryApi } from "@/lib/api"
-import type { Subscriber, SubscriberPlantHop } from "@/lib/types"
-import { ago, fmtDateTime, isDownState, isFresh, onuName, onuSev } from "@/lib/format"
+import type {
+  RadiusStatus, Subscriber, SubscriberPlantHop, UserMac, WebMacStatus,
+} from "@/lib/types"
+import {
+  ago, fmtDateTime, isDownState, isFresh, onuName, onuSearchKey, onuSev,
+} from "@/lib/format"
 import { ratioLabel } from "@/map/drops"
 import { RowTag } from "@/components/device-detail"
 import { StatusDot } from "@/components/status-badge"
@@ -99,6 +103,89 @@ function cumulativeSplit(chain: SubscriberPlantHop[]): number | null {
 const isPassiveHop = (h: SubscriberPlantHop): boolean =>
   ["splitter", "fdb", "closure"].includes((h.device_type ?? "").toLowerCase())
 
+// Why there is no address to show. Same split SnmpDiagnosis/RxDiagnosis make: an
+// empty column has several meanings that need OPPOSITE actions, and the worst of
+// them is `partial` — a truncated read makes a customer who HAS an address look
+// exactly like one who does not.
+function noMacReason(status: WebMacStatus | null): string {
+  if (!status) {
+    return "This OLT's address table hasn't been read yet."
+  }
+  switch (status.state) {
+    case "ok":
+      return "The OLT currently knows no address behind this ONU. It learns "
+        + "them from traffic, so an idle or offline customer drops off the table."
+    case "partial":
+      return "The last read of this OLT's address table was INCOMPLETE, so this "
+        + "customer may well have an address we simply didn't get."
+    case "no_profile":
+      return "No address-table recipe is configured for this OLT's vendor."
+    case "no_credentials":
+      return "Nobody has stored this OLT's web-UI login, so its address table "
+        + "can't be opened."
+    case "login":
+      return "This OLT is refusing the stored web-UI login, so its address "
+        + "table can't be read."
+    case "unreachable":
+      return "This OLT's address table couldn't be reached on its web UI."
+    case "skipped":
+      return "The address table wasn't read on the last pass. "
+        + (status.detail ?? "")
+    default:
+      return "The last attempt to read this OLT's address table failed."
+  }
+}
+
+function UserMacs({ macs, status }: {
+  macs: UserMac[]; status: WebMacStatus | null
+}) {
+  const [copied, setCopied] = useState<string | null>(null)
+  const copy = (mac: string) => {
+    void navigator.clipboard?.writeText(mac).then(
+      () => { setCopied(mac); setTimeout(() => setCopied(null), 1200) },
+      () => undefined)
+  }
+  if (!macs.length) {
+    return (
+      <span className={cn("text-faint-foreground",
+        status?.state === "partial" && "text-warning")}>
+        {noMacReason(status)}
+      </span>
+    )
+  }
+  return (
+    <div className="space-y-1">
+      {macs.map((m) => {
+        const live = isFresh(m.last_seen_at)
+        return (
+          <div key={m.mac} className="flex flex-wrap items-baseline gap-x-2">
+            <button
+              type="button"
+              onClick={() => copy(m.mac)}
+              title="Copy this address"
+              className={cn("font-mono text-xs hover:underline",
+                !live && "text-muted-foreground")}
+            >
+              {m.mac}
+            </button>
+            {copied === m.mac && (
+              <span className="text-2xs text-success">copied</span>
+            )}
+            {m.vlan && (
+              <span className="text-2xs text-faint-foreground">VLAN {m.vlan}</span>
+            )}
+            {!live && (
+              <span className="text-2xs text-faint-foreground">
+                last seen {ago(m.last_seen_at)}
+              </span>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function Row({ label, children, className }: {
   label: string; children: React.ReactNode; className?: string
 }) {
@@ -106,6 +193,164 @@ function Row({ label, children, className }: {
     <div className={cn("flex gap-2 py-1", className)}>
       <span className="w-[5.5rem] shrink-0 text-2xs text-faint-foreground">{label}</span>
       <div className="min-w-0 flex-1 text-xs">{children}</div>
+    </div>
+  )
+}
+
+// A blank billing block has four meanings and they take opposite actions, so the
+// server ships facts (radius_status) and this writes the sentence — the same split
+// SnmpDiagnosis and RxDiagnosis keep. An org with no panel configured gets NOTHING
+// rather than an explanation of a feature it does not use.
+function noBillingReason(st: RadiusStatus | null): string | null {
+  if (!st) return null
+  const was = st.last_ok_at ? ` It last worked ${ago(st.last_ok_at)}.` : ""
+  switch (st.state) {
+    case "ok":
+    case "partial":
+      return "This subscriber isn't in the billing panel, or nothing ties them to "
+        + "this ONU yet — a disconnected customer stops passing traffic, so their "
+        + "address ages out of the OLT's table."
+    case "no_credentials":
+      return "Nobody has stored the billing panel's sign-in details."
+    case "no_profile":
+      return "There's no recipe for this billing panel yet."
+    case "forbidden":
+      return "The billing panel signed in but would not hand over the customer "
+        + "list — that login needs permission to export it."
+    case "login":
+      return `The billing panel is refusing the stored sign-in.${was}`
+    case "unreachable":
+      return `The billing panel couldn't be reached.${was}`
+    default:
+      return (st.detail || "The last billing sync failed.") + was
+  }
+}
+
+// With several panels connected, "why is there no name here" is only answerable
+// once one of them is working: a panel that read fine means the customer really
+// is absent, and only when NONE did is the trouble worth naming. Picking the
+// first failure would blame a second panel for a subscriber the first one covers.
+function panelToBlame(panels: RadiusStatus[]): RadiusStatus | null {
+  if (!panels.length) return null
+  return panels.find((p) => p.state === "ok" || p.state === "partial") ?? panels[0]
+}
+
+// Only what BILLING alone can know lives here — account, package, status,
+// expiry. The identity facts (name, phone, address) are composed into the
+// Customer section with per-fact provenance, so one subscriber is never
+// introduced twice.
+function BillingSection({ sub }: { sub: Subscriber }) {
+  const r = sub.radius
+  const st = panelToBlame(sub.radius_panels ?? [])
+  if (!st && !r) return null
+  // When the ONU itself could not be resolved the card already says why, at the
+  // top and in stronger terms. A second, speculative explanation down here would
+  // compete with it and read as a different fault.
+  if (!r && (!sub.matched || sub.ambiguous)) return null
+  const reason = r ? null : noBillingReason(st)
+  if (!r && !reason) return null
+  return (
+    <Section title="Billing">
+      {r ? (
+        <div className="space-y-0">
+          <Row label="Account"><span className="font-mono">{r.username}</span></Row>
+          {r.package && <Row label="Package">{r.package}</Row>}
+          {r.status && (
+            <Row label="Status">
+              <span className={cn(r.status !== "active" && "text-warning")}>
+                {r.status}
+              </span>
+            </Row>
+          )}
+          {r.expiry && (
+            <Row label="Expiry">
+              <span className="text-muted-foreground">{r.expiry}</span>
+            </Row>
+          )}
+          <p className="pt-1 text-2xs text-faint-foreground">
+            From {r.account_label || "the billing panel"}, matched on{" "}
+            {r.match_by === "mac" ? "the router's MAC address" : "the ONU's name"}
+            {r.updated_at ? ` · ${ago(r.updated_at)}` : ""}
+          </p>
+        </div>
+      ) : (
+        <p className="py-1 text-xs text-muted-foreground">{reason}</p>
+      )}
+    </Section>
+  )
+}
+
+const digitsOf = (v?: string | null) => (v ?? "").replace(/\D/g, "")
+
+function PhoneRow({ number, tag }: { number: string; tag?: "field" | "billing" }) {
+  return (
+    <Row label="Phone">
+      <a href={`tel:${number}`}
+        className="inline-flex items-center gap-1 font-mono underline-offset-2 hover:underline">
+        <Phone className="size-3" />{number}
+      </a>
+      {tag && <span className="ml-1.5 text-2xs text-faint-foreground">{tag}</span>}
+    </Row>
+  )
+}
+
+// One identity, composed from both sources with per-fact provenance. The two
+// phones are often DIFFERENT PEOPLE — the on-site contact a tech collected vs
+// the account holder billing registered — so when they differ both render,
+// tagged. A blank in one source never hides the other's fact.
+// The survey label is USUALLY the billing account name — the operator's own
+// convention, 137 of 164 labeled subscribers on the live fleet — so a label
+// matching the USERNAME is not a competing name: the billing full name then
+// renders as the plain Name row. Only a label matching neither is a real
+// disagreement worth framing as one.
+function IdentityRows({ sub, canWrite }: { sub: Subscriber; canWrite: boolean }) {
+  const rec = sub.record
+  const r = sub.radius
+  const labelIsAccount = !!(rec?.label && r?.username
+    && onuSearchKey(rec.label) === onuSearchKey(r.username))
+  const billingName = !!(labelIsAccount && r?.name)
+  const namesDiffer = !!(rec?.label && r?.name && !labelIsAccount
+    && onuSearchKey(rec.label) !== onuSearchKey(r.name))
+  const twoPhones = !!(rec?.phone && r?.mobile
+    && digitsOf(r.mobile) !== digitsOf(rec.phone))
+  const any = billingName || namesDiffer || rec?.phone || r?.mobile
+    || r?.address || rec?.notes
+  if (!any) {
+    return (
+      <p className="py-1 text-xs text-muted-foreground">
+        {rec?.label || r?.name
+          ? "Only a name on file."
+            + (canWrite ? " Add a number so a fault on this drop reaches somebody." : "")
+          : "No customer details recorded yet."
+            + (canWrite ? " Add a name and number so a fault on this drop reaches somebody." : "")}
+      </p>
+    )
+  }
+  return (
+    <div className="space-y-0">
+      {billingName && <Row label="Name">{r!.name}</Row>}
+      {namesDiffer && (
+        <Row label="Name">
+          {rec!.label}
+          <p className="text-2xs text-faint-foreground">billing: {r!.name}</p>
+        </Row>
+      )}
+      {rec?.phone && (
+        <PhoneRow number={rec.phone} tag={twoPhones ? "field" : undefined} />
+      )}
+      {r?.mobile && (!rec?.phone || twoPhones) && (
+        <PhoneRow number={r.mobile} tag={twoPhones ? "billing" : undefined} />
+      )}
+      {r?.address && (
+        <Row label="Address">
+          <span className="text-muted-foreground">{r.address}</span>
+        </Row>
+      )}
+      {rec?.notes && (
+        <Row label="Notes">
+          <span className="text-muted-foreground">{rec.notes}</span>
+        </Row>
+      )}
     </div>
   )
 }
@@ -202,8 +447,8 @@ export interface SubscriberActions {
   onClose?: () => void
 }
 
-export function SubscriberDetail({ mac, actions }: {
-  mac: string; actions?: SubscriberActions
+export function SubscriberDetail({ mac, actions, fibre }: {
+  mac: string; actions?: SubscriberActions; fibre?: React.ReactNode
 }) {
   const { canWrite, scopeOrg } = useAuth()
   const qc = useQueryClient()
@@ -246,7 +491,10 @@ export function SubscriberDetail({ mac, actions }: {
   const rec = sub.record
   const r = sub.roster
   const sev = r ? onuSev(r) : "offline"
-  const name = onuName({ label: rec?.label, name: r?.name, serial: sub.mac })
+  const name = onuName({
+    label: rec?.label, radius_name: sub.radius?.name, name: r?.name,
+    serial: sub.mac,
+  })
   const frozen = !!sub.olt && isDownState(sub.olt.state)
   const opticsFresh = isFresh(sub.olt?.optics_updated_at)
   const dark = !!r && r.state !== "online"
@@ -295,26 +543,12 @@ export function SubscriberDetail({ mac, actions }: {
         )}>
         {editing ? (
           <ContactForm sub={sub} onDone={() => setEditing(false)} />
-        ) : rec?.label || rec?.phone || rec?.notes ? (
-          <div className="space-y-0">
-            {rec.label && <Row label="Name">{rec.label}</Row>}
-            {rec.phone && (
-              <Row label="Phone">
-                <a href={`tel:${rec.phone}`}
-                  className="inline-flex items-center gap-1 font-mono underline-offset-2 hover:underline">
-                  <Phone className="size-3" />{rec.phone}
-                </a>
-              </Row>
-            )}
-            {rec.notes && <Row label="Notes"><span className="text-muted-foreground">{rec.notes}</span></Row>}
-          </div>
         ) : (
-          <p className="py-1 text-xs text-muted-foreground">
-            No customer details recorded yet.
-            {canWrite && " Add a name and number so a fault on this drop reaches somebody."}
-          </p>
+          <IdentityRows sub={sub} canWrite={canWrite} />
         )}
       </Section>
+
+      <BillingSection sub={sub} />
 
       <Section title="Where it hangs">
         {sub.olt ? (
@@ -383,6 +617,20 @@ export function SubscriberDetail({ mac, actions }: {
               Not located yet. A fault here has no coordinate to send anyone to.
             </span>
           )}
+        </Row>
+      </Section>
+
+      {fibre}
+
+      {/* Deliberately NOT inside the frozen block below, and not suppressed when
+          the ONU is dark: an address is a fact about the customer's own router,
+          not a live measurement of the light, and it is MOST wanted exactly when
+          they are down — it is what the RADIUS lookup is keyed on. Every row
+          carries its own date instead, so "the OLT still sees this" and "this is
+          the last one we saw" can never read alike. */}
+      <Section title="Customer equipment">
+        <Row label="User MAC">
+          <UserMacs macs={sub.user_macs ?? []} status={sub.user_mac_status} />
         </Row>
       </Section>
 

@@ -110,11 +110,30 @@ class SpaAgreementTest(unittest.TestCase):
 
     def test_a_port_reads_the_same_on_both_sides(self):
         self.assertEqual(
-            [fiber.port_label(k, n) for k, n in
-             (("pon", 3), ("leg", 4), ("in", None), ("in", 1), ("in", 2))],
-            ["PON 3", "leg 4", "input", "input", "input 2"])
-        for template in ("`PON ${no}`", "`leg ${no}`", "`input ${no}`"):
+            [fiber.port_label(k, r) for k, r in
+             (("pon", "3"), ("leg", "4"), ("in", None), ("in", "1"), ("in", "2"),
+              ("port", "GE0/5 INPUT"))],
+            ["PON 3", "leg 4", "input", "input", "input 2", "GE0/5 INPUT"])
+        for template in ("`PON ${text}`", "`leg ${text}`", "`input ${text}`"):
             self.assertIn(template, self.src, template)
+
+    def test_the_KIND_LIST_is_mirrored(self):
+        # A box that central says has two kinds must offer two in the SPA, or the
+        # panel refuses a port the picker offered.
+        self.assertIn("export function portKindsFor", self.src)
+        self.assertIn('return ["pon", "port"]', self.src)
+        raw = re.search(r"PORT_KINDS = \[([^\]]+)\]", self.src)
+        self.assertNotIn("uplink", re.findall(r'"(\w+)"', raw.group(1)))
+
+    def test_the_ONE_normalizer_is_mirrored(self):
+        # Both sides must reconcile two spellings of one socket the SAME way, or a
+        # port the SPA thinks is free is one central thinks is taken.
+        self.assertIn("export function portKey", self.src)
+        self.assertIn("NUMBERED_KINDS", self.src)
+        raw = re.search(r"NUMBERED_KINDS = \[([^\]]+)\]", self.src)
+        self.assertIsNotNone(raw, "NUMBERED_KINDS not found in fiber.ts")
+        self.assertEqual(tuple(re.findall(r'"(\w+)"', raw.group(1))),
+                         fiber.NUMBERED_KINDS)
 
     def test_every_refusal_central_can_send_has_a_sentence_in_the_SPA(self):
         for key in fiber.JOINT_REFUSAL_TEXT:
@@ -129,7 +148,7 @@ def _joint(point, a, b=None, port=None):
     return {"point": point, "a_cable_id": a[0], "a_core_no": a[1],
             "b_cable_id": b[0] if b else None, "b_core_no": b[1] if b else None,
             "port_kind": port[0] if port else None,
-            "port_no": port[1] if port else None}
+            "port_ref": port[1] if port else None}
 
 
 class PortTest(unittest.TestCase):
@@ -141,16 +160,17 @@ class PortTest(unittest.TestCase):
     def test_a_splitter_has_its_inputs_then_its_legs(self):
         self.assertEqual(
             fiber.port_slots("splitter", split_ratio=4, split_inputs=2),
-            [("in", 1), ("in", 2), ("leg", 1), ("leg", 2), ("leg", 3), ("leg", 4)])
+            [("in", "1"), ("in", "2"),
+             ("leg", "1"), ("leg", "2"), ("leg", "3"), ("leg", "4")])
 
     def test_an_OLT_lists_the_PONs_IT_REPORTS_gaps_and_all(self):
         self.assertEqual(fiber.port_slots("OLT", pons=[1, 3, 4]),
-                         [("pon", 1), ("pon", 3), ("pon", 4)])
+                         [("pon", "1"), ("pon", "3"), ("pon", "4")])
 
     def test_a_box_with_nothing_to_go_on_offers_nothing_rather_than_guessing(self):
         self.assertEqual(fiber.port_slots("OLT", pons=[]), [])
         self.assertEqual(fiber.port_slots("splitter", split_ratio=None),
-                         [("in", 1)])
+                         [("in", "1")])
 
     def test_a_leg_is_bounded_by_the_split_but_a_PON_is_not(self):
         self.assertEqual(fiber.port_bound("leg", split_ratio=8), 8)
@@ -186,6 +206,113 @@ class PortTest(unittest.TestCase):
 
     def test_a_RECORDED_port_never_drops_off_the_list_that_offered_it(self):
         self.assertEqual(fiber.pon_ports(recorded=[7]), [7])
+
+
+class PonNameTest(unittest.TestCase):
+
+    # A PON IS NAMED BY THE BOX. Its REF stays the index — that is what joins to the
+    # roster and what `pon_of_points` inherits down the plant — but SRPL-OLT calls
+    # its four PONs `EPON0/1..4` on every other screen in this product, and the fibre
+    # pickers called them `PON 1..4` beside a `GE0/1` read straight off the same walk.
+
+    SRPL = ("GE0/1", "GE0/2", "GE0/3", "GE0/4", "EPON0/1", "EPON0/2", "EPON0/3",
+            "EPON0/4", "VLAN1", "EPON0/1:5")
+
+    def test_the_box_names_its_own_PONs(self):
+        self.assertEqual(
+            fiber.pon_names(interfaces=self.SRPL),
+            {"1": "EPON0/1", "2": "EPON0/2", "3": "EPON0/3", "4": "EPON0/4"})
+
+    def test_a_BARE_NUMBER_IS_NOT_A_NAME(self):
+        # The Syrotech build writes a bare `3` in `pon_port`; `PON 3` beats `3`.
+        self.assertEqual(fiber.pon_names(roster=["3", "4"]), {})
+        self.assertEqual(fiber.port_display("pon", "3", {}), "PON 3")
+
+    def test_the_WALK_wins_over_the_roster(self):
+        # Both usually carry the same string; where they differ the interface name is
+        # the box naming its own socket.
+        self.assertEqual(
+            fiber.pon_names(roster=["PON 1"], interfaces=["EPON0/1"]),
+            {"1": "EPON0/1"})
+
+    def test_a_box_that_walks_NOTHING_still_gets_a_name(self):
+        # Four OLTs on this fleet walk no ifTable at all. `port_label` is the floor.
+        self.assertEqual(fiber.port_display("pon", "2", None), "PON 2")
+        self.assertEqual(fiber.port_display("pon", "9", {"1": "EPON0/1"}), "PON 9")
+
+    def test_only_a_PON_is_renamed(self):
+        # A `port`'s ref is ALREADY the box's own string, and a leg or an input is
+        # plastic nothing walks — none of them may be reached by a PON's names.
+        names = {"1": "EPON0/1"}
+        self.assertEqual(fiber.port_display("port", "GE0/1", names), "GE0/1")
+        self.assertEqual(fiber.port_display("leg", "1", names), "leg 1")
+        self.assertEqual(fiber.port_display("in", "1", names), "input")
+
+    def test_the_pseudo_interfaces_are_not_names_for_anything(self):
+        self.assertEqual(fiber.pon_names(interfaces=["EPON0/1:5", "EPON01ONU3"]), {})
+
+
+class ConnectedSpanTest(unittest.TestCase):
+
+    # RECORDED GLASS WINS: the map stands a dependency chord down once its pair is
+    # joined here, and hangs the chord's rate chip on the sheath this names.
+
+    # HALIYA-WAN-SW ==tail== JC1 ==main 6F== JC2 ==tail== SRPL-OLT, off the live fleet.
+    RUN = [{"id": 86, "cores": 1, "a_point": ("device", 248), "b_point": ("device", 27)},
+           {"id": 85, "cores": 6, "a_point": ("device", 248), "b_point": ("device", 249)},
+           {"id": 90, "cores": 1, "a_point": ("device", 249), "b_point": ("device", 32)}]
+    JCS = {("device", 248), ("device", 249)}
+
+    PAIR = frozenset((("device", 27), ("device", 32)))
+
+    def test_the_BIGGEST_SHEATH_on_the_run_carries_the_label(self):
+        # Not either 1F tail: they are our own plumbing, 26 m long, and unreadable at
+        # the zoom somebody reads a trunk at.
+        self.assertEqual(
+            fiber.connected_spans(self.RUN, self.JCS)[self.PAIR]["label"], 85)
+
+    def test_THE_WHOLE_RUN_comes_back_because_THE_MAP_DRAWS_IT(self):
+        # The chord this replaces spanned both boxes, so every sheath under it has to
+        # light — `main` alone leaves the tails dark and the line stops at a closure.
+        self.assertEqual(
+            sorted(fiber.connected_spans(self.RUN, self.JCS)[self.PAIR]["path"]),
+            [85, 86, 90])
+
+    def test_a_pair_with_NO_glass_between_them_is_simply_absent(self):
+        self.assertNotIn(self.PAIR, fiber.connected_spans(self.RUN[:1], self.JCS))
+
+    def test_the_light_does_NOT_run_on_through_GEAR(self):
+        # A closure is where a sheath is opened; a switch is where the light stops.
+        self.assertNotIn(self.PAIR, fiber.connected_spans(self.RUN, set()))
+
+    def test_a_DIRECT_cable_names_itself_and_is_its_own_whole_run(self):
+        spans = fiber.connected_spans(
+            [{"id": 78, "cores": 4, "a_point": ("device", 35),
+              "b_point": ("device", 11)}])
+        got = spans[frozenset((("device", 35), ("device", 11)))]
+        self.assertEqual((got["label"], got["path"]), (78, [78]))
+
+    def test_parallel_cables_between_one_pair_pick_the_bigger(self):
+        spans = fiber.connected_spans(
+            [{"id": 1, "cores": 2, "a_point": ("device", 1), "b_point": ("device", 2)},
+             {"id": 2, "cores": 12, "a_point": ("device", 1), "b_point": ("device", 2)}])
+        got = spans[frozenset((("device", 1), ("device", 2)))]
+        # The chosen run's OWN cable, never a path spliced from two answers.
+        self.assertEqual((got["label"], got["path"]), (2, [2]))
+
+    def test_a_TIE_breaks_on_the_lower_id_so_the_map_does_not_flicker(self):
+        spans = fiber.connected_spans(
+            [{"id": 9, "cores": 6, "a_point": ("device", 1), "b_point": ("device", 7)},
+             {"id": 4, "cores": 6, "a_point": ("device", 7), "b_point": ("device", 2)}],
+            {("device", 7)})
+        self.assertEqual(spans[frozenset((("device", 1), ("device", 2)))]["label"], 4)
+
+    def test_the_PAIRS_answer_never_depends_on_the_LABELLING_one(self):
+        # `undrawn` hands over cables carrying nothing but their two ends.
+        bare = [{"a_point": ("device", 1), "b_point": ("device", 7)},
+                {"a_point": ("device", 7), "b_point": ("device", 2)}]
+        self.assertIn(frozenset((("device", 1), ("device", 2))),
+                      fiber.connected_points(bare, {("device", 7)}))
 
 
 class SegmentModelTest(unittest.TestCase):
@@ -252,25 +379,38 @@ class JointRefusalTest(unittest.TestCase):
             "absent")
 
     def test_ONE_port_takes_exactly_ONE_fibre(self):
-        ports = {("pon", 3): {"id": 7}}
+        ports = {fiber.port_slot("pon", "3"): {"id": 7}}
         self.assertEqual(
             fiber.joint_refusal((1, 1), None, self.here, self.cables, {},
-                                ("pon", 3), ports),
+                                ("pon", "3"), ports),
             "port_taken")
         self.assertIsNone(
             fiber.joint_refusal((1, 1), None, self.here, self.cables, {},
-                                ("pon", 4), ports))
+                                ("pon", "4"), ports))
+
+    def test_ONE_SOCKET_TYPED_TWO_WAYS_IS_STILL_ONE_SOCKET(self):
+        # An SNMP-silent box gets its ports typed by hand, so `GE0/5` and `ge0/5  `
+        # WILL both be entered. They are one port or the free-text field is a way to
+        # double-book a socket.
+        ports = {fiber.port_slot("port", "GE0/5 INPUT"): {"id": 9}}
+        self.assertEqual(
+            fiber.joint_refusal((1, 1), None, self.here, self.cables, {},
+                                ("port", " ge0/5   input "), ports),
+            "port_taken")
+        self.assertIsNone(
+            fiber.joint_refusal((1, 1), None, self.here, self.cables, {},
+                                ("port", "GE0/6"), ports))
 
     def test_a_port_belongs_to_a_TERMINATION_never_to_a_splice(self):
         self.assertEqual(
             fiber.joint_refusal((1, 1), (2, 1), self.here, self.cables, {},
-                                ("pon", 3), {}),
+                                ("pon", "3"), {}),
             "port_splice")
 
     def test_a_termination_with_NO_port_stays_ordinary(self):
         self.assertIsNone(
             fiber.joint_refusal((1, 2), None, self.here, self.cables, {},
-                                None, {("pon", 3): {"id": 7}}))
+                                None, {fiber.port_slot("pon", "3"): {"id": 7}}))
 
     def test_every_refusal_has_a_sentence(self):
         for why in ("absent", "self", "taken", "port_taken", "port_splice"):
@@ -470,17 +610,35 @@ class EveryBoxHasPortsTest(unittest.TestCase):
 
     def test_a_SWITCH_has_the_ports_it_walks(self):
         self.assertEqual(
-            fiber.port_slots("switch", ports=[1, 2, 24]),
-            [("port", 1), ("port", 2), ("port", 24)])
+            fiber.port_slots("switch", ports=["GE0/1", "GE0/2", "GE0/24"]),
+            [("port", "GE0/1"), ("port", "GE0/2"), ("port", "GE0/24")])
 
     def test_a_router_a_gateway_and_a_CPE_too(self):
         for t in ("router", "gateway", "CPE"):
-            self.assertEqual(fiber.port_slots(t, ports=[3]), [("port", 3)],
-                             f"{t} has no ports")
+            self.assertEqual(fiber.port_slots(t, ports=["eth3"]),
+                             [("port", "eth3")], f"{t} has no ports")
 
     def test_an_ENCLOSURE_still_has_none(self):
         for t in ("coupler", "closure", "fdb"):
             self.assertEqual(fiber.port_slots(t, ports=[1, 2]), [], t)
+
+    def test_A_BOX_HAS_KINDS_PLURAL(self):
+        # An OLT has PONs AND the GE uplink the trunk lands on. One kind per device
+        # type is why "GE0/5 INPUT" — walked, in the database — could not be named,
+        # leaving only two ways to record an OLT's uplink: lie, or leave it blank.
+        self.assertEqual(fiber.port_kinds_for("OLT"), ("pon", "port"))
+        self.assertEqual(fiber.port_kinds_for("splitter"), ("leg",))
+        self.assertEqual(fiber.port_kinds_for("switch"), ("port",))
+        self.assertEqual(fiber.port_kinds_for("coupler"), ())
+        self.assertEqual(fiber.port_kinds_for(None), ())
+
+    def test_there_is_NO_uplink_kind(self):
+        # Uplink is a ROLE, not a socket: which GE port is the uplink is decided by
+        # what somebody plugged in and changes on a re-patch. The first customer feed
+        # on GE0/8 would make the vocabulary a lie.
+        self.assertNotIn("uplink", fiber.PORT_KINDS)
+        for t in ("OLT", "switch", "router", "splitter"):
+            self.assertNotIn("uplink", fiber.port_kinds_for(t), t)
 
     def test_the_NOUN_differs_because_the_boxes_do(self):
         self.assertEqual(fiber.port_kind_for("OLT"), "pon")
@@ -488,18 +646,66 @@ class EveryBoxHasPortsTest(unittest.TestCase):
         self.assertEqual(fiber.port_kind_for("switch"), "port")
         self.assertIsNone(fiber.port_kind_for("coupler"))
 
-    def test_a_numbered_port_is_said_out_loud_as_one(self):
-        self.assertEqual(fiber.port_label("port", 5), "port 5")
+    def test_an_OLT_offers_its_PONS_AND_its_uplink_ports(self):
+        slots = fiber.slots_for("OLT", roster=["EPON0/1", "EPON0/2"],
+                                interfaces=["EPON0/1", "GE0/1", "GE0/5 INPUT",
+                                            "EPON01ONU3", "Vlan-interface1"])
+        self.assertEqual(slots, [("pon", "1"), ("pon", "2"),
+                                 ("port", "GE0/1"), ("port", "GE0/5 INPUT")])
 
-    def test_a_port_number_comes_off_the_END_of_the_walked_name(self):
-        self.assertEqual(fiber.if_port_no("gigabitEthernet 1/0/5"), 5)
-        self.assertEqual(fiber.if_port_no("Te1/0/25"), 25)
-        self.assertEqual(fiber.if_port_no("eth3"), 3)
+    def test_a_PON_INTERFACE_is_never_ALSO_offered_as_a_port(self):
+        # One socket may not appear twice under two kinds.
+        self.assertIsNone(fiber.if_port_ref("EPON0/1"))
+        self.assertIsNone(fiber.if_port_ref("GPON0/1 ANREDDY"))
+
+    def test_an_ONU_pseudo_interface_is_not_a_SOCKET_ON_THE_BOX(self):
+        # HLY-OLT-1 walks 200 interfaces of which 176 are these. Offering them would
+        # bury the 16 real ports.
+        for junk in ("EPON01ONU3", "EPON0/1:3", "EPON08ONU51 hc_nirmala1"):
+            self.assertIsNone(fiber.if_port_ref(junk), junk)
+
+    def test_a_VIRTUAL_FAMILY_is_matched_on_the_FIRST_TOKEN_not_a_SUBSTRING(self):
+        # Real sockets were refused for what their DESCRIPTION said: `LAN-1
+        # HILLCOLONY` and `LAN-2 PYLON COLONY` were both dropped because "co-LO-ny"
+        # contains "lo".
+        for real in ("LAN-1 HILLCOLONY", "LAN-2 PYLON COLONY", "ether8 LOCAL CH",
+                     "GE0/5 INPUT"):
+            self.assertEqual(fiber.if_port_ref(real), real, real)
+        for virtual in ("Vlan-interface1", "vlan1.1", "lo", "lo0", "loopback0",
+                        "Null0", "bridge1-WAN", "mgmt0", "mng0", "default",
+                        "port-channel 3"):
+            self.assertIsNone(fiber.if_port_ref(virtual), virtual)
+
+    def test_the_INTERFACE_NAME_IS_THE_LABEL(self):
+        # "port gigabitEthernet 1/0/5" says it twice; the box's own string is enough.
+        self.assertEqual(fiber.port_label("port", "gigabitEthernet 1/0/5"),
+                         "gigabitEthernet 1/0/5")
+        self.assertEqual(fiber.port_label("port", None), "port")
+
+    def test_a_ports_identity_is_the_BOXS_OWN_STRING(self):
+        for name in ("gigabitEthernet 1/0/5", "Te1/0/25", "eth3", "GE0/5 INPUT"):
+            self.assertEqual(fiber.if_port_ref(name), name, name)
+
+    def test_TWO_SOCKETS_ENDING_IN_5_STAY_TWO_SOCKETS(self):
+        # The defect this replaced: a trailing digit collapsed GigaEthernet0/5 with
+        # TGigaEthernet0/5 on EVERY switch on the fleet, and the one it dropped was
+        # the SFP+ the trunk fibre actually lands on.
+        walked = ["GigaEthernet0/5", "TGigaEthernet0/5", "e0/0/5", "e0/1/5"]
+        self.assertEqual(fiber.interface_refs(walked), sorted(walked, key=str.lower))
+        self.assertEqual(len({fiber.port_key(n) for n in walked}), 4)
 
     def test_a_VIRTUAL_interface_is_not_somewhere_to_land_a_FIBRE(self):
         for name in ("Vlan-interface1", "loopback0", "Bridge-Aggregation2",
                      "port-channel 3", "NULL0"):
-            self.assertIsNone(fiber.if_port_no(name), name)
+            self.assertIsNone(fiber.if_port_ref(name), name)
+
+    def test_a_HAND_TYPED_port_becomes_a_slot_the_NEXT_person_PICKS(self):
+        # This is what bounds free text on an SNMP-silent box: drift is possible only
+        # on the FIRST entry for a port, and it self-corrects once the list has one.
+        self.assertEqual(fiber.interface_refs([], ["GE0/5"]), ["GE0/5"])
+        # ...and the WALKED spelling wins on a tie — the box's string is the authority.
+        self.assertEqual(fiber.interface_refs(["GE0/5 INPUT"], ["ge0/5  input"]),
+                         ["GE0/5 INPUT"])
 
     def test_a_port_number_is_UNBOUNDED_because_nobody_holds_the_count(self):
         self.assertIsNone(fiber.port_bound("port"))
@@ -585,6 +791,38 @@ class FeedMapTest(unittest.TestCase):
     def test_the_SHORTEST_path_back_to_gear_wins(self):
         feed = fiber.feed_map([(10, 20), (20, 30), (10, 30)], roots={10})
         self.assertEqual(feed[30], 10)
+
+    def test_the_flood_runs_DOWN_the_gear_tree_not_from_the_nearest_gear(self):
+        # The live defect: switch 10 - JC1 - JC-6 - JC-3 - mainJC2 - OLT 11. JC-3
+        # sits two hops from the OLT and three from the switch that feeds it, so the
+        # blind flood claimed it from the OLT side and its chain read "fed from
+        # SRPL-OLT" — an OLT feeding its own uplink.
+        edges = [(10, 20), (20, 30), (30, 40), (40, 50), (50, 11)]
+        blind = fiber.feed_map(edges, roots={10, 11})
+        self.assertEqual(blind[40], 50)
+        feed = fiber.feed_map(edges, roots={10, 11}, rank={10: 0, 11: 1})
+        self.assertEqual(feed[40], 30)
+        self.assertEqual(feed[50], 40)
+        # …and the wave passes THROUGH the OLT: it is fed through the glass, and
+        # anything hanging beyond it is fed FROM it, not from the distant switch.
+        self.assertEqual(feed[11], 50)
+        beyond = fiber.feed_map(edges + [(11, 60)], roots={10, 11},
+                                rank={10: 0, 11: 1})
+        self.assertEqual(beyond[60], 11)
+
+    def test_a_deeper_root_still_seeds_a_component_the_shallow_flood_never_reaches(self):
+        # badri_fiber's shape: OLT uplinks are not in the glass, so each OLT is its
+        # own island and must still source it — rank narrows nothing there.
+        feed = fiber.feed_map([(10, 20), (11, 60)], roots={10, 11},
+                              rank={10: 0, 11: 1})
+        self.assertEqual(feed[60], 11)
+        self.assertEqual(feed[20], 10)
+
+    def test_equal_ranks_keep_the_plain_nearest_gear_flood(self):
+        edges = [(10, 20), (20, 30), (30, 40), (40, 50), (50, 11)]
+        blind = fiber.feed_map(edges, roots={10, 11})
+        ranked = fiber.feed_map(edges, roots={10, 11}, rank={10: 0, 11: 0})
+        self.assertEqual(blind, ranked)
 
 
 if __name__ == "__main__":

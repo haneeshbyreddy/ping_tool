@@ -96,7 +96,7 @@ export interface BillingInfo {
 }
 
 export const DEVICE_TYPES = [
-  "core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul",
+  "core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul", "nvr",
 ] as const
 export const PASSIVE_DEVICE_TYPES = ["splitter", "coupler", "fdb", "closure"] as const
 export const SPLIT_RATIOS = [2, 4, 8, 16] as const
@@ -202,6 +202,23 @@ export interface Cable {
   updated_by: string | null
 }
 
+// A device pair the FIBRE RECORD already joins — directly, or on through a closure,
+// which is where a sheath is opened rather than a place the light stops. The map
+// stands that pair's dependency chord down (the glass is the better line, drawn where
+// somebody walked it) and hangs the link's rate chip on `cable_id`, the biggest sheath
+// on the run. Derived server-side by the same walk `undrawn` reads, so the map and the
+// draft can never disagree about what counts as recorded.
+export interface CabledPair {
+  a: number
+  b: number
+  // The sheath worth labelling — the biggest on the run.
+  cable_id: number | null
+  // EVERY cable the light crosses between the pair. The map draws all of them wherever
+  // it stands the chord down, including below the plant zoom floor: the sheath has
+  // taken over the chord's job, so it inherits the chord's visibility, not plant's.
+  cable_ids: number[]
+}
+
 export interface TrayCable {
   cable_id: number
   name: string
@@ -220,14 +237,16 @@ export interface FibreJoint {
   b_cable_id: number | null
   b_core_no: number | null
   port_kind: PortKind | null
-  port_no: number | null
+  port_ref: string | null
 }
 
 export interface TrayPort {
   kind: PortKind
-  no: number | null
+  ref: string
   label: string
-  device_label?: string | null
+  // true up, false down, null NOT MEASURED — a passive leg, a stale walk, or a box
+  // that is down. The third never renders as a colour.
+  live?: boolean | null
   drops: Array<{ mac: string; name: string | null }>
 }
 
@@ -236,11 +255,20 @@ export interface UndrawnLink {
   relation: "feeds" | "fed by"
 }
 
+export interface CarriedEnd {
+  name: string | null
+  port: string | null
+  here: boolean
+}
+
 export interface PointFibre {
   point: FibrePoint
   cables: TrayCable[]
+  // cable_id -> core_no -> the terminations that fibre reaches. Only cores that
+  // REACH something appear: a core joined to nothing carries nothing.
+  carries: Record<string, Record<string, CarriedEnd[]>>
   ports: TrayPort[]
-  port_add: PortKind | null
+  port_add: PortKind[]
   undrawn: UndrawnLink[]
   unplaced_drops: Array<{ mac: string; name: string | null }>
   joints: FibreJoint[]
@@ -289,6 +317,7 @@ export interface OrgDevice {
   snmp_port: number
 
   gpon_vendor: string | null
+  nvr_vendor: string | null
   pon_port: string | null
   fibre_pon: {
     olt_id: number | null
@@ -327,6 +356,9 @@ export interface OrgDevice {
   dup_macs: number
   optics_updated_at: string | null
   ports_updated_at: string | null
+  cameras_total: number | null
+  cameras_down: number | null
+  cameras_updated_at: string | null
   outage_started_at: string | null
 
   state: DeviceState | null
@@ -424,6 +456,11 @@ export interface OnuOptic {
   onu_id: number | null
   name: string | null
   label: string | null
+  radius_name?: string | null
+  radius_username?: string | null
+  radius_mobile?: string | null
+  radius_status?: string | null
+  radius_match?: "mac" | "name" | null
   serial: string | null
   state: "online" | "offline" | "dying_gasp" | "los" | "unknown" | null
   rx_dbm: number | null
@@ -490,6 +527,9 @@ export interface OnuPlace {
   lat: number
   lng: number
   label: string | null
+  // The customer's name from billing, NULL when the MAC is on more than one live
+  // slot — the mark and its card must never name one subscriber two ways.
+  radius_name?: string | null
   phone: string | null
   notes: string | null
   witness: boolean
@@ -623,6 +663,161 @@ export interface Subscriber {
     updated_at: string | null
   } | null
   thresholds: { warn_dbm: number; crit_dbm: number } | null
+  user_macs: UserMac[]
+  user_mac_status: WebMacStatus | null
+  radius: RadiusCustomer | null
+  radius_panels: RadiusStatus[]
+}
+
+// The customer as the BILLING panel holds them, tied to this ONU by the MAC we
+// scrape off the OLT (or, failing that, by the ONU's provisioned name matching
+// the RADIUS username). `match_by` says WHICH evidence tied them, because an
+// ambiguous match links nothing at all rather than guessing.
+// `expiry` and `balance` are the panel's own strings, deliberately unparsed.
+export type RadiusCustomer = {
+  username: string
+  match_by: "mac" | "name"
+  updated_at: string
+  account_id: number
+  account_label: string | null
+  account_url: string | null
+  name: string | null
+  mobile: string | null
+  alt_mobile: string | null
+  status: string | null
+  expiry: string | null
+  package: string | null
+  branch: string | null
+  area: string | null
+  address: string | null
+  balance: string | null
+  acno: string | null
+  mac: string | null
+}
+
+// The panel's address, the recipe to read it with, and who we sign in as. The
+// password is WRITE-ONLY: `password_set` is a boolean and the secret itself never
+// leaves the server, so a blank field on the form means "leave the stored one".
+// MANY panels per org, not one: an ISP can run several billing systems at once
+// and Hansa asked for a second the week the first went live. `id` identifies the
+// panel everywhere, and account ORDER is priority — the panel connected first
+// wins a cross-panel tie.
+export type RadiusAccount = {
+  id: number
+  label: string
+  profile: string
+  base_url: string
+  username: string | null
+  password_set: boolean
+  enabled: boolean
+  updated_at: string
+  status: RadiusStatus | null
+  customers: number
+}
+
+export type RadiusSettings = {
+  accounts: RadiusAccount[]
+  customers: number
+  profiles: string[]
+}
+
+export type RadiusAccountPayload = {
+  id?: number
+  label?: string
+  profile: string
+  base_url: string
+  username: string
+  password?: string
+  enabled?: boolean
+}
+
+// The billing book joined to the network, one row per billing customer.
+// `net` is a claim about NOW and keeps the frozen rule: a customer behind a
+// DOWN OLT reads `frozen`, never `dark` — the OLT's outage owns that page.
+export type CustomerNet = "online" | "dark" | "frozen" | "stale" | "unlinked"
+
+export interface CustomerRow {
+  username: string
+  name: string | null
+  mobile: string | null
+  status: string
+  package: string | null
+  branch: string | null
+  area: string | null
+  address: string | null
+  acno: string | null
+  expiry: string | null
+  expiry_at: string | null
+  days_left: number | null
+  account_id: number
+  account_label: string | null
+  in_last_read: boolean
+  last_seen_at: string | null
+  net: CustomerNet
+  reason: string | null
+  match_by: string | null
+  device_id: number | null
+  device_name: string | null
+  onu_mac: string | null
+  onu_label: string | null
+  onu_name: string | null
+  pon_port: string | null
+  onu_id: number | null
+  located: boolean
+  dark_since: string | null
+}
+
+export interface CustomersReply {
+  customers: CustomerRow[]
+  counts: {
+    customers: number
+    active: number
+    linked: number
+    paying_dark: number
+    paying_frozen: number
+  }
+  reasons: Record<string, string>
+  panels: RadiusStatus[]
+}
+
+// `forbidden` is its own state and is NOT a password problem: the sign-in worked
+// and the panel refused the export to this login. Reported as `login` it sends an
+// ISP to change a password that was never wrong.
+export type RadiusStatus = {
+  account_id: number
+  org_id: string
+  profile: string
+  state: "ok" | "partial" | "skipped" | "no_profile" | "no_credentials"
+    | "unreachable" | "login" | "forbidden" | "error"
+  detail: string | null
+  customers: number
+  linked: number
+  updated_at: string
+  last_ok_at: string | null
+}
+
+// The address the SUBSCRIBER'S OWN equipment presents behind the ONU, read off
+// the OLT's address table. Not the ONU's MAC — on the GPON fleet the ONU has no
+// MAC at all, so this is the only address that customer has, and it is what the
+// ISPs' RADIUS app is keyed on.
+export interface UserMac {
+  mac: string
+  vlan: string | null
+  kind: string | null
+  port_label: string | null
+  first_seen_at: string
+  last_seen_at: string
+}
+
+export interface WebMacStatus {
+  profile: string
+  state: "ok" | "partial" | "skipped" | "no_profile" | "no_credentials"
+    | "unreachable" | "login" | "error"
+  detail: string | null
+  rows: number
+  declared: number | null
+  updated_at: string
+  last_ok_at: string | null
 }
 
 export interface SubscriberRecord {
@@ -667,11 +862,93 @@ export interface ReliabilityRow {
   outage_count: number
 }
 
+// /api/history/reliability?device_id= — the availability strip's rows.
+// day/coverage keys are epoch SECONDS (UTC day floors), the historian's
+// number-only convention; the SPA converts to ms at the edge.
+export interface ReliabilityDay {
+  day: number
+  down_s: number
+  outages: number
+}
+
+export interface OutageSpan {
+  id: number
+  started_at: string
+  resolved_at: string | null
+  final_state: string
+  root_cause: string | null
+  duration_s: number
+}
+
+export interface CoverageDay {
+  day: number
+  samples: number
+}
+
+export interface DeviceReliability {
+  since: string
+  until: string
+  days: ReliabilityDay[]
+  spans: OutageSpan[]
+  coverage: CoverageDay[]
+  recording_since: string | null
+}
+
+// /api/history/reliability (org view) — Monday-anchored ISO weeks, epoch s.
+export interface WeekStat {
+  week: number
+  outages: number
+  resolved: number
+  ttr_p50_s: number | null
+  ttr_p90_s: number | null
+  tta_p50_s: number | null
+  tta_p90_s: number | null
+}
+
+export interface OrgReliability {
+  since: string
+  until: string
+  weeks: WeekStat[]
+}
+
+// /api/history/onus — the org's hourly ONU story, summed over OLTs.
+// crit/warn are sums of each OLT's hourly WORST, labeled that way on screen.
+export interface OnuTrendBucket {
+  bucket: number
+  olts: number
+  samples: number
+  onus: number
+  online: number
+  warn: number
+  crit: number
+}
+
+export interface OnuTrendReply {
+  since: string
+  until: string
+  recording_since: string | null
+  buckets: OnuTrendBucket[]
+}
+
+// /api/history/paging — kind '' is the pre-kind era, labeled, never dropped.
+export interface PagingRow {
+  day: string
+  kind: string
+  status: string
+  n: number
+}
+
+export interface PagingReply {
+  since: string
+  until: string
+  rows: PagingRow[]
+}
+
 export type OutageStatus =
   "unassigned" | "assigned" | "in_progress" | "pending_postmortem"
 
 export type IssueKind =
-  | "device_down" | "port_down" | "probe_stale" | "bandwidth"
+  | "device_down" | "port_down" | "camera_down" | "probe_stale" | "bandwidth"
   | "onu_crit" | "onu_warn" | "dup_mac" | "pon_fiber" | "pon_power"
   | "pon_capacity" | "onu_offline"
 
@@ -941,6 +1218,42 @@ export interface RxStatusResponse {
   onus_total: number
   onus_rx: number
   scrape: WebOpticsStatus | null
+  can_refresh: boolean
+  refreshing: boolean
+}
+
+export interface NvrChannel {
+  channel_no: number
+  name: string | null
+  ip_address: string | null
+  port: number | null
+  camera_kind: string | null
+  enabled: boolean
+  monitored: boolean
+  state: "online" | "offline" | "unknown"
+  last_online_at: string | null
+  first_seen_at: string
+  updated_at: string
+}
+
+export interface NvrScrapeStatus {
+  state: string
+  detail: string | null
+  profile: string
+  channels: number
+  updated_at: string
+  last_ok_at: string | null
+}
+
+export interface NvrChannelsResponse {
+  channels: NvrChannel[]
+  scrape: NvrScrapeStatus | null
+  vendor: string | null
+  profile: string | null
+  known_vendors: string[]
+  has_credentials: boolean
+  web_proxy: boolean
+  has_node: boolean
   can_refresh: boolean
   refreshing: boolean
 }

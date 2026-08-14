@@ -1,9 +1,12 @@
 import type {
-  AccountUser, AdminOverview, AssignmentRoster, BillingInfo, Cable, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
+  AccountUser, AdminOverview, AssignmentRoster, BillingInfo, Cable, CabledPair, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
   OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
+  DeviceReliability, OrgReliability, PagingReply, OnuTrendReply,
   OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
   BranchFault, FibreTrace, PointFibre, SplitterLoad, Subscriber, SubscriberDrop,
   Summary, SwitchPort, SystemStats, TrayPort, TrendBucket, WebUiCredentials,
+  CustomersReply, RadiusAccountPayload, RadiusSettings,
+  NvrChannelsResponse,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
   FieldTokensResponse, FieldWorkersResponse, ShiftState,
 } from "./types"
@@ -222,7 +225,8 @@ export const inventoryApi = {
   ) => request<{ ok: boolean }>("/api/inventory/link-style",
     { method: "POST", body: { child_id, parent_id, ...style } }),
   cables: (org: string | null) =>
-    request<{ cables: Cable[]; counts: number[] }>(`/api/inventory/cables${tq(org)}`),
+    request<{ cables: Cable[]; cabled_pairs: CabledPair[]; counts: number[] }>(
+      `/api/inventory/cables${tq(org)}`),
   devicePorts: (org: string | null) =>
     request<{ ports: Record<string, TrayPort[]> }>(`/api/inventory/fibre/ports${tq(org)}`),
   saveCable: (
@@ -240,6 +244,18 @@ export const inventoryApi = {
   setCablePath: (cable_id: number, path: Array<[number, number]>) =>
     request<{ ok: boolean }>("/api/inventory/cable/path",
       { method: "POST", body: { cable_id, path } }),
+  moveCableEnd: (body: {
+    org_id?: string | null
+    from_device_id?: number | null; from_mac?: string | null
+    to_device_id?: number | null; to_mac?: string | null
+    cable_ids: number[]; preview?: boolean
+  }) => request<{
+    ok: boolean; refused?: string; reason?: string
+    preview?: boolean; moving?: number; discards?: number; carries?: number
+    unported?: number; collapses?: number; to?: string | null
+    cables?: string[]
+    moved?: number; discarded?: number; carried?: number; collapsed?: number
+  }>("/api/inventory/cable/move", { method: "POST", body }),
   splitCable: (cable_id: number, lat: number, lng: number, name?: string | null) =>
     request<{
       ok: boolean; cable_id: number; new_cable_id: number
@@ -261,14 +277,15 @@ export const inventoryApi = {
     device_id?: number | null; mac?: string | null
     a_cable_id: number; a_core_no: number
     b_cable_id?: number | null; b_core_no?: number | null
-    port_kind?: string | null; port_no?: number | null
+    port_kind?: string | null; port_ref?: string | null
   }) => request<{ ok: boolean; id?: number; refused?: string; reason?: string }>(
     "/api/inventory/fibre/joint", { method: "POST", body: joint }),
   connectPort: (body: {
     device_id?: number | null; mac?: string | null
-    port_kind?: string | null; port_no?: number | null
+    port_kind?: string | null; port_ref?: string | null
     to_device_id?: number | null; to_mac?: string | null
-    to_port_kind?: string | null; to_port_no?: number | null
+    to_port_kind?: string | null; to_port_ref?: string | null
+    to_cable_id?: number | null; to_core_no?: number | null
     org_id?: string | null
   }) => request<{
     ok: boolean; cable_id?: number; name?: string; far_port?: string | null
@@ -278,7 +295,8 @@ export const inventoryApi = {
     device_id?: number | null; mac?: string | null
     a_cable_id: number; a_core_no: number
     to_device_id?: number | null; to_mac?: string | null
-    port_kind?: string | null; port_no?: number | null
+    port_kind?: string | null; port_ref?: string | null
+    to_cable_id?: number | null; to_core_no?: number | null
   }) => request<{
     ok: boolean; cable_id?: number; name?: string
     refused?: string; reason?: string
@@ -341,7 +359,7 @@ export const inventoryApi = {
       `/api/inventory/drops/subscribers?device_id=${deviceId}`),
   setDrops: (body: {
     macs: string[]; passive_id: number | null; org_id?: string | null
-    leg_no?: number | null
+    leg_no?: string | number | null
   }) => request<{ ok: boolean; attached?: number; detached?: number }>(
     "/api/inventory/drops/set", { method: "POST", body }),
 
@@ -446,6 +464,39 @@ export const webOpticsApi = {
       { method: "POST", body: { device_id: deviceId } }),
 }
 
+export const nvrApi = {
+  channels: (deviceId: number) =>
+    request<NvrChannelsResponse>(
+      `/api/inventory/nvr-channels?device_id=${deviceId}`),
+  refresh: (deviceId: number) =>
+    request<{ started: boolean }>("/api/inventory/nvr-refresh",
+      { method: "POST", body: { device_id: deviceId } }),
+  setWatch: (deviceId: number, channelNo: number, on: boolean) =>
+    request<{ ok: boolean }>("/api/inventory/nvr-watch",
+      { method: "POST", body: { device_id: deviceId, channel_no: channelNo, on } }),
+  profiles: (org?: string | null) =>
+    request<{ names: string[] }>(`/api/nvr-profiles${tq(org)}`),
+}
+
+export const customersApi = {
+  list: (org?: string | null) =>
+    request<CustomersReply>(`/api/inventory/customers${tq(org)}`),
+}
+
+export const radiusApi = {
+  get: (org?: string | null) =>
+    request<RadiusSettings>(`/api/inventory/radius${tq(org)}`),
+  save: (org_id: string, body: RadiusAccountPayload) =>
+    request<{ saved: boolean; id: number }>("/api/inventory/radius",
+      { method: "POST", body: { org_id, ...body } }),
+  remove: (org_id: string, id: number) =>
+    request<{ deleted: boolean }>("/api/inventory/radius",
+      { method: "POST", body: { org_id, id, delete: true } }),
+  syncNow: (org_id: string, id?: number) =>
+    request<{ started: boolean; panels: number }>("/api/inventory/radius/sync",
+      { method: "POST", body: id ? { org_id, id } : { org_id } }),
+}
+
 export const proxyApi = {
   open: (device_id: number, port: number) =>
     request<{ sid: string; url: string; device_id: number; expires_at: number }>(
@@ -469,6 +520,18 @@ export const analyticsApi = {
   reliability: (org: string | null | undefined, days = 7) =>
     request<{ since: string; until: string; devices: ReliabilityRow[] }>(
       `/api/analytics?days=${days}${org ? `&org=${encodeURIComponent(org)}` : ""}`),
+}
+
+export const historyApi = {
+  device: (deviceId: number, days = 90) =>
+    request<DeviceReliability>(
+      `/api/history/reliability?device_id=${deviceId}&days=${days}`),
+  org: (org: string | null | undefined, days = 182) =>
+    request<OrgReliability>(`/api/history/reliability?days=${days}${aq(org)}`),
+  paging: (org: string | null | undefined, days = 90) =>
+    request<PagingReply>(`/api/history/paging?days=${days}${aq(org)}`),
+  onus: (org: string | null | undefined, days = 14) =>
+    request<OnuTrendReply>(`/api/history/onus?days=${days}${aq(org)}`),
 }
 
 export const issuesApi = {

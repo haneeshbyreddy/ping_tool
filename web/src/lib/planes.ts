@@ -22,6 +22,7 @@ export const KIND_PLANE: Record<string, Plane | null> = {
   device_down: null,
   probe_stale: "fleet",
   port_down: "traffic",
+  camera_down: "plant",
   bandwidth: "traffic",
   onu_crit: "optical",
   onu_warn: "optical",

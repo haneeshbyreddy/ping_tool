@@ -76,8 +76,8 @@ class CentralMapDetailHttpTest(unittest.TestCase):
 
     def test_superadmin_can_save_and_read_it_back(self):
         root = self._login("root", "rootpassword")
-        sent = {"labels": 10, "passives": 11, "subscribers": 12,
-                "subscriber_names": 16, "drop_lines": 15}
+        sent = {**mapdetail.DEFAULTS, "labels": 10, "passives": 11,
+                "subscribers": 12, "subscriber_names": 16, "drop_lines": 15}
         status, _ = self._req("POST", "/api/admin/settings",
                               {"map_detail": sent}, cookie=root)
         self.assertEqual(status, 200)
@@ -114,10 +114,28 @@ class CentralMapDetailHttpTest(unittest.TestCase):
         self.assertEqual(body["map_detail"]["drop_lines"], 17)
 
 
+    def test_a_plant_PLATE_can_never_outlive_the_PIN_it_sits_beside(self):
+        root = self._login("root", "rootpassword")
+        self._req("POST", "/api/admin/settings",
+                  {"map_detail": {"passives": 16, "passive_names": 10}},
+                  cookie=root)
+        _, body = self._req("GET", "/api/admin/settings", cookie=root)
+        self.assertEqual(body["map_detail"]["passive_names"], 16)
+
+    def test_a_plant_PLATE_is_independent_of_DEVICE_NAMES(self):
+        root = self._login("root", "rootpassword")
+        self._req("POST", "/api/admin/settings",
+                  {"map_detail": {"labels": 18, "passives": 13,
+                                  "passive_names": 13}},
+                  cookie=root)
+        _, body = self._req("GET", "/api/admin/settings", cookie=root)
+        self.assertEqual(body["map_detail"]["labels"], 18)
+        self.assertEqual(body["map_detail"]["passive_names"], 13)
+
     def test_it_rides_every_org_row_so_the_map_needs_no_extra_fetch(self):
         root = self._login("root", "rootpassword")
-        sent = {"labels": 11, "passives": 12, "subscribers": 13,
-                "subscriber_names": 18, "drop_lines": 14}
+        sent = {**mapdetail.DEFAULTS, "labels": 11, "passives": 12,
+                "subscribers": 13, "subscriber_names": 18, "drop_lines": 14}
         self._req("POST", "/api/admin/settings",
                   {"map_detail": sent}, cookie=root)
         owner = self._login("owner", "ownerpassword")

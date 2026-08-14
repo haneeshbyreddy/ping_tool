@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from wisp.central.assignment import scope_of
 from wisp.central.store_util import _now_iso
 
 
 class AssignmentStoreMixin:
 
+
+    def worker_device_scope(self, org_id: str, user_id: int) -> set[int]:
+
+        return scope_of(user_id, self.device_parent_map(org_id),
+                        self.device_assignment_map(org_id))
 
     def device_parent_map(self, org_id: str) -> dict[int, int | None]:
 

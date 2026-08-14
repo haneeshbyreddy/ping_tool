@@ -76,9 +76,12 @@ class AudienceResolverTest(unittest.TestCase):
     def _numbers(self, device_id):
         return PagingAudience(self.store, "ispA").for_device(device_id)
 
-    def test_unassigned_device_pages_everyone(self):
-        self.assertEqual(sorted(self._numbers(self.olt)),
-                         ["919000000001", "919000000002", "919000000003"])
+    def test_unassigned_device_pages_no_worker_at_all(self):
+        self.assertEqual(self._numbers(self.olt), ["919000000001"])
+
+    def test_an_org_that_has_assigned_nothing_pages_no_worker(self):
+        for did in (self.olt, self.onu):
+            self.assertEqual(self._numbers(did), ["919000000001"], did)
 
     def test_assignment_narrows_to_owner_plus_assignee(self):
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
@@ -90,20 +93,19 @@ class AudienceResolverTest(unittest.TestCase):
         self.assertEqual(sorted(self._numbers(self.onu)),
                          ["919000000001", "919000000003"])
 
-    def test_clearing_restores_the_whole_team(self):
+    def test_clearing_drops_back_to_owners_never_to_the_whole_team(self):
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
         self.store.set_device_assignees("ispA", self.olt, [], "own")
-        self.assertEqual(len(self._numbers(self.olt)), 3)
+        self.assertEqual(self._numbers(self.olt), ["919000000001"])
 
-    def test_a_deactivated_assignee_does_not_narrow_to_nobody(self):
+    def test_a_deactivated_assignee_leaves_owners_only(self):
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
         self.store.set_user_active(self.w1, False)
-        self.assertEqual(len(self._numbers(self.olt)), 2)
-        self.assertIn("919000000003", self._numbers(self.olt))
+        self.assertEqual(self._numbers(self.olt), ["919000000001"])
 
-    def test_org_level_alert_stays_org_wide(self):
+    def test_an_event_with_no_device_reaches_owners_only(self):
         self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
-        self.assertEqual(len(self._numbers(None)), 3)
+        self.assertEqual(self._numbers(None), ["919000000001"])
 
     def test_numberless_assignee_leaves_owners_only(self):
         self.store.set_user_whatsapp(self.w1, None)
@@ -120,9 +122,16 @@ class AudienceResolverTest(unittest.TestCase):
         self.assertEqual(sorted(aud.for_node("n1")),
                          ["919000000001", "919000000002"])
 
-    def test_a_probe_with_nothing_assigned_behind_it_stays_org_wide(self):
+    def test_a_probe_with_nothing_assigned_behind_it_reaches_owners_only(self):
         aud = PagingAudience(self.store, "ispA")
-        self.assertEqual(len(aud.for_node("n-unknown")), 3)
+        self.assertEqual(aud.for_node("n-unknown"), ["919000000001"])
+
+    def test_worker_scope_is_what_the_read_paths_filter_on(self):
+        self.assertEqual(self.store.worker_device_scope("ispA", self.w1), set())
+        self.store.set_device_assignees("ispA", self.olt, [self.w1], "own")
+        self.assertEqual(self.store.worker_device_scope("ispA", self.w1),
+                         {self.olt, self.onu})
+        self.assertEqual(self.store.worker_device_scope("ispA", self.w2), set())
 
 
 class AssignmentStoreTest(unittest.TestCase):

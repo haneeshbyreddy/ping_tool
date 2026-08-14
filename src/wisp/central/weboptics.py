@@ -411,6 +411,21 @@ def _decode(resp: Response, profile=None) -> str:
     return resp.body.decode(charset, "replace")
 
 
+def login(http: TunnelHttp, username: str, password: str, profile) -> str | None:
+
+
+    entry = http.get(profile.login_page_path)
+    if not entry.ok:
+        return (f"no login page at {profile.login_page_path} "
+                f"({entry.error or entry.status}), so credentials NOT sent; "
+                "check the address really reaches the OLT's web UI")
+    reply = http.post_form(profile.login_path,
+                           profile.login_form(username, password))
+    if not reply.ok:
+        return f"login failed: {reply.error or reply.status}"
+    return None
+
+
 def scrape_optics(http: TunnelHttp, username: str, password: str,
                   profile=None, pons=None,
                   deadline: float | None = None) -> tuple[list[dict], str | None]:
@@ -418,15 +433,9 @@ def scrape_optics(http: TunnelHttp, username: str, password: str,
 
     prof = profile if profile is not None else DBC
     pons = tuple(pons) if pons else prof.default_pons
-    entry = http.get(prof.login_page_path)
-    if not entry.ok:
-        return [], (f"no login page at {prof.login_page_path} "
-                    f"({entry.error or entry.status}), so credentials NOT sent; "
-                    "check the address really reaches the OLT's web UI")
-
-    login = http.post_form(prof.login_path, prof.login_form(username, password))
-    if not login.ok:
-        return [], f"login failed: {login.error or login.status}"
+    err = login(http, username, password, prof)
+    if err:
+        return [], err
 
     opened = http.get(prof.optics_path)
     if opened.status == 404:

@@ -53,9 +53,12 @@ _WORKER_GET = {
     "/api/inventory/onu-search", "/api/inventory/onu-places",
     "/api/inventory/subscriber",
     "/api/inventory/onu-coverage", "/api/inventory/snmp-status",
-    "/api/inventory/rx-status", "/api/inventory/perf",
+    "/api/inventory/rx-status", "/api/inventory/nvr-channels",
+    "/api/inventory/nvr-snapshot",
+    "/api/inventory/perf",
     "/api/inventory/perf/samples", "/api/pon/faults", "/api/pon/summary",
     "/api/incident/shape", "/api/analytics", "/api/analytics/trend",
+    "/api/history/reliability",
     "/api/logs",
     "/api/issues", "/api/issues/pdf", "/api/issues/xlsx",
     "/api/field/shift",
@@ -698,7 +701,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.proxy = ProxyHub(device_max_inflight=cfg.proxy_device_max_inflight)
     Handler.field_rate = field.TrackRate(cfg.field_track_rate_per_min)
     from wisp.central.weboptics_sweep import build_sweeper
-    Handler.weboptics = build_sweeper(cfg, store, Handler.proxy, secret_box)
+    Handler.weboptics = build_sweeper(cfg, store, Handler.proxy, secret_box,
+                                      notifier)
     return Handler
 
 class _TLSThreadingHTTPServer(ThreadingHTTPServer):
@@ -767,10 +771,16 @@ def serve(cfg: Config = CONFIG) -> None:
     start_central_watchdog_thread(cfg, httpd.store)
     central_rollup.start_central_rollup_prune_thread(cfg, httpd.store)
     field.start_field_prune_thread(cfg, httpd.store)
+    from wisp.central.history import start_history_thread
+    start_history_thread(cfg, httpd.store)
     billing.start_central_billing_thread(cfg, httpd.store)
-    from wisp.central.weboptics_sweep import start_web_optics_thread
+    from wisp.central.weboptics_sweep import start_nvr_thread, start_web_optics_thread
     start_web_optics_thread(cfg, httpd.store, httpd.proxy, httpd.secretbox,
                             sweeper=httpd.weboptics)
+    start_nvr_thread(cfg, httpd.store, httpd.proxy, httpd.secretbox,
+                     sweeper=httpd.weboptics)
+    from wisp.central.radius_sync import start_radius_thread
+    start_radius_thread(cfg, httpd.store, httpd.secretbox)
     if not httpd.store.list_users():
         log.warning("no central accounts yet — bootstrap one: "
                     "PYTHONPATH=src python -m wisp.central.admin create-superadmin --username ...")

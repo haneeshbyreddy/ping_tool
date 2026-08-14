@@ -72,29 +72,103 @@ export const JOINT_REFUSAL_TEXT: Record<string, string> = {
 export const PORT_KINDS = ["pon", "leg", "in", "port"] as const
 export type PortKind = (typeof PORT_KINDS)[number]
 
+// MIRRORS fiber.py — a port's identity is the box's own string, never a number we
+// derived from it. `port` refs are interface names; the numbered kinds carry their
+// number as text. See fiber.py:NUMBERED_KINDS for why the two are separated.
+export const NUMBERED_KINDS = ["pon", "leg", "in"] as const
+export const PORT_REF_MAX = 64
+
+// THE ONE normalizer, mirroring fiber.port_key. Refs display as typed; two spellings
+// of one socket are reconciled here and nowhere else.
+export function portKey(ref: string | null | undefined): string {
+  return (ref ?? "").trim().split(/\s+/).join(" ").toLowerCase()
+}
+
+export function isNumberedKind(kind: string | null | undefined): boolean {
+  return (NUMBERED_KINDS as readonly string[]).includes(kind ?? "")
+}
+
 export function portLabel(kind: string | null | undefined,
-                          no: number | null | undefined): string | null {
+                          ref: string | null | undefined): string | null {
   if (!kind || !(PORT_KINDS as readonly string[]).includes(kind)) return null
-  if (kind === "pon") return no == null ? "PON" : `PON ${no}`
-  if (kind === "leg") return no == null ? "leg" : `leg ${no}`
-  if (kind === "port") return no == null ? "port" : `port ${no}`
-  return no && no > 1 ? `input ${no}` : "input"
+  const text = (ref ?? "").trim()
+  if (kind === "port") return text || "port"      // the interface name IS the label
+  if (kind === "pon") return text ? `PON ${text}` : "PON"
+  if (kind === "leg") return text ? `leg ${text}` : "leg"
+  return text && text !== "1" ? `input ${text}` : "input"
+}
+
+// A PORT IS NAMED BY THE BOX, NOT BY US — the server resolves `TrayPort.label` to the
+// walked interface name (`EPON0/1`, never `PON 1`), so anything printing a port looks
+// it up in that box's own list rather than rebuilding the string. `portLabel` stays
+// the CANONICAL form and the fallback: a port recorded on a box that walks nothing
+// has no name but the one our ref spells. Structurally typed so this module keeps no
+// imports — it is the mirror `unit/test_fiber` reads as source.
+export function portName(ports: ReadonlyArray<{ kind: string; ref: string;
+                                                label: string }> | undefined,
+                         kind: string | null | undefined,
+                         ref: string | null | undefined): string | null {
+  if (!kind) return null
+  const key = portKey(ref)
+  const hit = (ports ?? []).find((p) => p.kind === kind && portKey(p.ref) === key)
+  return hit?.label ?? portLabel(kind, ref)
 }
 
 export const ENCLOSURE_TYPES = ["coupler", "closure", "fdb"] as const
 
+// MIRRORS fiber.port_kinds_for — A BOX HAS KINDS, PLURAL. An OLT has PONs AND the GE
+// uplink the trunk lands on. Deliberately no `uplink` kind: uplink is a ROLE, decided
+// by what somebody plugged in, and the first customer feed on GE0/8 makes it a lie.
+export function portKindsFor(deviceType: string | null | undefined): PortKind[] {
+  if (!deviceType) return []
+  if ((ENCLOSURE_TYPES as readonly string[]).includes(deviceType)) return []
+  if (deviceType === "splitter") return ["leg"]
+  if (deviceType === "OLT") return ["pon", "port"]
+  return ["port"]
+}
+
 export function portKindFor(deviceType: string | null | undefined): PortKind | null {
-  if (!deviceType) return null
-  if ((ENCLOSURE_TYPES as readonly string[]).includes(deviceType)) return null
-  if (deviceType === "splitter") return "leg"
-  if (deviceType === "OLT") return "pon"
-  return "port"
+  return portKindsFor(deviceType)[0] ?? null
+}
+
+export function portKindWord(kind: string): string {
+  return kind === "pon" ? "PON" : kind === "in" ? "input" : kind
 }
 
 export function isPlumbing(c: { name?: string | null; cores?: number | null
                                 path?: unknown }): boolean {
   const traced = Array.isArray(c.path) ? c.path.length > 0 : !!c.path
   return !(c.name || "").trim() && (c.cores ?? 1) <= 1 && !traced
+}
+
+// A CUT DRUM IS ONE OBJECT. Opening a closure mid-span stores TWO cables — the
+// segment model that keeps a core's name unambiguous — and both halves keep the
+// drum's name, so the tray's picker offered "6F · main" twice, told apart only by a
+// small far-end hint. That asks a question that does not exist at the pole (the
+// operator who had just cut the closure could not read it back), and it HID facts: a
+// core cut and used on one side read "+ join" on the other, with nothing saying the
+// spare glass existed. Exactly two non-plumbing cables sharing a name and a count at
+// one point pair into the drum they are — the pairing split() produces by
+// construction, since both halves keep the drum's name and count. Three same-named
+// segments cannot pair and fall back to the per-cable view. View-level only: storage
+// stays two segments, the same standing the half-coupler has.
+export function cutPairs(cables: ReadonlyArray<{
+  id: number; name?: string | null; cores?: number | null; plumbing?: boolean
+}>): Map<number, number> {
+  const groups = new Map<string, number[]>()
+  for (const c of cables) {
+    const name = (c.name || "").trim()
+    if (c.plumbing || !c.cores || !name) continue
+    const key = `${name.toLowerCase()}|${c.cores}`
+    groups.set(key, [...(groups.get(key) ?? []), c.id])
+  }
+  const out = new Map<number, number>()
+  for (const g of groups.values()) {
+    if (g.length !== 2) continue
+    out.set(g[0], g[1])
+    out.set(g[1], g[0])
+  }
+  return out
 }
 
 export function cableRef(c: { name?: string | null; cores?: number | null;

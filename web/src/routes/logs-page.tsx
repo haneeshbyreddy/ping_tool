@@ -12,6 +12,7 @@ import { ago, toUtcDate } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { PagingLedger } from "@/components/paging-ledger"
 import { Segmented } from "@/components/ui/segmented"
 import { Skeleton } from "@/components/ui/skeleton"
 
@@ -97,6 +98,8 @@ export function LogsPage() {
       </div>
 
       <Segmented value={typeFilter} options={FILTERS} onChange={setTypeFilter} />
+
+      <PagingLedger />
 
       <div className="wisp-panel">
         <div className={cn(COLS, "wisp-thead h-9")}>

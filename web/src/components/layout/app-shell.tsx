@@ -32,9 +32,12 @@ export function AppShell() {
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const navItems = NAV_ITEMS.filter((i) => !i.superadminOnly || user?.is_superadmin)
+  const navItems = NAV_ITEMS.filter(
+    (i) => (!i.superadminOnly || user?.is_superadmin) && !(i.ownerOnly && isWorker),
+  )
   const moreItems = MORE_ITEMS.filter(
-    (i) => (!i.superadminOnly || user?.is_superadmin) && !(i.account && isWorker),
+    (i) => (!i.superadminOnly || user?.is_superadmin)
+      && !((i.account || i.ownerOnly) && isWorker),
   )
   const sidebarItems = navItems.filter((i) => !i.account)
 

@@ -19,6 +19,7 @@ import { NeedsOrg } from "@/components/needs-org"
 import { SnmpProfilesCard } from "@/components/snmp-profiles-card"
 import { GponProfilesCard } from "@/components/gpon-profiles-card"
 import { WebOpticsCard } from "@/components/web-optics-card"
+import { RadiusCard } from "@/components/radius-card"
 import { WebProxyCard } from "@/components/web-proxy"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -483,6 +484,11 @@ const SECTIONS: Array<{
         id: "web-proxy", label: "Device web UI sessions",
         visible: (c) => !!c.org && c.hasWebProxy,
         render: (c) => <WebProxyCard org={c.org!} />,
+      },
+      {
+        id: "radius", label: "Billing / RADIUS panel",
+        visible: (c) => !!c.org,
+        render: (c) => <RadiusCard org={c.org!} />,
       },
       { id: "snmp-profiles", label: "SNMP health profiles", render: (c) => <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
       { id: "gpon-profiles", label: "GPON vendor profiles", render: (c) => <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },

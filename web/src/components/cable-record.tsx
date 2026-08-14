@@ -1,7 +1,12 @@
 import { useState } from "react"
 import {
-  ArrowRight, Check, MapPin, Pencil, Plus, Route, Scissors, Trash2, Waypoints,
+  ArrowRight, Check, MapPin, Pencil, Plus, Route, Scissors, Search, Trash2,
+  Waypoints,
 } from "lucide-react"
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   FIBER_COUNTS, STRAND_COLORS, TUBE_SIZE,
   coresRecordedLabel, isPlumbing, strandHex, strandLabel, tubeRows,
@@ -181,9 +186,67 @@ function CoreDetail({ cable, coreNo, canWrite, onLabel, onTrace }: {
   )
 }
 
+export interface MoveTarget {
+  device_id: number
+  name: string
+  km: number | null
+}
+
+function EndButton({ end, targets, disabled, onMove }: {
+  end: FibrePoint & { name?: string | null }
+  targets: MoveTarget[]
+  disabled?: boolean
+  onMove: (to: MoveTarget) => void
+}) {
+  const [q, setQ] = useState("")
+  const hit = targets.filter((t) =>
+    t.name.toLowerCase().includes(q.trim().toLowerCase()))
+  const label = end.name ?? "unplaced"
+  if (!targets.length) return <span className="truncate">{label}</span>
+  return (
+    <DropdownMenu onOpenChange={(o) => { if (!o) setQ("") }}>
+      <DropdownMenuTrigger asChild>
+        <button type="button" disabled={disabled}
+          className="-mx-1 min-w-0 truncate rounded px-1 text-left hover:bg-foreground/5 hover:text-foreground">
+          {label}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="max-h-96 min-w-56 max-w-72 overflow-y-auto">
+        <DropdownMenuLabel className="text-2xs font-normal text-faint-foreground">
+          This end really lands on…
+        </DropdownMenuLabel>
+        {targets.length > 6 && (
+          <div className="sticky top-0 z-10 -mx-1 mb-1 flex items-center gap-1.5 border-b bg-popover px-2 py-1.5">
+            <Search className="size-3 shrink-0 text-faint-foreground" />
+            <input autoFocus value={q} onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => { if (e.key !== "Escape") e.stopPropagation() }}
+              placeholder="box…"
+              className="w-full bg-transparent text-xs outline-none placeholder:text-faint-foreground" />
+          </div>
+        )}
+        {hit.map((t) => (
+          <DropdownMenuItem key={t.device_id} onSelect={() => onMove(t)}>
+            <MapPin className="size-3 shrink-0 text-muted-foreground" />
+            <span className="truncate">{t.name}</span>
+            <span className="ml-auto shrink-0 whitespace-nowrap pl-2 text-2xs text-faint-foreground">
+              {t.km == null ? "" : t.km < 1
+                ? `${Math.round(t.km * 1000)} m` : `${t.km.toFixed(1)} km`}
+            </span>
+          </DropdownMenuItem>
+        ))}
+        {!hit.length && (
+          <p className="px-2 py-3 text-center text-2xs text-faint-foreground">
+            Nothing here by that name.
+          </p>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 export function CablePanel({
   cable, canWrite, busy, onEdit, onTrace, onRetrace, onSplit, onDelete,
-  onLabel, onCore, selectedCore,
+  onLabel, onCore, selectedCore, moveTargets = [], onMoveEnd,
 }: {
   cable: Cable
   canWrite: boolean
@@ -196,8 +259,11 @@ export function CablePanel({
   onLabel: (coreNo: number, label: string | null) => void
   onCore: (coreNo: number | null) => void
   selectedCore: number | null
+  moveTargets?: MoveTarget[]
+  onMoveEnd?: (end: "a" | "b", to: MoveTarget) => void
 }) {
   const length = cableLength(cable.length_m)
+  const targets = canWrite && onMoveEnd ? moveTargets : []
   return (
     <div className="space-y-3">
       <div className="space-y-1">
@@ -210,9 +276,11 @@ export function CablePanel({
           )}
         </div>
         <p className="flex items-center gap-1.5 truncate text-2xs text-muted-foreground">
-          <span className="truncate">{cable.a.name ?? "unplaced"}</span>
+          <EndButton end={cable.a} targets={targets} disabled={busy}
+            onMove={(t) => onMoveEnd?.("a", t)} />
           <ArrowRight className="size-3 shrink-0 rotate-0 text-faint-foreground" />
-          <span className="truncate">{cable.b.name ?? "unplaced"}</span>
+          <EndButton end={cable.b} targets={targets} disabled={busy}
+            onMove={(t) => onMoveEnd?.("b", t)} />
         </p>
         <p className="text-2xs text-faint-foreground">
           {length ? `${length} along the route` : "route not traced"}

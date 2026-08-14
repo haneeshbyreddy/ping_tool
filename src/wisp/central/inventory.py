@@ -8,7 +8,8 @@ from wisp.central import fiber
 from wisp.central.fiber import (
     FiberError, clean_cable_name, clean_core_no, clean_fiber_count)
 
-DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE", "backhaul")
+DEVICE_TYPES = ("core", "router", "switch", "gateway", "OLT", "AP", "CPE",
+                "backhaul", "nvr")
 PASSIVE_TYPES = ("splitter", "coupler", "fdb", "closure")
 SPLIT_RATIOS = (2, 4, 8, 16)
 SPLIT_INPUTS = (1, 2)
@@ -18,6 +19,13 @@ def _gpon_vendors(extra: set[str] | None = None) -> frozenset[str]:
 
     from wisp.ingress.gpon import PROFILES
     return frozenset(PROFILES) | frozenset(
+        v.lower() for v in (extra or ()) if v)
+
+
+def _nvr_vendors(extra: set[str] | None = None) -> frozenset[str]:
+
+    from wisp.central.nvr_profiles import builtin_names
+    return frozenset(builtin_names()) | frozenset(
         v.lower() for v in (extra or ()) if v)
 
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -36,7 +44,8 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
                          device_id: int | None,
                          registered_nodes: set[str] | None = None,
                          passive_ids: set[int] | None = None,
-                         gpon_vendors: set[str] | None = None) -> dict:
+                         gpon_vendors: set[str] | None = None,
+                         nvr_vendors: set[str] | None = None) -> dict:
     name = _str(data, "name", required=True)
     device_type = _str(data, "device_type")
     if device_type and device_type not in DEVICE_TYPES + PASSIVE_TYPES:
@@ -118,6 +127,16 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             raise InventoryError(
                 f"GPON vendor must be one of: {', '.join(sorted(known))}")
 
+    nvr_vendor = _str(data, "nvr_vendor")
+    if nvr_vendor:
+        nvr_vendor = nvr_vendor.lower()
+        if device_type != "nvr":
+            raise InventoryError("NVR brand only applies to an NVR")
+        known_nvr = _nvr_vendors(nvr_vendors)
+        if nvr_vendor not in known_nvr:
+            raise InventoryError(
+                f"NVR brand must be one of: {', '.join(sorted(known_nvr))}")
+
     pon_port = _str(data, "pon_port") if passive else None
     if pon_port and len(pon_port) > 32:
         raise InventoryError("PON port must be 32 characters or fewer")
@@ -132,6 +151,7 @@ def clean_device_payload(data: dict, *, parents: dict[int, int | None],
             "region": region, "tags": ",".join(tags) or None,
             "parent_device_id": parent_id,
             "assigned_node_id": assigned_node_id, "gpon_vendor": gpon_vendor,
+            "nvr_vendor": nvr_vendor,
             "pon_port": pon_port, "split_ratio": split_ratio,
             "split_inputs": split_inputs,
             "onu_pon_limit": onu_pon_limit}
@@ -382,8 +402,10 @@ def clean_onu_drops_payload(data: dict, *,
     leg = data.get("leg_no")
     leg_no = None
     if leg not in (None, "", "null"):
-        leg_no = clean_port({"port_kind": "leg", "port_no": leg},
-                            split_ratio=split_ratio)["port_no"]
+        # `onu_drops.leg_no` stays an integer column — a leg is a numbered kind, so
+        # its ref round-trips through the same bound check the fibre panel uses.
+        leg_no = fiber.port_no(clean_port({"port_kind": "leg", "port_ref": leg},
+                                          split_ratio=split_ratio)["port_ref"])
     return {"macs": macs, "passive_id": passive_id, "leg_no": leg_no}
 
 
@@ -558,6 +580,29 @@ def clean_cable_path_payload(data: dict) -> dict:
     return {"cable_id": cable_id, "path": path}
 
 
+def clean_cable_move_payload(data: dict) -> dict:
+
+
+    frm, to = _cable_end(data, "from"), _cable_end(data, "to")
+    if frm is None or to is None:
+        raise InventoryError("a move names the point the fibres leave and the one"
+                             " they land on")
+    if (frm["device_id"], frm["mac"]) == (to["device_id"], to["mac"]):
+        raise InventoryError("that is where these fibres already end")
+    raw = data.get("cable_ids")
+    if not isinstance(raw, list) or not raw:
+        raise InventoryError("name at least one cable to move")
+    ids: list[int] = []
+    for r in raw:
+        try:
+            ids.append(int(r))
+        except (TypeError, ValueError):
+            raise InventoryError("cable id is invalid")
+    return {"from": (frm["device_id"], frm["mac"]),
+            "to": (to["device_id"], to["mac"]),
+            "cable_ids": ids, "preview": bool(data.get("preview"))}
+
+
 def clean_cable_split_payload(data: dict) -> dict:
 
 
@@ -598,31 +643,44 @@ def clean_port(data: dict, *, split_ratio: int | None = None,
                split_inputs: int | None = None, prefix: str = "port") -> dict:
 
 
-    kk, nk = f"{prefix}_kind", f"{prefix}_no"
+    kk, rk = f"{prefix}_kind", f"{prefix}_ref"
     kind = (_str(data, kk) or "").strip().lower()
-    raw = data.get(nk)
+    raw = data.get(rk)
+    if raw is None:
+        raw = data.get(f"{prefix}_no")          # older SPA builds still send _no
     if not kind and raw in (None, "", "null"):
-        return {kk: None, nk: None}
+        return {kk: None, rk: None}
     if kind not in fiber.PORT_KINDS:
         raise InventoryError(
             "port must be one of: " + ", ".join(fiber.PORT_KINDS))
-    if raw in (None, "", "null"):
+    ref = str(raw).strip() if raw is not None else ""
+    if not ref or ref == "null":
         if kind == "in":
-            return {kk: kind, nk: None}
+            return {kk: kind, rk: None}
         raise InventoryError("name which port the fibre lands on")
-    try:
-        no = int(raw)
-    except (TypeError, ValueError):
-        raise InventoryError("port number is invalid")
+    if len(ref) > fiber.PORT_REF_MAX:
+        raise InventoryError(
+            f"a port name must be {fiber.PORT_REF_MAX} characters or fewer")
+    # A `port` is the box's own interface string and is kept AS TYPED. Only the
+    # numbered kinds are arithmetic, and only they are bounded — a number is refused
+    # for being impossible (leg 9 of a 1:8), never for being unusual.
+    if kind not in fiber.NUMBERED_KINDS:
+        return {kk: kind, rk: ref}
+    no = fiber.port_no(ref)
+    if no is None:
+        raise InventoryError(
+            f"a {fiber.port_label(kind, None)} is numbered — give its number")
     if no < 1:
         raise InventoryError("port numbers start at 1")
+    if kind == "pon" and no > fiber.MAX_PON_INDEX:
+        raise InventoryError(f"PON numbers stop at {fiber.MAX_PON_INDEX}")
     bound = fiber.port_bound(kind, split_ratio=split_ratio,
                              split_inputs=split_inputs)
     if bound is not None and no > bound:
         raise InventoryError(
             f"this box has {bound} {'leg' if kind == 'leg' else 'input'}"
             f"{'' if bound == 1 else 's'}")
-    return {kk: kind, nk: no}
+    return {kk: kind, rk: str(no)}
 
 
 def clean_fibre_joint_payload(data: dict, *, a_cores: int | None = None,
@@ -663,7 +721,8 @@ def clean_fibre_joint_payload(data: dict, *, a_cores: int | None = None,
 
 def clean_fibre_tail_payload(data: dict, *, a_cores: int | None = None,
                              split_ratio: int | None = None,
-                             split_inputs: int | None = None) -> dict:
+                             split_inputs: int | None = None,
+                             to_cores: int | None = None) -> dict:
 
 
     point = _fibre_point(data)
@@ -684,14 +743,42 @@ def clean_fibre_tail_payload(data: dict, *, a_cores: int | None = None,
         raise InventoryError("a fibre cannot be taken out to the point it leaves")
     name = str(data.get("name") or "").strip()
     port = clean_port(data, split_ratio=split_ratio, split_inputs=split_inputs)
+    # ...and the far end of a TAIL may be a core too. Taking a core out to another
+    # CLOSURE is the same shape as taking it out to a box: an enclosure has no ports,
+    # so terminating there leaves the fibre arriving and stopping.
+    to_cable, to_core = _far_core(data, to_cores)
+    if to_cable is not None and port.get("port_kind"):
+        raise InventoryError("a fibre lands on a port or joins a core, not both")
     return {**point, "a_cable_id": a_cable_id, "a_core_no": a_core_no,
-            "to": to, "name": name or None, **port}
+            "to": to, "name": name or None, **port,
+            "to_cable_id": to_cable, "to_core_no": to_core}
+
+
+def _far_core(data: dict, to_cores: int | None) -> tuple[int | None, int | None]:
+
+    # THE FAR END AS A CORE — shared by the connect and the tail so the two gestures
+    # cannot come apart on what "join it there" means.
+    raw = data.get("to_cable_id")
+    if raw in (None, "", "null"):
+        return None, None
+    try:
+        cable_id = int(raw)
+    except (TypeError, ValueError):
+        raise InventoryError("to_cable_id is invalid")
+    try:
+        core = clean_core_no(data.get("to_core_no"), to_cores)
+    except FiberError as exc:
+        raise InventoryError(str(exc)) from exc
+    if core is None:
+        raise InventoryError("a splice names a specific fibre — give a core number")
+    return cable_id, core
 
 
 def clean_fibre_connect_payload(data: dict, *, split_ratio: int | None = None,
                                 split_inputs: int | None = None,
                                 to_split_ratio: int | None = None,
-                                to_split_inputs: int | None = None) -> dict:
+                                to_split_inputs: int | None = None,
+                                to_cores: int | None = None) -> dict:
 
 
     point = _fibre_point(data)
@@ -704,8 +791,15 @@ def clean_fibre_connect_payload(data: dict, *, split_ratio: int | None = None,
     port = clean_port(data, split_ratio=split_ratio, split_inputs=split_inputs)
     far = clean_port(data, split_ratio=to_split_ratio,
                      split_inputs=to_split_inputs, prefix="to_port")
+    # THE FAR END MAY BE A CORE INSTEAD OF A PORT. An enclosure has no ports — every
+    # fibre in one is a splice — so "connect this port to that closure" has to ask
+    # WHICH CORE it joins there, or the fibre arrives at the closure and stops.
+    to_cable, to_core = _far_core(data, to_cores)
+    if to_cable is not None and far.get("to_port_kind"):
+        raise InventoryError("a fibre lands on a port or joins a core, not both")
     name = str(data.get("name") or "").strip()
-    return {**point, "to": to, "name": name or None, **port, **far}
+    return {**point, "to": to, "name": name or None, **port, **far,
+            "to_cable_id": to_cable, "to_core_no": to_core}
 
 
 def clean_fibre_through_payload(data: dict) -> dict:

@@ -66,45 +66,34 @@ class PagingAudience:
         self._owner_numbers = numbers["owners"]
         self._worker_numbers = numbers["workers"]
 
-    @property
-    def _all_workers(self) -> list[str]:
-        return list(self._worker_numbers.values())
-
     def _compose(self, worker_numbers) -> list[str]:
         return list(dict.fromkeys([*self._owner_numbers, *worker_numbers]))
 
+    def _workers(self, users) -> list[str]:
+        return [self._worker_numbers[u] for u in sorted(users)
+                if u in self._worker_numbers]
 
-    def org_wide(self) -> list[str]:
+
+    def owners_only(self) -> list[str]:
         self._load()
-        return self._compose(self._all_workers)
+        return self._compose([])
 
     def for_device(self, device_id: int | None) -> list[str]:
         if device_id is None:
-            return self.org_wide()
+            return self.owners_only()
         cached = self._cache.get(device_id)
         if cached is not None:
             return cached
         self._load()
-        users = audience_for(device_id, self._parents, self._assignments)
-        if users is None:
-            out = self._compose(self._all_workers)
-        else:
-            assigned = [self._worker_numbers[u] for u in sorted(users)
-                        if u in self._worker_numbers]
-            out = self._compose(assigned)
+        users = audience_for(device_id, self._parents, self._assignments) or set()
+        out = self._compose(self._workers(users))
         self._cache[device_id] = out
         return out
 
     def for_node(self, node_id: str) -> list[str]:
 
         self._load()
-        device_ids = self.store.node_device_ids(self.org_id, node_id)
-        if not device_ids:
-            return self.org_wide()
         users: set[int] = set()
-        for did in device_ids:
+        for did in self.store.node_device_ids(self.org_id, node_id):
             users |= responsible_users(did, self._parents, self._assignments)
-        if not users:
-            return self.org_wide()
-        return self._compose([self._worker_numbers[u] for u in sorted(users)
-                              if u in self._worker_numbers])
+        return self._compose(self._workers(users))

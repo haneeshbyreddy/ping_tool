@@ -75,9 +75,9 @@ class DevicePagingTest(_Base):
         self.store.open_outage_if_absent("ispA", device_id, T0, DOWN)
         disp.dispatch([OutageOpened(device_id, DOWN)], T0)
 
-    def test_unassigned_device_still_pages_the_whole_team(self):
+    def test_unassigned_device_pages_no_worker(self):
         self._page_down(self.olt)
-        self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
+        self.assertEqual(self._paged(), [OWNER])
 
     def test_an_assigned_device_pages_owner_plus_assignee_only(self):
         self.store.set_device_assignees("ispA", self.olt, [self._uid("ravi")],
@@ -109,14 +109,14 @@ class DevicePagingTest(_Base):
                 " ORDER BY id DESC LIMIT 1").fetchone()["recipient"]
         self.assertEqual(sorted((recipient or "").split(",")), [RAVI, OWNER])
 
-    def test_an_uplink_alert_has_no_device_and_stays_org_wide(self):
+    def test_an_uplink_alert_has_no_device_so_it_reaches_owners_only(self):
         from wisp.core.state_machine import UplinkDown
         disp = CentralAlertDispatcher(self.store, "ispA", self.engine,
                                       self.notifier, self.cfg)
         self.store.set_device_assignees("ispA", self.wan, [self._uid("ravi")],
                                         "owner")
         disp.dispatch([UplinkDown()], T0)
-        self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
+        self.assertEqual(self._paged(), [OWNER])
 
 
 class PortPagingTest(_Base):
@@ -142,12 +142,12 @@ class PortPagingTest(_Base):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sorted(sent[0]["whatsapp"]), [KIRAN, OWNER])
 
-    def test_port_down_on_an_unassigned_switch_pages_everyone(self):
+    def test_port_down_on_an_unassigned_switch_pages_no_worker(self):
         self._monitor_port()
         self._sync("down")
         sent = [s for s in self.notifier.sent if "Port down" in s["title"]]
         self.assertEqual(len(sent), 1)
-        self.assertEqual(sorted(sent[0]["whatsapp"]), [RAVI, KIRAN, OWNER])
+        self.assertEqual(sorted(sent[0]["whatsapp"]), [OWNER])
 
 
 class ProbePagingTest(_Base):
@@ -166,9 +166,9 @@ class ProbePagingTest(_Base):
         self.assertTrue(self.notifier.sent, "expected a PROBE DOWN page")
         self.assertEqual(self._paged(), [RAVI, OWNER])
 
-    def test_probe_down_with_nothing_assigned_behind_it_stays_org_wide(self):
+    def test_probe_down_with_nothing_assigned_behind_it_reaches_owners_only(self):
         self._check()
-        self.assertEqual(self._paged(), [RAVI, KIRAN, OWNER])
+        self.assertEqual(self._paged(), [OWNER])
 
 
 class AssignApiTest(_Base):
@@ -351,21 +351,101 @@ class VisibilityTest(_Base):
         conn.close()
         return cookie.split(";")[0] if cookie else None
 
-    def _devices(self, cookie):
+    def _get(self, path, cookie):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", "/api/inventory?org=ispA", headers={"Cookie": cookie})
+        conn.request("GET", path, headers={"Cookie": cookie})
         resp = conn.getresponse()
-        body = json.loads(resp.read())
+        raw = resp.read()
         conn.close()
+        return resp.status, (json.loads(raw) if raw[:1] in (b"{", b"[") else {})
+
+    def _post(self, path, cookie, payload):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", path, body=json.dumps(payload),
+                     headers={"Cookie": cookie, "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def _devices(self, cookie):
+        _, body = self._get("/api/inventory?org=ispA", cookie)
         return {d["id"] for d in body["devices"]}
 
-    def test_an_unassigned_worker_still_sees_the_whole_fleet(self):
+    def test_a_worker_with_no_assignment_sees_nothing(self):
         seen = self._devices(self._login("kiran", "kiranpassword"))
-        self.assertEqual(seen, {self.wan, self.olt})
+        self.assertEqual(seen, set())
 
-    def test_the_assigned_worker_sees_the_whole_fleet_too(self):
+    def test_the_assigned_worker_sees_its_device_and_what_hangs_below_it(self):
+        seen = self._devices(self._login("ravi", "ravipassword"))
+        self.assertEqual(seen, {self.olt})
+
+    def test_responsibility_carries_the_subtree_into_view(self):
+        self.store.set_device_assignees("ispA", self.wan, [self._uid("ravi")],
+                                        "owner")
         seen = self._devices(self._login("ravi", "ravipassword"))
         self.assertEqual(seen, {self.wan, self.olt})
+
+    def test_the_owner_still_sees_the_whole_fleet(self):
+        seen = self._devices(self._login("owner", "ownerpassword"))
+        self.assertEqual(seen, {self.wan, self.olt})
+
+    def test_outages_carry_only_what_the_worker_can_see(self):
+        for did in (self.wan, self.olt):
+            self.store.open_outage_if_absent("ispA", did, DOWN, T0)
+        ravi = self._login("ravi", "ravipassword")
+        _, body = self._get("/api/outages?org=ispA", ravi)
+        self.assertEqual({o["device_id"] for o in body["outages"]}, {self.olt})
+        _, seen = self._get("/api/outages?org=ispA",
+                            self._login("kiran", "kiranpassword"))
+        self.assertEqual(seen["outages"], [])
+        _, all_ = self._get("/api/outages?org=ispA",
+                            self._login("owner", "ownerpassword"))
+        self.assertEqual({o["device_id"] for o in all_["outages"]},
+                         {self.wan, self.olt})
+
+    def test_a_worker_cannot_triage_an_outage_it_cannot_see(self):
+        self.store.open_outage_if_absent("ispA", self.wan, DOWN, T0)
+        oid = self.store.open_outage_id("ispA", self.wan)
+        ravi = self._login("ravi", "ravipassword")
+        self.assertEqual(
+            self._post("/api/outages/acknowledge", ravi, {"outage_id": oid}), 403)
+        self.assertEqual(
+            self._post("/api/outages/postmortem", ravi,
+                       {"outage_id": oid, "root_cause": "x"}), 403)
+
+    def test_a_worker_can_still_triage_its_own(self):
+        self.store.open_outage_if_absent("ispA", self.olt, DOWN, T0)
+        oid = self.store.open_outage_id("ispA", self.olt)
+        self.assertEqual(
+            self._post("/api/outages/acknowledge",
+                       self._login("ravi", "ravipassword"),
+                       {"outage_id": oid}), 200)
+
+    def test_issues_and_their_counts_narrow_together(self):
+        ravi = self._login("ravi", "ravipassword")
+        _, body = self._get("/api/issues?org=ispA", ravi)
+        outside = [r for r in body["issues"] if r.get("device_id") == self.wan]
+        self.assertEqual(outside, [])
+        self.assertEqual(body["total"], len(body["issues"]))
+        self.assertEqual(sum(body["counts"].values()), len(body["issues"]))
+
+    def test_a_per_device_read_is_refused_outside_the_scope(self):
+        ravi = self._login("ravi", "ravipassword")
+        self.assertEqual(
+            self._get(f"/api/inventory/ports?device_id={self.wan}", ravi)[0], 403)
+        self.assertEqual(
+            self._get(f"/api/inventory/ports?device_id={self.olt}", ravi)[0], 200)
+
+    def test_the_survey_cannot_place_a_device_it_cannot_see(self):
+        ravi = self._login("ravi", "ravipassword")
+        body = {"id": self.wan, "lat": 17.1, "lng": 78.1,
+                "accuracy_m": 5, "source": "gps"}
+        self.assertEqual(
+            self._post("/api/inventory/field-location", ravi, body), 403)
+        self.assertEqual(
+            self._post("/api/inventory/field-location", ravi,
+                       {**body, "id": self.olt}), 200)
 
 
 if __name__ == "__main__":

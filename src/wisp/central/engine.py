@@ -60,7 +60,8 @@ class EngineRegistry:
 
     @staticmethod
     def _fingerprint(devices: list[DeviceMeta]) -> tuple:
-        return tuple(sorted((d.id, d.parent_device_id, d.parents) for d in devices))
+        return tuple(sorted(
+            (d.id, d.ip_address, d.parent_device_id, d.parents) for d in devices))
 
     def get(self, org_id: str) -> MonitorEngine:
         devices = load_device_meta(self.store, org_id)

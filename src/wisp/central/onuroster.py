@@ -36,7 +36,7 @@ def search_key(raw: str | None) -> str:
 def display_name(row: dict) -> str:
 
 
-    for key in ("label", "name", "serial", "onu_key"):
+    for key in ("label", "radius_name", "name", "serial", "onu_key"):
         v = row.get(key)
         if v not in (None, ""):
             return str(v)

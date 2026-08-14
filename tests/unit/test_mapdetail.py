@@ -28,8 +28,9 @@ class _FakeStore:
 
 class CleanTest(unittest.TestCase):
     def test_keeps_valid_zooms(self):
-        payload = {"labels": 10, "passives": 12, "subscribers": 13,
-                   "subscriber_names": 16, "drop_lines": 17}
+        payload = {"labels": 10, "passives": 12, "passive_names": 14,
+                   "subscribers": 13, "subscriber_names": 16, "drop_lines": 17,
+                   "line_labels": 11}
         self.assertEqual(mapdetail.clean(payload), payload)
 
     def test_clamps_to_the_offered_span(self):
@@ -92,6 +93,45 @@ class CleanTest(unittest.TestCase):
         self.assertEqual(got["subscriber_names"], 15)
         self.assertEqual(got["drop_lines"], 15)
         self.assertEqual(got["passives"], mapdetail.DEFAULTS["passives"])
+
+    def test_a_plant_plate_can_never_sit_below_its_own_PIN(self):
+        got = mapdetail.clean({"passives": 16, "passive_names": 11})
+        self.assertEqual(got["passive_names"], 16)
+
+    def test_plant_plates_are_INDEPENDENT_of_device_names(self):
+        got = mapdetail.clean({"labels": 18, "passives": 13, "passive_names": 13})
+        self.assertEqual(got["passive_names"], 13)
+
+    def test_plant_plates_do_NOT_drag_the_pins_up_with_them(self):
+        got = mapdetail.clean({"passives": 13, "passive_names": 18})
+        self.assertEqual(got["passives"], 13)
+
+    def test_a_row_stored_before_plant_plates_had_a_row_lands_on_ITS_passives(self):
+        got = mapdetail.clean({"labels": 13, "passives": 14, "subscribers": 14,
+                               "subscriber_names": 19, "drop_lines": 19})
+        self.assertEqual(got["passive_names"], 14)
+
+    def test_line_labels_ships_as_a_KNOB_that_changes_nothing(self):
+        self.assertEqual(mapdetail.DEFAULTS["line_labels"], mapdetail.MIN_ZOOM)
+
+    def test_line_labels_takes_NO_floor_from_another_row(self):
+        got = mapdetail.clean({"passives": 18, "subscribers": 18,
+                               "line_labels": 6})
+        self.assertEqual(got["line_labels"], 6)
+
+    def test_line_labels_drags_NOTHING_up_with_it(self):
+        got = mapdetail.clean({"line_labels": 19, "passives": 13,
+                               "subscribers": 14, "drop_lines": 16})
+        self.assertEqual(got["passives"], 13)
+        self.assertEqual(got["subscribers"], 14)
+        self.assertEqual(got["drop_lines"], 16)
+
+    def test_a_row_stored_before_line_labels_existed_keeps_its_tuning(self):
+        got = mapdetail.clean({"labels": 10, "passives": 11, "subscribers": 12,
+                               "subscriber_names": 15, "drop_lines": 15})
+        self.assertEqual(got["labels"], 10)
+        self.assertEqual(got["passives"], 11)
+        self.assertEqual(got["line_labels"], mapdetail.DEFAULTS["line_labels"])
 
     def test_names_and_drop_lines_are_INDEPENDENT_of_each_other(self):
         got = mapdetail.clean({"subscribers": 12, "subscriber_names": 13,

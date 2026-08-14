@@ -6,6 +6,7 @@ import { inventoryApi, ApiError } from "@/lib/api"
 import { isPassiveType, type OnuOptic, type OrgDevice, type SubscriberDrop } from "@/lib/types"
 import { useAuth } from "@/hooks/use-auth"
 import { onuName } from "@/lib/format"
+import { portKey } from "@/lib/fiber"
 import { fmtKm, distanceKm, polyKm } from "@/map/geometry"
 import { cumulativeSplit, feedChain } from "@/map/plant"
 import { deviceRatioLabel, hasProtectionInput } from "@/map/drops"
@@ -58,7 +59,9 @@ const DOT: Record<string, string> = {
   offline: "bg-destructive/60", unknown: "bg-muted-foreground/40",
 }
 
-export function DistributionPanel({ device }: { device: OrgDevice }) {
+export function DistributionPanel({ device, onOpenFibre }: {
+  device: OrgDevice; onOpenFibre?: () => void
+}) {
   const { scopeOrg, canWrite } = useAuth()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(true)
@@ -107,6 +110,12 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
 
   if (!isPassiveType(device.device_type)) return null
 
+  const fibreQ = useQuery({
+    queryKey: ["point-fibre", scopeOrg, device.id, null],
+    queryFn: () => inventoryApi.pointFibre({ device_id: device.id }, scopeOrg),
+    enabled: isPassiveType(device.device_type),
+  })
+
   const devices = invQ.data?.devices ?? []
   const byId = new Map(devices.map((d) => [d.id, d]))
   const self = byId.get(device.id) ?? device
@@ -124,8 +133,18 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
   const ratio = self.split_ratio
   const ratioText = deviceRatioLabel(self)
   const protection = hasProtectionInput(self)
-  const feeds = (self.parent_device_id != null ? 1 : 0)
-    + (self.backup_parents?.length ?? 0)
+  // A SECOND INPUT IS GLASS, so the count is the `in` PORTS CARRYING A FIBRE — not
+  // `backup_parents`. A backup parent is `kind='backup'` in org_device_links, which
+  // is what `DeviceMeta.effective_parents()` reads: THE ENGINE'S DEPENDENCY EDGE.
+  // Recording fibre must never write that, and it would be a false claim anyway —
+  // "traffic reroutes this way on failure" depends on STP/routing state central
+  // cannot see, and a splitter has no state, no FSM and no routing.
+  const inPorts = (fibreQ.data?.ports ?? []).filter((p) => p.kind === "in")
+  const inTaken = new Set((fibreQ.data?.joints ?? [])
+    .filter((j) => j.port_kind === "in" && j.b_cable_id == null)
+    .map((j) => portKey(j.port_ref)))
+  const feeds = inPorts.filter((p) => inTaken.has(portKey(p.ref))).length
+  const freeInput = inPorts.find((p) => !inTaken.has(portKey(p.ref))) ?? null
   const over = !!ratio && !!load && load.recorded > ratio
 
   const splits = (self.device_type ?? "") === "splitter"
@@ -256,13 +275,22 @@ export function DistributionPanel({ device }: { device: OrgDevice }) {
               {protection && (
                 <div className="flex items-start gap-1.5 rounded border border-border-subtle bg-muted/50 px-2 py-1 text-2xs text-muted-foreground">
                   <GitMerge className="mt-px size-3 shrink-0" />
-                  <span>
+                  <span className="min-w-0">
                     Two inputs ·{" "}
                     <span className="font-mono text-foreground">{feeds}</span>{" "}
-                    {feeds === 1 ? "feed" : "feeds"} recorded.{" "}
+                    {feeds === 1 ? "fibre" : "fibres"} recorded.{" "}
                     {feeds < 2
-                      ? "The protection feed is either not connected or not drawn."
-                      : "Both feeds are on the map."}
+                      ? "The protection feed is either not connected or not recorded."
+                      : "Both inputs carry a fibre."}
+                    {freeInput && onOpenFibre && (
+                      <>
+                        {" "}
+                        <button type="button" onClick={onOpenFibre}
+                          className="font-medium text-primary underline-offset-2 hover:underline">
+                          Connect {freeInput.label}…
+                        </button>
+                      </>
+                    )}
                   </span>
                 </div>
               )}

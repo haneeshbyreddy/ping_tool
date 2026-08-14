@@ -100,6 +100,7 @@ class DispatchFanoutTest(unittest.TestCase):
         w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(o, "919000000001")
         self.store.set_user_whatsapp(w, "919000000009")
+        self.store.set_device_assignees("ispA", self.dev, [w], "own1")
         self.engine = central_engine.build_engine(self.store, "ispA", self.cfg)
         self.notifier = RecordingNotifier()
         self.disp = CentralAlertDispatcher(self.store, "ispA", self.engine,
@@ -143,7 +144,7 @@ class RouterPushFanoutTest(unittest.TestCase):
         self.cfg = Config(central_db=Path(self.tmp.name) / "central.db")
         self.store = CentralStore(self.cfg.central_db)
         self.store.set_org("ispA")
-        w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
+        w = self.store.add_user("ispA", "wkr1", "h", "s", "owner")
         self.store.set_user_whatsapp(w, "919000000009")
         self.notifier = RecordingNotifier()
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)

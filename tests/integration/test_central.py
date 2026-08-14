@@ -520,7 +520,8 @@ class OrgDevicesTest(unittest.TestCase):
         fk_tables = {
             name for name, body in re.findall(
                 r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)\s*\((.*?)\n\s*\);",
-                store_mod._SCHEMA, re.S)
+                store_mod._SCHEMA + store_mod._FIBRE_SCHEMA
+                + store_mod._HIST_SCHEMA, re.S)
             if "REFERENCES org_devices(id)" in body}
         fk_tables.discard("org_devices")
         src = inspect.getsource(store_mod.CentralStore.delete_org_device)

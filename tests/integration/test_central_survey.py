@@ -43,6 +43,10 @@ class _Base(unittest.TestCase):
         self.foreign = self.store.create_org_device("ispB", {
             "name": "B1", "ip_address": "10.9.9.9", "device_type": "switch",
             "region": None, "parent_device_id": None})
+        self.store.set_device_assignees(
+            "ispA", self.wan,
+            [next(u["id"] for u in self.store.list_users("ispA")
+                  if u["username"] == "ravi")], "owner")
 
         self.notifier = RecordingNotifier()
         self.server = make_server(self.cfg, self.store, notifier=self.notifier)

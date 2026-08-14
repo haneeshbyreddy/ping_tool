@@ -1,6 +1,6 @@
 import {
   LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
-  TriangleAlert, MapPinPlus,
+  TriangleAlert, MapPinPlus, BookUser,
   type LucideIcon,
 } from "lucide-react"
 
@@ -23,6 +23,10 @@ export interface NavItem {
 
   superadminOnly?: boolean
 
+  // The full billing book with phone numbers is the largest PII surface in the
+  // product: workers keep the per-subscriber panel, never the enumeration.
+  ownerOnly?: boolean
+
   account?: boolean
 }
 
@@ -32,6 +36,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/map", label: "Map", icon: Map, mobile: true, group: "infrastructure" },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false, account: true },
   { to: "/issues", label: "Issues", icon: TriangleAlert, mobile: true, group: "monitor" },
+  { to: "/customers", label: "Customers", icon: BookUser, mobile: false, group: "monitor", ownerOnly: true },
   { to: "/survey", label: "Survey", icon: MapPinPlus, mobile: true, group: "infrastructure" },
   { to: "/logs", label: "Logs", icon: Terminal, mobile: false, group: "monitor" },
   { to: "/overview", label: "Overview", icon: Gauge, mobile: false, superadminOnly: true, group: "platform" },

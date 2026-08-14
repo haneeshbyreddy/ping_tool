@@ -44,6 +44,8 @@ class CentralPortMonitorTest(unittest.TestCase):
             "region": "Rampur", "parent_device_id": None})
         w = self.store.add_user(ORG, "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(w, "919000000009")
+        for did in (self.switch, self.tower):
+            self.store.set_device_assignees(ORG, did, [w], "own")
         self.notifier = RecordingNotifier()
         self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
 

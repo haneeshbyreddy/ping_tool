@@ -6,7 +6,9 @@ import { useAuth } from "@/hooks/use-auth"
 import { analyticsApi, inventoryApi } from "@/lib/api"
 import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
 import { AssignmentPanel } from "@/components/device-assignees"
+import { DeviceHistoryPanel } from "@/components/device-history"
 import { Meter } from "@/components/meter"
+import { CamerasPanel } from "@/components/cameras-panel"
 import { OpticalPanel } from "@/components/optical-panel"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
 import { DistributionPanel } from "@/components/splitter-panel"
@@ -734,30 +736,40 @@ export function DevicePanelHeader({
   )
 }
 
-export type DeviceTab = "health" | "optical" | "ports"
+export type DeviceTab = "health" | "optical" | "ports" | "cameras"
 export function isOpticalOlt(device: OrgDevice): boolean {
   return (device.device_type ?? "").toUpperCase() === "OLT" && device.snmp_enabled === 1
 }
+export function isNvr(device: OrgDevice): boolean {
+  return (device.device_type ?? "").toLowerCase() === "nvr"
+}
 export function deviceTabs(device: OrgDevice): DeviceTab[] {
-  const tabs: DeviceTab[] = []
+  // Health leads for EVERY device (operator's call 2026-08-14, reversing the
+  // earlier optics-first-for-OLTs pick): the panel opens on the box's own
+  // state and its outage history; the roster is one click away.
+  const tabs: DeviceTab[] = ["health"]
   if (isOpticalOlt(device)) tabs.push("optical")
-  tabs.push("health")
+  if (isNvr(device)) tabs.push("cameras")
   if (device.snmp_enabled === 1) tabs.push("ports")
   return tabs
 }
-const TAB_LABEL: Record<DeviceTab, string> = { health: "Health", optical: "Optical", ports: "Ports" }
-const TAB_PLANE: Record<DeviceTab, Plane> = { health: "vitals", optical: "optical", ports: "traffic" }
+const TAB_LABEL: Record<DeviceTab, string> = {
+  health: "Health", optical: "Optical", ports: "Ports", cameras: "Cameras" }
+const TAB_PLANE: Record<DeviceTab, Plane> = {
+  health: "vitals", optical: "optical", ports: "traffic", cameras: "plant" }
 
-export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
+export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac,
+                              onOpenFibre }: {
   device: OrgDevice; tab: DeviceTab; onTab: (t: DeviceTab) => void
   focusOnuId?: number | null
   focusOnuMac?: string | null
+  onOpenFibre?: () => void
 }) {
   const tabs = deviceTabs(device)
   const webUi = useWebProxy() && canOpenWebUi(device)
   const manageCreds = useCanManageCreds() && canOpenWebUi(device)
   if (isPassiveType(device.device_type)) {
-    return <DistributionPanel device={device} />
+    return <DistributionPanel device={device} onOpenFibre={onOpenFibre} />
   }
   if (tabs.length === 1) {
     return (
@@ -770,6 +782,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
         )}
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
+          <DeviceHistoryPanel device={device} />
           <ConnectionPanel device={device} />
           <AssignmentPanel device={device} />
         </div>
@@ -797,6 +810,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
       <TabsContent value="health">
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
+          <DeviceHistoryPanel device={device} />
           <ConnectionPanel device={device} />
           <AssignmentPanel device={device} />
         </div>
@@ -805,6 +819,9 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac }: {
         <TabsContent value="optical">
           <OpticalPanel device={device} focusOnuId={focusOnuId} focusOnuMac={focusOnuMac} />
         </TabsContent>
+      )}
+      {tabs.includes("cameras") && (
+        <TabsContent value="cameras"><CamerasPanel device={device} /></TabsContent>
       )}
       {tabs.includes("ports") && (
         <TabsContent value="ports"><PortsPanel device={device} /></TabsContent>

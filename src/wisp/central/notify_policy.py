@@ -17,6 +17,7 @@ _ACTIVE_KINDS = frozenset({
     "PORT_DOWN", "PORT_RESTORED",
     "PORT_BW_HIGH", "PORT_BW_NORMAL",
     "PORT_BW_LOW", "PORT_BW_OK",
+    "CAMERA_DOWN", "CAMERA_RESTORED",
 })
 
 _DIGEST_KINDS = frozenset({
@@ -43,6 +44,8 @@ _KIND_LABELS = {
     "ON_BACKUP": "🔁 On backup",
     "BACKUP_CLEARED": "✅ Primary restored",
     "HOURLY_ESCALATION": "⏰ Still down",
+    "CAMERA_DOWN": "📷 Camera down",
+    "CAMERA_RESTORED": "✅ Camera restored",
 }
 
 

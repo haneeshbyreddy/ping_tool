@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from wisp.central.api import devices, edge, field, fleet, orgs, outages, proxy, users
+from wisp.central.api import (devices, edge, field, fleet, history, orgs,
+                              outages, proxy, users)
 
 GET = {
     "/healthz": orgs.healthz,
@@ -38,6 +39,11 @@ GET = {
     "/api/web-optics-profiles": devices.web_optics_profiles,
     "/api/inventory/snmp-status": devices.snmp_status,
     "/api/inventory/rx-status": devices.rx_status,
+    "/api/inventory/nvr-channels": devices.nvr_channels,
+    "/api/inventory/nvr-snapshot": devices.nvr_snapshot,
+    "/api/nvr-profiles": devices.nvr_profiles_list,
+    "/api/inventory/radius": devices.radius_settings,
+    "/api/inventory/customers": devices.customers_list,
     "/api/inventory/credentials": devices.webui_credentials,
     "/api/inventory/redundancy": devices.redundancy,
     "/api/inventory/assignments": devices.assignments,
@@ -48,6 +54,9 @@ GET = {
     "/api/incident/shape": outages.incident_shape,
     "/api/analytics": outages.analytics,
     "/api/analytics/trend": outages.analytics_trend,
+    "/api/history/reliability": history.reliability,
+    "/api/history/paging": history.paging,
+    "/api/history/onus": history.onus,
     "/api/outages": outages.list_open,
     "/api/issues": outages.issues,
     "/api/issues/pdf": outages.issues_pdf,
@@ -108,6 +117,7 @@ POST = {
     "/api/inventory/cable/core": devices.cable_core,
     "/api/inventory/cable/path": devices.cable_path,
     "/api/inventory/cable/split": devices.cable_split,
+    "/api/inventory/cable/move": devices.cable_move,
     "/api/inventory/cable/delete": devices.cable_delete,
     "/api/inventory/fibre/joint": devices.fibre_joint,
     "/api/inventory/fibre/connect": devices.fibre_connect,
@@ -139,6 +149,10 @@ POST = {
     "/api/inventory/optics/ack": devices.optics_ack,
     "/api/inventory/optics/thresholds": devices.optics_thresholds,
     "/api/inventory/rx-refresh": devices.rx_refresh,
+    "/api/inventory/nvr-refresh": devices.nvr_refresh,
+    "/api/inventory/nvr-watch": devices.nvr_watch,
+    "/api/inventory/radius": devices.radius_configure,
+    "/api/inventory/radius/sync": devices.radius_sync_now,
     "/api/inventory/links": devices.link_add,
     "/api/inventory/links/delete": devices.link_delete,
     "/api/inventory/peers": devices.peer_add,

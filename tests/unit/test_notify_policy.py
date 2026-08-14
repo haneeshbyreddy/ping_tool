@@ -49,7 +49,7 @@ class RouterTest(unittest.TestCase):
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
         self.store.set_org("ispA", name="A")
-        self.wkr = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
+        self.wkr = self.store.add_user("ispA", "wkr1", "h", "s", "owner")
         self.store.set_user_whatsapp(self.wkr, "919000000009")
         self.router = AlertRouter(self.store, "ispA", self.notifier, self.cfg)
 
@@ -119,7 +119,7 @@ class DigestFlushTest(unittest.TestCase):
         self.notifier = RecordingNotifier()
         self.cfg = Config(db_path=Path(self.tmp.name) / "wisp.db")
         self.store.set_org("ispA", name="A")
-        w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
+        w = self.store.add_user("ispA", "wkr1", "h", "s", "owner")
         self.store.set_user_whatsapp(w, "919000000009")
 
     def tearDown(self):

@@ -1145,6 +1145,33 @@
 .wisp-map-lowzoom .wisp-pin--selected .wisp-pin__label {
   display: block;
 }
+/* PLANT PLATES RUN ON THEIR OWN FLOOR (Map detail → Splitter labels), not on the
+   device-name one. A `1:8` is reference material ABOUT the network and a device
+   name is an identity, so an operator thinning one has no reason to be thinning
+   the other — the same split subscriber NAMES already have from their marks.
+   SPECIFICITY IS THE MECHANISM, so mind the order: rule 1 lifts plant out of the
+   device-name floor, and rule 2 ties it at (0,3,0) while sitting LATER, so it wins
+   wherever the plant floor is in force. */
+.wisp-map-lowzoom .wisp-pin--plant .wisp-pin__label {
+  display: block;
+}
+.wisp-map-lowplant .wisp-pin--plant .wisp-pin__label {
+  display: none;
+}
+/* ONLY THE SELECTED plate outlives the floor — a plate in trouble does NOT
+   (operator, 2026-08-12: "its label is also visible for longer … i don't want
+   those special effect"). It shipped with a `--drops-dark`/`--drops-weak`
+   exemption here, argued as "dropping the plate off the box a crew drives to
+   takes half that alarm off the map". It does not: the PIN's own exemption from
+   the Splitters floor is untouched, so a dark splitter still draws, in red, at
+   every zoom — what went is the ratio being SHOUTED as well. The alarm lives on
+   the mark; the plate is reference material about the box, and a density floor
+   the operator set may thin it. Selection is not a tone, it is the panel being
+   open, and a panel floating over an unnamed pin is its own failure.
+   (0,4,0), so it beats both rules above whatever the order. */
+.wisp-map-lowplant .wisp-pin--plant.wisp-pin--selected .wisp-pin__label {
+  display: block;
+}
 /* ISOLATION IS LOAD-BEARING: Leaflet stacks its own panes at z-index 400
    (tiles/overlays), 600 (markers), 700 (popups) and 800–1000 (controls). With
    the wrapper at `position: relative; z-index: auto` those numbers land in the
@@ -1304,19 +1331,23 @@
      the whole distance between "measured healthy" and "never measured". */
   background: var(--map-plant);
 }
-/* The dot follows the same rule. It does NOT pulse: the pulse means "this box
-   is down", and a splitter is never down — its subscribers are. The halo is
-   what makes a splitter in trouble findable across a viewport, so it stays on
-   top of the fill rather than being replaced by it. */
+/* THE ALARM IS THE FILL AND NOTHING ELSE (operator, 2026-08-12: "there is glowing
+   effect around pin … i don't want those special effect, just yellow/red colour
+   would be fine"). It carried a coloured HALO as well, on the argument that the
+   halo is what makes a splitter in trouble findable across a viewport — the fill
+   does that on its own, and the halo put plant in the loudest grammar on the map
+   for a box that is not down and has no outage. It does NOT pulse either, for the
+   older half of the same reason: a pulse means "this box is down", and a splitter
+   is never down — its subscribers are.
+   NO `box-shadow` here at all, deliberately, rather than one restating the casing:
+   the base `.wisp-pin__dot` casing then applies untouched (an uncased mark vanishes
+   over satellite — the twice-paid lesson), and `.wisp-pin--selected`'s ring stops
+   being overridden by a rule that only sits later in this file. */
 .wisp-pin--drops-weak .wisp-pin__dot {
   background: var(--warning);
-  box-shadow: 0 0 0 1px var(--border-strong),
-    0 0 0 3px color-mix(in srgb, var(--warning) 45%, transparent);
 }
 .wisp-pin--drops-dark .wisp-pin__dot {
   background: var(--destructive);
-  box-shadow: 0 0 0 1px var(--border-strong),
-    0 0 0 3px color-mix(in srgb, var(--destructive) 55%, transparent);
 }
 
 /* Branch fault: every recorded subscriber below one passive is dark while a
@@ -1684,10 +1715,11 @@
   font-variant-numeric: tabular-nums;
 }
 .wisp-linkhover__name { color: var(--muted-foreground); font-weight: 400; }
-/* Renders ONLY on an undrawn link, to say the number is a chord and not drum
-   metres — the one thing that must not be guessed off a figure a splicing crew
-   is about to order cable against. The drawn case carries no note: the traced
-   line already shows what was measured. */
+/* Renders ONLY on an UNSURVEYED line — an undrawn dependency chord, or a cable
+   nobody has traced — to say the number is a chord and not drum metres, the one
+   thing that must not be guessed off a figure a splicing crew is about to order
+   cable against. A traced line carries no note: it already shows what was
+   measured. */
 .wisp-linkhover__note {
   color: var(--faint-foreground);
   font-weight: 400;
@@ -1735,6 +1767,22 @@
   --mark-w: calc(var(--mark-gear) * var(--markshape-square));
   border-radius: 18%;
   transform: rotate(45deg);
+}
+/* nvr: a square body with a round lens hole — the camera housing. A SQUARE
+   donut, distinct from core/gateway's circle donut, at gear rank like every
+   device. The hole rides ::before for the same reason theirs does: it
+   survives the selection box-shadow and the down-pulse. */
+.wisp-pin--t-nvr .wisp-pin__dot {
+  --mark-w: calc(var(--mark-gear) * var(--markshape-square));
+  border-radius: 18%;
+}
+.wisp-pin--t-nvr .wisp-pin__dot::before {
+  content: "";
+  position: absolute;
+  inset: 28%;
+  border-radius: 9999px;
+  background: var(--background);
+  pointer-events: none;
 }
 /* core/gateway: donut — a ::before hole survives the box-shadow overrides
    from selection and the down-pulse (an inset shadow wouldn't) */

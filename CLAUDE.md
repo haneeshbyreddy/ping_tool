@@ -175,8 +175,26 @@ from `central/static/`.
   `central/dispatch.py` is the alerting policy (dedupe per outage, owner+worker on open, both
   on resolve, ack never stops it — only recovery does).
 - **`EngineRegistry`: one live engine per org** (flap streaks accumulate across stateless
-  `/report` calls). Rebuilds only when the fingerprint `(id, parent_device_id, d.parents)`
-  changes; rehydrates from `device_states`. Breaking rehydration re-pages everyone on restart.
+  `/report` calls). Rebuilds only when the fingerprint
+  `(id, ip_address, parent_device_id, d.parents)` changes; rehydrates from `device_states`.
+  Breaking rehydration re-pages everyone on restart.
+  **`ip_address` IS IN THE FINGERPRINT, and it was added the hard way** (2026-08-13,
+  badri_fiber's Epon_8, reported as "stale ever since I changed the IP"). The fingerprint was
+  shape-only, so editing a device's IP did NOT rebuild the engine: `load_device_meta` re-read
+  the new IP on every `get()` and then THREW IT AWAY because the shape had not moved, leaving
+  the live `DeviceMeta` on the old address. The edge, which re-reads `/edge/devices` every
+  cycle, probed the NEW IP correctly — so the two halves disagreed and
+  `process_cycle`'s `expected_ips` filter (`meta[id].ip_address in expected_ips`) dropped the
+  device from `order` outright. It was never fed, never landed in `cycle.states`, and so never
+  written: **frozen at UP for 3.5 hours, silently, while SNMP health/optics/ports stayed green
+  and fresh on the same box** — that asymmetry (SNMP fresh, ICMP frozen) is the tell, because
+  SNMP reads the device row fresh each sweep and never touches the engine. Note which way this
+  fails: without the `expected_ips` filter the stale meta would have looked up the OLD ip,
+  got nothing, scored 100% loss and PAGED A FALSE OUTAGE — the filter turned a false page into
+  a silent freeze, which is safer and much harder to notice. Anything the engine CACHES from a
+  device row belongs in the fingerprint; the shape is not the whole state.
+  `test_central_brain:test_registry_rebuilds_when_a_device_ip_changes` and
+  `test_a_device_keeps_being_monitored_after_its_ip_changes`.
 - **Wire format is IP-keyed**: `POST /report` `{"v":1,"org_id","node_id","ts","mode":"full"|
   "recheck","pings":{ip:{loss_pct,latency_ms,jitter_ms}}}`. The edge never sees device ids.
 - **Escalation sweeping rides the report cadence** — `sweep(ts)` once per full `/report`,
@@ -272,18 +290,54 @@ one, kept warm. Tests: `unit/test_notify_policy`, `unit/test_whatsapp`,
 (storage), `org_device_workers` (org_id, device_id, user_id). Narrows WHO an alert reaches:
 owners always page for everything, and a device's WORKERS are its assignees.
 
-- **It is a NOTIFICATION rule and NOTHING else.** Deliberately not read by any view, list,
-  KPI, map or export — every account still sees the whole fleet (operator's explicit call:
-  "the only thing we are doing the assigning is for workers to only get notifications for the
-  devices they are responsible for"). So it is not a permission table and a bug here can lose
-  a page but can never leak or withhold data. `test_central_assign:VisibilityTest` fails if a
-  read path ever starts filtering on it.
-- **An UNASSIGNED device pages EVERY worker** — `audience_for` returns `None`, which is NOT
-  the empty set. That distinction is the whole safety property: switching this feature on
-  narrowed nothing until someone was actually assigned, so it cannot silence a fleet. Same
-  instinct as the governor writing state rows regardless of its allowlist. The roster reply
-  carries the count of such devices so the UI states it rather than the operator inferring it
-  from an absence.
+- **IT IS NOW A VISIBILITY RULE TOO, AND UNASSIGNED MEANS NOBODY** (2026-08-12, operator's
+  call — this REVERSES both of the two properties this section shipped with, and the reversal
+  was deliberate, not a drift). It was notification-only, and an unassigned device paged EVERY
+  worker; the ISPs' report was *"all workers are getting all notifications"*, and the audit
+  that followed showed the narrowing itself was working perfectly — byreddy split 152 pages to
+  one team and 104 to the other — while **MS-Telecom had assigned 1 of its 9 devices**, so the
+  "unassigned pages everyone" rule delivered every page to all nine workers. The old safety
+  property ("it cannot silence a fleet") was real; the operator weighed it against a field team
+  that ignores its phone and chose the other side, with the owner as the backstop that keeps it
+  safe. Concretely, for a WORKER only:
+  - **A worker sees and is paged for exactly `scope_of(user)`** — devices assigned to them plus
+    everything BELOW those, by the same live parent walk the paging side uses. Strictly that:
+    **ancestors are NOT visible**, so a worker assigned one splitter does not see the OLT above
+    it (operator's explicit pick over showing the chain read-only for context).
+  - **An UNASSIGNED device reaches NO worker, in either sense.** `audience_for` still returns
+    `None` for it, but `for_device` no longer widens that to the whole team — it composes
+    owners only. An org that has assigned nothing therefore pages no worker and shows its
+    workers an empty fleet. That IS the requested behaviour; it is also why the next bullet
+    exists.
+  - **OWNERS AND SUPERADMIN ARE UNTOUCHED — that is the whole safety argument.** `_compose`
+    always prepends the owner numbers, and `visible_device_ids` returns `None` (meaning "no
+    filter") for anyone who is not a worker. An org can silence and blind its entire field team
+    by assigning nothing, and the owner still sees every device and gets every page. Nothing
+    here can make a fleet go dark.
+  - **An event with NO device reaches owners only** — uplink up/down carries no device id, and
+    a probe (`for_node`) resolves to whoever is responsible for what that probe carries, with
+    NO org-wide fallback when the answer is nobody. Do not restore the fallback: it was the
+    single largest remaining source of "everyone got it".
+  - **The read side is ONE helper, `api/common.visible_device_ids`**, plus `in_scope`/
+    `keep_visible`. It is gated inside `device_read_scope` (which covers every per-device GET
+    at once), `survey_write_org` and `triage_outage_org`, so a NEW route on those choke points
+    is scoped by default. The list endpoints filter explicitly, because this is now a table
+    that can WITHHOLD data and an implicit filter is not auditable.
+  - **A count and its list must narrow TOGETHER** — `issues` filters `rows` BEFORE `counts` and
+    `total` are derived, and `regions.device_count` is recomputed from the visible set. The
+    count-agreement rule outranks the convenience of filtering late. `/api/nodes` is
+    deliberately NOT filtered: `fleet_size`/`open_outages` are what the PROBE reported about
+    itself, and recomputing them per viewer would invent a number nobody sent.
+  - **A worker with nothing assigned must be TOLD, not shown a blank screen.** Home, the
+    Network tree and the map all said "No devices yet. Add one above." — a lie twice over
+    (the devices exist, and a worker cannot add one). `format.ts:NO_ASSIGNED_DEVICES` is the
+    one string all three use. Same rule as "nothing is wrong" vs "nothing is measured".
+  - **The known cost, accepted:** a passive a worker creates in the field is unassigned, so it
+    vanishes from their own screen the moment they save it. Auto-assigning a field-created box
+    to its creator is the obvious fix and was deliberately NOT built without asking.
+  - `test_central_assign:VisibilityTest` now pins the NARROWING (it used to fail if any read
+    path filtered at all). Old behaviour, for the record: every account saw the whole fleet,
+    and an unassigned device paged every worker.
 - **Responsibility flows DOWN the tree and UNIONS; it never overrides.** One row on a region
   head covers the region (the only thing that scales on a fleet growing weekly), and naming a
   second worker on an OLT below it does NOT un-page whoever owns the head. Nearest-ancestor-
@@ -301,10 +355,11 @@ owners always page for everything, and a device's WORKERS are its assignees.
   device pages owners only). Widening back would mean an assignment quietly undone by
   somebody's empty profile field.
 - **Wiring**: `dispatch._recipients(device_id)` for device up/down (uplink events carry no
-  device → org-wide), `AlertRouter.emit` for everything through the governor (it builds its
-  own resolver when a shell doesn't pass one, so a NEW paging shell narrows by default), and
-  `watchdog` via `for_node` — a probe is not a device, so its audience is whoever owns what it
-  carries, falling back to org-wide because a dark probe blinds a slice of the fleet.
+  device → OWNERS ONLY since 2026-08-12), `AlertRouter.emit` for everything through the
+  governor (it builds its own resolver when a shell doesn't pass one, so a NEW paging shell
+  narrows by default), and `watchdog` via `for_node` — a probe is not a device, so its audience
+  is whoever owns what it carries, and when that is nobody it is owners only (the org-wide
+  fallback is GONE; it was the largest remaining source of "everyone got it").
   `alert_log.recipient` records the NARROWED set, so "who was actually told" stays answerable.
 - **`emit` resolves the audience AFTER the allowlist/gate checks** — most SNMP kinds are
   suppressed, and resolving a per-device audience for a page that was never going to send put
@@ -313,12 +368,16 @@ owners always page for everything, and a device's WORKERS are its assignees.
   per page because that thread is long-lived and would otherwise page a stale audience.
 - UI: Settings → Users → **Device responsibility** (bulk, per account, region-filtered) and the
   device panel's **"Paged for this device"** fold (per device, naming the ancestor an
-  inherited assignee comes from). Both say "paged", never "sees". Owner-only writes; the
+  inherited assignee comes from). Both said "paged", never "sees" — **that copy is now wrong
+  and both surfaces govern SEEING as well as paging**; say so, or an owner assigning a device
+  will not realise they are also handing over (and withholding) a view. Owner-only writes; the
   roster GET is owner-only too (it enumerates accounts) and ships `has_whatsapp` as a boolean,
   never the number. The outage-assign dialog marks accounts already responsible for that
   device and sorts them first — a suggestion, never a filter or an auto-assignment.
-- Tests: `unit/test_assignment` (the rules), `integration/test_central_assign` (device/port/
-  probe pages narrowing, the API, and the visibility guard).
+- Tests: `unit/test_assignment` (the rules + `worker_device_scope`),
+  `integration/test_central_assign` (device/port/probe pages narrowing, the API, and
+  `VisibilityTest` — the device list, outages, issues+counts, a per-device read, and the
+  survey write, each refused or narrowed for a worker and untouched for the owner).
 
 ### Alerting subsystems
 
@@ -701,8 +760,12 @@ entire plant a crew works on.
 - **A passive stays QUIET until its subscribers aren't.** Plant is reference material and
   must not compete with gear for the eye (why passives render small and muted). The one
   exception is worth making — a splitter whose recorded customers are dark is the most
-  useful object on the map during a cut. SIZE never changes, only tone, and the dot does
-  NOT pulse: a pulse means "this box is down", and a splitter is never down.
+  useful object on the map during a cut. SIZE never changes, only tone — and **tone means the
+  FILL, nothing around it** (2026-08-12, operator: "there is glowing effect around pin … i
+  don't want those special effect, just yellow/red colour would be fine"): the coloured HALO
+  is gone, the plate no longer outlives its zoom floor, and the dot does NOT pulse. Same
+  reason each time — a pulse, a halo and a shouted label all mean "this box is down", and a
+  splitter is never down; its subscribers are. The fill finds it across a viewport by itself.
 - **Its pin runs on BOTH colour axes: identity for the ordinary states, status only for an
   alarm** (`index.css:--map-plant`, 2026-08-06, operator: "change the colour of splitter's
   pin"). A splitter used to be painted entirely out of the STATUS vocabulary — grey with no
@@ -923,9 +986,11 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   roster's name is whatever the OLT reports and the SNMP upsert rewrites it
   (`name=excluded.name`) every sweep, so a name typed into it would vanish inside ~300s —
   worse than not offering the field. The label is operator-owned and no walk touches it;
-  `label || walked_name || serial || mac` is the display order everywhere (`refTitle`
-  already used it). The capture sheet shows the walked name as the placeholder so the tech
-  can see what the OLT calls it without being able to edit that.
+  `label || radius_name || walked_name || serial || mac` is the display order everywhere
+  (`refTitle` already used it; `radius_name` joined it 2026-08-13 — see the RADIUS section:
+  it ranks BELOW the operator's own label and ABOVE the OLT's provisioning string). The
+  capture sheet shows the walked name as the placeholder so the tech can see what the OLT
+  calls it without being able to edit that.
   - **That display order is a FUNCTION, `onuroster.display_name` / `format.ts:onuName` —
     never a rule each screen re-implements** (2026-07-29). The first cut left it to the
     callers and every one of them named an ONU off `onu_optics.name` ALONE, so a name a
@@ -1082,9 +1147,9 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
   `map/detail.ts`, 2026-08-02). Hand-tuning a threshold every time somebody says the map is too
   busy or too empty is the same shape of ask as "make the palette warmer", and gets the same
   answer the theme panel already gives: **a density ask is a dashboard control, not a code
-  edit** — check this before editing a number. Five rows (device NAMES / PASSIVE PLANT + the
-  cable into it / subscriber marks / subscriber NAMES / drop lines + their chips), in
-  **Settings → Platform → Map detail**, stored
+  edit** — check this before editing a number. Seven rows (device NAMES / PASSIVE PLANT + the
+  cable into it / plant PLATES / subscriber marks / subscriber NAMES / drop lines + their chips /
+  CABLE NAME + RATE chips), in **Settings → Platform → Map detail**, stored
   in `app_settings.map_detail`. The card is driven off `DETAIL_ROWS`, so a new layer is a row in
   that table plus a key in both defaults — never JSX (`test_mapdetail:
   test_every_field_is_OFFERED_a_row_in_the_settings_card` fails if the two drift, because a
@@ -1104,9 +1169,10 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
     not cosmetic**: `refLinesVisible` and `refNamesVisible` are both `refVisible && …`, and a
     drop line is suppressed with the splitter it runs to, so a floor set below its mark's doesn't
     draw it earlier, it does nothing — and a setting that silently no-ops is worse than one
-    that refuses. `subscriber_names` floors at `subscribers`; `drop_lines` floors at BOTH
-    `subscribers` and `passives`, because a drop line is the one row with a mark at EACH END and
-    a dotted line running to a point where nothing is drawn reads as a rendering fault. The two
+    that refuses. `subscriber_names` floors at `subscribers` and `passive_names` at `passives`
+    for the same reason (a plate is part of a mark, not a mark of its own); `drop_lines` floors at
+    BOTH `subscribers` and `passives`, because a drop line is the one row with a mark at EACH END
+    and a dotted line running to a point where nothing is drawn reads as a rendering fault. The two
     dependents are INDEPENDENT OF EACH OTHER (a name rides the mark, a
     rate chip rides the line), so naming subscribers without drawing their drop lines is a
     legitimate setting and must not be "repaired" — and `passives` is likewise independent of
@@ -1116,8 +1182,8 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
     disagree about where the floor is; `mapdetail.clean` repairs it AGAIN server-side, on the
     write AND on the read, so a hand-edited SQLite row can't reach the map broken either. One
     repair covers every way of breaking it, so no "which knob moved" state is needed.
-  - **`passives` hides the PIN AND THE CABLE INTO IT, and it is the one row with an ALARM
-    EXEMPTION** (2026-08-05, operator: "i want splitters to disappear as well at certain
+  - **`passives` hides the PIN AND THE CABLE INTO IT, and it is one of the two rows with an
+    ALARM EXEMPTION** (2026-08-05, operator: "i want splitters to disappear as well at certain
     configurable zoom level when zooming out"). It is the other half of taking plant out of the
     clustering pass the same day: the accepted cost there was that dense plant OVERLAPS at low
     zoom instead of folding, exactly what subscribers do — so plant gets the answer subscribers
@@ -1138,6 +1204,68 @@ lands in `onu_places`, the table the REFERENCE-ONU feature already owned.
     (4) it filters `drawnDevices`, **never `placed`** — the "N / M on map" census, Fit-all,
     search and the drag-snap still reach every placed box, because hiding a reference layer must
     not make the fleet look smaller than it is.
+  - **`passive_names` takes plant PLATES off the device-name row** (2026-08-12, operator: "treat
+    closure labels and splitter labels same as subscribers labels at zoom level"). A splitter's
+    plate (`drops.passivePinLabel` — the split ratio, or the name where no ratio is recorded) rode
+    `labels` while its PIN rode `passives`, so the two halves of one mark answered to different
+    rows and neither answered to plant. It now mirrors `subscriber_names`/`subscribers` exactly:
+    its own row, floored at `passives`, because a plate may not outlive the pin it sits beside.
+    Four things it must keep:
+    (1) **it is a WRAPPER CLASS (`wisp-map-lowplant`), never a per-pin decision** — icons are
+    cached by their html string, so folding the floor into `pinIcon` would swap every plant pin's
+    DOM node on the threshold crossing. Same reason the device label may live inside its icon;
+    two classes because the two floors are independent, and the CSS pairs them;
+    (2) **SPECIFICITY IS THE MECHANISM, so mind the source order.** `.wisp-map-lowzoom
+    .wisp-pin--plant .wisp-pin__label{display:block}` lifts plant out of the device-name floor and
+    `.wisp-map-lowplant .wisp-pin--plant .wisp-pin__label{display:none}` TIES it at (0,3,0) while
+    sitting LATER, so it wins wherever the plant floor is in force. Verified in a real browser
+    across all 28 wrapper × pin combinations, not reasoned about — this file has been wrong about
+    a cascade twice (the theme mode-scoping pair, both of which passed static review);
+    (3) **ONLY the SELECTED plate outlives the floor. A plate in trouble does NOT** — it shipped
+    with a `--drops-dark`/`--drops-weak` exemption and the operator had it out the same hour
+    ("its label is also visible for longer … i don't want those special effect"). The argument
+    for it was that dropping the plate takes half a branch fault off the map; it does not,
+    because the PIN's own exemption from the `passives` floor is untouched, so a dark splitter
+    still draws, in red, at every zoom. **The alarm lives on the MARK; the plate is reference
+    material about the box, and a density floor may thin it.** Selection is not a tone — it is
+    the panel being open, and a panel floating over an unnamed pin is its own failure. Worth
+    knowing if a trouble exemption is ever wanted here again: it needs its own selector, because
+    a passive has no state, so `pinTone` returns `muted` and it never carries
+    `wisp-pin--destructive` — its alarm is `--drops-dark`/`--drops-weak`, which the lowzoom
+    exemption does not match;
+    (4) **`wisp-pin--plant` is ONE class off `isPassiveType`**, never a CSS list of the four
+    `--t-<type>` classes — that list would drift from `PASSIVE_TYPES`, where `coupler` lives
+    forever precisely so a straggler row stays silent plant.
+    Default 13 = `passives`' default, i.e. the plate arrives WITH its pin, which is what every
+    install did while it rode `labels`. A row stored before this existed therefore lands on ITS
+    OWN `passives` value through the floor, not on the shipped 13 — prod (`passives` 14) is
+    unchanged.
+  - **`line_labels` governs the CABLE NAME chip and the ↓/↑ RATE chip together, and ships as a
+    knob that changes nothing** (2026-08-12, operator's ask). One row, not two, for the reason
+    the collision budget is one budget: a sheath that inherited a stood-down chord's reading
+    draws the name and the rate as ONE chip (`main 6F · ↓70M ↑5.3M`), so a setting that hid half
+    of it would have to render half a chip. Four things it must keep:
+    (1) **it defaults to `MIN_ZOOM`, i.e. every zoom** — the ask was for a control, not for a new
+    density, and shipping a floor would take chips off every install to answer one operator's
+    question; the sparse row means a later change to that number still reaches everyone who
+    never turned it;
+    (2) **the floor is taken in `chipShown`, NEVER at the render** — the budget must read the
+    same predicate the render does, or a chip nobody draws goes on reserving pixels away from a
+    subscriber name that would have (the rule the drop-line chips already keep);
+    (3) **an ALARM outranks it** — a link chip carries `linkTone`, so a port that is DOWN or over
+    its bandwidth keeps its chip at every zoom, on the chord OR on the sheath the reading moved
+    to; so does a selected path and a traced core, the same "down or selected keeps its name"
+    exemption `labels` makes. A plain cable name has no alarm to make (a cable has no state), so
+    only a trace outranks the floor there;
+    (4) **it takes NO floor from another row**, unlike the two subscriber dependents, and that is
+    not an oversight in the ordering invariant: the lines it labels do not share one floor — a
+    chord between two boxes draws at every zoom and so does a sheath standing in for one, while a
+    plain cable is bound by `passives`. So a value below `passives` still governs something and
+    is not the silent no-op that invariant refuses. A cable chip can never outlive its own cable
+    regardless, because the budget only offers pixels to a line that was drawn.
+    The Layers → **Bandwidth labels** toggle reads **"on · zoom in"** below the floor, exactly as
+    Subscribers does: a toggle reading "on" over a map drawing no chips reads as a broken feature
+    rather than as a setting somebody chose.
   - **An untouched install stores NOTHING** (`mapdetail.save` clears the row at defaults, which
     is also what Reset posts), so a future change to the shipped numbers still reaches everyone
     who never expressed an opinion — the same sparse-storage rule as the theme overrides.
@@ -1549,6 +1677,300 @@ construction: it rides the web-proxy tunnel the edge already serves — no edge 
 - Tests: `unit/test_weboptics`, `unit/test_weboptics_profiles`, `unit/test_weboptics_sweep`,
   `integration/test_central_weboptics`, `integration/test_central_rxstatus`.
 
+### THE USER MAC: the subscriber's own address, off the OLT's address table (2026-08-12)
+
+`central/webmacs.py` (parse) + `webmacs_profiles.py` (the recipe) + the SAME
+`weboptics_sweep.py` shell, `onu_user_macs` + `web_mac_status` + `web_mac_profiles`,
+`api/devices.subscriber`, `components/subscriber-detail.tsx`. **Not the ONU's MAC** — the
+address the SUBSCRIBER'S OWN router presents behind it, which is what the ISPs' RADIUS app is
+keyed on. Stage 1 of a RADIUS integration; nothing here talks to RADIUS yet.
+
+- **It replaces a per-customer click-through, and the audit proved that was the real
+  workflow.** `proxy_audit` carries **739 hits on `/action/onumacinfo.html?gponid=&gonuid=`
+  across 14 OLTs and 5 ISPs, ~830 distinct ONU slots** — the owners themselves (byreddy 1036,
+  rn_giga 168, badri 110), not us: haneesh appears twice. That is one page open per customer,
+  which is why the answer is the OLT-WIDE table instead. **1 GET per OLT, not one per
+  subscriber**: 16 requests a sweep against 1,984 online ONUs, and it stays 16 as the fleet
+  grows. Per-ONU would be the exact load shape that overran these boxes' accept queues at
+  1.00 s per fetch — see the web-proxy latency section.
+- **`Port ID` IS the join, and it is the SLOT.** The row is `VLAN ID | MAC Address | Type |
+  Port ID`, and Port ID reads `EPON0/8:38` (C-Data) or `PON2:ONU36` (Syrotech) → `onu_key`
+  `8.38` / `2.36`, the roster's own key. Measured on both builds: **143/143 and 130/130 slots
+  join `onu_optics`, 100%**, every scraped ONU online. Keyed on the SLOT and never the serial,
+  the identity rule `parse_onu_table` already keeps.
+- **THE RECIPE IS ITS OWN TABLE, NOT A FIELD ON THE OPTICS PROFILE, and the reason is
+  hardware**: `syrotech_gpon` serves this page and provably has NO optical page (its OPM path
+  404s), so a MAC recipe folded into `web_optics_profiles` — which requires `optics_path` and
+  `rx_dbm` — could never be configured for the fleet that needs it most. **A GPON ONU has no
+  MAC at all** (its identity is a serial like `ZTEGcbd796ed`), so this is the ONLY address that
+  customer has. The reverse case exists too: a vendor may publish optics and no address table.
+  The LOGIN half is duplicated in the spec but NOT in the code — both go through
+  `weboptics.login`, so there is one implementation of "send the credential only after the
+  login page answered".
+- **`port_shape` is a CLOSED vocabulary** (`epon-slash-colon` | `pon-onu`), because the shape
+  is the one thing that genuinely varies per vendor and a permissive regex here would attribute
+  one customer's router to another. Everything else about a profile follows
+  `web_optics_profiles` verbatim: whole profile rejected on anything outside the vocabulary,
+  org_id NULL = global, a same-named row shadows the built-in, a disabled row is a tombstone.
+- **ONE SWEEP, ONE LOGIN, because the OLT holds ONE web session slot.** The address read is a
+  second page inside `WebOpticsSweeper.scrape_device`, not a second sweeper — a second one
+  would fight the first for that slot and log the operator out of the box they are working on.
+  Every gate is therefore taken ONCE and unchanged (tunnel dormant, someone is browsing,
+  per-device lock, preflight, credentials), and `_gate()` records the outcome for whichever
+  subsystems are active. A device with a mac profile and no optics profile still reaches the
+  address read — that is the syrotech case and the whole point.
+- **THE TRUNCATION GUARD IS THE OLT'S OWN COUNT, and it only exists on one build.** The C-Data
+  page carries `Total Addresses Found in System` (`macCount`) and a full read matches it
+  exactly — 548 = 548 on the capture, 561 = 561 live 20 minutes later. The Syrotech page prints
+  no total anywhere, so `complete` is **None**, never `True`: "we cannot tell" is a third answer
+  and collapsing it into "complete" is the GETBULK lie again (a walk missing whole columns
+  stored as finished). A short read records `partial` and NAMES THE SHORTFALL, because a
+  truncated table makes a customer who HAS an address render exactly like one who does not.
+  Both builds carry a `macport` filter (`ALL, GE1..16, PON1..8`, POST with `who=100`), so
+  per-PON is the fallback if a big OLT ever truncates — 8 requests, not 2,000.
+- **UPLINK ROWS ARE DISCARDED, not attributed.** 353 of HLY-OLT-1's 548 real rows sit on
+  `GE5`/`CPU`/`PON6` — aggregate traffic behind which every customer sits. Pinning one of those
+  to a subscriber is the wrong-house failure this subsystem must not introduce.
+- **ONE SLOT MAY CARRY SEVERAL AND ALL ARE KEPT** (1–5 observed; `EPON0/1:4` presents three
+  MACs on three service VLANs). Picking one would be a guess about which is "the" customer
+  device. The VLAN rides along on the same row and is stored with it — it is the likely hook
+  for the RADIUS stage.
+- **ROWS ARE NEVER DELETED, ONLY RE-STAMPED, and that is not laziness.** This is a LEARNED
+  forwarding table: it ages out, so an idle or offline customer drops off the page while being
+  the same customer with the same router. `first_seen_at`/`last_seen_at` make "the OLT still
+  sees this" and "this is the last one we saw" different sentences, and the stale one is
+  exactly what a tech wants — **this is the one reading in the panel that is MORE useful when
+  the customer is down**, because it is what they type into RADIUS. A subscriber who changes
+  router accumulates a second row, which is honest and is also what RADIUS will still hold.
+- **So the panel row is deliberately OUTSIDE the frozen block** and is not suppressed when the
+  ONU is dark — the opposite of every other reading there. An address is a fact about the
+  customer's own equipment, not a measurement of the light. Each row carries its own date
+  instead. `noMacReason` writes the sentence from `web_mac_status` (the `SnmpDiagnosis`/
+  `RxDiagnosis` split: the server ships facts, the SPA writes the sentence), and the `partial`
+  case is toned `warning` and says the read was incomplete rather than implying the customer
+  has no device.
+- **Search by user MAC is deliberately NOT wired** (operator's call, 2026-08-12). Pasting a MAC
+  from the RADIUS app into the map/Network search is the obvious next move and was left out on
+  purpose; it is `format.ts:onuSearchKey` plus the `onu_user_macs` index, which exists.
+- Tests: `unit/test_webmacs` (both port shapes, the uplink refusal, the truncation guard, the
+  three-answer `complete`, the profile vocabulary), `integration/test_central_usermacs`
+  (storage and the never-delete rule, the GPON-with-no-optics-profile target, the sweep
+  including the browse gate and the credential-not-sent gate, the delete cascade, and that a
+  neighbouring slot's address is never reported for this subscriber).
+
+### RADIUS: the customer as BILLING holds them (2026-08-13)
+
+`central/radius.py` (pure parse + match) + `radius_profiles.py` (the recipe) +
+`radius_sync.py` (the shell), `radius_accounts` + `radius_profiles` + `radius_customers` +
+`radius_links` + `radius_status`, `api/devices.radius_settings`/`radius_configure`/
+`radius_sync_now`. Stage 2 of the user-MAC work: stage 1 read the subscriber's own router
+MAC off the OLT, this turns that MAC into a NAME.
+
+**The workflow it kills, in the ISPs' own words:** to put a customer's details against an
+ONU they either survey it in the field ("which isn't working out all the time") or open the
+OLT's page for the user MAC and then search that MAC in their RADIUS app. Stage 1 removed
+the OLT page. This removes the RADIUS app.
+
+- **THE JOIN IS THE WHOLE FEATURE, AND IT WAS MEASURED BEFORE ANY OF IT WAS BUILT.** Against
+  Hansa's live panel: **336 of 336 online sessions** resolve to an exact ONU slot, and **377
+  of 415 ACTIVE customers (91%)** are reachable from plant we already hold. The live sync
+  stores 794 customers and links **403** — 353 by MAC, 50 by name.
+- **EXPIRED CUSTOMERS ARE 9% REACHABLE AND THAT IS CORRECT, NOT A GAP.** The OLT's address
+  table is a LEARNED forwarding table: a disconnected customer passes no traffic and ages
+  out. 266 of the 345 MAC misses are expired accounts. Don't "fix" this by widening the
+  match — a name pinned to a slot on weak evidence is the wrong-house failure.
+- **TWO JOIN KEYS, AND THE MAC OUTRANKS THE NAME.** The MAC is observed traffic *now*: that
+  router is behind that ONU. The ONU's provisioned name matching the RADIUS username
+  (`HC_MITTAPALLI`) is a string somebody typed at provisioning and may be stale or copied.
+  So MAC first, name as the fallback that covers the 50 the MAC cannot see. The name compare
+  is punctuation-blind (`onuroster.search_key`, so `hc_kiran` == `HC-KIRAN`); the MAC compare
+  goes through **`webmacs.normalise_mac`, the SAME function that stored the other side**, or
+  SQL identity drifts from Python identity.
+- **AN AMBIGUOUS MATCH LINKS NOTHING.** A MAC on two slots, two customers claiming one MAC,
+  a name on two slots — all link nothing at all, exactly as `_merge_web_optics` refuses an
+  ambiguous MAC and for the identical reason: a customer pinned to the wrong drop sends a
+  tech to the wrong house. On the live fleet that is 8 customers, and they are better absent
+  than guessed. `unit/test_radius:LinkTest` pins every refusal.
+- **RESOLVED ONCE AT SYNC, NOT JOINED ON THE FLY** (`radius_links`). The join is two hops
+  with a fuzzy fallback and that does not belong inside `list_org_devices`, the hottest query
+  in the app — which is deliberately left untouched. Storing it also makes the match
+  AUDITABLE: `match_by` says which evidence tied this customer to this slot.
+- **IDENTITY RANKS BELOW THE OPERATOR AND ABOVE THE OLT.** `onuroster.display_name` is now
+  `label || radius_name || name || serial || onu_key`, mirrored in `format.ts:onuName`. A
+  worker's typed label still wins — it is the human who stood there. RADIUS beats the walked
+  name because "VIJAY VIHAR HOTEL" beats `VVC-DLX`. **The row CARRIES it** (`_LABEL_JOIN`
+  gained `radius_links`/`radius_customers`), because the lesson of `onu_places.label` is that
+  a name visible only on the screen that captured it is indistinguishable from one never
+  saved.
+- **THE LAT/LONG COLUMNS ARE JUNK AND THE SURVEY IS NOT REPLACEABLE.** The panel has
+  `Latitude`/`Longitude` and 657 of 794 customers carry values: **443 rows read `0,0` and 214
+  read `1,1`** — two distinct points for the whole ISP. So RADIUS answers the identity half
+  of the survey (name and number for everyone, no field visit) and none of the location half.
+  Nothing in this subsystem writes `onu_places`. Checked, because importing them was the
+  obvious next move.
+- **EXPIRY AND BALANCE ARE STORED AS THE PANEL'S OWN STRINGS, UNPARSED.** `06/01/2024` is
+  day-first or month-first depending on a setting we cannot see, and a date we guessed wrong
+  is worse than a date we merely repeat. Nothing computes "expires in N days" off it.
+- **THE RECIPE IS DATA** (`radius_profiles`, built-in `cbp` = Excell Media's hosted panel),
+  the fourth such table after gpon/web-optics/web-mac and identical in every rule: closed
+  vocabulary, whole profile rejected on anything outside it, org_id NULL = global, a
+  same-named row shadows the built-in, a disabled row is a TOMBSTONE. Columns map by HEADING,
+  never by position. The other ISPs run different platforms, so this is what onboarding one
+  costs: a profile row.
+- **A PROFILE MAY NEVER CARRY A HOST — the ACCOUNT does** (`radius_accounts.base_url`,
+  refused if it carries a path, a query or userinfo). Same boundary `web_optics_profiles`
+  keeps for the tunnel: the recipe says which pages, the operator says which server, so a
+  recipe can never point the credential somewhere nobody authorised.
+- **CENTRAL TALKS TO IT DIRECTLY, NOT THROUGH THE EDGE** — the panel is on the public
+  internet, not the ISP's LAN, so there is no tunnel to ride and `weboptics`' whole transport
+  is inapplicable. Pure stdlib (`urllib` + a cookie jar), like `releasesync`. **Dormant by
+  construction**: nothing happens until an org has an account row, so the default-on flag
+  costs an unconfigured install nothing.
+- **THE LOGIN-PAGE GET IS A GATE, NOT A PREAMBLE.** A non-OK reply aborts with "the
+  credentials were NOT sent", the rule `weboptics.login` already keeps. Login success is
+  judged by whether the EXPORT came back as CSV rather than by a vendor-specific redirect —
+  a panel answering with a page instead of the export is what a wrong password looks like,
+  and that is reported as `login`, not as a mystery.
+- **THE OUTCOME IS PERSISTED** (`radius_status`, closed vocabulary ok | partial | skipped |
+  no_profile | no_credentials | unreachable | login | error; `last_ok_at` survives a failure).
+  An ONU with no customer name has four meanings — nobody configured a panel, the password is
+  wrong, the sync has been failing for a day, or this subscriber genuinely is not in billing —
+  and they take opposite actions. `partial` NAMES the columns the export did not carry.
+- **A CUSTOMER MISSING FROM ONE EXPORT IS KEPT, NEVER DELETED**, the rule `onu_user_macs`
+  keeps: far more likely a filtered read than a cancelled subscriber. Links are REPLACED
+  wholesale each sync, because a link is a claim about now.
+- Search reaches customer NAME, RADIUS USERNAME and MOBILE, in **both** halves — the
+  `onu_search_device_ids` prefilter and the in-Python filter — or an OLT whose only hit is a
+  customer name never gets scanned. That is the same trap `onu_places.label` fell into.
+- **An ISP CONNECTS ITS OWN PANEL** — Settings → Monitoring → **Billing / RADIUS panel**
+  (`components/radius-card.tsx`, owner-only, org-scoped). Brand is a dropdown built from the
+  server's own profile list, never a hardcoded set here, so a recipe added as DATA is
+  immediately selectable. The password is WRITE-ONLY (`password_set` is a boolean; blank means
+  "keep the stored one") and the address is validated server-side as a bare server. The status
+  chip writes the sentence from `radius_status`'s facts, so "nobody stored a password", "the
+  panel refused the sign-in" and "it has been failing since <ts>" never render alike. Without
+  this card the subsystem was reachable only by a script against the DB, which is no feature
+  at all for the other five ISPs.
+- **Still to do:** a per-customer session history and the complaints table (both of which the
+  CBP panel carries) are the obvious stage 3. Nothing here pages, and `radius.py` is imported
+  by no alerting shell — structurally incapable of paging, which is what lets it be this
+  opinionated.
+- Tests: `unit/test_radius` (the profile vocabulary, the base-URL refusals, the CSV parse
+  including a missing column REPORTED rather than guessed by position, and every match
+  refusal), `integration/test_central_radius` (the sweep and its gates, credentials-not-sent,
+  the login-vs-unreachable split, identity ranking, search by name/username/mobile, the
+  subscriber reply, and the org-delete cascade).
+
+#### MANY PANELS PER ORG, and what onboarding the next ISP actually costs (2026-08-13)
+
+Two more ISPs arrived the day this shipped and Hansa asked for a SECOND panel, which is one
+change, not two: **an account is a SOURCE and an org has a list of them.** `radius_accounts`
+is keyed on its own `id`, `radius_customers` on `(org, account, username)`, `radius_status`
+on the account, and `radius_links` carries `account_id` so "who is behind this ONU" stays
+answerable. **ORDER IS PRIORITY and order is `id`** — the panel connected first wins a tie,
+which needs no UI and is right by default.
+
+- **THE LINK PASS IS ORG-WIDE, NOT PER PANEL** (`RadiusSyncer.relink_org`), and this is the
+  one thing that would have broken silently: `replace_radius_links` deletes by ORG, so a
+  second panel linking from its own roster alone would delete the first's links every sweep
+  and the two would trade the fleet back and forth for ever.
+- **LINKING READS ONLY EACH PANEL'S LATEST READ** (`radius_customers.seen_seq`). Rows are
+  never deleted, so once the join reads STORED customers instead of the roster in hand, the
+  customer who used to own a router goes on claiming its MAC and makes the live one look
+  ambiguous — which links nothing. Exactly `current_roster`'s freshest-walk rule, needed for
+  exactly the same reason. **The marker is a COUNTER, not the timestamp**: two syncs inside
+  one second stamp the same `_now_iso()` and then both books read as current.
+- **TWO PANELS CLAIMING ONE MAC ARE SETTLED BY ORDER, NOT REFUSED** — and that is not a
+  softening of "an ambiguous match links nothing". The failure that rule prevents is a WRONG
+  LOCATION; two books describing one person name the SAME slot, so refusing would drop a real
+  subscriber to protect nothing. Two customers on one MAC INSIDE one panel is still the book
+  contradicting itself and still links nothing. Counted (`cross_panel`) rather than silent.
+- **`forbidden` IS ITS OWN STATE, and Badri Fiber Net paid for it.** Their CBP login SIGNS IN
+  and the export 302s to `/admin/notallowed`; read as "the panel answered with a page instead
+  of the export" that reported `login`, i.e. **an ISP sent to change a password that was never
+  wrong**. `fetch_roster` now looks at WHERE the export landed: same path = login, back at the
+  sign-in page = login, anywhere else = the account is not permitted to export, said in those
+  words. That account's user list renders with no export control at all, so this is a
+  permission to be granted on their side, not anything we can fix.
+- **A NEW LOGIN FLOW IS PART OF THE RECIPE** (`login_flow` = `form` | `encrypted-nonce`, the
+  `SESSION_STRATEGIES` precedent). MS Telecom runs **OneRadius** (Yii2), which mints a
+  one-time `enckey` on the sign-in page and AES-encrypts username AND password in the browser
+  with CryptoJS; it answers 500 to a plaintext post, so there is no way round it. The profile
+  names the fields to scrape (`csrf_field`, `nonce_field`) and which roles to encrypt; a
+  sign-in page carrying no nonce SENDS NOTHING and says so, the `login`-page-is-a-gate rule.
+  Its export is a bare GET, hence `roster_method`.
+- **`central/webcrypto.py` is the ONLY cipher in this codebase** — pure-stdlib AES-CBC plus
+  the CryptoJS PBKDF2-SHA512 envelope, because central is stdlib-only and `hashlib` has no
+  AES. It protects NOTHING of ours (TLS carries the request; the passphrase is the panel's own
+  public nonce), so it is written for clarity, not constant time — **do not reach for it as a
+  general-purpose primitive**; `secretbox.py` is what encrypts anything we store. Pinned to
+  the PUBLISHED FIPS-197 and NIST SP 800-38A vectors, never to itself: a round-trip test
+  passes just as happily against a wrong cipher, and the panel would answer 500 with nothing
+  to say why.
+- **A MAC CELL IS NOT ALWAYS ONE MAC** (`radius.mac_field`). OneRadius prints
+  `"F8:C4:F3:E7:BA:3E, F8:C4:F3:E7:BA:3E"` for **556 of MS Telecom's 1,017** addressed
+  customers; read whole it normalises to nothing and every one of them silently fails to
+  match — **121 links instead of 312 on that fleet**. Split, normalise each, one distinct MAC
+  or none: two DIFFERENT MACs in one cell is a genuine ambiguity and links nothing. Deliberately
+  unconditional and NOT a profile knob — a messy cell is not a vendor dialect, and a knob is
+  one more thing to get wrong per onboarding.
+- **AN AGGREGATE PORT IS NOT A SUBSCRIBER** (`MAX_SLOT_MACS` = 128). MS Telecom's OLT reports
+  **21,666 MACs against one ONU slot**; the largest legitimate slot anywhere on the live fleet
+  carries 34, so the gap is three orders of magnitude and the threshold is measured rather than
+  guessed. A crowded slot is dropped whole and counted — linking a customer there is the
+  wrong-house failure with a trunk port standing in for a house.
+- **Onboarding the next ISP is: a profile row, an account row, and a measurement.** What is
+  NOT negotiable is measuring the join before believing it — MS Telecom has **zero named ONUs**,
+  so the name fallback contributes nothing there and the MAC is the whole integration.
+- Tests: `unit/test_webcrypto` (the published vectors and the envelope), `unit/test_radius`
+  (`MultiPanelTest`, `MacFieldTest`, the aggregate-slot guard, the login-flow vocabulary),
+  `integration/test_central_radius` (`MultiPanelTest` — the sibling-wipe, per-panel status, one
+  username in two panels, per-panel delete; `ForbiddenTest`; `EncryptedLoginTest`;
+  `MigrationTest` — the one-panel install carrying across, idempotently).
+
+#### The customers page: the billing book joined to the network (2026-08-13)
+
+`central/customers.py` (compose-only, imported by no alerting shell) +
+`GET /api/inventory/customers` + `routes/customers-page.tsx` (nav `ownerOnly`), built as
+**directory + fault triage, deliberately NOT a mirror of the billing panel** — the rows are the
+JOIN's output: who is paying and dark, where each customer hangs, why the rest can't be matched.
+
+- **OWNER-ONLY ON BOTH LAYERS** (not in `_WORKER_GET`, AND the handler gates `_can_write`; the
+  nav entry carries `ownerOnly`). The full billing book with phone numbers is the largest PII
+  surface in the product; a worker keeps the per-subscriber panel, never the enumeration. An
+  unlinked customer has NO device, so worker scope-narrowing could not even apply to them.
+- **`net` is a closed vocabulary** (online | dark | frozen | stale | unlinked) **and keeps the
+  frozen rule**: a customer behind a DOWN or state-stale OLT reads `frozen`, never `dark` —
+  "6 of 6 dark" behind a down OLT is the OLT's outage restated per customer, and the ICMP page
+  owns it (same refusal `drops.py` and `ponfault` keep). "Paying & dark" therefore counts
+  active + dark off a FRESH walk of an UP OLT only; the frozen actives get their own count.
+- **EXPIRY PARSES ONLY UNDER A PROFILE-DECLARED `date_format`** (`radius_profiles.DATE_FORMATS`
+  = blank | dmy | mdy | iso | named-month; blank = stays unparsed, the old rule as the default).
+  The raw string is still what is STORED and shown; `radius.parse_expiry` derives a naive
+  panel-local timestamp at READ time and `days_until` compares calendar dates against today in
+  `WISP_DISPLAY_TZ`. cbp is `dmy` (proven: 448 live rows carry a day > 12); oneradius is
+  `named-month` (`08 Jan, 2024 11:59 pm` — the month is a word, so the order is unambiguous).
+  An impossible date parses to NOTHING, never to a guess.
+- **An unmatched customer carries a PROVABLE reason only** (`no_mac` / `mac_unseen` /
+  `mac_unresolved`) — computed from the billing MAC and the org's `onu_user_macs`, never from
+  the linker's transient internals. `mac_unresolved` deliberately does NOT claim which kind of
+  ambiguity: naming one we can't prove is the wrong-house failure in words.
+- **Every chip count is a recount of the rows it filters to** (client-side, one list) — the
+  /issues rule. A customer absent from a panel's LATEST read is KEPT (never-delete rule) and
+  marked "gone from billing", not silently equal to a current one.
+- **The subscriber panel composes ONE identity** (2026-08-13, the operator's own report:
+  Customer vs Billing read as redundant). `IdentityRows` merges name/phone/address with
+  per-fact provenance — the two phones are often DIFFERENT PEOPLE (on-site contact vs account
+  holder), so when they differ BOTH render, tagged `field`/`billing`; the Name row appears only
+  when the label and the billing name DISAGREE (the header already carries the display name).
+  `BillingSection` keeps only what billing alone can know: account, package, status, expiry,
+  provenance. A blank in one source still never hides the other's fact.
+- Tests: `unit/test_radius:ExpiryDateTest`, `integration/test_central_customers` (the worker
+  refusal, the frozen rule, expired-dark ≠ paying-dark, provable reasons, count agreement, the
+  kept-and-marked stale customer). Test-fixture trap already paid for: stamp fixtures at CALL
+  time, never module import — discovery imports every test file up front, so an import-time
+  "now" is stale by the time the file runs and every linked customer reads frozen.
+
 ### Topology extras
 
 - **Passive plant lives in org_devices** (`inventory.PASSIVE_TYPES` = splitter/closure/fdb —
@@ -1754,6 +2176,16 @@ raising `proxy_connect_timeout_s` would be treating the symptom.
   (fleet-watchdog NODE_STALE/OK) — don't merge.
 - **New columns on existing tables need `_ensure_columns`** in `CentralStore.__init__` or an
   existing `central.db` keeps the old schema. New tables need nothing.
+- **ON THE PROD BOX, EDITING THE SCHEMA MIGRATES THE LIVE DB WITHIN 15 MINUTES — no restart,
+  no deploy step, nothing to run.** `wisp-release-sync.timer` fires
+  `python3 -m wisp.central.admin sync-releases` from the repo working directory every 15
+  minutes, and the admin CLI opens `CentralStore(cfg.central_db)` = the live `data/central.db`,
+  which runs `__init__` and therefore every migration in the file you just saved. The running
+  `wisp-central` still holds the OLD code in memory, so the window between that timer and your
+  restart is exactly "new schema, old code" — harmless for a table nothing else touches,
+  a broken subsystem for anything hot. So: **write the migration, then restart central in the
+  same breath**, and never leave a half-finished schema edit saved on this box. Rehearsing on
+  a copy does not protect you here — the timer reads the SOURCE, not your copy.
 - `make_server`/`_make_handler` take an injectable `notifier` — tests inject a recording double;
   follow this for anything central sends.
 - **Routes live in `central/api/` route tables**, not `server.py` if/elif chains:
@@ -1803,7 +2235,10 @@ login.
   don't "clean them up" into a migration.
 - **Worker scope is ONE choke point**, `server.py:_WORKER_ROUTES`: a worker reaches
   me/outages/SSE/ack/post-mortem/own-password and 403s on every other `/api/*`, so a NEW route
-  is worker-blocked by default — widen the set deliberately.
+  is worker-blocked by default — widen the set deliberately. That is the ROUTE layer; since
+  2026-08-12 there is a second, DATA layer under it (`api/common.visible_device_ids`) that
+  narrows a worker to its assigned devices within the routes it may reach. Both apply; reaching
+  a route says nothing about seeing every row in it.
 - **Every worker check gates on IDENTITY before role — server AND SPA.** A superadmin is
   `org_id IS NULL` and its `role` is meaningless, so it must be exempted first, in BOTH
   `_worker_blocked` and `require-auth.tsx`. When the collapse made the org default `worker` the
@@ -2822,6 +3257,21 @@ the old model creeps back.
   (`org_plant_feed_map` over `fiber.feed_map`), and DECLARED still wins. A feed arriving
   THROUGH a customer is dropped rather than reported: the walk follows a daisy chain
   correctly, but that map is device→device and there is no id to name a subscriber with.
+- **THE FEED FLOOD RUNS DOWN THE GEAR TREE, NOT FROM THE NEAREST GEAR** (2026-08-12;
+  `fiber.feed_map(rank=)`, ranks = declared tree depth via `store_devices._tree_depths`).
+  The blind nearest-in-hops flood read JC-3 — a backbone closure between HALIYA-WAN-SW and
+  its OLTs — as "FED FROM SRPL-OLT": the OLT sat two hops away and the switch that feeds it
+  three, so the panel named an OLT feeding its own uplink. Shallower gear floods FIRST and
+  the wave passes THROUGH deeper gear (an OLT hands light onward to its splitters), so a
+  deeper root seeds only a component no shallower flood reaches — which is what keeps
+  badri_fiber right, where OLT uplinks are not in the glass and every OLT must still source
+  its own island. Consequences worth keeping: the tray's `side` flag now marks the TRUE
+  feed half (the drum view leads with it), and gear itself can be claimed by the flood —
+  harmless by construction, because a gear point ranks above 0 only when it HAS a declared
+  parent, exactly the case `org_plant_feed_map` ignores. Depths walk DECLARED parents only,
+  cycle-pinned flat rather than spun. Verified on a copy of prod: all eleven byreddy
+  closures chain from HALIYA-WAN-SW. `FeedMapTest`,
+  `integration/test_central_cableplant:FeedDirectionTest`.
 
 **A FIBRE LANDS ON A PORT** (2026-08-10, the ISPs' second correction, on first contact
 with the map: *"when I select an OLT it should show me ports, that's what we connect"*).
@@ -2877,6 +3327,33 @@ closure mid-span — turned out to be one point: **what you connect to is a port
   it that way); an interface name is one only if it SAYS so. The list is a SET, never a
   range — HILL-OLT-1 really runs 1,3,4,…8, and a stray `60` from a partial walk costs one
   odd row instead of fifty-two invented ones.
+- **A PON IS STORED BY INDEX AND PRINTED BY THE BOX'S OWN NAME** (`fiber.pon_names` →
+  `fiber.port_display`, 2026-08-12, reported from the field: *"I was trying to correct
+  SRPL-OLT port GE0/1 but in the closure the ports shown are different."* They were not a
+  different SET — the picker offered exactly the eight real sockets, and the other 57 rows
+  on that OLT's Ports tab are the per-ONU pseudo-interfaces plus `VLAN1`, correctly
+  refused. They were a different VOCABULARY: four rows read `GE0/1..4` straight off the
+  walk and four read `PON 1..4`, our arithmetic, for a box whose Ports tab, Optical tab and
+  silkscreen all say `EPON0/1`. **Half a menu in the operator's words and half in ours
+  reads as the wrong box.**
+  - The REF stays the index — it is what joins to `onu_optics.pon_port`, what
+    `pon_of_points` inherits down the plant chain, and the one form `EPON0/3` and the
+    Syrotech build's bare `3` both reduce to. **Display only; nothing stored moves**
+    (`test_naming_a_PON_never_moves_the_REF_it_is_STORED_under`).
+  - **A bare number is NOT a name.** The Syrotech roster writes `3`, and `PON 3` beats `3`
+    — so that source is left alone and the canonical `port_label` stands. Same for the four
+    OLTs on this fleet that walk no ifTable, and for a PON somebody named by hand that no
+    walk has ever reported: those keep `PON n`, honestly, and must not be made to match.
+  - **The WALK wins over the roster**, which is the only case they can differ — an
+    interface name is the box naming its own socket.
+  - It is resolved SERVER-SIDE at one call, so the org-wide picker, the box's own panel and
+    the schedule's far-end row cannot drift; the SPA's `portName(ports, kind, ref)` looks a
+    port up in that box's list rather than rebuilding the string, and `portLabel` stays the
+    canonical mirror and the fallback. Pinned together by
+    `test_a_PON_IS_NAMED_THE_WAY_THE_BOX_NAMES_IT_wherever_it_is_printed`.
+  - **STILL ON OUR INDEX: `splitter-panel.tsx`'s `ponChip`** (`fibre_pon.pon_no` → "PON 3"
+    on a box the operator typed `EPON0/3` on). Different sentence, and naming it would put
+    an org-wide port-name read on `list_org_devices`, the hottest query in the app.
 - **A DROP IS A FIBRE ON A LEG, and `onu_drops` is not being merged into anything.** It is
   live, it carries the map's drop geometry and branch-fault localization runs on it — so
   the leg rows REPORT it (read-only; recording stays the splitter's bulk dialog, or one
@@ -3115,8 +3592,9 @@ Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`)
    — `RouteEdit.endA`/`endB`, set as they are clicked and never inferred afterwards from
    coordinates, because two boxes racked at one point would be indistinguishable. One
    sheet then asks for a name and a fibre count (a row of chips, not a select — the count
-   is read off a drum tag). **An end that landed on open ground becomes a COUPLER**, which
-   is what makes "a cable runs between two couplers" true by CONSTRUCTION rather than by a
+   is read off a drum tag). **An end that landed on open ground becomes a CLOSURE** (it
+   created a `coupler` until the 2026-08-11 rename — see THE RECORD STARTS FULL), which
+   is what makes "a cable runs between two closures" true by CONSTRUCTION rather than by a
    rule.
    - **THE SNAP HAS TWO BUDGETS AND THE LARGER WINS** (`SNAP_PX` 24 / `SNAP_M` 8), and one
      budget cost this feature its first two real users. On 2026-08-10 badri_fiber traced
@@ -3139,7 +3617,8 @@ Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`)
      threshold always has a wrong side; noticing does not. Accepting moves the END and
      **never the geometry** — the route stays where it was walked.
 2. **Open a closure mid-span** (`cablepath.split`, `POST /api/inventory/cable/split`). The
-   segment is cut at the click, a coupler stands at the cut, **every core is spliced
+   segment is cut at the click, a closure stands at the cut (a `coupler` row until the
+   2026-08-11 rename), **every core is spliced
    straight through**, and the joints at each far end move to the half that still reaches
    them. This is what keeps segment-per-span from being a tax: a crew tapping a street does
    not redraw the street. **Every core, not just the recorded ones** — splitting a sheath
@@ -3153,7 +3632,7 @@ Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`)
      the polyline is `interactive={false}` (it must stay so, or it swallows the placement
      clicks this map is also for), so reaching it meant knowing to click the cable's name
      chip first. A capability nobody can find is indistinguishable from one that is
-     missing. "Coupler" is the row; "closure" is what a crew straps to a pole.
+     missing. (This note predates the rename: the row it writes is a closure now too.)
    - **AN UNTRACED CABLE CAN BE OPENED TOO.** The cut needs a line, so with no route the
      honest line is the CHORD between the two recorded ends — the dashed line the map is
      already drawing, and the one that was just pointed at. Refusing made "put a closure
@@ -3202,6 +3681,29 @@ Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`)
    argument for the form: the two-column view could not express it at all.
    **The arcs are gone and nothing was lost** — their one job was showing 1:1 across two
    cables, and a collapsed run says that in words AND states the core numbers.
+   **A CUT DRUM IS ONE SCHEDULE** (2026-08-12, the operator's own read of JC-3: *"why is
+   there a drop down that shows two side of cables at the closure"*). Opening a closure
+   mid-span stores TWO cables — the segment model, correct — and both halves keep the
+   drum's name, so the picker offered "6F · main" twice, told apart only by a small
+   far-end hint, and a core cut and USED on one side read "+ join" on the other with
+   nothing saying the spare glass existed: the panel hiding the work just done, the
+   two-column tray's failure back through another door. Exactly two non-plumbing cables
+   sharing a name and a count at one point render as the drum they are
+   (`lib/fiber.ts:cutPairs` — the pairing `split_org_cable` produces by construction):
+   ONE picker entry, hinted `JC-6 ↔ main JC2` like a trace; one row per core, where
+   straight-through runs collapse with no cable named (it is the drum itself), a used
+   core shows its joint AND `spare · toward <far>` on the same row, and a crossing reads
+   `core m · toward <far>` and never collapses. A spare side's `+ join` sources ITS OWN
+   side's glass; a both-free core's run action defaults to the FEED side — the glass a
+   new box would actually be lit from, which is also why the drum's numbering leads with
+   the feed half. VIEW-LEVEL ONLY: storage stays two segments (the half-coupler's
+   standing — a view, not a constraint); three same-named segments cannot pair and fall
+   back to the per-cable picker; two genuinely distinct drums sharing name+count merge
+   on screen with every row still truthful, and renaming separates them. The closed fold
+   and the FibrePanel summary count a pair ONCE, and every splice-target menu names a
+   pair member `toward <far>` — two menu rows both reading "main · 6F" is the same
+   defect one level down. Any DEEPER merge (one record, one rename) would need split
+   provenance the schema deliberately does not store.
 4. **Take a core to a box** — a joint with no second cable. `b_cable_id IS NULL` is the
    TERMINATION, and it is the only way a core is attached to equipment, which is why
    connecting a device needs no route and no table of its own.
@@ -3332,13 +3834,75 @@ Tests: `unit/test_fiber` (`PlumbingTest`, `EveryBoxHasPortsTest`, `UndrawnTest`)
   - **`cableLines` resolves the geometry ONCE** for the render and the budget. On a traced
     street the midpoint of the line as drawn is nowhere near the chord's, and computing it
     twice is exactly how a budget reports itself clear over a visible collision.
-- **The Layers control is "Dependency links", NOT "Links with no cable"** — the old name
-  went stale the day the segment model landed. It was written when a topology link could
-  carry a cable and most did not; a link now carries no plant record BY CONSTRUCTION, so the
-  set it hides is not "the ones nobody got to yet" but all of them, always. A control naming
-  a state that can no longer occur reads as broken, and this one is the answer to the
-  commonest fibre complaint (dashed dependency lines shouting over surveyed cable): switching
-  it off leaves a pure plant map. The legend gained the two CABLE rows it never had — traced
+- **RECORDED GLASS WINS: a dependency chord STANDS DOWN once the fibre joins its pair**
+  (`fiber.connected_spans` → `store.org_cabled_pairs` → the cables reply's `cabled_pairs`,
+  `map-page.tsx:standsDown`, 2026-08-12, operator: *"now that I am using main 6F fibre to
+  connect those both... that dotted line should disappear right"*). It should, and it did
+  not: the chord and the sheath drew the same connection twice, one of them a straight line
+  through ground nothing runs under. Automatic — the operator's call — so **what stays dashed
+  IS the to-do list**, and the Layers switch governs only those.
+  - **Through a CLOSURE counts.** `HALIYA-WAN-SW → JC1 → main → JC2 → SRPL-OLT` is three
+    cables and one connection; a closure is where a sheath is opened, not where the light
+    stops. Same walk `undrawn` reads (`connected_points` is now `set(connected_spans(…))`),
+    so the map and the draft can never disagree about what counts as recorded.
+  - **THE RATE CHIP MOVES ONTO THE SHEATH — it is not dropped** (operator's pick). It rides
+    the BIGGEST cable on the run in cores (the 6F trunk, never the 26 m 1F tails either
+    side), ties on the lower id so the choice is stable across reloads. `linkRateBody` is ONE
+    grammar for both marks: a reading that changed shape as the plant record filled in would
+    read as two measurements of one port. **Only a REAL reading moves** — with no fresh
+    counter the chord's fallback is the port NAME, and `main 6F · GE0/1` on a sheath reads as
+    though the cable were called GE0/1.
+  - **THE SHEATH INHERITS THE CHORD'S VISIBILITY, NOT PLANT'S — so a stood-down pair NEVER
+    reverts to a dotted line** (operator, same day: *"when I zoom out that solid line
+    disappears and dotted line comes up but I don't want dotted line at any zoom level"*).
+    The first cut let the chord return below the plant floor (Map detail → passives, 13),
+    reasoning that a chord may only stand down for a line actually on screen — true, and the
+    operator's answer is the better one: light the sheath at every zoom instead. It costs no
+    ink, because each of these lines stands in for a dependency line that was already drawn
+    there; the floor exists to stop dense plant smearing, and this is not extra plant. Same
+    shape as the floor's existing dark-splitter exemption.
+  - **THE EXEMPTION IS THE WHOLE RUN, not the labelled sheath** (`connected_spans` returns
+    `{label, path}`; `cable_ids` on the wire). Lighting `main` alone would leave the 1F tails
+    either side of it dark and the line would stop dead at a closure — the "no line ends in
+    empty ground" rule. The intermediate closures stay hidden and that is correct: the
+    polylines chain through them, and the run's two ENDS are gear, drawn at every zoom.
+    Verified z15→z9 on live data: 3 plant lines and no chord at every level.
+  - **THE RELOCATED CHIP KEEPS ITS RANK.** Left in the later cable pass it competed at 244px
+    against every link chip claimed first and lost — the busiest link going quiet the moment
+    its plant was recorded, the opposite of what recording plant should do. One pass, ranked
+    by `bwRank`, whichever mark carries it; the plain cable-name chip stays in the second.
+  - **RE-MEASURED, because a claim carries its own half-width**: a bare `main 6F` chip is
+    65px and the same chip with `↓70M ↑5.3M` is **175** against the 136 the cable family
+    reserved. `CHIP_HALF.cableRate` = 122. Re-measure on any content change.
+  - **A CHORD THAT REACHES THE SCREEN IS ALWAYS UNSURVEYED NOW**, so it is always dashed. It
+    used to go solid when a cable joined the pair directly — but such a pair stands down the
+    moment its sheath draws, so the only way that line survives is that no cable is on screen
+    to be the surveyed one.
+  - **THE DISTANCE READOUT MOVES ONTO THE SHEATH TOO, and the probe reads what the map DRAWS**
+    (`map-page.tsx:hoverLines`, `linkhover.tsx`, 2026-08-13, operator: *"when I hover over
+    straight line it is showing the distance metric … but when I lay out fiber that distance
+    hover should be over the [fibre] line"*). `LinkHoverProbe` was still fed every
+    `drawnLinks` entry, stood-down ones included, so hovering EMPTY GROUND beside the sheath
+    printed `5.7 km HALIYA-WAN-SW · 7.8 km PDVR-OLT · straight-line` — a measurement of a line
+    that is not on screen, and a `straight-line` note about ground that had just been surveyed.
+    Same rule the chip budget already keeps (a chip nobody draws may not reserve pixels), and
+    the same fix: `standsDown` and the Dependency-links switch are taken in the probe list, and
+    every drawn cable joins it. **The readout names the cable's OWN ends** — the closures a
+    crew drives to — never the run's, which is a sum this line cannot show; it names no cable,
+    which is why plumbing can be measurable here without being labelled.
+    **`HoverLink.straight` replaced `drawn`+`fromCable`**: one flag, "these metres are a chord,
+    not a walk", so a traced cable prints drum metres bare and an untraced one carries the note
+    a chord does. (`from_cable` had not been sent by the server since the segment model landed,
+    so `along the cable` was unreachable — the note is now what the CSS always said it was.)
+    Verified in a browser on a copy of prod, both themes, with an A/B on the probe list: on the
+    traced `PDVR` sheath `5.8 km PDVR JC1 · 9.1 km PDVR JC2` (= its stored 14 942 m) and no
+    note; on an untraced 1F tail `25 m · 26 m · straight-line`; on an uncabled chord unchanged;
+    over the stood-down chord, nothing.
+- **The Layers control is "Dependency links", NOT "Links with no cable"** — but its old
+  meaning is BACK, earned rather than assumed: since a recorded pair now drops its own line,
+  the set left dashed really is "the ones nobody got to yet". (Between the segment model and
+  2026-08-12 it was every link, always, which is why the name changed.) Switching it off
+  leaves a pure plant map; leaving it on leaves the to-do list. The legend gained the two CABLE rows it never had — traced
   and untraced, the pair a crew must tell apart because one is a route they quote drum
   against and the other is an admitted straight line.
 - **A STRAND COLOUR MAY NEVER BE A LINE'S STROKE, AND NEVER TEXT.** TIA-598-D contains red,

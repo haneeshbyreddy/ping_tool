@@ -4,6 +4,7 @@ import logging
 import math
 from datetime import timedelta
 
+from wisp.central import history
 from wisp.central.notify_policy import AlertRouter
 from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
@@ -89,6 +90,7 @@ class CentralOpticsMonitor:
                  self.store.list_onu_optics(self.org_id, device_id)}
 
         total = online = warn_count = crit_count = crit_unacked = 0
+        acc = history.OpticsAccumulator()
         for raw in raw_onus:
             onu_key = str(raw.get("onu_key") or "").strip()
             if not onu_key:
@@ -103,6 +105,7 @@ class CentralOpticsMonitor:
                 warn_count += 1
             elif sev == SEV_CRIT:
                 crit_count += 1
+            acc.add(raw.get("pon_port"), state, rx, sev)
 
             prev = prior.get(onu_key)
             ref, ref_at = _next_ref(
@@ -123,6 +126,8 @@ class CentralOpticsMonitor:
 
         self._update_badge(device_id, total, online, warn_count, crit_count,
                            crit_unacked, ts)
+        history.record_optics(self.store, self.cfg, self.org_id, device_id,
+                              ts, acc)
 
     def _update_badge(self, device_id: int, total: int, online: int, warn_count: int,
                       crit_count: int, crit_unacked: int, ts: str) -> None:

@@ -9,8 +9,10 @@ from wisp.central import issues as central_issues
 from wisp.central import pdf as central_pdf
 from wisp.central import rollup as central_rollup
 from wisp.central import xlsx as central_xlsx
-from wisp.central.api.common import (can_triage, now_iso, olt_liveness,
-                                     org_or_400, q_int_or, reader_or_401)
+from wisp.central.api.common import (DENIED, can_triage, in_scope, keep_visible,
+                                     now_iso, olt_liveness, org_or_400,
+                                     q_int_or, reader_or_401,
+                                     triage_outage_org, visible_device_ids)
 
 
 def summary(h, qs):
@@ -20,9 +22,12 @@ def summary(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
+    scope = visible_device_ids(h, user, org)
     h._reply(200, {"uplink_down": h.store.uplink_active(org),
-                   "low_bandwidth": h.store.low_bandwidth_alarms(org),
-                   "high_bandwidth": h.store.high_bandwidth_alarms(org)})
+                   "low_bandwidth": keep_visible(
+                       h.store.low_bandwidth_alarms(org), scope),
+                   "high_bandwidth": keep_visible(
+                       h.store.high_bandwidth_alarms(org), scope)})
 
 
 def events(h, qs):
@@ -40,7 +45,13 @@ def list_open(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    h._reply(200, {"outages": h.store.triage_outages(org)})
+    rows = h.store.triage_outages(org)
+    scope = visible_device_ids(h, user, org)
+    if scope is not None:
+        me = user["username"]
+        rows = [r for r in rows if r.get("device_id") in scope
+                or me in (r.get("assigned_to") or [])]
+    h._reply(200, {"outages": rows})
 
 
 def logs(h, qs):
@@ -56,7 +67,9 @@ def logs(h, qs):
         before_id = int(before_raw) if before_raw is not None else None
     except ValueError:
         before_id = None
-    h._reply(200, {"events": h.store.list_events(org, limit, before_id)})
+    h._reply(200, {"events": keep_visible(
+        h.store.list_events(org, limit, before_id),
+        visible_device_ids(h, user, org))})
 
 
 def analytics(h, qs):
@@ -69,8 +82,10 @@ def analytics(h, qs):
     days = q_int_or(qs, "days", 30)
     since, until = central_analytics.window(days)
     h._reply(200, {"since": since, "until": until,
-                   "devices": central_analytics.device_reliability(
-                       h.store, org, since, until)})
+                   "devices": keep_visible(
+                       central_analytics.device_reliability(
+                           h.store, org, since, until),
+                       visible_device_ids(h, user, org))})
 
 
 def analytics_trend(h, qs):
@@ -84,6 +99,9 @@ def analytics_trend(h, qs):
         return
     org = h.store.device_org(did)
     if org is None or not (user["is_superadmin"] or user["org_id"] == org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    if not in_scope(visible_device_ids(h, user, org), did):
         h._reply(403, {"error": "forbidden"})
         return
     days = q_int_or(qs, "days", 7)
@@ -108,14 +126,19 @@ def pon_faults(h, qs):
         if org is None or not (user["is_superadmin"] or user["org_id"] == org):
             h._reply(403, {"error": "forbidden"})
             return
+        scope = visible_device_ids(h, user, org)
+        if not in_scope(scope, did):
+            h._reply(403, {"error": "forbidden"})
+            return
         rows = h.store.org_onu_rows(org, did)
     else:
         org = h._scope_org(user, qs)
         if not org:
             h._reply(400, {"error": "org required"})
             return
-        rows = h.store.org_onu_rows(org)
-    devs = h.store.list_org_devices(org)
+        scope = visible_device_ids(h, user, org)
+        rows = keep_visible(h.store.org_onu_rows(org), scope)
+    devs = keep_visible(h.store.list_org_devices(org), scope, "id")
     now = datetime.now(timezone.utc)
     down_olts, stale_olts = olt_liveness(devs, now, h.cfg.central_node_stale_s)
     skip = down_olts | stale_olts
@@ -134,8 +157,9 @@ def pon_summary(h, qs):
     if not org:
         return
     now = datetime.now(timezone.utc)
-    rows = h.store.org_onu_rows(org)
-    devs = h.store.list_org_devices(org)
+    scope = visible_device_ids(h, user, org)
+    rows = keep_visible(h.store.org_onu_rows(org), scope)
+    devs = keep_visible(h.store.list_org_devices(org), scope, "id")
     down_olts, stale_olts = olt_liveness(devs, now, h.cfg.central_node_stale_s)
     seen_rows = [r for r in rows if r["device_id"] not in stale_olts]
     live_rows = [r for r in seen_rows if r["device_id"] not in down_olts]
@@ -184,8 +208,10 @@ def incident_shape(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    found = incidents.evaluate(h.store.list_org_devices(org),
-                               datetime.now(timezone.utc))
+    found = incidents.evaluate(
+        keep_visible(h.store.list_org_devices(org),
+                     visible_device_ids(h, user, org), "id"),
+        datetime.now(timezone.utc))
     h._reply(200, {"incidents": [i.as_dict() for i in found]})
 
 
@@ -198,6 +224,23 @@ def _kinds_arg(qs) -> list[str] | None:
     return picked or None
 
 
+def _visible_issues(h, user, org, rows):
+
+    scope = visible_device_ids(h, user, org)
+    if scope is None:
+        return rows
+    out = []
+    for r in rows:
+        did = r.get("device_id")
+        if did is not None:
+            if did in scope:
+                out.append(r)
+        elif r.get("kind") == "probe_stale" and scope.intersection(
+                h.store.node_device_ids(org, r.get("subject") or "")):
+            out.append(r)
+    return out
+
+
 def issues(h, qs):
     user = reader_or_401(h)
     if not user:
@@ -205,7 +248,7 @@ def issues(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    rows = central_issues.collect(h.store, h.cfg, org)
+    rows = _visible_issues(h, user, org, central_issues.collect(h.store, h.cfg, org))
     kinds = _kinds_arg(qs)
     shown = ([r for r in rows if r["kind"] in set(kinds)] if kinds else rows)
     h._reply(200, {"issues": shown, "counts": central_issues.counts(rows),
@@ -232,7 +275,7 @@ def issues_pdf(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    rows = central_issues.collect(h.store, h.cfg, org)
+    rows = _visible_issues(h, user, org, central_issues.collect(h.store, h.cfg, org))
     kinds = _kinds_arg(qs)
     if kinds:
         want = set(kinds)
@@ -276,7 +319,7 @@ def issues_xlsx(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    rows = central_issues.collect(h.store, h.cfg, org)
+    rows = _visible_issues(h, user, org, central_issues.collect(h.store, h.cfg, org))
     kinds = _kinds_arg(qs)
     if kinds:
         want = set(kinds)
@@ -297,9 +340,8 @@ def issues_xlsx(h, qs):
 
 def acknowledge(h, user, body):
     oid = int(body.get("outage_id") or 0)
-    org = h.store.outage_org(oid)
-    if not can_triage(user, org):
-        h._reply(403, {"error": "forbidden"})
+    org = triage_outage_org(h, user, oid)
+    if org is DENIED:
         return
     ok = h.store.acknowledge_outage(org, oid, user["username"])
     h._reply(200 if ok else 404, {"ok": ok})
@@ -375,12 +417,11 @@ def accept(h, user, body):
 
 
     oid = int(body.get("outage_id") or 0)
-    org = h.store.outage_org(oid)
-    if org is None:
+    if h.store.outage_org(oid) is None:
         h._reply(404, {"error": "no such outage"})
         return
-    if not can_triage(user, org):
-        h._reply(403, {"error": "forbidden"})
+    org = triage_outage_org(h, user, oid)
+    if org is DENIED:
         return
     outcome = h.store.accept_outage(org, oid, user["username"])
     if outcome in ("missing", "closed"):
@@ -419,9 +460,8 @@ def _tell_assigner(h, org, row, who: str) -> None:
 
 def postmortem(h, user, body):
     oid = int(body.get("outage_id") or 0)
-    org = h.store.outage_org(oid)
-    if not can_triage(user, org):
-        h._reply(403, {"error": "forbidden"})
+    org = triage_outage_org(h, user, oid)
+    if org is DENIED:
         return
     cause = str(body.get("root_cause") or "").strip()
     if not cause:

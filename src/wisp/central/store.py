@@ -12,8 +12,10 @@ from wisp.central.store_users import UserStoreMixin
 from wisp.central.store_fleet import FleetStoreMixin
 from wisp.central.store_devices import DeviceStoreMixin
 from wisp.central.store_field import FieldStoreMixin
+from wisp.central.store_history import HistoryStoreMixin
 from wisp.central.store_outages import OutageStoreMixin
 from wisp.central.store_proxy import ProxyStoreMixin
+from wisp.central.store_radius import RadiusStoreMixin
 from wisp.central.store_snmp import SnmpStoreMixin
 from wisp.central.store_util import (  # noqa: F401
     SNMP_STATUS_STATES, SNMP_SUBSYSTEMS, SNMP_WALKS_KEEP,
@@ -522,6 +524,46 @@ CREATE TABLE IF NOT EXISTS onu_web_optics (
 );
 CREATE INDEX IF NOT EXISTS idx_onu_web_optics_device
     ON onu_web_optics(org_id, device_id);
+-- The MAC a SUBSCRIBER'S OWN equipment presents behind an ONU, read off the
+-- OLT's address table (central/webmacs.py). Not the ONU's MAC: on the GPON
+-- fleet the ONU has no MAC at all (its identity is a GPON serial like
+-- ZTEGcbd796ed), so this is the only address that customer has, and it is what
+-- the ISPs' RADIUS app is keyed on. Before this they read it by opening the
+-- OLT's per-ONU page one customer at a time.
+--
+-- Its own table, for the reason onu_web_optics is: the address table rides its
+-- own clock and one table would make "which half of this row is fresh?"
+-- unanswerable. Joined to the roster on (device_id, onu_key) — the SLOT, never
+-- the serial, the same identity rule parse_onu_table keeps.
+--
+-- ONE SLOT MAY CARRY SEVERAL, so the MAC is part of the key: a customer router
+-- plus what is bridged behind it, or one device presenting on several service
+-- VLANs (1-5 observed per slot in the field). Picking one would be a guess
+-- about which is "the" customer.
+--
+-- ROWS ARE NEVER DELETED, only re-stamped. This is a LEARNED forwarding table
+-- and it ages out, so an ONU that is offline or merely idle drops off the page
+-- while still being the same customer with the same router. Keeping the last
+-- known address (with its date, so the UI can grade it) is what makes this
+-- useful for exactly the customer who has gone down — and a MAC that has aged
+-- out is stale, not absent. A subscriber who changes router accumulates a
+-- second row, which is honest and is also what RADIUS will still be holding.
+CREATE TABLE IF NOT EXISTS onu_user_macs (
+    org_id        TEXT NOT NULL,
+    device_id     INTEGER NOT NULL REFERENCES org_devices(id),   -- the OLT
+    onu_key       TEXT NOT NULL,   -- "<pon>.<onu_id>", the roster's own key
+    mac           TEXT NOT NULL,   -- as the page prints it, upper, colon-separated
+    vlan          TEXT,            -- service VLAN, straight off the same row
+    kind          TEXT,            -- Dynamic | Static, the OLT's own word
+    port_label    TEXT,            -- e.g. "EPON0/8:38" / "PON2:ONU36", as printed
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    PRIMARY KEY (device_id, onu_key, mac)
+);
+CREATE INDEX IF NOT EXISTS idx_onu_user_macs_device
+    ON onu_user_macs(org_id, device_id);
+CREATE INDEX IF NOT EXISTS idx_onu_user_macs_mac
+    ON onu_user_macs(org_id, mac);
 -- Per-OLT optical badge — one row per OLT, restart-safe like device_redundancy/
 -- device_perf. Carries the summary counts the OLT row/header render and the
 -- transition-only paging state (page when crit_count crosses 0 -> >0, recover at 0),
@@ -777,6 +819,244 @@ CREATE TABLE IF NOT EXISTS web_optics_status (
     state       TEXT NOT NULL,
     detail      TEXT,
     rows        INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL,
+    last_ok_at  TEXT
+);
+-- Vendor recipe for the OLT's ADDRESS TABLE page, the same shape and the same
+-- rules as web_optics_profiles (closed vocabulary, whole profile rejected on
+-- anything outside it, org_id NULL = global, a same-named row shadows a
+-- built-in, a disabled row is a tombstone that switches it off).
+--
+-- SEPARATE from web_optics_profiles on purpose, and the reason is a hardware
+-- fact: syrotech_gpon serves this page and provably has NO optical page (the
+-- OPM path 404s on that build), so a MAC recipe folded into the optics one
+-- could never be configured for the very fleet where it matters most — a GPON
+-- ONU has no MAC of its own. The reverse holds too: a vendor may publish
+-- optics and no address table. The two pages fail, and are onboarded,
+-- independently. The LOGIN half is duplicated in the spec but not in the code:
+-- both go through weboptics.login, so there is one implementation of "send the
+-- credential only after the login page answered".
+CREATE TABLE IF NOT EXISTS web_mac_profiles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT,                    -- NULL => global
+    name        TEXT NOT NULL,
+    spec        TEXT NOT NULL,           -- JSON, closed vocabulary
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_web_mac_profiles_scope
+    ON web_mac_profiles(IFNULL(org_id, ''), name);
+-- Outcome of the last address-table read, per OLT — same job and the same
+-- closed vocabulary as web_optics_status, because a blank MAC column has the
+-- same several meanings: this vendor has no recipe, nobody stored the OLT's
+-- password, the read has been failing for a day, or the page was TRUNCATED.
+-- 'partial' is the truncation case and it is not cosmetic: a short read makes
+-- customers who do have an address render exactly like customers who do not.
+CREATE TABLE IF NOT EXISTS web_mac_status (
+    device_id   INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    org_id      TEXT NOT NULL,
+    profile     TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL,
+    detail      TEXT,
+    rows        INTEGER NOT NULL DEFAULT 0,
+    declared    INTEGER,                 -- the OLT's own total, where it prints one
+    updated_at  TEXT NOT NULL,
+    last_ok_at  TEXT
+);
+-- CCTV: an NVR's cameras, read off the NVR's own web API through the tunnel
+-- (central/nvr.py + the weboptics sweeper). Cameras are a ROSTER, never
+-- org_devices rows — the ONU rule: the tree, billing and the engine fingerprint
+-- must not know a camera exists. Identity is the CHANNEL (the slot), never the
+-- camera's IP — an IP is a fact ABOUT the row. last_online_at FREEZES when a
+-- channel leaves 'online' (the onu_optics rule), so "dark since Tuesday" needs
+-- no history table. Unlike onu_optics this table IS pruned on a complete read:
+-- the source is deliberate config, not a learned table, so a channel the
+-- operator removed from the NVR disappearing here is the honest reading.
+-- state is a closed vocabulary: online | offline | unknown — an absent or
+-- unrecognised state cell reads 'unknown', never 'offline' (the gpon lesson:
+-- a decode gap must not render live cameras dark or page a fabricated drop).
+CREATE TABLE IF NOT EXISTS nvr_channels (
+    org_id         TEXT NOT NULL,
+    device_id      INTEGER NOT NULL REFERENCES org_devices(id),
+    channel_no     INTEGER NOT NULL,     -- the NVR's own 0-based slot
+    name           TEXT,
+    ip_address     TEXT,
+    port           INTEGER,
+    camera_kind    TEXT,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    monitored      INTEGER NOT NULL DEFAULT 1,  -- operator column, sweep never writes it; unlike ports it defaults ON (8 deliberate cameras, not 28 walked interfaces)
+    state          TEXT NOT NULL DEFAULT 'unknown',
+    last_online_at TEXT,
+    first_seen_at  TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (device_id, channel_no)
+);
+CREATE INDEX IF NOT EXISTS idx_nvr_channels_org
+    ON nvr_channels(org_id, device_id);
+-- Outcome of the last channel read, per NVR — the web_mac_status shape and the
+-- same reason: an empty Cameras tab has several meanings (no brand set, no
+-- stored login, the read failing for a day, a build with no channel table) and
+-- they take opposite actions. last_ok_at survives a failure.
+CREATE TABLE IF NOT EXISTS nvr_status (
+    device_id   INTEGER PRIMARY KEY REFERENCES org_devices(id),
+    org_id      TEXT NOT NULL,
+    profile     TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL,           -- ok|partial|skipped|no_profile|no_credentials|unreachable|login|error
+    detail      TEXT,
+    channels    INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL,
+    last_ok_at  TEXT
+);
+-- NVR vendor recipes — the fifth profile table, same rules as gpon/web-optics/
+-- web-mac/radius: closed vocabulary, whole profile rejected on anything outside
+-- it, org_id NULL = global, a same-named row shadows the built-in, a disabled
+-- row is a tombstone. Paths only, never a host (the tunnel boundary).
+CREATE TABLE IF NOT EXISTS nvr_profiles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT,                    -- NULL => global
+    name        TEXT NOT NULL,
+    spec        TEXT NOT NULL,           -- JSON, closed vocabulary
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nvr_profiles_scope
+    ON nvr_profiles(IFNULL(org_id, ''), name);
+-- The org's RADIUS/billing panel: WHERE it is and WHO we sign in as. The recipe
+-- (which pages, which columns) is radius_profiles; this row is the one thing that
+-- cannot be shared, and it is deliberately the ONLY place a host is stored. The
+-- profile carries paths alone, exactly as web_optics_profiles does, so a recipe
+-- can never point the credential at a server nobody authorised.
+-- MANY rows per org, not one (2026-08-13). An ISP can run several billing
+-- panels at once -- Hansa asked for a second the week the first went live, and
+-- two brands or two franchise areas on two platforms is the ordinary shape, not
+-- an edge case. So an account is the SOURCE, identified by its own id, and
+-- org_id is a plain indexed column.
+-- ORDER IS PRIORITY, and it is `id` rather than an operator-sorted column: the
+-- panel connected FIRST wins a cross-panel tie, which is explicable without a UI
+-- for it and is right by default (the established panel outranks the new one).
+CREATE TABLE IF NOT EXISTS radius_accounts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id       TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',  -- the operator's name for this panel
+    profile      TEXT NOT NULL,
+    base_url     TEXT NOT NULL,           -- scheme://host[:port], no path
+    username     TEXT,
+    password_enc TEXT,                    -- secretbox token; NULL = nothing stored
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    updated_by   TEXT,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_radius_accounts_org
+    ON radius_accounts(org_id, id);
+-- The vendor recipe for a billing panel, DATA like gpon_profiles /
+-- web_optics_profiles / web_mac_profiles: org_id NULL = global, a same-named row
+-- SHADOWS the built-in, a disabled row is a TOMBSTONE (not an absence) so the
+-- toggle does not lie on the orgs that shipped with one. Whole profile rejected
+-- on anything outside the closed vocabulary — never a best-effort partial, or a
+-- column read by position reports one customer's details against another's line.
+CREATE TABLE IF NOT EXISTS radius_profiles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id      TEXT,                    -- NULL => global
+    name        TEXT NOT NULL,
+    spec        TEXT NOT NULL,           -- JSON, closed vocabulary
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_radius_profiles_scope
+    ON radius_profiles(IFNULL(org_id, ''), name);
+-- The customer as the BILLING SYSTEM holds them, keyed on the RADIUS username
+-- because that is the only identifier that panel guarantees. Everything here is
+-- the panel's own text and none of it is ours to correct: expiry and balance are
+-- stored as the STRINGS they arrived as, deliberately unparsed — "06/01/2024" is
+-- day-first or month-first depending on a setting we cannot see, and a date we
+-- guessed wrong is worse than a date we simply repeat.
+-- Rows are re-stamped and never deleted while the account survives, the same rule
+-- onu_user_macs keeps: a customer missing from one export is far more likely a
+-- filtered read than a cancelled subscriber.
+-- BECAUSE nothing is deleted, LINKING reads only the rows from each account's
+-- MOST RECENT read -- `current_roster`'s freshest-walk rule, needed here for the
+-- identical reason: a customer who has since given up a router would otherwise go
+-- on claiming its MAC forever and make the live customer on that MAC look
+-- ambiguous, which links nothing and silently drops a real subscriber.
+-- The marker is `seen_seq`, a COUNTER and deliberately not the timestamp: two
+-- syncs inside one second stamp the same `_now_iso()`, and then both books read
+-- as current. Every row one sync saw carries that sync's number.
+-- Stale rows are kept for history and for every read that is not the join.
+-- Keyed on the ACCOUNT as well as the org: two panels may both hold a customer
+-- called "1001" and they are different people, so a username is only unique
+-- inside the book it came from.
+CREATE TABLE IF NOT EXISTS radius_customers (
+    org_id        TEXT NOT NULL,
+    account_id    INTEGER NOT NULL DEFAULT 0,
+    username      TEXT NOT NULL,
+    name          TEXT,
+    mac           TEXT,                  -- upper, colon-separated, via webmacs.normalise_mac
+    mobile        TEXT,
+    alt_mobile    TEXT,
+    acno          TEXT,
+    status        TEXT NOT NULL DEFAULT 'unknown',  -- active|expired|inactive|unknown
+    expiry        TEXT,                  -- the panel's own string, unparsed
+    package       TEXT,
+    branch        TEXT,
+    area          TEXT,
+    address       TEXT,
+    balance       TEXT,                  -- the panel's own string, unparsed
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    seen_seq      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (org_id, account_id, username)
+);
+CREATE INDEX IF NOT EXISTS idx_radius_customers_mac
+    ON radius_customers(org_id, mac);
+-- Which ONU a customer sits behind, RESOLVED ONCE at sync rather than joined on
+-- the fly. Two reasons: the join is two hops (slot -> learned MAC -> customer)
+-- with a punctuation-blind name fallback, which is not something to re-derive
+-- inside list_org_devices, the hottest query in the app; and storing it makes the
+-- match AUDITABLE — match_by says which evidence tied this customer to this slot.
+-- An AMBIGUOUS match is absent, never a guess: a MAC on two slots, or two
+-- customers claiming one MAC, links nothing at all. A name pinned to the wrong
+-- drop sends a tech to the wrong house, which is the same failure the web-optics
+-- merge refuses for the same reason.
+-- account_id says WHICH panel this claim came from, so "who is behind this ONU"
+-- stays answerable when an org runs several. The PK is still the SLOT: an ONU
+-- has one customer whatever the number of books, and a slot claimed by two
+-- panels is settled by account order (see radius_accounts) rather than refused
+-- -- two panels naming one MAC is not the LOCATION ambiguity that must link
+-- nothing, it is two books describing one person, and the drop is the same drop.
+CREATE TABLE IF NOT EXISTS radius_links (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    onu_key    TEXT NOT NULL,
+    account_id INTEGER NOT NULL DEFAULT 0,
+    username   TEXT NOT NULL,
+    match_by   TEXT NOT NULL,            -- mac | name
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, device_id, onu_key)
+);
+CREATE INDEX IF NOT EXISTS idx_radius_links_user
+    ON radius_links(org_id, username);
+-- Outcome of the last roster read, same job and the same instinct as
+-- web_optics_status: an ONU with no customer name has several meanings — nobody
+-- configured a panel, the password is wrong, the sync has been failing for a day,
+-- or this subscriber genuinely is not in billing — and they take opposite actions.
+-- last_ok_at survives a failure so a panel can still say "was working until <ts>".
+-- Per ACCOUNT, because with several panels "the sync is failing" is only a
+-- useful sentence once it names which one: one panel refusing the sign-in while
+-- another reads fine is the ordinary state of an org mid-onboarding.
+-- `forbidden` is its own state and was paid for by Badri Fiber Net, whose login
+-- succeeds and whose export answers a permission page: reported as `login` it
+-- sends an ISP to change a password that was never wrong.
+CREATE TABLE IF NOT EXISTS radius_status (
+    account_id  INTEGER PRIMARY KEY,
+    org_id      TEXT NOT NULL,
+    profile     TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL,           -- ok|partial|skipped|no_profile|no_credentials|unreachable|login|forbidden|error
+    detail      TEXT,
+    customers   INTEGER NOT NULL DEFAULT 0,
+    linked      INTEGER NOT NULL DEFAULT 0,
     updated_at  TEXT NOT NULL,
     last_ok_at  TEXT
 );
@@ -1039,6 +1319,198 @@ CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_a ON org_fibre_joints(a_cable_id
 CREATE INDEX IF NOT EXISTS idx_org_fibre_joints_b ON org_fibre_joints(b_cable_id);
 """
 
+_HIST_SCHEMA = """
+-- THE HISTORIAN — see notes/viz-plan.md Stage 1. Rules that shaped every table:
+--   * ANSWERS, never evidence: derived counts/rates/percentiles a named chart
+--     reads — no raw payloads, ever (those stay in snmp_walks/proxy_audit).
+--   * Numbers only, wide rows. Time columns are INTEGER epoch seconds (UTC) —
+--     a deliberate deviation from the ISO-TEXT convention: smaller rows, exact
+--     bucket arithmetic, no parse ambiguity; the API converts at the edge.
+--     Buckets floor on epoch hours / epoch days (UTC).
+--   * A missed sweep writes NOTHING; a frozen/stale reading is never sampled.
+--     Rows only exist when a walk actually arrived, so a gap IS the record.
+--     `samples` on the hour/day tiers counts coverage against the expected
+--     cadence — the probe-honesty channel every chart renders under its axis.
+--   * WITHOUT ROWID, PK = the read path, no secondary indexes (device_rollups
+--     pays for a redundant one; not repeating that). org_id TEXT on every
+--     table so the org-delete introspection sweeps them (pinned by a test).
+--   * Retention ladder + hard row caps live in central/history.py; the nightly
+--     maintenance thread prunes by age AND enforces the caps, so unbounded
+--     growth is impossible even if a clock runs wild.
+--
+-- One row per OLT optics walk: the folded truth AFTER every gate (rail guard,
+-- sane_rx, web-optics merge) — the same numbers olt_optics' badge writes.
+-- rx percentiles are over ONLINE ONUs whose walk carried a usable Rx;
+-- `measured` is that population's size (the "N of M measured" honesty figure).
+CREATE TABLE IF NOT EXISTS hist_olt_sweep (
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES org_devices(id),
+    ts        INTEGER NOT NULL,
+    onus      INTEGER NOT NULL,
+    online    INTEGER NOT NULL,
+    warn      INTEGER NOT NULL,
+    crit      INTEGER NOT NULL,
+    measured  INTEGER NOT NULL,
+    rx_med    REAL,
+    rx_p10    REAL,
+    rx_min    REAL,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+-- Hourly digest, upserted as running sums/extremes at walk time (the
+-- device_rollups fold pattern — no fold job for this tier). crit_max is the
+-- honest hourly answer to "was there a spike"; mean-of-sweep-medians =
+-- rx_med_sum / rx_med_n, labeled as such wherever it renders.
+CREATE TABLE IF NOT EXISTS hist_olt_hour (
+    org_id       TEXT NOT NULL,
+    device_id    INTEGER NOT NULL REFERENCES org_devices(id),
+    bucket       INTEGER NOT NULL,
+    samples      INTEGER NOT NULL,
+    onus_max     INTEGER NOT NULL,
+    online_min   INTEGER NOT NULL,
+    warn_max     INTEGER NOT NULL,
+    crit_max     INTEGER NOT NULL,
+    measured_min INTEGER NOT NULL,
+    rx_med_sum   REAL NOT NULL,
+    rx_med_n     INTEGER NOT NULL,
+    rx_min       REAL,
+    PRIMARY KEY (device_id, bucket)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hist_olt_day (
+    org_id       TEXT NOT NULL,
+    device_id    INTEGER NOT NULL REFERENCES org_devices(id),
+    day          INTEGER NOT NULL,
+    samples      INTEGER NOT NULL,
+    onus_max     INTEGER NOT NULL,
+    online_min   INTEGER NOT NULL,
+    warn_max     INTEGER NOT NULL,
+    crit_max     INTEGER NOT NULL,
+    measured_min INTEGER NOT NULL,
+    rx_med_sum   REAL NOT NULL,
+    rx_med_n     INTEGER NOT NULL,
+    rx_min       REAL,
+    PRIMARY KEY (device_id, day)
+) WITHOUT ROWID;
+-- Per-PON grain — where a splice lives. pon_port is the roster's own label (a
+-- key, not a sample), so charts join current_roster/fibre_pon untranslated.
+-- ONUs whose walk carries no pon_port are counted in the OLT tables and
+-- skipped here (a PON that can't be named can't be charted). Hourly tier only
+-- at this cardinality (163 PONs today); week-over-week reads the day tier.
+CREATE TABLE IF NOT EXISTS hist_pon_hour (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    pon_port   TEXT NOT NULL,
+    bucket     INTEGER NOT NULL,
+    samples    INTEGER NOT NULL,
+    onus_max   INTEGER NOT NULL,
+    online_min INTEGER NOT NULL,
+    crit_max   INTEGER NOT NULL,
+    rx_med_sum REAL NOT NULL,
+    rx_med_n   INTEGER NOT NULL,
+    rx_min     REAL,
+    PRIMARY KEY (device_id, pon_port, bucket)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hist_pon_day (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    pon_port   TEXT NOT NULL,
+    day        INTEGER NOT NULL,
+    samples    INTEGER NOT NULL,
+    onus_max   INTEGER NOT NULL,
+    online_min INTEGER NOT NULL,
+    crit_max   INTEGER NOT NULL,
+    rx_med_sum REAL NOT NULL,
+    rx_med_n   INTEGER NOT NULL,
+    rx_min     REAL,
+    PRIMARY KEY (device_id, pon_port, day)
+) WITHOUT ROWID;
+-- ELIGIBLE ports only (monitored, or carrying a declared link, or carrying a
+-- bandwidth threshold — 177 of 6,400 walked ports today): sampling every
+-- walked access port would be ~14M rows/90d for readings nobody asked about.
+-- Rates are the POST-throughput_bps values, so a counter reset/reboot arrives
+-- as NULL in a row that still exists — "we walked the port, no rate
+-- computable" — never a negative spike and never a zero.
+CREATE TABLE IF NOT EXISTS hist_port_sweep (
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES org_devices(id),
+    if_index  INTEGER NOT NULL,
+    ts        INTEGER NOT NULL,
+    in_bps    REAL,
+    out_bps   REAL,
+    oper_up   INTEGER NOT NULL,
+    PRIMARY KEY (device_id, if_index, ts)
+) WITHOUT ROWID;
+-- rate_n counts sweeps where BOTH rates were computable, and it is the mean's
+-- denominator (in_sum/rate_n) — `samples` alone would let a reboot hour
+-- understate the average.
+CREATE TABLE IF NOT EXISTS hist_port_hour (
+    org_id     TEXT NOT NULL,
+    device_id  INTEGER NOT NULL REFERENCES org_devices(id),
+    if_index   INTEGER NOT NULL,
+    bucket     INTEGER NOT NULL,
+    samples    INTEGER NOT NULL,
+    rate_n     INTEGER NOT NULL,
+    in_sum     REAL NOT NULL,
+    in_max     REAL,
+    out_sum    REAL NOT NULL,
+    out_max    REAL,
+    up_samples INTEGER NOT NULL,
+    PRIMARY KEY (device_id, if_index, bucket)
+) WITHOUT ROWID;
+-- Folded NIGHTLY from hist_port_hour (not upserted at walk time) because the
+-- busy_* columns need the day's hourly means complete: busy_in_bps is the max
+-- HOURLY MEAN and busy_in_hour which UTC hour it fell in — the evening-peak
+-- question at day grain for a year, two columns instead of twenty-four.
+CREATE TABLE IF NOT EXISTS hist_port_day (
+    org_id       TEXT NOT NULL,
+    device_id    INTEGER NOT NULL REFERENCES org_devices(id),
+    if_index     INTEGER NOT NULL,
+    day          INTEGER NOT NULL,
+    samples      INTEGER NOT NULL,
+    rate_n       INTEGER NOT NULL,
+    in_sum       REAL NOT NULL,
+    in_max       REAL,
+    out_sum      REAL NOT NULL,
+    out_max      REAL,
+    up_samples   INTEGER NOT NULL,
+    busy_in_bps  REAL,
+    busy_in_hour INTEGER,
+    busy_out_bps REAL,
+    busy_out_hour INTEGER,
+    PRIMARY KEY (device_id, if_index, day)
+) WITHOUT ROWID;
+-- Folded nightly from device_rollups BEFORE its 30-day prune discards the
+-- hours — the month-scale latency/loss/downtime record. Sums only (rollups
+-- carry no percentiles); DEGRADED is deliberately not counted (rollups don't
+-- carry it; perf episodes live in alert_log's PERF_* rows if ever charted).
+CREATE TABLE IF NOT EXISTS hist_device_day (
+    org_id       TEXT NOT NULL,
+    device_id    INTEGER NOT NULL REFERENCES org_devices(id),
+    day          INTEGER NOT NULL,
+    samples      INTEGER NOT NULL,
+    down_samples INTEGER NOT NULL,
+    latency_sum  REAL NOT NULL,
+    latency_n    INTEGER NOT NULL,
+    loss_sum     REAL NOT NULL,
+    PRIMARY KEY (device_id, day)
+) WITHOUT ROWID;
+-- The billing runway, one row per org per UTC day, written only when EVERY
+-- enabled panel's latest read was fully 'ok' (a partial read may be missing
+-- the status/expiry columns themselves — counting it would trend garbage; the
+-- gap is the record). Counts reuse the customers page's own derivation
+-- (current-book rows, parse_expiry under the profile's date_format, days_left
+-- against today in WISP_DISPLAY_TZ) so the chart and the page cannot disagree.
+CREATE TABLE IF NOT EXISTS hist_radius_day (
+    org_id    TEXT NOT NULL,
+    day       INTEGER NOT NULL,
+    customers INTEGER NOT NULL,
+    active    INTEGER NOT NULL,
+    expired   INTEGER NOT NULL,
+    expiring7 INTEGER NOT NULL,
+    linked    INTEGER NOT NULL,
+    PRIMARY KEY (org_id, day)
+) WITHOUT ROWID;
+"""
+
 
 class CentralStore(
     OrgStoreMixin,
@@ -1048,8 +1520,10 @@ class CentralStore(
     OutageStoreMixin,
     SnmpStoreMixin,
     ProxyStoreMixin,
+    RadiusStoreMixin,
     AssignmentStoreMixin,
     FieldStoreMixin,
+    HistoryStoreMixin,
 ):
 
     _TENANT_TABLES = (
@@ -1069,11 +1543,15 @@ class CentralStore(
         self._write_lock = threading.Lock()
         with self._connect() as conn:
             self._migrate_tenant_to_org(conn)
+            self._radius_panels_are_many(conn)
             conn.executescript(_SCHEMA)
             self._rebuild_fibre_plant(conn)
             conn.executescript(_FIBRE_SCHEMA)
+            conn.executescript(_HIST_SCHEMA)
             self._ensure_columns(conn, "org_fibre_joints", (
-                ("port_kind", "TEXT"), ("port_no", "INTEGER")))
+                ("port_kind", "TEXT"), ("port_no", "INTEGER"),
+                ("port_ref", "TEXT")))
+            self._port_refs_are_text(conn)
             self._unname_plumbing(conn)
             self._couplers_are_closures(conn)
             self._ensure_columns(conn, "orgs", (
@@ -1100,6 +1578,8 @@ class CentralStore(
                 ("accepted_at", "TEXT")))
             self._ensure_columns(conn, "onu_dup_mac_state", (
                 ("online_members", "INTEGER NOT NULL DEFAULT 0"),))
+            self._ensure_columns(conn, "radius_customers", (
+                ("seen_seq", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "alert_log", (("kind", "TEXT"),))
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alert_log_cooldown"
@@ -1122,6 +1602,7 @@ class CentralStore(
                 ("assigned_node_id", "TEXT"),
                 ("optical_warn_dbm", "REAL"), ("optical_crit_dbm", "REAL"),
                 ("gpon_vendor", "TEXT"),
+                ("nvr_vendor", "TEXT"),
                 ("lat", "REAL"), ("lng", "REAL"),
                 ("pon_port", "TEXT"),
                 ("split_ratio", "INTEGER"),
@@ -1140,6 +1621,8 @@ class CentralStore(
                 ("last_online_at", "TEXT"),))
             self._ensure_columns(conn, "device_webui_credentials", (
                 ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
+            self._ensure_columns(conn, "nvr_channels", (
+                ("monitored", "INTEGER NOT NULL DEFAULT 1"),))
             self._ensure_columns(conn, "link_routes", (
                 ("color", "TEXT"), ("label_pos", "REAL")))
             self._ensure_columns(conn, "onu_drops", (
@@ -1156,6 +1639,7 @@ class CentralStore(
             self._seed_google_key(conn)
             self._collapse_roles(conn)
             self._upper_onu_labels(conn)
+            self._stamp_history_since(conn)
             conn.commit()
 
 
@@ -1230,13 +1714,132 @@ class CentralStore(
 
 
     @staticmethod
+    def _radius_panels_are_many(conn) -> None:
+
+        # An org used to have exactly one billing panel, so `radius_accounts` was
+        # keyed on org_id and customers/links/status all hung off the org alone.
+        # Carrying that across is a REBUILD rather than an ALTER because the
+        # primary keys themselves move. Every existing row belongs to the org's
+        # one account, so the mapping is unambiguous and nothing is guessed.
+        # Runs BEFORE `_SCHEMA`: its `CREATE TABLE IF NOT EXISTS` would leave the
+        # old shape in place, and the new index names a column it has not got.
+        def columns(table: str) -> list[str]:
+            try:
+                return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            except sqlite3.OperationalError:
+                return []
+
+        def key_of(table: str) -> set[str]:
+            try:
+                return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")
+                        if r[5]}
+            except sqlite3.OperationalError:
+                return set()
+
+        cols = columns("radius_accounts")
+        if cols and "id" not in cols:
+            conn.execute(
+                "CREATE TABLE radius_accounts_new ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, org_id TEXT NOT NULL,"
+                " label TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL,"
+                " base_url TEXT NOT NULL, username TEXT, password_enc TEXT,"
+                " enabled INTEGER NOT NULL DEFAULT 1, updated_by TEXT,"
+                " updated_at TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO radius_accounts_new (org_id, label, profile, base_url,"
+                " username, password_enc, enabled, updated_by, updated_at)"
+                " SELECT org_id, '', profile, base_url, username, password_enc,"
+                " enabled, updated_by, updated_at FROM radius_accounts"
+                " ORDER BY org_id")
+            conn.execute("DROP TABLE radius_accounts")
+            conn.execute("ALTER TABLE radius_accounts_new RENAME TO radius_accounts")
+
+        if not columns("radius_accounts"):
+            return
+        owner = {r["org_id"]: r["id"] for r in conn.execute(
+            "SELECT id, org_id FROM radius_accounts GROUP BY org_id")}
+
+        for table in ("radius_customers", "radius_links", "radius_status"):
+            have = columns(table)
+            if not have or "account_id" in have:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN"
+                         " account_id INTEGER NOT NULL DEFAULT 0")
+            for org_id, account_id in owner.items():
+                conn.execute(f"UPDATE {table} SET account_id=? WHERE org_id=?",
+                             (account_id, org_id))
+
+        # radius_status was keyed on org_id; its PK has to become the account.
+        # Rebuilt rather than altered for the same reason as the accounts table.
+        status_cols = columns("radius_status")
+        if status_cols and "account_id" not in key_of("radius_status"):
+            conn.execute(
+                "CREATE TABLE radius_status_new (account_id INTEGER PRIMARY KEY,"
+                " org_id TEXT NOT NULL, profile TEXT NOT NULL DEFAULT '',"
+                " state TEXT NOT NULL, detail TEXT,"
+                " customers INTEGER NOT NULL DEFAULT 0,"
+                " linked INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,"
+                " last_ok_at TEXT)")
+            conn.execute(
+                "INSERT OR REPLACE INTO radius_status_new (account_id, org_id,"
+                " profile, state, detail, customers, linked, updated_at, last_ok_at)"
+                " SELECT account_id, org_id, profile, state, detail, customers,"
+                " linked, updated_at, last_ok_at FROM radius_status"
+                " WHERE account_id != 0")
+            conn.execute("DROP TABLE radius_status")
+            conn.execute("ALTER TABLE radius_status_new RENAME TO radius_status")
+
+        # The old customers PK was (org_id, username); it is now scoped by the
+        # account too. SQLite cannot alter a PK, so this is the same rebuild.
+        cust_cols = columns("radius_customers")
+        if cust_cols and "account_id" not in key_of("radius_customers"):
+            names = [c for c in cust_cols if c != "account_id"]
+            cols_sql = ", ".join(names)
+            conn.execute(
+                "CREATE TABLE radius_customers_new ("
+                " org_id TEXT NOT NULL, account_id INTEGER NOT NULL DEFAULT 0,"
+                " username TEXT NOT NULL, name TEXT, mac TEXT, mobile TEXT,"
+                " alt_mobile TEXT, acno TEXT,"
+                " status TEXT NOT NULL DEFAULT 'unknown', expiry TEXT,"
+                " package TEXT, branch TEXT, area TEXT, address TEXT,"
+                " balance TEXT, first_seen_at TEXT NOT NULL,"
+                " last_seen_at TEXT NOT NULL,"
+                " PRIMARY KEY (org_id, account_id, username))")
+            conn.execute(
+                f"INSERT OR REPLACE INTO radius_customers_new (account_id, {cols_sql})"
+                f" SELECT account_id, {cols_sql} FROM radius_customers")
+            conn.execute("DROP TABLE radius_customers")
+            conn.execute(
+                "ALTER TABLE radius_customers_new RENAME TO radius_customers")
+
+
+    @staticmethod
+    def _port_refs_are_text(conn) -> None:
+
+        # A port's identity is the box's own STRING (`fiber.port_ref`). The old
+        # `port_no` derived a number from an interface name, which collapsed
+        # `GigaEthernet0/5` with `TGigaEthernet0/5` — two sockets, one of them the
+        # SFP+ the trunk lands on. Carry any number already recorded across as its own
+        # text; for a numbered kind that is the same fact spelled the same way, and for
+        # `port` it is the best we can say about a row written under the old rule.
+        # `port_no` itself is LEFT IN PLACE unread, the convention this schema keeps
+        # for the ntfy topics — dropping a column is irreversible and nothing reads it.
+        try:
+            conn.execute(
+                "UPDATE org_fibre_joints SET port_ref = CAST(port_no AS TEXT)"
+                " WHERE port_ref IS NULL AND port_no IS NOT NULL")
+        except sqlite3.OperationalError:
+            pass
+
+
+    @staticmethod
     def _unname_plumbing(conn) -> None:
 
 
         try:
             rows = conn.execute(
                 "SELECT c.id, c.name, c.a_device_id, c.b_device_id,"
-                "       j.port_kind, j.port_no"
+                "       j.port_kind, j.port_ref"
                 "  FROM org_cables c"
                 "  LEFT JOIN org_fibre_joints j"
                 "         ON j.a_cable_id=c.id AND j.b_cable_id IS NULL"
@@ -1252,7 +1855,10 @@ class CentralStore(
         for r in rows:
             here = names.get(r["a_device_id"]) or "box"
             there = names.get(r["b_device_id"]) or "box"
-            label = fiber.port_label(r["port_kind"], r["port_no"])
+            # `port_label`, NOT `port_display` — this rebuilds the string the deleted
+            # `_connect_name` ACTUALLY WROTE, and it wrote the canonical form. Naming a
+            # PON the box's way here would stop matching the very rows it must clear.
+            label = fiber.port_label(r["port_kind"], r["port_ref"])
             built = {f"{here} → {there}"}
             if label:
                 built.add(f"{here} {label} → {there}")

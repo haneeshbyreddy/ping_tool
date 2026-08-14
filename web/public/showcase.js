@@ -157,9 +157,9 @@
           "font-weight:600;letter-spacing:.2px;white-space:nowrap"
       );
       label.className = "wisp-label";
-      // Small-N reads weak as "Trusted by 1 ISP"; lead with the names instead.
+      // Small-N reads weak as "Trusted by 1 User"; lead with the names instead.
       var labelText =
-        count >= 3 ? "Trusted by " + count + " ISPs" : "Now live with";
+        count >= 3 ? "Trusted by " + count + " Users" : "Now live with";
       label.appendChild(document.createTextNode(labelText));
 
       bar.appendChild(label);
@@ -201,17 +201,50 @@
         "display:flex;align-items:center;height:100%;width:max-content"
       );
       track.className = "wisp-track";
-      // Two identical halves so the -50% loop is seamless.
+      // Two identical HALVES so the -50% loop is seamless — but a half must be
+      // at least as wide as the viewport or the names run out mid-cycle and the
+      // bar shows empty canvas (6 names ≈ 1080px, which is narrower than most
+      // screens). fitTrack() tops up the copies once widths are measurable.
       track.appendChild(chipRow());
       track.appendChild(chipRow());
-      // Duration scales with content so speed stays constant regardless of count.
-      var dur = Math.max(18, names.length * 4);
-      track.style.setProperty("--wisp-dur", dur + "s");
       if (reduce) track.style.animation = "none";
+      track.makeRow = chipRow;
 
       viewport.appendChild(track);
       bar.appendChild(viewport);
       return bar;
+    }
+
+    // Repeat the name set until ONE half covers the viewport, then match the
+    // duration to the measured width so the speed is the same at any count or
+    // window size. Idempotent: a no-op unless the rep count actually changes,
+    // since rebuilding mid-flight jumps the animation.
+    var SPEED_PX_S = 45;
+    function fitTrack() {
+      var bar = document.getElementById(TRUST_ID);
+      if (!bar) return;
+      var track = bar.querySelector(".wisp-track");
+      if (!track || !track.makeRow || !track.firstElementChild) return;
+      var viewport = track.parentNode;
+      var vw = viewport ? viewport.clientWidth : 0;
+      var unit = track.firstElementChild.offsetWidth;
+      // Not laid out yet (or fonts still loading) — a later mount() retries.
+      if (!vw || !unit) return;
+
+      var per = Math.max(1, Math.ceil(vw / unit));
+      var want = per * 2;
+      if (track.children.length !== want) {
+        while (track.children.length > want) {
+          track.removeChild(track.lastElementChild);
+        }
+        while (track.children.length < want) {
+          track.appendChild(track.makeRow());
+        }
+      }
+      var dur = Math.max(18, Math.round((unit * per) / SPEED_PX_S));
+      if (track.style.getPropertyValue("--wisp-dur") !== dur + "s") {
+        track.style.setProperty("--wisp-dur", dur + "s");
+      }
     }
 
     // ---- Mount / self-heal ----------------------------------------------
@@ -235,6 +268,19 @@
         if (t) document.body.appendChild(t);
       }
       applyPadding();
+      // After append: widths are only measurable once the bar is in the layout,
+      // and again once the webfont lands. mount() runs on a timer ladder, so
+      // this converges without its own retry loop.
+      fitTrack();
+    }
+
+    var fitTimer = 0;
+    window.addEventListener("resize", function () {
+      clearTimeout(fitTimer);
+      fitTimer = setTimeout(fitTrack, 150);
+    });
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(fitTrack).catch(function () {});
     }
 
     // The bundle swaps the whole documentElement once on load, detaching our

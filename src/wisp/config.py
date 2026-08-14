@@ -136,6 +136,31 @@ class Config:
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_DEVICE_BUDGET_S", 120))
     web_optics_browse_idle_s: int = field(
         default_factory=lambda: _env_int("WISP_WEB_OPTICS_BROWSE_IDLE_S", 180))
+    nvr_interval_s: int = field(
+        default_factory=lambda: _env_int("WISP_NVR_INTERVAL_S", 300))
+    radius_enabled: bool = field(
+        default_factory=lambda: _env_bool("WISP_RADIUS_ENABLED", True))
+    radius_interval_s: int = field(
+        default_factory=lambda: _env_int("WISP_RADIUS_INTERVAL_S", 3600))
+    radius_timeout_s: int = field(
+        default_factory=lambda: _env_int("WISP_RADIUS_TIMEOUT_S", 60))
+    # THE HISTORIAN (central/history.py): bounded derived-number time series
+    # sampled off sweeps that already run. Retentions are OPS knobs (they bound
+    # disk + nightly-backup size), not display knobs — hence Config, not
+    # app_settings. hist_enabled=0 stops every sample and the maintenance
+    # thread; existing rows keep pruning on their own age either way.
+    hist_enabled: bool = field(
+        default_factory=lambda: _env_bool("WISP_HIST_ENABLED", True))
+    hist_raw_hours: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_RAW_HOURS", 48))
+    hist_olt_hour_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_OLT_HOUR_DAYS", 90))
+    hist_pon_hour_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_PON_HOUR_DAYS", 14))
+    hist_port_hour_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_PORT_HOUR_DAYS", 30))
+    hist_day_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_DAY_DAYS", 730))
     field_track_retention_days: int = field(
         default_factory=lambda: _env_int("WISP_FIELD_TRACK_RETENTION_DAYS", 7))
     field_track_max_accuracy_m: float = field(

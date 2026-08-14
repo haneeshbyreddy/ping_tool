@@ -100,6 +100,35 @@ class CentralEngineTest(unittest.TestCase):
         eng = registry.get("ispA")
         self.assertIn(new_dev, eng.meta)
 
+    def test_registry_rebuilds_when_a_device_ip_changes(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "n1"})
+        registry = EngineRegistry(self.store, self.cfg)
+        self.assertEqual(registry.get("ispA").meta[dev].ip_address, "10.0.0.1")
+        self.store.update_org_device("ispA", dev, {
+            "name": "Core", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "n1"})
+        self.assertEqual(registry.get("ispA").meta[dev].ip_address, "10.0.0.2")
+
+    def test_a_device_keeps_being_monitored_after_its_ip_changes(self):
+        dev = self.store.create_org_device("ispA", {
+            "name": "Core", "ip_address": "10.0.0.1", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "n1"})
+        registry = EngineRegistry(self.store, self.cfg)
+        central_engine.run_cycle(
+            self.store, "ispA", registry.get("ispA"), {"10.0.0.1": _up()}, T0,
+            expected_ips=self.store.node_expected_ips("ispA", "n1"))
+        self.store.update_org_device("ispA", dev, {
+            "name": "Core", "ip_address": "10.0.0.2", "device_type": None,
+            "region": None, "parent_device_id": None, "assigned_node_id": "n1"})
+        cycle = central_engine.run_cycle(
+            self.store, "ispA", registry.get("ispA"),
+            {"10.0.0.2": _up(latency=5.0)}, T_LATER,
+            expected_ips=self.store.node_expected_ips("ispA", "n1"))
+        self.assertIn(dev, cycle.states)
+        self.assertEqual(self.store.device_states("ispA")[dev]["latency_ms"], 5.0)
+
     def test_orgs_have_independent_engines(self):
         a = self.store.create_org_device("ispA", {
             "name": "A", "ip_address": "10.0.0.1", "device_type": None,
@@ -180,6 +209,7 @@ class CentralAlertDispatcherTest(unittest.TestCase):
         w = self.store.add_user("ispA", "wkr1", "h", "s", "worker")
         self.store.set_user_whatsapp(o, "919000000001")
         self.store.set_user_whatsapp(w, "919000000009")
+        self.store.set_device_assignees("ispA", self.dev, [w], "own1")
         self.engine = central_engine.build_engine(self.store, "ispA", self.cfg)
         self.notifier = RecordingNotifier()
         self.disp = CentralAlertDispatcher(self.store, "ispA", self.engine,

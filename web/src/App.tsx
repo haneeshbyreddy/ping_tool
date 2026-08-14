@@ -14,6 +14,7 @@ import { MapPage } from "@/routes/map-page"
 import { SettingsPage } from "@/routes/settings-page"
 import { AccountPage } from "@/routes/account-page"
 import { IssuesPage } from "@/routes/issues-page"
+import { CustomersPage } from "@/routes/customers-page"
 import { SurveyPage } from "@/routes/survey-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
@@ -46,6 +47,7 @@ function App() {
                     <Route path="settings/:section" element={<SettingsPage />} />
                     <Route path="account" element={<AccountPage />} />
                     <Route path="issues" element={<IssuesPage />} />
+                    <Route path="customers" element={<CustomersPage />} />
                     <Route path="survey" element={<SurveyPage />} />
                     <Route path="logs" element={<LogsPage />} />
                     <Route path="orgs" element={<OrganizationsPage />} />

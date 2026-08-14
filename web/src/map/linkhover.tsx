@@ -9,13 +9,17 @@ const HOVER_SLACK_PX = 12
 
 const PIN_KEEPOUT_PX = 32
 
+// ANY LINE ON THIS MAP MAY BE MEASURED — a dependency chord, or the cable that stood
+// one down. `straight` is the only thing the readout has to say about which: whether
+// these metres were WALKED or are a chord through ground nobody surveyed. It is the
+// one figure a splicing crew orders drum against, so it is the one claim that may
+// never be guessed off a number.
 export interface HoverLink {
   key: string
   pts: Array<[number, number]>
   from: { name: string }
   to: { name: string }
-  drawn: boolean
-  fromCable: boolean
+  straight: boolean
 }
 
 export interface LinkHover {
@@ -25,8 +29,7 @@ export interface LinkHover {
   toName: string
   fromKm: number
   toKm: number
-  drawn: boolean
-  fromCable: boolean
+  straight: boolean
 }
 
 export function projectLinks(links: HoverLink[], zoom: number) {
@@ -74,8 +77,7 @@ export function LinkHoverProbe({ projected, enabled, onHover, zoom, keepOut }: {
           toName: link.to.name,
           fromKm: from,
           toKm: Math.max(polyKm(link.pts) - from, 0),
-          drawn: link.drawn,
-          fromCable: link.fromCable,
+          straight: link.straight,
         }
       }
       emit(best)
@@ -97,9 +99,7 @@ export function hoverIcon(h: LinkHover): L.DivIcon {
     + `<span class="wisp-linkhover__end">`
     + `<span class="wisp-linkhover__km">${esc(fmtKm(h.toKm))}</span>`
     + `<span class="wisp-linkhover__name">${esc(h.toName)}</span></span>`
-    + (h.drawn
-      ? (h.fromCable ? `<span class="wisp-linkhover__note">along the cable</span>` : "")
-      : `<span class="wisp-linkhover__note">straight-line</span>`)
+    + (h.straight ? `<span class="wisp-linkhover__note">straight-line</span>` : "")
     + `</div></div>`
   return L.divIcon({ className: "wisp-pin-anchor", iconSize: [0, 0], html })
 }

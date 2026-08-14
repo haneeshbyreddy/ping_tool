@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { MapPin, Search, Users } from "lucide-react"
+import { MapPin, PanelRight, Search, Users } from "lucide-react"
 import type { OnuPlace, OrgDevice } from "@/lib/types"
 import { useDebounced } from "@/hooks/use-debounced"
 import { RowTag } from "@/components/device-detail"
 import { Chip, StatusDot } from "@/components/status-badge"
+import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { inventoryApi } from "@/lib/api"
@@ -42,7 +43,9 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
   devices: OrgDevice[]
   org: string | null | undefined
   bounds: [number, number, number, number] | null
-  onDevice: (d: OrgDevice) => void
+  // `openPanel` is the row's own button: picking the row goes to the device and filters the
+  // map to its customers and plant, the button opens its panel.
+  onDevice: (d: OrgDevice, openPanel?: boolean) => void
   onOnu: (hit: OnuHit) => void
   onPlace: (p: PlaceHit) => void
 }) {
@@ -136,15 +139,26 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
       {open && needle && (
         <Card className="absolute top-9 right-0 left-0 z-[1001] flex max-h-80 flex-col gap-0 overflow-y-auto bg-popover py-0">
           {deviceHits.map((d) => (
-            <button key={d.id}
-              className="flex h-9 w-full shrink-0 items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-foreground/5"
+            // A div, not a button: the row carries a button of its own and a nested one is
+            // invalid markup. Keyboard reach is the Enter handler, as on the site card.
+            <div key={d.id} role="button" tabIndex={0}
+              className="flex h-9 w-full shrink-0 cursor-pointer items-center gap-2 border-b px-3 text-left last:border-b-0 hover:bg-foreground/5"
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => pick(() => onDevice(d))}>
+              onClick={() => pick(() => onDevice(d))}
+              onKeyDown={(e) => { if (e.key === "Enter") pick(() => onDevice(d)) }}>
               <StatusDot tone={pinTone(d)} />
               <span className="min-w-0 truncate font-mono text-xs font-medium">{d.name}</span>
               {!isPlaced(d) && <RowTag tone="muted">not placed</RowTag>}
               <span className="ml-auto shrink-0 font-mono text-2xs text-muted-foreground">{d.ip_address}</span>
-            </button>
+              {isPlaced(d) && (
+                <Button variant="ghost" size="icon" className="-mr-1.5 size-6 shrink-0 text-muted-foreground"
+                  title={`Open ${d.name}'s panel`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={(e) => { e.stopPropagation(); pick(() => onDevice(d, true)) }}>
+                  <PanelRight className="size-3.5" />
+                </Button>
+              )}
+            </div>
           ))}
           {onuHits.map((h) => (
             <button key={`onu:${h.mac}`}

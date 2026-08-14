@@ -10,6 +10,7 @@ from wisp.core.state_machine import DOWN_FAMILY
 KINDS: tuple[str, ...] = (
     "device_down",
     "port_down",
+    "camera_down",
     "probe_stale",
     "bandwidth",
     "onu_crit",
@@ -24,6 +25,7 @@ KINDS: tuple[str, ...] = (
 KIND_LABELS: dict[str, str] = {
     "device_down": "Device not up",
     "port_down": "Port down",
+    "camera_down": "Camera dark",
     "probe_stale": "Probe stale",
     "bandwidth": "Bandwidth alarm",
     "onu_crit": "Critical ONU",
@@ -105,6 +107,26 @@ def _ports(store, org: str, down_ids: set[int]) -> list[dict]:
             device_id=p["device_id"], device_name=p["switch_name"],
             region=p.get("region"), subject=p["label"], detail=detail,
             since=p.get("alarm_since")))
+    return out
+
+
+def _cameras(store, org: str, down_ids: set[int]) -> list[dict]:
+    out = []
+    for c in store.dark_cameras(org):
+        frozen = c["device_id"] in down_ids
+        label = f"CH{int(c['channel_no']) + 1}"
+        if c.get("name"):
+            label += f" {c['name']}"
+        detail = "no video"
+        if c.get("ip_address"):
+            detail += f" · {c['ip_address']}"
+        if frozen:
+            detail += " · NVR unreachable, reading frozen"
+        out.append(_row(
+            "camera_down", "info" if frozen else "critical",
+            device_id=c["device_id"], device_name=c["nvr_name"],
+            region=c.get("region"), subject=label, detail=detail,
+            since=c.get("last_online_at")))
     return out
 
 
@@ -255,6 +277,8 @@ def collect(store, cfg, org: str, kinds: list[str] | None = None,
         out += _devices(devs, cutoff, live_nodes)
     if "port_down" in want:
         out += _ports(store, org, down_ids)
+    if "camera_down" in want:
+        out += _cameras(store, org, down_ids)
     if "bandwidth" in want:
         out += _bandwidth(store, org)
     if "probe_stale" in want:

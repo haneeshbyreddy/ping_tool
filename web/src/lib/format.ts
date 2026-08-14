@@ -92,10 +92,10 @@ export function isFresh(ts: string | null | undefined, withinS = SNMP_FRESH_AFTE
 }
 
 export function onuName(o: {
-  label?: string | null; name?: string | null
+  label?: string | null; radius_name?: string | null; name?: string | null
   serial?: string | null; onu_key?: string | null
 }): string {
-  return o.label || o.name || o.serial || o.onu_key || ""
+  return o.label || o.radius_name || o.name || o.serial || o.onu_key || ""
 }
 
 export type OnuSev = "ok" | "warn" | "crit" | "offline"
@@ -119,3 +119,6 @@ export function deviceTone(
   if (state && isStale(stateUpdatedAt)) return "muted"
   return stateTone(state)
 }
+
+export const NO_ASSIGNED_DEVICES =
+  "No devices are assigned to you yet. Ask your network owner to assign the ones you are responsible for."

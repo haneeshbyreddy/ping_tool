@@ -4,13 +4,16 @@ import logging
 import threading
 from datetime import datetime, timezone
 
-from wisp.central import (assignment, billing, drops, fiber, inventory,
-                          onuroster, ponfault, weboptics_profiles)
+from wisp.central import (assignment, billing, customers as customers_mod,
+                          drops, fiber, inventory, nvr_profiles, onuroster,
+                          ponfault, radius_profiles, radius_sync,
+                          weboptics_profiles)
 from wisp.central.api.common import (DENIED, body_org_write, can_survey,
                                      device_read_scope, device_write_org,
-                                     olt_liveness, org_or_400, q_int_or,
-                                     q_int_required, reader_or_401,
-                                     survey_write_org)
+                                     in_scope, keep_visible, olt_liveness,
+                                     org_or_400, q_int_or, q_int_required,
+                                     reader_or_401, survey_write_org,
+                                     visible_device_ids)
 
 log = logging.getLogger("wisp.central")
 
@@ -48,7 +51,8 @@ def list_devices(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    devices = h.store.list_org_devices(org)
+    devices = keep_visible(h.store.list_org_devices(org),
+                           visible_device_ids(h, user, org), "id")
     _stamp_optical_faults(h, org, devices)
     h._reply(200, {"devices": devices, "tag_colors": h.store.org_colors(org, "tag")})
 
@@ -60,7 +64,15 @@ def regions(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    h._reply(200, {"regions": h.store.list_regions(org)})
+    regions_ = h.store.list_regions(org)
+    scope = visible_device_ids(h, user, org)
+    if scope is not None:
+        seen: dict[str, int] = {}
+        for d in h.store.list_org_devices(org):
+            if d["id"] in scope and d.get("region"):
+                seen[d["region"]] = seen.get(d["region"], 0) + 1
+        regions_ = [{**r, "device_count": seen.get(r["name"], 0)} for r in regions_]
+    h._reply(200, {"regions": regions_})
 
 
 def routes(h, qs):
@@ -70,7 +82,12 @@ def routes(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    h._reply(200, {"routes": h.store.list_link_routes(org)})
+    routes_ = h.store.list_link_routes(org)
+    scope = visible_device_ids(h, user, org)
+    if scope is not None:
+        routes_ = [r for r in routes_
+                   if r.get("child_id") in scope and r.get("parent_id") in scope]
+    h._reply(200, {"routes": routes_})
 
 
 def ports(h, qs):
@@ -91,7 +108,8 @@ def link_ports(h, qs):
     org = org_or_400(h, user, qs)
     if not org:
         return
-    h._reply(200, {"ports": h.store.list_link_ports(org)})
+    h._reply(200, {"ports": keep_visible(h.store.list_link_ports(org),
+                                         visible_device_ids(h, user, org))})
 
 
 def optics(h, qs):
@@ -148,10 +166,13 @@ def onu_search(h, qs):
     if len(needle) < ONU_SEARCH_MIN:
         return h._reply(200, {"matches": [], "truncated": False})
     now = datetime.now(timezone.utc)
+    scope = visible_device_ids(h, user, org)
     matches: list[dict] = []
     shipped = 0
     truncated = False
     for did in h.store.onu_search_device_ids(org, needle):
+        if not in_scope(scope, did):
+            continue
         dev = h.store.get_org_device(org, did)
         if not dev:
             continue
@@ -160,7 +181,10 @@ def onu_search(h, qs):
         hits = [o for o in roster
                 if needle in onuroster.search_key(o.get("serial"))
                 or needle in onuroster.search_key(o.get("name"))
-                or needle in onuroster.search_key(o.get("label"))]
+                or needle in onuroster.search_key(o.get("label"))
+                or needle in onuroster.search_key(o.get("radius_name"))
+                or needle in onuroster.search_key(o.get("radius_username"))
+                or needle in onuroster.search_key(o.get("radius_mobile"))]
         if not hits:
             continue
         hits.sort(key=lambda o: (str(o.get("pon_port") or ""), o.get("onu_id") or 0,
@@ -187,6 +211,10 @@ def onu_search(h, qs):
                 "distance_m": o.get("distance_m"),
                 "last_online_at": o.get("last_online_at"),
                 "updated_at": o.get("updated_at"),
+                "radius_name": o.get("radius_name"),
+                "radius_username": o.get("radius_username"),
+                "radius_mobile": o.get("radius_mobile"),
+                "radius_status": o.get("radius_status"),
             } for o in hits],
         })
         if shipped >= ONU_SEARCH_MAX:
@@ -324,6 +352,268 @@ def rx_refresh(h, user, body):
     h._reply(200, {"started": True})
 
 
+def nvr_profiles_list(h, qs):
+
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = h._scope_org(user, qs)
+    pset = nvr_profiles.ProfileSet.build(h.store.list_nvr_profiles(org))
+    h._reply(200, {
+        "profiles": h.store.list_nvr_profiles(org),
+        "builtins": list(nvr_profiles.builtin_names()),
+        "names": sorted(pset.names()),
+    })
+
+
+def nvr_channels(h, qs):
+
+    user = reader_or_401(h)
+    if not user:
+        return
+    scope = device_read_scope(h, user, qs)
+    if not scope:
+        return
+    did, org = scope
+    dev = h.store.get_org_device(org, did) or {}
+    declared = str(dev.get("nvr_vendor") or "").strip().lower()
+    profiles = nvr_profiles.ProfileSet.build(h.store.list_nvr_profiles(org))
+    profile = profiles.resolve(org, declared) if declared else None
+    creds = h.store.get_device_webui_credentials(org, did) or {}
+    sweeper = getattr(h, "weboptics", None)
+    h._reply(200, {
+        "channels": h.store.list_nvr_channels(org, did),
+        "scrape": h.store.get_nvr_status(org, did),
+        "vendor": declared or None,
+        "profile": profile.name if profile else None,
+        "known_vendors": sorted(profiles.names()),
+        "has_credentials": bool(creds.get("username")
+                                and creds.get("password_enc")),
+        "web_proxy": h.store.org_web_proxy(org),
+        "has_node": bool(dev.get("assigned_node_id")),
+        "can_refresh": bool(sweeper and sweeper.nvr_target(org, did)),
+        "refreshing": bool(sweeper and sweeper.busy(did)),
+    })
+
+
+def nvr_snapshot(h, qs):
+
+    user = reader_or_401(h)
+    if not user:
+        return
+    scope = device_read_scope(h, user, qs)
+    if not scope:
+        return
+    did, org = scope
+    channel_no = q_int_or(qs, "channel_no", None)
+    if channel_no is None:
+        h._reply(400, {"error": "channel_no required"})
+        return
+    sweeper = getattr(h, "weboptics", None)
+    if sweeper is None:
+        h._reply(503, {"error": "web-UI reads are not enabled on this server"})
+        return
+    frame, err, code = sweeper.snapshot(org, did, channel_no)
+    if frame is None:
+        h._reply(code, {"error": err or "no frame"})
+        return
+    h._send_binary(200, "image/jpeg", frame)
+
+
+def nvr_watch(h, user, body):
+
+    try:
+        device_id = int(body.get("device_id"))
+        channel_no = int(body.get("channel_no"))
+    except (TypeError, ValueError):
+        h._reply(400, {"error": "device_id and channel_no required"})
+        return
+    org = device_write_org(h, user, device_id)
+    if org is DENIED:
+        return
+    if org is None:
+        h._reply(404, {"error": "device not found"})
+        return
+    on = bool(body.get("on"))
+    if not h.store.set_nvr_channel_watch(org, device_id, channel_no, on):
+        h._reply(404, {"error": "no such camera channel"})
+        return
+    h._reply(200, {"ok": True})
+
+
+def nvr_refresh(h, user, body):
+
+    try:
+        device_id = int(body.get("device_id"))
+    except (TypeError, ValueError):
+        h._reply(400, {"error": "device_id required"})
+        return
+    org = device_write_org(h, user, device_id)
+    if org is DENIED:
+        return
+    if org is None:
+        h._reply(404, {"error": "device not found"})
+        return
+    sweeper = getattr(h, "weboptics", None)
+    if sweeper is None:
+        h._reply(503, {"error": "web-UI reads are not enabled on this server"})
+        return
+    if sweeper.busy(device_id):
+        h._reply(409, {"error": "a read of this NVR is already running"})
+        return
+    dev = sweeper.nvr_target(org, device_id)
+    if dev is None:
+        h._reply(400, {"error": "this NVR isn't set up for camera reads. "
+                                "See the Cameras tab for what's missing."})
+        return
+
+    def _run() -> None:
+        try:
+            sweeper.scrape_nvr(dev)
+        except Exception:
+            log.exception("manual NVR read failed for device=%d", device_id)
+
+    threading.Thread(target=_run, name=f"wisp-nvrrefresh-{device_id}",
+                     daemon=True).start()
+    log.info("manual NVR read queued by user=%s for %s/device=%d",
+             user["id"], org, device_id)
+    h._reply(200, {"started": True})
+
+
+def customers_list(h, qs):
+
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    h._reply(200, customers_mod.collect(h.store, h.cfg, org))
+
+
+def radius_settings(h, qs):
+
+    user = reader_or_401(h)
+    if not user:
+        return
+    org = org_or_400(h, user, qs)
+    if not org:
+        return
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    status = {s["account_id"]: s for s in h.store.org_radius_status(org)}
+    accounts = []
+    for account in h.store.org_radius_accounts(org):
+        account_id = int(account["id"])
+        accounts.append({
+            "id": account_id,
+            "label": account.get("label") or "",
+            "profile": account.get("profile"),
+            "base_url": account.get("base_url"),
+            "username": account.get("username"),
+            "password_set": bool(account.get("password_enc")),
+            "enabled": bool(account.get("enabled")),
+            "updated_at": account.get("updated_at"),
+            "status": status.get(account_id),
+            "customers": h.store.radius_customer_count(org, account_id),
+        })
+    h._reply(200, {
+        "accounts": accounts,
+        "customers": h.store.radius_customer_count(org),
+        "profiles": list(radius_profiles.ProfileSet.build(
+            h.store.list_radius_profiles(org)).names()),
+    })
+
+
+def radius_configure(h, user, body):
+
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+
+    account_id = body.get("id")
+    account_id = int(account_id) if account_id else None
+    if account_id is not None:
+        existing = h.store.get_radius_account(account_id)
+        if not existing or existing.get("org_id") != org:
+            h._reply(404, {"error": "no such billing panel for this org"})
+            return
+
+    if body.get("delete"):
+        if account_id is None:
+            h._reply(422, {"error": "which panel? the request named no id"})
+            return
+        h.store.delete_radius_account(account_id)
+        log.info("radius account %s deleted by user=%s for org=%s", account_id,
+                 user["id"], org)
+        h._reply(200, {"deleted": True})
+        return
+
+    profile = str(body.get("profile") or "").strip().lower()
+    if radius_profiles.ProfileSet.build(
+            h.store.list_radius_profiles(org)).resolve(org, profile) is None:
+        h._reply(422, {"error": f"no billing-panel recipe named {profile!r}"})
+        return
+    try:
+        base_url = radius_sync.clean_base_url(body.get("base_url"))
+    except radius_sync.PanelError as e:
+        h._reply(422, {"error": str(e)})
+        return
+
+    label = str(body.get("label") or "").strip()[:64]
+    username = str(body.get("username") or "").strip() or None
+    password_enc = None
+    if body.get("password"):
+        password_enc = h.secretbox.encrypt(str(body["password"]))
+    saved = h.store.set_radius_account(
+        org, profile=profile, base_url=base_url, username=username,
+        password_enc=password_enc, account_id=account_id, label=label,
+        enabled=bool(body.get("enabled", True)), updated_by=user["id"])
+    log.info("radius account %s set by user=%s for org=%s (%s)", saved, user["id"],
+             org, base_url)
+    h._reply(200, {"saved": True, "id": saved})
+
+
+def radius_sync_now(h, user, body):
+
+    org = body_org_write(h, user, body)
+    if org is DENIED:
+        return
+
+    wanted = body.get("id")
+    accounts = h.store.org_radius_accounts(org, enabled_only=True)
+    if wanted:
+        accounts = [a for a in accounts if int(a["id"]) == int(wanted)]
+        if not accounts:
+            h._reply(404, {"error": "no such billing panel for this org"})
+            return
+    if not accounts:
+        h._reply(400, {"error": "no billing panel is configured for this org"})
+        return
+
+    syncer = radius_sync.build_syncer(h.cfg, h.store, h.secretbox)
+    if syncer is None:
+        h._reply(503, {"error": "billing-panel sync is not enabled on this server"})
+        return
+
+    def _run() -> None:
+        for account in accounts:
+            try:
+                syncer.sync_org(account)
+            except Exception:
+                log.exception("manual radius sync failed for org=%s account=%s",
+                              org, account.get("id"))
+
+    threading.Thread(target=_run, name=f"wisp-radius-{org}", daemon=True).start()
+    log.info("manual radius sync queued by user=%s for org=%s (%d panel(s))",
+             user["id"], org, len(accounts))
+    h._reply(200, {"started": True, "panels": len(accounts)})
+
+
 def redundancy(h, qs):
     user = reader_or_401(h)
     if not user:
@@ -362,6 +652,11 @@ def _gpon_vendor_names(h, org: str) -> set[str]:
     return {p["name"] for p in h.store.list_gpon_profiles(org) if p.get("name")}
 
 
+def _nvr_vendor_names(h, org: str) -> set[str]:
+
+    return {p["name"] for p in h.store.list_nvr_profiles(org) if p.get("name")}
+
+
 def create(h, user, body):
     org = body_org_write(h, user, body)
     if org is DENIED:
@@ -370,7 +665,8 @@ def create(h, user, body):
         body, parents=h.store.org_device_parent_map(org), device_id=None,
         registered_nodes=h.store.registered_node_ids(org),
         passive_ids=h.store.org_passive_ids(org),
-        gpon_vendors=_gpon_vendor_names(h, org))
+        gpon_vendors=_gpon_vendor_names(h, org),
+        nvr_vendors=_nvr_vendor_names(h, org))
     if clean.get("device_type") not in inventory.PASSIVE_TYPES:
         plan = h.store.org_plan(org)
         cap = billing.device_cap(plan)
@@ -396,7 +692,8 @@ def update(h, user, body):
         body, parents=parents, device_id=did,
         registered_nodes=h.store.registered_node_ids(org),
         passive_ids=h.store.org_passive_ids(org),
-        gpon_vendors=_gpon_vendor_names(h, org))
+        gpon_vendors=_gpon_vendor_names(h, org),
+        nvr_vendors=_nvr_vendor_names(h, org))
     ok = h.store.update_org_device(org, did, clean)
     h._reply(200 if ok else 404, {"ok": ok})
 
@@ -484,7 +781,10 @@ def onu_coverage(h, qs):
     if not org:
         return
     now = datetime.now(timezone.utc)
-    roster = onuroster.current_roster(h.store.org_onu_rows(org), now, stale_s=None)
+    scope = visible_device_ids(h, user, org)
+    roster = [r for r in onuroster.current_roster(h.store.org_onu_rows(org), now,
+                                                  stale_s=None)
+              if in_scope(scope, r.get("device_id"))]
     placed = h.store.onu_place_macs(org, witness_only=False, located_only=True)
 
     olts: dict[int, dict] = {}
@@ -554,8 +854,9 @@ def field_onu(h, user, body):
         h._reply(400, {"error": "org_id is required to locate an ONU"})
         return
     clean = inventory.clean_field_onu_payload(body)
+    scope = visible_device_ids(h, user, org)
     known = {onuroster._norm_mac(r.get("serial"))
-             for r in h.store.org_onu_rows(org)}
+             for r in h.store.org_onu_rows(org) if in_scope(scope, r.get("device_id"))}
     if clean["mac"] not in known:
         h._reply(404, {"error": "no ONU with that MAC is in this org's roster"})
         return
@@ -579,6 +880,12 @@ def field_onu_name(h, user, body):
         h._reply(400, {"error": "org_id is required"})
         return
     clean = inventory.clean_field_onu_name_payload(body)
+    scope = visible_device_ids(h, user, org)
+    if scope is not None and not any(
+            in_scope(scope, r.get("device_id")) for r in h.store.org_onu_rows(org)
+            if onuroster._norm_mac(r.get("serial")) == clean["mac"]):
+        h._reply(404, {"error": "that subscriber has no location yet"})
+        return
     ok = h.store.set_onu_place_contact(org, clean["mac"], clean["label"],
                                        clean["phone"])
     h._reply(200 if ok else 404,
@@ -634,7 +941,7 @@ def onu_places(h, qs):
                     "in_bps": port["in_bps"] if port else None,
                     "out_bps": port["out_bps"] if port else None,
                     "port_updated_at": port["updated_at"] if port else None})
-    h._reply(200, {"places": out})
+    h._reply(200, {"places": keep_visible(out, visible_device_ids(h, user, org))})
 
 
 _MAX_PLANT_HOPS = 12
@@ -655,9 +962,14 @@ def subscriber(h, qs):
         return
     now = datetime.now(timezone.utc)
 
+    scope = visible_device_ids(h, user, org)
     hits = [r for r in onuroster.current_roster(h.store.org_onu_rows(org), now,
                                                 stale_s=None)
             if onuroster._norm_mac(r.get("serial")) == mac]
+    if scope is not None and not any(in_scope(scope, r.get("device_id"))
+                                     for r in hits):
+        h._reply(403, {"error": "forbidden"})
+        return
     record = h.store.get_onu_place(org, mac)
     out: dict = {
         "mac": mac,
@@ -667,7 +979,8 @@ def subscriber(h, qs):
         "ambiguous": len(hits) > 1,
         "slots": len(hits),
         "roster": None, "olt": None, "drop": None, "rate": None,
-        "thresholds": None,
+        "thresholds": None, "user_macs": [], "user_mac_status": None,
+        "radius": None, "radius_panels": h.store.org_radius_status(org),
     }
     if len(hits) != 1:
         h._reply(200, out)
@@ -694,6 +1007,11 @@ def subscriber(h, qs):
         "crit_dbm": (dev.get("optical_crit_dbm")
                      if dev.get("optical_crit_dbm") is not None
                      else h.cfg.optical_crit_dbm)}
+
+    out["user_macs"] = h.store.user_macs_for_slot(org, did,
+                                                  hits[0].get("onu_key") or "")
+    out["user_mac_status"] = h.store.get_web_mac_status(org, did)
+    out["radius"] = h.store.radius_link_for(org, did, hits[0].get("onu_key") or "")
 
     token = onuroster.onu_if_token(hits[0].get("pon_port"), hits[0].get("onu_id"))
     port = h.store.onu_interfaces(org, {did}).get((did, token)) if token else None
@@ -919,6 +1237,7 @@ def cables(h, qs):
     if not org:
         return
     h._reply(200, {"cables": h.store.list_org_cables(org),
+                   "cabled_pairs": h.store.org_cabled_pairs(org),
                    "counts": list(fiber.FIBER_COUNTS)})
 
 
@@ -1065,6 +1384,28 @@ def cable_split(h, user, body):
     h._reply(200, {"ok": True, **out})
 
 
+def cable_move(h, user, body):
+
+
+    clean = inventory.clean_cable_move_payload(body)
+    orgs = {h.store.cable_org(cid) for cid in clean["cable_ids"]}
+    if None in orgs or len(orgs) != 1:
+        h._reply(404, {"error": "cable not found"})
+        return
+    org = orgs.pop()
+    if not h._can_write(user, org):
+        h._reply(403, {"error": "forbidden"})
+        return
+    ends = [{"device_id": d, "mac": m} for d, m in (clean["from"], clean["to"])]
+    if not _ends_in_org(h, org, *ends):
+        return
+    try:
+        h._reply(200, h.store.move_cable_ends(org, clean,
+                                              updated_by=user["username"]))
+    except ValueError as exc:
+        raise inventory.InventoryError(str(exc)) from exc
+
+
 def _joint_scope(h, user, body, *cable_keys):
 
     ids = []
@@ -1126,8 +1467,16 @@ def fibre_connect(h, user, body):
     if not org:
         h._reply(400, {"error": "org_id is required"})
         return
+    to_cable = _int_or_none(body.get("to_cable_id"))
+    to_cores = None
+    if to_cable is not None:
+        if h.store.cable_org(to_cable) != org:
+            h._reply(404, {"error": "cable not found"})
+            return
+        to_cores = next((c["cores"] for c in h.store.list_org_cables(org)
+                         if c["id"] == to_cable), None)
     clean = inventory.clean_fibre_connect_payload(
-        body,
+        body, to_cores=to_cores,
         **_port_bounds(h, org, _int_or_none(body.get("device_id"))),
         **{f"to_{k}": v for k, v in
            _port_bounds(h, org, _int_or_none(body.get("to_device_id"))).items()})
@@ -1144,8 +1493,15 @@ def fibre_tail(h, user, body):
         return
     cables = {c["id"]: c for c in h.store.list_org_cables(org)}
     a_cable = cables.get(_int_or_none(body.get("a_cable_id")))
+    to_cable = _int_or_none(body.get("to_cable_id"))
+    to_cores = None
+    if to_cable is not None:
+        if h.store.cable_org(to_cable) != org:
+            h._reply(404, {"error": "cable not found"})
+            return
+        to_cores = (cables.get(to_cable) or {}).get("cores")
     clean = inventory.clean_fibre_tail_payload(
-        body, a_cores=a_cable["cores"] if a_cable else None,
+        body, a_cores=a_cable["cores"] if a_cable else None, to_cores=to_cores,
         **_port_bounds(h, org, _int_or_none(body.get("to_device_id"))))
     if not _ends_in_org(h, org, clean, clean["to"]):
         return

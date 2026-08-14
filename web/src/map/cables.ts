@@ -1,5 +1,5 @@
 import type L from "leaflet"
-import { coresRecordedLabel } from "@/lib/fiber"
+import { coresRecordedLabel, isPlumbing } from "@/lib/fiber"
 import type { Cable, FibrePoint } from "@/lib/types"
 import { cachedDivIcon, esc } from "@/map/pins"
 
@@ -63,19 +63,43 @@ export function cableLabelPos(pts: LatLng[]): LatLng {
   return pts[0]
 }
 
-export function cableIcon(cable: Cable): L.DivIcon {
+// `rate` is the reading off a DEPENDENCY LINK whose glass this sheath carries. Once
+// the fibre record joins a pair the chord stands down — the cable is the better line,
+// drawn where somebody walked it — so its ↓/↑ moves here rather than being lost. It
+// rides the BIGGEST sheath on the run (`fiber.connected_spans`), because the tails
+// either side of a trunk are our own 26 m plumbing and unreadable at trunk zoom.
+export function cableIcon(
+  cable: Cable,
+  rate?: { html: string; title: string; idle: boolean; tone: string | null } | null,
+): L.DivIcon {
   const traced = cableTraced(cable)
-  const bits = [
+  // PLUMBING CARRIES THE RATE AND NOTHING ELSE — see below. Its title sheds the cable
+  // furniture with the chip: `rate.title` already names both ends AND their ports, so
+  // the cable's own ends line would say the same thing again, less precisely.
+  const bare = !!rate && isPlumbing(cable)
+  const bits = (bare ? [rate!.title] : [
     `${cable.a.name ?? "?"} ↔ ${cable.b.name ?? "?"}`,
     traced && cable.length_m != null
       ? `${Math.round(cable.length_m)} m along the route`
       : "route not traced — drawn straight",
     coresRecordedLabel(cable.cores_recorded, cable.cores) || null,
-  ].filter(Boolean)
+    rate?.title || null,
+  ]).filter(Boolean)
+  const cls = ["wisp-linkbw", "wisp-cablechip"]
+  // The TONE is the link's, not the cable's — a sheath has no state of its own, and
+  // the tone here says the same thing it said on the chord it replaced.
+  if (rate?.tone) cls.push(`wisp-linkbw--${rate.tone}`)
+  else if (rate?.idle) cls.push("wisp-linkbw--idle")
+  // PLUMBING CARRIES THE RATE AND NOTHING ELSE. A cable nobody laid is never labelled
+  // for its own sake, and `· 1F` beside a reading is this codebase's row numbering read
+  // aloud to somebody asking about their network — the very thing `is_plumbing` exists
+  // to stop. It reaches the map only because it is the one line left under a chord that
+  // stood down, so it draws exactly what that chord was drawing.
   return cachedDivIcon(
-    `<div class="wisp-linkbw wisp-cablechip" title="${esc(bits.join(" · "))}">`
-    + `<span class="wisp-cablechip__n">${esc(cable.name)}</span>`
-    + (cable.cores
+    `<div class="${cls.join(" ")}" title="${esc(bits.join(" · "))}">`
+    + (bare ? "" : `<span class="wisp-cablechip__n">${esc(cable.name)}</span>`)
+    + (!bare && cable.cores
         ? `<span class="wisp-cablechip__f">${cable.cores}F</span>` : "")
+    + (rate ? `${bare ? "" : `<span class="wisp-linkbw__sep"></span>`}${rate.html}` : "")
     + `</div>`)
 }

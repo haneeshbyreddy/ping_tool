@@ -4,76 +4,22 @@ import { Link } from "react-router-dom"
 import { ChevronDown, ChevronUp, ListTree, TriangleAlert } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
-import { summaryApi, inventoryApi, outagesApi, nodesApi, logsApi, analyticsApi } from "@/lib/api"
-import type { IssueKind, OrgDevice } from "@/lib/types"
+import { summaryApi, inventoryApi, outagesApi, nodesApi } from "@/lib/api"
+import type { IssueKind } from "@/lib/types"
+import { DownMostPanel } from "@/components/down-most"
 import { NeedsOrg } from "@/components/needs-org"
+import { OnuSignalPanel } from "@/components/onu-signal"
+import { OrgReliabilityPanel } from "@/components/org-reliability"
 import { OutageCard } from "@/components/outage-card"
 import { ClearPostmortems } from "@/components/clear-postmortems"
 import { StaleNodeCard } from "@/components/stale-node-card"
 import { StatusDot } from "@/components/status-badge"
-import { describeEvent, eventTone } from "@/lib/events"
-import { ago, deviceTone, isStale } from "@/lib/format"
+import { ago, isStale } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
-function severityRank(d: OrgDevice): number {
-  if (d.maintenance) return 5
-  if (!d.assigned_node_id) return 6
-  if (!d.state) return 6
-  if (d.state === "DOWN") return 0
-  if (d.state === "UNREACHABLE") return 1
-  if (d.state === "DEGRADED") return 2
-  if (isStale(d.state_updated_at)) return 3
-  return 4
-}
-
-const PANEL_ROW_CAP = 3
-
-function fmtUptime(pct: number): string {
-  return pct >= 99.995 ? "100%" : `${pct.toFixed(2)}%`
-}
-
-function Panel({ title, count, action, children }: {
-  title: string
-  count?: string | number
-  action?: { label: string; to: string }
-  children: React.ReactNode
-}) {
-  return (
-    <section className="wisp-panel">
-      <div className="wisp-panel-head">
-        <h2 className="flex items-baseline gap-2">
-          <span className="text-sm font-semibold text-foreground">{title}</span>
-          {count != null && <span className="text-xs text-faint-foreground">{count}</span>}
-        </h2>
-        {action && (
-          <Link to={action.to}
-            className="shrink-0 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground">
-            {action.label} →
-          </Link>
-        )}
-      </div>
-      {children}
-    </section>
-  )
-}
-
-function PanelEmpty({ children }: { children: React.ReactNode }) {
-  return <p className="px-4 py-8 text-center text-xs text-faint-foreground">{children}</p>
-}
-
-const ROW = "flex h-11 items-center gap-3 px-4 wisp-row"
-
-function PanelMore({ to, children }: { to: string; children: React.ReactNode }) {
-  return (
-    <Link to={to}
-      className="block border-t border-border-subtle px-4 py-2.5 text-center text-xs font-medium text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground">
-      {children}
-    </Link>
-  )
-}
 
 type Stat = {
   key: string
@@ -163,16 +109,6 @@ export function HomePage() {
 
     refetchInterval: 30_000,
   })
-  const reliability = useQuery({
-    queryKey: ["analytics", scopeOrg, 7],
-    queryFn: () => analyticsApi.reliability(scopeOrg, 7),
-    enabled: !!scopeOrg,
-  })
-  const recentEvents = useQuery({
-    queryKey: ["logs", scopeOrg, "recent"],
-    queryFn: () => logsApi.list(scopeOrg, 8),
-    enabled: !!scopeOrg,
-  })
   const ponSummary = useQuery({
     queryKey: ["pon-summary", scopeOrg],
     queryFn: () => inventoryApi.ponSummary(scopeOrg),
@@ -201,6 +137,9 @@ export function HomePage() {
   const pendingPostmortems = postmortemList.length
   const portsDown = deviceList.reduce((sum, d) => sum + (d.ports_down ?? 0), 0)
   const portsDownIds = deviceList.filter((d) => (d.ports_down ?? 0) > 0).map((d) => d.id)
+  const hasNvrs = deviceList.some((d) => (d.device_type ?? "").toLowerCase() === "nvr")
+  const camerasDark = deviceList.reduce((sum, d) => sum + (d.cameras_down ?? 0), 0)
+  const camerasDarkIds = deviceList.filter((d) => (d.cameras_down ?? 0) > 0).map((d) => d.id)
   const lowBwAlarms = summary.data?.low_bandwidth ?? []
   const highBwAlarms = summary.data?.high_bandwidth ?? []
   const lowBw = lowBwAlarms.length
@@ -231,23 +170,6 @@ export function HomePage() {
     : postmortemList.slice(0, postmortemPreview)
   const hiddenPostmortems = pendingPostmortems - postmortemPreview
 
-  const uptimeByDevice = new Map(
-    (reliability.data?.devices ?? []).map((r) => [r.device_id, r.uptime_pct]),
-  )
-  const rankedDevices = [...deviceList].sort(
-    (a, b) =>
-      severityRank(a) - severityRank(b) ||
-      (uptimeByDevice.get(a.id) ?? 100) - (uptimeByDevice.get(b.id) ?? 100) ||
-      a.name.localeCompare(b.name),
-  )
-  const visibleDevices = rankedDevices.slice(0, PANEL_ROW_CAP)
-
-  const events = [...(recentEvents.data?.events ?? [])].sort((a, b) =>
-    (b.occurred_at ?? b.received_at).localeCompare(a.occurred_at ?? a.received_at),
-  )
-  const visibleNodes = activeNodes.slice(0, PANEL_ROW_CAP)
-  const visibleEvents = events.slice(0, PANEL_ROW_CAP)
-
   const stats: Stat[] = [
     {
       key: "devices",
@@ -272,6 +194,17 @@ export function HomePage() {
       filter: filterFor("Ports down", portsDownIds),
       issueKind: "port_down",
     },
+    ...(hasNvrs ? [{
+      key: "cameras",
+      label: "Cameras dark",
+      loading: devices.isLoading,
+      value: camerasDark,
+      detail: camerasDark > 0 ? "no video" : "all live",
+      tone: camerasDark > 0 ? "destructive" : undefined,
+      to: "/topology",
+      filter: filterFor("Cameras dark", camerasDarkIds),
+      issueKind: "camera_down",
+    } satisfies Stat] : []),
     {
       key: "probes",
       label: "Stale probes",
@@ -482,114 +415,11 @@ export function HomePage() {
         </div>
       )}
 
-      <div className="grid items-start gap-4 @2xl:grid-cols-[1.85fr_1fr]">
-        <Panel title="Network" count={`${rankedDevices.length} devices`}
-          action={{ label: "Topology", to: "/topology" }}>
-          {devices.isLoading && <Skeleton className="m-4 h-32" />}
-          {!devices.isLoading && deviceList.length === 0 && (
-            <PanelEmpty>No devices yet. Add them on the Network page.</PanelEmpty>
-          )}
-          {visibleDevices.map((d) => {
-            const uptime = uptimeByDevice.get(d.id)
-            const unassigned = !d.assigned_node_id
-            const stale = !unassigned && !!d.state && isStale(d.state_updated_at)
-            return (
-              <Link key={d.id} to="/topology" state={{ deviceId: d.id }}
-                className={cn(ROW, "transition-colors hover:bg-foreground/5")}>
-                <StatusDot tone={unassigned ? "muted" : deviceTone(d.state, d.state_updated_at)} />
-                <span className={cn("min-w-0 truncate font-mono text-xs font-medium",
-                  unassigned && "text-muted-foreground")}>{d.name}</span>
-                {d.device_type && (
-                  <span className="hidden shrink-0 text-xs text-faint-foreground md:inline">{d.device_type}</span>
-                )}
-                {d.region && (
-                  <span className="hidden min-w-0 truncate text-xs text-faint-foreground lg:inline">· {d.region}</span>
-                )}
-                <span className="ml-auto flex shrink-0 items-baseline gap-4 text-right">
-                  {unassigned && (
-                    <span className="text-xs text-ghost-foreground">not monitored</span>
-                  )}
-                  {!unassigned && d.maintenance === 1 && (
-                    <span className="text-xs text-faint-foreground">maintenance</span>
-                  )}
-                  {stale && <span className="text-xs text-faint-foreground">stale · {ago(d.state_updated_at)}</span>}
-                  {!unassigned && !stale && d.state && d.state !== "UP" && (
-                    <span className={cn("font-mono text-xs font-semibold",
-                      d.state === "DEGRADED" ? "text-warning" : "text-destructive")}>
-                      {d.state}
-                    </span>
-                  )}
-                  {!unassigned && !stale && d.state === "UP" && d.latency_ms != null && (
-                    <span className="w-14 font-mono text-xs text-muted-foreground">{Math.round(d.latency_ms)} ms</span>
-                  )}
-                  {!unassigned && !stale && d.state === "UP" && d.packet_loss != null && d.packet_loss > 0 && (
-                    <span className="font-mono text-xs text-warning">{Math.round(d.packet_loss)}% loss</span>
-                  )}
-                  {uptime != null && (
-                    <span className="hidden w-16 font-mono text-xs text-faint-foreground sm:inline"
-                      title={`${fmtUptime(uptime)} uptime over the last 7 days`}>
-                      {fmtUptime(uptime)}
-                    </span>
-                  )}
-                </span>
-              </Link>
-            )
-          })}
-          {rankedDevices.length > PANEL_ROW_CAP && (
-            <PanelMore to="/topology">All {rankedDevices.length} devices →</PanelMore>
-          )}
-        </Panel>
+      <OrgReliabilityPanel />
 
-        <div className="flex flex-col gap-4">
-          <Panel title="Probes" count={activeNodes.length || undefined}
-            action={{ label: "Manage", to: "/topology" }}>
-            {nodes.isLoading && <Skeleton className="m-4 h-16" />}
-            {!nodes.isLoading && activeNodes.length === 0 && (
-              <PanelEmpty>No probes registered.</PanelEmpty>
-            )}
-            {visibleNodes.map((n) => {
-              const stale = !n.last_seen || isStale(n.last_seen)
-              return (
-                <div key={n.node_id} className={ROW}>
-                  <StatusDot tone={stale ? "destructive" : "success"} />
-                  <span className="min-w-0 truncate font-mono text-xs font-medium">{n.node_id}</span>
-                  {n.version && <span className="shrink-0 font-mono text-2xs text-faint-foreground">{n.version}</span>}
-                  <span className={cn("ml-auto shrink-0 font-mono text-xs",
-                    stale ? "text-destructive" : "text-faint-foreground")}>
-                    {n.last_seen ? ago(n.last_seen) : "never seen"}
-                  </span>
-                </div>
-              )
-            })}
-            {activeNodes.length > PANEL_ROW_CAP && (
-              <PanelMore to="/topology">All {activeNodes.length} probes →</PanelMore>
-            )}
-          </Panel>
-
-          <Panel title="Recent activity" action={{ label: "Logs", to: "/logs" }}>
-            {recentEvents.isLoading && <Skeleton className="m-4 h-24" />}
-            {!recentEvents.isLoading && events.length === 0 && (
-              <PanelEmpty>No events yet.</PanelEmpty>
-            )}
-            {visibleEvents.map((ev) => (
-              <div key={ev.id} className={ROW}>
-                <StatusDot tone={eventTone(ev)} />
-                <span className="min-w-0 shrink-0 truncate font-mono text-xs font-medium">
-                  {ev.device_name || "—"}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={describeEvent(ev)}>
-                  {describeEvent(ev)}
-                </span>
-                <span className="ml-auto shrink-0 font-mono text-xs text-faint-foreground">
-                  {ago(ev.occurred_at ?? ev.received_at)}
-                </span>
-              </div>
-            ))}
-            {events.length > PANEL_ROW_CAP && (
-              <PanelMore to="/logs">More in Logs →</PanelMore>
-            )}
-          </Panel>
-        </div>
+      <div className="grid items-start gap-4 @2xl:grid-cols-[1.5fr_1fr]">
+        <OnuSignalPanel hasOptics={hasOptics} />
+        <DownMostPanel devices={deviceList} />
       </div>
     </div>
   )
