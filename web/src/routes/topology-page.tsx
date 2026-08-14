@@ -1260,44 +1260,58 @@ export function TopologyPage() {
     }
   }, [focusId, devicesData])
 
-  if (!scopeOrg) return <NeedsOrg />
-
-  const allDevices = data?.devices ?? []
+  const allDevices = useMemo(() => data?.devices ?? [], [data])
   const searching = search.trim().length > 0
-  const probeFiltered = probeFilter
-    ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
-    : allDevices
-  const statusFilterIds = statusFilter ? new Set(statusFilter.ids) : null
-  const statusFiltered = statusFilterIds
-    ? probeFiltered.filter((d) => statusFilterIds.has(d.id))
-    : probeFiltered
-  const tagFiltered = tagFilter.size === 0 ? statusFiltered
-    : statusFiltered.filter((d) => [...tagFilter].every(
-        (t) => d.tags.some((x) => x.toLowerCase() === t.toLowerCase())))
   const onuData = onuSearchOn ? onuHits.data : undefined
-  const onuMatches: OnuSearchMatch[] = onuData?.matches ?? []
-  const onuDeviceIds = new Set(onuMatches.map((m) => m.device_id))
-  const devices = filterWithAncestors(tagFiltered, search, onuDeviceIds)
-  const tagCounts = new Map<string, number>()
-  for (const d of allDevices) for (const t of d.tags) {
-    tagCounts.set(t, (tagCounts.get(t) ?? 0) + 1)
-  }
-  const allTags = [...tagCounts.keys()].sort((a, b) => a.localeCompare(b))
-  const colors: ColorMaps = {
+  const onuMatches: OnuSearchMatch[] = useMemo(() => onuData?.matches ?? [], [onuData])
+  const onuDeviceIds = useMemo(
+    () => new Set(onuMatches.map((m) => m.device_id)), [onuMatches])
+  const devices = useMemo(() => {
+    const probeFiltered = probeFilter
+      ? allDevices.filter((d) => d.assigned_node_id === probeFilter)
+      : allDevices
+    const statusFilterIds = statusFilter ? new Set(statusFilter.ids) : null
+    const statusFiltered = statusFilterIds
+      ? probeFiltered.filter((d) => statusFilterIds.has(d.id))
+      : probeFiltered
+    const tagFiltered = tagFilter.size === 0 ? statusFiltered
+      : statusFiltered.filter((d) => [...tagFilter].every(
+          (t) => d.tags.some((x) => x.toLowerCase() === t.toLowerCase())))
+    return filterWithAncestors(tagFiltered, search, onuDeviceIds)
+  }, [allDevices, probeFilter, statusFilter, tagFilter, search, onuDeviceIds])
+  const tagCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const d of allDevices) for (const t of d.tags) {
+      counts.set(t, (counts.get(t) ?? 0) + 1)
+    }
+    return counts
+  }, [allDevices])
+  const allTags = useMemo(
+    () => [...tagCounts.keys()].sort((a, b) => a.localeCompare(b)), [tagCounts])
+  const colors: ColorMaps = useMemo(() => ({
     tags: data?.tag_colors ?? {},
     nodes: nodes.data?.node_colors ?? {},
-  }
-  const monitoredCount = allDevices.filter((d) => !isPassiveType(d.device_type)).length
+  }), [data?.tag_colors, nodes.data?.node_colors])
+  const monitoredCount = useMemo(
+    () => allDevices.filter((d) => !isPassiveType(d.device_type)).length, [allDevices])
   const deviceCap = billing.data?.device_cap ?? null
   const atCap = deviceCap != null && monitoredCount >= deviceCap
   const gridView = view === "grid"
-  const cmp = comparatorFor(sortMode)
-  const effectiveCollapsed = gridView || searching ? new Set<number>() : collapsed
-  const treeOrdered = treeOrder(devices, effectiveCollapsed, cmp)
-  const flatten = (rows: Ordered[]) => (gridView && cmp ? [...rows].sort(cmp) : rows)
-  const orderedGear = flatten(treeOrdered.gear)
-  const orderedPlant = flatten(treeOrdered.plant)
-  const openDevice = open ? devices.find((d) => d.id === open.id) ?? null : null
+  const cmp = useMemo(() => comparatorFor(sortMode), [sortMode])
+  const effectiveCollapsed = useMemo(
+    () => (gridView || searching ? new Set<number>() : collapsed),
+    [gridView, searching, collapsed])
+  const treeOrdered = useMemo(
+    () => treeOrder(devices, effectiveCollapsed, cmp),
+    [devices, effectiveCollapsed, cmp])
+  const orderedGear = useMemo(
+    () => (gridView && cmp ? [...treeOrdered.gear].sort(cmp) : treeOrdered.gear),
+    [treeOrdered, gridView, cmp])
+  const orderedPlant = useMemo(
+    () => (gridView && cmp ? [...treeOrdered.plant].sort(cmp) : treeOrdered.plant),
+    [treeOrdered, gridView, cmp])
+  const openDevice = useMemo(
+    () => (open ? devices.find((d) => d.id === open.id) ?? null : null), [open, devices])
   const forcePlantOpen = (searching && orderedPlant.length > 0)
     || (openDevice != null && isPassiveType(openDevice.device_type))
   const showPlant = plantOpen || forcePlantOpen
@@ -1306,15 +1320,22 @@ export function TopologyPage() {
     storageKey: "wisp:network:panelw", defaultWidth: 420, min: 340, max: 760,
     open: !!openDevice,
   })
-  const nameById = new Map(allDevices.map((d) => [d.id, d.name]))
-  const activeNodes = (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at)
-  const nodeIds = activeNodes.map((n) => n.node_id)
-  const deviceCounts = new Map<string, number>()
-  for (const d of allDevices) {
-    if (d.assigned_node_id) {
-      deviceCounts.set(d.assigned_node_id, (deviceCounts.get(d.assigned_node_id) ?? 0) + 1)
+  const nameById = useMemo(
+    () => new Map(allDevices.map((d) => [d.id, d.name])), [allDevices])
+  const activeNodes = useMemo(
+    () => (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at), [nodes.data])
+  const nodeIds = useMemo(() => activeNodes.map((n) => n.node_id), [activeNodes])
+  const deviceCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const d of allDevices) {
+      if (d.assigned_node_id) {
+        counts.set(d.assigned_node_id, (counts.get(d.assigned_node_id) ?? 0) + 1)
+      }
     }
-  }
+    return counts
+  }, [allDevices])
+
+  if (!scopeOrg) return <NeedsOrg />
 
   const fresh = devices.filter((d) => d.assigned_node_id && d.state && !isStale(d.state_updated_at))
   const down = fresh.filter((d) => d.state === "DOWN" || d.state === "UNREACHABLE").length

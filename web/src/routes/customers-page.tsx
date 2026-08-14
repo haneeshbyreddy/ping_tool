@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { Link, useSearchParams } from "react-router-dom"
 import { MapPin, Search } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
+import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
 import { ApiError, customersApi } from "@/lib/api"
 import type { CustomerRow, CustomersReply } from "@/lib/types"
@@ -32,6 +33,8 @@ const FILTERS: Record<Filter, (r: CustomerRow) => boolean> = {
   inactive: (r) => r.status === "inactive",
   unmatched: (r) => r.net === "unlinked",
 }
+
+const FILTER_KEYS = Object.keys(FILTERS) as Filter[]
 
 const isFilter = (raw: string | null): raw is Filter =>
   raw != null && raw in FILTERS
@@ -88,9 +91,13 @@ function TriageChips({ all, picked, setPicked }: {
   all: CustomerRow[]
   picked: Filter | null; setPicked: (f: Filter | null) => void
 }) {
-  const count = (f: Filter) => all.filter(FILTERS[f]).length
+  const counts = useMemo(() => {
+    const out = Object.fromEntries(FILTER_KEYS.map((f) => [f, 0])) as Record<Filter, number>
+    for (const r of all) for (const f of FILTER_KEYS) if (FILTERS[f](r)) out[f]++
+    return out
+  }, [all])
   const chip = (f: Filter, label: string, hot?: boolean) => {
-    const n = count(f)
+    const n = counts[f]
     if (n === 0 && (f === "dark" || f === "frozen" || f === "expiring"
       || f === "inactive")) return null
     return (
@@ -173,19 +180,23 @@ export function CustomersPage() {
   })
 
   const all = useMemo(() => query.data?.customers ?? [], [query.data])
-  const reasons = query.data?.reasons ?? {}
-  const needle = search.trim().toLowerCase()
-  const rows = all.filter((r) =>
+  const reasons = useMemo(() => query.data?.reasons ?? {}, [query.data])
+  // The page re-renders on the useNow tick and on every keystroke; the row pass
+  // depends on neither the clock nor the raw input, so it is memoized off the
+  // DEBOUNCED needle and recomputed only when what it reads actually moves.
+  const needle = useDebounced(search.trim().toLowerCase(), 200)
+  const rows = useMemo(() => all.filter((r) =>
     (!picked || FILTERS[picked](r)) &&
     (!needle || [r.name, r.username, r.mobile, r.acno, r.package, r.branch,
       r.area, r.address, r.device_name, r.onu_label, r.onu_name]
-      .some((v) => (v ?? "").toLowerCase().includes(needle))))
+      .some((v) => (v ?? "").toLowerCase().includes(needle)))), [all, picked, needle])
+  const multiPanel = useMemo(
+    () => new Set(all.map((r) => r.account_id)).size > 1, [all])
 
   if (!scopeOrg) return <NeedsOrg />
 
   const counts = query.data?.counts
   const panels = query.data?.panels ?? []
-  const multiPanel = new Set(all.map((r) => r.account_id)).size > 1
   // last_ok_at, never updated_at: "read Nm ago" is a claim a SUCCESSFUL read
   // happened — a panel failing hourly updates its status just as often.
   const lastRead = panels.map((p) => p.last_ok_at).filter(Boolean).sort().at(-1)

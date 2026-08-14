@@ -89,7 +89,9 @@ export function AppShell() {
 
   const wasLocked = useRef(false)
   useEffect(() => {
-    if (wasLocked.current && billing && !billing.locked) queryClient.invalidateQueries()
+    if (wasLocked.current && billing && !billing.locked) {
+      queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] !== "billing" })
+    }
     wasLocked.current = !!billing?.locked
   }, [billing, queryClient])
 
