@@ -29,6 +29,11 @@ def _pbw(idx, in_oct, out_oct, oper="up", admin="up"):
            "admin_status": admin, "oper_status": oper,
            "in_octets": in_oct, "out_octets": out_oct, "speed_bps": 1_000_000_000}
 
+def _hot(idx, oper="up", admin="up", **cells):
+    # What a budget-bounded walk delivers: the status columns arrived, the rest
+    # of the ifTable never did, so those keys are ABSENT from the row.
+    return {"if_index": idx, "admin_status": admin, "oper_status": oper, **cells}
+
 class CentralPortMonitorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -374,6 +379,144 @@ class BandwidthTest(unittest.TestCase):
         self.assertEqual(self._row(3)["bw_alarm"], 1)
         self.store.write_device_states(ORG, [(self.switch, "UP", 1.0, 0.0, 0.1)], TS_SEQ[5])
         self.assertEqual(len(self.store.low_bandwidth_alarms(ORG)), 1)
+
+class PartialWalkTest(unittest.TestCase):
+    # A big OLT's port walk runs out of budget before the counter columns, so
+    # rows arrive without them. Wiping the stored octets on those sweeps is why
+    # a rate — which needs two CONSECUTIVE complete walks — never computed once.
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          snmp_down_consecutive=2, snmp_bw_consecutive=2)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
+        self.olt = self.store.create_org_device(ORG, {
+            "name": "HILL-OLT-1", "ip_address": "10.0.0.7", "device_type": "OLT",
+            "region": "Rampur", "parent_device_id": None})
+        self.notifier = RecordingNotifier()
+        self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _row(self, idx=3):
+        return {r["if_index"]: r for r in
+               self.store.list_switch_ports(ORG, self.olt)}[idx]
+
+    def _watch(self, idx=3, threshold=None):
+        self.pm.sync_device(self.olt, [_pbw(idx, 0, 0)], TS_SEQ[0])
+        pid = self._row(idx)["id"]
+        self.store.set_port_monitored(ORG, pid, True)
+        if threshold is not None:
+            self.store.set_port_bandwidth_config(ORG, pid, threshold, "either")
+        return pid
+
+    def test_a_counterless_sweep_keeps_the_baseline_for_the_next_complete_walk(self):
+        self._watch()
+        self.pm.sync_device(self.olt, [_hot(3)], TS_SEQ[1])
+        held = self._row(3)
+        self.assertEqual(held["in_octets"], "0")
+        self.assertEqual(held["out_octets"], "0")
+        self.assertEqual(held["counters_at"], TS_SEQ[0])
+        # dt spans the gap: the two complete walks are 20s apart, not 10s.
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 20 * _OCT_PER_MBPS_10S, 20 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        r = self._row(3)
+        self.assertAlmostEqual(r["in_bps"], 10_000_000.0, delta=1.0)
+        self.assertAlmostEqual(r["out_bps"], 10_000_000.0, delta=1.0)
+        self.assertEqual(r["counters_at"], TS_SEQ[2])
+
+    def test_an_absent_identity_key_is_held_and_a_present_null_one_clears(self):
+        self.pm.sync_device(self.olt, [{
+            "if_index": 3, "if_name": "Gi0/3", "if_alias": "-> Rampur Tower",
+            "admin_status": "up", "oper_status": "up",
+            "last_change": "12:00", "in_octets": 0, "out_octets": 0}], TS_SEQ[0])
+        self.pm.sync_device(self.olt, [_hot(3)], TS_SEQ[1])
+        r = self._row(3)
+        self.assertEqual(r["if_name"], "Gi0/3")
+        self.assertEqual(r["if_alias"], "-> Rampur Tower")
+        self.assertEqual(r["last_change"], "12:00")
+        # A full walk that DID read the column and found it empty is authoritative.
+        self.pm.sync_device(self.olt, [_pbw(3, 0, 0)], TS_SEQ[2])
+        r = self._row(3)
+        self.assertIsNone(r["if_alias"])
+        self.assertEqual(r["if_name"], "Gi0/3")
+
+    def test_one_counter_without_the_other_preserves_the_whole_pair(self):
+        self._watch()
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 25 * _OCT_PER_MBPS_10S, 25 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        rated = self._row(3)
+        self.assertAlmostEqual(rated["in_bps"], 25_000_000.0, delta=1.0)
+        # counters_at is ONE stamp for both directions, so a half pair is no pair.
+        self.pm.sync_device(self.olt, [_hot(
+            3, in_octets=99 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        r = self._row(3)
+        self.assertEqual(r["in_octets"], str(25 * _OCT_PER_MBPS_10S))
+        self.assertEqual(r["out_octets"], str(25 * _OCT_PER_MBPS_10S))
+        self.assertEqual(r["counters_at"], TS_SEQ[1])
+        self.assertAlmostEqual(r["in_bps"], 25_000_000.0, delta=1.0)
+        self.assertAlmostEqual(r["out_bps"], 25_000_000.0, delta=1.0)
+
+    def test_a_held_rate_expires_once_its_counters_go_stale(self):
+        self._watch()
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 25 * _OCT_PER_MBPS_10S, 25 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.olt, [_hot(3)], "2026-01-01T00:14:00+00:00")
+        self.assertAlmostEqual(self._row(3)["in_bps"], 25_000_000.0, delta=1.0)
+        self.pm.sync_device(self.olt, [_hot(3)], "2026-01-01T00:15:20+00:00")
+        r = self._row(3)
+        self.assertIsNone(r["in_bps"])
+        self.assertIsNone(r["out_bps"])
+        # only the RATE expires — the baseline is still what the next walk measures
+        self.assertEqual(r["in_octets"], str(25 * _OCT_PER_MBPS_10S))
+        self.assertEqual(r["counters_at"], TS_SEQ[1])
+
+    def test_bandwidth_alarm_state_holds_across_a_counterless_sweep(self):
+        self._watch(threshold=10)
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.assertEqual(self._row(3)["bw_low_streak"], 1)
+        # does not advance: a sweep with no rate is no evidence toward the alarm
+        self.assertEqual(self.pm.sync_device(self.olt, [_hot(3)], TS_SEQ[2]), [])
+        self.assertEqual(self._row(3)["bw_low_streak"], 1)
+        self.assertEqual(self._row(3)["bw_alarm"], 0)
+        evs = self.pm.sync_device(self.olt, [_pbw(
+            3, 15 * _OCT_PER_MBPS_10S, 15 * _OCT_PER_MBPS_10S)], TS_SEQ[3])
+        self.assertEqual([e.kind for e in evs], ["bw_low"])
+        since = self._row(3)["bw_alarm_since"]
+        # and does not reset: a real alarm survives the gap
+        self.assertEqual(self.pm.sync_device(self.olt, [_hot(3)], TS_SEQ[4]), [])
+        r = self._row(3)
+        self.assertEqual((r["bw_alarm"], r["bw_low_streak"]), (1, 2))
+        self.assertEqual(r["bw_alarm_since"], since)
+
+    def test_a_port_going_down_on_a_counterless_sweep_still_clears_bw_alarm(self):
+        # Oper status arrives on every sweep, so eligibility is current even
+        # when the rate is not — the hold must not keep a dead port's alarm.
+        self._watch(threshold=10)
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 10 * _OCT_PER_MBPS_10S, 10 * _OCT_PER_MBPS_10S)], TS_SEQ[2])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        self.pm.sync_device(self.olt, [_hot(3, oper="down")], TS_SEQ[3])
+        r = self._row(3)
+        self.assertEqual((r["bw_alarm"], r["bw_low_streak"]), (0, 0))
+
+    def test_the_historian_records_no_rate_for_a_counterless_sweep(self):
+        self._watch()
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 25 * _OCT_PER_MBPS_10S, 25 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        self.pm.sync_device(self.olt, [_hot(3)], TS_SEQ[2])
+        rows = self.store.port_history(ORG, self.olt, 3, 0, 2**33, "sweep")
+        rated = {r["ts"]: r["in_bps"] for r in rows}
+        self.assertEqual(len(rated), 2)
+        # a held rate is not a second measurement of it
+        self.assertIsNone(rated[max(rated)])
+        self.assertEqual([r["oper_up"] for r in rows], [1, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

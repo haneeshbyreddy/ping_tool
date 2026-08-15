@@ -14,6 +14,7 @@ import {
 } from "@/routes/lazy"
 import { AccountPage } from "@/routes/account-page"
 import { IssuesPage } from "@/routes/issues-page"
+import { TriagePage } from "@/routes/triage-page"
 import { LogsPage } from "@/routes/logs-page"
 import { OrganizationsPage } from "@/routes/organizations-page"
 import { OverviewPage } from "@/routes/overview-page"
@@ -45,6 +46,7 @@ function App() {
                     <Route path="settings/:section" element={<SettingsPage />} />
                     <Route path="account" element={<AccountPage />} />
                     <Route path="issues" element={<IssuesPage />} />
+                    <Route path="triage" element={<TriagePage />} />
                     <Route path="customers" element={<CustomersPage />} />
                     <Route path="survey" element={<SurveyPage />} />
                     <Route path="logs" element={<LogsPage />} />

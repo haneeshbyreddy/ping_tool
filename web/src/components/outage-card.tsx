@@ -1,7 +1,8 @@
 import { useState } from "react"
+import { useNavigate } from "react-router-dom"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Check, Clock, UserCheck } from "lucide-react"
+import { Check, Clock, History, UserCheck } from "lucide-react"
 import { outagesApi, ApiError } from "@/lib/api"
 import type { Outage, OutageStatus } from "@/lib/types"
 import { ROOT_CAUSES } from "@/lib/types"
@@ -33,8 +34,14 @@ function OutageDuration({ outage }: { outage: Outage }) {
   return <span className="font-mono text-xs font-semibold text-destructive">{durationSince(outage.started_at)}</span>
 }
 
+// The replay window tops out at 90 days, so an outage older than that has no
+// map to open. Offering the link anyway would land the operator on a view
+// clamped to the window edge with nothing of theirs in it.
+const REPLAY_REACH_S = 90 * 86400
+
 export function OutageCard({ outage }: { outage: Outage }) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const { canWrite, user } = useAuth()
   const username = user?.username
   const [closing, setClosing] = useState(false)
@@ -69,6 +76,8 @@ export function OutageCard({ outage }: { outage: Outage }) {
     setNotes("")
   }
 
+  const startedMs = toUtcDate(outage.started_at).getTime()
+  const startedAt = Number.isFinite(startedMs) ? Math.round(startedMs / 1000) : null
   const meta = STATUS_META[outage.status]
   const mine = !outage.resolved_at && !!username
     && outage.assigned_to.includes(username)
@@ -87,10 +96,23 @@ export function OutageCard({ outage }: { outage: Outage }) {
           </span>
         </div>
 
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <p className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <Clock className="size-3 shrink-0" />
           Down {fmtDateTime(outage.started_at)}
           {outage.resolved_at && <> – {fmtDateTime(outage.resolved_at)}</>}
+          {/* Beside the timestamp, because that is where the eye already is
+              when the question becomes "what else went at the same moment".
+              A QUERY param, not nav state, so the link survives a reload and
+              a paste into a chat. */}
+          {startedAt != null && Date.now() / 1000 - startedAt < REPLAY_REACH_S && (
+            <button type="button"
+              onClick={() => navigate(`/map?replay=${startedAt}`)}
+              title="Open the map as it was at this moment"
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs text-muted-foreground hover:bg-foreground/5 hover:text-foreground">
+              <History className="size-3 shrink-0" />
+              View in replay
+            </button>
+          )}
         </p>
 
         <div className="flex items-center justify-between gap-2">

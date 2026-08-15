@@ -12,7 +12,7 @@ from wisp.ingress.snmp import (
     OID_IF_ADMIN, OID_IF_ALIAS, OID_IF_DESCR, OID_IF_HCIN, OID_IF_HCOUT,
     OID_IF_HIGHSPEED, OID_IF_LASTCHANGE, OID_IF_NAME, OID_IF_OPER, OID_IF_SPEED,
     WALK_COLUMNS, MultiColumnWalk, PortStatus, PysnmpPoller, SnmpTarget,
-    parse_if_table, throughput_bps,
+    missing_detail, parse_if_table, throughput_bps,
 )
 
 try:
@@ -207,7 +207,7 @@ class CombinedWalkDriverTest(unittest.TestCase):
         forbidden = mock.MagicMock(
             side_effect=AssertionError("fallback must not run on success"))
         ports = self._run_walk(bulk_cmd=self._fake_bulk_cmd(calls),
-                               bulk_walk_cmd=forbidden)
+                               bulk_walk_cmd=forbidden).ports
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertEqual(ports[0].if_name, "Gi0/1")
         self.assertEqual((ports[1].oper_status, ports[1].in_octets), ("down", 2000))
@@ -227,7 +227,8 @@ class CombinedWalkDriverTest(unittest.TestCase):
                 if oid.startswith(prefix):
                     yield (None, 0, 0, [(oid, self._Val(table[oid]))])
 
-        ports = self._run_walk(bulk_cmd=broken_bulk_cmd, bulk_walk_cmd=bulk_walk_cmd)
+        ports = self._run_walk(bulk_cmd=broken_bulk_cmd,
+                               bulk_walk_cmd=bulk_walk_cmd).ports
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertEqual(ports[1].oper_status, "down")
 
@@ -296,7 +297,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
     def test_percolumn_tolerates_a_dropped_column(self):
         poller = self._new_poller()
         ports = self._run(poller, bulk_cmd=self._broken_bulk_cmd,
-                          bulk_walk_cmd=self._percolumn(drop={OID_IF_HCIN}))
+                          bulk_walk_cmd=self._percolumn(drop={OID_IF_HCIN})).ports
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertEqual(ports[0].if_name, "Gi0/1")
         self.assertEqual((ports[1].admin_status, ports[1].oper_status), ("up", "down"))
@@ -325,7 +326,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
 
         poller = self._new_poller()
         ports = self._run(poller, bulk_cmd=empty_combined,
-                          bulk_walk_cmd=self._percolumn(record=used))
+                          bulk_walk_cmd=self._percolumn(record=used)).ports
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertTrue(used)
 
@@ -338,7 +339,7 @@ class AdaptivePortWalkTest(unittest.TestCase):
             raise AssertionError("combined should have been abandoned at the time box")
 
         ports = self._run(poller, bulk_cmd=hanging_combined,
-                          bulk_walk_cmd=self._percolumn(record=used))
+                          bulk_walk_cmd=self._percolumn(record=used)).ports
         self.assertEqual([p.if_index for p in ports], [1, 2])
         self.assertTrue(used)
 
@@ -359,13 +360,166 @@ class AdaptivePortWalkTest(unittest.TestCase):
                     hlapi, ObjectIdentity=lambda o: o, ObjectType=lambda i: i,
                     bulk_cmd=counting_broken, bulk_walk_cmd=self._percolumn(),
                 ):
-                    out.append(await poller.walk(target))
+                    out.append((await poller.walk(target)).ports)
             return out
 
         results = asyncio.run(body())
         self.assertEqual([p.if_index for p in results[0]], [1, 2])
         self.assertEqual([p.if_index for p in results[1]], [1, 2])
         self.assertEqual(len(combined_calls), 1)
+
+@unittest.skipUnless(_HAS_PYSNMP, "pysnmp not installed")
+class ScopedWalkTest(unittest.TestCase):
+    _HOT = [OID_IF_ADMIN, OID_IF_OPER, OID_IF_HCIN, OID_IF_HCOUT]
+    _TABLE = {
+        f"{OID_IF_ADMIN}.1": "1", f"{OID_IF_ADMIN}.2": "1",
+        f"{OID_IF_OPER}.1": "1", f"{OID_IF_OPER}.2": "2",
+        f"{OID_IF_HCIN}.1": "1000", f"{OID_IF_HCIN}.2": "2000",
+        f"{OID_IF_HCOUT}.1": "3000", f"{OID_IF_HCOUT}.2": "4000",
+        f"{OID_IF_NAME}.1": "Gi0/1", f"{OID_IF_NAME}.2": "Gi0/2",
+        f"{OID_IF_DESCR}.1": "GigabitEthernet0/1",
+        f"{OID_IF_DESCR}.2": "GigabitEthernet0/2",
+        f"{OID_IF_LASTCHANGE}.1": "11", f"{OID_IF_LASTCHANGE}.2": "22",
+        f"{OID_IF_HIGHSPEED}.1": "1000", f"{OID_IF_HIGHSPEED}.2": "1000",
+        f"{OID_IF_SPEED}.1": "1000000000", f"{OID_IF_SPEED}.2": "1000000000",
+        f"{OID_IF_ALIAS}.1": "uplink to core", f"{OID_IF_ALIAS}.2": "",
+    }
+
+    class _Val:
+        def __init__(self, s):
+            self._s = str(s)
+        def prettyPrint(self):
+            return self._s
+
+    class EndOfMibView(_Val):
+        def __init__(self):
+            super().__init__("")
+
+    @staticmethod
+    def _oid_key(oid):
+        return tuple(int(p) for p in oid.split("."))
+
+    @staticmethod
+    async def _broken_bulk_cmd(*args, **options):
+        raise RuntimeError("tooBig")
+
+    def _combined(self, record):
+        table, oid_key, Val, eom = (self._TABLE, self._oid_key, self._Val,
+                                    self.EndOfMibView)
+        universe = sorted(table, key=oid_key)
+
+        async def bulk_cmd(engine, authData, transport, ctx,
+                           nonRepeaters, maxRepetitions, *varBinds, **options):
+            record.append([str(vb) for vb in varBinds])
+            streams = [[o for o in universe if oid_key(o) > oid_key(str(vb))]
+                       for vb in varBinds]
+            binds = []
+            for rep in range(maxRepetitions):
+                for s in streams:
+                    binds.append((s[rep], Val(table[s[rep]])) if rep < len(s)
+                                 else ("0.0", eom()))
+            return (None, 0, 0, binds)
+        return bulk_cmd
+
+    def _percolumn(self, record=None, drop=frozenset(), hang_after=None):
+        table, oid_key, Val = self._TABLE, self._oid_key, self._Val
+
+        async def bulk_walk_cmd(engine, authData, transport, ctx,
+                                nonRepeaters, maxRepetitions, varBind, **options):
+            col = str(varBind)
+            if record is not None:
+                record.append(col)
+            if col in drop:
+                raise RuntimeError("No SNMP response received before timeout")
+            sent = 0
+            for oid in sorted(table, key=oid_key):
+                if not oid.startswith(col + "."):
+                    continue
+                if hang_after is not None and col in hang_after and sent >= hang_after[col]:
+                    await asyncio.sleep(30)
+                yield (None, 0, 0, [(oid, Val(table[oid]))])
+                sent += 1
+        return bulk_walk_cmd
+
+    def _new_poller(self, **cfg):
+        cfg.setdefault("snmp_request_timeout_s", 0.05)
+        cfg.setdefault("snmp_request_retries", 1)
+        poller = PysnmpPoller(Config(**cfg))
+        self.addCleanup(
+            lambda: poller._engine.close_dispatcher()
+            if poller._engine is not None else None)
+        return poller
+
+    def _run(self, poller, scope, **patches):
+        import pysnmp.hlapi.asyncio as hlapi
+        patches.setdefault("ObjectIdentity", lambda oid: oid)
+        patches.setdefault("ObjectType", lambda ident: ident)
+        with mock.patch.multiple(hlapi, **patches):
+            return asyncio.run(poller.walk(
+                SnmpTarget(ip="127.0.0.1", community="public", port=1), scope))
+
+    def test_hot_scope_asks_the_combined_walk_for_status_and_counters_only(self):
+        asked: list[list[str]] = []
+        forbidden = mock.MagicMock(
+            side_effect=AssertionError("fallback must not run on success"))
+        res = self._run(self._new_poller(), "hot",
+                        bulk_cmd=self._combined(asked), bulk_walk_cmd=forbidden)
+        self.assertEqual(asked[0], self._HOT)
+        self.assertEqual([p.if_index for p in res.ports], [1, 2])
+        self.assertEqual(res.ports[0].in_octets, 1000)
+        self.assertIsNone(res.ports[0].if_name)
+        self.assertEqual(res.missing_columns, ())
+
+    def test_hot_scope_walks_the_same_four_columns_per_column(self):
+        order: list[str] = []
+        res = self._run(self._new_poller(), "hot", bulk_cmd=self._broken_bulk_cmd,
+                        bulk_walk_cmd=self._percolumn(record=order))
+        self.assertEqual(order, self._HOT)
+        self.assertEqual((res.ports[0].in_octets, res.ports[0].out_octets),
+                         (1000, 3000))
+
+    def test_full_scope_walks_the_counters_right_after_the_status_columns(self):
+        order: list[str] = []
+        res = self._run(self._new_poller(), "full", bulk_cmd=self._broken_bulk_cmd,
+                        bulk_walk_cmd=self._percolumn(record=order))
+        self.assertEqual(order[:4], self._HOT)
+        self.assertEqual(len(order), 10)
+        self.assertEqual(res.ports[0].if_name, "Gi0/1")
+
+    def test_a_complete_walk_reports_nothing_missing(self):
+        res = self._run(self._new_poller(), "full", bulk_cmd=self._broken_bulk_cmd,
+                        bulk_walk_cmd=self._percolumn())
+        self.assertEqual(res.missing_columns, ())
+
+    def test_a_dropped_column_is_named_and_the_walk_still_returns_ports(self):
+        res = self._run(self._new_poller(), "full", bulk_cmd=self._broken_bulk_cmd,
+                        bulk_walk_cmd=self._percolumn(drop={OID_IF_HCIN}))
+        self.assertEqual([p.if_index for p in res.ports], [1, 2])
+        self.assertEqual(res.missing_columns, ("in_octets",))
+        self.assertIsNone(res.ports[0].in_octets)
+        self.assertNotIn("in_octets", res.ports[0].carried)
+        self.assertEqual(res.ports[0].out_octets, 3000)
+
+    def test_a_column_cut_off_by_the_deadline_keeps_the_rows_it_fetched(self):
+        res = self._run(self._new_poller(port_walk_timeout_s=0.6), "full",
+                        bulk_cmd=self._broken_bulk_cmd,
+                        bulk_walk_cmd=self._percolumn(hang_after={OID_IF_HCOUT: 1}))
+        self.assertEqual([p.if_index for p in res.ports], [1, 2])
+        self.assertEqual(res.ports[0].out_octets, 3000)
+        self.assertIsNone(res.ports[1].out_octets)
+        self.assertNotIn("out_octets", res.ports[1].carried)
+        self.assertEqual(res.missing_columns[:2], ("out_octets", "if_name"))
+
+class MissingDetailTest(unittest.TestCase):
+    def test_counters_are_named_in_operator_words(self):
+        self.assertEqual(missing_detail(("in_octets", "out_octets")),
+                         "walk dropped: bandwidth counters (in_octets, out_octets)")
+
+    def test_groups_keep_the_order_they_were_dropped_in(self):
+        self.assertEqual(
+            missing_detail(("out_octets", "alias", "if_name")),
+            "walk dropped: bandwidth counters (out_octets);"
+            " port identity (alias, if_name)")
 
 class ThroughputBps(unittest.TestCase):
     def test_normal_rate(self):

@@ -1,9 +1,11 @@
-import { useEffect, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react"
+import { useEffect, useMemo, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ChevronRight, Plus, X, type LucideIcon } from "lucide-react"
+import { Activity, ChevronRight, Plus, X, type LucideIcon } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
-import { analyticsApi, inventoryApi } from "@/lib/api"
+import { analyticsApi, inventoryApi, snmpApi } from "@/lib/api"
+import { fmtRate, portRecords } from "@/lib/capacity-api"
+import { PortTrafficProfile, useProfileState } from "@/components/capacity-panel"
 import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
 import { AssignmentPanel } from "@/components/device-assignees"
 import { DeviceHistoryPanel } from "@/components/device-history"
@@ -79,14 +81,6 @@ function PortBandwidthForm({ port, onSaved }: { port: SwitchPort; onSaved: () =>
   )
 }
 
-function fmtRate(bps: number | null): string {
-  if (bps == null) return "—"
-  if (bps >= 1e9) return `${(bps / 1e9).toFixed(2)} Gb/s`
-  if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} Mb/s`
-  if (bps >= 1e3) return `${(bps / 1e3).toFixed(0)} kb/s`
-  return `${Math.round(bps)} b/s`
-}
-
 function portTone(p: SwitchPort): "success" | "destructive" | "muted" {
   if (p.admin_status !== "up") return "muted"
   return p.oper_status === "up" ? "success" : "destructive"
@@ -104,6 +98,18 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
     queryFn: () => inventoryApi.ports(device.id),
     refetchInterval: 30_000, // rates/alarms move on the SNMP cadence; SSE doesn't cover this key
   })
+  // Everything down to profileOpen sits ABOVE the early returns on purpose — a
+  // hook below one is the React #310 crash this panel has already paid for once.
+  const statusQ = useQuery({
+    queryKey: ["snmp-status", device.id], // shared with SnmpDiagnosis — deduped
+    queryFn: () => snmpApi.status(device.id),
+    refetchInterval: 60_000,
+    enabled: device.snmp_enabled === 1,
+  })
+  const ports = useMemo(() => data?.ports ?? [], [data])
+  const [profileOpen, setProfileOpen] = useProfileState(ports)
+  const portsPartial = statusQ.data?.status.find(
+    (s) => s.subsystem === "ports" && s.state === "partial") ?? null
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["inventory-ports", device.id] })
@@ -117,7 +123,6 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   })
 
   if (isLoading) return <Skeleton className="h-16 w-full" />
-  const ports = data?.ports ?? []
   if (ports.length === 0) {
     return <SnmpDiagnosis device={device} subsystem="ports" />
   }
@@ -139,6 +144,18 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
         <span className="font-medium">{ports.length} ports · {watched} watched</span>
         {!isDown && down > 0 && <span className="font-semibold text-destructive">{down} down</span>}
         {!isDown && bwAlarms > 0 && <span className="font-semibold text-warning">{bwAlarms} bandwidth</span>}
+        {/* A partial walk with rows on screen is the one case SnmpDiagnosis
+            can't reach (it only renders over an EMPTY table) — without this
+            chip a dropped counter column is a blank bandwidth column with no
+            explanation, i.e. a green light over a gap. */}
+        {!isDown && !portsStale && portsPartial && (
+          <span
+            className="font-semibold text-warning"
+            title={`The last walk ran out of budget: ${portsPartial.detail ?? "some columns didn't arrive"}. What arrived is current; a dropped column holds its last complete reading and then goes blank.`}
+          >
+            last walk incomplete
+          </span>
+        )}
         {isDown
           ? <span className="font-semibold text-foreground" title="This device is unreachable, so its port table can't refresh. These rows are the last walk before it went down.">device offline · last walk {ago(lastWalk)}</span>
           : portsStale
@@ -152,8 +169,14 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
           p.bw_max_mbps != null && `≤${p.bw_max_mbps}`,
         ].filter(Boolean).join(" ")
         return (
-          <div key={p.id} className={cn("border-b last:border-b-0", isDown && "wisp-frozen")}>
-            <div className={cn("flex h-10 items-center gap-2 px-4", portAlarmed(p) && "bg-destructive-soft/30")}>
+          <div key={p.id} className="border-b last:border-b-0">
+            {/* The frozen wash goes on the LIVE row and its limits form, not on
+                the whole group: the busy-hour fold below is a record of what
+                this port really carried, not a reading claiming to be now, so
+                greying it out would say "this chart is broken" about honest
+                history. */}
+            <div className={cn("flex h-10 items-center gap-2 px-4",
+              portAlarmed(p) && "bg-destructive-soft/30", isDown && "wisp-frozen")}>
               <StatusDot tone={portTone(p)} />
               <span className={cn("min-w-0 shrink truncate font-mono text-xs font-medium",
                 !p.monitored && "text-muted-foreground")}>
@@ -176,13 +199,27 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
                   {limits ? `${limits} ${p.bw_direction ?? "either"}` : "set limits"}
                 </button>
               )}
+              {portRecords(p) && (
+                <button
+                  className={cn("shrink-0 rounded p-1 transition-colors hover:bg-accent",
+                    profileOpen === p.id ? "text-foreground" : "text-faint-foreground")}
+                  title="Busy hour: this port's traffic by hour of day"
+                  onClick={() => setProfileOpen(profileOpen === p.id ? null : p.id)}>
+                  <Activity className="size-3.5" />
+                </button>
+              )}
               <Switch checked={!!p.monitored} onCheckedChange={() => toggleMonitored.mutate(p)}
                 title={p.monitored ? "Stop watching this port" : "Watch this port"}
                 className="shrink-0 scale-75" />
             </div>
             {configOpen === p.id && !!p.monitored && (
-              <div className="border-t bg-card/50 px-4 py-2.5">
+              <div className={cn("border-t bg-card/50 px-4 py-2.5", isDown && "wisp-frozen")}>
                 <PortBandwidthForm port={p} onSaved={() => { invalidate(); setConfigOpen(null) }} />
+              </div>
+            )}
+            {profileOpen === p.id && portRecords(p) && (
+              <div className="border-t bg-card/50 px-4 py-2.5">
+                <PortTrafficProfile device={device} port={p} />
               </div>
             )}
           </div>

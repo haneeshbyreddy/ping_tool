@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { Link, useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -161,6 +161,113 @@ function ipKey(d: OrgDevice): number {
 const TYPE_RANK: Record<string, number> = {
   core: 0, router: 1, gateway: 2, backhaul: 3, switch: 4, OLT: 5, AP: 6, CPE: 7,
   splitter: 8, fdb: 9, closure: 10,
+}
+
+// The right-hand jump rail (operator's asks, 2026-08-15 ×2: "some easy nav on
+// the right", then "always visible as I scroll, minimal like Grok — show the
+// names on hover"). A MINIMAP, not a menu: fixed at the content column's right
+// edge, collapsed to one tick per device type — tick length carries a rough
+// weight (count), a type with a device DOWN keeps the destructive tick, and
+// the type currently under the viewport top runs brighter and longer (a
+// lightweight scrollspy over the rows' data-devtype). Hovering (or keyboard
+// focus) expands the ticks into labelled rows on a popover surface; clicking
+// scrolls the first row of that type into view through the same
+// jumpId/useFocusScroll path ONU search uses. Counts come from the filtered
+// device list — the same population the "Devices N" header counts — never
+// from the collapse-dependent visible rows.
+//
+// Fixed, so it never gets pushed out at the section's end the way the sticky
+// version did; it stands down (opacity) while the device panel owns the right
+// edge, and a [data-pane] CSS rule hides it in split view, where "the
+// viewport's right edge" is the wrong pane.
+interface TypeGroup {
+  type: string
+  count: number
+  down: number
+  plant: boolean
+  firstId?: number
+}
+
+// First row whose bottom clears the app header ≈ the row being read.
+const RAIL_SPY_TOP_PX = 96
+
+function TypeRail({ groups, hidden, onJump }: {
+  groups: TypeGroup[]
+  hidden: boolean
+  onJump: (g: TypeGroup) => void
+}) {
+  const [active, setActive] = useState<string | null>(null)
+  useEffect(() => {
+    let raf = 0
+    const measure = () => {
+      raf = 0
+      let cur: string | null = null
+      for (const el of document.querySelectorAll<HTMLElement>("[data-devtype]")) {
+        if (el.getBoundingClientRect().bottom > RAIL_SPY_TOP_PX) {
+          cur = el.dataset.devtype ?? null
+          break
+        }
+      }
+      setActive((prev) => (prev === cur ? prev : cur))
+    }
+    // Capture-phase listener sees the inner <main>'s scroll, whichever
+    // container it lands on; one rAF per frame keeps it cheap.
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(measure) }
+    window.addEventListener("scroll", onScroll, true)
+    measure()
+    return () => {
+      window.removeEventListener("scroll", onScroll, true)
+      if (raf) cancelAnimationFrame(raf)
+    }
+  }, [groups])
+
+  return (
+    <nav aria-label="Jump to device type"
+      // right-2.5 pairs with .wisp-has-typerail's reserved gutter on the page
+      // — the sidebar shifts the content column, so any viewport-centred
+      // offset math lands ON the card (measured, 2026-08-15). Reserving the
+      // space in layout is the only placement that survives both sidebar
+      // states and every viewport.
+      className={cn(
+        "wisp-typerail group fixed top-1/2 right-2.5 z-30 hidden -translate-y-1/2 py-3 pl-8 transition-opacity duration-200 xl:block",
+        hidden && "pointer-events-none opacity-0",
+      )}>
+      <div className="flex flex-col gap-1 rounded-xl border border-transparent p-1.5 transition-colors duration-200 group-focus-within:border-border group-focus-within:bg-popover/95 group-hover:border-border group-hover:bg-popover/95">
+        {groups.map((g) => {
+          const on = g.type === active
+          return (
+            <button key={g.type} type="button" onClick={() => onJump(g)}
+              disabled={g.firstId == null}
+              title={g.firstId == null
+                ? "Every device of this type is inside a collapsed branch"
+                : `Scroll to the first ${g.type}`}
+              className="flex h-6 items-center justify-end gap-2 rounded-md px-1 outline-none hover:bg-foreground/5 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-45">
+              <span className={cn(
+                "max-w-0 overflow-hidden text-xs whitespace-nowrap opacity-0 transition-all duration-200 group-focus-within:max-w-44 group-focus-within:opacity-100 group-hover:max-w-44 group-hover:opacity-100",
+                on ? "font-medium text-foreground" : "text-muted-foreground",
+              )}>
+                {g.type}
+                {g.down > 0 && (
+                  <span className="ml-1.5 font-mono text-2xs font-semibold text-destructive">
+                    {g.down}↓
+                  </span>
+                )}
+                <span className="ml-1.5 font-mono text-2xs tabular-nums text-faint-foreground">
+                  {g.count}
+                </span>
+              </span>
+              <span aria-hidden
+                className={cn("h-[2.5px] shrink-0 rounded-full transition-all duration-200",
+                  g.down > 0 ? "bg-destructive"
+                    : on ? "bg-foreground/75"
+                    : "bg-muted-foreground/40 group-hover:bg-muted-foreground/60")}
+                style={{ width: (on ? 8 : 0) + 12 + Math.min(12, g.count) }} />
+            </button>
+          )
+        })}
+      </div>
+    </nav>
+  )
 }
 
 function comparatorFor(mode: SortMode): ((a: OrgDevice, b: OrgDevice) => number) | undefined {
@@ -950,7 +1057,8 @@ function DeviceRow({
   const lifted = device.tree_detached === 1 || (passive && device.depth === 0)
 
   return (
-    <div ref={ref} className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
+    <div ref={ref} data-devtype={device.device_type || "untyped"}
+      className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
           RAIL)}
@@ -1033,6 +1141,7 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill, colors
   return (
     <div
       ref={ref}
+      data-devtype={device.device_type || "untyped"}
       className={cn("group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
         RAIL, detailOpen && "border-border-strong bg-popover")}
       style={railStyle(deviceColor(device, colors))}
@@ -1322,6 +1431,36 @@ export function TopologyPage() {
   })
   const nameById = useMemo(
     () => new Map(allDevices.map((d) => [d.id, d.name])), [allDevices])
+  const typeGroups = useMemo<TypeGroup[]>(() => {
+    const m = new Map<string, TypeGroup>()
+    for (const d of devices) {
+      const t = d.device_type || "untyped"
+      let g = m.get(t)
+      if (!g) {
+        g = { type: t, count: 0, down: 0, plant: isPassiveType(d.device_type) }
+        m.set(t, g)
+      }
+      g.count++
+      if (!g.plant && d.assigned_node_id && !isStale(d.state_updated_at)
+        && (d.state === "DOWN" || d.state === "UNREACHABLE")) g.down++
+    }
+    for (const r of [...treeOrdered.gear, ...treeOrdered.plant]) {
+      const g = m.get(r.device_type || "untyped")
+      if (g && g.firstId == null) g.firstId = r.id
+    }
+    return [...m.values()].sort((a, b) =>
+      (TYPE_RANK[a.type] ?? 99) - (TYPE_RANK[b.type] ?? 99) || a.type.localeCompare(b.type))
+  }, [devices, treeOrdered])
+  // Rail rows earn their place only when there is something to jump between.
+  const showRail = typeGroups.length >= 2 && devices.length >= 8
+  const jumpToType = (g: TypeGroup) => {
+    if (g.firstId == null) return
+    if (g.plant && !showPlant) changePlantOpen(true)
+    // Re-arm the focus scroll even when the same type is clicked twice: the
+    // row's effect fires on the focus EDGE, so bounce through null first.
+    setJumpId(null)
+    requestAnimationFrame(() => setJumpId(g.firstId!))
+  }
   const activeNodes = useMemo(
     () => (nodes.data?.nodes ?? []).filter((n) => !n.revoked_at), [nodes.data])
   const nodeIds = useMemo(() => activeNodes.map((n) => n.node_id), [activeNodes])
@@ -1345,9 +1484,40 @@ export function TopologyPage() {
   const closeForm = () => { setFormOpen(false); setEditing(null) }
 
   type Ordered = OrgDevice & { depth: number; descendantCount: number }
-  const renderList = (list: Ordered[]) => (
-    <Card className="@container gap-0 overflow-hidden py-0">
-      {list.map((d) => (
+  // The list's furniture (operator's ask, 2026-08-15: "a line separator
+  // between device types"). Under Sort: Type the top-level rows cluster by
+  // type, so each cluster gets a labelled muted-well header — the wisp-thead
+  // grammar, framing rather than competing with the rows. Under the other
+  // sorts types interleave with the hierarchy, so the honest separator there
+  // is a slim groove wherever a SUBTREE ends (a depth-0 row after nested
+  // rows) — it bounds the blocks without claiming a grouping that isn't
+  // there. The count on a header is the type's count in the filtered set,
+  // the same population the "Devices N" header counts.
+  const typeCount = (t: string) =>
+    devices.filter((d) => (d.device_type || "untyped") === t).length
+  const typeHeader = (t: string, key: string) => (
+    <div key={key} className="flex h-7 items-center gap-2 border-b bg-muted/40 px-4">
+      <span className="wisp-eyebrow">{t}</span>
+      <span className="text-2xs tabular-nums text-faint-foreground">{typeCount(t)}</span>
+    </div>
+  )
+  const renderList = (list: Ordered[]) => {
+    const rows: ReactNode[] = []
+    let prevTopType: string | null = null
+    let prevDepth = 0
+    list.forEach((d, i) => {
+      if (d.depth === 0) {
+        const t = d.device_type || "untyped"
+        if (sortMode === "type" && t !== prevTopType) {
+          rows.push(typeHeader(t, `th-${t}`))
+        } else if (sortMode !== "type" && i > 0 && prevDepth > 0) {
+          rows.push(<div key={`sep-${d.id}`} aria-hidden
+            className="h-1.5 border-b bg-muted/40" />)
+        }
+        prevTopType = t
+      }
+      prevDepth = d.depth
+      rows.push(
         <Fragment key={d.id}>
           <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
             collapsed={collapsed.has(d.id)} onToggleCollapse={() => toggleCollapse(d.id)}
@@ -1359,14 +1529,27 @@ export function TopologyPage() {
               <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
             </div>
           )}
-        </Fragment>
-      ))}
-    </Card>
-  )
-  const renderGrid = (list: Ordered[]) => (
-    <div className="@container">
-      <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2 @4xl:grid-cols-3">
-      {list.map((d) => (
+        </Fragment>,
+      )
+    })
+    return <Card className="@container gap-0 overflow-hidden py-0">{rows}</Card>
+  }
+  const renderGrid = (list: Ordered[]) => {
+    const cells: ReactNode[] = []
+    let prevType: string | null = null
+    list.forEach((d) => {
+      const t = d.device_type || "untyped"
+      if (sortMode === "type" && t !== prevType) {
+        cells.push(
+          <div key={`th-${t}`} className="col-span-full flex items-center gap-2 pt-1 first:pt-0">
+            <span className="wisp-eyebrow shrink-0">{t}</span>
+            <span className="shrink-0 text-2xs tabular-nums text-faint-foreground">{typeCount(t)}</span>
+            <span aria-hidden className="h-px flex-1 bg-border" />
+          </div>,
+        )
+      }
+      prevType = t
+      cells.push(
         <Fragment key={d.id}>
           <DeviceCard device={d} canWrite={canWrite} onEdit={openEdit}
             focus={d.id === (jumpId ?? focusId)}
@@ -1378,14 +1561,21 @@ export function TopologyPage() {
               <DeviceForm org={scopeOrg} editing={editing} devices={allDevices} nodeIds={nodeIds} onDone={closeForm} />
             </div>
           )}
-        </Fragment>
-      ))}
+        </Fragment>,
+      )
+    })
+    return (
+      <div className="@container">
+        <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2 @4xl:grid-cols-3">
+          {cells}
+        </div>
       </div>
-    </div>
-  )
+    )
+  }
 
   return (
-    <div className="wisp-tree-page mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6" style={panel.vars}>
+    <div className={cn("wisp-tree-page mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6",
+      showRail && "wisp-has-typerail")} style={panel.vars}>
       <div className="wisp-panel-clear flex items-center justify-between">
         <h1 className="text-base font-semibold">Network</h1>
         <ViewToggle view={view} onChange={changeView} />
@@ -1564,6 +1754,10 @@ export function TopologyPage() {
           </>
         )}
       </section>
+
+      {showRail && (
+        <TypeRail groups={typeGroups} hidden={!!openDevice} onJump={jumpToType} />
+      )}
 
       {openDevice && (
         <div aria-hidden

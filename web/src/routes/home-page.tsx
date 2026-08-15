@@ -1,90 +1,32 @@
-import { useState } from "react"
+// HOME IS AN INSTRUMENT PANEL (2026-08-15, the operator's ask: "make home a
+// visual area — intuitive analysis, not numbered blocks"). The grid of stat
+// tiles became the cockpit band (home-pulse.tsx): two state rings and a watch
+// column, so a healthy fleet reads as a quiet shape and trouble as a red arc,
+// not as one number among eleven. The triage queue moved to /triage with a
+// nav badge; the verdict band here is what keeps Home from ever claiming
+// all-clear while the queue is hot — it names the queue's depth and links it.
+//
+// Every figure still derives exactly as the tiles did (count agreement), and
+// every drill-through keeps the tiles' destinations: topology statusFilter
+// state and /issues?kind=.
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
-import { ChevronDown, ChevronUp, ListTree, TriangleAlert } from "lucide-react"
+import { ArrowRight } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useNow } from "@/hooks/use-now"
-import { summaryApi, inventoryApi, outagesApi, nodesApi } from "@/lib/api"
-import type { IssueKind } from "@/lib/types"
+import { useTriage } from "@/hooks/use-triage"
+import { summaryApi, inventoryApi } from "@/lib/api"
+import { PulseBand, type WatchItem } from "@/components/home-pulse"
+import { CapacityPanel } from "@/components/capacity-panel"
 import { DownMostPanel } from "@/components/down-most"
 import { NeedsOrg } from "@/components/needs-org"
 import { OnuSignalPanel } from "@/components/onu-signal"
 import { OrgReliabilityPanel } from "@/components/org-reliability"
-import { OutageCard } from "@/components/outage-card"
-import { ClearPostmortems } from "@/components/clear-postmortems"
-import { StaleNodeCard } from "@/components/stale-node-card"
 import { StatusDot } from "@/components/status-badge"
 import { ago, isStale } from "@/lib/format"
-import { Button } from "@/components/ui/button"
-import { Skeleton } from "@/components/ui/skeleton"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { cn } from "@/lib/utils"
-
-
-type Stat = {
-  key: string
-  label: string
-  loading: boolean
-  value: string | number
-  detail: string
-  tone?: "destructive" | "warning"
-  to?: string
-  filter?: { label: string; ids: number[] }
-  issueKind?: IssueKind
-}
-
-function filterFor(label: string, ids: number[]): Stat["filter"] {
-  return ids.length > 0 ? { label, ids } : undefined
-}
-
-function StatTile({ s }: { s: Stat }) {
-  const body = (
-    <>
-      <p className="truncate pr-7 text-xs font-medium text-muted-foreground">{s.label}</p>
-      {s.loading ? <Skeleton className="mt-3.5 h-7 w-14" /> : (
-        <p className={cn(
-          "mt-3.5 font-mono text-3xl leading-none font-medium tracking-tight",
-          s.tone === "destructive" ? "text-destructive"
-            : s.tone === "warning" ? "text-warning" : "text-foreground",
-        )}>
-          {s.value}
-        </p>
-      )}
-      <p className="mt-2 truncate text-xs text-faint-foreground">{s.detail}</p>
-    </>
-  )
-  const shell = cn(
-    "wisp-panel px-5 py-4 transition-colors",
-    s.tone === "destructive" && "border-destructive/35",
-    s.tone === "warning" && "border-warning/35",
-    s.to && "hover:bg-foreground/[0.03]",
-  )
-  const state = s.filter ? { statusFilter: s.filter } : undefined
-  const listable = s.issueKind && s.filter
-  if (!s.to) return <div className={shell}>{body}</div>
-  return (
-    <div className={cn(shell, "relative")}>
-      <Link to={s.to} state={state} aria-label={`${s.label} · filter the network`}
-        className="absolute inset-0 z-0 rounded-[inherit]" />
-      {body}
-      {listable && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Link to={`/issues?kind=${s.issueKind}`}
-              className="absolute top-3 right-3 z-10 flex size-6 items-center justify-center rounded-md border border-border bg-card text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground">
-              <ListTree className="size-3.5" />
-            </Link>
-          </TooltipTrigger>
-          <TooltipContent>List these issues</TooltipContent>
-        </Tooltip>
-      )}
-    </div>
-  )
-}
 
 export function HomePage() {
   const { scopeOrg } = useAuth()
-  const [showPostmortems, setShowPostmortems] = useState(false)
   useNow()
 
   const summary = useQuery({
@@ -97,330 +39,149 @@ export function HomePage() {
     queryFn: () => inventoryApi.list(scopeOrg),
     enabled: !!scopeOrg,
   })
-  const outages = useQuery({
-    queryKey: ["outages", scopeOrg],
-    queryFn: () => outagesApi.list(scopeOrg),
-    enabled: !!scopeOrg,
-  })
-  const nodes = useQuery({
-    queryKey: ["nodes", scopeOrg],
-    queryFn: () => nodesApi.list(scopeOrg),
-    enabled: !!scopeOrg,
-
-    refetchInterval: 30_000,
-  })
   const ponSummary = useQuery({
     queryKey: ["pon-summary", scopeOrg],
     queryFn: () => inventoryApi.ponSummary(scopeOrg),
     enabled: !!scopeOrg,
   })
+  const triage = useTriage()
 
   if (!scopeOrg) return <NeedsOrg />
 
   const deviceList = devices.data?.devices ?? []
-
-  const registeredNodeIds = new Set(
-    (nodes.data?.nodes ?? []).filter((n) => n.registered && !n.revoked_at).map((n) => n.node_id),
-  )
-
+  const registeredNodeIds = new Set(triage.activeNodes.map((n) => n.node_id))
   const monitored = deviceList.filter(
     (d) => d.assigned_node_id && registeredNodeIds.has(d.assigned_node_id),
   )
 
-  const notUpDevices = monitored.filter(
-    (d) => !(d.state === "UP" && !isStale(d.state_updated_at)),
-  )
-  const online = monitored.length - notUpDevices.length
-  const outageList = outages.data?.outages ?? []
-  const activeOutages = outageList.filter((o) => o.status !== "pending_postmortem")
-  const postmortemList = outageList.filter((o) => o.status === "pending_postmortem")
-  const pendingPostmortems = postmortemList.length
-  const portsDown = deviceList.reduce((sum, d) => sum + (d.ports_down ?? 0), 0)
-  const portsDownIds = deviceList.filter((d) => (d.ports_down ?? 0) > 0).map((d) => d.id)
-  const hasNvrs = deviceList.some((d) => (d.device_type ?? "").toLowerCase() === "nvr")
-  const camerasDark = deviceList.reduce((sum, d) => sum + (d.cameras_down ?? 0), 0)
-  const camerasDarkIds = deviceList.filter((d) => (d.cameras_down ?? 0) > 0).map((d) => d.id)
-  const lowBwAlarms = summary.data?.low_bandwidth ?? []
-  const highBwAlarms = summary.data?.high_bandwidth ?? []
-  const lowBw = lowBwAlarms.length
-  const highBw = highBwAlarms.length
-  const bwAlarms = lowBw + highBw
-  const bwAlarmIds = [...new Set([...lowBwAlarms, ...highBwAlarms].map((a) => a.device_id))]
-
-  const activeNodes = (nodes.data?.nodes ?? []).filter((n) => n.registered && !n.revoked_at)
-  const staleNodes = activeNodes.filter((n) => n.last_seen && isStale(n.last_seen))
-  const staleNodeIds = new Set(staleNodes.map((n) => n.node_id))
+  const staleNodeIds = new Set(triage.staleNodes.map((n) => n.node_id))
   const staleProbeDeviceIds = deviceList
     .filter((d) => d.assigned_node_id && staleNodeIds.has(d.assigned_node_id))
     .map((d) => d.id)
-  const triageCount = outageList.length + staleNodes.length
-  const triageLoading = outages.isLoading || nodes.isLoading
 
-  const lastSeen = activeNodes
+  const lastSeen = triage.activeNodes
     .map((n) => n.last_seen)
     .filter((t): t is string => !!t)
     .sort()
     .at(-1)
   const feedStale = !lastSeen || isStale(lastSeen)
 
-  const urgentCount = staleNodes.length + activeOutages.length
-  const postmortemPreview = urgentCount === 0 ? Math.min(2, pendingPostmortems) : 0
-  const visiblePostmortems = showPostmortems
-    ? postmortemList
-    : postmortemList.slice(0, postmortemPreview)
-  const hiddenPostmortems = pendingPostmortems - postmortemPreview
-
-  const stats: Stat[] = [
-    {
-      key: "devices",
-      label: "Devices online",
-      loading: devices.isLoading,
-      value: monitored.length ? `${online}/${monitored.length}` : "—",
-      detail: !monitored.length ? "no probe assigned"
-        : online < monitored.length ? `${notUpDevices.length} not up` : "all up",
-      tone: online < monitored.length ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Not up", notUpDevices.map((d) => d.id)),
-      issueKind: "device_down",
-    },
-    {
-      key: "ports",
-      label: "Ports down",
-      loading: devices.isLoading,
-      value: portsDown,
-      detail: portsDown > 0 ? "check switches" : "all up",
-      tone: portsDown > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Ports down", portsDownIds),
-      issueKind: "port_down",
-    },
-    ...(hasNvrs ? [{
-      key: "cameras",
-      label: "Cameras dark",
-      loading: devices.isLoading,
-      value: camerasDark,
-      detail: camerasDark > 0 ? "no video" : "all live",
-      tone: camerasDark > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Cameras dark", camerasDarkIds),
-      issueKind: "camera_down",
-    } satisfies Stat] : []),
-    {
-      key: "probes",
-      label: "Stale probes",
-      loading: nodes.isLoading,
-      value: staleNodes.length,
-      detail: staleNodes.length > 0 ? "not reporting" : "all reporting",
-      tone: staleNodes.length > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Behind a stale probe", staleProbeDeviceIds),
-      issueKind: "probe_stale",
-    },
-    {
-      key: "bw",
-      label: "Bandwidth alarms",
-      loading: summary.isLoading,
-      value: bwAlarms,
-      detail: bwAlarms > 0 ? [lowBw && `${lowBw} low`, highBw && `${highBw} high`].filter(Boolean).join(" · ") : "within limits",
-      tone: bwAlarms > 0 ? "warning" : undefined,
-      to: "/topology",
-      filter: filterFor("Bandwidth alarm", bwAlarmIds),
-      issueKind: "bandwidth",
-    },
-  ]
+  const portsDown = deviceList.reduce((sum, d) => sum + (d.ports_down ?? 0), 0)
+  const portsDownIds = deviceList.filter((d) => (d.ports_down ?? 0) > 0).map((d) => d.id)
+  const hasNvrs = deviceList.some((d) => (d.device_type ?? "").toLowerCase() === "nvr")
+  const camerasDark = deviceList.reduce((sum, d) => sum + (d.cameras_down ?? 0), 0)
+  const camerasDarkIds = deviceList.filter((d) => (d.cameras_down ?? 0) > 0).map((d) => d.id)
+  const lowBw = summary.data?.low_bandwidth.length ?? 0
+  const highBw = summary.data?.high_bandwidth.length ?? 0
+  const bwAlarmIds = [...new Set(
+    [...(summary.data?.low_bandwidth ?? []), ...(summary.data?.high_bandwidth ?? [])]
+      .map((a) => a.device_id),
+  )]
 
   const pon = ponSummary.data
   const hasOptics = (pon?.olts ?? 0) > 0
   const dupStale = pon ? pon.dup_macs_total - pon.dup_macs_live : 0
-  const rxCount = pon?.onus_rx ?? 0
-  const noRx = hasOptics && rxCount === 0
-  const partialRx = hasOptics && rxCount > 0 && rxCount < (pon?.onus_total ?? 0)
-  const rxCoverage = partialRx
-    ? `${rxCount} of ${pon!.onus_total} ONUs measured`
-    : `${rxCount} ONUs measured`
-  const onusCritIds = deviceList.filter((d) => (d.onus_crit ?? 0) > 0).map((d) => d.id)
-  const onusWarnIds = deviceList.filter((d) => (d.onus_warn ?? 0) > 0).map((d) => d.id)
   const dupMacIds = deviceList.filter((d) => (d.dup_macs ?? 0) > 0).map((d) => d.id)
   const fiberCutIds = deviceList.filter((d) => (d.fiber_cuts ?? 0) > 0).map((d) => d.id)
-  const onusOfflineIds = deviceList
-    .filter((d) => (d.onus_total ?? 0) > (d.onus_online ?? 0))
-    .map((d) => d.id)
-  const opticalStats: Stat[] = [
+
+  const watch: WatchItem[] = [
     {
-      key: "onus-crit",
-      label: "Critical ONUs",
-      loading: ponSummary.isLoading,
-      value: noRx ? "—" : (pon?.onus_crit ?? 0),
-      detail: noRx ? "no OLT reports dBm"
-        : (pon?.onus_crit ?? 0) > 0 ? "below the Rx floor" : rxCoverage,
-      tone: !noRx && (pon?.onus_crit ?? 0) > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Critical ONUs", onusCritIds),
-      issueKind: "onu_crit",
+      key: "ports", label: "Ports down", one: "port down", value: portsDown,
+      tone: "destructive", plane: "traffic",
+      filter: { label: "Ports down", ids: portsDownIds }, issueKind: "port_down",
     },
     {
-      key: "onus-warn",
-      label: "Warning ONUs",
-      loading: ponSummary.isLoading,
-      value: noRx ? "—" : (pon?.onus_warn ?? 0),
-      detail: noRx ? "check the Optical tab"
-        : (pon?.onus_warn ?? 0) > 0 ? "weak Rx power" : rxCoverage,
-      tone: !noRx && (pon?.onus_warn ?? 0) > 0 ? "warning" : undefined,
-      to: "/topology",
-      filter: filterFor("Warning ONUs", onusWarnIds),
-      issueKind: "onu_warn",
+      key: "bw", label: "Bandwidth alarms", one: "bandwidth alarm", value: lowBw + highBw,
+      detail: [lowBw && `${lowBw} low`, highBw && `${highBw} high`].filter(Boolean).join(" · ") || undefined,
+      tone: "warning", plane: "traffic",
+      filter: { label: "Bandwidth alarm", ids: bwAlarmIds }, issueKind: "bandwidth",
     },
+    ...(hasNvrs ? [{
+      key: "cameras", label: "Cameras dark", one: "camera dark", value: camerasDark,
+      tone: "destructive", plane: "plant",
+      filter: { label: "Cameras dark", ids: camerasDarkIds }, issueKind: "camera_down",
+    } satisfies WatchItem] : []),
     {
-      key: "dup-macs",
-      label: "Duplicate MACs",
-      loading: ponSummary.isLoading,
-      value: pon?.dup_macs_live ?? 0,
-      detail: (pon?.dup_macs_live ?? 0) > 0 ? "cloned or looping"
-        : dupStale > 0 ? `${dupStale} stale-only` : "none live",
-      tone: (pon?.dup_macs_live ?? 0) > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Duplicate MACs", dupMacIds),
-      issueKind: "dup_mac",
+      key: "probes", label: "Stale probes", one: "stale probe", value: triage.staleNodes.length,
+      tone: "destructive", plane: "fleet",
+      filter: { label: "Behind a stale probe", ids: staleProbeDeviceIds },
+      issueKind: "probe_stale",
     },
-    {
-      key: "fiber",
-      label: "Fiber cuts",
-      loading: ponSummary.isLoading,
-      value: pon?.fiber_cuts ?? 0,
-      detail: (pon?.fiber_cuts ?? 0) > 0 ? "check optical tab" : "none suspected",
-      tone: (pon?.fiber_cuts ?? 0) > 0 ? "destructive" : undefined,
-      to: "/topology",
-      filter: filterFor("Fiber cuts", fiberCutIds),
-      issueKind: "pon_fiber",
-    },
-    {
-      key: "pon-cap",
-      label: "PONs at capacity",
-      loading: ponSummary.isLoading,
-      value: pon?.pons_over_cap ?? 0,
-      detail: (pon?.pons_over_cap ?? 0) > 0
-        ? `busiest has ${pon!.pon_cap_worst}`
-        : `all under ${pon?.pon_cap ?? 64}`,
-      tone: (pon?.pons_over_cap ?? 0) > 0 ? "warning" : undefined,
-      to: "/topology",
-      filter: filterFor("PON at capacity", pon?.over_cap_device_ids ?? []),
-      issueKind: "pon_capacity",
-    },
-    {
-      key: "onus",
-      label: "ONUs online",
-      loading: ponSummary.isLoading,
-      value: pon?.onus_total ? `${pon.onus_online}/${pon.onus_total}` : "—",
-      detail: (pon?.onus_offline ?? 0) > 0 ? `${pon!.onus_offline} offline` : "all up",
-      to: "/topology",
-      filter: filterFor("ONUs offline", onusOfflineIds),
-      issueKind: "onu_offline",
-    },
+    ...(hasOptics ? [
+      {
+        key: "dup-macs", label: "Duplicate MACs", one: "duplicate MAC", value: pon?.dup_macs_live ?? 0,
+        detail: dupStale > 0 ? `${dupStale} stale-only` : undefined,
+        tone: "destructive", plane: "optical",
+        filter: { label: "Duplicate MACs", ids: dupMacIds }, issueKind: "dup_mac",
+      } satisfies WatchItem,
+      {
+        key: "fiber", label: "Fiber cuts", one: "fiber cut", value: pon?.fiber_cuts ?? 0,
+        tone: "destructive", plane: "optical",
+        filter: { label: "Fiber cuts", ids: fiberCutIds }, issueKind: "pon_fiber",
+      } satisfies WatchItem,
+      {
+        key: "pon-cap", label: "PONs at capacity", one: "PON at capacity", value: pon?.pons_over_cap ?? 0,
+        detail: (pon?.pons_over_cap ?? 0) > 0 ? `busiest has ${pon!.pon_cap_worst}` : undefined,
+        tone: "warning", plane: "optical",
+        filter: { label: "PON at capacity", ids: pon?.over_cap_device_ids ?? [] },
+        issueKind: "pon_capacity",
+      } satisfies WatchItem,
+    ] : []),
   ]
 
-  const allStats = hasOptics ? [...stats, ...opticalStats] : stats
-
-  const isZero = (s: Stat) =>
-    !s.tone && (s.value === 0 || s.value === "0") && !s.loading
-  const loudStats = allStats.filter((s) => !isZero(s))
-  const quietStats = allStats.filter(isZero)
-
-  const troubled = allStats.filter((s) => s.tone && !s.loading)
-  const verdict = triageCount > 0
-    ? null                                  // the triage queue speaks for itself
-    : troubled.length === 0
-      ? { tone: "success" as const, head: "All clear.",
-          rest: "No open outages, every probe reporting." }
-      : { tone: "warning" as const,
-          head: "Nothing is down.",
-          rest: `Every device is up and every probe reporting, but ${
-            [...troubled]
-              .sort((a, b) => (a.tone === "destructive" ? 0 : 1) - (b.tone === "destructive" ? 0 : 1))
-              .slice(0, 2)
-              .map((t) => `${t.value} ${t.label}`)
-              .join(", ")
-          }${troubled.length > 2 ? `, and ${troubled.length - 2} more` : ""} need attention.` }
+  const dataLoading = devices.isLoading || summary.isLoading || ponSummary.isLoading
 
   return (
     <div className="wisp-page @container flex flex-col gap-4 p-4 md:px-8 md:py-6">
       <div className="flex items-center justify-between gap-4">
         <h1 className="text-lg font-semibold tracking-tight">Home</h1>
-        <div className="flex items-center gap-2 text-xs text-faint-foreground">
-          <StatusDot tone={feedStale ? "destructive" : "success"} />
-          {lastSeen
-            ? <>{feedStale ? "Feed stale" : "Live"} · updated {ago(lastSeen)}</>
-            : "No probe has reported yet"}
+        <div className="flex items-center gap-3">
+          {/* The queue's depth stays visible without a panel of its own: the
+              cockpit shows the trouble, this chip names the queue. */}
+          {!triage.loading && triage.urgent > 0 && (
+            <Link to="/triage"
+              className="flex items-center gap-1.5 rounded-md border border-destructive/30 bg-destructive-soft px-2.5 py-1 text-xs font-medium text-destructive transition-[filter] hover:brightness-125">
+              <span className="size-1.5 rounded-full bg-destructive" aria-hidden />
+              {[
+                triage.activeOutages.length > 0
+                  && `${triage.activeOutages.length} outage${triage.activeOutages.length === 1 ? "" : "s"}`,
+                triage.staleNodes.length > 0
+                  && `${triage.staleNodes.length} probe${triage.staleNodes.length === 1 ? "" : "s"} dark`,
+              ].filter(Boolean).join(" · ")}
+              <ArrowRight className="size-3" />
+            </Link>
+          )}
+          <div className="flex items-center gap-2 text-xs text-faint-foreground">
+            <StatusDot tone={feedStale ? "destructive" : "success"} />
+            {lastSeen
+              ? <>{feedStale ? "Feed stale" : "Live"} · updated {ago(lastSeen)}</>
+              : "No probe has reported yet"}
+          </div>
         </div>
       </div>
 
-      {triageLoading && <Skeleton className="h-12 w-full rounded-xl" />}
-      {!triageLoading && verdict && (
-        <div className="wisp-panel flex flex-wrap items-center gap-x-3 gap-y-1 px-5 py-3.5">
-          <span className={cn("size-2 shrink-0 rounded-full",
-            verdict.tone === "success" ? "bg-success ring-4 ring-success/15"
-              : "bg-warning ring-4 ring-warning/15")} />
-          <span className="text-sm font-medium text-foreground">{verdict.head}</span>
-          <span className="text-sm text-muted-foreground">{verdict.rest}</span>
-          {lastSeen && (
-            <span className="ml-auto text-xs text-faint-foreground">Last check {ago(lastSeen)}</span>
-          )}
-        </div>
-      )}
+      <PulseBand
+        monitored={monitored}
+        devicesLoading={devices.isLoading || triage.loading}
+        pon={pon}
+        ponLoading={ponSummary.isLoading}
+        hasOptics={hasOptics}
+        watch={watch}
+        watchLoading={dataLoading || triage.loading}
+      />
 
-      {loudStats.length > 0 && (
-        <div className={cn("grid grid-cols-2 gap-3 @md:grid-cols-3 @2xl:grid-cols-4",
-          loudStats.length >= 5 && "@4xl:grid-cols-5")}>
-          {loudStats.map((s) => <StatTile key={s.key} s={s} />)}
-        </div>
-      )}
-
-      {quietStats.length > 0 && (
-        <div className="wisp-panel flex flex-wrap items-center gap-x-5 gap-y-2 px-5 py-3">
-          {quietStats.map((s) => (
-            <span key={s.key} className="flex items-baseline gap-1.5 text-xs">
-              <span className="font-mono font-medium text-muted-foreground">{s.value}</span>
-              <span className="text-faint-foreground">{s.label.toLowerCase()}</span>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {!triageLoading && triageCount > 0 && (
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <h2 className="flex items-center gap-2 text-sm font-semibold">
-              <TriangleAlert className="size-4 text-destructive" />
-              Triage queue
-            </h2>
-            <div className="flex items-center gap-3">
-              <ClearPostmortems org={scopeOrg} count={pendingPostmortems} />
-              <span className="rounded-4xl border bg-card px-2.5 py-0.5 text-xs font-semibold">
-                {triageCount} open
-              </span>
-            </div>
-          </div>
-          <div className="grid gap-3 @md:grid-cols-2 @md:items-start @4xl:grid-cols-3">
-            {staleNodes.map((n) => <StaleNodeCard key={n.node_id} node={n} />)}
-            {activeOutages.map((o) => <OutageCard key={o.id} outage={o} />)}
-            {visiblePostmortems.map((o) => <OutageCard key={o.id} outage={o} />)}
-          </div>
-          {hiddenPostmortems > 0 && (
-            <Button variant="outline" size="sm" className="gap-1.5 self-start"
-              onClick={() => setShowPostmortems((v) => !v)}>
-              {showPostmortems
-                ? <><ChevronUp className="size-3.5" /> Hide post-mortems</>
-                : <><ChevronDown className="size-3.5" /> Show {hiddenPostmortems}{postmortemPreview > 0 ? " more" : ""} pending post-mortem{hiddenPostmortems === 1 ? "" : "s"}</>}
-            </Button>
-          )}
-        </div>
-      )}
-
-      <OrgReliabilityPanel />
-
-      <div className="grid items-start gap-4 @2xl:grid-cols-[1.5fr_1fr]">
+      <div className="grid items-stretch gap-4 @2xl:grid-cols-[1.5fr_1fr]">
         <OnuSignalPanel hasOptics={hasOptics} />
         <DownMostPanel devices={deviceList} />
       </div>
+
+      <OrgReliabilityPanel />
+
+      {/* Capacity closes the band: the cockpit says what is wrong now, the
+          reliability panels say how the fleet has been behaving, and this says
+          what to buy before either becomes a complaint. Owner-only, and it
+          mounts nothing for an org whose ports the historian doesn't sample. */}
+      <CapacityPanel />
     </div>
   )
 }

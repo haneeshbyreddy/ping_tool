@@ -151,6 +151,53 @@ from `central/static/`.
   so a budget-bounded partial still yields port up/down. A genuinely dead agent still
   RE-RAISES (keeps the no_response classification); an agent with no ifTable returns `[]`.
   `AdaptivePortWalkTest`.
+- **The port walk is SPLIT: counters every sweep, identity hourly** (2026-08-15). Per-sweep
+  cost is rows × columns, and on C-Data EPON every ONU is an ifTable row — so HILL-OLT-1
+  (222 rows, 197 of them ONU pseudo-interfaces) burned its 60s budget on six near-static
+  identity columns and died before the two counter columns, EVERY sweep, filed as `ok`, with
+  the bandwidth column blank for weeks and every `bw_threshold_mbps` on the box silently
+  unable to alarm. Raising the timeout is the wrong fix — row count grows with SUBSCRIBERS.
+  The HOT walk (`scope="hot"`, every `port_interval_s`) is `admin, oper, HCIn, HCOut`; the
+  FULL 10-column walk rides `port_identity_interval_s` (3600s), plus process start and
+  whenever a hot walk returns a never-seen if_index. Status columns stay FIRST; counters
+  moved from LAST to right behind them in the full order too — safe ONLY because of the
+  sparse contract below. The level-0 combined walk uses the scope's column set; the ladder
+  is untouched, one level per device across scopes. A column cut off by the deadline KEEPS
+  the rows it fetched (the accumulator lives outside the cancelled coroutine) and is named
+  in `missing_columns`. `ScopedWalkTest`, `test_daemon_central_brain:PortScopePlannerTest`.
+- **The wire is SPARSE and central PRESERVES on absence** — an ABSENT row key means that
+  ifTable cell never arrived (not walked, dropped, or truncated past); a PRESENT key, even
+  None, is authoritative (present-None is what still clears an alias somebody deleted on the
+  box). `ports.py:_to_port_status` holds identity from the prior row on absent keys.
+  **Counters are ATOMIC per row — both octets or neither** (`_has_counters`): `counters_at`
+  is ONE stamp for both directions, and taking one side while holding the other makes the
+  next delta divide by the wrong dt and inflate the rate. A counter-less sweep PRESERVES the
+  stored baseline — the old unconditional upsert wiped it, which is why a rate (needing two
+  CONSECUTIVE complete counter walks) never computed once on HILL-OLT-1 even on its lucky
+  sweeps. The held bps expires past 900s (a rate is a claim about now); the baseline never
+  expires (the next pair averages over the gap; a counter wrap yields None, never a bogus
+  number); the historian records NO rate for a held sweep (one walk's number must not become
+  a run of samples); bw alarm streaks get no rate evidence so they hold — but eligibility
+  rides oper status, which IS current every sweep, so a port that went down still clears.
+  **DEPLOY ORDER: central before any edge rollout** — an old central + new edge wipes port
+  names on every hot sweep (old edges always send every key, so the reverse is safe).
+  `PartialWalkTest` in `integration/test_central_ports`.
+- **A walk that dropped columns reports `partial`, NAMING them** — never `ok` (green light
+  over an empty bandwidth column is exactly how this failure hid for weeks). `partial` had
+  to be ADDED to `store_util.SNMP_STATUS_STATES`: that vocabulary is closed and
+  `upsert_snmp_statuses` SILENTLY DROPS unknown states, so a new state that skips the tuple
+  never reaches the DB while every layer above looks wired. `last_ok_at` stamps on `ok`
+  only, so "last complete walk" stays answerable. The ports PANEL chips "last walk
+  incomplete" when rows exist — `SnmpDiagnosis` only renders over an EMPTY table, so
+  without the chip a partial walk is a blank column with no explanation, the exact failure
+  again. Chip yields to the offline/stale notes (frozen outranks incomplete).
+- **The next lever is Stage 2, never a bigger timeout** (operator's calls, 2026-08-15: hot
+  path stays 300s; ONU pseudo-rows MAY relax to 600s — only spendable with targeted reads,
+  since a column walk cannot skip rows; design for ~2× fleet). When a hot walk outgrows
+  ~40s or an OLT passes ~400 ONUs: targeted GETs for the ~25 real ports (4 columns ×
+  if_index, O(real ports) not O(subscribers)) with a sysUpTime reboot guard, ONU rows on
+  the slower full walk. The ONU rows can never be dropped outright — they are the only
+  per-subscriber rate source on this hardware (`onu_if_token`).
 - **Unit tests inject fake pollers, so a bad HLAPI call only surfaces on a REAL walk** —
   verify `device_snmp_status` after any edge SNMP rollout.
 - **Remote walks: the edge is central's hands, poll-only.** Queued from the dashboard,
@@ -2729,6 +2776,32 @@ Both actions stay on the tile: the body links to the tree, a corner button (`Lis
   invalidating react-query keys off `store.data_version` (which includes `MAX(nodes.last_seen)`
   so a bare heartbeat un-stales a probe without a refresh). `list_org_devices()` LEFT JOINs
   `device_states` (+ `switch_ports` aggregates) so rows color without per-device round trips.
+- **The SPA keeps ITSELF fresh — session and build both** (2026-08-14, operator: an expired tab
+  "isn't auto refresh" and new builds only arrive on a manual reload). Three pieces:
+  (1) **A window-`focus` probe of `/api/me`** (`use-auth.tsx`, 30s min interval): react-query v5
+  refetches only on `visibilitychange`, and a browser window sitting BEHIND another window never
+  goes hidden — so returning to it fired no request at all and an expired session stayed rendered
+  until the next click. A 401 anywhere dispatches `wisp:unauthorized` → login with the expired
+  note → back to the same page via `state.from`.
+  (2) **A dying SSE stream probes auth** (`use-event-stream.ts`): an EventSource cannot see WHY
+  its connection died — expired session and restarting central look identical from JS — so
+  `error` while visible probes `/api/me` (15s guard, failures swallowed). The server already
+  closes the stream within 60s of session expiry, so even a tab that stays visible bounces to
+  login about a minute after its session lapses. Returning after >60s hidden also refetches
+  every ACTIVE query once (`invalidateQueries()`, bounded — mounted queries only, NOT the
+  per-event refetch storm the LIVE_QUERY_KEYS list exists to avoid).
+  (3) **`event: build` on the SSE stream announces the SERVED bundle** (`server.py:_BuildCache`):
+  the entry chunk's hash, re-read off `index.html` on disk (mtime-gated, 5s TTL) because
+  `npm run build` deploys the SPA with NO restart — a startup latch would announce the old build
+  forever. The client compares against its own `<script>` tag (`lib/build-refresh.ts:ownBuildId`)
+  — the SAME fact both sides parse, no second version scheme — and reloads WHEN SAFE: immediately
+  while hidden (unless a dialog is open — alt-tabbing away mid-edit must not discard the edit),
+  otherwise on the next `hashchange` navigation or the next hide. ONE auto-reload per build id
+  (sessionStorage) so a cached index.html can't reload-loop. `vite:preloadError` triggers one
+  reload per route: a deploy DELETES the old hashed chunks, so a pre-deploy tab 404s any lazy
+  route it hadn't visited — code-splitting made this failure real, and without the guard it
+  renders as a broken page. Tests: `test_central.py` (`…announces_the_served_build`,
+  `…build_cache_reads_reparses_and_degrades`).
 
 ### Map (`/map`)
 

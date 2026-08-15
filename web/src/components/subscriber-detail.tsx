@@ -14,6 +14,7 @@ import {
 } from "@/lib/format"
 import { ratioLabel } from "@/map/drops"
 import { RowTag } from "@/components/device-detail"
+import { OnuHistorySection } from "@/components/onu-history"
 import { StatusDot } from "@/components/status-badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -498,6 +499,14 @@ export function SubscriberDetail({ mac, actions, fibre }: {
   const frozen = !!sub.olt && isDownState(sub.olt.state)
   const opticsFresh = isFresh(sub.olt?.optics_updated_at)
   const dark = !!r && r.state !== "online"
+  // The ONE live reading this panel is prepared to stand behind, decided in the
+  // same order and on the same facts as the Signal row below prints it: frozen
+  // behind a down OLT, dark, a stale optics walk, or a vendor publishing no
+  // per-ONU Rx each mean there is no "now" for the history chart to place at
+  // its right edge. Deciding it HERE keeps that grammar in one place — a stale
+  // or frozen figure redrawn on a chart as "now" is exactly the lie the panel
+  // spends four branches avoiding two sections down.
+  const liveRx = !frozen && !dark && opticsFresh && r?.rx_dbm != null ? r.rx_dbm : null
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -532,6 +541,111 @@ export function SubscriberDetail({ mac, actions, fibre }: {
           Registered on {sub.slots} live slots, so we can't say which OLT this
           drop is on. Clearing the stale registration on the OLT fixes it.
         </div>
+      )}
+
+      {/* Live state leads (operator's ask, 2026-08-15): the panel is opened
+          during a complaint, and "is it up, what does the light read, what did
+          it do this week" is the question — identity and billing are the
+          follow-up. The history chart stays directly under "Right now": the
+          live figure is what its right edge repeats. */}
+      <Section title="Right now">
+        {!r ? (
+          <p className="py-1 text-xs text-faint-foreground">
+            No roster row, so there is nothing live to report.
+          </p>
+        ) : (
+          <>
+            {frozen && (
+              <p className="mb-1 text-xs text-warning">
+                Its OLT is down. Readings below are frozen at the last walk.
+              </p>
+            )}
+            <div className={cn(frozen && "wisp-frozen")}>
+              <Row label="State">
+                <span className={cn("font-medium",
+                  dark ? "text-destructive" : "text-success")}>
+                  {dark ? `Dark · ${r.state}` : "Online"}
+                </span>
+                {dark && r.last_online_at && (
+                  <span className="text-muted-foreground"> · since {ago(r.last_online_at)}</span>
+                )}
+              </Row>
+
+              <Row label="Signal">
+                {frozen ? (
+                  <span className="text-faint-foreground">—</span>
+                ) : dark ? (
+                  <span className="text-faint-foreground">
+                    Not measured while the ONU is dark.
+                  </span>
+                ) : !opticsFresh ? (
+                  <span className="text-faint-foreground">
+                    This OLT's optics walk is stale, so there is no current reading.
+                  </span>
+                ) : r.rx_dbm == null ? (
+                  <span className="text-faint-foreground">
+                    This OLT reports no per-ONU receive power.
+                  </span>
+                ) : (
+                  <>
+                    <span className={cn("font-mono font-semibold",
+                      sev === "crit" ? "text-destructive"
+                        : sev === "warn" ? "text-warning" : "")}>
+                      {r.rx_dbm.toFixed(2)} dBm
+                    </span>
+                    {sub.thresholds && (
+                      <span className="text-2xs text-faint-foreground">
+                        {" "}· warn {sub.thresholds.warn_dbm}, crit {sub.thresholds.crit_dbm}
+                      </span>
+                    )}
+                  </>
+                )}
+              </Row>
+
+              <Row label="Traffic">
+                {frozen ? (
+                  <span className="text-faint-foreground">—</span>
+                ) : !sub.rate ? (
+                  <span className="text-faint-foreground">
+                    This OLT's firmware publishes no per-ONU interface.
+                  </span>
+                ) : !isFresh(sub.rate.updated_at) ? (
+                  <span className="text-faint-foreground">
+                    No recent rate. This OLT's port walk is stale.
+                  </span>
+                ) : (
+                  <span className="font-mono">
+                    ↓ {((sub.rate.out_bps ?? 0) / 1e6).toFixed(1)} Mb/s
+                    {" · "}↑ {((sub.rate.in_bps ?? 0) / 1e6).toFixed(1)} Mb/s
+                    {sub.rate.if_name && (
+                      <span className="text-faint-foreground">
+                        {" "}· {sub.rate.if_name.split(" ")[0]}
+                      </span>
+                    )}
+                  </span>
+                )}
+              </Row>
+
+              {r.distance_m != null && r.distance_m > 0 && (
+                <Row label="Ranging">
+                  <span className="font-mono">{(r.distance_m / 1000).toFixed(2)} km</span>
+                  <span className="text-2xs text-faint-foreground"> · optical path</span>
+                </Row>
+              )}
+            </div>
+            {sub.olt?.optics_updated_at && (
+              <p className="mt-1 text-2xs text-faint-foreground">
+                Optics walked {ago(sub.olt.optics_updated_at)}
+                {r.name && r.name !== rec?.label && ` · the OLT calls it "${r.name}"`}
+              </p>
+            )}
+          </>
+        )}
+      </Section>
+
+      {sub.olt && r?.onu_key && (
+        <OnuHistorySection deviceId={sub.olt.id} onuKey={r.onu_key}
+          nowRx={liveRx} nowSev={sev} />
       )}
 
       <Section title="Customer"
@@ -632,101 +746,6 @@ export function SubscriberDetail({ mac, actions, fibre }: {
         <Row label="User MAC">
           <UserMacs macs={sub.user_macs ?? []} status={sub.user_mac_status} />
         </Row>
-      </Section>
-
-      <Section title="Right now">
-        {!r ? (
-          <p className="py-1 text-xs text-faint-foreground">
-            No roster row, so there is nothing live to report.
-          </p>
-        ) : (
-          <>
-            {frozen && (
-              <p className="mb-1 text-xs text-warning">
-                Its OLT is down. Readings below are frozen at the last walk.
-              </p>
-            )}
-            <div className={cn(frozen && "wisp-frozen")}>
-              <Row label="State">
-                <span className={cn("font-medium",
-                  dark ? "text-destructive" : "text-success")}>
-                  {dark ? `Dark · ${r.state}` : "Online"}
-                </span>
-                {dark && r.last_online_at && (
-                  <span className="text-muted-foreground"> · since {ago(r.last_online_at)}</span>
-                )}
-              </Row>
-
-              <Row label="Signal">
-                {frozen ? (
-                  <span className="text-faint-foreground">—</span>
-                ) : dark ? (
-                  <span className="text-faint-foreground">
-                    Not measured while the ONU is dark.
-                  </span>
-                ) : !opticsFresh ? (
-                  <span className="text-faint-foreground">
-                    This OLT's optics walk is stale, so there is no current reading.
-                  </span>
-                ) : r.rx_dbm == null ? (
-                  <span className="text-faint-foreground">
-                    This OLT reports no per-ONU receive power.
-                  </span>
-                ) : (
-                  <>
-                    <span className={cn("font-mono font-semibold",
-                      sev === "crit" ? "text-destructive"
-                        : sev === "warn" ? "text-warning" : "")}>
-                      {r.rx_dbm.toFixed(2)} dBm
-                    </span>
-                    {sub.thresholds && (
-                      <span className="text-2xs text-faint-foreground">
-                        {" "}· warn {sub.thresholds.warn_dbm}, crit {sub.thresholds.crit_dbm}
-                      </span>
-                    )}
-                  </>
-                )}
-              </Row>
-
-              <Row label="Traffic">
-                {frozen ? (
-                  <span className="text-faint-foreground">—</span>
-                ) : !sub.rate ? (
-                  <span className="text-faint-foreground">
-                    This OLT's firmware publishes no per-ONU interface.
-                  </span>
-                ) : !isFresh(sub.rate.updated_at) ? (
-                  <span className="text-faint-foreground">
-                    No recent rate. This OLT's port walk is stale.
-                  </span>
-                ) : (
-                  <span className="font-mono">
-                    ↓ {((sub.rate.out_bps ?? 0) / 1e6).toFixed(1)} Mb/s
-                    {" · "}↑ {((sub.rate.in_bps ?? 0) / 1e6).toFixed(1)} Mb/s
-                    {sub.rate.if_name && (
-                      <span className="text-faint-foreground">
-                        {" "}· {sub.rate.if_name.split(" ")[0]}
-                      </span>
-                    )}
-                  </span>
-                )}
-              </Row>
-
-              {r.distance_m != null && r.distance_m > 0 && (
-                <Row label="Ranging">
-                  <span className="font-mono">{(r.distance_m / 1000).toFixed(2)} km</span>
-                  <span className="text-2xs text-faint-foreground"> · optical path</span>
-                </Row>
-              )}
-            </div>
-            {sub.olt?.optics_updated_at && (
-              <p className="mt-1 text-2xs text-faint-foreground">
-                Optics walked {ago(sub.olt.optics_updated_at)}
-                {r.name && r.name !== rec?.label && ` · the OLT calls it "${r.name}"`}
-              </p>
-            )}
-          </>
-        )}
       </Section>
 
       {canWrite && (

@@ -59,6 +59,7 @@ _WORKER_GET = {
     "/api/inventory/perf/samples", "/api/pon/faults", "/api/pon/summary",
     "/api/incident/shape", "/api/analytics", "/api/analytics/trend",
     "/api/history/reliability",
+    "/api/history/onu", "/api/history/replay", "/api/history/port",
     "/api/logs",
     "/api/issues", "/api/issues/pdf", "/api/issues/xlsx",
     "/api/field/shift",
@@ -118,6 +119,51 @@ class _VersionCache:
                 return cur
             self._cond.wait(timeout)
             return self._versions.get(org)
+
+
+_ENTRY_RE = re.compile(rb"/assets/index-([A-Za-z0-9_-]+)\.js")
+
+
+class _BuildCache:
+    """The served SPA's build id: the entry chunk's hash off index.html on disk.
+
+    `npm run build` deploys the SPA with no restart, so this must re-read the
+    file rather than latch at startup — cached by mtime behind a short TTL so
+    every SSE iteration can afford the check. The id is the same string the
+    browser can read off its own <script> tag, which is what lets the client
+    compare without a second versioning scheme.
+    """
+
+    def __init__(self, path: Path, ttl: float = 5.0) -> None:
+        self.path = path
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._checked = 0.0
+        self._mtime: float | None = None
+        self._id: str | None = None
+
+    def current(self) -> str | None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._checked < self.ttl:
+                return self._id
+            self._checked = now
+            try:
+                mtime = self.path.stat().st_mtime
+            except OSError:
+                self._mtime = self._id = None
+                return None
+            if mtime != self._mtime:
+                self._mtime = mtime
+                try:
+                    m = _ENTRY_RE.search(self.path.read_bytes())
+                except OSError:
+                    m = None
+                self._id = m.group(1).decode("ascii") if m else None
+            return self._id
+
+
+_build_cache = _BuildCache(_STATIC / "index.html")
 
 
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
@@ -472,6 +518,9 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 self._security_headers()
                 self.end_headers()
                 self.wfile.write(b"retry: 3000\n\n")
+                build = _build_cache.current()
+                if build:
+                    self.wfile.write(f"event: build\ndata: {build}\n\n".encode())
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
@@ -487,7 +536,11 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                     last_check = time.monotonic()
                     if auth.resolve_session(store, tok, cfg=cfg) is None:
                         return
+                cur_build = _build_cache.current()
                 try:
+                    if cur_build and cur_build != build:
+                        build = cur_build
+                        self.wfile.write(f"event: build\ndata: {build}\n\n".encode())
                     if version is not None and version != last:
                         last = version
                         self.wfile.write(f"event: changed\ndata: {version}\n\n".encode())

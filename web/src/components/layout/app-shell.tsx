@@ -14,10 +14,11 @@ import { AlarmChips } from "./alarm-chips"
 import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
 import { AccountMenu } from "./account-menu"
+import { useTriage } from "@/hooks/use-triage"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
-  SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
-  SidebarTrigger,
+  SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuBadge, SidebarMenuButton, SidebarMenuItem,
+  SidebarProvider, SidebarTrigger,
 } from "@/components/ui/sidebar"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
@@ -40,6 +41,17 @@ export function AppShell() {
       && !((i.account || i.ownerOnly) && isWorker),
   )
   const sidebarItems = navItems.filter((i) => !i.account)
+
+  // The queue left Home for /triage, so the nav item carries its depth: loud
+  // while anything needs a response, quiet while only post-mortem paperwork
+  // waits. Same useTriage numbers Home's verdict and the page itself quote.
+  const triage = useTriage()
+  const triageBadge = triage.loading ? null
+    : triage.urgent > 0
+      ? { n: triage.urgent, cls: "border-destructive/30 bg-destructive-soft text-destructive" }
+      : triage.postmortems.length > 0
+        ? { n: triage.postmortems.length, cls: "border-border bg-foreground/[0.04] text-muted-foreground" }
+        : null
 
   const isNavActive = (to: string) => (to === "/" ? pathname === "/" : pathname.startsWith(to))
 
@@ -134,6 +146,13 @@ export function AppShell() {
                             <span>{item.label}</span>
                           </NavLink>
                         </SidebarMenuButton>
+                        {item.to === "/triage" && triageBadge && (
+                          <SidebarMenuBadge
+                            className={cn("rounded-md border font-mono text-2xs font-semibold",
+                              triageBadge.cls)}>
+                            {triageBadge.n > 99 ? "99+" : triageBadge.n}
+                          </SidebarMenuBadge>
+                        )}
                       </SidebarMenuItem>
                     ))}
                   </SidebarMenu>
@@ -201,8 +220,16 @@ export function AppShell() {
           ))}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex min-w-0 flex-1 flex-col items-center gap-0.5 px-1 py-2 text-2xs font-medium text-faint-foreground">
-                <MoreHorizontal className="size-5" />
+              <button className="relative flex min-w-0 flex-1 flex-col items-center gap-0.5 px-1 py-2 text-2xs font-medium text-faint-foreground">
+                <span className="relative">
+                  <MoreHorizontal className="size-5" />
+                  {/* Triage is off the six-slot tab bar, so its urgency dot
+                      rides the button that reaches it. */}
+                  {triageBadge && (
+                    <span className={cn("absolute -top-0.5 -right-1 size-2 rounded-full",
+                      triage.urgent > 0 ? "bg-destructive" : "bg-muted-foreground/50")} />
+                  )}
+                </span>
                 More
               </button>
             </DropdownMenuTrigger>
@@ -212,6 +239,13 @@ export function AppShell() {
                   <NavLink to={item.to}>
                     <item.icon />
                     {item.label}
+                    {item.to === "/triage" && triageBadge && (
+                      <span className={cn(
+                        "ml-auto rounded-md border px-1.5 font-mono text-2xs font-semibold",
+                        triageBadge.cls)}>
+                        {triageBadge.n > 99 ? "99+" : triageBadge.n}
+                      </span>
+                    )}
                   </NavLink>
                 </DropdownMenuItem>
               ))}

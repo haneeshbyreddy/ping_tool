@@ -11,6 +11,7 @@ import { ProfileWizard } from "@/components/profile-wizard"
 import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { useAuth } from "@/hooks/use-auth"
 import { ago } from "@/lib/format"
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -27,6 +28,7 @@ const SUBSYSTEM_NOUN: Record<SnmpSubsystem, string> = {
 interface Diagnosis {
   cause: string
   steps: string[]
+  tone?: "warning"
   walk?: boolean
   wizard?: boolean
   notSupported?: boolean
@@ -47,6 +49,22 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
       return {
         cause: `The last sweep succeeded${st.item_count != null ? ` (${st.item_count} item${st.item_count === 1 ? "" : "s"})` : ""} ${ago(st.updated_at)}. Data should appear shortly.`,
         steps: [],
+      }
+    case "partial":
+      // Not "ok": the walk answered for some columns and ran out of budget
+      // before the rest. What arrived is current, what didn't holds its last
+      // complete reading and then blanks — never a green light over a gap.
+      return {
+        cause: `The last sweep ran out of budget before the whole ${subsystem === "ports" ? "interface table" : "walk"}: ${st.detail ?? "some columns didn't arrive"}. What did arrive is current ${ago(st.updated_at)}; the dropped columns hold their last complete reading and go blank once that ages out.`,
+        steps: subsystem === "ports"
+          ? [
+              "A rate is a delta between two walks, so bandwidth stays blank until two consecutive sweeps both carry the counters.",
+              "Usually a very large ifTable on a slow agent. Persistent partials on one box are worth reporting — the walk budget is tunable per subsystem.",
+            ]
+          : [
+              "Usually a very large table on a slow agent. Persistent partials are worth reporting — the walk budget is tunable per subsystem.",
+            ],
+        tone: "warning",
       }
     case "no_response":
       return {
@@ -235,7 +253,8 @@ export function SnmpDiagnosis({ device, subsystem }: {
   const d = diagnose(subsystem, st)
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border bg-muted/40 px-3 py-2.5">
+    <div className={cn("flex flex-col gap-2 rounded-lg border px-3 py-2.5",
+      d.tone === "warning" ? "border-warning/40 bg-warning-soft/30" : "bg-muted/40")}>
       <p className="text-xs text-foreground">{d.cause}</p>
       {d.steps.length > 0 && (
         <ol className="flex list-decimal flex-col gap-0.5 pl-4 text-xs text-muted-foreground">

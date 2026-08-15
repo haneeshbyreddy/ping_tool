@@ -29,7 +29,9 @@ from wisp.runtime.edge_status import (
 from wisp.runtime.single_instance import AlreadyRunning, SingleInstance
 from wisp.ingress.probers import PingResult, Prober, build_prober
 from wisp.ingress.health import HealthPoller, build_health_poller
-from wisp.ingress.snmp import SnmpPoller, SnmpTarget, build_snmp_poller
+from wisp.ingress.snmp import (
+    PortStatus, SnmpPoller, SnmpTarget, build_snmp_poller, missing_detail,
+)
 from wisp.ingress.gpon import GponPollerPool
 from wisp.ingress.webproxy import ProxyTunnel, build_proxy_tunnel
 
@@ -100,17 +102,68 @@ def _classify_snmp_exc(exc: Exception) -> tuple[str, str]:
         return "no_response", msg
     return "error", msg
 
+# A key the walk did not fetch is OMITTED, so central preserves what it stored;
+# a key that arrived empty rides as None, which is authoritative.
+_WIRE_OPTIONAL = ("if_name", "if_alias", "last_change", "in_octets",
+                  "out_octets", "speed_bps")
+
+def _wire_port(p: PortStatus) -> dict:
+    row = {"if_index": p.if_index, "if_name": p.if_name, "if_alias": p.if_alias,
+           "admin_status": p.admin_status, "oper_status": p.oper_status,
+           "last_change": p.last_change, "in_octets": p.in_octets,
+           "out_octets": p.out_octets, "speed_bps": p.speed_bps}
+    if p.carried is not None:
+        for key in _WIRE_OPTIONAL:
+            if key not in p.carried:
+                del row[key]
+    return row
+
+class _PortScopePlanner:
+
+    def __init__(self, cfg: Config = CONFIG) -> None:
+        self._every = cfg.port_identity_interval_s
+        self._full_at: dict[int, float] = {}
+        self._indexes: dict[int, frozenset[int]] = {}
+        self._refresh: set[int] = set()
+
+    def plan(self, devices: list[dict], now: float) -> dict[int, str]:
+        scopes: dict[int, str] = {}
+        for d in devices:
+            if not d.get("snmp_enabled"):
+                continue
+            last = self._full_at.get(d["id"])
+            full = (last is None or d["id"] in self._refresh
+                    or (self._every > 0 and now - last >= self._every))
+            scopes[d["id"]] = "full" if full else "hot"
+        return scopes
+
+    def record(self, scopes: dict[int, str], data: dict[int, list[dict]],
+               now: float) -> None:
+        for dev_id, scope in scopes.items():
+            rows = data.get(dev_id)
+            if not rows:
+                continue
+            seen = frozenset(r["if_index"] for r in rows)
+            if scope == "full":
+                self._full_at[dev_id] = now
+                self._indexes[dev_id] = seen
+                self._refresh.discard(dev_id)
+            elif seen - self._indexes.get(dev_id, frozenset()):
+                self._refresh.add(dev_id)
+
 async def _gather_snmp_ports(
     snmp_poller: SnmpPoller, devices: list[dict], cfg: Config = CONFIG,
-    gate: _SnmpAirtime | None = None,
+    gate: _SnmpAirtime | None = None, scopes: dict[int, str] | None = None,
 ) -> tuple[dict[int, list[dict]], dict[int, dict]]:
     gate = gate or _SnmpAirtime(cfg.snmp_max_inflight)
+    scopes = scopes or {}
 
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         async with gate.slot(d["ip_address"]):
             try:
-                ports = await asyncio.wait_for(
-                    snmp_poller.walk(_snmp_target(d)),
+                result = await asyncio.wait_for(
+                    snmp_poller.walk(_snmp_target(d),
+                                     scope=scopes.get(d["id"], "full")),
                     timeout=cfg.port_walk_timeout_s or None)
             except asyncio.TimeoutError:
                 log.warning("SNMP port walk of device %s (%s) exceeded %.0fs cap; skipping",
@@ -123,18 +176,16 @@ async def _gather_snmp_ports(
                               d.get("id"), d["ip_address"])
                 state, detail = _classify_snmp_exc(exc)
                 return d["id"], None, {"state": state, "detail": detail}
-        if not ports:
+        if not result.ports:
             return d["id"], None, {
                 "state": "empty",
                 "detail": "agent answered but the interface table had no rows"}
-        wire = [
-            {"if_index": p.if_index, "if_name": p.if_name, "if_alias": p.if_alias,
-             "admin_status": p.admin_status, "oper_status": p.oper_status,
-             "last_change": p.last_change, "in_octets": p.in_octets,
-             "out_octets": p.out_octets, "speed_bps": p.speed_bps}
-            for p in ports
-        ]
-        return d["id"], wire, {"state": "ok", "count": len(ports)}
+        wire = [_wire_port(p) for p in result.ports]
+        if result.missing_columns:
+            return d["id"], wire, {
+                "state": "partial", "count": len(result.ports),
+                "detail": missing_detail(result.missing_columns)}
+        return d["id"], wire, {"state": "ok", "count": len(result.ports)}
 
     rows = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
     data = {dev_id: wire for dev_id, wire, _ in rows if wire is not None}
@@ -494,6 +545,8 @@ async def _run_central_brain(
     snmp_poller = build_snmp_poller(cfg) if cfg.snmp_interval_s > 0 else None
     next_ports = 0.0
     snmp_task: asyncio.Task | None = None
+    port_plan = _PortScopePlanner(cfg)
+    port_scopes: dict[int, str] = {}
     gpon_pool = GponPollerPool(cfg) if cfg.snmp_interval_s > 0 else None
     if gpon_pool is not None:
         gpon_pool.set_profiles(gpon_profiles)
@@ -530,9 +583,10 @@ async def _run_central_brain(
         started = asyncio.get_running_loop().time()
         if max_cycles is None:
             if snmp_poller is not None and snmp_task is None and started >= next_ports:
+                port_scopes = port_plan.plan(devices, started)
                 snmp_task = asyncio.create_task(
                     _gather_snmp_ports(snmp_poller, list(devices), cfg,
-                                       gate=airtime))
+                                       gate=airtime, scopes=port_scopes))
                 next_ports = started + cfg.port_interval_s
             if gpon_pool is not None and gpon_task is None and started >= next_optics:
                 gpon_pool.set_profiles(gpon_profiles)
@@ -550,6 +604,7 @@ async def _run_central_brain(
         if snmp_task is not None and snmp_task.done():
             try:
                 ports, st = snmp_task.result()
+                port_plan.record(port_scopes, ports, started)
                 _merge_snmp_status(snmp_status, "ports", st)
             except Exception:
                 log.exception("SNMP sweep failed; continuing")

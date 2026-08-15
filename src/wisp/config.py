@@ -113,6 +113,8 @@ class Config:
         default_factory=lambda: _env_int("WISP_SNMP_REQUEST_RETRIES", 3))
     port_walk_timeout_s: float = field(
         default_factory=lambda: _env_float("WISP_PORT_WALK_TIMEOUT_S", 60.0))
+    port_identity_interval_s: float = field(
+        default_factory=lambda: _env_float("WISP_PORT_IDENTITY_INTERVAL_S", 3600.0))
     snmp_max_inflight: int = field(
         default_factory=lambda: _env_int("WISP_SNMP_MAX_INFLIGHT", 4))
     snmp_down_consecutive: int = field(
@@ -159,6 +161,17 @@ class Config:
         default_factory=lambda: _env_int("WISP_HIST_PON_HOUR_DAYS", 14))
     hist_port_hour_days: int = field(
         default_factory=lambda: _env_int("WISP_HIST_PORT_HOUR_DAYS", 30))
+    # The per-ONU tier is the cardinality outlier — 5,205 ONUs against 29 OLTs
+    # and 177 eligible ports — so it gets its own two horizons instead of
+    # riding the shared ones. The hour tier is a SHORT rolling window (the
+    # post-splice / last-night question, ~125 k rows a day); the day tier is
+    # the long record and stops well short of hist_day_days' 730, which at this
+    # width would be ~3.8 M rows in one table. onu_events rides the day horizon
+    # — the transition ledger must cover exactly the window the buckets do.
+    hist_onu_hour_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_ONU_HOUR_DAYS", 2))
+    hist_onu_day_days: int = field(
+        default_factory=lambda: _env_int("WISP_HIST_ONU_DAY_DAYS", 180))
     hist_day_days: int = field(
         default_factory=lambda: _env_int("WISP_HIST_DAY_DAYS", 730))
     field_track_retention_days: int = field(

@@ -91,6 +91,7 @@ class CentralOpticsMonitor:
 
         total = online = warn_count = crit_count = crit_unacked = 0
         acc = history.OpticsAccumulator()
+        onus = history.OnuAccumulator()
         pending: list[dict] = []
         for raw in raw_onus:
             onu_key = str(raw.get("onu_key") or "").strip()
@@ -109,6 +110,10 @@ class CentralOpticsMonitor:
             acc.add(raw.get("pon_port"), state, rx, sev)
 
             prev = prior.get(onu_key)
+            # The per-ONU historian rides the same pass: `prev` is the previous
+            # roster row, so the transition is decided here (where both states
+            # are in hand) and nowhere else.
+            onus.add(onu_key, prev["state"] if prev else None, state, rx)
             ref, ref_at = _next_ref(
                 prev["rx_ref_dbm"] if prev else None,
                 prev["rx_ref_at"] if prev else None, rx, ts)
@@ -131,6 +136,8 @@ class CentralOpticsMonitor:
                            crit_unacked, ts)
         history.record_optics(self.store, self.cfg, self.org_id, device_id,
                               ts, acc)
+        history.record_onus(self.store, self.cfg, self.org_id, device_id,
+                            ts, onus)
 
     def _update_badge(self, device_id: int, total: int, online: int, warn_count: int,
                       crit_count: int, crit_unacked: int, ts: str) -> None:

@@ -7,7 +7,9 @@ from pathlib import Path
 
 from wisp.central import fiber
 from wisp.central.store_assign import AssignmentStoreMixin
+from wisp.central.store_capacity import CapacityStoreMixin
 from wisp.central.store_orgs import OrgStoreMixin
+from wisp.central.store_replay import ReplayStoreMixin
 from wisp.central.store_users import UserStoreMixin
 from wisp.central.store_fleet import FleetStoreMixin
 from wisp.central.store_devices import DeviceStoreMixin
@@ -1509,6 +1511,71 @@ CREATE TABLE IF NOT EXISTS hist_radius_day (
     linked    INTEGER NOT NULL,
     PRIMARY KEY (org_id, day)
 ) WITHOUT ROWID;
+-- PER-ONU (Wave 2). Stage 1 REFUSED this tier — "5,205 ONUs at even the hour
+-- tier would be ~11 M rows/90 d" — and the refusal was about the RETENTION, not
+-- the grain: a subscriber's own history is the one series a tech opens while
+-- standing at the drop. So the hour tier is a SHORT rolling window (2 d, the
+-- post-splice / last-night question) and the long record is the day tier, on
+-- its own horizon (`hist_onu_day_days`, 180 d — deliberately NOT the 730 d the
+-- other day tables get: 5,205 ONUs x 730 d is ~3.8 M rows for one table).
+--   * IDENTITY IS THE SLOT (`onu_key`), never the serial — parse_onu_table's
+--     rule: these OLTs never drop a vacated registration, so a re-registered
+--     ONU is reported on both its old and new slot and a serial key collapses
+--     two rows into one (Gpon_08: 9 serials on 2-3 slots).
+--   * Rx folds exactly as the OLT tier folds it (after sane_rx and the DDM rail
+--     guard, ONLINE ONUs only) — a dark ONU's stored dBm is whatever the last
+--     good walk saw, i.e. not now. The ROW still exists for it (samples/online
+--     are counted, rx_n stays 0), because most of the C-Data/DBC fleet reports
+--     no dBm at all and the state history is the only signal those subscribers
+--     have. rx_n = 0 is "nothing measured", never "nothing wrong".
+--   * ON DELETE CASCADE, unlike its siblings, which are swept by name inside
+--     delete_org_device. A hardcoded sweep list is one edit away from a
+--     forgotten cascade (the failure test_delete_cascade_handles_every_fk_table
+--     exists to catch); these three tables cannot be forgotten. The org-delete
+--     introspection sweep still finds them by org_id, as it must.
+CREATE TABLE IF NOT EXISTS hist_onu_hour (
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES org_devices(id) ON DELETE CASCADE,
+    onu_key   TEXT NOT NULL,
+    bucket    INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    online    INTEGER NOT NULL,
+    rx_n      INTEGER NOT NULL,
+    rx_sum    REAL NOT NULL,
+    rx_min    REAL,
+    rx_max    REAL,
+    PRIMARY KEY (device_id, onu_key, bucket)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hist_onu_day (
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES org_devices(id) ON DELETE CASCADE,
+    onu_key   TEXT NOT NULL,
+    day       INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    online    INTEGER NOT NULL,
+    rx_n      INTEGER NOT NULL,
+    rx_sum    REAL NOT NULL,
+    rx_min    REAL,
+    rx_max    REAL,
+    PRIMARY KEY (device_id, onu_key, day)
+) WITHOUT ROWID;
+-- TRANSITIONS, never samples — the one place this schema encodes state changes
+-- rather than fixed-cadence rows, because "when did this subscriber go dark"
+-- is answered by the change and a per-sweep state column would be 1.5 M rows a
+-- day to say "still online". old_state NULL = first seen (no prior roster row).
+-- States are stored RAW (online/offline/unknown/dying_gasp/los/...): the
+-- vendor's own word, never normalised, since dying_gasp vs los is exactly what
+-- the PON verdict reads. A walk that never arrives writes nothing, so a gap is
+-- still the record — nothing here is synthesised from staleness.
+CREATE TABLE IF NOT EXISTS onu_events (
+    org_id    TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES org_devices(id) ON DELETE CASCADE,
+    onu_key   TEXT NOT NULL,
+    old_state TEXT,
+    new_state TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    PRIMARY KEY (device_id, onu_key, ts)
+) WITHOUT ROWID;
 """
 
 
@@ -1524,6 +1591,8 @@ class CentralStore(
     AssignmentStoreMixin,
     FieldStoreMixin,
     HistoryStoreMixin,
+    CapacityStoreMixin,
+    ReplayStoreMixin,
 ):
 
     _TENANT_TABLES = (

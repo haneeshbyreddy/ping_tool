@@ -16,7 +16,7 @@ _spec.loader.exec_module(daemon)
 
 from wisp.config import Config
 from wisp.ingress.probers import PingResult
-from wisp.ingress.snmp import PortStatus
+from wisp.ingress.snmp import PortStatus, PortWalkResult
 from wisp.runtime.central_client import CentralClientError
 from wisp.runtime.edge_status import StatusWriter
 
@@ -85,12 +85,15 @@ class RecordingCentralClient:
 class _FakeSnmpPoller:
     def __init__(self, behaviour):
         self._behaviour = behaviour
+        self.scopes: list[tuple[str, str]] = []
 
-    async def walk(self, target):
+    async def walk(self, target, scope="full"):
+        self.scopes.append((target.ip, scope))
         result = self._behaviour[target.ip]
         if isinstance(result, Exception):
             raise result
-        return result
+        return (result if isinstance(result, PortWalkResult)
+                else PortWalkResult(result))
 
 class GentleProbePlanTest(unittest.TestCase):
     def test_parent_gets_infra_cadence_leaf_gets_full(self):
@@ -225,10 +228,10 @@ class GatherSnmpPortsTest(unittest.TestCase):
 
     def test_a_hung_walk_is_capped_not_waited_out(self):
         class _HangingPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 if target.ip == "10.0.0.1":
                     await asyncio.sleep(3600)
-                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
 
         devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
                   _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
@@ -239,9 +242,9 @@ class GatherSnmpPortsTest(unittest.TestCase):
 
     def test_slow_port_walk_rides_the_port_cap_not_the_snmp_cap(self):
         class _SlowPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 await asyncio.sleep(0.1)
-                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
 
         devices = [_dev(8, "10.0.0.8", snmp_enabled=True, snmp_community="public")]
         cfg = Config(snmp_walk_timeout_s=0.01, port_walk_timeout_s=5.0)
@@ -252,12 +255,12 @@ class GatherSnmpPortsTest(unittest.TestCase):
         inflight = {"now": 0, "peak": 0}
 
         class _SlowPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 inflight["now"] += 1
                 inflight["peak"] = max(inflight["peak"], inflight["now"])
                 await asyncio.sleep(0.02)
                 inflight["now"] -= 1
-                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
 
         devices = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
                   for i in range(1, 5)]
@@ -270,12 +273,12 @@ class GatherSnmpPortsTest(unittest.TestCase):
         inflight = {"now": 0, "peak": 0}
 
         class _SlowPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 inflight["now"] += 1
                 inflight["peak"] = max(inflight["peak"], inflight["now"])
                 await asyncio.sleep(0.01)
                 inflight["now"] -= 1
-                return []
+                return PortWalkResult([])
 
         devices = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
                   for i in range(1, 7)]
@@ -283,19 +286,98 @@ class GatherSnmpPortsTest(unittest.TestCase):
         asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices, cfg))
         self.assertLessEqual(inflight["peak"], 2)
 
+    def test_a_cell_that_never_arrived_is_left_off_the_wire(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        snmp = _FakeSnmpPoller({"10.0.0.1": [PortStatus(
+            3, "Gi0/3", "-> X", "up", "up", in_octets=7, out_octets=9,
+            carried=frozenset({"in_octets", "out_octets"}))]})
+        ports, _ = asyncio.run(daemon._gather_snmp_ports(snmp, devices, Config()))
+        self.assertEqual(ports[1], [{"if_index": 3, "admin_status": "up",
+                                     "oper_status": "up", "in_octets": 7,
+                                     "out_octets": 9}])
+
+    def test_a_cell_that_arrived_empty_rides_as_an_explicit_null(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        snmp = _FakeSnmpPoller({"10.0.0.1": [PortStatus(
+            3, None, None, "up", "up", carried=frozenset({"if_alias"}))]})
+        ports, _ = asyncio.run(daemon._gather_snmp_ports(snmp, devices, Config()))
+        self.assertEqual(ports[1][0]["if_alias"], None)
+        self.assertNotIn("if_name", ports[1][0])
+
+    def test_a_walk_that_dropped_a_column_reports_partial_and_names_it(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        snmp = _FakeSnmpPoller({"10.0.0.1": PortWalkResult(
+            [PortStatus(3, "Gi0/3", None, "up", "up")],
+            ("in_octets", "out_octets"))})
+        ports, status = asyncio.run(daemon._gather_snmp_ports(snmp, devices, Config()))
+        self.assertEqual(set(ports), {1})
+        self.assertEqual(status[1]["state"], "partial")
+        self.assertEqual(status[1]["count"], 1)
+        self.assertIn("bandwidth counters", status[1]["detail"])
+
+    def test_the_planned_scope_reaches_the_poller(self):
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
+                  _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
+        snmp = _FakeSnmpPoller({"10.0.0.1": [PortStatus(1, "Gi0/1", None, "up", "up")],
+                               "10.0.0.2": [PortStatus(1, "Gi0/1", None, "up", "up")]})
+        asyncio.run(daemon._gather_snmp_ports(snmp, devices, Config(),
+                                              scopes={1: "hot"}))
+        self.assertEqual(sorted(snmp.scopes),
+                         [("10.0.0.1", "hot"), ("10.0.0.2", "full")])
+
+class PortScopePlannerTest(unittest.TestCase):
+    _CFG = Config(port_identity_interval_s=3600.0)
+
+    def _devices(self):
+        return [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
+                _dev(2, "10.0.0.2", snmp_enabled=False)]
+
+    def test_first_sweep_is_full_and_the_next_is_hot(self):
+        planner = daemon._PortScopePlanner(self._CFG)
+        devices = self._devices()
+        first = planner.plan(devices, 0.0)
+        self.assertEqual(first, {1: "full"})
+        planner.record(first, {1: [{"if_index": 1}, {"if_index": 2}]}, 0.0)
+        self.assertEqual(planner.plan(devices, 300.0), {1: "hot"})
+
+    def test_identity_is_walked_again_once_the_interval_elapses(self):
+        planner = daemon._PortScopePlanner(self._CFG)
+        devices = self._devices()
+        planner.record(planner.plan(devices, 0.0), {1: [{"if_index": 1}]}, 0.0)
+        self.assertEqual(planner.plan(devices, 3599.0), {1: "hot"})
+        self.assertEqual(planner.plan(devices, 3600.0), {1: "full"})
+
+    def test_a_new_if_index_in_a_hot_result_forces_a_full_walk(self):
+        planner = daemon._PortScopePlanner(self._CFG)
+        devices = self._devices()
+        planner.record(planner.plan(devices, 0.0), {1: [{"if_index": 1}]}, 0.0)
+        hot = planner.plan(devices, 60.0)
+        self.assertEqual(hot, {1: "hot"})
+        planner.record(hot, {1: [{"if_index": 1}, {"if_index": 9}]}, 60.0)
+        full = planner.plan(devices, 120.0)
+        self.assertEqual(full, {1: "full"})
+        planner.record(full, {1: [{"if_index": 1}, {"if_index": 9}]}, 120.0)
+        self.assertEqual(planner.plan(devices, 180.0), {1: "hot"})
+
+    def test_a_device_that_answered_nothing_is_still_due_a_full_walk(self):
+        planner = daemon._PortScopePlanner(self._CFG)
+        devices = self._devices()
+        planner.record(planner.plan(devices, 0.0), {}, 0.0)
+        self.assertEqual(planner.plan(devices, 60.0), {1: "full"})
+
 class SharedAirtimeGateTest(unittest.TestCase):
 
     def test_same_device_never_walked_twice_at_once(self):
         per_ip: dict[str, dict] = {}
 
         class _SlowPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 st = per_ip.setdefault(target.ip, {"now": 0, "peak": 0})
                 st["now"] += 1
                 st["peak"] = max(st["peak"], st["now"])
                 await asyncio.sleep(0.02)
                 st["now"] -= 1
-                return [PortStatus(1, "Gi0/1", None, "up", "up")]
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
 
         devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public"),
                   _dev(2, "10.0.0.2", snmp_enabled=True, snmp_community="public")]
@@ -315,12 +397,12 @@ class SharedAirtimeGateTest(unittest.TestCase):
         inflight = {"now": 0, "peak": 0}
 
         class _SlowPoller:
-            async def walk(self, target):
+            async def walk(self, target, scope="full"):
                 inflight["now"] += 1
                 inflight["peak"] = max(inflight["peak"], inflight["now"])
                 await asyncio.sleep(0.01)
                 inflight["now"] -= 1
-                return []
+                return PortWalkResult([])
 
         first = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
                  for i in range(1, 4)]

@@ -1214,6 +1214,28 @@
 [data-pane] .wisp-tree-scrim {
   position: absolute;
 }
+/* The type minimap is `fixed` against the viewport ("always visible while I
+   scroll"), which is exactly wrong inside a split-view pane — it would hover
+   over whichever pane happens to own the right edge. Same reasoning as the
+   device-panel rule above; hiding beats repositioning because a pane is
+   already a narrowed working view. */
+[data-pane] .wisp-typerail {
+  display: none;
+}
+/* The gutter the minimap lives in. Reserved in LAYOUT, not solved by offset
+   arithmetic: the sidebar shifts the content column (and collapses to icons),
+   so no viewport-based `right:` calc can promise the rail lands beside the
+   card rather than on it — measured failing at 1500px, 2026-08-15. Matches
+   the rail's xl gate; a pane reverts to the plain page padding because the
+   rail is hidden there. */
+@media (min-width: 1280px) {
+  .wisp-has-typerail {
+    padding-right: 4rem;
+  }
+  [data-pane] .wisp-has-typerail {
+    padding-right: 1.5rem;
+  }
+}
 .wisp-map-wrap:fullscreen {
   height: 100vh;
   background: var(--background);

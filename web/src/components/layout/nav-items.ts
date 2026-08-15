@@ -1,6 +1,6 @@
 import {
   LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
-  TriangleAlert, MapPinPlus, BookUser,
+  TriangleAlert, MapPinPlus, BookUser, Siren,
   type LucideIcon,
 } from "lucide-react"
 
@@ -32,6 +32,11 @@ export interface NavItem {
 
 export const NAV_ITEMS: NavItem[] = [
   { to: "/", label: "Home", icon: LayoutDashboard, mobile: true, group: "monitor" },
+  // The queue lived on Home until 2026-08-15; it moved out so Home could become
+  // the visual overview, and the nav badge (app-shell) is what keeps it
+  // unmissable. mobile stays false — the tab bar is at its six-destination
+  // ceiling — so the More button carries the urgency dot instead.
+  { to: "/triage", label: "Triage", icon: Siren, mobile: false, group: "monitor" },
   { to: "/topology", label: "Network", icon: Network, mobile: true, group: "infrastructure" },
   { to: "/map", label: "Map", icon: Map, mobile: true, group: "infrastructure" },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false, account: true },

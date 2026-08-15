@@ -46,6 +46,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("wisp:unauthorized", handler)
   }, [queryClient])
 
+  // react-query v5 refetches only on visibilitychange, and a browser window
+  // sitting BEHIND another window never goes hidden — so coming back to it
+  // fired no request at all and an expired session sat rendered until the next
+  // click. Probe /api/me on window focus too; a 401 dispatches
+  // wisp:unauthorized (the bounce to login), success keeps the user row fresh.
+  useEffect(() => {
+    let last = 0
+    const probe = () => {
+      if (document.visibilityState !== "visible") return
+      if (!queryClient.getQueryData<MeResponse>(["me"])?.user) return
+      const now = Date.now()
+      if (now - last < 30_000) return
+      last = now
+      authApi.me()
+        .then((data) => queryClient.setQueryData(["me"], data))
+        .catch(() => {})
+    }
+    window.addEventListener("focus", probe)
+    return () => window.removeEventListener("focus", probe)
+  }, [queryClient])
+
   const user = meQuery.data?.user ?? null
 
   const login = async (username: string, password: string, remember = false,

@@ -36,6 +36,11 @@ MAINTENANCE_INTERVAL_S = 6 * 3600
 # older than the shortest hour-tier retention would fold from partially
 # pruned hours and silently understate. Beyond it, the missed days stay gaps
 # — which is the record.
+# NOT to be cut to the per-ONU tier's 2 days (2026-08-14): pruning only happens
+# INSIDE run_maintenance and always AFTER the fold loop, so nothing prunes while
+# central is down and a 7-day catch-up still folds from intact hours. The bound
+# is about a tier pruned by an EARLIER run, which by that ordering can only have
+# happened to a day already folded.
 CATCHUP_MAX_DAYS = 7
 
 
@@ -113,6 +118,51 @@ class OpticsAccumulator:
                         "online": p["online"], "crit": p["crit"],
                         "rx_med": med, "rx_min": mn})
         return out
+
+
+class OnuAccumulator:
+    # The PER-ONU half of the same walk (Wave 2): one hour-tier sample for
+    # every ONU the walk carried, plus the state TRANSITIONS among them.
+    # Separate from OpticsAccumulator on purpose — they are written under
+    # separate guards, so a failure in the wide per-ONU write can never cost
+    # the OLT/PON sample the dashboard charts already read.
+    #
+    # The transition rule, entire: a state that did not move writes NOTHING.
+    # `prev_state` is the ONU's own previous roster row (None when the slot has
+    # never been walked, which is a first-seen event with old_state NULL). A
+    # prior row whose state column is NULL reads as first-seen too — the same
+    # sentence in practice, and not worth a column to tell apart.
+    # An ONU that VANISHES from a walk writes nothing either: these OLTs never
+    # drop a vacated registration, so a slot missing from one walk is a gap in
+    # the walk, not a subscriber going anywhere.
+    #
+    # Rx is taken ONLY from an online ONU, exactly as OpticsAccumulator takes
+    # it: a dark ONU's reading is whatever the last good walk saw. The SAMPLE
+    # still exists for it, because on the C-Data/DBC fleet the state history is
+    # the only signal most subscribers have.
+
+    def __init__(self) -> None:
+        self.rows: list[tuple] = []
+        self.events: list[tuple] = []
+
+    def add(self, onu_key: str, prev_state: str | None, state: str,
+            rx: float | None) -> None:
+        online = state == "online"
+        self.rows.append((onu_key, online, rx if online else None))
+        if prev_state != state:
+            self.events.append((onu_key, prev_state, state))
+
+
+def record_onus(store, cfg: Config, org_id: str, device_id: int, ts: str,
+                acc: OnuAccumulator) -> None:
+    if not cfg.hist_enabled or not (acc.rows or acc.events):
+        return
+    try:
+        store.record_onu_sweep(org_id, device_id, epoch_s(ts), acc.rows,
+                               acc.events)
+    except Exception:
+        log.exception("history: per-ONU sample failed for %s/device=%d",
+                      org_id, device_id)
 
 
 def record_optics(store, cfg: Config, org_id: str, device_id: int, ts: str,
@@ -231,6 +281,12 @@ def run_maintenance(store, cfg: Config = CONFIG, now_s: int | None = None) -> No
         "hist_port_day": now_s - cfg.hist_day_days * DAY_S,
         "hist_device_day": now_s - cfg.hist_day_days * DAY_S,
         "hist_radius_day": now_s - cfg.hist_day_days * DAY_S,
+        "hist_onu_hour": now_s - cfg.hist_onu_hour_days * DAY_S,
+        "hist_onu_day": now_s - cfg.hist_onu_day_days * DAY_S,
+        # The transition ledger shares the per-ONU DAY horizon: the events
+        # series is drawn on the same window as the buckets, and a chart whose
+        # dots stop months before its line reads as a broken feature.
+        "onu_events": now_s - cfg.hist_onu_day_days * DAY_S,
     })
     if removed:
         log.info("history: pruned %s",

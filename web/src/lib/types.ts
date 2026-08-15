@@ -1167,7 +1167,8 @@ export interface GponProfilesResponse {
 }
 
 export type SnmpSubsystem = "health" | "ports" | "optics"
-export type SnmpStatusState = "ok" | "empty" | "no_response" | "timeout" | "no_profile" | "error"
+export type SnmpStatusState =
+  | "ok" | "partial" | "empty" | "no_response" | "timeout" | "no_profile" | "error"
 
 export interface SnmpSubsystemStatus {
   subsystem: SnmpSubsystem

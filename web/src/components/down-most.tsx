@@ -22,7 +22,9 @@ import { cn } from "@/lib/utils"
 
 const FLEET = "var(--chart-5)"
 const DAYS = 30
-const ROWS = 7
+// Five rows at h-10 lands this panel at the ONU signal chart's height, so the
+// Home row the two share reads as one band instead of a step (2026-08-15).
+const ROWS = 5
 
 export function DownMostPanel({ devices }: { devices: OrgDevice[] }) {
   const { scopeOrg, canWrite } = useAuth()
@@ -48,11 +50,14 @@ export function DownMostPanel({ devices }: { devices: OrgDevice[] }) {
   const maxCount = Math.max(1, ...top.map((r) => r.outage_count))
 
   return (
-    <section className="wisp-panel">
+    <section className="wisp-panel flex h-full flex-col">
       <div className="wisp-panel-head">
         <h2 className="flex items-baseline gap-2">
           <span className="text-sm font-semibold text-foreground">Down the most</span>
-          <span className="text-xs text-faint-foreground">last {DAYS} days</span>
+          <span className="text-xs text-faint-foreground">
+            last {DAYS} days
+            {ranked.length > ROWS && ` · top ${ROWS} of ${ranked.length}`}
+          </span>
         </h2>
         <Link to="/issues?kind=device_down"
           className="shrink-0 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground">
@@ -74,7 +79,7 @@ export function DownMostPanel({ devices }: { devices: OrgDevice[] }) {
               <Link key={r.device_id} to="/topology"
                 state={{ deviceId: r.device_id }}
                 title={`${r.uptime_pct.toFixed(2)}% uptime · ${fmtDurS(r.downtime_seconds)} down over ${DAYS} days`}
-                className="flex h-11 items-center gap-3 px-4 transition-colors hover:bg-foreground/5">
+                className="flex h-10 items-center gap-3 px-4 transition-colors hover:bg-foreground/5">
                 <StatusDot tone={live ? deviceTone(d!.state, d!.state_updated_at) : "muted"} />
                 <span className="w-0 flex-1">
                   <span className="flex items-baseline gap-2">
@@ -105,11 +110,6 @@ export function DownMostPanel({ devices }: { devices: OrgDevice[] }) {
               </Link>
             )
           })}
-          {ranked.length > ROWS && (
-            <p className="px-4 py-2 text-2xs text-faint-foreground">
-              +{ranked.length - ROWS} more with outages in the window
-            </p>
-          )}
         </div>
       )}
     </section>

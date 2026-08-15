@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -308,10 +309,20 @@ class MaintenanceWiringTest(RetentionTestBase):
     def test_the_thread_starts_even_with_the_historian_off(self):
         # Retention bounds the disk; hanging it off a feature flag is the same
         # shape as the bug that left proxy_audit pruning only on session create.
+        # run_maintenance is stubbed so the daemon loop's first pass cannot
+        # race tearDown's rmtree (it recreates WAL files under a dir being
+        # deleted); the stub's event also proves the loop actually ran.
         cfg = Config(central_db=self.cfg.central_db, hist_enabled=False)
-        t = history.start_history_thread(cfg, self.store)
-        self.assertIsNotNone(t)
-        self.assertTrue(t.daemon)
+        ran = threading.Event()
+        real = history.run_maintenance
+        history.run_maintenance = lambda store, cfg: ran.set()
+        try:
+            t = history.start_history_thread(cfg, self.store)
+            self.assertIsNotNone(t)
+            self.assertTrue(t.daemon)
+            self.assertTrue(ran.wait(5))
+        finally:
+            history.run_maintenance = real
 
 
 if __name__ == "__main__":

@@ -46,6 +46,24 @@ class SnmpStatusStoreTest(unittest.TestCase):
         self.assertEqual(row["last_ok_at"], "2026-01-01T00:00:00+00:00")
         self.assertEqual(row["sysobjectid"], "1.3.6.1.4.1.5651.3")
 
+    def test_a_partial_walk_files_as_partial_and_never_as_ok(self):
+        # A walk that dropped the counter columns still delivers port up/down.
+        # Filing it as 'ok' is a green light over an empty bandwidth column.
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "ports", {"state": "ok", "count": 28}),
+        ], "2026-01-01T00:00:00+00:00")
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "ports", {
+                "state": "partial", "count": 28,
+                "detail": "walk dropped: bandwidth counters (in_octets, out_octets)"}),
+        ], "2026-01-01T00:05:00+00:00")
+        row = self._status()["ports"]
+        self.assertEqual(row["state"], "partial")
+        self.assertIn("in_octets", row["detail"])
+        self.assertEqual(row["item_count"], 28)
+        # "last worked" stays the last COMPLETE walk
+        self.assertEqual(row["last_ok_at"], "2026-01-01T00:00:00+00:00")
+
     def test_unknown_subsystem_or_state_is_dropped(self):
         self.store.upsert_snmp_statuses("ispA", [
             (self.dev, "quantum", {"state": "ok"}),
@@ -194,6 +212,21 @@ class SnmpStatusHttpTest(unittest.TestCase):
         self.assertEqual(rows["health"]["profile"], "fiberhome")
         self.assertEqual(rows["health"]["item_count"], 3)
         self.assertEqual(body["capability"], [])
+
+    def test_a_partial_ports_walk_reaches_the_api_the_spa_reads(self):
+        status, _ = self._report(snmp_status={str(self.dev): {
+            "ports": {"state": "partial", "count": 28,
+                      "detail": "walk dropped: bandwidth counters "
+                                "(in_octets, out_octets)"},
+        }})
+        self.assertEqual(status, 200)
+        cookie = self._login("owner", "ownerpassword")
+        _, body, _ = self._req(
+            "GET", f"/api/inventory/snmp-status?device_id={self.dev}", cookie=cookie)
+        row = {r["subsystem"]: r for r in body["status"]}["ports"]
+        self.assertEqual(row["state"], "partial")
+        self.assertIn("bandwidth counters", row["detail"])
+        self.assertIsNone(row["last_ok_at"])
 
     def test_status_for_a_device_outside_the_org_is_ignored(self):
         stranger = self.store.create_org_device("ispB", {

@@ -874,7 +874,12 @@ class CentralServerTest(unittest.TestCase):
         self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
         self.assertTrue(resp.readline().startswith(b"retry:"))
         resp.readline()
-        self.assertEqual(resp.readline(), b"event: changed\n")
+        line = resp.readline()
+        if line == b"event: build\n":  # served build id, present when static exists
+            resp.readline()
+            resp.readline()
+            line = resp.readline()
+        self.assertEqual(line, b"event: changed\n")
         version_before = resp.readline()
         resp.readline()
         dev = self.store.create_org_device("ispA", {
@@ -887,6 +892,54 @@ class CentralServerTest(unittest.TestCase):
         version_after = resp.readline()
         self.assertNotEqual(version_before, version_after)
         conn.close()
+
+    def test_events_stream_announces_the_served_build(self):
+        # The SPA reloads itself off this event; it must carry the entry hash
+        # index.html names, and a redeploy mid-stream must push the NEW hash.
+        from wisp.central import server as central_server
+        self._req("POST", "/heartbeat", _hb(), token="s3cret")
+        tmp = Path(self.tmp.name) / "index.html"
+        tmp.write_bytes(b'<script src="/assets/index-OLDHASH11.js"></script>')
+        saved = central_server._build_cache
+        central_server._build_cache = central_server._BuildCache(tmp, ttl=0.0)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.request("GET", "/api/events",
+                         headers={"Authorization": "Bearer s3cret"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(resp.readline().startswith(b"retry:"))
+            resp.readline()
+            self.assertEqual(resp.readline(), b"event: build\n")
+            self.assertEqual(resp.readline(), b"data: OLDHASH11\n")
+            resp.readline()
+            # a deploy rewrites index.html; the next stream iteration says so
+            tmp.write_bytes(b'<script src="/assets/index-NEWHASH22.js"></script>')
+            os.utime(tmp, (1, 1))  # force a distinct mtime
+            self.store.create_org_device("ispA", {
+                "name": "SW2", "ip_address": "10.9.9.9", "device_type": "switch",
+                "region": None, "parent_device_id": None})
+            seen = []
+            for _ in range(20):
+                line = resp.readline()
+                seen.append(line)
+                if line == b"data: NEWHASH22\n":
+                    break
+            self.assertIn(b"data: NEWHASH22\n", seen)
+            conn.close()
+        finally:
+            central_server._build_cache = saved
+
+    def test_build_cache_reads_reparses_and_degrades(self):
+        from wisp.central.server import _BuildCache
+        path = Path(self.tmp.name) / "idx.html"
+        cache = _BuildCache(path, ttl=0.0)
+        self.assertIsNone(cache.current())  # missing file: no id, no raise
+        path.write_bytes(b'<script src="/assets/index-AbC123_-.js"></script>')
+        self.assertEqual(cache.current(), "AbC123_-")
+        path.write_bytes(b"<html>no entry script</html>")
+        os.utime(path, (2, 2))
+        self.assertIsNone(cache.current())
 
 class AdminOverviewTest(unittest.TestCase):
     def setUp(self):

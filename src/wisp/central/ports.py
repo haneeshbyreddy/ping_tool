@@ -8,6 +8,8 @@ from wisp.config import CONFIG, Config
 from wisp.core.analytics import _parse
 from wisp.ingress.snmp import PortStatus, throughput_bps
 
+STALE_S = 900
+
 @dataclass(frozen=True)
 class PortEvent:
     device_id: int
@@ -20,22 +22,38 @@ def _label(p: PortStatus) -> str:
     base = p.if_name or f"if{p.if_index}"
     return f"{base} ({p.if_alias})" if p.if_alias else base
 
-def _to_port_status(raw: dict) -> PortStatus | None:
+def _if_index(raw: dict) -> int | None:
     try:
-        if_index = int(raw.get("if_index"))
+        return int(raw.get("if_index"))
     except (TypeError, ValueError):
         return None
+
+def _to_port_status(raw: dict, if_index: int, prior: dict | None) -> PortStatus:
+    # An ABSENT key means that ifTable cell never arrived (a budget-bounded walk
+    # dropped the column); a key PRESENT with None arrived empty and is
+    # authoritative — that is what clears an alias somebody deleted on the box.
+    def held(key: str):
+        if key in raw:
+            return raw[key]
+        return prior[key] if prior else None
     return PortStatus(
         if_index=if_index,
-        if_name=raw.get("if_name"),
-        if_alias=raw.get("if_alias"),
+        if_name=held("if_name"),
+        if_alias=held("if_alias"),
         admin_status=str(raw.get("admin_status") or "unknown"),
         oper_status=str(raw.get("oper_status") or "unknown"),
-        last_change=raw.get("last_change"),
+        last_change=held("last_change"),
         in_octets=_to_int(raw.get("in_octets")),
         out_octets=_to_int(raw.get("out_octets")),
         speed_bps=_to_int(raw.get("speed_bps")),
     )
+
+def _has_counters(raw: dict, p: PortStatus) -> bool:
+    # Atomic on purpose: counters_at is ONE stamp for both directions, so taking
+    # one direction's octets while holding the other's makes the next delta
+    # divide by the wrong dt.
+    return ("in_octets" in raw and "out_octets" in raw
+            and p.in_octets is not None and p.out_octets is not None)
 
 def _to_int(raw) -> int | None:
     if raw in (None, ""):
@@ -83,6 +101,27 @@ def _bw_above(in_bps: float | None, out_bps: float | None, max_bps: float,
         return None
     return any(v > max_bps for v in vals)
 
+def _bw_bound(hit: bool | None, eligible: bool, prior_streak: int,
+              prior_alarm: bool, prior_since: str | None, consecutive: int,
+              ts: str) -> tuple[int, bool, str | None]:
+    if hit is True:
+        streak = prior_streak + 1
+    elif hit is False:
+        streak = 0
+    else:
+        streak = prior_streak if eligible else 0
+    if not eligible:
+        alarm = False
+    elif streak >= consecutive:
+        alarm = True
+    elif streak == 0:
+        alarm = False
+    else:
+        alarm = prior_alarm
+    since = (ts if (alarm and not prior_alarm)
+            else (prior_since if alarm else None))
+    return streak, alarm, since
+
 def _fmt_rate(bps: float | None) -> str:
     if bps is None:
         return "—"
@@ -106,10 +145,11 @@ class CentralPortMonitor:
         hist_rows: list[tuple] = []
         port_rows: list[dict] = []
         for raw in raw_ports:
-            p = _to_port_status(raw)
-            if p is None:
+            if_index = _if_index(raw)
+            if if_index is None:
                 continue
-            prior = existing.get(p.if_index)
+            prior = existing.get(if_index)
+            p = _to_port_status(raw, if_index, prior)
             monitored = bool(prior["monitored"]) if prior else False
             feeds = prior["feeds_device_id"] if prior else None
             prior_streak = prior["down_streak"] if prior else 0
@@ -126,61 +166,60 @@ class CentralPortMonitor:
             since = (ts if (alarm and not prior_alarm)
                     else (prior["alarm_since"] if (prior and alarm) else None))
 
-            dt = _dt_seconds(prior["counters_at"] if prior else None, ts)
-            in_bps = throughput_bps(_to_int(prior["in_octets"]) if prior else None,
-                                    p.in_octets, dt)
-            out_bps = throughput_bps(_to_int(prior["out_octets"]) if prior else None,
-                                     p.out_octets, dt)
-
+            fresh_counters = _has_counters(raw, p)
             threshold = prior["bw_threshold_mbps"] if prior else None
+            max_threshold = prior["bw_max_mbps"] if prior else None
             direction = (prior["bw_direction"] if prior else None) or "either"
-            prior_bw_streak = prior["bw_low_streak"] if prior else 0
             prior_bw_alarm = bool(prior["bw_alarm"]) if prior else False
+            prior_bw_high_alarm = bool(prior["bw_high_alarm"]) if prior else False
             bw_eligible = (monitored and threshold is not None
                           and p.oper_status == "up" and not down)
-            below = (_bw_below(in_bps, out_bps, threshold * 1e6, direction)
-                    if bw_eligible else None)
-            if below is True:
-                bw_streak = prior_bw_streak + 1
-            elif below is False:
-                bw_streak = 0
-            else:
-                bw_streak = prior_bw_streak if bw_eligible else 0
-            if not bw_eligible:
-                bw_alarm = False
-            elif bw_streak >= cfg.snmp_bw_consecutive:
-                bw_alarm = True
-            elif bw_streak == 0:
-                bw_alarm = False
-            else:
-                bw_alarm = prior_bw_alarm
-            bw_since = (ts if (bw_alarm and not prior_bw_alarm)
-                       else (prior["bw_alarm_since"] if (prior and bw_alarm) else None))
-
-            max_threshold = prior["bw_max_mbps"] if prior else None
-            prior_bw_high_streak = prior["bw_high_streak"] if prior else 0
-            prior_bw_high_alarm = bool(prior["bw_high_alarm"]) if prior else False
             high_eligible = (monitored and max_threshold is not None
                             and p.oper_status == "up" and not down)
-            above = (_bw_above(in_bps, out_bps, max_threshold * 1e6, direction)
-                    if high_eligible else None)
-            if above is True:
-                bw_high_streak = prior_bw_high_streak + 1
-            elif above is False:
-                bw_high_streak = 0
+            if fresh_counters:
+                dt = _dt_seconds(prior["counters_at"] if prior else None, ts)
+                in_octets, out_octets, counters_at = p.in_octets, p.out_octets, ts
+                in_bps = throughput_bps(_to_int(prior["in_octets"]) if prior else None,
+                                        p.in_octets, dt)
+                out_bps = throughput_bps(_to_int(prior["out_octets"]) if prior else None,
+                                         p.out_octets, dt)
+                bw_streak, bw_alarm, bw_since = _bw_bound(
+                    _bw_below(in_bps, out_bps, threshold * 1e6, direction)
+                    if bw_eligible else None,
+                    bw_eligible, prior["bw_low_streak"] if prior else 0,
+                    prior_bw_alarm, prior["bw_alarm_since"] if prior else None,
+                    cfg.snmp_bw_consecutive, ts)
+                bw_high_streak, bw_high_alarm, bw_high_since = _bw_bound(
+                    _bw_above(in_bps, out_bps, max_threshold * 1e6, direction)
+                    if high_eligible else None,
+                    high_eligible, prior["bw_high_streak"] if prior else 0,
+                    prior_bw_high_alarm,
+                    prior["bw_high_alarm_since"] if prior else None,
+                    cfg.snmp_bw_consecutive, ts)
             else:
-                bw_high_streak = prior_bw_high_streak if high_eligible else 0
-            if not high_eligible:
-                bw_high_alarm = False
-            elif bw_high_streak >= cfg.snmp_bw_consecutive:
-                bw_high_alarm = True
-            elif bw_high_streak == 0:
-                bw_high_alarm = False
-            else:
-                bw_high_alarm = prior_bw_high_alarm
-            bw_high_since = (ts if (bw_high_alarm and not prior_bw_high_alarm)
-                            else (prior["bw_high_alarm_since"]
-                                 if (prior and bw_high_alarm) else None))
+                # The walk dropped the counter columns. The stored octets are the
+                # baseline the NEXT complete pair is measured against — wiping
+                # them is why a rate needs two consecutive complete walks and a
+                # big OLT never got one. A held rate is still a claim about now,
+                # so it expires; the alarm bounds got no rate evidence this sweep
+                # (hit=None holds an eligible streak), but eligibility rides oper
+                # status, which IS current — a port that went down still clears.
+                in_octets = prior["in_octets"] if prior else None
+                out_octets = prior["out_octets"] if prior else None
+                counters_at = prior["counters_at"] if prior else None
+                still_now = (prior is not None and counters_at is not None
+                             and _dt_seconds(counters_at, ts) <= STALE_S)
+                in_bps = prior["in_bps"] if still_now else None
+                out_bps = prior["out_bps"] if still_now else None
+                bw_streak, bw_alarm, bw_since = _bw_bound(
+                    None, bw_eligible, prior["bw_low_streak"] if prior else 0,
+                    prior_bw_alarm, prior["bw_alarm_since"] if prior else None,
+                    cfg.snmp_bw_consecutive, ts)
+                bw_high_streak, bw_high_alarm, bw_high_since = _bw_bound(
+                    None, high_eligible, prior["bw_high_streak"] if prior else 0,
+                    prior_bw_high_alarm,
+                    prior["bw_high_alarm_since"] if prior else None,
+                    cfg.snmp_bw_consecutive, ts)
 
             port_rows.append({
                 "if_index": p.if_index, "if_name": p.if_name,
@@ -188,11 +227,15 @@ class CentralPortMonitor:
                 "oper_status": p.oper_status, "last_change": p.last_change,
                 "down_streak": streak, "alarm": alarm, "alarm_since": since,
                 "ts": ts,
-                "bw": (p.in_octets, p.out_octets, ts, in_bps, out_bps, bw_streak,
-                       bw_alarm, bw_since, bw_high_streak, bw_high_alarm,
-                       bw_high_since)})
+                "bw": (in_octets, out_octets, counters_at, in_bps, out_bps,
+                       bw_streak, bw_alarm, bw_since, bw_high_streak,
+                       bw_high_alarm, bw_high_since)})
             if history.port_eligible(prior):
-                hist_rows.append((p.if_index, in_bps, out_bps,
+                # A held rate is not a fresh measurement — the historian would
+                # draw one walk's number as a run of samples.
+                hist_rows.append((p.if_index,
+                                  in_bps if fresh_counters else None,
+                                  out_bps if fresh_counters else None,
                                   p.oper_status == "up"))
 
             if alarm != prior_alarm:

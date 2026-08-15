@@ -90,12 +90,29 @@ import { FIT_PADDING, InvalidateOnResize, MapEvents, ViewController, loadView } 
 import {
   trailStyle, workerCensus, workerIcon, workerPlaced, workerState, workerZIndex,
 } from "@/map/workers"
+import { reconstruct, replayApi } from "@/lib/replay-api"
+import {
+  ACCUM_Z, accumIcon, accumLevel, projectDevices,
+} from "@/map/replay"
+import { AccumLegend, ReplayButton, ReplayDock } from "@/map/replay-controls"
+import { MareyToggle, OutageMarey, mareyRows } from "@/components/outage-marey"
 
 const BW_LABELS_KEY = "wisp:map:bw-labels"
 const REF_ONUS_KEY = "wisp:map:ref-onus"
 const WORKERS_KEY = "wisp:map:workers"
 const GOOGLE_LABELS_KEY = "wisp:map:google-labels"
 const UNCABLED_KEY = "wisp:map:uncabled"
+const ACCUM_KEY = "wisp:map:accum"
+
+// Play walks the window in about a minute whatever its length: uniform, and
+// deliberately coarse, because PLAY is for watching a cascade unfold while
+// STEP is for landing exactly on the moment something moved.
+const PLAY_TICK_MS = 100
+const PLAY_TICKS = 600
+// The projection's freshness stamp is refreshed on this coarse clock so a
+// replay left paused cannot age past STALE_AFTER_S and grey the whole map.
+// Coarse on purpose: it recomputes 57 objects, not a render loop.
+const REPLAY_STAMP_MS = 30_000
 
 const UNCABLED_DASH = "3 6"
 
@@ -144,9 +161,23 @@ export function MapPage() {
   // panel covering it. The panel is one click away either way: its row carries the button,
   // and clicking the pin still opens it.
   const [panelFor, setPanelFor] = useState<number | null>(null)
+  // REPLAY STATE LIVES UP HERE because `selectDevice` closes over it, and a
+  // hook reading a state declared further down is the crash this file has
+  // already paid for once.
+  const [replayOn, setReplayOn] = useState(false)
+  const [replayDays, setReplayDays] = useState<number>(7)
+  const [replayAt, setReplayAt] = useState<number | null>(null)
+  const [playing, setPlaying] = useState(false)
+  const [mareyOpen, setMareyOpen] = useState(true)
   const selectDevice = useCallback((id: number | null) => {
-    setSelectedId(id); setPanelFor(id)
-  }, [])
+    // In replay the device panel stays SHUT. Every tab in it (Health, Ports,
+    // Optical, the fibre tray) is a live reading or a write, and a panel of
+    // today's numbers hanging over a map of last Tuesday is exactly the
+    // "past read as now" the banner exists to stop. Selection still works:
+    // the pin highlights, its Marey row highlights, and the hover card reads
+    // the projected state.
+    setSelectedId(id); setPanelFor(replayOn ? null : id)
+  }, [replayOn])
   const [cableOpen, setCableOpenRaw] = useState<number | null>(null)
   const [traceCore, setTraceCore] = useState<number | null>(null)
   const cableDelete = useConfirm()
@@ -215,6 +246,19 @@ export function MapPage() {
       return !v
     })
   }
+  // The ACCUMULATION layer is a Layers entry (opt-in, remembered) because it
+  // is a reference overlay on a live map, unlike replay itself, which is a
+  // mode. Off by default: it describes the past, and a map's default state
+  // must be about now.
+  const [showAccum, setShowAccum] = useState(() => {
+    try { return localStorage.getItem(ACCUM_KEY) === "on" } catch { return false }
+  })
+  const toggleAccum = () => {
+    setShowAccum((v) => {
+      try { localStorage.setItem(ACCUM_KEY, v ? "off" : "on") } catch { /* private mode */ }
+      return !v
+    })
+  }
   const [showUncabled, setShowUncabled] = useState(() => {
     try { return localStorage.getItem(UNCABLED_KEY) !== "off" } catch { return true }
   })
@@ -233,6 +277,11 @@ export function MapPage() {
       return !v
     })
   }
+  // A rate chip is a counter read minutes ago. On a map of last Tuesday it is
+  // the same past-read-as-now lie the readings were blanked for, so the chips
+  // stand down in replay. The SETTING is untouched and the Layers row says
+  // which of the two is hiding them.
+  const bwShown = bwLabels && !replayOn
   const [googleLabels, setGoogleLabels] = useState(() => {
     try { return localStorage.getItem(GOOGLE_LABELS_KEY) !== "off" } catch { return true }
   })
@@ -374,10 +423,18 @@ export function MapPage() {
     enabled: !!scopeOrg,
     refetchInterval: 30_000,
   })
+  // EVERY LIVE VERDICT STANDS DOWN IN REPLAY. A splitter's drop tone, a branch
+  // fault and a power-incident hull are all claims about NOW, derived from
+  // today's optical roster; drawn over a map of last Tuesday they would be the
+  // "past read as now" lie wearing the loudest marks on the map. The
+  // reconstruction has no ONU history yet (that is Wave 3), and the honest
+  // answer to "what were these doing then" is to draw nothing rather than to
+  // draw today's.
   const loadByPassive = useMemo(
-    () => loadsById(dropsQ.data?.splitters), [dropsQ.data])
+    () => (replayOn ? new Map() : loadsById(dropsQ.data?.splitters)),
+    [dropsQ.data, replayOn])
   const branchFaults = useMemo(
-    () => dropsQ.data?.faults ?? [], [dropsQ.data])
+    () => (replayOn ? [] : dropsQ.data?.faults ?? []), [dropsQ.data, replayOn])
 
   const workersQ = useQuery({
     queryKey: ["field-workers", scopeOrg],
@@ -398,9 +455,9 @@ export function MapPage() {
     refetchInterval: 30_000,
   })
   const powerIncidents = useMemo(
-    () => (incidentsQ.data?.incidents ?? []).filter(
-      (i) => i.kind === "power" && i.center != null && i.radius_km != null),
-    [incidentsQ.data])
+    () => (replayOn ? [] : (incidentsQ.data?.incidents ?? []).filter(
+      (i) => i.kind === "power" && i.center != null && i.radius_km != null)),
+    [incidentsQ.data, replayOn])
 
   const orgsQ = useQuery({
     queryKey: ["orgs", scopeOrg],
@@ -414,7 +471,52 @@ export function MapPage() {
   const googleActive = !!googleKey && !googleDown
   const detail = useMemo(() => detailFrom(myOrg?.map_detail), [myOrg?.map_detail])
 
-  const devices = useMemo(() => data?.devices ?? [], [data])
+  // ── THE TIME MACHINE ──────────────────────────────────────────────────
+  // One read serves both projections AND the accumulation layer, so a bar in
+  // the Marey, a tint on a live pin and a pin in replay are three views of one
+  // interval list and cannot disagree. `staleTime: Infinity` for the window:
+  // it is a closed range of the past, so an SSE invalidation has nothing to
+  // add to it — which is also half of why a live refetch can never repaint a
+  // replay tint.
+  const replayQ = useQuery({
+    queryKey: ["replay", scopeOrg, replayDays],
+    queryFn: () => replayApi.window(scopeOrg, replayDays),
+    enabled: !!scopeOrg && (replayOn || showAccum),
+    staleTime: 5 * 60_000,
+  })
+  const recon = useMemo(
+    () => (replayQ.data ? reconstruct(replayQ.data) : null), [replayQ.data])
+
+  const [stampTick, setStampTick] = useState(0)
+  useEffect(() => {
+    if (!replayOn) return
+    const id = setInterval(() => setStampTick((n) => n + 1), REPLAY_STAMP_MS)
+    return () => clearInterval(id)
+  }, [replayOn])
+  const replayStamp = useMemo(
+    () => new Date().toISOString(), [stampTick, replayOn])
+
+  const liveDevices = useMemo(() => data?.devices ?? [], [data])
+  // THE PROJECTION IS KEYED ON THE LAST TRANSITION, not on the cursor. Between
+  // two events the fleet is unchanged by definition, so this makes playback
+  // rebuild the device rows, the clusters and the link set only when the map
+  // actually changes, instead of ten times a second to draw the same picture.
+  // The banner and the Marey cursor still read the true cursor.
+  const projectAt = useMemo(
+    () => (recon && replayAt != null ? recon.eventFloorAt(replayAt) : 0),
+    [recon, replayAt])
+  // THE PROJECTION, applied before anything else reads a device row. Pins,
+  // clusters, tones, hover cards, the tree and the detail floors then all
+  // render a past fleet through the one grammar this map has, so replay can
+  // never drift from live. It is also the isolation: a live refetch re-runs
+  // this at the SAME T and produces the same states, and identical states
+  // produce identical icon html, which the icon cache returns as the SAME
+  // object — so no marker is remounted and no mount animation replays.
+  const devices = useMemo(
+    () => (replayOn
+      ? projectDevices(liveDevices, recon, projectAt, replayStamp)
+      : liveDevices),
+    [liveDevices, replayOn, recon, projectAt, replayStamp])
   const placed = useMemo(() => devices.filter(isPlaced), [devices])
   const unplaced = useMemo(() => devices.filter((d) => !isPlaced(d)), [devices])
   const byId = useMemo(() => new Map(devices.map((d) => [d.id, d])), [devices])
@@ -556,8 +658,11 @@ export function MapPage() {
       : places.find((p) => p.mac === selectedOnuMac) ?? null),
     [places, selectedOnuMac])
 
-  const refVisible = (refOnus && zoom >= detail.subscribers)
-    || onuScope != null || placingOnu != null
+  // Subscriber marks carry today's optical state, so they stand down in replay
+  // for the same reason the branch faults do. Wave 3 feeds ONU transitions
+  // through the same reconstruction and they come back.
+  const refVisible = !replayOn && ((refOnus && zoom >= detail.subscribers)
+    || onuScope != null || placingOnu != null)
   const refLinesVisible = refVisible
     && (zoom >= detail.drop_lines || onuScope != null || placingOnu != null)
   const refNamesVisible = refVisible
@@ -566,11 +671,11 @@ export function MapPage() {
   // alike — the same override an OLT focus takes, but pointer-bound.
   const hoverDropMacs = useMemo(() => {
     const out = new Set<string>()
-    if (hoverId == null) return out
+    if (hoverId == null || replayOn) return out
     for (const p of shownPlaces)
       if (p.drop_passive_id === hoverId) out.add(p.mac)
     return out
-  }, [hoverId, shownPlaces])
+  }, [hoverId, replayOn, shownPlaces])
   const refShown = refVisible || hoverDropMacs.size > 0
   const placedByOlt = useMemo(() => {
     const m = new Map<number, number>()
@@ -639,9 +744,14 @@ export function MapPage() {
     if (armed != null || addNext || plantMenu != null) return null
     if (plantDraft != null || customerDraft != null) return null
     const solo = clusters.find((c) => c.members.length === 1 && c.members[0].id === hoverId)
+    // A PASSIVE HAS NO CARD IN REPLAY. Its whole card is a report on today's
+    // recorded drops, and with the drop loads stood down it would say "No
+    // subscribers recorded" about a splitter that has plenty. Gear's card is
+    // built from the projected state and stays.
+    if (replayOn && solo && isPassiveType(solo.members[0].device_type)) return null
     return solo?.members[0] ?? null
   }, [hoverId, selectedId, hoverOnuMac, placingId, placingOnu, routeEdit, editPins,
-      armed, addNext, plantMenu, plantDraft, customerDraft, clusters])
+      armed, addNext, plantMenu, plantDraft, customerDraft, clusters, replayOn])
 
   useEffect(() => {
     if (hoverId == null) return
@@ -1142,7 +1252,10 @@ export function MapPage() {
       } else {
         focusDevice(d, { fly: true })
       }
-    } else if (canWrite) {
+    } else if (canWrite && !replayOn) {
+      // Placement is a WRITE, and a historical view is not where a pin gets
+      // dropped: every other way in is already closed in replay, and this was
+      // the last one.
       selectDevice(null)
       setPlaceOpen(false)
       setPlacingId(d.id)
@@ -1175,6 +1288,125 @@ export function MapPage() {
     setPlaceOpen(false)
     navigate(navLocation.pathname, { replace: true, state: null })
   }, [navLocation.state, navLocation.pathname, navigate, selectDevice])
+
+  // ── REPLAY CONTROL ────────────────────────────────────────────────────
+  // Entering replay LEAVES every write mode. A traced route or a half-placed
+  // pin belongs to now; finishing one against a map of last week would write
+  // real geometry from a historical view.
+  const enterReplay = useCallback(() => {
+    setReplayOn(true)
+    setPlaying(false)
+    setPanelFor(null)
+    setSelectedOnuMac(null)
+    setEditPins(false)
+    setRouteEdit(null)
+    setArmed(null)
+    setAddNext(false)
+    setPlacingId(null)
+    setPlacingOnu(null)
+    setPlantMenu(null)
+    setSplitAt(null)
+    setCableOpen(null)
+    setCableList(false)
+    setOnuScope(null)
+    setReplayAt((t) => t ?? Math.floor(Date.now() / 1000) - 3600)
+  }, [setCableOpen])
+
+  const exitReplay = useCallback(() => {
+    setReplayOn(false)
+    setPlaying(false)
+  }, [])
+
+  // Off the 15s `useNow()` tick rather than a bare Date.now() in the render,
+  // so the slider's own bounds cannot creep between two renders of one frame.
+  const replayNow = useMemo(() => Math.floor(now / 1000), [now])
+
+  // A deep link opens replay AT that moment: `?replay=<epoch_s>`, a QUERY
+  // param and not nav state, so it survives a reload and a link pasted into a
+  // chat (the `?onu=` precedent). It picks the shortest window that contains
+  // the moment, so arriving from an outage card lands on a 24-hour view of
+  // that evening rather than a week you have to hunt through.
+  const replayReady = useRef(false)
+  // What the URL already says, so the writer below can tell a no-op from a
+  // change. Without it the writer fires a replace-navigation on mount, which
+  // hands back a fresh `setSearchParams` identity, which re-fires the writer:
+  // a loop that only shows up in a browser.
+  const replayInUrl = useRef<string | null>(null)
+  useEffect(() => {
+    if (replayReady.current) return
+    replayReady.current = true
+    const raw = searchParams.get("replay")
+    const t = raw ? Number(raw) : NaN
+    if (!Number.isFinite(t) || t <= 0) return
+    const at = Math.round(t)
+    replayInUrl.current = String(at)
+    const ageDays = (Date.now() / 1000 - t) / 86400
+    setReplayDays(ageDays <= 1 ? 1 : 7)
+    setReplayAt(at)
+    enterReplay()
+  }, [searchParams, enterReplay])
+
+  useEffect(() => {
+    // Written only while PAUSED: at 10 playback frames a second this would be
+    // ten history writes a second, and the position a shared link wants is
+    // where somebody stopped, not every frame they passed through.
+    if (!replayReady.current || playing) return
+    const want = replayOn && replayAt != null ? String(replayAt) : null
+    if (replayInUrl.current === want) return
+    replayInUrl.current = want
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      if (want) next.set("replay", want)
+      else next.delete("replay")
+      return next
+    }, { replace: true })
+  }, [replayOn, replayAt, playing, setSearchParams])
+
+  useEffect(() => {
+    if (!playing || !replayOn || !recon) return
+    const step = Math.max(1, Math.round((recon.until - recon.since) / PLAY_TICKS))
+    const id = setInterval(() => setReplayAt(
+      (t) => Math.min(recon.until, (t ?? recon.since) + step)), PLAY_TICK_MS)
+    return () => clearInterval(id)
+  }, [playing, replayOn, recon])
+
+  useEffect(() => {
+    if (!recon || replayAt == null) return
+    if (playing && replayAt >= recon.until) setPlaying(false)
+    const clamped = Math.min(recon.until, Math.max(recon.since, replayAt))
+    if (clamped !== replayAt) setReplayAt(clamped)
+  }, [recon, replayAt, playing])
+
+  // STEP LANDS ON A TRANSITION. A fleet is unchanged for most of any window,
+  // so a uniform step is mostly dead air; the reconstruction already knows
+  // every moment something moved.
+  const stepReplay = useCallback((dir: -1 | 1) => {
+    if (!recon || replayAt == null) return
+    setPlaying(false)
+    const t = dir === 1 ? recon.nextEventAfter(replayAt)
+                        : recon.prevEventBefore(replayAt)
+    if (t != null) setReplayAt(t)
+  }, [recon, replayAt])
+
+  const mareyDeviceRows = useMemo(
+    () => (replayOn ? mareyRows(liveDevices) : []), [replayOn, liveDevices])
+
+  // The accumulation layer's per-device downtime, over the SAME window and off
+  // the SAME reconstruction the replay reads. UNREACHABLE spans do not count
+  // (`downSecondsIn` reads the owned set), or one OLT's outage would tint
+  // every box behind it as a chronic offender.
+  const accumByDevice = useMemo(() => {
+    const out = new Map<number, number>()
+    if (!showAccum || replayOn || !recon) return out
+    const span = recon.until - recon.since
+    for (const d of placed) {
+      if (isPassiveType(d.device_type)) continue
+      const level = accumLevel(
+        recon.downSecondsIn(d.id, recon.since, recon.until), span)
+      if (level > 0) out.set(d.id, level)
+    }
+    return out
+  }, [showAccum, replayOn, recon, placed])
 
   const onuParam = searchParams.get("onu")
   useEffect(() => {
@@ -1275,10 +1507,10 @@ export function MapPage() {
   const openPlantMenu = useCallback((
     lat: number, lng: number, x: number, y: number, device: OrgDevice | null,
   ) => {
-    if (!canWrite) return
+    if (!canWrite || replayOn) return
     if (placingId != null || placingOnu != null || routeEdit != null || editPins) return
     setPlantMenu({ lat, lng, x, y, device })
-  }, [canWrite, placingId, placingOnu, routeEdit, editPins])
+  }, [canWrite, replayOn, placingId, placingOnu, routeEdit, editPins])
 
   const onMapContext = useCallback((ll: L.LatLng, point: L.Point) => {
     openPlantMenu(ll.lat, ll.lng, point.x, point.y, null)
@@ -1599,7 +1831,7 @@ export function MapPage() {
   // several links. Rank picks the loudest so the one that survives is worth reading.
   const cableRate = useMemo(() => {
     const m = new Map<number, ReturnType<typeof linkRateBody> & { rank: number }>()
-    if (!bwLabels) return m
+    if (!bwShown) return m
     for (const l of links) {
       if (!l.cabled || l.plantCableId == null || !l.binding) continue
       const body = linkRateBody(l.binding, l.from, l.to)
@@ -1616,7 +1848,7 @@ export function MapPage() {
       m.set(l.plantCableId, { ...body, rank })
     }
     return m
-  }, [links, bwLabels])
+  }, [links, bwShown])
 
   // A SHEATH THAT REPLACED A CHORD INHERITS THE CHORD'S VISIBILITY, NOT PLANT'S — so
   // it draws at EVERY zoom (operator, 2026-08-12: "I don't want dotted line at any
@@ -1717,7 +1949,7 @@ export function MapPage() {
     const chipFloor = zoom >= detail.line_labels
     const cands: Array<{ key: string; cable?: number; x: number; y: number
                          rank: number; half: number }> = []
-    for (const l of bwLabels ? drawnLinks : []) {
+    for (const l of bwShown ? drawnLinks : []) {
       if (!l.binding && !l.cores) continue
       const emphasized = selectedId != null
         && (l.to.id === selectedId || downstream.has(l.to.id))
@@ -1736,7 +1968,7 @@ export function MapPage() {
       cands.push({ key: l.key, x, y, half: CHIP_HALF.link,
         rank: bwRank(l.binding, l.from.id, l.to.id, l.cores) })
     }
-    for (const { cable, pts } of bwLabels ? cableLines : []) {
+    for (const { cable, pts } of bwShown ? cableLines : []) {
       const rate = cableRate.get(cable.id)
       if (!rate) continue
       // The reading relocated onto this sheath keeps the tone it had on the chord,
@@ -1822,7 +2054,7 @@ export function MapPage() {
       names.add(c.mac)
     }
     return { links, cables, refs, names }
-  }, [drawnLinks, bwLabels, showUncabled, zoom, troubleOnly, selectedId, downstream,
+  }, [drawnLinks, bwShown, showUncabled, zoom, troubleOnly, selectedId, downstream,
       refLinesVisible, refNamesVisible, refVisible, shownPlaces, byId, cableLines,
       cableRate, standsDown, detail.line_labels, tracedCables])
 
@@ -2198,6 +2430,21 @@ export function MapPage() {
             </>
           )
         })()}
+        {/* THE ACCUMULATION LAYER. Ground under the mark, drawn only where a
+            single pin is actually visible: a site badge is a claim about
+            gear-in-a-rack and summing downtime into one coin behind it would
+            invent an aggregate nobody asked for. */}
+        {accumByDevice.size > 0 && clusters.map((c) => {
+          if (c.members.length !== 1) return null
+          const d = c.members[0]
+          const level = accumByDevice.get(d.id)
+          if (!level) return null
+          return (
+            <Marker key={`accum:${d.id}`} position={[d.lat, d.lng]}
+              icon={accumIcon(level)} interactive={false}
+              zIndexOffset={ACCUM_Z} />
+          )
+        })}
         {clusters.map((c) => {
           if (c.members.length > 1) {
             const anyDown = c.members.some((m) => pinTone(m) === "destructive")
@@ -2444,7 +2691,7 @@ export function MapPage() {
             />
           )
         })}
-        {showWorkers && fieldWorkers.map((w) => {
+        {showWorkers && !replayOn && fieldWorkers.map((w) => {
           if (!workerPlaced(w)) return null
           const state = workerState(w, workerFreshS, now)
           const fix = w.last_fix!
@@ -2513,6 +2760,52 @@ export function MapPage() {
           Google
         </span>
       )}
+
+      {replayOn && (() => {
+        // A BOTTOM DOCK, not a right rail. Time runs horizontally, so the
+        // Marey wants the map's full width: vertical alignment is the whole
+        // read (several OLTs dropping in one minute is what separates an area
+        // power cut from a fibre cut on hardware that reports neither), and a
+        // 380px rail would squeeze a week into a few hundred pixels. It also
+        // puts the cursor directly over the ruler that moves it.
+        // `useResizablePanel` is width-only, so it does not apply here.
+        const winSince = recon?.since ?? replayNow - replayDays * 86400
+        const winUntil = recon?.until ?? replayNow
+        const at = Math.min(winUntil, Math.max(winSince, replayAt ?? winUntil))
+        return (
+          <ReplayDock
+            at={at} since={winSince} until={winUntil} days={replayDays}
+            playing={playing} loading={!recon}
+            recordingSince={replayQ.data?.org_since ?? null}
+            canStepBack={!!recon && recon.prevEventBefore(at) != null}
+            canStepOn={!!recon && recon.nextEventAfter(at) != null}
+            onScrub={(t) => { setPlaying(false); setReplayAt(t) }}
+            onDays={(d) => { setPlaying(false); setReplayDays(d) }}
+            onPlay={() => setPlaying((p) => !p)}
+            onStep={stepReplay}
+            onExit={exitReplay}
+            toggle={mareyDeviceRows.length > 0 ? (
+              <MareyToggle open={mareyOpen}
+                onToggle={() => setMareyOpen((v) => !v)} />
+            ) : null}>
+            {mareyOpen && recon && (
+              <OutageMarey
+                className="min-h-0 flex-1"
+                recon={recon} rows={mareyDeviceRows} at={at}
+                selectedId={selectedId}
+                onScrub={(t) => { setPlaying(false); setReplayAt(t) }}
+                onPick={(id) => {
+                  setSelectedId(id)
+                  const d = byId.get(id)
+                  if (d && isPlaced(d)) {
+                    setSiteAnchor(id)
+                    mapRef.current?.panTo([d.lat, d.lng])
+                  }
+                }} />
+            )}
+          </ReplayDock>
+        )
+      })()}
 
       <div className="wisp-panel-strip pointer-events-none absolute top-3 left-3 z-[1002] flex max-w-[calc(100%-6rem)] flex-wrap items-center gap-2">
         <MapSearch devices={devices} org={scopeOrg} bounds={region.bounds}
@@ -2800,9 +3093,10 @@ export function MapPage() {
                     Subscribers row does. A toggle reading "on" over a map drawing
                     no chips reads as a broken feature rather than as a setting. */}
                 <span className={cn("text-2xs font-medium",
-                  bwLabels && zoom >= detail.line_labels
+                  bwShown && zoom >= detail.line_labels
                     ? "text-success" : "text-muted-foreground")}>
                   {!bwLabels ? "off"
+                    : replayOn ? "on · not in replay"
                     : zoom >= detail.line_labels ? "on" : "on · zoom in"}
                 </span>
               </button>
@@ -2812,13 +3106,26 @@ export function MapPage() {
                 onClick={() => { setOnuScope(null); toggleRefOnus() }}>
                 <span>Subscribers{places.length > 0 ? ` · ${places.length}` : ""}</span>
                 <span className={cn("text-2xs font-medium",
-                  onuScope != null || (refOnus && zoom >= detail.subscribers)
+                  !replayOn && (onuScope != null
+                    || (refOnus && zoom >= detail.subscribers))
                     ? "text-success" : "text-muted-foreground")}>
-                  {onuScope != null ? "focused"
-                    : !refOnus ? "off"
+                  {!refOnus && onuScope == null ? "off"
+                    : replayOn ? "on · not in replay"
+                    : onuScope != null ? "focused"
                       : zoom >= detail.subscribers ? "on" : "on · zoom in"}
                 </span>
               </button>
+              <button
+                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
+                title="How much of the replay window each box has spent down, summed onto its pin. It describes the PAST on a live map, so it never uses the alarm colours: a branch that flaps every evening is a pattern to find, not an alarm. A box that is down right now keeps its own status colour."
+                onClick={toggleAccum}>
+                <span>Outage time</span>
+                <span className={cn("text-2xs font-medium",
+                  showAccum && !replayOn ? "text-success" : "text-muted-foreground")}>
+                  {!showAccum ? "off" : replayOn ? "on · in replay" : "on"}
+                </span>
+              </button>
+              {showAccum && !replayOn && <AccumLegend days={replayDays} />}
               {canWrite && (
                 <button
                   className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-foreground/5"
@@ -2826,8 +3133,8 @@ export function MapPage() {
                   onClick={toggleWorkers}>
                   <span>Workers{census.total > 0 ? ` · ${census.placed}/${census.total}` : ""}</span>
                   <span className={cn("text-2xs font-medium",
-                    showWorkers ? "text-success" : "text-muted-foreground")}>
-                    {showWorkers ? "on" : "off"}
+                    showWorkers && !replayOn ? "text-success" : "text-muted-foreground")}>
+                    {!showWorkers ? "off" : replayOn ? "on · not in replay" : "on"}
                   </span>
                 </button>
               )}
@@ -2924,11 +3231,13 @@ export function MapPage() {
           title="Go to my location" onClick={locateMe}>
           <LocateFixed className="size-3.5" />
         </Button>
+        <ReplayButton on={replayOn}
+          onClick={() => (replayOn ? exitReplay() : enterReplay())} />
         <Button variant="outline" size="icon" className="size-8 bg-popover/95 dark:bg-popover/95 backdrop-blur"
           title={fullscreen ? "Exit fullscreen" : "Fullscreen (NOC wall)"} onClick={toggleFullscreen}>
           {fullscreen ? <Shrink className="size-3.5" /> : <Expand className="size-3.5" />}
         </Button>
-        {canWrite && (
+        {canWrite && !replayOn && (
           <Button variant={editPins ? "default" : "outline"} size="icon"
             className={cn("size-8 backdrop-blur", !editPins && "bg-popover/95 dark:bg-popover/95")}
             title={editPins ? "Done moving pins" : "Move pins (drag)"}
@@ -2936,7 +3245,7 @@ export function MapPage() {
             <Pencil className="size-3.5" />
           </Button>
         )}
-        {canWrite && (
+        {canWrite && !replayOn && (
           <Button variant={addNext ? "default" : "outline"} size="icon"
             className={cn("size-8 backdrop-blur", !addNext && "bg-popover/95 dark:bg-popover/95")}
             title="Add a splitter or a customer (or right-click the map)"

@@ -25,6 +25,29 @@ WALK_COLUMNS = (
     OID_IF_NAME, OID_IF_HCIN, OID_IF_HCOUT, OID_IF_HIGHSPEED, OID_IF_ALIAS,
 )
 
+_COLUMN_NAMES = {
+    OID_IF_ADMIN: "admin_status", OID_IF_OPER: "oper_status",
+    OID_IF_HCIN: "in_octets", OID_IF_HCOUT: "out_octets",
+    OID_IF_NAME: "if_name", OID_IF_DESCR: "if_descr",
+    OID_IF_LASTCHANGE: "last_change", OID_IF_HIGHSPEED: "speed",
+    OID_IF_SPEED: "speed_32bit", OID_IF_ALIAS: "alias",
+}
+
+_MISSING_PHRASE = {
+    "in_octets": "bandwidth counters", "out_octets": "bandwidth counters",
+    "admin_status": "port status", "oper_status": "port status",
+    "if_name": "port identity", "if_descr": "port identity",
+    "alias": "port identity", "speed": "link speed",
+    "speed_32bit": "link speed", "last_change": "last change",
+}
+
+def missing_detail(missing: Sequence[str]) -> str:
+    groups: dict[str, list[str]] = {}
+    for name in missing:
+        groups.setdefault(_MISSING_PHRASE.get(name, name), []).append(name)
+    return "walk dropped: " + "; ".join(
+        f"{phrase} ({', '.join(names)})" for phrase, names in groups.items())
+
 _IF_STATUS = {
     1: "up", 2: "down", 3: "testing", 4: "unknown",
     5: "dormant", 6: "notPresent", 7: "lowerLayerDown",
@@ -49,13 +72,22 @@ class PortStatus:
     in_octets: int | None = None
     out_octets: int | None = None
     speed_bps: int | None = None
+    # Which wire keys this row actually has a cell for; None = presence unknown,
+    # so a hand-built PortStatus keeps carrying every field.
+    carried: frozenset[str] | None = None
 
     def is_down(self) -> bool:
         return self.admin_status == "up" and self.oper_status in _DOWN_OPER
 
+@dataclass(frozen=True)
+class PortWalkResult:
+    ports: list[PortStatus]
+    missing_columns: tuple[str, ...] = ()
+
 @runtime_checkable
 class SnmpPoller(Protocol):
-    async def walk(self, target: SnmpTarget) -> list[PortStatus]: ...
+    async def walk(self, target: SnmpTarget,
+                   scope: str = "full") -> PortWalkResult: ...
 
 def _status_label(raw: str) -> str:
     s = str(raw).strip()
@@ -127,6 +159,14 @@ def parse_if_table(varbinds: list[tuple[str, str]]) -> list[PortStatus]:
             in_octets=_int_or_none(c.get("hcin")),
             out_octets=_int_or_none(c.get("hcout")),
             speed_bps=speed_bps,
+            carried=frozenset(k for k, arrived in (
+                ("if_name", "name" in c or "descr" in c),
+                ("if_alias", "alias" in c),
+                ("last_change", "lastchange" in c),
+                ("in_octets", "hcin" in c),
+                ("out_octets", "hcout" in c),
+                ("speed_bps", "speed" in c or "highspeed" in c),
+            ) if arrived),
         ))
     return ports
 
@@ -142,10 +182,15 @@ _PERCOLUMN_REPETITIONS = 25
 _PERCOLUMN_SMALL_REPETITIONS = 4
 _MAX_LEVEL = 2
 
-_PERCOLUMN_ORDER = (
-    OID_IF_ADMIN, OID_IF_OPER, OID_IF_NAME, OID_IF_DESCR, OID_IF_LASTCHANGE,
-    OID_IF_HIGHSPEED, OID_IF_SPEED, OID_IF_ALIAS, OID_IF_HCIN, OID_IF_HCOUT,
+# Status first (a budget-starved walk must still yield port up/down), counters
+# next: central preserves stored identity for a row that carries no identity
+# cell, so on a short walk the static columns are what may be sacrificed.
+_FULL_ORDER = (
+    OID_IF_ADMIN, OID_IF_OPER, OID_IF_HCIN, OID_IF_HCOUT, OID_IF_NAME,
+    OID_IF_DESCR, OID_IF_LASTCHANGE, OID_IF_HIGHSPEED, OID_IF_SPEED, OID_IF_ALIAS,
 )
+_HOT_ORDER = (OID_IF_ADMIN, OID_IF_OPER, OID_IF_HCIN, OID_IF_HCOUT)
+_SCOPE_COLUMNS = {"full": _FULL_ORDER, "hot": _HOT_ORDER}
 
 def _oid_tuple(oid: str) -> tuple[int, ...]:
     return tuple(int(part) for part in oid.split("."))
@@ -213,7 +258,7 @@ class PysnmpPoller:
         else:
             self._promote_at.pop(key, None)
 
-    async def walk(self, target: SnmpTarget) -> list[PortStatus]:
+    async def walk(self, target: SnmpTarget, scope: str = "full") -> PortWalkResult:
         try:
             from pysnmp.hlapi.asyncio import (
                 SnmpEngine, CommunityData, UdpTransportTarget,
@@ -240,45 +285,48 @@ class PysnmpPoller:
             fast_budget = _FAST_PATH_MAX_S
 
         key = f"{target.ip}:{target.port}"
+        columns = _SCOPE_COLUMNS.get(scope, _FULL_ORDER)
         answered = False
         last_exc: Exception | None = None
+        missing: tuple[str, ...] = ()
 
         for level in range(self._start_level(key, now), _MAX_LEVEL + 1):
             if level == 0:
                 ports = await self._combined_walk(
-                    target, community, transport, fast_budget)
+                    target, community, transport, fast_budget, columns)
                 if ports is None:
                     continue
                 answered = True
                 if ports:
                     self._remember(key, 0, now)
-                    return ports
+                    return PortWalkResult(ports)
                 continue
             max_rep = (_PERCOLUMN_REPETITIONS if level == 1
                        else _PERCOLUMN_SMALL_REPETITIONS)
-            varbinds, responded, exc = await self._percolumn_walk(
-                target, community, transport, max_rep, hard_deadline)
+            varbinds, responded, exc, missing = await self._percolumn_walk(
+                target, community, transport, max_rep, hard_deadline, columns)
             answered = answered or responded
             if exc is not None:
                 last_exc = exc
             ports = parse_if_table(varbinds)
             if ports:
                 self._remember(key, level, now)
-                return ports
+                return PortWalkResult(ports, missing)
 
         if answered:
-            return []
+            return PortWalkResult([], missing)
         raise RuntimeError(
             f"SNMP walk of {target.ip} failed: {last_exc}") from last_exc
 
-    async def _combined_walk(self, target, community, transport, fast_budget):
+    async def _combined_walk(self, target, community, transport, fast_budget,
+                             columns):
         from pysnmp.hlapi.asyncio import (
             ContextData, ObjectType, ObjectIdentity, bulk_cmd,
         )
         engine = self._engine
 
         async def inner() -> list[PortStatus]:
-            walker = MultiColumnWalk(WALK_COLUMNS)
+            walker = MultiColumnWalk(columns)
             rounds = 0
             while not walker.done:
                 rounds += 1
@@ -304,15 +352,17 @@ class PysnmpPoller:
             return None
 
     async def _percolumn_walk(self, target, community, transport, max_rep,
-                              hard_deadline):
+                              hard_deadline, columns):
         from pysnmp.hlapi.asyncio import (
             ContextData, ObjectType, ObjectIdentity, bulk_walk_cmd,
         )
         engine = self._engine
         loop = asyncio.get_running_loop()
 
-        async def one_column(col: str) -> list[tuple[str, str]]:
-            out: list[tuple[str, str]] = []
+        # The accumulator is the CALLER's, so a column cut off at the deadline
+        # keeps the rows it had already fetched instead of dying with the
+        # cancelled coroutine.
+        async def one_column(col: str, out: list[tuple[str, str]]) -> None:
             async for errInd, errStat, errIdx, binds in bulk_walk_cmd(
                 engine, community, transport, ContextData(),
                 0, max_rep, ObjectType(ObjectIdentity(col)),
@@ -322,33 +372,40 @@ class PysnmpPoller:
                     raise RuntimeError(str(errInd or errStat))
                 for name, val in binds:
                     out.append((str(name), val.prettyPrint()))
-            return out
 
         varbinds: list[tuple[str, str]] = []
+        missing: list[str] = []
         responded = False
         consecutive_fail = 0
         last_exc: Exception | None = None
-        for column in _PERCOLUMN_ORDER:
+        for i, column in enumerate(columns):
             remaining = None
             if hard_deadline is not None:
                 remaining = hard_deadline - loop.time()
                 if remaining <= 0:
+                    missing.extend(_COLUMN_NAMES[c] for c in columns[i:])
                     break
+            out: list[tuple[str, str]] = []
             try:
-                col_binds = (await asyncio.wait_for(one_column(column), remaining)
-                             if remaining is not None else await one_column(column))
+                if remaining is not None:
+                    await asyncio.wait_for(one_column(column, out), remaining)
+                else:
+                    await one_column(column, out)
             except Exception as exc:
                 last_exc = exc
+                missing.append(_COLUMN_NAMES[column])
                 consecutive_fail += 1
-                log.debug("ifTable column %s of %s skipped: %s",
-                          column, target.ip, exc)
+                log.debug("ifTable column %s of %s cut short after %d rows: %s",
+                          column, target.ip, len(out), exc)
+                varbinds.extend(out)
+                responded = responded or bool(out)
                 if not responded and consecutive_fail >= _DEAD_AGENT_GIVEUP:
                     break
                 continue
             responded = True
             consecutive_fail = 0
-            varbinds.extend(col_binds)
-        return varbinds, responded, last_exc
+            varbinds.extend(out)
+        return varbinds, responded, last_exc, tuple(missing)
 
 def build_snmp_poller(cfg: Config = CONFIG) -> SnmpPoller:
     return PysnmpPoller(cfg)

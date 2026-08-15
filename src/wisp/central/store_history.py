@@ -22,6 +22,16 @@ HIST_CAPS = {
     "hist_port_day": 600_000,
     "hist_device_day": 200_000,
     "hist_radius_day": 20_000,
+    # Per-ONU (Wave 2), the cardinality outlier. Steady state on the 2026-08-14
+    # fleet: 5,205 ONUs x 24 = 124,920 hour rows/day, so 2 d ~ 250 k; 5,205
+    # day rows/day, so 180 d ~ 937 k. Caps are ~2x each, the house rule.
+    # onu_events is the one cap that is NOT arithmetic — a transition rate is
+    # fleet BEHAVIOUR, not a row count we can derive — so 1 M is ~5,500
+    # transitions a day held for the day tier's 180 d. Tripping it is the
+    # signal to measure the real rate, not to raise the number blindly.
+    "hist_onu_hour": 500_000,
+    "hist_onu_day": 2_000_000,
+    "onu_events": 1_000_000,
 }
 
 # The time column each table is pruned and capped on.
@@ -36,6 +46,9 @@ _HIST_TIME_COL = {
     "hist_port_day": "day",
     "hist_device_day": "day",
     "hist_radius_day": "day",
+    "hist_onu_hour": "bucket",
+    "hist_onu_day": "day",
+    "onu_events": "ts",
 }
 
 # NULL-ignoring running MIN/MAX for the hour-tier upserts: sqlite's scalar
@@ -147,6 +160,46 @@ class HistoryStoreMixin:
                      pon["online"], pon["crit"],
                      pmed if pmed is not None else 0.0,
                      1 if pmed is not None else 0, pon.get("rx_min")))
+            conn.commit()
+
+    _ONU_HOUR_SQL = (
+        "INSERT INTO hist_onu_hour (org_id, device_id, onu_key, bucket,"
+        " samples, online, rx_n, rx_sum, rx_min, rx_max)"
+        " VALUES (?,?,?,?,1,?,?,?,?,?)"
+        " ON CONFLICT(device_id, onu_key, bucket) DO UPDATE SET"
+        " samples = samples + 1,"
+        " online = online + excluded.online,"
+        " rx_n = rx_n + excluded.rx_n,"
+        " rx_sum = rx_sum + excluded.rx_sum,"
+        " rx_min = " + _KEEP_MIN.format(c="rx_min") + ","
+        " rx_max = " + _KEEP_MAX.format(c="rx_max"))
+
+    _ONU_EVENT_SQL = (
+        "INSERT OR REPLACE INTO onu_events (org_id, device_id, onu_key,"
+        " old_state, new_state, ts) VALUES (?,?,?,?,?,?)")
+
+    def record_onu_sweep(self, org_id: str, device_id: int, ts_s: int,
+                         rows: list[tuple], events: list[tuple]) -> None:
+        # rows:   (onu_key, online: bool, rx: float|None)  — EVERY walked ONU
+        # events: (onu_key, old_state|None, new_state)     — transitions only
+        # ONE transaction and two executemany calls for the whole walk: this is
+        # the widest write on the report path (~180 ONUs per OLT walk today),
+        # so a per-ONU commit would put 5,205 fsyncs a sweep on the ingest
+        # thread the scaling pass just batched.
+        if not rows and not events:
+            return
+        bucket = (ts_s // HOUR_S) * HOUR_S
+        with self._write_lock, self._connect() as conn:
+            if rows:
+                conn.executemany(self._ONU_HOUR_SQL, [
+                    (org_id, device_id, key, bucket, 1 if online else 0,
+                     1 if rx is not None else 0,
+                     rx if rx is not None else 0.0, rx, rx)
+                    for key, online, rx in rows])
+            if events:
+                conn.executemany(self._ONU_EVENT_SQL, [
+                    (org_id, device_id, key, old, new, ts_s)
+                    for key, old, new in events])
             conn.commit()
 
     def record_port_sweeps(self, org_id: str, device_id: int, ts_s: int,
@@ -284,6 +337,24 @@ class HistoryStoreMixin:
                      a["busy_out"][1] if a["busy_out"] else None))
                 written += 1
 
+            # Per-ONU: the widest fold (5,205 rows out of ~125 k hours), still
+            # one INSERT..SELECT. SQL's aggregate MIN/MAX IGNORE NULLs — unlike
+            # the scalar min()/max() the hour upsert has to work around — so an
+            # unmeasured hour cannot erase the day's extreme.
+            cur = conn.execute(
+                "INSERT INTO hist_onu_day (org_id, device_id, onu_key, day,"
+                " samples, online, rx_n, rx_sum, rx_min, rx_max)"
+                " SELECT org_id, device_id, onu_key, ?, SUM(samples),"
+                "  SUM(online), SUM(rx_n), SUM(rx_sum), MIN(rx_min), MAX(rx_max)"
+                " FROM hist_onu_hour WHERE bucket >= ? AND bucket < ?"
+                " GROUP BY device_id, onu_key"
+                " ON CONFLICT(device_id, onu_key, day) DO UPDATE SET"
+                " samples=excluded.samples, online=excluded.online,"
+                " rx_n=excluded.rx_n, rx_sum=excluded.rx_sum,"
+                " rx_min=excluded.rx_min, rx_max=excluded.rx_max",
+                (day_s, lo, hi))
+            written += cur.rowcount
+
             cur = conn.execute(
                 "INSERT INTO hist_device_day (org_id, device_id, day, samples,"
                 " down_samples, latency_sum, latency_n, loss_sum)"
@@ -382,6 +453,43 @@ class HistoryStoreMixin:
                 (org_id, device_id, if_index, int(since_s),
                  int(until_s))).fetchall()
         return [dict(r) for r in rows]
+
+    def onu_history(self, org_id: str, device_id: int, onu_key: str,
+                    since_s: int, until_s: int, tier: str = "hour") -> list[dict]:
+        table, col = {"hour": ("hist_onu_hour", "bucket"),
+                      "day": ("hist_onu_day", "day")}[tier]
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE org_id=? AND device_id=?"
+                f" AND onu_key=? AND {col} >= ? AND {col} < ? ORDER BY {col}",
+                (org_id, device_id, onu_key, int(since_s),
+                 int(until_s))).fetchall()
+        return [dict(r) for r in rows]
+
+    def onu_events_window(self, org_id: str, device_id: int, onu_key: str,
+                          since_s: int, until_s: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM onu_events WHERE org_id=? AND device_id=?"
+                " AND onu_key=? AND ts >= ? AND ts < ? ORDER BY ts",
+                (org_id, device_id, onu_key, int(since_s),
+                 int(until_s))).fetchall()
+        return [dict(r) for r in rows]
+
+    def onu_pon_port(self, org_id: str, device_id: int,
+                     onu_key: str) -> str | None:
+        # The LIVE roster row's own label, which is the key hist_pon_* is
+        # written under — so an ONU's chart and the PON band under it cannot
+        # disagree about which PON this subscriber is on. A slot with no walked
+        # pon_port (or no roster row at all) answers None, and the caller ships
+        # no band rather than guessing one.
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT pon_port FROM onu_optics"
+                " WHERE org_id=? AND device_id=? AND onu_key=?",
+                (org_id, device_id, onu_key)).fetchone()
+        pon = (row["pon_port"] or "").strip() if row else ""
+        return pon or None
 
     def org_optics_hours(self, org_id: str, since_s: int,
                          until_s: int) -> list[dict]:

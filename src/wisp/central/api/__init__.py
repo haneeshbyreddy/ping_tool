@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from wisp.central.api import (devices, edge, field, fleet, history, orgs,
-                              outages, proxy, users)
+from wisp.central.api import (capacity, devices, edge, field, fleet, history,
+                              orgs, outages, proxy, replay, users)
 
 GET = {
     "/healthz": orgs.healthz,
@@ -57,6 +57,10 @@ GET = {
     "/api/history/reliability": history.reliability,
     "/api/history/paging": history.paging,
     "/api/history/onus": history.onus,
+    "/api/history/onu": history.onu_history,
+    "/api/history/replay": replay.replay,
+    "/api/history/capacity": capacity.capacity,
+    "/api/history/port": capacity.port_history,
     "/api/outages": outages.list_open,
     "/api/issues": outages.issues,
     "/api/issues/pdf": outages.issues_pdf,

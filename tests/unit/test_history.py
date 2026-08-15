@@ -22,7 +22,8 @@ TS_NEXT_HOUR = "2026-08-14T06:05:00+00:00"
 HIST_TABLES = (
     "hist_olt_sweep", "hist_olt_hour", "hist_olt_day", "hist_pon_hour",
     "hist_pon_day", "hist_port_sweep", "hist_port_hour", "hist_port_day",
-    "hist_device_day", "hist_radius_day")
+    "hist_device_day", "hist_radius_day",
+    "hist_onu_hour", "hist_onu_day", "onu_events")
 
 
 class RxStatsTest(unittest.TestCase):
@@ -184,6 +185,10 @@ class FoldTest(_StoreTest):
         self.assertEqual(rows[0]["latency_n"], 1)
 
     def test_maintenance_advances_covered_through_even_over_empty_days(self):
+        # A fresh store stamps covered-through at REAL yesterday; once the wall
+        # clock passes TS's day that vacuously covers it, so pin the stamp
+        # just before the sampled day to keep the test on TS's own clock.
+        self.store.set_hist_folded_through(self.DAY - DAY_S)
         self._optics(TS)
         now_s = self.DAY + 3 * DAY_S + 100   # three days later
         history.run_maintenance(self.store, self.cfg, now_s)

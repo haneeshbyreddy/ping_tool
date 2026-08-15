@@ -56,7 +56,9 @@ export function LegendChip({ color, label, struck }: {
   )
 }
 
-const PAD = { l: 42, r: 8, t: 10, b: 20 }
+// Exported so a mark rendered OUTSIDE the svg (a coverage rail under the plot)
+// can align with the plot area instead of mirroring these numbers by hand.
+export const PAD = { l: 42, r: 8, t: 10, b: 20 }
 
 export function TimeChart({
   domain, yMax, height = 160, yFmt, yTicks = 3, tooltip, legend, empty,
