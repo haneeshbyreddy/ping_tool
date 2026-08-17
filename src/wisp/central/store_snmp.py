@@ -774,27 +774,47 @@ class SnmpStoreMixin:
     _PLACE_COLS = ("mac, lat, lng, label, phone, notes, witness, accuracy_m,"
                    " place_source, placed_by, placed_at, created_at, updated_at")
 
-    _PLACE_RADIUS = (
-        ", (SELECT CASE WHEN COUNT(DISTINCT rc.name) = 1 THEN MIN(rc.name) END"
-        "   FROM onu_optics o"
-        "   JOIN radius_links rl ON rl.org_id = o.org_id"
-        "     AND rl.device_id = o.device_id AND rl.onu_key = o.onu_key"
-        "   JOIN radius_customers rc ON rc.org_id = rl.org_id"
-        "     AND rc.username = rl.username AND rc.account_id = rl.account_id"
-        "   WHERE o.org_id = onu_places.org_id"
-        "     AND wisp_norm_mac(o.serial) = onu_places.mac) AS radius_name")
+    # The username rides beside the name and under the SAME ambiguity guard:
+    # a MAC on more than one live slot yields NULL rather than a pick, because
+    # the mark and its card may never name one subscriber two ways. The guard is
+    # stated PER COLUMN — a book can carry two rows agreeing on the username and
+    # differing on the name, and the answerable half should still be answered.
+    #
+    # ONE GROUPED PASS, NOT A CORRELATED SUBQUERY PER COLUMN. This shipped as a
+    # scalar sub-select and cost **721 ms** for byreddy's 357 pins, on a read
+    # the map makes on load; adding the username beside it as a second
+    # sub-select took it to 1,334 ms. Grouped once into a CTE and LEFT JOINed it
+    # is **~40 ms for both columns** — so the username arrives and the read gets
+    # 18× faster than it was before it. Measured on a copy of prod.
+    _PLACE_IDENT_CTE = (
+        "WITH ident AS ("
+        "  SELECT wisp_norm_mac(o.serial) AS mac,"
+        "         CASE WHEN COUNT(DISTINCT rc.name) = 1"
+        "              THEN MIN(rc.name) END AS radius_name,"
+        "         CASE WHEN COUNT(DISTINCT rc.username) = 1"
+        "              THEN MIN(rc.username) END AS radius_username"
+        "  FROM onu_optics o"
+        "  JOIN radius_links rl ON rl.org_id = o.org_id"
+        "    AND rl.device_id = o.device_id AND rl.onu_key = o.onu_key"
+        "  JOIN radius_customers rc ON rc.org_id = rl.org_id"
+        "    AND rc.username = rl.username AND rc.account_id = rl.account_id"
+        "  WHERE o.org_id = ?"
+        "  GROUP BY wisp_norm_mac(o.serial))")
 
     def list_onu_places(self, org_id: str, *,
                         located_only: bool = False) -> list[dict]:
 
 
-        q = (f"SELECT {self._PLACE_COLS}{self._PLACE_RADIUS}"
-             " FROM onu_places WHERE org_id=?")
+        cols = ", ".join(f"p.{c.strip()}" for c in self._PLACE_COLS.split(","))
+        q = (f"{self._PLACE_IDENT_CTE}"
+             f" SELECT {cols}, i.radius_name, i.radius_username"
+             " FROM onu_places p LEFT JOIN ident i ON i.mac = p.mac"
+             " WHERE p.org_id=?")
         if located_only:
-            q += " AND lat IS NOT NULL AND lng IS NOT NULL"
+            q += " AND p.lat IS NOT NULL AND p.lng IS NOT NULL"
         with self._connect() as conn:
             rows = self._with_norm_mac(conn).execute(
-                q + " ORDER BY label, mac", (org_id,)).fetchall()
+                q + " ORDER BY p.label, p.mac", (org_id, org_id)).fetchall()
         return [dict(r) for r in rows]
 
     def get_onu_place(self, org_id: str, mac: str) -> dict | None:

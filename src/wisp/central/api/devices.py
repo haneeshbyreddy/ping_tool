@@ -809,7 +809,15 @@ def onu_coverage(h, qs):
             mac = onuroster._norm_mac(r.get("serial"))
             if not mac:
                 continue
+            # The survey used to be the one screen with its own naming rule —
+            # label, then the OLT's provisioning string — so a tech standing at
+            # a drop read `HC-KOTHAMASS-2` where every desk screen named the
+            # customer. It ranks through the shared `onuName` now, which needs
+            # billing's two columns on the wire (`org_onu_rows` already selects
+            # them). Read-only, and it adds no write path a worker can reach.
             row = {"mac": mac, "name": r.get("name"),
+                   "radius_username": r.get("radius_username"),
+                   "radius_name": r.get("radius_name"),
                    "pon_port": r.get("pon_port"),
                    "onu_id": r.get("onu_id"),
                    "state": r.get("state"),

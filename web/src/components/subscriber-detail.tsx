@@ -10,7 +10,8 @@ import type {
   RadiusStatus, Subscriber, SubscriberPlantHop, UserMac, WebMacStatus,
 } from "@/lib/types"
 import {
-  ago, fmtDateTime, isDownState, isFresh, onuName, onuSearchKey, onuSev,
+  ago, fmtDateTime, isDownState, isFresh, onuName, onuNameIsKey, onuSearchKey,
+  onuSev, onuSubName,
 } from "@/lib/format"
 import { ratioLabel } from "@/map/drops"
 import { RowTag } from "@/components/device-detail"
@@ -299,22 +300,26 @@ function PhoneRow({ number, tag }: { number: string; tag?: "field" | "billing" }
 // phones are often DIFFERENT PEOPLE — the on-site contact a tech collected vs
 // the account holder billing registered — so when they differ both render,
 // tagged. A blank in one source never hides the other's fact.
-// The survey label is USUALLY the billing account name — the operator's own
-// convention, 137 of 164 labeled subscribers on the live fleet — so a label
-// matching the USERNAME is not a competing name: the billing full name then
-// renders as the plain Name row. Only a label matching neither is a real
-// disagreement worth framing as one.
-function IdentityRows({ sub, canWrite }: { sub: Subscriber; canWrite: boolean }) {
+//
+// The NAME row is now whatever the HEADER did not already say (2026-08-17).
+// The header composes headline + sub-line from the shared ranking, so this
+// section printing the billing name unconditionally repeated it two rows
+// apart — and the old `labelIsAccount` special case existed only to decide
+// which of the two to print, a decision `onuName`/`onuSubName` now make once
+// for every surface. `shown` is the header's own two strings, passed in rather
+// than re-derived, so the two can never disagree about what has been said.
+function IdentityRows({ sub, canWrite, shown }: {
+  sub: Subscriber; canWrite: boolean; shown: string[]
+}) {
   const rec = sub.record
   const r = sub.radius
-  const labelIsAccount = !!(rec?.label && r?.username
-    && onuSearchKey(rec.label) === onuSearchKey(r.username))
-  const billingName = !!(labelIsAccount && r?.name)
-  const namesDiffer = !!(rec?.label && r?.name && !labelIsAccount
-    && onuSearchKey(rec.label) !== onuSearchKey(r.name))
+  const said = new Set(shown.filter(Boolean).map(onuSearchKey))
+  const unsaid = (v?: string | null) => !!v && !said.has(onuSearchKey(v))
+  const billingName = unsaid(r?.name)
+  const fieldName = unsaid(rec?.label)
   const twoPhones = !!(rec?.phone && r?.mobile
     && digitsOf(r.mobile) !== digitsOf(rec.phone))
-  const any = billingName || namesDiffer || rec?.phone || r?.mobile
+  const any = billingName || fieldName || rec?.phone || r?.mobile
     || r?.address || rec?.notes
   if (!any) {
     return (
@@ -329,11 +334,18 @@ function IdentityRows({ sub, canWrite }: { sub: Subscriber; canWrite: boolean })
   }
   return (
     <div className="space-y-0">
-      {billingName && <Row label="Name">{r!.name}</Row>}
-      {namesDiffer && (
+      {fieldName && (
         <Row label="Name">
           {rec!.label}
-          <p className="text-2xs text-faint-foreground">billing: {r!.name}</p>
+          <span className="ml-1.5 text-2xs text-faint-foreground">field</span>
+        </Row>
+      )}
+      {billingName && (
+        <Row label="Name">
+          {r!.name}
+          {fieldName && (
+            <span className="ml-1.5 text-2xs text-faint-foreground">billing</span>
+          )}
         </Row>
       )}
       {rec?.phone && (
@@ -492,10 +504,17 @@ export function SubscriberDetail({ mac, actions, fibre }: {
   const rec = sub.record
   const r = sub.roster
   const sev = r ? onuSev(r) : "offline"
-  const name = onuName({
-    label: rec?.label, radius_name: sub.radius?.name, name: r?.name,
-    serial: sub.mac,
-  })
+  const ident = {
+    label: rec?.label, radius_username: sub.radius?.username,
+    radius_name: sub.radius?.name, name: r?.name, serial: sub.mac,
+  }
+  const name = onuName(ident)
+  // The customer name goes on the sub-line rather than the headline (the ISPs'
+  // call, 2026-08-17: the username is the identity, the name is extra info).
+  // `onuSubName` guarantees it is not the headline repeated — on the ~150 rows
+  // where billing's name IS the username, printing both would be one string
+  // twice at two sizes.
+  const subName = onuSubName(ident)
   const frozen = !!sub.olt && isDownState(sub.olt.state)
   const opticsFresh = isFresh(sub.olt?.optics_updated_at)
   const dark = !!r && r.state !== "online"
@@ -514,14 +533,18 @@ export function SubscriberDetail({ mac, actions, fibre }: {
         <span className="mt-1"><StatusDot tone={TONE[sev]} /></span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <p className="min-w-0 truncate text-sm font-semibold">
+            <p className={cn("min-w-0 truncate text-sm font-semibold",
+              onuNameIsKey(ident) && "font-mono")}>
               {name || <span className="text-muted-foreground">Unnamed subscriber</span>}
             </p>
             {rec?.witness && <RowTag tone="success" title="Power-backed reference point. Tells a fibre cut from an area power cut.">reference</RowTag>}
           </div>
-          <p className="mt-0.5 truncate font-mono text-2xs text-muted-foreground"
-            title="The ONU's serial as the OLT reports it. The sticker on the box, not the customer's own device.">
-            ONU {sub.mac}
+          <p className="mt-0.5 truncate text-2xs text-muted-foreground">
+            {subName && <span title="From billing. The account holder's name.">{subName} · </span>}
+            <span className="font-mono"
+              title="The ONU's serial as the OLT reports it. The sticker on the box, not the customer's own device.">
+              ONU {sub.mac}
+            </span>
           </p>
         </div>
         {actions?.onClose && (
@@ -636,7 +659,14 @@ export function SubscriberDetail({ mac, actions, fibre }: {
             {sub.olt?.optics_updated_at && (
               <p className="mt-1 text-2xs text-faint-foreground">
                 Optics walked {ago(sub.olt.optics_updated_at)}
-                {r.name && r.name !== rec?.label && ` · the OLT calls it "${r.name}"`}
+                {/* Only when the OLT's own string is NEWS. It was compared
+                    against the label alone, so once billing started naming the
+                    headline this read `HCS_RAMPRASAD · the OLT calls it
+                    "HCS_RAMPRASAD"` — the same string, quoted back as though it
+                    were a second opinion. */}
+                {r.name && onuSearchKey(r.name) !== onuSearchKey(name)
+                  && onuSearchKey(r.name) !== onuSearchKey(subName)
+                  && ` · the OLT calls it "${r.name}"`}
               </p>
             )}
           </>
@@ -658,7 +688,7 @@ export function SubscriberDetail({ mac, actions, fibre }: {
         {editing ? (
           <ContactForm sub={sub} onDone={() => setEditing(false)} />
         ) : (
-          <IdentityRows sub={sub} canWrite={canWrite} />
+          <IdentityRows sub={sub} canWrite={canWrite} shown={[name, subName]} />
         )}
       </Section>
 

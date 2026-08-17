@@ -15,6 +15,8 @@ REASONS = {
     "mac_unseen": "their router's MAC hasn't been seen behind any ONU",
     "mac_unresolved": "their router's MAC shows on the network, but it can't be "
                       "pinned to one ONU unambiguously",
+    "gone": "they aren't in the panel's latest customer list, so there is "
+            "nothing to match them to",
 }
 
 
@@ -54,8 +56,28 @@ def collect(store, cfg: Config, org: str, now: datetime | None = None) -> dict:
                 (int(m["device_id"]), str(m["onu_key"])))
 
     formats = _date_formats(store, org)
+
+    # ONE BOOK'S ABSENCE IS EVIDENCE; A SIBLING'S IS NOT. A customer missing from
+    # a panel's latest read is KEPT and marked (far more likely a filtered read
+    # than a cancelled subscriber) — but when the SAME username is CURRENT in
+    # another panel of the org, the row is provably that customer's old copy, not
+    # a fact about anybody. Hansa split one book across two Excell Media panels
+    # and 482 of 1779 rows were exactly that: every one with a fresh twin
+    # agreeing on name, MAC, mobile and account number, none a real departure.
+    # It is a DISPLAY rule — the row stays in storage under the never-delete
+    # rule — and it is COUNTED, because silently folding rows away is the failure
+    # "kept, not silently equal to a current one" was written against.
+    cust_rows = store.org_radius_customer_rows(org)
+    current = {str(c["username"]) for c in cust_rows
+               if c.get("seen_seq") == c.get("account_seq")}
+
+    superseded = 0
     out: list[dict] = []
-    for c in store.org_radius_customer_rows(org):
+    for c in cust_rows:
+        in_last_read = c.get("seen_seq") == c.get("account_seq")
+        if not in_last_read and str(c["username"]) in current:
+            superseded += 1
+            continue
         account_id = int(c["account_id"])
         expiry_at = radius.parse_expiry(c.get("expiry"), formats.get(account_id, ""))
         row = {
@@ -68,7 +90,7 @@ def collect(store, cfg: Config, org: str, now: datetime | None = None) -> dict:
             "days_left": radius.days_until(expiry_at, today),
             "account_id": account_id,
             "account_label": c.get("account_label") or c.get("account_profile"),
-            "in_last_read": c.get("seen_seq") == c.get("account_seq"),
+            "in_last_read": in_last_read,
             "last_seen_at": c.get("last_seen_at"),
             "net": "unlinked", "reason": None, "match_by": None,
             "device_id": None, "device_name": None, "onu_mac": None,
@@ -78,7 +100,14 @@ def collect(store, cfg: Config, org: str, now: datetime | None = None) -> dict:
         link = links.get((account_id, c["username"]))
         if link is None:
             mac = normalise_mac(c.get("mac") or "")
-            if not mac:
+            if not in_last_read:
+                # Only a panel's LATEST read is fed to the linker
+                # (`radius_customers_for_link`), so this row can never match
+                # whatever its MAC does. Blaming the MAC here is a guess stated
+                # as a finding: 340 of Hansa's rows read "can't be pinned to one
+                # ONU unambiguously" about MACs that pin perfectly well.
+                row["reason"] = "gone"
+            elif not mac:
                 row["reason"] = "no_mac"
             elif not slots_of_mac.get(mac):
                 row["reason"] = "mac_unseen"
@@ -114,6 +143,9 @@ def collect(store, cfg: Config, org: str, now: datetime | None = None) -> dict:
     counts = {
         "customers": len(out),
         "active": len(active),
+        # Server-only by necessity: the SPA recounts every chip off the rows it
+        # was sent, and these are the rows it was NOT sent.
+        "superseded": superseded,
         "linked": sum(1 for r in out if r["net"] != "unlinked"),
         "paying_dark": sum(1 for r in active if r["net"] == "dark"),
         "paying_frozen": sum(1 for r in active if r["net"] == "frozen"),

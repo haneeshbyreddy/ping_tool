@@ -2,12 +2,26 @@
 // Question: "which port is closest to its ceiling, and at what time of day?"
 // Action: buy capacity, or re-balance a region before the complaints start.
 //
-// THIS IS A CAPACITY LIST, NOT AN ALARM SURFACE. A port pinned near its
-// ceiling is a purchase decision, and a purchase decision is not a fault — so
-// the ranking is neutral text plus a meter in the TRAFFIC plane, and the only
-// tones here are the two claims ports.py already made (`alarm` = the port is
-// down, `bw_high_alarm` = it is over its ceiling RIGHT NOW). Painting the list
-// red would fabricate alarms out of arithmetic.
+// THE METER IS GRADED, THE LIST IS NOT (operator's ask, 2026-08-17: "colour
+// indication to show that bandwidth is above threshold … red above 90%"). This
+// shipped entirely neutral — a meter in the TRAFFIC plane, with tone reserved
+// for the two claims ports.py already made (`alarm` = the port is down,
+// `bw_high_alarm` = it is over its ceiling RIGHT NOW) on the argument that a
+// purchase decision is not a fault. The operator's answer is that a port at 94%
+// of the backhaul they bought IS the thing this panel exists to find, and it
+// was the one number on the page you had to read digit by digit. So:
+//
+//   * only the METER and its percentage take a tone (`utilStage`, ONE ladder
+//     shared with the per-port drill) — the port name, the device and the busy
+//     figure stay neutral text, so a full row still reads as capacity rather
+//     than as an outage;
+//   * it grades the ceiling the OPERATOR recorded and nothing else, so a port
+//     with none stays untoned and untracked rather than being scored against a
+//     number we made up;
+//   * `bw_high_alarm` keeps its own chip. The bar saying "full" is a 30-day
+//     busy-hour average; the chip is ports.py's live claim about right now, and
+//     collapsing the two would lose the distinction between "this hits its
+//     ceiling every evening" and "it is over it as you read this".
 //
 // Owner-only, twice: the endpoint refuses a worker, and the panel never
 // mounts for one. An org-wide port list leaks past assignment scope.
@@ -17,9 +31,13 @@ import { Link } from "react-router-dom"
 import { Heatmap, HeatmapLegend } from "@/chart/heatmap"
 import type { HeatmapRow } from "@/chart/heatmap"
 import { useAuth } from "@/hooks/use-auth"
-import { busyArrow, capacityApi, fmtRate, hourLabel, hourSlots, portRecords } from "@/lib/capacity-api"
-import type { CapacityRow, HeatCell, PortHistoryReply } from "@/lib/capacity-api"
+import {
+  UTIL_FULL_PCT, UTIL_WATCH_PCT, busyArrow, capacityApi, fmtRate, hourLabel,
+  hourSlots, portRecords, utilStage,
+} from "@/lib/capacity-api"
+import type { CapacityRow, HeatCell, PortHistoryReply, UtilStage } from "@/lib/capacity-api"
 import { isDownState, toUtcDate } from "@/lib/format"
+import { cn } from "@/lib/utils"
 import type { OrgDevice, SwitchPort } from "@/lib/types"
 import { Chip } from "@/components/status-badge"
 
@@ -43,25 +61,52 @@ function cellTitle(slotLabel: string, c: HeatCell | undefined): string {
 
 // -- the ranking row -----------------------------------------------------------
 
+// The three stages, spelled once. `ok` keeps the TRAFFIC plane — a healthy
+// meter is identity, not a green light — and only the two loaded stages cross
+// onto the status axis. The tone is the FILL and the figure; nothing here
+// pulses, tints the row or grows.
+const STAGE_FILL: Record<UtilStage, { bg: string; opacity: number }> = {
+  ok: { bg: TRAFFIC, opacity: 0.85 },
+  watch: { bg: "var(--warning)", opacity: 1 },
+  full: { bg: "var(--destructive)", opacity: 1 },
+}
+const STAGE_TEXT: Record<UtilStage, string> = {
+  ok: "text-muted-foreground",
+  watch: "text-warning",
+  full: "text-destructive",
+}
+const STAGE_WORD: Record<UtilStage, string> = {
+  ok: "room left",
+  watch: `past ${UTIL_WATCH_PCT}% of its ceiling`,
+  full: `past ${UTIL_FULL_PCT}% of its ceiling`,
+}
+
 function CeilingBar({ row }: { row: CapacityRow }) {
   // No ceiling recorded is a DIFFERENT sentence from 0% used, so it gets no
   // track at all: an empty bar would read as "plenty of room" and a full one
   // as trouble, and neither is a thing we know.
-  if (row.util_pct == null) {
+  const stage = utilStage(row.util_pct)
+  if (row.util_pct == null || !stage) {
     return (
       <span className="text-2xs text-faint-foreground">
         {row.rate_n === 0 ? "not recording yet" : "no ceiling recorded"}
       </span>
     )
   }
+  const fill = STAGE_FILL[stage]
   return (
     <>
-      <span className="h-1 min-w-8 flex-1 overflow-hidden rounded-full bg-muted">
+      <span className="h-1 min-w-8 flex-1 overflow-hidden rounded-full bg-muted"
+        title={`${Math.round(row.util_pct)}% of the recorded ceiling`
+          + ` — ${STAGE_WORD[stage]}`}>
         <span className="block h-full rounded-full"
           style={{ width: `${Math.min(100, row.util_pct)}%`,
-                   background: TRAFFIC, opacity: 0.85 }} />
+                   background: fill.bg, opacity: fill.opacity }} />
       </span>
-      <span className="w-10 shrink-0 text-right font-mono text-2xs tabular-nums text-muted-foreground">
+      {/* The percentage carries the tone too: the bar alone is 8px of colour,
+          and the figure beside it is what gets read aloud and screenshotted. */}
+      <span className={cn("w-10 shrink-0 text-right font-mono text-2xs tabular-nums",
+        STAGE_TEXT[stage])}>
         {Math.round(row.util_pct)}%
       </span>
     </>
@@ -206,6 +251,12 @@ export function CapacityPanel() {
             ))}
             <p className="px-4 pt-2 pb-1 text-2xs text-faint-foreground">
               Closest to the recorded ceiling first.
+              {/* A colour with no stated meaning is decoration; this names the
+                  two thresholds so the amber and the red are readable without
+                  hovering a bar. */}
+              {" "}
+              <span className="text-warning">Amber</span> past {UTIL_WATCH_PCT}%
+              of it, <span className="text-destructive">red</span> past {UTIL_FULL_PCT}%.
               {data.sampled > top.length
                 && ` ${data.sampled - top.length} more recording.`}
               {data.no_ceiling > 0
@@ -282,7 +333,14 @@ function DrillFigures({ data, refMs }: {
       <div className="flex items-baseline gap-2 text-2xs">
         {data.util_pct != null ? (
           <span className="text-muted-foreground">
-            <span className="font-mono font-semibold text-foreground">
+            {/* Same ladder as the Home ranking (`utilStage`), or one port
+                would read amber on the list it was opened from and plain
+                here. `ok` keeps the neutral ink — a healthy figure is not
+                news, and green would be a claim this panel can't make. */}
+            <span className={cn("font-mono font-semibold",
+              utilStage(data.util_pct) === "full" ? "text-destructive"
+                : utilStage(data.util_pct) === "watch" ? "text-warning"
+                : "text-foreground")}>
               {Math.round(data.util_pct)}%
             </span>{" "}
             of the {data.bw_max_mbps} Mbps ceiling, on {data.bw_direction}

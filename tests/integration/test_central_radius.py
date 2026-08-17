@@ -576,7 +576,26 @@ class IdentityTest(Base):
     def test_display_name_prefers_radius_over_the_walked_name(self):
         self._linked()
         row_ = self.store.list_onu_optics(ORG, self.olt)[0]
-        self.assertEqual(onuroster.display_name(row_), "VENKATESWARLU GOGU")
+        self.assertEqual(onuroster.display_name(row_), "HC_GOGU")
+
+    def test_THE_USERNAME_IS_THE_IDENTITY_AND_THE_NAME_IS_EXTRA(self):
+        # The ISPs' own instruction, 2026-08-17: "everybody recognise the user
+        # by username only". Before it, this slot printed VENKATESWARLU GOGU —
+        # and printed the username anyway wherever a worker had hand-typed it
+        # into the survey label, which is 253 of the 289 surveyed, linked
+        # subscribers on the live fleet.
+        self._linked()
+        row_ = self.store.list_onu_optics(ORG, self.olt)[0]
+        self.assertEqual(onuroster.display_name(row_), "HC_GOGU")
+        self.assertEqual(row_["radius_name"], "VENKATESWARLU GOGU")
+
+    def test_the_billing_NAME_still_names_a_row_carrying_no_username(self):
+        # The name is demoted, never dropped: a book that exports a customer
+        # with no username still has a subscriber to name.
+        self.assertEqual(
+            onuroster.display_name({"radius_name": "VENKATESWARLU GOGU",
+                                    "name": "walked", "serial": "AA"}),
+            "VENKATESWARLU GOGU")
 
     def test_AN_OPERATOR_TYPED_LABEL_STILL_OUTRANKS_RADIUS(self):
         self._linked()
@@ -591,6 +610,77 @@ class IdentityTest(Base):
         row_ = self.store.list_onu_optics(ORG, self.olt)[0]
         self.assertIsNone(row_["radius_name"])
         self.assertEqual(onuroster.display_name(row_), "sub")
+
+
+class PlaceIdentityTest(Base):
+    """The map's pins get the same identity, off one grouped pass.
+
+    `list_onu_places` resolved the customer through a correlated sub-select per
+    row — 721 ms for 357 pins on a copy of prod, on a read the map makes on
+    load. It is a CTE joined once now (~32 ms WITH the username added), so these
+    pin the behaviour the rewrite must keep: both columns, the per-column
+    ambiguity guard, and no fabricated claim for an unlinked pin.
+    """
+
+    def _place(self, mac="AA:11:22:33:44:55", label=None):
+        self.store.set_onu_place(ORG, mac, 1.0, 2.0, label, None, witness=False)
+
+    def _place_row(self, mac="AA:11:22:33:44:55"):
+        return next(p for p in self.store.list_onu_places(ORG)
+                    if p["mac"] == mac)
+
+    def test_a_placed_linked_subscriber_carries_BOTH_identities(self):
+        self._account()
+        self._roster()
+        self._usermac("F0:A7:31:EA:7E:32")
+        self._sync(FakePanel(HEAD + row("HC_GOGU", "F0:A7:31:EA:7E:32",
+                                        "VENKATESWARLU GOGU")))
+        self._place()
+        p = self._place_row()
+        self.assertEqual(p["radius_username"], "HC_GOGU")
+        self.assertEqual(p["radius_name"], "VENKATESWARLU GOGU")
+        # And the pin is NAMED by the username, like every other surface.
+        self.assertEqual(onuroster.display_name(p), "HC_GOGU")
+
+    def test_an_unplaced_pin_of_an_unlinked_ONU_claims_neither(self):
+        self._account()
+        self._roster()
+        self._place()
+        p = self._place_row()
+        self.assertIsNone(p["radius_username"])
+        self.assertIsNone(p["radius_name"])
+
+    def test_ONE_MAC_ON_TWO_SLOTS_WITH_TWO_CUSTOMERS_NAMES_NEITHER(self):
+        # The guard the map depends on: a mark and its card may never name one
+        # subscriber two ways, so an ambiguous MAC gets NULL, not a pick.
+        self._account()
+        self._roster()
+        self.store.upsert_onu_optics(
+            ORG, self.olt, "1.9", pon_port="EPON0/1", onu_id=9, name="sub2",
+            serial="AA:11:22:33:44:55", state="online", rx_dbm=-21.0,
+            tx_dbm=None, olt_rx_dbm=None, distance_m=None, rx_ref_dbm=None,
+            rx_ref_at=None, severity="ok", ts=RECENT)
+        self._usermac("F0:A7:31:EA:7E:32", onu_key="1.4")
+        self._usermac("F0:A7:31:EA:7E:99", onu_key="1.9")
+        self._sync(FakePanel(
+            HEAD
+            + row("HC_GOGU", "F0:A7:31:EA:7E:32", "VENKATESWARLU GOGU")
+            + row("HC_OTHER", "F0:A7:31:EA:7E:99", "SOMEBODY ELSE")))
+        self._place()
+        p = self._place_row()
+        self.assertIsNone(p["radius_username"])
+        self.assertIsNone(p["radius_name"])
+
+    def test_located_only_still_filters_and_still_carries_the_identity(self):
+        self._account()
+        self._roster()
+        self._usermac("F0:A7:31:EA:7E:32")
+        self._sync(FakePanel(HEAD + row("HC_GOGU", "F0:A7:31:EA:7E:32",
+                                        "VENKATESWARLU GOGU")))
+        self._place()
+        located = self.store.list_onu_places(ORG, located_only=True)
+        self.assertEqual([p["mac"] for p in located], ["AA:11:22:33:44:55"])
+        self.assertEqual(located[0]["radius_username"], "HC_GOGU")
 
 
 class SearchApiTest(Base):

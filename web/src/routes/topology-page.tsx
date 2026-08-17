@@ -150,8 +150,6 @@ function TagColorsDialog({ org, tags, colors, counts, open, onOpenChange }: {
   )
 }
 
-type SortMode = "default" | "ip" | "type"
-
 function ipKey(d: OrgDevice): number {
   const m = d.ip_address.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
   if (!m) return Number.MAX_SAFE_INTEGER
@@ -270,14 +268,16 @@ function TypeRail({ groups, hidden, onJump }: {
   )
 }
 
-function comparatorFor(mode: SortMode): ((a: OrgDevice, b: OrgDevice) => number) | undefined {
-  if (mode === "ip") return (a, b) => ipKey(a) - ipKey(b) || a.name.localeCompare(b.name)
-  if (mode === "type") {
-    return (a, b) =>
-      (TYPE_RANK[a.device_type ?? ""] ?? 99) - (TYPE_RANK[b.device_type ?? ""] ?? 99)
-      || ipKey(a) - ipKey(b) || a.name.localeCompare(b.name)
-  }
-  return undefined // insertion order (ORDER BY id), the historical behavior
+// THE ONLY ORDER (operator's call, 2026-08-17). The page used to offer
+// Recent / IP / Type behind a Select; the operator asked for the picker gone
+// and Type kept. Type is the one order the rest of this page is built around —
+// it is what the labelled cluster headers and the right-hand jump rail read,
+// and both of those had to grow an "other sorts" fallback that nobody chose.
+// IP and name remain the tie-breaks, so a cluster of switches still reads in
+// address order.
+function byType(a: OrgDevice, b: OrgDevice): number {
+  return (TYPE_RANK[a.device_type ?? ""] ?? 99) - (TYPE_RANK[b.device_type ?? ""] ?? 99)
+    || ipKey(a) - ipKey(b) || a.name.localeCompare(b.name)
 }
 
 function filterWithAncestors(devices: OrgDevice[], query: string,
@@ -1210,17 +1210,6 @@ function loadPlantOpen(): boolean {
   try { return localStorage.getItem(PLANT_KEY) === "1" } catch { return false }
 }
 
-const SORT_KEY = "wisp:network:sort"
-
-function loadSort(): SortMode {
-  try {
-    const v = localStorage.getItem(SORT_KEY)
-    return v === "ip" || v === "type" ? v : "default"
-  } catch {
-    return "default"
-  }
-}
-
 export function TopologyPage() {
   const { scopeOrg, canWrite, isWorker } = useAuth()
   const location = useLocation()
@@ -1241,7 +1230,6 @@ export function TopologyPage() {
   const [view, setView] = useState<ViewMode>(loadView)
   const [search, setSearch] = useState("")
   const searchRef = useRef<HTMLInputElement>(null)
-  const [sortMode, setSortMode] = useState<SortMode>(loadSort)
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
   const [tagColorsOpen, setTagColorsOpen] = useState(false)
   const [open, setOpen] = useState<{ id: number; tab: DeviceTab; onu?: number | null } | null>(null)
@@ -1266,10 +1254,6 @@ export function TopologyPage() {
   const changeView = (v: ViewMode) => {
     setView(v)
     saveView(v)
-  }
-  const changeSort = (v: SortMode) => {
-    setSortMode(v)
-    try { localStorage.setItem(SORT_KEY, v) } catch { /* private mode / quota */ }
   }
   const changePlantOpen = (v: boolean) => {
     setPlantOpen(v)
@@ -1406,19 +1390,18 @@ export function TopologyPage() {
   const deviceCap = billing.data?.device_cap ?? null
   const atCap = deviceCap != null && monitoredCount >= deviceCap
   const gridView = view === "grid"
-  const cmp = useMemo(() => comparatorFor(sortMode), [sortMode])
   const effectiveCollapsed = useMemo(
     () => (gridView || searching ? new Set<number>() : collapsed),
     [gridView, searching, collapsed])
   const treeOrdered = useMemo(
-    () => treeOrder(devices, effectiveCollapsed, cmp),
-    [devices, effectiveCollapsed, cmp])
+    () => treeOrder(devices, effectiveCollapsed, byType),
+    [devices, effectiveCollapsed])
   const orderedGear = useMemo(
-    () => (gridView && cmp ? [...treeOrdered.gear].sort(cmp) : treeOrdered.gear),
-    [treeOrdered, gridView, cmp])
+    () => (gridView ? [...treeOrdered.gear].sort(byType) : treeOrdered.gear),
+    [treeOrdered, gridView])
   const orderedPlant = useMemo(
-    () => (gridView && cmp ? [...treeOrdered.plant].sort(cmp) : treeOrdered.plant),
-    [treeOrdered, gridView, cmp])
+    () => (gridView ? [...treeOrdered.plant].sort(byType) : treeOrdered.plant),
+    [treeOrdered, gridView])
   const openDevice = useMemo(
     () => (open ? devices.find((d) => d.id === open.id) ?? null : null), [open, devices])
   const forcePlantOpen = (searching && orderedPlant.length > 0)
@@ -1485,14 +1468,12 @@ export function TopologyPage() {
 
   type Ordered = OrgDevice & { depth: number; descendantCount: number }
   // The list's furniture (operator's ask, 2026-08-15: "a line separator
-  // between device types"). Under Sort: Type the top-level rows cluster by
-  // type, so each cluster gets a labelled muted-well header — the wisp-thead
-  // grammar, framing rather than competing with the rows. Under the other
-  // sorts types interleave with the hierarchy, so the honest separator there
-  // is a slim groove wherever a SUBTREE ends (a depth-0 row after nested
-  // rows) — it bounds the blocks without claiming a grouping that isn't
-  // there. The count on a header is the type's count in the filtered set,
-  // the same population the "Devices N" header counts.
+  // between device types"). Top-level rows cluster by type, so each cluster
+  // gets a labelled muted-well header — the wisp-thead grammar, framing
+  // rather than competing with the rows. The count on a header is the type's
+  // count in the filtered set, the same population the "Devices N" header
+  // counts. (The slim end-of-subtree groove this used to draw under the
+  // Recent/IP sorts went with those sorts on 2026-08-17.)
   const typeCount = (t: string) =>
     devices.filter((d) => (d.device_type || "untyped") === t).length
   const typeHeader = (t: string, key: string) => (
@@ -1504,19 +1485,12 @@ export function TopologyPage() {
   const renderList = (list: Ordered[]) => {
     const rows: ReactNode[] = []
     let prevTopType: string | null = null
-    let prevDepth = 0
-    list.forEach((d, i) => {
+    list.forEach((d) => {
       if (d.depth === 0) {
         const t = d.device_type || "untyped"
-        if (sortMode === "type" && t !== prevTopType) {
-          rows.push(typeHeader(t, `th-${t}`))
-        } else if (sortMode !== "type" && i > 0 && prevDepth > 0) {
-          rows.push(<div key={`sep-${d.id}`} aria-hidden
-            className="h-1.5 border-b bg-muted/40" />)
-        }
+        if (t !== prevTopType) rows.push(typeHeader(t, `th-${t}`))
         prevTopType = t
       }
-      prevDepth = d.depth
       rows.push(
         <Fragment key={d.id}>
           <DeviceRow device={d} canWrite={canWrite} onEdit={openEdit}
@@ -1539,7 +1513,7 @@ export function TopologyPage() {
     let prevType: string | null = null
     list.forEach((d) => {
       const t = d.device_type || "untyped"
-      if (sortMode === "type" && t !== prevType) {
+      if (t !== prevType) {
         cells.push(
           <div key={`th-${t}`} className="col-span-full flex items-center gap-2 pt-1 first:pt-0">
             <span className="wisp-eyebrow shrink-0">{t}</span>
@@ -1641,16 +1615,6 @@ export function TopologyPage() {
                 </button>
               )}
             </div>
-            <Select value={sortMode} onValueChange={(v) => changeSort(v as SortMode)}>
-              <SelectTrigger className="h-8 w-32 text-xs" aria-label="Sort devices">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">Sort: Recent</SelectItem>
-                <SelectItem value="ip">Sort: IP</SelectItem>
-                <SelectItem value="type">Sort: Type</SelectItem>
-              </SelectContent>
-            </Select>
             {allTags.length > 0 && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>

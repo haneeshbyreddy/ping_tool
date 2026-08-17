@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link, useSearchParams } from "react-router-dom"
-import { MapPin, Search } from "lucide-react"
+import { ArrowDown, ArrowUp, ChevronsUpDown, MapPin, Search } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils"
 const COLS = "grid grid-cols-[0.5rem_minmax(0,1.5fr)_minmax(0,1.3fr)_6rem] items-center gap-3.5 px-4 md:grid-cols-[0.5rem_minmax(0,1.5fr)_minmax(0,0.8fr)_6rem_minmax(0,1.3fr)]"
 
 type Filter = "dark" | "frozen" | "expiring" | "active" | "expired"
-  | "inactive" | "unmatched"
+  | "inactive" | "online" | "unmatched"
 
 // Every chip count is a recount of the rows it filters to, so a chip and the
 // list it opens can never disagree — the /issues rule, kept here.
@@ -31,13 +31,69 @@ const FILTERS: Record<Filter, (r: CustomerRow) => boolean> = {
   active: (r) => r.status === "active",
   expired: (r) => r.status === "expired",
   inactive: (r) => r.status === "inactive",
-  unmatched: (r) => r.net === "unlinked",
+  // The ONU is up right now. Deliberately NOT narrowed to active billing: an
+  // expired customer still passing traffic is a real thing to find, and the
+  // status chips already answer the billing question.
+  online: (r) => r.net === "online",
+  // ACTIVE-ONLY, and that is the point of the chip. An expired customer passes
+  // no traffic, so their router ages out of the OLT's address table and cannot
+  // match — on Hansa that is 475 of the 542 unmatched rows, i.e. the number was
+  // reporting the design working as if it were a fault. What is actionable is
+  // the paying customer we cannot find on the network.
+  unmatched: (r) => r.status === "active" && r.net === "unlinked",
 }
 
 const FILTER_KEYS = Object.keys(FILTERS) as Filter[]
 
 const isFilter = (raw: string | null): raw is Filter =>
   raw != null && raw in FILTERS
+
+// Sort is a VIEW preference, so it lives in local state while the filter rides
+// the URL (tiles link to a chip; nothing links to an order).
+type Sort = "name" | "expiry-asc" | "expiry-desc"
+
+// Ordered by the NUMBER THE COLUMN PRINTS, not by the expiry date behind it
+// (operator's call 2026-08-15). Sorting on the raw `days_left` is chronological
+// and reads as broken: an expired customer's is negative, so ascending led with
+// 1262 d ago and buried every customer actually about to lapse under ~500 dead
+// accounts — on Hansa, 687 of 1779 rows are expired. Ascending now means the
+// SMALLEST printed figure first ("today", "in 1 d", …), which is also the one
+// question this column gets sorted to answer: who runs out next.
+//
+// Expired rows sink BELOW live ones in both directions rather than
+// interleaving: "3 d ago" and "in 3 d" print the same magnitude and mean
+// opposite things, and a list alternating between them answers neither. They
+// keep the same lowest-first rule among themselves, so filtering to Expired
+// leads with the ones that lapsed most recently — the ones still worth a call.
+// Keyed on `days_left < 0`, NOT on `status`: the rule is about what is printed,
+// and the panel's own status can disagree with the date it gave us.
+//
+// A row with no `days_left` sorts LAST in BOTH directions: its panel declared
+// no `date_format`, or the string did not parse, and neither is a claim about
+// when this customer runs out. Name breaks ties, so the order is stable and
+// matches the server's own default.
+function bySort(sort: Sort) {
+  // Sorted on what the row PRINTS BIG, which is now the username — a list
+  // ordered by a string the eye cannot find reads as unsorted.
+  const label = (r: CustomerRow) => (r.username || r.name || "").toLowerCase()
+  return (a: CustomerRow, b: CustomerRow) => {
+    if (sort !== "name") {
+      const x = a.days_left, y = b.days_left
+      if (x == null || y == null) {
+        if (x != null || y != null) return x == null ? 1 : -1
+      } else {
+        const gone = (n: number) => (n < 0 ? 1 : 0)
+        if (gone(x) !== gone(y)) return gone(x) - gone(y)
+        if (Math.abs(x) !== Math.abs(y)) {
+          return sort === "expiry-asc"
+            ? Math.abs(x) - Math.abs(y)
+            : Math.abs(y) - Math.abs(x)
+        }
+      }
+    }
+    return label(a).localeCompare(label(b))
+  }
+}
 
 function expiresCell(r: CustomerRow): { text: string; tone?: "warning" } {
   if (r.days_left == null) return { text: r.expiry ?? "—" }
@@ -134,7 +190,8 @@ function TriageChips({ all, picked, setPicked }: {
       {chip("active", "Active")}
       {chip("expired", "Expired")}
       {chip("inactive", "Inactive")}
-      {chip("unmatched", "Not matched")}
+      {chip("online", "Online")}
+      {chip("unmatched", "Active, not matched")}
     </div>
   )
 }
@@ -160,6 +217,7 @@ export function CustomersPage() {
   const { scopeOrg } = useAuth()
   const [params, setParams] = useSearchParams()
   const [search, setSearch] = useState("")
+  const [sort, setSort] = useState<Sort>("name")
   const [open, setOpen] = useState<string | null>(null)
   useNow()
 
@@ -189,7 +247,8 @@ export function CustomersPage() {
     (!picked || FILTERS[picked](r)) &&
     (!needle || [r.name, r.username, r.mobile, r.acno, r.package, r.branch,
       r.area, r.address, r.device_name, r.onu_label, r.onu_name]
-      .some((v) => (v ?? "").toLowerCase().includes(needle)))), [all, picked, needle])
+      .some((v) => (v ?? "").toLowerCase().includes(needle))))
+    .sort(bySort(sort)), [all, picked, needle, sort])
   const multiPanel = useMemo(
     () => new Set(all.map((r) => r.account_id)).size > 1, [all])
 
@@ -228,7 +287,24 @@ export function CustomersPage() {
           <span />
           <span>Customer</span>
           <span className="hidden md:block">Package</span>
-          <span className="text-right">Expires</span>
+          <span className="flex justify-end">
+            <button type="button"
+              onClick={() => setSort(sort === "expiry-asc" ? "expiry-desc"
+                : sort === "expiry-desc" ? "name" : "expiry-asc")}
+              title={sort === "expiry-asc"
+                ? "Running out soonest first, expired below — click to reverse"
+                : sort === "expiry-desc"
+                  ? "Furthest out first — click to go back to name order"
+                  : "Sort by days to expiry"}
+              className={cn("-mr-1 inline-flex items-center gap-1 rounded px-1",
+                "transition-colors hover:text-foreground",
+                sort !== "name" && "text-foreground")}>
+              Expires
+              {sort === "expiry-asc" ? <ArrowUp className="size-3" />
+                : sort === "expiry-desc" ? <ArrowDown className="size-3" />
+                : <ChevronsUpDown className="size-3 opacity-50" />}
+            </button>
+          </span>
           <span>Network</span>
         </div>
         {query.isLoading && <div className="p-4"><Skeleton className="h-40 w-full" /></div>}
@@ -268,17 +344,27 @@ export function CustomersPage() {
                 clickable && "cursor-pointer hover:bg-foreground/5")}>
               <NetDot r={r} />
               <span className="min-w-0">
-                <span className="block truncate text-xs font-medium">
-                  {r.name || r.username}
+                {/* USERNAME LEADS (the ISPs' call, 2026-08-17: it is the only
+                    identifier everyone recognises; the customer name is extra
+                    info, and on three of the four live books it is the weaker
+                    string — 1,442 of rapidnetworks' 1,784 names are a single
+                    word). MONO and verbatim: this is a key somebody retypes
+                    into the billing panel, so it may not be case-folded the way
+                    a survey label is, and mono is this app's mark for "an
+                    identifier, not prose" (a port is GE0/5, a device row leads
+                    with its name). The status word stays on this line — it
+                    qualifies the account, not the person. */}
+                <span className="block truncate font-mono text-xs font-medium">
+                  {r.username}
                   {r.status !== "active" && (
-                    <span className={cn("ml-1.5 text-2xs font-normal",
+                    <span className={cn("ml-1.5 font-sans text-2xs font-normal",
                       r.status === "expired" ? "text-warning" : "text-faint-foreground")}>
                       {r.status}
                     </span>
                   )}
                 </span>
-                <span className="block truncate font-mono text-2xs text-faint-foreground">
-                  {r.username}
+                <span className="block truncate text-2xs text-faint-foreground">
+                  {r.name}
                   {multiPanel && r.account_label && ` · ${r.account_label}`}
                   {!r.in_last_read && (
                     <span title={r.last_seen_at
@@ -307,6 +393,10 @@ export function CustomersPage() {
           {counts.linked} of {counts.customers} customers are matched to an ONU.
           An unmatched customer is usually a disconnected one — their router
           stops passing traffic, so its address ages out of the OLT's table.
+          {counts.superseded > 0 && (
+            <> {counts.superseded} older {counts.superseded === 1 ? "row is" : "rows are"} not
+            shown: the same customer is current in another panel.</>
+          )}
         </p>
       )}
 

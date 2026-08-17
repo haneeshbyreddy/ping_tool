@@ -131,7 +131,15 @@ export function LogsPage() {
                   {ev.device_name || "—"}
                 </span>
                 <span className="min-w-0">
-                  <Chip tone={eventTone(ev)}>{TYPE_LABEL[ev.type] ?? ev.type}</Chip>
+                  {/* The chip is nowrap by design, so a label longer than the
+                      column overflows ONTO the Event text rather than
+                      wrapping — which is exactly how an unlabelled event type
+                      read. Bounded here so the next one can only ellipsize. */}
+                  <Chip tone={eventTone(ev)} className="max-w-full">
+                    <span className="min-w-0 truncate" title={ev.type}>
+                      {TYPE_LABEL[ev.type] ?? ev.type}
+                    </span>
+                  </Chip>
                 </span>
                 <span className="min-w-0 truncate text-xs text-muted-foreground"
                   title={describeEvent(ev)}>

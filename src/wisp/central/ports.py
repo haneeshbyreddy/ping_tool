@@ -55,6 +55,35 @@ def _has_counters(raw: dict, p: PortStatus) -> bool:
     return ("in_octets" in raw and "out_octets" in raw
             and p.in_octets is not None and p.out_octets is not None)
 
+def _counter_regression(prior: dict | None, p: PortStatus) -> bool:
+    # A counter reading BACKWARDS is a glitch, not a measurement. throughput_bps
+    # already refuses the negative delta, so the glitch sweep itself published
+    # nothing — what leaked was the BASELINE: the low value was stored, and the
+    # next normal read subtracted against it and reported the port's whole
+    # lifetime counter as one interval (NLK-OLT EPON0/3 at 121.85 Gb/s on a
+    # 1 Gb/s PON, which the busy-hour panel then averaged). Either direction
+    # condemns the pair, because counters_at is ONE stamp for both.
+    if prior is None:
+        return False
+    for key, cur in (("in_octets", p.in_octets), ("out_octets", p.out_octets)):
+        stored = _to_int(prior[key])
+        if stored is not None and cur is not None and cur < stored:
+            return True
+    return False
+
+def _baseline_stale(prior: dict | None, ts: str) -> bool:
+    # The escape hatch for a genuine reboot: past STALE_S nobody has refreshed
+    # the baseline, so holding it protects nothing and would strand the port
+    # publishing no rate for ever. Adopt the lower value, skip the gap, resume
+    # next sweep. This is also what bounds the hold after a bogus HIGH reading —
+    # every honest read after one looks like a regression.
+    if prior is None:
+        return True
+    at = prior["counters_at"]
+    if not at:
+        return True
+    return _dt_seconds(at, ts) > STALE_S
+
 def _to_int(raw) -> int | None:
     if raw in (None, ""):
         return None
@@ -176,7 +205,15 @@ class CentralPortMonitor:
                           and p.oper_status == "up" and not down)
             high_eligible = (monitored and max_threshold is not None
                             and p.oper_status == "up" and not down)
-            if fresh_counters:
+            # A backwards counter is treated as a counter-LESS sweep: the stored
+            # baseline is kept and no rate is measured, so the next good read
+            # measures correctly across the longer interval. Only the LOW side is
+            # guarded — a suspiciously high reading is still adopted outright,
+            # which is what let TMG-OLT self-heal in two sweeps.
+            regressed = fresh_counters and _counter_regression(prior, p)
+            rebooted = regressed and _baseline_stale(prior, ts)
+            measured = fresh_counters and not regressed
+            if measured:
                 dt = _dt_seconds(prior["counters_at"] if prior else None, ts)
                 in_octets, out_octets, counters_at = p.in_octets, p.out_octets, ts
                 in_bps = throughput_bps(_to_int(prior["in_octets"]) if prior else None,
@@ -197,18 +234,25 @@ class CentralPortMonitor:
                     prior["bw_high_alarm_since"] if prior else None,
                     cfg.snmp_bw_consecutive, ts)
             else:
-                # The walk dropped the counter columns. The stored octets are the
-                # baseline the NEXT complete pair is measured against — wiping
-                # them is why a rate needs two consecutive complete walks and a
-                # big OLT never got one. A held rate is still a claim about now,
+                # The walk dropped the counter columns, or the pair read
+                # backwards. The stored octets are the baseline the NEXT
+                # complete pair is measured against — wiping them is why a rate
+                # needs two consecutive complete walks and a big OLT never got
+                # one. A held rate is still a claim about now,
                 # so it expires; the alarm bounds got no rate evidence this sweep
                 # (hit=None holds an eligible streak), but eligibility rides oper
                 # status, which IS current — a port that went down still clears.
-                in_octets = prior["in_octets"] if prior else None
-                out_octets = prior["out_octets"] if prior else None
-                counters_at = prior["counters_at"] if prior else None
-                still_now = (prior is not None and counters_at is not None
-                             and _dt_seconds(counters_at, ts) <= STALE_S)
+                if rebooted:
+                    in_octets, out_octets, counters_at = p.in_octets, p.out_octets, ts
+                else:
+                    in_octets = prior["in_octets"] if prior else None
+                    out_octets = prior["out_octets"] if prior else None
+                    counters_at = prior["counters_at"] if prior else None
+                # Judged on the PRIOR stamp, never the one just adopted: a
+                # reboot's gap must not resurrect a rate that had already expired.
+                base_at = prior["counters_at"] if prior else None
+                still_now = (base_at is not None
+                             and _dt_seconds(base_at, ts) <= STALE_S)
                 in_bps = prior["in_bps"] if still_now else None
                 out_bps = prior["out_bps"] if still_now else None
                 bw_streak, bw_alarm, bw_since = _bw_bound(
@@ -234,8 +278,8 @@ class CentralPortMonitor:
                 # A held rate is not a fresh measurement — the historian would
                 # draw one walk's number as a run of samples.
                 hist_rows.append((p.if_index,
-                                  in_bps if fresh_counters else None,
-                                  out_bps if fresh_counters else None,
+                                  in_bps if measured else None,
+                                  out_bps if measured else None,
                                   p.oper_status == "up"))
 
             if alarm != prior_alarm:

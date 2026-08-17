@@ -527,8 +527,10 @@ export interface OnuPlace {
   lat: number
   lng: number
   label: string | null
-  // The customer's name from billing, NULL when the MAC is on more than one live
-  // slot — the mark and its card must never name one subscriber two ways.
+  // Billing's two identity columns, each NULL when the MAC is on more than one
+  // live slot — the mark and its card must never name one subscriber two ways.
+  // The username is what names the pin (see onuName); the name is extra info.
+  radius_username?: string | null
   radius_name?: string | null
   phone: string | null
   notes: string | null
@@ -589,6 +591,13 @@ export interface OnuSearchHit {
   onu_id: number | null
   name: string | null
   label: string | null
+  // Shipped by /api/inventory/onu-search since RADIUS landed and declared here
+  // only in 2026-08-17 — the reply carried the customer's identity while every
+  // consumer of this type was typed out of seeing it.
+  radius_username?: string | null
+  radius_name?: string | null
+  radius_mobile?: string | null
+  radius_status?: string | null
   serial: string | null
   state: OnuOptic["state"]
   severity: OnuOptic["severity"]
@@ -611,6 +620,10 @@ export interface OnuCoverageOlt {
 export interface OnuCoverageRow {
   mac: string
   name: string | null
+  // Billing's identity, so the handset names a subscriber the same way every
+  // desk screen does (the survey used to rank label → the OLT's own string).
+  radius_username?: string | null
+  radius_name?: string | null
   pon_port: string | null
   onu_id: number | null
   state: string | null
@@ -772,6 +785,10 @@ export interface CustomersReply {
   counts: {
     customers: number
     active: number
+    // Rows the server folded away: the same username is CURRENT in another
+    // panel of this org, so the older copy is not a customer of its own. Not
+    // recountable here, because those rows are deliberately not sent.
+    superseded: number
     linked: number
     paying_dark: number
     paying_frozen: number

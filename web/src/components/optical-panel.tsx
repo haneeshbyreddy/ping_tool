@@ -4,7 +4,8 @@ import { toast } from "sonner"
 import { inventoryApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
 import {
-  ago, durationSince, isDownState, isFresh, onuName, onuSev, type OnuSev,
+  ago, durationSince, isDownState, isFresh, onuIdentityTitle, onuName, onuSev,
+  type OnuSev,
 } from "@/lib/format"
 import { useAuth } from "@/hooks/use-auth"
 import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
@@ -182,16 +183,19 @@ function OnuRow({ o, deviceId, focused, noRx, splitters, warnDbm, critDbm }: {
             + (o.onu_key ? ` · slot ${o.onu_key}` : "")}>
           {onuIndex(o)}
         </span>
+        {/* One line, so the row prints the headline and the title carries the
+            rest. `onuIdentityTitle` names every identity this ONU has and says
+            whose each one is — the row is 15px and a customer's full name would
+            push the MAC and the Rx off a 380px panel. */}
         {o.serial ? (
           <button type="button"
             className="min-w-0 flex-1 truncate text-left underline-offset-2 hover:underline"
-            title={o.label && o.name && o.label !== o.name
-              ? `${o.label} · the OLT calls it ${o.name}` : "Open this subscriber"}
+            title={`${onuIdentityTitle(o)} · open this subscriber`}
             onClick={() => setOpenSub(true)}>
             {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
           </button>
         ) : (
-          <span className="min-w-0 flex-1 truncate">
+          <span className="min-w-0 flex-1 truncate" title={onuIdentityTitle(o)}>
             {onuName(o) || <span className="text-muted-foreground">unnamed</span>}
           </span>
         )}

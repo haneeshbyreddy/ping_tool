@@ -8,7 +8,7 @@
 // Downtime counts final_state DOWN only, the device_reliability rule, so this
 // strip can never disagree with the analytics table; UNREACHABLE spans are
 // listed and labeled ("parent was down") but never counted.
-import { useState } from "react"
+import { Fragment, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { ChevronRight } from "lucide-react"
 import { DayStrip, DayStripLegend } from "@/chart/day-strip"
@@ -19,7 +19,12 @@ import type { OrgDevice, OutageSpan } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const DAYS = 90
-const SPAN_ROWS = 8
+// Three, not eight (operator's call 2026-08-15): the strip above already says
+// whether this box flaps — the list is there to name the last few, and a
+// nine-line ledger under it made the fold as tall as the panel it sits in.
+// The rest is one click away rather than gone: "+N more" expands, so nothing
+// this window holds is unreachable from here.
+const SPAN_ROWS = 3
 
 function spanLine(s: OutageSpan): string {
   return toUtcDate(s.started_at).toLocaleString(undefined, {
@@ -31,6 +36,7 @@ export function DeviceHistoryPanel({ device }: { device: OrgDevice }) {
   // Open by default (operator's call 2026-08-14) — the strip is why the
   // Health tab now leads; the fold survives only as a way to put it away.
   const [open, setOpen] = useState(true)
+  const [allSpans, setAllSpans] = useState(false)
   const q = useQuery({
     queryKey: ["device-history", device.id],
     queryFn: () => historyApi.device(device.id, DAYS),
@@ -40,7 +46,7 @@ export function DeviceHistoryPanel({ device }: { device: OrgDevice }) {
 
   const data = q.data
   const spans = (data?.spans ?? []).slice().reverse()
-  const shown = spans.slice(0, SPAN_ROWS)
+  const shown = allSpans ? spans : spans.slice(0, SPAN_ROWS)
 
   return (
     <div className="flex flex-col rounded-lg border bg-muted/40">
@@ -79,30 +85,43 @@ export function DeviceHistoryPanel({ device }: { device: OrgDevice }) {
                   No outages in this window.
                 </p>
               ) : (
-                <div className="flex flex-col gap-0.5 border-t pt-2">
-                  {shown.map((s) => (
-                    <div key={s.id} className="flex items-baseline gap-2 text-2xs">
-                      <span className="shrink-0 tabular-nums text-muted-foreground">
-                        {spanLine(s)}
-                      </span>
-                      <span className={cn("shrink-0 font-mono font-semibold",
-                        s.final_state === "DOWN" ? "text-destructive"
-                          : "text-muted-foreground")}>
-                        {s.resolved_at ? fmtDurS(s.duration_s) : "ongoing"}
-                      </span>
-                      {s.final_state !== "DOWN" && (
-                        <span className="shrink-0 text-faint-foreground">parent was down</span>
-                      )}
-                      {s.root_cause && (
+                <div className="flex flex-col gap-1 border-t pt-2">
+                  {/* ONE grid, rows flattened — so the four columns are sized
+                      across every row and line up. Widths are `auto` rather
+                      than hardcoded: a date string's width is the locale's,
+                      not ours, and a fixed column would truncate somebody's. */}
+                  <div className={cn(
+                    "grid grid-cols-[auto_auto_auto_minmax(0,1fr)] items-baseline",
+                    "gap-x-2 gap-y-0.5 text-2xs",
+                    allSpans && "max-h-40 overflow-y-auto")}>
+                    {shown.map((s) => (
+                      <Fragment key={s.id}>
+                        <span className="tabular-nums whitespace-nowrap text-muted-foreground">
+                          {spanLine(s)}
+                        </span>
+                        <span className={cn(
+                          "text-right font-mono font-semibold tabular-nums whitespace-nowrap",
+                          s.final_state === "DOWN" ? "text-destructive"
+                            : "text-muted-foreground")}>
+                          {s.resolved_at ? fmtDurS(s.duration_s) : "ongoing"}
+                        </span>
+                        <span className="whitespace-nowrap text-faint-foreground">
+                          {s.final_state !== "DOWN" ? "parent was down" : ""}
+                        </span>
                         <span className="min-w-0 truncate text-muted-foreground"
-                          title={s.root_cause}>{s.root_cause}</span>
-                      )}
-                    </div>
-                  ))}
-                  {spans.length > shown.length && (
-                    <p className="text-2xs text-faint-foreground">
-                      +{spans.length - shown.length} more in the window
-                    </p>
+                          title={s.root_cause ?? undefined}>
+                          {s.root_cause ?? ""}
+                        </span>
+                      </Fragment>
+                    ))}
+                  </div>
+                  {spans.length > SPAN_ROWS && (
+                    <button type="button" onClick={() => setAllSpans((v) => !v)}
+                      className="self-start text-2xs text-faint-foreground hover:text-muted-foreground">
+                      {allSpans
+                        ? "Show fewer"
+                        : `+${spans.length - SPAN_ROWS} more in the window`}
+                    </button>
                   )}
                 </div>
               )}

@@ -34,9 +34,26 @@ def search_key(raw: str | None) -> str:
 
 
 def display_name(row: dict) -> str:
-
-
-    for key in ("label", "radius_name", "name", "serial", "onu_key"):
+    # THE USERNAME IS THE IDENTITY; THE CUSTOMER NAME IS EXTRA INFO (the ISPs'
+    # own words, 2026-08-17: "everybody recognise the user by username only").
+    # `radius_username` was inserted above `radius_name` on that instruction,
+    # and the fleet had already voted with its hands: 253 of the 289 surveyed,
+    # billing-linked subscribers carry a hand-typed label that IS the username
+    # (punctuation-blind). So this slot was ALREADY showing a username wherever
+    # somebody had surveyed the drop, and the billing name wherever nobody had
+    # — one fleet rendering two kinds of string in one position, decided by
+    # whether a worker had visited. The billing name is also the weaker
+    # identifier on three of the four live books (1,442 of rapidnetworks' 1,784
+    # names are a single word; MS-Telecom has 779 all-lowercase), while a
+    # username is present for every customer and unique by construction.
+    #
+    # `label` STILL OUTRANKS IT, unchanged: that is the human who stood at the
+    # drop, and demoting it would make a typed correction invisible on the
+    # single-slot surfaces (the map plate, a chip) — the "a name visible only on
+    # the screen that captured it" failure, from the other side. In 88% of cases
+    # it is the same string anyway; in the rest it is a deliberate correction.
+    for key in ("label", "radius_username", "radius_name", "name",
+                "serial", "onu_key"):
         v = row.get(key)
         if v not in (None, ""):
             return str(v)

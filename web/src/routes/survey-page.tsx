@@ -23,7 +23,7 @@ import { ShiftButton } from "@/components/field-tracking-card"
 import { PinAdjustMap } from "@/components/pin-adjust-map"
 import { SplitRatioField, type SplitRatio } from "@/components/split-ratio-field"
 import { Chip, StatusDot, type Tone } from "@/components/status-badge"
-import { ago } from "@/lib/format"
+import { ago, onuName, onuSubName } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -148,7 +148,14 @@ export function SurveyPage() {
         const p = placedMacs.get(mac)
         out.push({
           mac,
-          who: p?.label || o.name || o.serial || mac,
+          // Through the SHARED ranking (2026-08-17). This list had its own —
+          // label, then the OLT's provisioning string — so a tech at a drop
+          // read `HC-KOTHAMASS-2` while every desk screen named the customer,
+          // and the username the ISPs identify people by appeared nowhere on
+          // the handset. `onu-search` already ships both billing columns.
+          who: onuName({ label: p?.label, radius_username: o.radius_username,
+                         radius_name: o.radius_name, name: o.name,
+                         serial: o.serial }) || mac,
           where: `${m.device_name}${o.pon_port ? ` · PON ${o.pon_port}` : ""}`,
           label: p?.label ?? null,
           phone: p?.phone ?? null,
@@ -453,7 +460,7 @@ function SubscriberCoverage({ org, onPick, expandable = true }: {
                     type="button"
                     onClick={() => onPick({
                       kind: "onu", mac: l.mac,
-                      who: l.label || l.name || l.mac,
+                      who: onuName(l) || l.mac,
                       where: `${l.device_name ?? ""}${l.pon_port ? ` · PON ${l.pon_port}` : ""}`,
                       located: true, label: l.label, phone: l.phone,
                       walked: l.name ?? null,
@@ -465,11 +472,17 @@ function SubscriberCoverage({ org, onPick, expandable = true }: {
                     <Check className="size-3.5 shrink-0 text-success" />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-mono text-xs">
-                        {l.label || l.name || l.mac}
+                        {onuName(l) || l.mac}
                       </span>
                       <span className="block truncate text-2xs text-faint-foreground">
-                        <span className="font-mono">{l.mac}</span>
-                        {l.placed_at ? ` · ${ago(l.placed_at)}` : ""}
+                        {onuSubName(l) && `${onuSubName(l)} · `}
+                        {/* Not when the MAC IS the headline — an ONU nobody
+                            has named renders its own address twice otherwise,
+                            and on a row with no placement stamp the second
+                            line is nothing but the repeat. */}
+                        {onuName(l) && <span className="font-mono">{l.mac}</span>}
+                        {l.placed_at
+                          ? `${onuName(l) ? " · " : ""}${ago(l.placed_at)}` : ""}
                         {l.placed_by ? ` by ${l.placed_by}` : ""}
                       </span>
                     </span>
@@ -499,7 +512,7 @@ function SubscriberCoverage({ org, onPick, expandable = true }: {
                     type="button"
                     onClick={() => onPick({
                       kind: "onu", mac: u.mac,
-                      who: u.name || u.mac,
+                      who: onuName(u) || u.mac,
                       where: `${u.device_name ?? ""}${u.pon_port ? ` · PON ${u.pon_port}` : ""}`,
                       located: false, label: null, phone: null,
                       walked: u.name ?? null, at: null,
@@ -509,11 +522,12 @@ function SubscriberCoverage({ org, onPick, expandable = true }: {
                     <MapPin className="size-3.5 shrink-0 text-faint-foreground" />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-mono text-xs">
-                        {u.name || u.mac}
+                        {onuName(u) || u.mac}
                       </span>
-                      {u.name && (
-                        <span className="block truncate font-mono text-2xs text-faint-foreground">
-                          {u.mac}
+                      {onuName(u) && (
+                        <span className="block truncate text-2xs text-faint-foreground">
+                          {onuSubName(u) && `${onuSubName(u)} · `}
+                          <span className="font-mono">{u.mac}</span>
                         </span>
                       )}
                     </span>

@@ -329,14 +329,18 @@ class BandwidthTest(unittest.TestCase):
         pid = self._row(3)["id"]
         self.store.set_port_monitored(ORG, pid, True)
         self.store.set_port_bandwidth_config(ORG, pid, 10, "either", 40)
-        for i in (1, 2):
-            self.pm.sync_device(self.switch, [_pbw(
-                3, 20 * _OCT_PER_MBPS_10S, 20 * _OCT_PER_MBPS_10S)], TS_SEQ[i])
+        # An octet counter only ever CLIMBS — what falls is the delta per sweep.
+        # Walking the absolute value back down instead reads as the backwards
+        # counter CounterRegressionTest guards, which publishes no rate at all.
+        total = 0
+        for i, mbps in ((1, 20), (2, 20)):
+            total += mbps * _OCT_PER_MBPS_10S
+            self.pm.sync_device(self.switch, [_pbw(3, total, total)], TS_SEQ[i])
         self.assertEqual(self._row(3)["bw_alarm"], 0)
         self.assertEqual(self._row(3)["bw_high_alarm"], 0)
-        for i in (3, 4):
-            self.pm.sync_device(self.switch, [_pbw(
-                3, 5 * _OCT_PER_MBPS_10S, 5 * _OCT_PER_MBPS_10S)], TS_SEQ[i])
+        for i, mbps in ((3, 5), (4, 5)):
+            total += mbps * _OCT_PER_MBPS_10S
+            self.pm.sync_device(self.switch, [_pbw(3, total, total)], TS_SEQ[i])
         self.assertEqual(self._row(3)["bw_alarm"], 1)
         self.assertEqual(self._row(3)["bw_high_alarm"], 0)
 
@@ -516,6 +520,158 @@ class PartialWalkTest(unittest.TestCase):
         # a held rate is not a second measurement of it
         self.assertIsNone(rated[max(rated)])
         self.assertEqual([r["oper_up"] for r in rows], [1, 1])
+
+
+class CounterRegressionTest(unittest.TestCase):
+    # An agent occasionally reads its own octet counters BACKWARDS for one sweep
+    # — a glitch, not a reboot. throughput_bps already refuses the negative
+    # delta, so that sweep published nothing; what leaked was the BASELINE. The
+    # low value was stored, and the next normal read subtracted against it and
+    # reported the port's whole lifetime counter as one interval: NLK-OLT
+    # EPON0/3 at 121.85 Gb/s on a 1 Gb/s PON, which the busy-hour panel averaged
+    # into 6.78 Gb/s and an ISP disputed.
+
+    LIFETIME = 500_000 * _OCT_PER_MBPS_10S  # a port that has been up for months
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(central_db=Path(self.tmp.name) / "central.db",
+                          snmp_down_consecutive=2, snmp_bw_consecutive=2)
+        self.store = CentralStore(self.cfg.central_db)
+        self.store.set_org(ORG, ntfy_topic_owner="own", ntfy_topic_worker="op")
+        self.olt = self.store.create_org_device(ORG, {
+            "name": "NLK-OLT", "ip_address": "10.0.0.9", "device_type": "OLT",
+            "region": "Rampur", "parent_device_id": None})
+        self.notifier = RecordingNotifier()
+        self.pm = CentralPortMonitor(self.store, ORG, self.notifier, self.cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _row(self, idx=3):
+        return {r["if_index"]: r for r in
+               self.store.list_switch_ports(ORG, self.olt)}[idx]
+
+    def _watch(self, octets=0, idx=3, threshold=None):
+        # The first sweep creates the row, so monitoring is set after it — the
+        # counter it carries becomes the baseline with no rate behind it.
+        self.pm.sync_device(self.olt, [_pbw(idx, octets, octets)], TS_SEQ[0])
+        pid = self._row(idx)["id"]
+        self.store.set_port_monitored(ORG, pid, True)
+        if threshold is not None:
+            self.store.set_port_bandwidth_config(ORG, pid, threshold, "either")
+        return pid
+
+    def _rates(self, idx=3):
+        # hist_port_sweep is keyed on an epoch ts, so read it in walk order.
+        return [r["in_bps"] for r in
+               self.store.port_history(ORG, self.olt, idx, 0, 2**33, "sweep")]
+
+    def test_a_backwards_counter_is_not_stored_as_the_baseline(self):
+        self._watch(self.LIFETIME)
+        self.pm.sync_device(self.olt, [_pbw(3, 1_000, 1_000)], TS_SEQ[1])
+        r = self._row(3)
+        self.assertEqual(r["in_octets"], str(self.LIFETIME))
+        self.assertEqual(r["out_octets"], str(self.LIFETIME))
+        self.assertEqual(r["counters_at"], TS_SEQ[0])
+
+    def test_the_next_good_read_measures_the_interval_not_the_lifetime(self):
+        self._watch(self.LIFETIME)
+        self.pm.sync_device(self.olt, [_pbw(3, 1_000, 1_000)], TS_SEQ[1])
+        # 20 Mb/s over the 20s the two GOOD reads really span, not 500 Gb/s of
+        # lifetime counter divided by one 10s sweep.
+        good = self.LIFETIME + 40 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, good, good)], TS_SEQ[2])
+        r = self._row(3)
+        self.assertAlmostEqual(r["in_bps"], 20_000_000.0, delta=1.0)
+        self.assertAlmostEqual(r["out_bps"], 20_000_000.0, delta=1.0)
+        self.assertEqual(r["counters_at"], TS_SEQ[2])
+
+    def test_the_historian_records_no_rate_for_the_glitch_sweep(self):
+        # This is the tier the busy-hour panel averages, so a spike reaching it
+        # is what the ISP saw.
+        self._watch(self.LIFETIME)
+        self.pm.sync_device(self.olt, [_pbw(3, 1_000, 1_000)], TS_SEQ[1])
+        good = self.LIFETIME + 40 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, good, good)], TS_SEQ[2])
+        glitch, good_read = self._rates()
+        self.assertIsNone(glitch)
+        self.assertAlmostEqual(good_read, 20_000_000.0, delta=1.0)
+
+    def test_one_direction_reading_backwards_condemns_the_pair(self):
+        # counters_at is ONE stamp for both, so taking the direction that still
+        # looks sane would make the next delta divide by the wrong dt.
+        self._watch(self.LIFETIME)
+        self.pm.sync_device(self.olt, [_pbw(
+            3, 1_000, self.LIFETIME + 10 * _OCT_PER_MBPS_10S)], TS_SEQ[1])
+        r = self._row(3)
+        self.assertEqual(r["in_octets"], str(self.LIFETIME))
+        self.assertEqual(r["out_octets"], str(self.LIFETIME))
+        self.assertEqual(r["counters_at"], TS_SEQ[0])
+
+    def test_a_suspiciously_high_reading_is_still_adopted_as_the_baseline(self):
+        # The guard is one-sided ON PURPOSE: today's unconditional overwrite of a
+        # high reading is what let TMG-OLT self-heal in two sweeps.
+        self._watch(10 * _OCT_PER_MBPS_10S)
+        bogus = 9_000_000 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, bogus, bogus)], TS_SEQ[1])
+        r = self._row(3)
+        self.assertEqual(r["in_octets"], str(bogus))
+        self.assertEqual(r["counters_at"], TS_SEQ[1])
+
+    def test_a_stale_baseline_adopts_the_lower_counter_and_skips_the_gap(self):
+        # The escape hatch for a genuine reboot — and the bound on the hold after
+        # a bogus HIGH reading, where every honest read after it looks backwards.
+        self._watch(self.LIFETIME)
+        rebooted_at = "2026-01-01T00:16:00+00:00"  # 960s on from the baseline
+        self.pm.sync_device(self.olt, [_pbw(3, 5_000, 5_000)], rebooted_at)
+        r = self._row(3)
+        self.assertEqual(r["in_octets"], "5000")
+        self.assertEqual(r["counters_at"], rebooted_at)
+        self.assertIsNone(r["in_bps"])  # nothing is published for the gap
+        self.assertIsNone(r["out_bps"])
+        self.assertEqual(self._rates(), [None])
+        after = 5_000 + 10 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, after, after)],
+                            "2026-01-01T00:16:10+00:00")
+        self.assertAlmostEqual(self._row(3)["in_bps"], 10_000_000.0, delta=1.0)
+
+    def test_a_held_rate_still_expires_across_a_run_of_backwards_reads(self):
+        # A glitch sweep holds the last rate, exactly as a counter-less one does
+        # — but a rate is a claim about NOW, so it may not outlive its stamp.
+        self._watch(self.LIFETIME)
+        rated = self.LIFETIME + 25 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, rated, rated)], TS_SEQ[1])
+        self.assertAlmostEqual(self._row(3)["in_bps"], 25_000_000.0, delta=1.0)
+        self.pm.sync_device(self.olt, [_pbw(3, 7, 7)], "2026-01-01T00:14:00+00:00")
+        self.assertAlmostEqual(self._row(3)["in_bps"], 25_000_000.0, delta=1.0)
+        self.pm.sync_device(self.olt, [_pbw(3, 7, 7)], "2026-01-01T00:15:20+00:00")
+        r = self._row(3)
+        self.assertIsNone(r["in_bps"])
+        self.assertIsNone(r["out_bps"])
+
+    def test_bandwidth_alarm_state_holds_across_a_backwards_sweep(self):
+        # A sweep with no rate is no evidence either way, but eligibility rides
+        # oper status, which IS current.
+        self._watch(self.LIFETIME, threshold=10)
+        low = self.LIFETIME + 5 * _OCT_PER_MBPS_10S
+        self.pm.sync_device(self.olt, [_pbw(3, low, low)], TS_SEQ[1])
+        self.assertEqual(self._row(3)["bw_low_streak"], 1)
+        self.assertEqual(self.pm.sync_device(self.olt, [_pbw(3, 12, 12)],
+                                             TS_SEQ[2]), [])
+        r = self._row(3)
+        self.assertEqual((r["bw_low_streak"], r["bw_alarm"]), (1, 0))
+
+    def test_a_port_going_down_on_a_backwards_sweep_still_clears_bw_alarm(self):
+        self._watch(self.LIFETIME, threshold=10)
+        total = self.LIFETIME
+        for i in (1, 2):  # two consecutive 5 Mb/s sweeps arm the low alarm
+            total += 5 * _OCT_PER_MBPS_10S
+            self.pm.sync_device(self.olt, [_pbw(3, total, total)], TS_SEQ[i])
+        self.assertEqual(self._row(3)["bw_alarm"], 1)
+        self.pm.sync_device(self.olt, [_pbw(3, 9, 9, oper="down")], TS_SEQ[3])
+        r = self._row(3)
+        self.assertEqual((r["bw_alarm"], r["bw_low_streak"]), (0, 0))
 
 
 if __name__ == "__main__":

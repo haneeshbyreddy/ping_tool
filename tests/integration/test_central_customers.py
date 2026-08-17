@@ -84,6 +84,16 @@ class Base(unittest.TestCase):
             "status": status, "expiry": expiry, "package": "PLAN",
             "branch": "HALIYA"}], ts or _now())
 
+    def _book(self, *customers, ts=None):
+        # ONE read carrying several customers. `_customer` is one call per
+        # customer and each call is its own read, which leaves everything but
+        # the last one "gone from billing" — true of the fixture, never of a
+        # sync, which hands over the whole book at once.
+        self.store.upsert_radius_customers(ORG, self.account, [
+            {"username": u, "name": "A CUSTOMER", "mobile": "9999",
+             "status": "active", "expiry": "06/01/2027 09:24", "package": "PLAN",
+             **kw} for u, kw in customers], ts or _now())
+
     def _link(self, username, onu_key="1.4", match_by="mac"):
         self.store.replace_radius_links(ORG, [
             RadiusLink(self.olt, onu_key, username, match_by, self.account)],
@@ -187,9 +197,9 @@ class CustomersApiTest(Base):
         self.store.upsert_user_macs(ORG, self.olt, [
             {"onu_key": "1.4", "mac": "F0:A7:31:EA:7E:32", "vlan": "1900",
              "kind": "Dynamic", "port_label": "EPON0/1:4"}], _now())
-        self._customer("HC_NOMAC", mac=None)
-        self._customer("HC_UNSEEN", mac="AA:AA:AA:AA:AA:01")
-        self._customer("HC_SEEN", mac="F0:A7:31:EA:7E:32")
+        self._book(("HC_NOMAC", {"mac": None}),
+                   ("HC_UNSEEN", {"mac": "AA:AA:AA:AA:AA:01"}),
+                   ("HC_SEEN", {"mac": "F0:A7:31:EA:7E:32"}))
         _, body = self._get()
         by_user = {r["username"]: r for r in body["customers"]}
         self.assertEqual(by_user["HC_NOMAC"]["reason"], "no_mac")
@@ -227,6 +237,82 @@ class CustomersApiTest(Base):
         by_user = {r["username"]: r for r in body["customers"]}
         self.assertFalse(by_user["HC_OLD"]["in_last_read"])
         self.assertTrue(by_user["HC_NEW"]["in_last_read"])
+
+    def test_a_row_that_LEFT_THE_BOOK_blames_the_book_and_never_the_MAC(self):
+        # Its MAC is on the network and pins to exactly ONE slot, so every MAC
+        # reason is provably false — only a panel's LATEST read is fed to the
+        # linker, so the reason it cannot match is that it is not in one.
+        self._state("UP")
+        self._roster()
+        self.store.upsert_user_macs(ORG, self.olt, [
+            {"onu_key": "1.4", "mac": "F0:A7:31:EA:7E:32", "vlan": "1900",
+             "kind": "Dynamic", "port_label": "EPON0/1:4"}], _now())
+        self._customer("HC_LEFT", mac="F0:A7:31:EA:7E:32",
+                       ts="2026-08-01T00:00:00+00:00")
+        self._customer("HC_STAYS")
+        _, body = self._get()
+        row = {r["username"]: r for r in body["customers"]}["HC_LEFT"]
+        self.assertEqual(row["reason"], "gone")
+        self.assertIn("gone", body["reasons"])
+
+
+class TwoPanelsTest(Base):
+    """One org, two panels: a sibling's absence is not evidence of anything.
+
+    Hansa split ONE book across two Excell Media panels, so 482 of 1779 rows
+    were the old copy of a customer current in the other panel — every one
+    agreeing on name, MAC, mobile and account number. The row stays in storage
+    (the never-delete rule); the page folds it into the current one and says how
+    many it folded.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.other = self.store.set_radius_account(
+            ORG, profile="cbp", base_url="https://rso.example.in",
+            username="hansa2", password_enc="enc", label="rso", updated_by="t")
+
+    def _on(self, account, username, *, mac=None, status="active", ts=None):
+        self.store.upsert_radius_customers(ORG, account, [{
+            "username": username, "name": "A CUSTOMER", "mac": mac,
+            "mobile": "9999", "status": status, "expiry": "06/01/2027 09:24",
+            "package": "PLAN"}], ts or _now())
+
+    def test_the_old_copy_is_FOLDED_AWAY_and_COUNTED(self):
+        self._on(self.account, "HC_MOVED", ts="2026-08-01T00:00:00+00:00")
+        self._on(self.account, "HC_STAYED")
+        self._on(self.other, "HC_MOVED")
+        _, body = self._get()
+        rows = body["customers"]
+        self.assertEqual([r["username"] for r in rows],
+                         ["HC_MOVED", "HC_STAYED"])
+        moved = rows[0]
+        self.assertEqual(moved["account_id"], self.other)
+        self.assertTrue(moved["in_last_read"])
+        self.assertEqual(body["counts"]["superseded"], 1)
+        self.assertEqual(body["counts"]["customers"], len(rows))
+
+    def test_a_customer_current_in_BOTH_panels_stays_two_rows(self):
+        # Two books describing one person is not the same claim as one book
+        # dropping them: both are current, so both are shown (the panel label
+        # tells them apart) and nothing is folded.
+        self._on(self.account, "HC_BOTH")
+        self._on(self.other, "HC_BOTH")
+        _, body = self._get()
+        self.assertEqual(len(body["customers"]), 2)
+        self.assertEqual(body["counts"]["superseded"], 0)
+
+    def test_a_customer_gone_from_the_ONLY_panel_that_had_them_is_KEPT(self):
+        # The never-delete rule, unchanged: with no sibling copy the absence is
+        # real evidence and the row must survive, marked.
+        self._on(self.account, "HC_GONE", ts="2026-08-01T00:00:00+00:00")
+        self._on(self.account, "HC_HERE")
+        self._on(self.other, "HC_ELSEWHERE")
+        _, body = self._get()
+        by_user = {r["username"]: r for r in body["customers"]}
+        self.assertIn("HC_GONE", by_user)
+        self.assertFalse(by_user["HC_GONE"]["in_last_read"])
+        self.assertEqual(body["counts"]["superseded"], 0)
 
     def test_the_reply_carries_the_panel_statuses(self):
         self.store.set_radius_status(ORG, self.account, "ok", None,

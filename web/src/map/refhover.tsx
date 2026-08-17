@@ -1,4 +1,4 @@
-import { onuSev } from "@/lib/format"
+import { onuSev, onuSubName } from "@/lib/format"
 import type { OnuPlace } from "@/lib/types"
 import { fmtKm } from "@/map/geometry"
 import { HoverCard, cardRow, type CardTone, type HoverCardModel } from "@/map/hovercard"
@@ -73,6 +73,13 @@ function refModel(p: OnuPlace, c: RefHoverCtx): HoverCardModel {
         : "no per-ONU interface on this OLT", "wisp-mapcard__v--soft"))
     }
   }
+
+  // The card is the one subscriber surface with room for the second identity.
+  // The mark and its plate carry the username (the identifier everyone here
+  // recognises); the account holder's name is what you read out on the phone,
+  // and it fits in a labelled row without competing with the reading above it.
+  const who = onuSubName(p)
+  if (who) rows.push(cardRow("Customer", esc(who)))
 
   if (p.phone) rows.push(cardRow("Phone", esc(p.phone), "wisp-mapcard__v--num"))
 

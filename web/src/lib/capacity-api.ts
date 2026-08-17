@@ -180,6 +180,29 @@ export function busyArrow(row: {
   return "↓"
 }
 
+// HOW FULL IS FULL (operator's ask, 2026-08-17: "colour indication … red above
+// 90%"). ONE ladder, read by the Home ranking AND by the per-port drill, so the
+// same percentage can never be graded two ways on two screens — the pin-vs-card
+// rule. Deliberately coarse: a capacity figure earns a tone for crossing a
+// threshold, not for every point it moves.
+//
+// It grades the OPERATOR'S OWN CEILING (`bw_max_mbps`), never a modelled one —
+// a port with no ceiling recorded gets no bar and no tone, because "we don't
+// know what full is here" is a different sentence from "there is room". That
+// refusal is what keeps this honest while it borrows the status tones: the
+// arithmetic is only as much of a claim as the number the operator typed.
+export type UtilStage = "ok" | "watch" | "full"
+
+export const UTIL_WATCH_PCT = 70
+export const UTIL_FULL_PCT = 90
+
+export function utilStage(pct: number | null | undefined): UtilStage | null {
+  if (pct == null) return null
+  if (pct >= UTIL_FULL_PCT) return "full"
+  if (pct >= UTIL_WATCH_PCT) return "watch"
+  return "ok"
+}
+
 // The panels' rate vocabulary. Identical to map/linklabel.ts:fmtFull, which is
 // deliberately not imported: that module pulls leaflet in, and Home must not
 // carry the map bundle. Keep the two in step if either ever changes.

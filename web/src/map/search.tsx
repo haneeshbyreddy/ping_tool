@@ -78,12 +78,17 @@ export function MapSearch({ devices, org, bounds, onDevice, onOnu, onPlace }: {
     if (!onuOn) return []
     const byMac = new Map<string, OnuHit>()
     for (const p of placesQ.data?.places ?? []) {
+      // The needle reaches every string this row can be NAMED by — the
+      // username included, since that is now the headline for a billing-linked
+      // subscriber and typing what you can see must find it.
       if (!(onuSearchKey(p.mac).includes(onuKey)
             || onuSearchKey(p.label).includes(onuKey)
+            || onuSearchKey(p.radius_username).includes(onuKey)
+            || onuSearchKey(p.radius_name).includes(onuKey)
             || onuSearchKey(p.name).includes(onuKey))) continue
       byMac.set(p.mac, {
         mac: p.mac,
-        who: onuName({ label: p.label, name: p.name, serial: p.mac }),
+        who: onuName({ ...p, serial: p.mac }),
         where: `${p.device_name ?? "no live slot"}${p.pon_port ? ` · ${p.pon_port}` : ""}`,
         place: p,
       })

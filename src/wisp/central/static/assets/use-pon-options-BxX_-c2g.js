@@ -1,0 +1,1 @@
+import{Kn as e,gr as t,pt as n,vr as r}from"./types-CMoKW5NQ.js";import{d as i}from"./split-ratio-field-CNh6sWRo.js";var a=r(t(),1);function o(t,r=!0){let o=e({queryKey:[`optics`,t],queryFn:()=>n.optics(t),enabled:!!t&&r,staleTime:6e4});return{pons:(0,a.useMemo)(()=>i((o.data?.onus??[]).map(e=>e.pon_port)),[o.data]),loading:o.isLoading&&!!t&&r}}export{o as t};
