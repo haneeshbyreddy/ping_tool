@@ -64,6 +64,46 @@ class SnmpStatusStoreTest(unittest.TestCase):
         # "last worked" stays the last COMPLETE walk
         self.assertEqual(row["last_ok_at"], "2026-01-01T00:00:00+00:00")
 
+    def test_walk_seconds_land_and_an_absent_one_never_blanks_them(self):
+        # The edge times its own walks. Half the fleet runs an older agent for a
+        # while and reports no duration at all: that must not wipe a number a
+        # newer probe already filed, and it must never become 0.0 (which would
+        # read as an instant walk on a box that was simply never measured).
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "ports", {"state": "ok", "count": 28, "elapsed_s": 41.7}),
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertAlmostEqual(self._status()["ports"]["elapsed_s"], 41.7)
+
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "ports", {"state": "ok", "count": 28}),   # older edge
+        ], "2026-01-01T00:05:00+00:00")
+        self.assertAlmostEqual(self._status()["ports"]["elapsed_s"], 41.7)
+
+    def test_a_walk_that_timed_out_still_carries_its_duration(self):
+        # The walk whose duration matters most is the one that didn't finish.
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "optics", {"state": "timeout", "elapsed_s": 75.0,
+                                  "detail": "ONU walk exceeded 75s"}),
+        ], "2026-01-01T00:00:00+00:00")
+        row = self._status()["optics"]
+        self.assertEqual(row["state"], "timeout")
+        self.assertAlmostEqual(row["elapsed_s"], 75.0)
+
+    def test_a_never_measured_walk_reads_as_null_not_zero(self):
+        self.store.upsert_snmp_statuses("ispA", [
+            (self.dev, "health", {"state": "ok"}),
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertIsNone(self._status()["health"]["elapsed_s"])
+
+    def test_junk_walk_seconds_are_dropped_not_stored(self):
+        # NaN/inf would reach json.dumps and hand the SPA a body it can't parse;
+        # a negative second is not a measurement of anything.
+        for junk in ("banana", float("nan"), float("inf"), -1.0, None):
+            self.store.upsert_snmp_statuses("ispA", [
+                (self.dev, "health", {"state": "ok", "elapsed_s": junk}),
+            ], "2026-01-01T00:00:00+00:00")
+            self.assertIsNone(self._status()["health"]["elapsed_s"], junk)
+
     def test_unknown_subsystem_or_state_is_dropped(self):
         self.store.upsert_snmp_statuses("ispA", [
             (self.dev, "quantum", {"state": "ok"}),
@@ -227,6 +267,26 @@ class SnmpStatusHttpTest(unittest.TestCase):
         self.assertEqual(row["state"], "partial")
         self.assertIn("bandwidth counters", row["detail"])
         self.assertIsNone(row["last_ok_at"])
+
+    def test_walk_seconds_ride_the_report_through_to_the_api(self):
+        # The whole point of the number: it is measured on the edge, rides the
+        # snmp_status payload already on /report, and reaches the panel that has
+        # to answer "can this walk finish inside a faster clock?".
+        status, _ = self._report(snmp_status={str(self.dev): {
+            "ports": {"state": "ok", "count": 512, "elapsed_s": 47.31},
+            "optics": {"state": "timeout", "elapsed_s": 75.0,
+                       "detail": "ONU walk exceeded 75s"},
+            "health": {"state": "ok", "count": 3},   # older edge: no duration
+        }})
+        self.assertEqual(status, 200)
+
+        cookie = self._login("owner", "ownerpassword")
+        _, body, _ = self._req(
+            "GET", f"/api/inventory/snmp-status?device_id={self.dev}", cookie=cookie)
+        rows = {r["subsystem"]: r for r in body["status"]}
+        self.assertAlmostEqual(rows["ports"]["elapsed_s"], 47.31)
+        self.assertAlmostEqual(rows["optics"]["elapsed_s"], 75.0)
+        self.assertIsNone(rows["health"]["elapsed_s"])
 
     def test_status_for_a_device_outside_the_org_is_ignored(self):
         stranger = self.store.create_org_device("ispB", {

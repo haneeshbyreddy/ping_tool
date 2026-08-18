@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Check, Copy, Download, KeyRound, MoreVertical, Paintbrush, Plus, Power, RotateCw, Trash2 } from "lucide-react"
 import { useNow } from "@/hooks/use-now"
-import { billingApi, nodesApi, orgsApi, ApiError } from "@/lib/api"
+import { nodesApi, orgsApi, ApiError } from "@/lib/api"
 import {
   WINDOWS_SETUP_EXE, linuxInstallCmd, probeIdentity, releaseAsset, windowsSilentCmd,
 } from "@/lib/install"
@@ -12,7 +12,6 @@ import { ConfirmDialog, useConfirm } from "@/components/confirm-dialog"
 import { ColorSwatches } from "@/components/color-swatches"
 import { paletteVarOf, type PaletteColor } from "@/lib/palette"
 import { StatusDot } from "@/components/status-badge"
-import { UpgradeNotice } from "@/components/upgrade-notice"
 import { ago, fmtBytes, isStale } from "@/lib/format"
 import { isNewerVersion } from "@/lib/version"
 import { cn } from "@/lib/utils"
@@ -450,12 +449,6 @@ export function ProbesPanel({
     refetchInterval: 30_000,
   })
 
-  const billing = useQuery({
-    queryKey: ["billing", org],
-    queryFn: () => billingApi.get(org),
-    enabled: !!org && canWrite,
-  })
-
   const register = useMutation({
     mutationFn: () => nodesApi.register(org, newId.trim()),
     onSuccess: (r) => {
@@ -471,10 +464,9 @@ export function ProbesPanel({
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Could not save auto-update"),
   })
 
+  // No probe cap since billing v2: the meter charges for what an org connects,
+  // so registering another probe is a monitoring decision, never a paywall.
   const nodes = data?.nodes ?? []
-  const activeNodeCount = nodes.filter((n) => n.registered && !n.revoked_at).length
-  const nodeCap = billing.data?.node_cap ?? null
-  const atNodeCap = nodeCap != null && activeNodeCount >= nodeCap
 
   return (
     <section className="flex flex-col gap-2">
@@ -505,10 +497,7 @@ export function ProbesPanel({
           onDismiss={() => setReveal(null)} />
       )}
 
-      {addOpen && (atNodeCap ? (
-        <UpgradeNotice billing={billing.data!} resource="probe"
-          onClose={() => { setAddOpen(false); setError("") }} />
-      ) : (
+      {addOpen && (
         <div className="flex items-center gap-2 rounded-lg border bg-card p-2">
           <Input autoFocus placeholder="probe id, e.g. edge-a1" className="h-8 flex-1 font-mono text-xs"
             value={newId} onChange={(e) => setNewId(e.target.value)}
@@ -518,7 +507,7 @@ export function ProbesPanel({
             Generate
           </Button>
         </div>
-      ))}
+      )}
       {error && <p className="text-xs text-destructive">{error}</p>}
 
       {isLoading && <Skeleton className="h-10 w-full" />}

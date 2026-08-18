@@ -2,12 +2,10 @@ import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
-import { Plus, ArrowRight, Building2, Radio, Trash2 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { Plus, ArrowRight, Building2, Network, Radio, Trash2 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi, ApiError } from "@/lib/api"
 import type { Org } from "@/lib/types"
-import { planTone } from "@/lib/billing"
 import { BillingAdminDialog } from "@/components/billing-admin"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -154,8 +152,13 @@ export function OrganizationsPage() {
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-3 pl-12 sm:pl-0">
-                <Badge variant="outline" className={cn("font-medium capitalize", planTone(o.plan))}>
-                  {o.plan}
+                {/* The plan badge stood here until plans died with billing v1.
+                    Its replacement is a fact this list already carries. No
+                    amount is read on this page: what an org owes lives one
+                    click away in the billing drawer below, the same drawer the
+                    fleet console opens. */}
+                <Badge variant="outline" className="gap-1 font-normal text-muted-foreground">
+                  <Network className="size-3" /> {o.device_count} device{o.device_count === 1 ? "" : "s"}
                 </Badge>
                 <Badge variant="outline" className="gap-1 font-normal text-muted-foreground">
                   <Radio className="size-3" /> {o.node_count} node{o.node_count === 1 ? "" : "s"}

@@ -1751,6 +1751,24 @@ class DeviceStoreMixin:
         return {"ok": True}
 
 
+    def org_device_parents(self, org_id: str) -> list[dict]:
+        """Every (id, parent) pair, UNFILTERED by maintenance or is_active.
+
+        Deliberately NOT `org_device_topology`, which drops maintenance and
+        inactive rows: "is this box something else's parent" is a fact about
+        the topology, not about whether the children happen to be monitored
+        right now. An OLT with forty ONUs all in maintenance is still an OLT,
+        and reading it as a leaf hands the live-ping stream the FAST cadence
+        that its ICMP rate limiter answers with phantom loss — on the very box
+        a technician is standing next to. Wrong toward "infra" costs a slower
+        stream; wrong toward "leaf" invents an outage.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, parent_device_id FROM org_devices WHERE org_id=?",
+                (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
     def org_device_topology(self, org_id: str) -> list[dict]:
         placeholders = ",".join("?" for _ in _PASSIVE_TYPES)
         with self._connect() as conn:

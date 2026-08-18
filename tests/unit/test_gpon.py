@@ -343,7 +343,13 @@ class EngineReuseTest(unittest.TestCase):
     def test_one_engine_across_walks(self):
         from pysnmp.hlapi import asyncio as hlapi
         real_engine_cls = hlapi.SnmpEngine
-        poller = PysnmpGponPoller(HUAWEI, Config(snmp_timeout_s=0.05))
+        # Fail fast: this walk is aimed at a dead port on purpose, and the
+        # poller reads gpon_request_timeout_s (5 s x 3 retries, twice over)
+        # rather than snmp_timeout_s. Naming the field it actually uses took
+        # this test from 40 s to under one.
+        poller = PysnmpGponPoller(HUAWEI, Config(
+            snmp_timeout_s=0.05, gpon_request_timeout_s=0.05,
+            gpon_request_retries=0))
         target = SnmpTarget(ip="127.0.0.1", community="public", port=1)
 
         async def two_walks():
@@ -465,6 +471,36 @@ class GatherTest(unittest.TestCase):
         self.assertEqual(walked.walked, ["10.0.0.1"])
         self.assertEqual(status[2]["state"], "no_profile")
         self.assertEqual(status[2]["sysobjectid"], "1.3.6.1.4.1.9.1.1")
+
+    def test_every_optics_outcome_carries_the_walk_seconds(self):
+        # The GPON walk is the slowest of the three and the one a cadence
+        # decision hangs on, so its clock covers the whole subsystem: the
+        # sysObjectID read too, which is SNMP work every sweep pays for even
+        # when it ends at "no profile claims this OLT".
+        class Slow(_FakePoller):
+            async def walk(self, target):
+                await asyncio.sleep(0.05)
+                return await super().walk(target)
+
+        class _MixedPool:
+            async def resolve_info(self, device, target):
+                if device["id"] == 2:
+                    await asyncio.sleep(0.05)
+                    return None, {"vendor": None, "sysobjectid": "1.3.6.1.4.1.9.1.1",
+                                  "reason": "no_profile"}
+                return poller, {"vendor": "huawei", "sysobjectid": None,
+                                "reason": "override"}
+
+        poller = Slow({"10.0.0.1": [OnuOptic("K1", state="online")]})
+        devices = [
+            {"id": 1, "ip_address": "10.0.0.1", "device_type": "OLT", "snmp_enabled": 1},
+            {"id": 2, "ip_address": "10.0.0.2", "device_type": "OLT", "snmp_enabled": 1},
+        ]
+        _, status = self._run(_gather_onu_optics(_MixedPool(), devices, Config()))
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertGreaterEqual(status[1]["elapsed_s"], 0.05)
+        self.assertEqual(status[2]["state"], "no_profile")
+        self.assertGreaterEqual(status[2]["elapsed_s"], 0.05)
 
 
 def _central_spec(name="vsol", match="1.3.6.1.4.1.999", **over):
@@ -594,3 +630,48 @@ class CentralProfileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentAbsentStateTest(unittest.TestCase):
+    """A missing STATE VALUE is `unknown` on the IDENT path too.
+
+    CLAUDE.md: "An ABSENT state cell is `unknown`, never `state_default` — an
+    absent COLUMN is a firmware fact (gets the default); a missing VALUE in a
+    column that exists is a row fact." That guard existed only on the metric
+    path. The ident path decoded `cells.get("state", "")`, and `_dbc_state`
+    answers ONLINE to anything it does not recognise — so on the profile that
+    actually uses the ident path (dbc, the C-Data EPON fleet) a dropped state
+    column read as "every ONU is up" and ponfault never saw the dark cohort.
+    Alarm-MUTING, and the metric path's own guard was added after the opposite
+    failure. Same trap as the ONU-identity rule, which is why it says "on BOTH
+    parse paths".
+    """
+
+    def _rows(self, with_state):
+        vbs = [
+            (f"{DBC.oid_ident_key}.29", "00:d3:9e:14:35:84"),
+            (f"{DBC.oid_ident_pon}.29", "2"),
+            (f"{DBC.oid_ident_onu}.29", "1"),
+        ]
+        if with_state:
+            vbs.append((f"{DBC.oid_ident_state}.29", "0"))
+        return {o.onu_key: o for o in parse_onu_table(vbs, DBC)}
+
+    def test_a_row_missing_its_state_is_unknown_not_online(self):
+        onu = self._rows(with_state=False)["2.1"]
+        self.assertEqual(onu.state, "unknown")
+        self.assertNotEqual(onu.state, "online")
+
+    def test_a_row_that_reports_offline_still_reads_offline(self):
+        self.assertEqual(self._rows(with_state=True)["2.1"].state, "offline")
+
+    def test_a_profile_with_no_state_column_still_takes_its_default(self):
+        # An absent COLUMN is a firmware fact, not a row fact, so the profile's
+        # own decoder decides. Only the missing VALUE becomes `unknown`.
+        stateless = dataclasses.replace(DBC, oid_ident_state="")
+        onus = {o.onu_key: o for o in parse_onu_table([
+            (f"{DBC.oid_ident_key}.29", "00:d3:9e:14:35:84"),
+            (f"{DBC.oid_ident_pon}.29", "2"),
+            (f"{DBC.oid_ident_onu}.29", "1"),
+        ], stateless)}
+        self.assertEqual(onus["2.1"].state, "online")

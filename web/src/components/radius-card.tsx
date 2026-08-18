@@ -106,6 +106,11 @@ function PanelRow({ org, account, profiles, onDone, onCancel }: {
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Couldn't start a read"),
   })
 
+  // A Select with no item for its value renders BLANK, and this panel's brand
+  // would then read as "not chosen" whenever its recipe row was renamed,
+  // disabled or moved. Keep the stored brand in the list, named for what it is.
+  const brands = [...new Set([...profiles, ...(d.profile ? [d.profile] : [])])]
+
   // A stored panel needs no password re-typed; a new one does.
   const ready = !!d.profile && !!d.base_url.trim() && !!d.username.trim()
     && (!!d.password || !!account?.password_set)
@@ -121,9 +126,10 @@ function PanelRow({ org, account, profiles, onDone, onCancel }: {
               <SelectValue placeholder="Choose your billing system" />
             </SelectTrigger>
             <SelectContent>
-              {profiles.map((p: string) => (
+              {brands.map((p: string) => (
                 <SelectItem key={p} value={p} className="text-xs">
                   {brandName(p)}
+                  {!profiles.includes(p) && " · no recipe on this server"}
                 </SelectItem>
               ))}
             </SelectContent>

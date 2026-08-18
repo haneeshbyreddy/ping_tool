@@ -78,6 +78,34 @@ def superadmin_or_403(h) -> dict | None:
     return user
 
 
+def superadmin_write_or_403(h, user) -> bool:
+    """The PLATFORM-ADMIN gate, for a POST handler whose user is already resolved.
+
+    Raw SNMP walking and recipe AUTHORING are platform work, not customer work:
+    a walk is an arbitrary read off live gear, and a profile is a decoding
+    recipe the whole fleet's readings ride on (a wrong one prints a fabricated
+    dBm). Every recipe table's create/update/delete answers to this gate —
+    snmp_profiles, gpon_profiles, web_optics_profiles — and so does the walk
+    queue.
+
+    This gate is the ONLY thing in front of those routes: the walk dialog and
+    the profile wizard were deleted from the SPA for every role, so there is no
+    button left to hide and no second layer to fall back on. Onboarding a
+    vendor is a CLI/ops job (`admin.py snmp-walk`).
+
+    READING a recipe list is NOT gated here and must not become so: an ISP
+    still picks which vendor applies to its own box, and a 403 on a list route
+    renders that dropdown blank and unstamps the device on the next save.
+
+    Identity before role, the superadmin rule: `is_superadmin` is
+    `org_id IS NULL` and a superadmin's own role column is meaningless.
+    """
+    if user["is_superadmin"]:
+        return True
+    h._reply(403, {"error": "forbidden"})
+    return False
+
+
 def org_or_400(h, user, qs) -> str | None:
     org = h._scope_org(user, qs)
     if not org:

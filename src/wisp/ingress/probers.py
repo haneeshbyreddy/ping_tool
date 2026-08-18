@@ -8,11 +8,21 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Protocol, runtime_checkable
+from typing import AsyncIterator, Callable, Protocol, runtime_checkable
 
 from wisp.config import CONFIG, Config
 
 _PRIVILEGED_ICMP = sys.platform.startswith("win")
+
+# What one `ping_stream` tick yields: the SESSION-LOCAL sequence number (1, 2,
+# 3, …) and the round trip in ms, or None for a packet that never came back.
+#
+# The seq is deliberately OURS and not the wire's. The wire seq is 16 bits and
+# shared across the whole prober, so it wraps and it is not contiguous for one
+# target — and a viewer counting gaps off a wrapped wire seq would draw a gap
+# that never happened. Both probers below emit the same 1..N counter, so the
+# two implementations are interchangeable to the reader of the stream.
+LiveSample = tuple[int, float | None]
 
 @dataclass(frozen=True)
 class PingResult:
@@ -72,6 +82,36 @@ class IcmpProber:
         latency = host.avg_rtt if host.packets_received else None
         jitter = getattr(host, "jitter", None) if host.packets_received else None
         return PingResult(ip, latency, loss, jitter)
+
+    async def ping_stream(self, ip: str, *, count: int,
+                          interval: float) -> AsyncIterator[LiveSample]:
+        """Yield one echo at a time, for the live-ping panel.
+
+        icmplib has no per-reply callback: `async_ping` hands back an aggregate
+        Host only once every packet is done. So this is NOT a re-implementation
+        of its loop — it is `count=1` per tick, which is an honest single echo:
+        with one packet sent, `avg_rtt` IS that packet's round trip and
+        `packets_received` IS whether it came back. Nothing is averaged and no
+        number is invented.
+
+        What it costs is a socket per tick instead of one for the run. At the
+        live-ping cadence (a packet a second, five minutes at the very most)
+        that is 300 sockets over a session, opened and closed one at a time —
+        irrelevant next to the probe cycle this box already runs, and worth
+        paying to keep the Linux default working. Trying to be cleverer would
+        mean a second raw-socket implementation on the platform whose whole
+        point is that it does NOT need raw sockets (`ping_group_range`).
+
+        The interval is a CEILING on the rate, not a metronome: the time the
+        echo itself took is subtracted, so a slow or lost packet delays the
+        next one rather than bunching two together.
+        """
+        for seq in range(1, max(0, count) + 1):
+            started = time.monotonic()
+            res = await self.ping(ip, count=1)
+            yield seq, (res.latency_ms if res.packet_loss < 100.0 else None)
+            if seq < count:
+                await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 _ICMP_ECHO_REQUEST = 8
 _ICMP_ECHO_REPLY = 0
@@ -201,6 +241,31 @@ class SingleSocketIcmpProber:
                 if self._seq not in self._pending:
                     return self._seq
 
+    async def _one_echo(self, ip: str,
+                        loop: asyncio.AbstractEventLoop) -> float | None:
+        """Send ONE echo and wait for its reply. None = it never came back.
+
+        The whole Windows invariant lives in here: one shared raw socket, one
+        receiver thread stamping `perf_counter`, matched by id+seq+source. Both
+        `ping` and `ping_stream` call this, so the live panel and the probe
+        cycle measure a packet exactly the same way — a live reading that
+        disagreed with the sweep's would be worse than no live reading.
+        """
+        seq = self._next_seq()
+        pend = _PendingEcho(ip, loop, loop.create_future())
+        packet = build_echo_request(self._ident, seq)
+        with self._lock:
+            self._pending[seq] = pend
+        try:
+            pend.sent_at = time.perf_counter()
+            self._sock.sendto(packet, (ip, 0))
+            return await asyncio.wait_for(pend.future, self._timeout)
+        except (asyncio.TimeoutError, OSError):
+            return None
+        finally:
+            with self._lock:
+                self._pending.pop(seq, None)
+
     async def ping(self, ip: str, count: int) -> PingResult:
         if ":" in ip:
             if self._v6_fallback is None:
@@ -212,20 +277,9 @@ class SingleSocketIcmpProber:
         loop = asyncio.get_running_loop()
         rtts: list[float] = []
         for i in range(count):
-            seq = self._next_seq()
-            pend = _PendingEcho(ip, loop, loop.create_future())
-            packet = build_echo_request(self._ident, seq)
-            with self._lock:
-                self._pending[seq] = pend
-            try:
-                pend.sent_at = time.perf_counter()
-                self._sock.sendto(packet, (ip, 0))
-                rtts.append(await asyncio.wait_for(pend.future, self._timeout))
-            except (asyncio.TimeoutError, OSError):
-                pass
-            finally:
-                with self._lock:
-                    self._pending.pop(seq, None)
+            rtt = await self._one_echo(ip, loop)
+            if rtt is not None:
+                rtts.append(rtt)
             if i + 1 < count:
                 await asyncio.sleep(self._interval)
         if not rtts:
@@ -235,6 +289,39 @@ class SingleSocketIcmpProber:
         jitter = (sum(abs(b - a) for a, b in zip(rtts, rtts[1:])) / (len(rtts) - 1)
                   if len(rtts) > 1 else 0.0)
         return PingResult(ip, latency, loss, jitter)
+
+    async def ping_stream(self, ip: str, *, count: int,
+                          interval: float) -> AsyncIterator[LiveSample]:
+        """Yield each echo as it lands, for the live-ping panel.
+
+        `ping` collapses its echoes into an average and a loss percentage,
+        which is the right shape for the FSM and the wrong shape for a person
+        watching a device come back: "80 ms, 20% loss" cannot say WHICH packet
+        was lost, and three in a row lost is a different fact from three
+        scattered. This yields the individual measurements `ping` already
+        makes and then throws away.
+
+        It shares `_one_echo` with `ping` and touches nothing else, so the
+        probe cycle's behaviour and return type are untouched by its
+        existence. The interval is a rate CEILING (see `IcmpProber`).
+        """
+        if ":" in ip:
+            if self._v6_fallback is None:
+                self._v6_fallback = IcmpProber(interval=self._interval,
+                                               timeout=self._timeout)
+            async for sample in self._v6_fallback.ping_stream(
+                    ip, count=count, interval=interval):
+                yield sample
+            return
+        self._ensure_started()
+        assert self._sock is not None
+        loop = asyncio.get_running_loop()
+        for seq in range(1, max(0, count) + 1):
+            started = time.monotonic()
+            rtt = await self._one_echo(ip, loop)
+            yield seq, rtt
+            if seq < count:
+                await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 def build_prober(cfg: Config = CONFIG) -> Prober:
     if cfg.prober == "icmplib":

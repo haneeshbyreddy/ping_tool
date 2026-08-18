@@ -145,6 +145,58 @@ class ReliabilityOrgTest(_HttpBase):
         self.assertEqual(wk["tta_p50_s"], 5 * 60)
         self.assertEqual(wk["week"] % 86400, 0)
 
+    def test_downtime_splits_at_the_thirty_minute_line(self):
+        # The Home panel's whole point: a week's outage COUNT and its downtime
+        # answer different questions. 10 min is a flap, 30 and 120 are jobs —
+        # and 30 lands ON the boundary, which counts as long.
+        base = self.now - timedelta(days=10)
+        for i, minutes in enumerate((10, 30, 120)):
+            start = base + timedelta(hours=i * 6)
+            self._outage(self.dev, start, start + timedelta(minutes=minutes))
+        st, body = self._req("/api/history/reliability?days=60", self._login())
+        self.assertEqual(st, 200)
+        wk = next(w for w in body["weeks"] if w["outages"] == 3)
+        self.assertEqual(wk["long_outages"], 2)
+        self.assertEqual(wk["down_long_s"], (30 + 120) * 60)
+        self.assertEqual(wk["down_short_s"], 10 * 60)
+
+    def test_an_unreachable_span_never_reaches_the_downtime_bands(self):
+        # Same rule device_reliability keeps: an UNREACHABLE span is a
+        # parent's outage restated on its victims, so it is not our downtime.
+        start = self.now - timedelta(days=5)
+        self._outage(self.dev, start, start + timedelta(hours=3),
+                     state="UNREACHABLE")
+        st, body = self._req("/api/history/reliability?days=60", self._login())
+        self.assertEqual(st, 200)
+        self.assertEqual(sum(w["down_long_s"] + w["down_short_s"]
+                             for w in body["weeks"]), 0)
+
+    def test_downtime_spreads_across_every_week_the_outage_covered(self):
+        # A 105 h fault dumped whole into the week it OPENED misreports every
+        # week it actually ran through (byreddy's week 26, the case that drove
+        # this). The count still belongs to the opening week; the hours do not.
+        start = (self.now - timedelta(days=12)).replace(
+            hour=12, minute=0, second=0, microsecond=0)
+        # Walk to the Monday after `start`, then stop 6 h past it: the outage
+        # straddles exactly one week boundary whatever weekday `now` is.
+        nxt_monday = start + timedelta(days=7 - start.weekday())
+        nxt_monday = nxt_monday.replace(hour=0)
+        self._outage(self.dev, start, nxt_monday + timedelta(hours=6))
+        st, body = self._req("/api/history/reliability?days=60", self._login())
+        self.assertEqual(st, 200)
+        weeks = {w["week"]: w for w in body["weeks"]}
+        self.assertEqual(len(weeks), 2)
+        opened = [w for w in weeks.values() if w["outages"] == 1]
+        self.assertEqual(len(opened), 1, "the COUNT stays in the opening week")
+        # Every second is banked, and the second week gets exactly its 6 h.
+        later = max(weeks)
+        self.assertEqual(weeks[later]["outages"], 0)
+        self.assertEqual(weeks[later]["down_long_s"], 6 * 3600)
+        self.assertEqual(sum(w["down_long_s"] for w in weeks.values()),
+                         int((nxt_monday + timedelta(hours=6) - start)
+                             .total_seconds()))
+        self.assertEqual(sum(w["down_short_s"] for w in weeks.values()), 0)
+
     def test_the_org_view_is_owner_only(self):
         st, _ = self._req("/api/history/reliability?days=30",
                           self._login("field", "fieldpassword"))

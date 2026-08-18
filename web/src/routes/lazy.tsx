@@ -58,3 +58,8 @@ export const SurveyPage = route(() => import("@/routes/survey-page"), "SurveyPag
 // → map/drops → map/pins → leaflet, so leaving it eager preloads the whole map
 // graph (412 kB) on a first paint that never draws a map.
 export const CustomersPage = route(() => import("@/routes/customers-page"), "CustomersPage")
+// Owner-only and visited about once a month, so its ledger tables and charts
+// have no business in the first paint. It ships a DEFAULT export, hence the
+// "default" name — the only route here that does, and the one thing tsc cannot
+// check through route()'s Record<string, unknown>.
+export const BillingPage = route(() => import("@/routes/billing-page"), "default")

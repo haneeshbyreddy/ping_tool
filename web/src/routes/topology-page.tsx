@@ -2,13 +2,13 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "
 import { Link, useLocation } from "react-router-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { ArrowUpFromLine, Cctv, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, MoreVertical, Palette, Pencil, Plus, Radio, ScanSearch, Scissors, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
+import { ArrowUpFromLine, Cctv, ChevronRight, CornerDownRight, CornerLeftUp, Gauge, MoreVertical, Palette, Pencil, Plus, Radio, Scissors, Search, Tags, Trash2, Waypoints, Wrench, X } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
 import { useDebounced } from "@/hooks/use-debounced"
 import { useNow } from "@/hooks/use-now"
 import { usePonOptions } from "@/hooks/use-pon-options"
 import { PanelResizeGrip, useResizablePanel } from "@/hooks/use-resizable-panel"
-import { billingApi, gponApi, inventoryApi, nodesApi, nvrApi, ApiError } from "@/lib/api"
+import { gponApi, inventoryApi, nodesApi, nvrApi, ApiError } from "@/lib/api"
 import { DEVICE_TYPES, isPassiveType, type OnuSearchMatch, type OrgDevice } from "@/lib/types"
 import { SplitRatioField } from "@/components/split-ratio-field"
 import { oltHead, ponOptions } from "@/map/plant"
@@ -25,8 +25,6 @@ import { runSnmpTest } from "@/components/snmp-test"
 import { TagsInput } from "@/components/tags-input"
 import { ViewToggle, loadView, saveView, type ViewMode } from "@/components/view-toggle"
 import { ProbesPanel } from "@/components/probes-panel"
-import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
-import { UpgradeNotice } from "@/components/upgrade-notice"
 import { WebUiLiveIcon } from "@/components/web-proxy"
 import { StatusDot } from "@/components/status-badge"
 import { OnuHealth } from "@/components/onu-bar"
@@ -446,7 +444,7 @@ function DeviceForm({
               id: editing.id, name: form.name.trim() || editing.name,
               ip_address: form.ip_address.trim() || editing.ip_address,
               snmp_port: Number(form.snmp_port) || 161,
-            }, queryClient)
+            })
           }
         }
       } else {
@@ -668,10 +666,26 @@ interface DrillIn {
   openTab: (t: DeviceTab) => void
 }
 
+// A jump lands the START of the cluster at the top of the reading area, never
+// the row's middle (operator, 2026-08-18: clicking a type "makes it in view but
+// not put its start to the top"). Two halves, both needed:
+//   - `block: "start"`, not "center" — a centred row keeps half a screen of the
+//     PREVIOUS type above it, which reads as landing mid-cluster.
+//   - the labelled type header IS the start of the cluster, so a row sitting
+//     directly under one hands the scroll to the header. Anchoring on the DOM
+//     sibling keeps both render paths (list rows, grid cards) on one rule and
+//     needs no second id scheme.
+// The app header is sticky OVER the document scroll, so every anchor carries
+// `.wisp-jump-mt`: scroll-margin is the only offset that survives a smooth
+// scroll (a corrective scrollBy afterwards fights the animation still running).
 function useFocusScroll(focus?: boolean) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    if (focus) ref.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+    if (!focus || !ref.current) return
+    const prev = ref.current.previousElementSibling
+    const anchor = prev instanceof HTMLElement && prev.dataset.typehead != null
+      ? prev : ref.current
+    anchor.scrollIntoView({ behavior: "smooth", block: "start" })
   }, [focus])
   return ref
 }
@@ -949,7 +963,6 @@ function DeviceActions({ device, canWrite, onEdit, parentName }: {
   parentName?: string
 }) {
   const queryClient = useQueryClient()
-  const [walkOpen, setWalkOpen] = useState(false)
   const confirmDelete = useConfirm()
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["inventory"] })
   const remove = useMutation({
@@ -990,11 +1003,6 @@ function DeviceActions({ device, canWrite, onEdit, parentName }: {
             <DropdownMenuItem onClick={() => onEdit(device)}>
               <Pencil /> Edit
             </DropdownMenuItem>
-            {device.snmp_enabled === 1 && (
-              <DropdownMenuItem onClick={() => setWalkOpen(true)}>
-                <ScanSearch /> SNMP walk
-              </DropdownMenuItem>
-            )}
             {!isPassiveType(device.device_type) && (
               <DropdownMenuItem onClick={() => toggleMaintenance.mutate()}>
                 <Wrench /> {device.maintenance ? "End maintenance" : "Start maintenance"}
@@ -1026,9 +1034,6 @@ function DeviceActions({ device, canWrite, onEdit, parentName }: {
         title={`Delete ${device.name}?`}
         description="The device, its state, and its outage history are removed. This cannot be undone."
         onConfirm={() => remove.mutate()} />
-      {walkOpen && (
-        <SnmpWalkDialog device={device} open={walkOpen} onOpenChange={setWalkOpen} />
-      )}
     </>
   )
 }
@@ -1058,7 +1063,7 @@ function DeviceRow({
 
   return (
     <div ref={ref} data-devtype={device.device_type || "untyped"}
-      className={cn(detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
+      className={cn("wisp-jump-mt", detailOpen ? "wisp-drillin" : "border-b last:border-b-0")}>
       <div
         className={cn("group flex h-11 cursor-pointer items-center gap-2.5 px-4 hover:bg-foreground/5",
           RAIL)}
@@ -1142,7 +1147,7 @@ function DeviceCard({ device, canWrite, onEdit, focus, parentName, drill, colors
     <div
       ref={ref}
       data-devtype={device.device_type || "untyped"}
-      className={cn("group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
+      className={cn("wisp-jump-mt group flex cursor-pointer flex-col gap-2 rounded-lg border bg-card p-3 transition-colors hover:bg-foreground/5",
         RAIL, detailOpen && "border-border-strong bg-popover")}
       style={railStyle(deviceColor(device, colors))}
       onClick={onToggle}
@@ -1311,11 +1316,6 @@ export function TopologyPage() {
     enabled: !!scopeOrg,
     staleTime: 60_000,
   })
-  const billing = useQuery({
-    queryKey: ["billing", scopeOrg],
-    queryFn: () => billingApi.get(scopeOrg),
-    enabled: !!scopeOrg && canWrite,
-  })
   const onuNeedle = useDebounced(search.trim(), 300)
   const onuSearchOn = onuSearchKey(search).length >= ONU_SEARCH_MIN
   const onuFetchOn = onuSearchKey(onuNeedle).length >= ONU_SEARCH_MIN
@@ -1385,10 +1385,9 @@ export function TopologyPage() {
     tags: data?.tag_colors ?? {},
     nodes: nodes.data?.node_colors ?? {},
   }), [data?.tag_colors, nodes.data?.node_colors])
-  const monitoredCount = useMemo(
-    () => allDevices.filter((d) => !isPassiveType(d.device_type)).length, [allDevices])
-  const deviceCap = billing.data?.device_cap ?? null
-  const atCap = deviceCap != null && monitoredCount >= deviceCap
+  // No device cap since billing v2: devices are metered, not rationed, so
+  // adding one is never refused here, and nothing counts monitored gear
+  // against a limit. What they cost is on /billing.
   const gridView = view === "grid"
   const effectiveCollapsed = useMemo(
     () => (gridView || searching ? new Set<number>() : collapsed),
@@ -1427,13 +1426,17 @@ export function TopologyPage() {
       if (!g.plant && d.assigned_node_id && !isStale(d.state_updated_at)
         && (d.state === "DOWN" || d.state === "UNREACHABLE")) g.down++
     }
-    for (const r of [...treeOrdered.gear, ...treeOrdered.plant]) {
+    // Off the RENDERED lists, never the tree order: grid view re-sorts by type,
+    // so the first OLT in tree order (one nested under a switch) can sit in the
+    // MIDDLE of the grid's OLT cluster — jumping there looks exactly like the
+    // centring bug it isn't.
+    for (const r of [...orderedGear, ...orderedPlant]) {
       const g = m.get(r.device_type || "untyped")
       if (g && g.firstId == null) g.firstId = r.id
     }
     return [...m.values()].sort((a, b) =>
       (TYPE_RANK[a.type] ?? 99) - (TYPE_RANK[b.type] ?? 99) || a.type.localeCompare(b.type))
-  }, [devices, treeOrdered])
+  }, [devices, orderedGear, orderedPlant])
   // Rail rows earn their place only when there is something to jump between.
   const showRail = typeGroups.length >= 2 && devices.length >= 8
   const jumpToType = (g: TypeGroup) => {
@@ -1477,7 +1480,8 @@ export function TopologyPage() {
   const typeCount = (t: string) =>
     devices.filter((d) => (d.device_type || "untyped") === t).length
   const typeHeader = (t: string, key: string) => (
-    <div key={key} className="flex h-7 items-center gap-2 border-b bg-muted/40 px-4">
+    <div key={key} data-typehead={t}
+      className="wisp-jump-mt flex h-7 items-center gap-2 border-b bg-muted/40 px-4">
       <span className="wisp-eyebrow">{t}</span>
       <span className="text-2xs tabular-nums text-faint-foreground">{typeCount(t)}</span>
     </div>
@@ -1515,7 +1519,8 @@ export function TopologyPage() {
       const t = d.device_type || "untyped"
       if (t !== prevType) {
         cells.push(
-          <div key={`th-${t}`} className="col-span-full flex items-center gap-2 pt-1 first:pt-0">
+          <div key={`th-${t}`} data-typehead={t}
+            className="wisp-jump-mt col-span-full flex items-center gap-2 pt-1 first:pt-0">
             <span className="wisp-eyebrow shrink-0">{t}</span>
             <span className="shrink-0 text-2xs tabular-nums text-faint-foreground">{typeCount(t)}</span>
             <span aria-hidden className="h-px flex-1 bg-border" />
@@ -1664,12 +1669,8 @@ export function TopologyPage() {
         </div>
 
         {formOpen && !editing && (
-          atCap
-            ? <UpgradeNotice billing={billing.data!} resource="device"
-                note="Splitters don't count toward the limit. Record them from the map."
-                onClose={closeForm} />
-            : <DeviceForm org={scopeOrg} editing={null} devices={allDevices} nodeIds={nodeIds}
-                onDone={closeForm} />
+          <DeviceForm org={scopeOrg} editing={null} devices={allDevices} nodeIds={nodeIds}
+            onDone={closeForm} />
         )}
 
         {isLoading && <Skeleton className="h-40 w-full" />}

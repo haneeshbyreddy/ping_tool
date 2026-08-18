@@ -1,14 +1,16 @@
 import type {
   AccountUser, AdminOverview, AssignmentRoster, BillingInfo, Cable, CabledPair, GponProfilesResponse, IncidentShape, IssueKind, IssuesResponse, LinkPort, LinkRoute, LogEvent, MeResponse, NodesResponse, Org, OrgDevice,
-  OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, Plan, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
+  BillingConsole, BillingConsoleOrg, PaymentSettings,
+  OnuCoverageResponse, OnuSearchResponse, OrgRegion, Outage, PerfSample, PerfState, OpticsResponse, ProxyAudit, ProxySession, ReliabilityRow, Role,
   DeviceReliability, OrgReliability, PagingReply, OnuTrendReply,
-  OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpWalk, SnmpWalkResult,
+  OnuPlace, PonFault, PonSummary, SnmpProfilesResponse, SnmpStatusResponse, SnmpSubsystem, SnmpTestResult,
   BranchFault, FibreTrace, PointFibre, SplitterLoad, Subscriber, SubscriberDrop,
   Summary, SwitchPort, SystemStats, TrayPort, TrendBucket, WebUiCredentials,
   CustomersReply, RadiusAccountPayload, RadiusSettings,
   NvrChannelsResponse,
   RxStatusResponse, WebOpticsProfileSpec, WebOpticsProfilesResponse, WhatsappSettings,
   FieldTokensResponse, FieldWorkersResponse, ShiftState,
+  LivePingStart, LivePingStatus,
 } from "./types"
 import type { ThemeOverrides } from "./theme-tokens"
 import type { MapDetail } from "@/map/detail"
@@ -74,16 +76,23 @@ export const adminApi = {
   overview: () => request<AdminOverview>("/api/admin/overview"),
   settings: () => request<{
     google_maps_key: string | null
-    billing_gpay_number: string
-    billing_qr_image: string | null
+    payments: PaymentSettings
     whatsapp: WhatsappSettings
     theme_overrides: ThemeOverrides
     map_detail: MapDetail
   }>("/api/admin/settings"),
   saveSettings: (body: {
     google_maps_key?: string | null
-    billing_gpay_number?: string | null
-    billing_qr_image?: string | null
+    // Secrets are write-only: an empty string LEAVES the stored value alone,
+    // clearing takes the explicit *_clear flag (the WhatsApp-token rule).
+    payments?: {
+      provider?: string
+      key_id?: string
+      key_secret?: string
+      key_secret_clear?: boolean
+      webhook_secret?: string
+      webhook_secret_clear?: boolean
+    }
     whatsapp?: {
       enabled?: boolean
       phone_id?: string
@@ -100,14 +109,38 @@ export const adminApi = {
     request<{ ok: true }>("/api/admin/settings", { method: "POST", body }),
 }
 
+// Billing v2: the metered postpaid ledger. Every amount is INTEGER PAISE.
 export const billingApi = {
   get: (org?: string | null) => request<BillingInfo>(`/api/billing${tq(org)}`),
-  adminSave: (body: { org_id: string; plan?: Plan; month?: string; paid?: boolean }) =>
-    request<{ ok: true } & BillingInfo>("/api/admin/billing", { method: "POST", body }),
-  markPaid: (org?: string | null) =>
-    request<{ ok: true; notified: boolean }>("/api/billing/paid", { method: "POST", body: { org_id: org } }),
-  setPlan: (body: { org_id?: string | null; plan: Plan }) =>
-    request<{ ok: true } & BillingInfo>("/api/billing/plan", { method: "POST", body }),
+  /** The invoice PDF is a plain link, not a fetch: the browser downloads it
+   *  with the session cookie and the server names the file. */
+  invoiceUrl: (month: string, org?: string | null) =>
+    `/api/billing/invoice?month=${encodeURIComponent(month)}${org ? `&org=${encodeURIComponent(org)}` : ""}`,
+  /** Create a gateway order. 503 while payments are dormant. */
+  pay: (body: { org_id?: string | null; paise: number }) =>
+    request<{
+      ok: true; provider: string; key_id: string
+      order_id: string; amount: number; currency: string
+    }>("/api/billing/pay", { method: "POST", body }),
+  /** Verify the browser return for INSTANT feedback. The webhook is what
+   *  actually posts the money, so a verified return means "processing". */
+  verifyReturn: (body: Record<string, unknown>) =>
+    request<{
+      ok: boolean; verified: boolean
+      outstanding_paise?: number; error?: string
+    }>("/api/billing/return", { method: "POST", body }),
+  console: (org?: string | null) =>
+    request<BillingConsole>(`/api/admin/billing${tq(org)}`),
+  adminSave: (body: {
+    org_id: string
+    conn_rate_paise?: number | null
+    floor_paise?: number | null
+    exempt?: boolean
+    deactivated?: boolean
+    payment?: { kind: "manual" | "adjustment"; paise: number; note?: string }
+    invoice?: { month: string; status: "open" | "void" }
+  }) =>
+    request<{ ok: true; org: BillingConsoleOrg }>("/api/admin/billing", { method: "POST", body }),
 }
 
 export const orgsApi = {
@@ -395,13 +428,15 @@ export const snmpApi = {
   setCapability: (body: {
     device_id: number; subsystem: SnmpSubsystem; supported: boolean; note?: string | null
   }) => request<{ ok: boolean }>("/api/inventory/capability", { method: "POST", body }),
-  walks: (deviceId: number) =>
-    request<{ walks: SnmpWalk[] }>(`/api/inventory/snmp-walks?device_id=${deviceId}`),
-  walkResult: (id: number) =>
-    request<{ walk: SnmpWalkResult | null }>(`/api/inventory/snmp-walk/result?id=${id}`),
-  startWalk: (device_id: number, root_oid: string, max_varbinds?: number) =>
-    request<{ id: number }>("/api/inventory/snmp-walk",
-      { method: "POST", body: { device_id, root_oid, max_varbinds } }),
+  // The owner's reachability test. It names no OID: the root and the varbind
+  // cap are pinned server-side, and the result route answers with a verdict
+  // (answered / sysDescr / error), never the walk's varbinds. The raw
+  // /snmp-walk pair stays superadmin-only and has no client here.
+  startTest: (device_id: number) =>
+    request<{ id: number }>("/api/inventory/snmp-test",
+      { method: "POST", body: { device_id } }),
+  testResult: (id: number) =>
+    request<{ test: SnmpTestResult | null }>(`/api/inventory/snmp-test/result?id=${id}`),
   profiles: (org?: string | null) => request<SnmpProfilesResponse>(`/api/snmp-profiles${tq(org)}`),
   createProfile: (body: {
     org_id?: string; name: string; match_sysobjectid: string
@@ -511,6 +546,20 @@ export const proxyApi = {
   },
   close: (sid: string) =>
     request<{ ok: true; was_open: boolean }>("/api/proxy/close", { method: "POST", body: { sid } }),
+}
+
+export const livePingApi = {
+  // One read answers both of the panel's questions: whether this device CAN
+  // be live pinged (probe version, probe freshness) and what has arrived
+  // since the cursor. Keeping them together is what stops the button
+  // rendering enabled against a probe that would never answer.
+  status: (deviceId: number, after = 0) =>
+    request<LivePingStatus>(`/api/liveping?device_id=${deviceId}&after=${after}`),
+  start: (device_id: number) =>
+    request<LivePingStart>("/api/liveping/start", { method: "POST", body: { device_id } }),
+  stop: (sid: string) =>
+    request<{ ok: true; was_live: boolean }>(
+      "/api/liveping/stop", { method: "POST", body: { sid } }),
 }
 
 export const analyticsApi = {

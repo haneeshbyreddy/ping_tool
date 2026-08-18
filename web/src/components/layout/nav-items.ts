@@ -1,6 +1,6 @@
 import {
-  LayoutDashboard, Network, Settings, Terminal, Building2, Gauge, Map, ServerCog,
-  TriangleAlert, MapPinPlus, BookUser, Siren,
+  LayoutDashboard, Network, Receipt, Settings, Terminal, Building2, Gauge, Map,
+  ServerCog, TriangleAlert, MapPinPlus, BookUser, Siren,
   type LucideIcon,
 } from "lucide-react"
 
@@ -23,8 +23,10 @@ export interface NavItem {
 
   superadminOnly?: boolean
 
-  // The full billing book with phone numbers is the largest PII surface in the
-  // product: workers keep the per-subscriber panel, never the enumeration.
+  // Hidden from workers. Two destinations carry it and for the same reason:
+  // the customer book with its phone numbers is the largest PII surface in the
+  // product (workers keep the per-subscriber panel, never the enumeration),
+  // and the bill is the org's own money. Both are 403 server-side too.
   ownerOnly?: boolean
 
   account?: boolean
@@ -40,6 +42,13 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/topology", label: "Network", icon: Network, mobile: true, group: "infrastructure" },
   { to: "/map", label: "Map", icon: Map, mobile: true, group: "infrastructure" },
   { to: "/settings", label: "Settings", icon: Settings, mobile: false, account: true },
+  // Account-scoped, so it rides the account menu rather than primary nav (same
+  // shape as Settings). mobile stays false: the tab bar is full and a bill is
+  // not a field destination, so the More menu carries it. ownerOnly for the
+  // same reason Customers is: the amounts, the invoices and the gateway
+  // receipts are the org's private business, and /api/billing is off the
+  // worker allowlist server-side, so a worker who reached it would only 403.
+  { to: "/billing", label: "Billing", icon: Receipt, mobile: false, account: true, ownerOnly: true },
   { to: "/issues", label: "Issues", icon: TriangleAlert, mobile: true, group: "monitor" },
   { to: "/customers", label: "Customers", icon: BookUser, mobile: false, group: "monitor", ownerOnly: true },
   { to: "/survey", label: "Survey", icon: MapPinPlus, mobile: true, group: "infrastructure" },

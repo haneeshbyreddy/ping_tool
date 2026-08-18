@@ -1,21 +1,28 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { IndianRupee, Map, MapPin, MessageCircle, Minus, Plus, RotateCcw, Trash2 } from "lucide-react"
+import {
+  Check, Copy, IndianRupee, Map, MapPin, MessageCircle, Minus, Plus, RotateCcw,
+} from "lucide-react"
+import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { adminApi, ApiError } from "@/lib/api"
+import type { PaymentSettings } from "@/lib/types"
 import {
   DETAIL_DEFAULTS, DETAIL_MAX, DETAIL_ROWS, detailFrom, detailMin,
   isDetailDefault, normalizeDetail, type MapDetail,
 } from "@/map/detail"
 import { AppearanceCard } from "@/components/appearance-card"
-import { QrImage } from "@/components/qr-image"
+import { BillingConsolePanel } from "@/components/billing-admin"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select"
 
 function GoogleMapsCard() {
   const queryClient = useQueryClient()
@@ -145,98 +152,211 @@ function MapDetailCard() {
   )
 }
 
-function PlatformBillingCard() {
+// The Select cannot carry "" as an item value (Radix reserves it for "no
+// selection"), so the explicit off option travels as this sentinel and becomes
+// "" on the wire. Off is a real, chosen state, not an empty form.
+const NO_PROVIDER = "__off__"
+
+/** What is configured and what is missing, composed from the SAVED settings
+ *  (never the typed form, which would claim a secret is stored the moment it
+ *  is keyed). Ranked by COST, not by order of setup: a half-configured
+ *  gateway that takes money it cannot record outranks one that simply refuses
+ *  to open, and both outrank the deliberate off state. */
+function gatewayStatus(p: PaymentSettings): { text: string; className: string } {
+  if (!p.provider) {
+    return {
+      className: "bg-muted text-muted-foreground",
+      text: "Payments off. Orgs see the amount and are told to contact you.",
+    }
+  }
+  if (!p.webhook_secret_set) {
+    return {
+      className: "bg-destructive/10 text-destructive",
+      text: "Checkout can take money that never reaches this ledger: no webhook secret stored.",
+    }
+  }
+  const missing: string[] = []
+  if (!p.key_id) missing.push("key id")
+  if (!p.key_secret_set) missing.push("key secret")
+  if (missing.length) {
+    return {
+      className: "bg-warning-soft text-warning",
+      text: `Nobody can pay: no ${missing.join(" and ")} stored.`,
+    }
+  }
+  return {
+    className: "bg-success-soft text-success",
+    text: `Live on ${p.provider}. Checkout and webhook are both configured.`,
+  }
+}
+
+function PaymentsCard() {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ["admin-settings"],
     queryFn: adminApi.settings,
   })
-  const [gpay, setGpay] = useState("")
-  const [qr, setQr] = useState("")   // data URI, or "" for none
-  const fileRef = useRef<HTMLInputElement>(null)
-  useEffect(() => {
-    if (data) {
-      setGpay(data.billing_gpay_number || "")
-      setQr(data.billing_qr_image || "")
-    }
-  }, [data])
+  const pay = data?.payments
+  const [provider, setProvider] = useState(NO_PROVIDER)
+  const [keyId, setKeyId] = useState("")
+  // Write-only, exactly like the WhatsApp token below: blank LEAVES the stored
+  // secret alone, so these never carry a value back from the server and reset
+  // to blank after every save.
+  const [keySecret, setKeySecret] = useState("")
+  const [webhookSecret, setWebhookSecret] = useState("")
+  const [copied, setCopied] = useState(false)
 
-  const pickFile = (file?: File | null) => {
-    if (!file) return
-    const isImage = file.type.startsWith("image/") || /\.svg$/i.test(file.name)
-    if (!isImage) { toast.error("Choose an image file (PNG, SVG or JPG)"); return }
-    if (file.size > 400_000) { toast.error("Image too large. Use a QR under 400 KB."); return }
-    const reader = new FileReader()
-    reader.onload = () => setQr(String(reader.result || ""))
-    reader.onerror = () => toast.error("Couldn't read that file")
-    reader.readAsDataURL(file)
+  useEffect(() => {
+    if (!pay) return
+    setProvider(pay.provider || NO_PROVIDER)
+    setKeyId(pay.key_id)
+    setKeySecret("")
+    setWebhookSecret("")
+  }, [pay])
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
+    // The pay button on every org's billing page reads this config.
+    queryClient.invalidateQueries({ queryKey: ["billing"] })
   }
 
   const save = useMutation({
     mutationFn: () => adminApi.saveSettings({
-      billing_gpay_number: gpay.trim(),
-      billing_qr_image: qr,
+      payments: {
+        provider: provider === NO_PROVIDER ? "" : provider,
+        key_id: keyId.trim(),
+        ...(keySecret.trim() ? { key_secret: keySecret.trim() } : {}),
+        ...(webhookSecret.trim() ? { webhook_secret: webhookSecret.trim() } : {}),
+      },
     }),
     onSuccess: () => {
       toast.success("Payment settings saved")
-      queryClient.invalidateQueries({ queryKey: ["admin-settings"] })
-      queryClient.invalidateQueries({ queryKey: ["billing"] })
+      setKeySecret(""); setWebhookSecret("")
+      invalidate()
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "Save failed"),
   })
 
-  if (isLoading) return <Skeleton className="h-24 w-full" />
+  const clearSecret = useMutation({
+    mutationFn: (which: "key_secret" | "webhook_secret") =>
+      adminApi.saveSettings({ payments: { [`${which}_clear`]: true } }),
+    onSuccess: (_r, which) => {
+      toast.success(which === "key_secret" ? "Key secret removed" : "Webhook secret removed")
+      invalidate()
+    },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "Failed"),
+  })
+
+  const webhookUrl = `${window.location.origin}/payments/webhook`
+  const copyWebhook = () => {
+    navigator.clipboard.writeText(webhookUrl)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  if (isLoading || !pay) return <Skeleton className="h-24 w-full" />
+  const status = gatewayStatus(pay)
 
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-sm">
-          <IndianRupee className="size-4 text-muted-foreground" /> Payments (all organizations)
+          <IndianRupee className="size-4 text-muted-foreground" /> Payment gateway (all organizations)
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        <span className={cn("w-fit rounded-md px-2 py-1 text-xs font-medium", status.className)}>
+          {status.text}
+        </span>
+
         <div className="flex flex-col gap-1.5">
-          <Label>GPay number</Label>
-          <Input value={gpay} placeholder="10-digit GPay number" className="max-w-sm font-mono text-xs"
-            spellCheck={false} onChange={(e) => setGpay(e.target.value)} />
+          <Label>Provider</Label>
+          <Select value={provider} onValueChange={setProvider}>
+            <SelectTrigger className="w-full max-w-sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NO_PROVIDER}>No gateway · payments off</SelectItem>
+              {pay.providers.map((p) => (
+                <SelectItem key={p} value={p} className="capitalize">{p}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <p className="max-w-lg text-xs text-muted-foreground">
-            Shown on every paid org's lock screen and reminders. You mark months
-            paid from Organizations → Billing once payment lands.
+            Off is a working state, not a broken one: orgs still see what they
+            owe and are asked to contact you. Invoices and the ledger run either
+            way.
           </p>
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label>Payment QR (optional)</Label>
-          <div className="flex items-center gap-3">
-            {qr
-              ? <QrImage src={qr} imgClassName="size-28 rounded-md border object-contain p-1" />
-              : <div className="flex size-28 items-center justify-center rounded-md border bg-muted text-center text-2xs text-muted-foreground">No QR</div>}
-            <div className="flex flex-col gap-2">
-              <input ref={fileRef} type="file" accept="image/*,.svg" className="hidden"
-                onChange={(e) => pickFile(e.target.files?.[0])} />
-              <Button variant="outline" size="sm" className="w-fit"
-                onClick={() => fileRef.current?.click()}>
-                {qr ? "Replace QR" : "Upload QR"}
-              </Button>
-              {qr && (
-                <Button variant="ghost" size="sm" className="w-fit text-muted-foreground"
-                  onClick={() => setQr("")}>
-                  <Trash2 className="size-3.5" /> Remove
-                </Button>
-              )}
-            </div>
+          <Label>Key id</Label>
+          <Input value={keyId} placeholder="rzp_live_…" className="max-w-sm font-mono text-xs"
+            spellCheck={false} onChange={(e) => setKeyId(e.target.value)} />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            Public by design. It is handed to the browser to open checkout, so
+            treat it as visible to every org. The secret below is the half that
+            must stay here.
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <Label>Key secret</Label>
+          <Input type="password" autoComplete="off" spellCheck={false}
+            className="max-w-sm font-mono text-xs"
+            placeholder={pay.key_secret_set
+              ? "•••••••• stored · leave blank to keep"
+              : "paste the gateway key secret"}
+            value={keySecret} onChange={(e) => setKeySecret(e.target.value)} />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            Central signs in with it to open the order, and checks the browser's
+            return against it. Stored encrypted and never shown again.
+            {pay.key_secret_set && (
+              <> <button type="button" className="underline hover:text-foreground"
+                disabled={clearSecret.isPending}
+                onClick={() => clearSecret.mutate("key_secret")}>Remove stored key secret</button>.</>
+            )}
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <Label>Webhook secret</Label>
+          <Input type="password" autoComplete="off" spellCheck={false}
+            className="max-w-sm font-mono text-xs"
+            placeholder={pay.webhook_secret_set
+              ? "•••••••• stored · leave blank to keep"
+              : "paste the webhook signing secret"}
+            value={webhookSecret} onChange={(e) => setWebhookSecret(e.target.value)} />
+          <p className="max-w-lg text-xs text-muted-foreground">
+            The webhook is the ONLY path that records a payment: a browser
+            coming back from checkout is treated as "processing" until the
+            gateway's own call lands. Without this secret central cannot verify
+            that call, so no money is ever posted.
+            {pay.webhook_secret_set && (
+              <> <button type="button" className="underline hover:text-foreground"
+                disabled={clearSecret.isPending}
+                onClick={() => clearSecret.mutate("webhook_secret")}>Remove stored webhook secret</button>.</>
+            )}
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <Label>Webhook URL</Label>
+          <div className="flex max-w-lg items-center gap-2">
+            <code className="min-w-0 flex-1 truncate rounded-md border bg-muted px-2.5 py-1.5 font-mono text-xs">
+              {webhookUrl}
+            </code>
+            <Button variant="outline" size="sm" className="shrink-0" onClick={copyWebhook}>
+              {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
+              {copied ? "Copied" : "Copy"}
+            </Button>
           </div>
           <p className="max-w-lg text-xs text-muted-foreground">
-            A UPI QR image (PNG, SVG or JPG) orgs scan to pay, shown beside the
-            GPay number on the lock screen. Leave empty to show just the number.
+            Paste this into the gateway dashboard and subscribe it to
+            <code className="mx-1 font-mono">payment.captured</code>
+            (<code className="font-mono">payment.failed</code> is read too).
+            Until it is set there, payments reach the gateway and never reach
+            this ledger.
           </p>
         </div>
-
-        <p className="max-w-lg text-xs text-muted-foreground">
-          When an org taps "I've paid", their name is sent to the admin WhatsApp
-          number (set in the WhatsApp card below) so you can verify and mark the
-          month.
-        </p>
 
         <Button size="sm" className="w-fit" disabled={save.isPending} onClick={() => save.mutate()}>
           Save
@@ -365,9 +485,10 @@ function WhatsAppCard() {
             className="max-w-sm font-mono text-xs" spellCheck={false}
             onChange={(e) => setAdminNumber(e.target.value)} />
           <p className="max-w-lg text-xs text-muted-foreground">
-            Platform ops pings only: an org tapping "I've paid", a self-downgrade to
-            Free, and release-mirror failures. Org alerts never come here. Leave blank
-            to skip them.
+            Platform ops pings only: the daily billing digest and release-mirror
+            failures. It is also the number an org is told to contact while the
+            payment gateway is off. Org alerts never come here. Leave blank to
+            skip them.
           </p>
         </div>
 
@@ -395,15 +516,18 @@ export function PlatformPage() {
         <h1 className="text-lg font-semibold tracking-tight">Platform settings</h1>
         <p className="text-sm text-muted-foreground">
           Server-wide configuration that applies to every organization: the look of the
-          dashboard, the Google Maps key and map detail, how subscribers pay, and the
-          WhatsApp channel.
+          dashboard, the Google Maps key and map detail, the payment gateway every org
+          checks out through, and the WhatsApp channel.
         </p>
       </div>
 
       <AppearanceCard />
       <GoogleMapsCard />
       <MapDetailCard />
-      <PlatformBillingCard />
+      <PaymentsCard />
+      {/* The fleet ledger sits under the gateway that feeds it: what each org
+          owes, what accrued today, and the manual entries only you can make. */}
+      <BillingConsolePanel />
       <WhatsAppCard />
     </div>
   )

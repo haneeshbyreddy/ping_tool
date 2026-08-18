@@ -1,25 +1,24 @@
-import type { QueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { snmpApi, ApiError } from "@/lib/api"
 
-const SYSTEM_OID = "1.3.6.1.2.1.1"
-const POLL_MS = 5_000       // matches the walk dialog's while-pending cadence
+const POLL_MS = 5_000       // one poll per report-ish cycle; the edge only ever polls
 const MAX_WAIT_MS = 180_000 // ~3 report cycles; past that the probe isn't picking up
+const DESCR_MAX = 90        // toast description, not the value: keep it one line
 
 const inflight = new Set<number>()
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-function sysDescrOf(rows: Array<[string, string]> | null): string | null {
-  if (!rows?.length) return null
-  const hit = rows.find(([oid]) => oid.startsWith("1.3.6.1.2.1.1.1")) ?? rows[0]
-  const text = (hit[1] || "").replace(/\s+/g, " ").trim()
-  return text ? (text.length > 90 ? `${text.slice(0, 90)}…` : text) : null
+// The server pins the walk root, extracts sysDescr and ships no varbinds, so
+// there is nothing to search here — only the length this toast can carry.
+function shortDescr(text: string | null): string | null {
+  const t = (text || "").trim()
+  if (!t) return null
+  return t.length > DESCR_MAX ? `${t.slice(0, DESCR_MAX)}…` : t
 }
 
 export async function runSnmpTest(
   device: { id: number; name: string; ip_address: string; snmp_port?: number },
-  queryClient?: QueryClient,
 ): Promise<void> {
   if (inflight.has(device.id)) return
   inflight.add(device.id)
@@ -30,27 +29,26 @@ export async function runSnmpTest(
       id: tid, duration: Infinity,
       description: "The probe runs a tiny system walk on its next report, usually under 2 minutes.",
     })
-    let walkId: number
+    let testId: number
     try {
-      walkId = (await snmpApi.startWalk(device.id, SYSTEM_OID, 10)).id
+      testId = (await snmpApi.startTest(device.id)).id
     } catch (e) {
       toast.error(`Couldn't queue the SNMP test for ${device.name}`, {
         id: tid, description: e instanceof ApiError ? e.message : "request failed",
       })
       return
     }
-    queryClient?.invalidateQueries({ queryKey: ["snmp-walks", device.id] })
 
     const started = Date.now()
     for (;;) {
       await sleep(POLL_MS)
-      let walk
+      let test
       try {
-        walk = (await snmpApi.walkResult(walkId)).walk
+        test = (await snmpApi.testResult(testId)).test
       } catch {
         continue // transient fetch hiccup — the walk row is still there
       }
-      if (!walk || walk.status === "pending") {
+      if (!test || test.status === "pending") {
         if (Date.now() - started > MAX_WAIT_MS) {
           toast.error(`SNMP test on ${device.name} never ran`, {
             id: tid,
@@ -60,23 +58,21 @@ export async function runSnmpTest(
         }
         continue
       }
-      queryClient?.invalidateQueries({ queryKey: ["snmp-walks", device.id] })
-      if (walk.status === "done") {
-        const descr = sysDescrOf(walk.result)
-        if ((walk.varbind_count ?? 0) > 0) {
+      if (test.status === "done") {
+        if (test.answered) {
           toast.success(`SNMP OK on ${device.name}`, {
             id: tid, duration: 10_000,
-            description: descr ?? "The device answered the system walk.",
+            description: shortDescr(test.sys_descr) ?? "The device answered the system walk.",
           })
         } else {
           toast.warning(`SNMP answered on ${device.name}, but with nothing`, {
             id: tid, duration: 10_000,
-            description: "The agent responded but its system table is empty. Unusual firmware; try a full walk.",
+            description: "The agent responded but its system table is empty. That is unusual firmware, and worth reporting to the platform admin.",
           })
         }
         return
       }
-      const err = walk.error || "walk failed"
+      const err = test.error || "walk failed"
       const noAnswer = /timeout|no (snmp )?response/i.test(err)
       toast.error(`SNMP test failed on ${device.name}`, {
         id: tid, duration: 15_000,

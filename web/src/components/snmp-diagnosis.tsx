@@ -1,14 +1,12 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Play, Wand2, Zap } from "lucide-react"
+import { Zap } from "lucide-react"
 import { snmpApi, ApiError } from "@/lib/api"
 import { runSnmpTest } from "@/components/snmp-test"
 import type {
   DeviceCapability, OrgDevice, SnmpSubsystem, SnmpSubsystemStatus,
 } from "@/lib/types"
-import { ProfileWizard } from "@/components/profile-wizard"
-import { SnmpWalkDialog } from "@/components/snmp-walk-dialog"
 import { useAuth } from "@/hooks/use-auth"
 import { ago } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -25,14 +23,30 @@ const SUBSYSTEM_NOUN: Record<SnmpSubsystem, string> = {
   optics: "ONU optical readings",
 }
 
+// How long the last walk took, measured on the probe itself. ONE formatter, so
+// the ports header, the optical header and the diagnosis card can't print the
+// same measurement three ways. null in means null out: a probe on an older
+// build reports no duration at all, and "we never measured it" may not render
+// as "it took no time" — the panels drop the chip entirely rather than show 0s.
+export function walkSecs(s: number | null | undefined): string | null {
+  if (s == null || !Number.isFinite(s)) return null
+  return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`
+}
+
 interface Diagnosis {
   cause: string
   steps: string[]
   tone?: "warning"
-  walk?: boolean
-  wizard?: boolean
   notSupported?: boolean
 }
+
+// Reading a new box is a platform-admin job (a vendor profile, written from a
+// walk run off the CLI), so a step for it names WHO does it. There is no walk
+// or wizard in the UI to point at any more, and this may not claim anybody has
+// been told: nothing here sends a notification.
+const ADMIN_ADDS_SUPPORT =
+  "Support for a new box is added by the platform admin as a vendor profile. "
+  + "It reaches your probes as data, with no update to install."
 
 function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined): Diagnosis {
   if (!st) {
@@ -59,10 +73,10 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
         steps: subsystem === "ports"
           ? [
               "A rate is a delta between two walks, so bandwidth stays blank until two consecutive sweeps both carry the counters.",
-              "Usually a very large ifTable on a slow agent. Persistent partials on one box are worth reporting — the walk budget is tunable per subsystem.",
+              "Usually a very large ifTable on a slow agent. Persistent partials on one box are worth reporting. The walk budget is tunable per subsystem.",
             ]
           : [
-              "Usually a very large table on a slow agent. Persistent partials are worth reporting — the walk budget is tunable per subsystem.",
+              "Usually a very large table on a slow agent. Persistent partials are worth reporting. The walk budget is tunable per subsystem.",
             ],
         tone: "warning",
       }
@@ -74,7 +88,6 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
           "Check the community string matches what's configured here.",
           "Check any SNMP ACL/allowed-hosts list on the device includes the probe's IP.",
         ],
-        walk: true,
       }
     case "timeout":
       return {
@@ -89,9 +102,8 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
         cause: `No GPON vendor profile claims this OLT (sysObjectID ${st.sysobjectid ?? "unknown"}). Optics stay off rather than guessing another vendor's OIDs.`,
         steps: [
           "If this is a known vendor under an odd sysObjectID, set the GPON vendor override in the device's settings.",
-          "Otherwise this vendor needs support added. Run a walk of its enterprise tree and share the dump.",
+          `Otherwise this OLT is hardware we don't read yet. ${ADMIN_ADDS_SUPPORT}`,
         ],
-        walk: true,
         notSupported: true,
       }
     case "empty":
@@ -100,20 +112,16 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
           ? {
               cause: `Profile “${st.profile}” matched this device but returned no readings. Its OIDs are probably wrong for this exact model.`,
               steps: [
-                "Run an SNMP walk of the enterprise tree to see what the device really exposes.",
-                "Fix the profile's OIDs from the walk (or create a model-specific profile; longest sysObjectID match wins).",
+                "Nothing on the device is misconfigured. It answers, and the reading is missing at our end.",
+                `The profile is corrected by the platform admin for this exact model. ${ADMIN_ADDS_SUPPORT}`,
               ],
-              walk: true,
-              wizard: true,
             }
           : {
               cause: "The device answers SNMP but exposes none of the standard health OIDs. Cheap gear usually hides CPU/RAM/temperature in its private vendor tree.",
               steps: [
-                "Run an SNMP walk of the enterprise tree (one click below).",
-                "Pick the CPU/RAM/temperature rows out of the dump with the profile wizard. The probe starts using them on its next sweep, no rollout.",
+                `Reading vitals off a box like this needs a profile for its private tree. ${ADMIN_ADDS_SUPPORT}`,
+                "If this hardware has no such sensors at all, mark it not supported so it stops counting as a gap.",
               ],
-              walk: true,
-              wizard: true,
               notSupported: true,
             }
       }
@@ -121,10 +129,8 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
         return {
           cause: "The device answers SNMP but its interface table (ifTable) came back empty. Some gear simply doesn't expose ports over SNMP.",
           steps: [
-            "Run a walk of the Interfaces subtree to confirm what the agent exposes.",
             "If the hardware genuinely has no port table, mark ports as not supported so it stops showing as a gap.",
           ],
-          walk: true,
           notSupported: true,
         }
       }
@@ -132,16 +138,14 @@ function diagnose(subsystem: SnmpSubsystem, st: SnmpSubsystemStatus | undefined)
         cause: "The OLT answers SNMP and a vendor profile matched, but its ONU table came back empty.",
         steps: [
           "If no ONUs are registered yet this is normal.",
-          "Otherwise the vendor profile may not fit this model. Run a walk and share the dump.",
+          `Otherwise the vendor profile may not fit this exact model. ${ADMIN_ADDS_SUPPORT}`,
         ],
-        walk: true,
       }
     case "error":
     default:
       return {
         cause: `The SNMP sweep failed: ${st.detail ?? "unknown error"}.`,
         steps: ["Transient errors clear on the next sweep. A persistent one usually means a network path or device problem."],
-        walk: true,
       }
   }
 }
@@ -218,10 +222,11 @@ export function SnmpDiagnosis({ device, subsystem }: {
   device: OrgDevice
   subsystem: SnmpSubsystem
 }) {
+  // "Test SNMP" is the one tool left here, and it stays with the owner: it
+  // answers "does this box reply to us", and every fix it points at (community
+  // string, source-IP ACL, UDP 161 through NAT) is the ISP's own to make. Raw
+  // OID walking and profile authoring left the UI entirely.
   const { canWrite } = useAuth()
-  const queryClient = useQueryClient()
-  const [walkOpen, setWalkOpen] = useState(false)
-  const [wizardOpen, setWizardOpen] = useState(false)
   const [nsOpen, setNsOpen] = useState(false)
   const q = useQuery({
     queryKey: ["snmp-status", device.id],
@@ -251,6 +256,15 @@ export function SnmpDiagnosis({ device, subsystem }: {
 
   const st = (q.data?.status ?? []).find((s) => s.subsystem === subsystem)
   const d = diagnose(subsystem, st)
+  // The walk duration sits with the other cold facts, not in the prose: on a
+  // timeout it is the budget, and on a slow success it is the reason the next
+  // sweep is late. A probe that reports none contributes no entry here.
+  const took = walkSecs(st?.elapsed_s)
+  const facts = [
+    st?.sysobjectid && `sysObjectID ${st.sysobjectid}`,
+    took && `walk took ${took}`,
+    st?.last_ok_at && `last worked ${ago(st.last_ok_at)}`,
+  ].filter((f): f is string => !!f)
 
   return (
     <div className={cn("flex flex-col gap-2 rounded-lg border px-3 py-2.5",
@@ -261,29 +275,17 @@ export function SnmpDiagnosis({ device, subsystem }: {
           {d.steps.map((s, i) => <li key={i}>{s}</li>)}
         </ol>
       )}
-      {(st?.sysobjectid || st?.last_ok_at) && (
+      {facts.length > 0 && (
         <p className="font-mono text-[0.6875rem] text-faint-foreground">
-          {st.sysobjectid && <>sysObjectID {st.sysobjectid}</>}
-          {st.sysobjectid && st.last_ok_at && " · "}
-          {st.last_ok_at && <>last worked {ago(st.last_ok_at)}</>}
+          {facts.join(" · ")}
         </p>
       )}
       {canWrite && (
         <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
           <Button variant="outline" size="sm" className="h-7 text-xs"
-            onClick={() => void runSnmpTest(device, queryClient)}>
+            onClick={() => void runSnmpTest(device)}>
             <Zap className="size-3" /> Test SNMP
           </Button>
-          {d.walk && (
-            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setWalkOpen(true)}>
-              <Play className="size-3" /> Run SNMP walk
-            </Button>
-          )}
-          {d.wizard && (
-            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setWizardOpen(true)}>
-              <Wand2 className="size-3" /> Build profile from walk
-            </Button>
-          )}
           {d.notSupported && (
             <button className="ml-auto text-2xs text-faint-foreground hover:text-foreground"
               onClick={() => setNsOpen(true)}>
@@ -291,11 +293,6 @@ export function SnmpDiagnosis({ device, subsystem }: {
             </button>
           )}
         </div>
-      )}
-      {walkOpen && <SnmpWalkDialog device={device} open={walkOpen} onOpenChange={setWalkOpen} />}
-      {wizardOpen && (
-        <ProfileWizard device={device} sysObjectId={st?.sysobjectid ?? null}
-          open={wizardOpen} onOpenChange={setWizardOpen} />
       )}
       <NotSupportedDialog device={device} subsystem={subsystem} open={nsOpen} onOpenChange={setNsOpen} />
     </div>

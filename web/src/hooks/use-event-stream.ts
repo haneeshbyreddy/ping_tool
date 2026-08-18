@@ -5,7 +5,6 @@ import { onServerBuild } from "@/lib/build-refresh"
 
 const LIVE_QUERY_KEYS = [
   "summary", "outages", "inventory", "nodes",
-  "snmp-walks", // a queued walk's result lands on the edge's report cadence
   "issues",
 ]
 

@@ -41,7 +41,9 @@ _ENABLED = {"enabled": "1", "token": "TOK", "phone_id": "PID"}
 
 
 def _cfg():
-    return Config()
+    # No real backoff: these tests assert HOW MANY attempts a status code
+    # earns, never how long the waiting takes.
+    return Config(notify_retry_backoff_s=0)
 
 
 class NumberNormalizeTest(unittest.TestCase):

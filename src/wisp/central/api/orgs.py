@@ -3,22 +3,12 @@ from __future__ import annotations
 import logging
 import re
 
-from wisp.central import billing as billing_mod
-from wisp.central import inventory, mapdetail, sysinfo, theme
+from wisp.central import inventory, mapdetail, payments, sysinfo, theme
 from wisp.central.api.common import (DENIED, body_org_write, now_iso, org_or_400,
                                      public_user, reader_or_401,
                                      superadmin_or_403)
 
-_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-_QR_MAX_CHARS = 700_000
-
 log = logging.getLogger("wisp.central.api.orgs")
-
-
-def _admin_whatsapp(h) -> list[str]:
-    num = (h.store.whatsapp_settings().get("admin_number")
-           or h.cfg.whatsapp_admin_number or "").strip()
-    return [num] if num else []
 
 
 def healthz(h, qs):
@@ -69,11 +59,21 @@ def admin_settings(h, qs):
     if not superadmin_or_403(h):
         return
     h._reply(200, {"google_maps_key": h.store.get_setting("google_maps_key"),
-                   "billing_gpay_number": billing_mod.gpay_number(h.store),
-                   "billing_qr_image": h.store.get_setting("billing_qr_image"),
+                   "payments": _payments_public(h),
                    "whatsapp": _whatsapp_public(h),
                    "theme_overrides": theme.load(h.store),
                    "map_detail": mapdetail.load(h.store)})
+
+
+def _payments_public(h) -> dict:
+    """The gateway config, secrets as booleans only. Same discipline as the
+    WhatsApp token: write-only, read back as "is it set", never echoed."""
+    s = payments.provider_settings(h.store, h.secretbox)
+    return {"provider": s["provider"] or "",
+            "key_id": s["key_id"] or "",
+            "key_secret_set": bool(s["key_secret"]),
+            "webhook_secret_set": bool(s["webhook_secret"]),
+            "providers": list(payments.PROVIDERS)}
 
 
 def list_orgs(h, qs):
@@ -176,19 +176,29 @@ def admin_settings_write(h, user, body):
     if google_key is not None:
         h.store.set_setting("google_maps_key",
                             str(google_key).strip()[:128])
-    gpay = body.get("billing_gpay_number")
-    if gpay is not None:
-        h.store.set_setting("billing_gpay_number", str(gpay).strip()[:32])
-    qr = body.get("billing_qr_image")
-    if qr is not None:
-        qr = str(qr).strip()
-        if qr and not qr.startswith("data:image/"):
-            h._reply(422, {"error": "QR must be an uploaded image"})
-            return
-        if len(qr) > _QR_MAX_CHARS:
-            h._reply(422, {"error": "QR image is too large. Use a smaller PNG."})
-            return
-        h.store.set_setting("billing_qr_image", qr)
+    pay = body.get("payments")
+    if isinstance(pay, dict):
+        if "provider" in pay:
+            name = str(pay.get("provider") or "").strip()[:32]
+            if name and name not in payments.PROVIDERS:
+                h._reply(422, {"error": "payment provider must be one of: "
+                                        + ", ".join(payments.PROVIDERS)})
+                return
+            h.store.set_setting(payments.PROVIDER_KEY, name)
+        if "key_id" in pay:
+            # Public by design: the key id ships to the browser in checkout.
+            h.store.set_setting(payments.KEY_ID_KEY,
+                                str(pay.get("key_id") or "").strip()[:128])
+        # Secrets are write-only and encrypted at rest. An empty value LEAVES
+        # the stored secret alone (the field renders blank on every load);
+        # clearing takes an explicit *_clear, the WhatsApp-token precedent.
+        for field, key in ((("key_secret"), payments.KEY_SECRET_KEY),
+                           (("webhook_secret"), payments.WEBHOOK_SECRET_KEY)):
+            if pay.get(field):
+                h.store.set_setting(
+                    key, h.secretbox.encrypt(str(pay[field]).strip()[:256]))
+            elif pay.get(f"{field}_clear"):
+                h.store.set_setting(key, "")
     wa = body.get("whatsapp")
     if isinstance(wa, dict):
         if "enabled" in wa:
@@ -206,121 +216,6 @@ def admin_settings_write(h, user, body):
     if "map_detail" in body:
         mapdetail.save(h.store, body.get("map_detail"))
     h._reply(200, {"ok": True})
-
-
-def billing(h, qs):
-    user = reader_or_401(h)
-    if not user:
-        return
-    org = org_or_400(h, user, qs)
-    if not org:
-        return
-    st = billing_mod.org_status(h.store, org)
-    cap = billing_mod.device_cap(st["plan"])
-    h._reply(200, {
-        **st,
-        "paid_months": sorted(h.store.paid_months(org)),
-        "device_count": h.store.org_monitored_device_count(
-            org, inventory.PASSIVE_TYPES),
-        "device_cap": cap,
-        "node_count": h.store.active_node_token_count(org),
-        "node_cap": billing_mod.node_cap(st["plan"]),
-        "gpay_number": billing_mod.gpay_number(h.store),
-        "qr_image": h.store.get_setting("billing_qr_image"),
-        "plans": billing_mod.PLANS,
-    })
-
-
-def billing_paid(h, user, body):
-    org = org_or_400(h, user, body if isinstance(body, dict) else {})
-    if not org:
-        return
-    numbers = _admin_whatsapp(h)
-    if not numbers:
-        h._reply(200, {"ok": True, "notified": False})
-        return
-    name = h.store.org_name(org) or org
-    plan = billing_mod.PLANS.get(h.store.org_plan(org), {})
-    st = billing_mod.org_status(h.store, org)
-    due = st.get("due_month") or st.get("current_month") or ""
-    body_line = f"{plan.get('label', '')} · ₹{plan.get('price_inr', '')}"
-    if due:
-        body_line += f" · {billing_mod.month_label(due)}"
-    body_line += " · verify & mark the month paid"
-    ok = False
-    try:
-        from wisp.egress.notifiers import WhatsAppFacts
-        ok = h.notifier.send(
-            f"💰 {name} says they've paid", body_line, 4, whatsapp=numbers,
-            facts=WhatsAppFacts(subject=name, status="PAID (claim)",
-                                detail=body_line, timestamp=now_iso())).ok
-    except Exception:
-        log.exception("payment-claim notification failed for %s", org)
-    h._reply(200, {"ok": True, "notified": bool(ok)})
-
-
-def billing_plan(h, user, body):
-    org = body_org_write(h, user, body)
-    if org is DENIED:
-        return
-    if not org or not h.store.org_exists(org):
-        h._reply(404, {"error": "unknown org"})
-        return
-    plan = billing_mod.clean_plan(body.get("plan"))
-    if plan != "free":
-        h._reply(422, {"error": "only the free plan can be chosen without "
-                                "payment. Pay the admin to move to a paid plan."})
-        return
-    prior = h.store.org_plan(org)
-    if prior != "free":
-        h.store.set_org_plan(org, "free")
-        _notify_admin_plan_change(h, org, prior)
-    st = billing_mod.org_status(h.store, org)
-    h._reply(200, {"ok": True, **st,
-                   "paid_months": sorted(h.store.paid_months(org))})
-
-
-def _notify_admin_plan_change(h, org: str, prior: str) -> None:
-    numbers = _admin_whatsapp(h)
-    if not numbers:
-        return
-    try:
-        name = h.store.org_name(org) or org
-        from wisp.egress.notifiers import WhatsAppFacts
-        detail = f"was {prior} · self-serve downgrade"
-        h.notifier.send(f"📉 {name} switched to Free", detail, 3, whatsapp=numbers,
-                        facts=WhatsAppFacts(subject=name, status="CHURN → Free",
-                                            detail=detail, timestamp=now_iso()))
-    except Exception:
-        log.exception("plan-change notification failed for %s", org)
-
-
-def admin_billing_write(h, user, body):
-    if not user["is_superadmin"]:
-        h._reply(403, {"error": "forbidden"})
-        return
-    org = str(body.get("org_id") or "").strip()
-    if not org or not h.store.org_exists(org):
-        h._reply(404, {"error": "unknown org"})
-        return
-    if body.get("plan") is not None:
-        plan = billing_mod.clean_plan(body.get("plan"))
-        if not plan:
-            h._reply(422, {"error": "plan must be one of: "
-                                    + ", ".join(billing_mod.PLANS)})
-            return
-        h.store.set_org_plan(org, plan)
-    month = body.get("month")
-    if month is not None:
-        month = str(month).strip()
-        if not _MONTH_RE.match(month):
-            h._reply(422, {"error": "month must be YYYY-MM"})
-            return
-        h.store.set_billing_month(org, month, bool(body.get("paid")),
-                                  marked_by=user["username"])
-    st = billing_mod.org_status(h.store, org)
-    h._reply(200, {"ok": True, **st,
-                   "paid_months": sorted(h.store.paid_months(org))})
 
 
 def test_alert(h, user, body):

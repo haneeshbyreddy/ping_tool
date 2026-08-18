@@ -1,23 +1,9 @@
 from __future__ import annotations
 
-from wisp.central import billing, inventory
+from wisp.central import inventory
 from wisp.central.api.common import (DENIED, body_org_write, org_or_400,
                                      reader_or_401)
 from wisp.version import is_newer
-
-
-def _probe_cap_blocked(h, org: str) -> bool:
-    plan = h.store.org_plan(org)
-    cap = billing.node_cap(plan)
-    if cap is None or h.store.active_node_token_count(org) < cap:
-        return False
-    label = billing.PLANS[plan]["label"]
-    upgrade = ("upgrade to Pro or VIP for more"
-               if plan == "free" else "upgrade to VIP for unlimited probes")
-    h._reply(422, {"error": f"{label} plan includes {cap} edge "
-                            f"probe{'s' if cap != 1 else ''}. {upgrade} "
-                            "(Settings → Plan & billing)"})
-    return True
 
 
 def nodes(h, qs):
@@ -46,8 +32,6 @@ def register(h, user, body):
         raise inventory.InventoryError(
             f"node {node_id!r} is already registered for {org!r}. "
             "Use rotate instead of registering it again.")
-    if _probe_cap_blocked(h, org):
-        return
     node_token = h.store.issue_node_token(org, node_id, created_by=user["id"])
     h._reply(200, {"node_id": node_id, "token": node_token})
 
@@ -61,8 +45,6 @@ def rotate(h, user, body):
     if not status:
         raise inventory.InventoryError(
             f"node {node_id!r} isn't registered for {org!r} yet")
-    if status.get("revoked_at") and _probe_cap_blocked(h, org):
-        return
     node_token = h.store.issue_node_token(org, node_id, created_by=user["id"])
     h._reply(200, {"node_id": node_id, "token": node_token})
 

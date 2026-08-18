@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from wisp.central.api import (capacity, devices, edge, field, fleet, history,
-                              orgs, outages, proxy, replay, users)
+from wisp.central.api import (billing, capacity, devices, edge, field, fleet,
+                              history, liveping, orgs, outages, proxy, replay,
+                              users)
 
 GET = {
     "/healthz": orgs.healthz,
@@ -10,7 +11,9 @@ GET = {
     "/api/system": orgs.system,
     "/api/admin/overview": orgs.admin_overview,
     "/api/admin/settings": orgs.admin_settings,
-    "/api/billing": orgs.billing,
+    "/api/admin/billing": billing.admin_billing,
+    "/api/billing": billing.billing,
+    "/api/billing/invoice": billing.invoice_pdf,
     "/api/events": outages.events,
     "/edge/devices": edge.devices,
     "/api/orgs": orgs.list_orgs,
@@ -34,6 +37,7 @@ GET = {
     "/api/inventory/drops/subscribers": devices.onu_drop_subscribers,
     "/api/inventory/snmp-walks": devices.snmp_walks,
     "/api/inventory/snmp-walk/result": devices.snmp_walk_result,
+    "/api/inventory/snmp-test/result": devices.snmp_test_result,
     "/api/snmp-profiles": devices.snmp_profiles,
     "/api/gpon-profiles": devices.gpon_profiles,
     "/api/web-optics-profiles": devices.web_optics_profiles,
@@ -71,6 +75,7 @@ GET = {
     "/api/field/tokens": field.tokens,
     "/api/proxy/sessions": proxy.sessions_list,
     "/api/proxy/audit": proxy.audit_list,
+    "/api/liveping": liveping.status,
 }
 
 POST = {
@@ -78,9 +83,10 @@ POST = {
     "/api/orgs/delete": orgs.delete,
     "/api/org": orgs.update,
     "/api/admin/settings": orgs.admin_settings_write,
-    "/api/admin/billing": orgs.admin_billing_write,
-    "/api/billing/paid": orgs.billing_paid,
-    "/api/billing/plan": orgs.billing_plan,
+    "/api/admin/billing": billing.admin_billing_write,
+    "/api/billing/pay": billing.pay,
+    "/api/billing/return": billing.payment_return,
+    "/api/billing/plan": billing.plan,
     "/api/test-alert": orgs.test_alert,
     "/api/users": users.create,
     "/api/users/deactivate": users.deactivate,
@@ -137,6 +143,7 @@ POST = {
     "/api/inventory/credentials": devices.webui_credentials_set,
     "/api/inventory/credentials/clear": devices.webui_credentials_clear,
     "/api/inventory/snmp-walk": devices.snmp_walk_create,
+    "/api/inventory/snmp-test": devices.snmp_test_create,
     "/api/snmp-profiles": devices.profile_create,
     "/api/snmp-profiles/update": devices.profile_update,
     "/api/snmp-profiles/delete": devices.profile_delete,
@@ -169,6 +176,8 @@ POST = {
     "/api/field/token/revoke": field.token_revoke,
     "/api/proxy/session": proxy.session_create,
     "/api/proxy/close": proxy.session_close,
+    "/api/liveping/start": liveping.start,
+    "/api/liveping/stop": liveping.stop,
     "/api/outages/acknowledge": outages.acknowledge,
     "/api/outages/assign": outages.assign,
     "/api/outages/accept": outages.accept,

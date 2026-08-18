@@ -83,8 +83,13 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Description 'WISP edge supervisor (launches + self-updates the agent)' -Force | Out-Null
 Write-Output "registered scheduled task $TaskName"
 
-if (-not ((Get-Content $envFile -Raw) -match "WISP_CENTRAL_URL = 'https?://")) {
-    Write-Warning 'no central URL configured; task registered but not started'
+$envRaw = Get-Content $envFile -Raw
+if (-not ($envRaw -match "WISP_CENTRAL_URL = 'https://")) {
+    if ($envRaw -match "WISP_CENTRAL_URL = 'http://") {
+        Write-Warning 'central URL is plain http; central must be https. task registered but not started'
+    } else {
+        Write-Warning 'no central URL configured; task registered but not started'
+    }
     exit 10
 }
 

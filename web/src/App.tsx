@@ -10,7 +10,7 @@ import { AppShell } from "@/components/layout/app-shell"
 import { LoginPage } from "@/routes/login-page"
 import { HomePage } from "@/routes/home-page"
 import {
-  CustomersPage, MapPage, SettingsPage, SurveyPage, TopologyPage,
+  BillingPage, CustomersPage, MapPage, SettingsPage, SurveyPage, TopologyPage,
 } from "@/routes/lazy"
 import { AccountPage } from "@/routes/account-page"
 import { IssuesPage } from "@/routes/issues-page"
@@ -44,6 +44,11 @@ function App() {
                     <Route path="nodes" element={<Navigate to="/topology" replace />} />
                     <Route path="settings" element={<SettingsPage />} />
                     <Route path="settings/:section" element={<SettingsPage />} />
+                    {/* Billing left Settings when it stopped being a plan and
+                        became a ledger. Reached from the account menu and the
+                        overdue banner; workers are kept out by the nav filter
+                        and by /api/billing being off the worker allowlist. */}
+                    <Route path="billing" element={<BillingPage />} />
                     <Route path="account" element={<AccountPage />} />
                     <Route path="issues" element={<IssuesPage />} />
                     <Route path="triage" element={<TriagePage />} />

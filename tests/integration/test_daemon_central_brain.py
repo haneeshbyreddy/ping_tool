@@ -325,6 +325,68 @@ class GatherSnmpPortsTest(unittest.TestCase):
         self.assertEqual(sorted(snmp.scopes),
                          [("10.0.0.1", "hot"), ("10.0.0.2", "full")])
 
+class WalkTimingTest(unittest.TestCase):
+    # The edge is the only place a walk can be timed honestly: central sees one
+    # /report per SNMP sweep and cannot tell a 60 s walk from a 2 s walk that
+    # waited 58 s for its turn. These pin that the number is the WALK.
+
+    def test_a_successful_port_walk_reports_how_long_it_took(self):
+        class _SlowPoller:
+            async def walk(self, target, scope="full"):
+                await asyncio.sleep(0.05)
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
+
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        _, status = asyncio.run(daemon._gather_snmp_ports(_SlowPoller(), devices,
+                                                          Config()))
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertGreaterEqual(status[1]["elapsed_s"], 0.05)
+
+    def test_a_walk_that_timed_out_still_reports_its_duration(self):
+        # The walk whose duration matters most is the one that never finished:
+        # "it burned the whole 0.2 s budget" is the finding.
+        class _HangingPoller:
+            async def walk(self, target, scope="full"):
+                await asyncio.sleep(3600)
+
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        cfg = Config(port_walk_timeout_s=0.2)
+        _, status = asyncio.run(daemon._gather_snmp_ports(_HangingPoller(), devices,
+                                                          cfg))
+        self.assertEqual(status[1]["state"], "timeout")
+        self.assertGreaterEqual(status[1]["elapsed_s"], 0.2)
+
+    def test_a_failed_walk_still_reports_its_duration(self):
+        class _AngryPoller:
+            async def walk(self, target, scope="full"):
+                await asyncio.sleep(0.02)
+                raise RuntimeError("SNMP walk boom")
+
+        devices = [_dev(1, "10.0.0.1", snmp_enabled=True, snmp_community="public")]
+        _, status = asyncio.run(daemon._gather_snmp_ports(_AngryPoller(), devices,
+                                                          Config()))
+        self.assertEqual(status[1]["state"], "error")
+        self.assertGreaterEqual(status[1]["elapsed_s"], 0.02)
+
+    def test_time_queued_behind_the_airtime_gate_is_NOT_walk_time(self):
+        # Two devices, one fleet slot. The second waits out the first, but its
+        # own walk is short — and short is what it must report, or every number
+        # on a busy probe reads as a slow device and the cadence work picks its
+        # intervals off contention it can just widen the semaphore for.
+        class _SlowPoller:
+            async def walk(self, target, scope="full"):
+                await asyncio.sleep(0.15)
+                return PortWalkResult([PortStatus(1, "Gi0/1", None, "up", "up")])
+
+        devices = [_dev(i, f"10.0.0.{i}", snmp_enabled=True, snmp_community="public")
+                   for i in (1, 2)]
+        gate = daemon._SnmpAirtime(1)
+        _, status = asyncio.run(daemon._gather_snmp_ports(
+            _SlowPoller(), devices, Config(), gate=gate))
+        for dev_id in (1, 2):
+            self.assertGreaterEqual(status[dev_id]["elapsed_s"], 0.15)
+            self.assertLess(status[dev_id]["elapsed_s"], 0.30, status)
+
 class PortScopePlannerTest(unittest.TestCase):
     _CFG = Config(port_identity_interval_s=3600.0)
 
@@ -767,3 +829,33 @@ class StatusCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepRestTest(unittest.TestCase):
+    """A sweep that overran its clock may not re-fire with no gap.
+
+    `next_*` is stamped at LAUNCH, so once a walk takes longer than its own
+    interval that deadline is already in the past when it lands and the very
+    next loop iteration starts another one. The device then gets walked back
+    to back forever. CLAUDE.md records this exact shape: "One clock once made
+    a slow roster walk starve the ifTable walk and re-fire immediately — the
+    polling caused the failure."
+    """
+
+    def test_a_sweep_that_finished_in_time_keeps_its_phase(self):
+        # Launched at 0, due at 300, landed at 12. Untouched: re-stamping here
+        # would push the cadence out by a probe cycle on every single sweep.
+        self.assertEqual(daemon._rest_after(300.0, 12.0, 300.0), 300.0)
+
+    def test_an_overrunning_sweep_gets_a_full_interval_of_rest(self):
+        # Launched at 0, due at 300, still walking at 460. Without this it is
+        # due the instant it lands, which is a continuous walk.
+        self.assertEqual(daemon._rest_after(300.0, 460.0, 300.0), 760.0)
+
+    def test_landing_exactly_on_the_deadline_still_rests(self):
+        self.assertEqual(daemon._rest_after(300.0, 300.0, 300.0), 600.0)
+
+    def test_the_gap_is_never_zero_however_far_it_overran(self):
+        for landed in (301.0, 900.0, 86_400.0):
+            with self.subTest(landed=landed):
+                self.assertGreater(daemon._rest_after(300.0, landed, 300.0), landed)

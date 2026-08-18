@@ -261,6 +261,25 @@ class GatherTest(unittest.TestCase):
         self.assertIn("profile", status[1]["detail"])
         self.assertEqual(status[2]["state"], "no_response")
 
+    def test_health_walks_report_how_long_they_took(self):
+        class _Slow(_FakeHealthPoller):
+            async def walk(self, target, profiles=None):
+                await asyncio.sleep(0.03)
+                return await super().walk(target, profiles)
+
+        devices = [{"id": 1, "ip_address": "10.0.0.1", "snmp_enabled": 1,
+                    "snmp_community": "public"},
+                   {"id": 2, "ip_address": "10.0.0.2", "snmp_enabled": 1,
+                    "snmp_community": "public"}]
+        poller = _Slow({"10.0.0.1": DeviceHealth(cpu_pct=33.0),
+                        "10.0.0.2": RuntimeError("boom")})
+        _, status = asyncio.run(_gather_snmp_health(poller, devices, Config()))
+        self.assertEqual(status[1]["state"], "ok")
+        self.assertGreaterEqual(status[1]["elapsed_s"], 0.03)
+        # A failed walk is timed too: it is the one whose duration matters.
+        self.assertEqual(status[2]["state"], "error")
+        self.assertGreaterEqual(status[2]["elapsed_s"], 0.03)
+
 try:
     import pysnmp  # noqa: F401
     _HAS_PYSNMP = True

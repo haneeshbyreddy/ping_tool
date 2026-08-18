@@ -1214,6 +1214,22 @@
 [data-pane] .wisp-tree-scrim {
   position: absolute;
 }
+/* Where a jump LANDS (topology-page.tsx:useFocusScroll). The app header is
+   `sticky top-0 h-14` over the DOCUMENT scroll, so an element scrolled to
+   `block: "start"` lands underneath it; scroll-margin is the fix that survives
+   a smooth scroll, and it has to sit on both anchor kinds (the labelled type
+   header and the row itself, for a row with no header above it). 4.5rem is the
+   header plus one gutter of air, so the cluster reads as starting there. */
+.wisp-jump-mt {
+  scroll-margin-top: 4.5rem;
+}
+/* Inside a pane the scroll box is the pane, and the app header is already above
+   it — the clearance would be a hole at the top of the list. Same reasoning as
+   the panel and minimap rules around it. */
+[data-pane] .wisp-jump-mt {
+  scroll-margin-top: 0.75rem;
+}
+
 /* The type minimap is `fixed` against the viewport ("always visible while I
    scroll"), which is exactly wrong inside a split-view pane — it would hover
    over whichever pane happens to own the right edge. Same reasoning as the

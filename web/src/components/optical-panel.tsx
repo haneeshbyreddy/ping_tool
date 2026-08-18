@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { inventoryApi, ApiError } from "@/lib/api"
+import { inventoryApi, snmpApi, ApiError } from "@/lib/api"
 import type { DupMac, OnuOptic, OpticsResponse, OrgDevice, PonFault } from "@/lib/types"
 import {
   ago, durationSince, isDownState, isFresh, onuIdentityTitle, onuName, onuSev,
   type OnuSev,
 } from "@/lib/format"
 import { useAuth } from "@/hooks/use-auth"
-import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
+import { SnmpDiagnosis, walkSecs } from "@/components/snmp-diagnosis"
 import { RxDiagnosis, RxFreshness } from "@/components/rx-diagnosis"
 import { ReferenceOnuButton } from "@/components/reference-onu"
 import { SubscriberDialog } from "@/components/subscriber-detail"
@@ -511,6 +511,19 @@ export function OpticalPanel({ device, focusOnuId, focusOnuMac }: {
     queryFn: () => inventoryApi.ponFaults(device.id),
     refetchInterval: 30_000,
   })
+  // Same key SnmpDiagnosis uses, so mounting both costs one request. All this
+  // reads is how long the last ONU walk took: the GPON walk is the slowest of
+  // the three and the one a cadence decision hangs on, and it is invisible
+  // otherwise once the table has rows (the diagnosis card only renders over an
+  // EMPTY one). Hooks stay above the early returns — React #310.
+  const statusQ = useQuery({
+    queryKey: ["snmp-status", device.id],
+    queryFn: () => snmpApi.status(device.id),
+    refetchInterval: 60_000,
+    enabled: device.snmp_enabled === 1,
+  })
+  const opticsTook = walkSecs(
+    statusQ.data?.status.find((s) => s.subsystem === "optics")?.elapsed_s)
   const pons = useMemo(() => groupByPon(q.data?.onus ?? []), [q.data])
   const invQ = useQuery({
     queryKey: ["inventory", scopeOrg],
@@ -611,6 +624,12 @@ export function OpticalPanel({ device, focusOnuId, focusOnuMac }: {
           {device.optics_updated_at && (opticsStale
             ? <span className="font-semibold" title="The SNMP optical walk on this OLT has stopped refreshing. These readings are the last good snapshot.">stale · {ago(device.optics_updated_at)}</span>
             : <span className="text-faint-foreground">as of {ago(device.optics_updated_at)}</span>)}
+          {opticsTook && (
+            <span className="text-faint-foreground"
+              title="How long the last ONU walk of this OLT took, measured by the probe. It is the walk itself, not time spent queued behind other SNMP work.">
+              walk took {opticsTook}
+            </span>
+          )}
           {!isDown && <RxFreshness device={device} canWrite={canWrite} />}
         </div>
       </div>

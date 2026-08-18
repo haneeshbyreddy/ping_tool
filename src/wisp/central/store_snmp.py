@@ -1264,22 +1264,35 @@ class SnmpStoreMixin:
                 count = int(count) if count is not None else None
             except (TypeError, ValueError):
                 count = None
+            # Edge-measured walk seconds. Absent = an older agent build that
+            # doesn't time its walks; that rides as NULL and is COALESCEd below
+            # so it can't blank a number a newer probe already reported. The
+            # range test also catches NaN/inf (every comparison against NaN is
+            # False), which would otherwise reach json.dumps and break the SPA.
+            elapsed = status.get("elapsed_s")
+            try:
+                elapsed = float(elapsed) if elapsed is not None else None
+            except (TypeError, ValueError):
+                elapsed = None
+            if elapsed is not None and not 0.0 <= elapsed < 86400.0:
+                elapsed = None
             clean.append((device_id, org_id, subsystem, state,
                           _s(status.get("detail"), 300),
                           _s(status.get("sysobjectid"), 128),
-                          _s(status.get("profile"), 64), count, ts,
+                          _s(status.get("profile"), 64), count, elapsed, ts,
                           ts if state == "ok" else None))
         if not clean:
             return
         with self._write_lock, self._connect() as conn:
             conn.executemany(
                 "INSERT INTO device_snmp_status (device_id, org_id, subsystem,"
-                " state, detail, sysobjectid, profile, item_count, updated_at,"
-                " last_ok_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " state, detail, sysobjectid, profile, item_count, elapsed_s,"
+                " updated_at, last_ok_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(device_id, subsystem) DO UPDATE SET"
                 " state=excluded.state, detail=excluded.detail,"
                 " sysobjectid=COALESCE(excluded.sysobjectid, sysobjectid),"
                 " profile=excluded.profile, item_count=excluded.item_count,"
+                " elapsed_s=COALESCE(excluded.elapsed_s, elapsed_s),"
                 " updated_at=excluded.updated_at,"
                 " last_ok_at=COALESCE(excluded.last_ok_at, last_ok_at)",
                 clean)
@@ -1290,7 +1303,7 @@ class SnmpStoreMixin:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT subsystem, state, detail, sysobjectid, profile, item_count,"
-                " updated_at, last_ok_at FROM device_snmp_status"
+                " elapsed_s, updated_at, last_ok_at FROM device_snmp_status"
                 " WHERE org_id=? AND device_id=? ORDER BY subsystem",
                 (org_id, device_id)).fetchall()
         return [dict(r) for r in rows]
@@ -1442,9 +1455,23 @@ class SnmpStoreMixin:
 
 
     def snmp_profiles_for_edge(self, org_id: str) -> list[dict]:
+        # ORDER IS THE OVERRIDE RULE — don't reorder this list.
+        # The edge keeps the LONGEST matching sysObjectID prefix with a
+        # strictly-greater compare (`ingress/health.py:match_profile`:
+        # `len(prefix) > best_len`), so on an EQUAL-length tie the FIRST row in
+        # this list wins. Profiles are mostly GLOBAL now, so "an org row and a
+        # global row carry the same prefix" is the ordinary case rather than the
+        # exotic one, and which one won used to fall out of a SQL ORDER BY
+        # nobody was reading as a permission. Org-scoped rows go FIRST, so an
+        # org's override deterministically beats the global profile — fixed
+        # here because central ships instantly and the edge needs a rollout.
+        # `gpon_profiles_for_edge` states the same guarantee the OPPOSITE way
+        # round; read the note there before making the two agree by shape.
+        # `EdgeProfileOrderTest` in integration/test_central_snmp_walk.
+        rows = [p for p in self.list_snmp_profiles(org_id) if p["enabled"]]
+        rows.sort(key=lambda p: p["org_id"] is None)   # stable: org rows first
         return [{"name": p["name"], "match_sysobjectid": p["match_sysobjectid"],
-                 "metrics": p["metrics"]}
-                for p in self.list_snmp_profiles(org_id) if p["enabled"]]
+                 "metrics": p["metrics"]} for p in rows]
 
 
     def create_snmp_profile(self, org_id: str | None, clean: dict) -> int:
@@ -1516,10 +1543,21 @@ class SnmpStoreMixin:
             return [self._gpon_row(r) for r in rows.fetchall()]
 
     def gpon_profiles_for_edge(self, org_id: str) -> list[dict]:
+        # ORDER IS THE OVERRIDE RULE here too, and it runs the OTHER WAY.
+        # The same guarantee as `snmp_profiles_for_edge` (an org override beats
+        # a global profile carrying the same prefix) needs org rows LAST on
+        # this list, because both edge-side rules let the LATER row win:
+        # `ingress/gpon.py:match_gpon_profile` takes an equal-length tie for a
+        # DB profile (`wins_ties`), and `GponPollerPool.set_profiles` keys the
+        # parsed profiles by NAME, where a later row overwrites an earlier one.
+        # This is the order the list already had — stated outright so it stops
+        # riding `list_gpon_profiles`' ORDER BY, and so the byte-for-byte
+        # payload the fleet already receives does not move.
+        # `EdgeProfileOrderTest` in integration/test_central_snmp_walk.
+        rows = [p for p in self.list_gpon_profiles(org_id) if p["enabled"]]
+        rows.sort(key=lambda p: p["org_id"] is not None)  # stable: org rows last
         out = []
-        for p in self.list_gpon_profiles(org_id):
-            if not p["enabled"]:
-                continue
+        for p in rows:
             spec = dict(p["spec"])
             spec["name"] = p["name"]
             spec["match_sysobjectid"] = p["match_sysobjectid"]

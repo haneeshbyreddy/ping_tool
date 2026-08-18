@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Navigate, useNavigate, useParams } from "react-router-dom"
 import {
-  Building2, Check, IndianRupee, KeyRound, MapPin, MessageCircle,
+  Building2, Check, KeyRound, MapPin, MessageCircle,
   Pencil, Plus, Radio, Trash2, Users, X, type LucideIcon,
 } from "lucide-react"
 import { useAuth } from "@/hooks/use-auth"
@@ -12,7 +12,6 @@ import { orgsApi, regionsApi, usersApi, ApiError } from "@/lib/api"
 import { DEFAULT_MAP_REGION, MAP_REGIONS, mapRegionOf } from "@/lib/map-regions"
 import type { AccountUser, Role } from "@/lib/types"
 import { AssignmentCard } from "@/components/assignment-card"
-import { BillingCard } from "@/components/billing-card"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { FieldTrackingCard } from "@/components/field-tracking-card"
 import { NeedsOrg } from "@/components/needs-org"
@@ -453,15 +452,6 @@ const SECTIONS: Array<{
   panels: Panel[]
 }> = [
   {
-    id: "billing",
-    label: "Plan & billing",
-    icon: IndianRupee,
-    visible: (c) => !!c.org,
-    panels: [
-      { id: "billing", label: "Plan & billing", render: (c) => <BillingCard org={c.org!} /> },
-    ],
-  },
-  {
     id: "organization",
     label: "Organization",
     icon: Building2,
@@ -490,8 +480,20 @@ const SECTIONS: Array<{
         visible: (c) => !!c.org,
         render: (c) => <RadiusCard org={c.org!} />,
       },
-      { id: "snmp-profiles", label: "SNMP health profiles", render: (c) => <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
-      { id: "gpon-profiles", label: "GPON vendor profiles", render: (c) => <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
+      // Authoring a recipe is a platform-admin job (every profile WRITE route is
+      // superadmin-only), so these two panels are hidden rather than shown as a
+      // form that 403s. Selecting a vendor stays with the ISP: that lives on the
+      // device form and in the cards above, and is deliberately not gated here.
+      {
+        id: "snmp-profiles", label: "SNMP health profiles",
+        visible: (c) => c.isSuperadmin,
+        render: (c) => <SnmpProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} />,
+      },
+      {
+        id: "gpon-profiles", label: "GPON vendor profiles",
+        visible: (c) => c.isSuperadmin,
+        render: (c) => <GponProfilesCard org={c.org} isSuperadmin={c.isSuperadmin} />,
+      },
       { id: "web-optics", label: "Web-UI optics vendors", render: (c) => <WebOpticsCard org={c.org} isSuperadmin={c.isSuperadmin} /> },
     ],
   },
@@ -508,7 +510,9 @@ const SECTIONS: Array<{
   },
 ]
 
-const SECTION_ORDER = ["organization", "billing", "monitoring", "accounts"]
+// Billing left this table on 2026-08-17: it stopped being a plan you pick and
+// became a ledger with its own page (/billing, off the account menu).
+const SECTION_ORDER = ["organization", "monitoring", "accounts"]
 const sectionRank = (id: string) => {
   const i = SECTION_ORDER.indexOf(id)
   return i === -1 ? SECTION_ORDER.length : i
@@ -532,8 +536,14 @@ export function SettingsPage() {
   }
 
   const ctx: SectionCtx = { org: scopeOrg, canWrite, isSuperadmin, hasWebProxy }
+  const panelsOf = (s: (typeof SECTIONS)[number]) =>
+    s.panels.filter((p) => (p.visible ? p.visible(ctx) : true))
+  // A section whose cards all gate themselves off renders as a blank tab, which
+  // a role-only predicate caused here once. The nav entry is DERIVED from the
+  // panels that actually render, so a section predicate cannot drift from the
+  // conditions its own cards gate on.
   const shown = SECTIONS
-    .filter((s) => s.visible(ctx))
+    .filter((s) => s.visible(ctx) && panelsOf(s).length > 0)
     .sort((a, b) => sectionRank(a.id) - sectionRank(b.id))
   const landingId = "organization"
   const active =
@@ -551,7 +561,7 @@ export function SettingsPage() {
   }
   if (!active) return null
 
-  const panels = active.panels.filter((p) => (p.visible ? p.visible(ctx) : true))
+  const panels = panelsOf(active)
 
   return (
     <div className="wisp-page wisp-page--narrow flex flex-col gap-4 p-4 md:px-8 md:py-6">

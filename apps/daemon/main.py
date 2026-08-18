@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from wisp.ingress.snmp import (
     PortStatus, SnmpPoller, SnmpTarget, build_snmp_poller, missing_detail,
 )
 from wisp.ingress.gpon import GponPollerPool
+from wisp.ingress.liveping import LivePingTunnel, build_live_ping_tunnel
 from wisp.ingress.webproxy import ProxyTunnel, build_proxy_tunnel
 
 log = logging.getLogger("wisp.daemon")
@@ -94,6 +96,30 @@ class _SnmpAirtime:
         async with self._locks.setdefault(ip, asyncio.Lock()):
             async with self._sem:
                 yield
+
+# How long the walk itself took, in seconds, started AFTER the airtime gates are
+# held. Queueing behind a busy box is contention, not walk cost — the number has
+# to answer "can this walk finish inside a faster clock?", which is a property of
+# the walk. Monotonic, so a clock step can't invent a duration. Every outcome
+# carries one: a walk that TIMED OUT is exactly the one whose duration matters.
+def _walk_elapsed(t0: float) -> float:
+    return round(time.monotonic() - t0, 2)
+
+def _rest_after(due: float, landed: float, interval: float) -> float:
+    """When may the next sweep start, given the one that just landed?
+
+    `due` is stamped at LAUNCH, so a sweep that ran longer than its interval
+    lands with its own deadline already in the past and the next loop
+    iteration starts another one immediately — the device gets walked back to
+    back with no gap at all. That is what CLAUDE.md means by "the polling
+    caused the failure": a box that cannot answer inside its interval needs
+    LESS polling, not continuous polling.
+
+    So an overrunning sweep is treated as if it had launched when it landed,
+    and a sweep that finished in time is left alone — the normal cadence keeps
+    its phase and does not drift by a probe cycle per sweep.
+    """
+    return landed + interval if landed >= due else due
 
 def _classify_snmp_exc(exc: Exception) -> tuple[str, str]:
     msg = str(exc)[:200]
@@ -160,6 +186,7 @@ async def _gather_snmp_ports(
 
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         async with gate.slot(d["ip_address"]):
+            t0 = time.monotonic()
             try:
                 result = await asyncio.wait_for(
                     snmp_poller.walk(_snmp_target(d),
@@ -169,23 +196,26 @@ async def _gather_snmp_ports(
                 log.warning("SNMP port walk of device %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.port_walk_timeout_s)
                 return d["id"], None, {
-                    "state": "timeout",
+                    "state": "timeout", "elapsed_s": _walk_elapsed(t0),
                     "detail": f"port walk exceeded {cfg.port_walk_timeout_s:.0f}s"}
             except Exception as exc:
                 log.exception("SNMP walk failed for device %s (%s); continuing",
                               d.get("id"), d["ip_address"])
                 state, detail = _classify_snmp_exc(exc)
-                return d["id"], None, {"state": state, "detail": detail}
+                return d["id"], None, {"state": state, "detail": detail,
+                                       "elapsed_s": _walk_elapsed(t0)}
+            took = _walk_elapsed(t0)
         if not result.ports:
             return d["id"], None, {
-                "state": "empty",
+                "state": "empty", "elapsed_s": took,
                 "detail": "agent answered but the interface table had no rows"}
         wire = [_wire_port(p) for p in result.ports]
         if result.missing_columns:
             return d["id"], wire, {
-                "state": "partial", "count": len(result.ports),
+                "state": "partial", "count": len(result.ports), "elapsed_s": took,
                 "detail": missing_detail(result.missing_columns)}
-        return d["id"], wire, {"state": "ok", "count": len(result.ports)}
+        return d["id"], wire, {"state": "ok", "count": len(result.ports),
+                               "elapsed_s": took}
 
     rows = await asyncio.gather(*(one(d) for d in devices if d.get("snmp_enabled")))
     data = {dev_id: wire for dev_id, wire, _ in rows if wire is not None}
@@ -200,6 +230,7 @@ async def _gather_snmp_health(
 
     async def one(d: dict) -> tuple[int, dict | None, dict]:
         async with gate.slot(d["ip_address"]):
+            t0 = time.monotonic()
             try:
                 reading = await asyncio.wait_for(
                     health_poller.walk(_snmp_target(d), profiles),
@@ -208,15 +239,17 @@ async def _gather_snmp_health(
                 log.warning("SNMP health walk of device %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.snmp_walk_timeout_s)
                 return d["id"], None, {
-                    "state": "timeout",
+                    "state": "timeout", "elapsed_s": _walk_elapsed(t0),
                     "detail": f"health walk exceeded {cfg.snmp_walk_timeout_s:.0f}s"}
             except Exception as exc:
                 log.exception("SNMP health walk failed for device %s (%s); continuing",
                               d.get("id"), d["ip_address"])
                 state, detail = _classify_snmp_exc(exc)
-                return d["id"], None, {"state": state, "detail": detail}
+                return d["id"], None, {"state": state, "detail": detail,
+                                       "elapsed_s": _walk_elapsed(t0)}
+            took = _walk_elapsed(t0)
         status: dict = {"sysobjectid": reading.sysobjectid,
-                        "profile": reading.profile_name}
+                        "profile": reading.profile_name, "elapsed_s": took}
         if reading.health.is_empty():
             if not reading.responded:
                 status.update(state="no_response",
@@ -248,6 +281,10 @@ async def _gather_onu_optics(
     async def one(d: dict) -> tuple[int, list[dict] | None, dict]:
         target = _snmp_target(d)
         async with gate.slot(d["ip_address"]):
+            # The sysObjectID read is SNMP work this subsystem pays for on every
+            # sweep, so the clock starts before it and covers the whole optics
+            # walk — including the runs that end at "no profile claims this OLT".
+            t0 = time.monotonic()
             poller, info = await pool.resolve_info(d, target)
             status: dict = {"sysobjectid": info.get("sysobjectid"),
                             "profile": info.get("vendor")}
@@ -260,6 +297,7 @@ async def _gather_onu_optics(
                         state="no_profile",
                         detail="no GPON vendor profile claims this OLT — optics"
                                " stay off rather than guessing OIDs")
+                status["elapsed_s"] = _walk_elapsed(t0)
                 return d["id"], None, status
             try:
                 onus = await asyncio.wait_for(
@@ -268,16 +306,18 @@ async def _gather_onu_optics(
                 log.warning("GPON walk of OLT %s (%s) exceeded %.0fs cap; skipping",
                             d.get("id"), d["ip_address"], cfg.gpon_walk_timeout_s)
                 status.update(
-                    state="timeout",
+                    state="timeout", elapsed_s=_walk_elapsed(t0),
                     detail=f"ONU walk exceeded {cfg.gpon_walk_timeout_s:.0f}s")
                 return d["id"], None, status
             except Exception as exc:
                 log.exception("GPON walk failed for OLT %s (%s); continuing",
                               d.get("id"), d["ip_address"])
                 state, detail = _classify_snmp_exc(exc)
-                status.update(state=state, detail=detail)
+                status.update(state=state, detail=detail,
+                              elapsed_s=_walk_elapsed(t0))
                 return d["id"], None, status
-        status.update(state="ok", count=len(onus))
+            took = _walk_elapsed(t0)
+        status.update(state="ok", count=len(onus), elapsed_s=took)
         return d["id"], [o.to_wire() for o in onus], status
 
     eligible = [d for d in devices
@@ -419,6 +459,7 @@ async def run_cycle_central_brain(
     snmp_status: dict[int, dict] | None = None,
     walk_runner: _DiagWalkRunner | None = None,
     proxy_tunnel: ProxyTunnel | None = None,
+    live_tunnel: LivePingTunnel | None = None,
 ) -> bool:
     prober.on_cycle_start()
     ts = _utc_now_iso()
@@ -454,6 +495,12 @@ async def run_cycle_central_brain(
     if proxy_tunnel is not None:
         proxy_tunnel.notify_sessions(reply.get("proxy_sessions"))
         proxy_tunnel.notify_standby(bool(reply.get("proxy_standby")))
+    # The live-ping wake-up, and the ONLY contact live ping has with this
+    # function: a boolean off the reply, going one way. Nothing a live session
+    # measures comes back through `results`, so a watched device's packets can
+    # never reach the report envelope and therefore never reach the FSM.
+    if live_tunnel is not None:
+        live_tunnel.notify(bool(reply.get("liveping")))
     if cfg.retry_interval_s > 0:
         await _follow_recheck(prober, client, reply, cfg)
     return True
@@ -562,6 +609,16 @@ async def _run_central_brain(
     proxy_tunnel = (build_proxy_tunnel(proxy_client, cfg, lambda: devices)
                     if proxy_client is not None else None)
 
+    # Its own client, like the proxy's: the exchange parks for up to
+    # `liveping_poll_hold_s`, and parking that on the client the report cycle
+    # uses would stall the sweep. The PROBER is shared on purpose — one raw
+    # socket, one receiver thread is the Windows invariant, and a live reading
+    # that came from a second socket could disagree with the sweep's.
+    live_client = build_central_client(cfg) if cfg.liveping_enabled else None
+    live_tunnel = (build_live_ping_tunnel(live_client, cfg, prober=prober,
+                                          devices_provider=lambda: devices)
+                   if live_client is not None else None)
+
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
         if max_cycles is None:
@@ -609,6 +666,17 @@ async def _run_central_brain(
             except Exception:
                 log.exception("SNMP sweep failed; continuing")
             snmp_task = None
+            # A sweep that OVERRAN its own clock must not re-fire the instant it
+            # lands. `next_*` is stamped at LAUNCH, so once a walk takes longer
+            # than its interval that deadline is already in the past and the
+            # very next loop iteration starts another one — the box gets walked
+            # back to back forever. That is the failure CLAUDE.md records as
+            # "the polling caused the failure". A walk that cannot answer inside
+            # its interval needs LESS polling, not continuous polling, so treat
+            # the landing as the launch and give it a full interval. Untouched
+            # for a sweep that finished in time, so the normal cadence does not
+            # drift.
+            next_ports = _rest_after(next_ports, started, cfg.port_interval_s)
         optics: dict[int, list[dict]] | None = None
         if gpon_task is not None and gpon_task.done():
             try:
@@ -617,6 +685,7 @@ async def _run_central_brain(
             except Exception:
                 log.exception("GPON optics sweep failed; continuing")
             gpon_task = None
+            next_optics = _rest_after(next_optics, started, cfg.gpon_interval_s)
         health: dict[int, dict] | None = None
         if health_task is not None and health_task.done():
             try:
@@ -625,11 +694,13 @@ async def _run_central_brain(
             except Exception:
                 log.exception("SNMP health sweep failed; continuing")
             health_task = None
+            next_health = _rest_after(next_health, started, cfg.snmp_interval_s)
         try:
             reported = await run_cycle_central_brain(
                 prober, client, devices, canary_ip, cfg, ports=ports, optics=optics,
                 health=health, snmp_status=snmp_status or None,
-                walk_runner=walk_runner, proxy_tunnel=proxy_tunnel)
+                walk_runner=walk_runner, proxy_tunnel=proxy_tunnel,
+                live_tunnel=live_tunnel)
             status.write(PHASE_RUNNING, ok=reported, devices=len(devices),
                          error=None if reported else "last report to central failed")
         except Exception as exc:
@@ -649,6 +720,12 @@ async def _run_central_brain(
         await proxy_tunnel.aclose()
     if proxy_client is not None:
         close = getattr(proxy_client, "close", None)
+        if close is not None:
+            close()
+    if live_tunnel is not None:
+        await live_tunnel.aclose()
+    if live_client is not None:
+        close = getattr(live_client, "close", None)
         if close is not None:
             close()
 

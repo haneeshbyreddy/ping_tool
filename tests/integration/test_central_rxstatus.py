@@ -34,6 +34,9 @@ class RxVisibilityTest(unittest.TestCase):
                           optical_warn_dbm=-24.0, optical_crit_dbm=-27.0)
         self.store = CentralStore(self.cfg.central_db)
         auth.create_user(self.store, ORG, "owner", "ownerpassword", "owner")
+        # Authoring a vendor recipe is superadmin-only since 2026-08-18; the
+        # owner keeps the READ (it feeds the vendor dropdown).
+        auth.create_user(self.store, None, "root", "rootpassword")
         self.now = datetime.now(timezone.utc)
         self.rx_olt = self.store.create_org_device(ORG, {
             "name": "HILL-OLT-1", "ip_address": "10.0.0.1", "device_type": "OLT",
@@ -86,6 +89,18 @@ class RxVisibilityTest(unittest.TestCase):
 
     def _post(self, path, body):
         status, out, _ = self._req("POST", path, body, cookie=self._login())
+        return status, out
+
+    def _root_login(self):
+        if getattr(self, "_root_cookie", None):
+            return self._root_cookie
+        _, _, setcookie = self._req("POST", "/api/login",
+                                    {"username": "root", "password": "rootpassword"})
+        self._root_cookie = setcookie.split(";")[0] if setcookie else None
+        return self._root_cookie
+
+    def _root_post(self, path, body):
+        status, out, _ = self._req("POST", path, body, cookie=self._root_login())
         return status, out
 
     def _onu(self, device_id, onu_key, rx, *, state="online", severity="ok",
@@ -269,10 +284,18 @@ class RxVisibilityTest(unittest.TestCase):
         self.assertEqual(status, 403)
 
 
-    def test_a_new_vendor_is_onboarded_by_a_dashboard_row(self):
+    def test_a_new_vendor_is_onboarded_by_a_profile_row(self):
+        # The ROW is still the whole onboarding step; only the hand that writes
+        # it changed (superadmin/ops). The owner still READS the list — that is
+        # the vendor dropdown, and a 403 there would blank it.
         status, body = self._post("/api/web-optics-profiles", {
             **BUILTIN_SPECS["dbc"], "name": "vsol", "enabled": True,
             "optics_path": "/cgi-bin/onu_optical.cgi",
+        })
+        self.assertEqual(status, 403, body)
+        status, body = self._root_post("/api/web-optics-profiles", {
+            **BUILTIN_SPECS["dbc"], "name": "vsol", "enabled": True,
+            "org_id": ORG, "optics_path": "/cgi-bin/onu_optical.cgi",
         })
         self.assertEqual(status, 200, body)
         _, listing = self._get("/api/web-optics-profiles")
@@ -282,14 +305,16 @@ class RxVisibilityTest(unittest.TestCase):
         self.assertIn("vsol", rx["known_vendors"])
 
     def test_a_recipe_that_could_lie_is_refused_by_the_server(self):
-        status, body = self._post("/api/web-optics-profiles", {
+        # Validation still bites the superadmin: a profile may never carry a
+        # host, whoever is typing it.
+        status, body = self._root_post("/api/web-optics-profiles", {
             **BUILTIN_SPECS["dbc"], "name": "sneaky",
             "optics_path": "http://192.168.1.1/admin",
         })
         self.assertEqual(status, 422, body)
         cols = {k: v for k, v in BUILTIN_SPECS["dbc"]["columns"].items()
                 if k != "rx_dbm"}
-        status, _ = self._post("/api/web-optics-profiles", {
+        status, _ = self._root_post("/api/web-optics-profiles", {
             **BUILTIN_SPECS["dbc"], "name": "norx", "columns": cols,
             "column_order": [],
         })

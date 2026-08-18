@@ -85,10 +85,20 @@ export function ColumnMark({ buckets, gap = 2 }: {
   // and between neighbours (the dataviz mark spec). Zero-height segments
   // draw nothing — a zero is an honest zero, not a dead zone, because these
   // buckets are counts of events.
-  const { x, y, h, pad } = useChart()
+  //
+  // Columns are CLIPPED to the plot area. A caller floors its first bucket to
+  // a week/day boundary that can precede the domain start (it must — dropping
+  // the partial first bucket loses real data), and an unclipped bucket then
+  // paints across the left gutter and buries the y-axis labels under itself.
+  // A tall first column hid every tick on the org reliability chart. Only the
+  // WIDTH is trimmed: the bar's height is still the whole bucket's value, so
+  // clipping costs no honesty.
+  const { x, y, w, h, pad } = useChart()
   const cols = useMemo(() => buckets.map((b) => {
-    const x0 = x(b.t) + gap / 2
-    const bw = Math.max(1, x(b.t + b.span) - x(b.t) - gap)
+    const x0 = Math.max(pad.l, x(b.t) + gap / 2)
+    const x1 = Math.min(w - pad.r, x(b.t + b.span) - gap / 2)
+    if (x1 <= x0) return []
+    const bw = Math.max(1, x1 - x0)
     let base = h - pad.b
     const rects = []
     for (const s of b.segs) {
@@ -101,7 +111,7 @@ export function ColumnMark({ buckets, gap = 2 }: {
       base -= 2
     }
     return rects
-  }), [buckets, x, y, h, pad, gap])
+  }), [buckets, x, y, w, h, pad, gap])
   return (
     <g>
       {cols.flat().map((r, i) => (

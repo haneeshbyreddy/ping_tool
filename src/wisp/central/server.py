@@ -12,6 +12,7 @@ import ssl
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,7 @@ from wisp.central import rollup as central_rollup
 from wisp.central.api.common import public_user
 from wisp.central.auth import LoginThrottle
 from wisp.central.engine import EngineRegistry
+from wisp.central.liveping import LivePingHub
 from wisp.central.proxy import ProxyHub
 from wisp.central.store import CentralStore
 from wisp.central.whatsapp_bot import WhatsAppBot
@@ -33,6 +35,12 @@ log = logging.getLogger("wisp.central")
 MAX_WIRE_V = WIRE_V
 _MAX_BODY = 16 * 1024 * 1024
 
+# gzip container (not raw deflate), and the two bytes every gzip member opens
+# with. `_MAX_BODY` bounds what a client may SEND; the decompressed side needs
+# its OWN ceiling or a few KB of zeros expands into gigabytes of RAM.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+_GZIP_MAGIC = b"\x1f\x8b"
+
 _PROXY_EXACT = frozenset({
     "/api/proxy/session", "/api/proxy/sessions",
     "/api/proxy/close", "/api/proxy/audit",
@@ -40,13 +48,21 @@ _PROXY_EXACT = frozenset({
 _PROXY_SID_RE = re.compile(r"/api/proxy/([A-Za-z0-9_-]{16,})/")
 _STATIC = Path(__file__).resolve().parent / "static"
 
-_BILLING_EXEMPT = {"/api/me", "/api/billing", "/api/login", "/api/logout",
-                   "/api/billing/paid", "/api/billing/plan", "/healthz"}
+# Routes a LOCKED org may still reach. Every billing and payment route is in
+# here on purpose: gating the pay screen behind the paywall it exists to clear
+# is the one unforgivable own-goal, and a locked owner must be able to see the
+# amount, download the invoice and pay it without reading anything twice.
+# `/payments/webhook` needs no entry (the gate only guards `/api/*`).
+_BILLING_EXEMPT = {"/api/me", "/api/login", "/api/logout", "/healthz",
+                   "/api/billing", "/api/billing/invoice", "/api/billing/pay",
+                   "/api/billing/return", "/api/billing/plan"}
 
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 
 _WORKER_GET = {
-    "/api/me", "/api/outages", "/api/events", "/api/summary", "/api/billing",
+    # `/api/billing` is deliberately ABSENT: workers never see billing, the
+    # customers-page rule (owner-only on the route layer AND in the nav).
+    "/api/me", "/api/outages", "/api/events", "/api/summary",
     "/api/orgs", "/api/nodes", "/api/regions",
     "/api/inventory", "/api/inventory/routes", "/api/inventory/ports",
     "/api/inventory/link-ports", "/api/inventory/optics",
@@ -63,10 +79,22 @@ _WORKER_GET = {
     "/api/logs",
     "/api/issues", "/api/issues/pdf", "/api/issues/xlsx",
     "/api/field/shift",
+    # Live ping. A deliberate grant, not a default: the user story IS the
+    # worker ("a technician standing at the device"), and the route is safe by
+    # what it cannot do — it writes nothing, pages nobody, and cannot reach the
+    # FSM (see `central/liveping.py`). The data layer still applies underneath:
+    # the handler resolves its target through `visible_device_ids`, so a worker
+    # can only watch a device assigned to them.
+    "/api/liveping",
 }
 _WORKER_POST = {
     "/api/outages/acknowledge", "/api/outages/accept", "/api/outages/postmortem",
-    "/api/users/password", "/api/users/whatsapp", "/api/billing/paid",
+    # Both halves of live ping, or the button 403s the person it exists for.
+    "/api/liveping/start", "/api/liveping/stop",
+    # No billing route belongs here. Workers never see billing, and a stale
+    # entry in a permission allowlist silently grants the path if it is ever
+    # reused (v1's "/api/billing/paid" sat here after its route was deleted).
+    "/api/users/password", "/api/users/whatsapp",
     "/api/inventory/field-location", "/api/inventory/field-passive",
     "/api/inventory/field-onu", "/api/inventory/field-onu-name",
     "/api/field/shift",
@@ -166,6 +194,56 @@ class _BuildCache:
 _build_cache = _BuildCache(_STATIC / "index.html")
 
 
+def gunzip_bounded(raw: bytes, limit: int = _MAX_BODY) -> bytes | None:
+    """Inflate a gzip body, refusing anything that expands past `limit`.
+
+    Content-Length bounds what a client may SEND, and once bodies may be
+    compressed that stops bounding what central ALLOCATES: 90 KB of zeros
+    inflates to a gigabyte. `max_length` makes zlib stop at the ceiling
+    instead of allocating past it, and a non-empty `unconsumed_tail` is the
+    proof it wanted to keep going.
+
+    Returns None — never raises — on a bomb, on corruption, and on a
+    TRUNCATED stream (`eof` false). Truncation is refused even though the
+    bytes so far may parse: half a port table that files as a complete walk
+    is the failure this codebase keeps paying for.
+    """
+    try:
+        dec = zlib.decompressobj(_GZIP_WBITS)
+        out = dec.decompress(raw, max(1, limit))
+        if dec.unconsumed_tail or not dec.eof:
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def decode_body(raw: bytes, encoding: str, limit: int = _MAX_BODY) -> bytes | None:
+    """Undo `Content-Encoding` on a request body. None = undecodable.
+
+    Central ALWAYS accepts both compressed and uncompressed — that is the
+    whole deployment argument for the edge half: no handshake and no version
+    dance, so central ships whenever and edges start saving as they roll.
+
+    The MAGIC decides, not the header, and it decides in BOTH directions. A
+    gzip member always opens \\x1f\\x8b and JSON text never can, so the bytes
+    are a stronger signal than a header a middlebox in front of central may
+    rewrite: a proxy that inflates the body and leaves `Content-Encoding:
+    gzip` behind, and one that strips the header and forwards the bytes, both
+    still parse. The header is kept only to log the disagreement, because a
+    fleet-wide 400 storm the day gzip rolls out wants a breadcrumb naming
+    which side of the tunnel mangled it.
+    """
+    gzipped = raw[:2] == _GZIP_MAGIC
+    declared = "gzip" in encoding
+    if gzipped != declared:
+        log.debug("body encoding disagrees with the bytes: header=%r gzip_magic=%s",
+                  encoding, gzipped)
+    if gzipped:
+        return gunzip_bounded(raw, limit)
+    return raw
+
+
 def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, notifier=None,
                   engine_registry: EngineRegistry | None = None,
                   secret_box=None):
@@ -261,11 +339,26 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                 return None
             if length <= 0 or length > _MAX_BODY:
                 return None
+            raw = decode_body(self.rfile.read(length),
+                              (self.headers.get("Content-Encoding") or "").strip().lower())
+            if raw is None:
+                # A body that will not inflate is refused exactly the way a
+                # body that will not parse has always been refused: None here,
+                # 400 at the caller. Never an exception into the handler.
+                return None
             try:
-                return json.loads(self.rfile.read(length))
+                return json.loads(raw)
             except Exception:
                 return None
 
+        # `_read_raw` deliberately does NOT decode Content-Encoding: its whole
+        # contract is "the bytes as they arrived". Two of its three callers HMAC
+        # what it returns (the payments webhook and the WhatsApp webhook sign the
+        # wire bytes), so inflating here would compute the digest over something
+        # the sender never signed and no signature would ever verify again. The
+        # third is Traccar's form POST. None of the three is our code, none of
+        # them negotiates an encoding with us, and none of them carries an SNMP
+        # table — so there is nothing to save here and a signature to lose.
         def _read_raw(self) -> bytes:
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -682,13 +775,31 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
             if route == "/whatsapp/webhook":
                 self._whatsapp_inbound()
                 return
+            # Carries no session and must skip both gates, so it is not an
+            # `/api/*` route. Signature-verified inside; replay-safe in the
+            # store. The gateway is the only thing that ever calls it.
+            if route == "/payments/webhook":
+                try:
+                    api.billing.webhook(self)
+                except Exception:
+                    log.exception("payment webhook failed")
+                    self._reply(500, {"error": "internal error"})
+                return
             if route == "/field/track":
                 self._field_track(parsed)
                 return
             if route.startswith("/api/proxy/") and route not in _PROXY_EXACT:
                 self._proxy_forward("POST", route, parsed.query)
                 return
-            if route in ("/heartbeat", "/report", "/edge/snmp-walk", "/edge/proxy/reply"):
+            # `/edge/liveping` is its OWN edge route and is deliberately not a
+            # mode on `/report`. `/report` is the FSM's ingest path — it routes
+            # `mode="recheck"` straight into `central_engine.run_cycle` — so a
+            # live-ping mode on it would put a packet stream one `if` away from
+            # the state machine, and an operator merely WATCHING a device could
+            # move its flap counters and page somebody. A separate route means
+            # there is no such `if` to get wrong.
+            if route in ("/heartbeat", "/report", "/edge/snmp-walk",
+                         "/edge/proxy/reply", "/edge/liveping"):
                 body = self._read_body()
                 if body is None or not isinstance(body, dict):
                     self._reply(400, {"error": "bad or missing JSON body"})
@@ -709,6 +820,8 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
                         api.edge.walk_result(self, org, node, env)
                     elif route == "/edge/proxy/reply":
                         api.proxy.edge_reply(self, org, node, env)
+                    elif route == "/edge/liveping":
+                        api.liveping.edge_exchange(self, org, node, env)
                     else:
                         self._reply(200, api.edge.report(self, org, env))
                 except Exception:
@@ -819,6 +932,13 @@ def _make_handler(cfg: Config, store: CentralStore, throttle: LoginThrottle, not
     Handler.registry = registry
     Handler.secretbox = secret_box
     Handler.proxy = ProxyHub(device_max_inflight=cfg.proxy_device_max_inflight)
+    # In-memory, TTL'd, dies with the process — a live ping is not history.
+    # Constructed with no store and no engine registry on purpose: see the
+    # FSM-isolation argument at the top of `central/liveping.py`.
+    Handler.liveping = LivePingHub(
+        max_s=cfg.liveping_max_s, interval_ms=cfg.liveping_interval_ms,
+        infra_interval_ms=cfg.liveping_infra_interval_ms,
+        max_per_org=cfg.liveping_max_per_org)
     Handler.field_rate = field.TrackRate(cfg.field_track_rate_per_min)
     Handler.field_ip_rate = field.TrackRate(cfg.field_track_rate_per_min * 20)
     from wisp.central.weboptics_sweep import build_sweeper
@@ -908,6 +1028,7 @@ def make_server(cfg: Config = CONFIG, store: CentralStore | None = None,
         httpd = _CentralHTTPServer((cfg.central_bind, cfg.central_port), handler)
     httpd.store = store
     httpd.proxy = handler.proxy
+    httpd.liveping = handler.liveping
     httpd.secretbox = handler.secretbox
     httpd.weboptics = handler.weboptics
     return httpd

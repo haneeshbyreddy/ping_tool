@@ -117,7 +117,12 @@ class ProxyRoundTripTest(unittest.TestCase):
             central_db=Path(self.tmp.name) / "central.db",
             central_bind="127.0.0.1", central_port=0, central_token="s3cret",
             proxy_enabled=True, proxy_mgmt_ports=str(self.dev_port),
-            proxy_poll_hold_s=5.0, proxy_request_timeout_s=10.0,
+            # The hold only bounds an EMPTY long-poll — a request that arrives
+            # returns at once — so the tests that let one expire paid it in
+            # full (4 of them, 5 s each). 1 s still outlives the handoff to the
+            # thread that submits; prod's 25 s is about edge poll traffic, a
+            # concern no test has.
+            proxy_poll_hold_s=1.0, proxy_request_timeout_s=10.0,
             proxy_max_body_bytes=1_000_000)
         self.store = CentralStore(self.cfg.central_db)
         self.store.set_org("ispA")
@@ -137,7 +142,7 @@ class ProxyRoundTripTest(unittest.TestCase):
             central_url=f"http://127.0.0.1:{self.port}", central_token="s3cret",
             org_id="ispA", node_id="edge-1",
             proxy_enabled=True, proxy_mgmt_ports=str(self.dev_port),
-            proxy_poll_hold_s=5.0, proxy_request_timeout_s=10.0,
+            proxy_poll_hold_s=1.0, proxy_request_timeout_s=10.0,
             proxy_max_body_bytes=1_000_000)
         self.edge_client = build_central_client(self.edge_cfg)
 

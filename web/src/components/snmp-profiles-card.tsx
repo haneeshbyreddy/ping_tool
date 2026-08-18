@@ -4,6 +4,8 @@ import { toast } from "sonner"
 import { Cpu, Pencil, Plus, Trash2 } from "lucide-react"
 import { snmpApi, ApiError } from "@/lib/api"
 import type { SnmpProfile } from "@/lib/types"
+import { claimWarning, globalClaim, scopeOf, type ProfileScope } from "@/lib/profiles"
+import { ScopeBadge, ScopeField, ScopeNote } from "@/components/profile-scope"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -30,9 +32,11 @@ const DECODE_HELP: Record<string, string> = {
 }
 
 function ProfileForm({
-  org, editing, vocab, onDone,
+  org, isSuperadmin, profiles, editing, vocab, onDone,
 }: {
   org: string | null
+  isSuperadmin: boolean
+  profiles: SnmpProfile[]
   editing: SnmpProfile | null
   vocab: { metrics: string[]; decodes: string[]; selects: string[] }
   onDone: () => void
@@ -41,6 +45,11 @@ function ProfileForm({
   const [name, setName] = useState(editing?.name ?? "")
   const [match, setMatch] = useState(editing?.match_sysobjectid ?? "1.3.6.1.4.1.")
   const [enabled, setEnabled] = useState(editing?.enabled ?? true)
+  // Global unless the platform admin says otherwise. An owner never reaches
+  // this form, and an org-less caller has nothing to scope to.
+  const [scope, setScope] = useState<ProfileScope>(() =>
+    editing ? scopeOf(editing.org_id) : (isSuperadmin ? "global" : "org"))
+  const clash = globalClaim(profiles, match, editing?.id ?? null)
   const [rows, setRows] = useState<MetricRow[]>(() =>
     editing
       ? Object.entries(editing.metrics).map(([metric, s]) => ({
@@ -61,7 +70,8 @@ function ProfileForm({
       if (Object.keys(metrics).length === 0) throw new Error("Map at least one metric to an OID")
       const body = { name: name.trim(), match_sysobjectid: match.trim(), metrics, enabled }
       if (editing) { await snmpApi.updateProfile(editing.id, body); return }
-      await snmpApi.createProfile(org ? { ...body, org_id: org } : body)
+      const orgId = scope === "org" ? org : null
+      await snmpApi.createProfile(orgId ? { ...body, org_id: orgId } : body)
     },
     onSuccess: () => {
       toast.success(editing ? "Profile saved" : "Profile created")
@@ -84,6 +94,12 @@ function ProfileForm({
           <Input className="font-mono text-xs" placeholder="1.3.6.1.4.1.5651" value={match}
             onChange={(e) => setMatch(e.target.value)} />
         </div>
+        {editing ? <ScopeNote orgId={editing.org_id} /> : (
+          <ScopeField scope={scope} onScope={setScope} org={org}
+            hint={"Global is the default: one recipe per hardware model, not one per "
+              + "customer. Scope it to a single organization only when the recipe is "
+              + "specific to their box. The longest matching sysObjectID prefix wins."} />
+        )}
       </div>
 
       <div className="flex flex-col gap-2">
@@ -128,6 +144,11 @@ function ProfileForm({
       <label className="flex items-center gap-2 text-sm">
         <Switch checked={enabled} onCheckedChange={setEnabled} /> Enabled (served to edges)
       </label>
+      {clash && (
+        <p className="rounded-lg border border-warning/40 bg-warning-soft/30 px-3 py-2 text-xs text-foreground">
+          {claimWarning(clash, match)}
+        </p>
+      )}
       {error && <p className="text-xs text-destructive">{error}</p>}
       <div className="flex justify-end gap-2">
         <Button variant="ghost" size="sm" onClick={onDone}>Cancel</Button>
@@ -184,7 +205,7 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
         <p className="px-4 pb-3 text-xs text-muted-foreground">
           Teach the edge a new vendor's CPU/RAM/temperature OIDs as data. No rollout.
           Matched to a device by its sysObjectID, filling any reading the standard MIBs
-          don't expose. {isSuperadmin && "Profiles you add here are global (every org's edges receive them)."}
+          don't expose. {isSuperadmin && "New profiles are global by default: every organization's edges receive them, so one recipe covers the same hardware everywhere."}
         </p>
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}
         {!isLoading && profiles.length === 0 && !adding && (
@@ -196,11 +217,7 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
               <div className="min-w-0">
                 <p className="flex items-center gap-2 truncate text-sm font-medium">
                   {p.name}
-                  {p.org_id === null && (
-                    <span className="rounded bg-muted px-1.5 py-px text-2xs font-semibold text-muted-foreground">
-                      global
-                    </span>
-                  )}
+                  <ScopeBadge orgId={p.org_id} />
                   {!p.enabled && (
                     <span className="rounded bg-muted px-1.5 py-px text-2xs font-semibold text-muted-foreground">
                       off
@@ -225,13 +242,14 @@ export function SnmpProfilesCard({ org, isSuperadmin }: {
               )}
             </div>
             {editing?.id === p.id && (
-              <ProfileForm org={p.org_id} editing={p} vocab={vocab} onDone={() => setEditing(null)} />
+              <ProfileForm org={org} isSuperadmin={isSuperadmin} profiles={profiles}
+                editing={p} vocab={vocab} onDone={() => setEditing(null)} />
             )}
           </div>
         ))}
         {adding && (
-          <ProfileForm org={isSuperadmin ? null : org} editing={null} vocab={vocab}
-            onDone={() => setAdding(false)} />
+          <ProfileForm org={org} isSuperadmin={isSuperadmin} profiles={profiles}
+            editing={null} vocab={vocab} onDone={() => setAdding(false)} />
         )}
         <ConfirmDialog
           open={!!deleting}

@@ -297,6 +297,29 @@ def _metric_state(cells: dict, profile: GponProfile) -> str:
         return STATE_UNKNOWN
     return profile.decode_state(raw if raw is not None else "")
 
+def _ident_state(cells: dict, profile: GponProfile) -> str:
+    """The absence guard, on the IDENT path this time.
+
+    Same rule as `_metric_state` and it has to be stated twice because the two
+    parse paths build their cells separately: an absent COLUMN is a firmware
+    fact and takes the profile's default, but a missing VALUE in a column that
+    EXISTS is a fact about the row and is `unknown`.
+
+    Missing it here was live and it muted alarms. The ident path decoded
+    `cells.get("state", "")`, and `_dbc_state` answers ONLINE to anything it
+    does not recognise — so on the profile that sets `oid_ident_state` (dbc,
+    the C-Data EPON fleet) a dropped state column read as "every ONU is up"
+    and ponfault never saw the dark cohort. The metric path's own guard was
+    added after the opposite failure (a truncated column faking a fibre cut);
+    fixing one path and not the other is the same trap CLAUDE.md already
+    records for ONU identity, which is why that rule says "on BOTH parse
+    paths".
+    """
+    raw = cells.get("state")
+    if profile.oid_ident_state and raw is None:
+        return STATE_UNKNOWN
+    return profile.decode_state(raw if raw is not None else "")
+
 def _onu_from_metric(idx: str, cells: dict, profile: GponProfile) -> OnuOptic:
     serial = (cells.get("serial") or "").strip() or None
     return OnuOptic(
@@ -370,7 +393,7 @@ def parse_onu_table(varbinds: list[tuple[str, str]], profile: GponProfile) -> li
             onu_id=onu_id,
             name=_clean_name(cells.get("name")),
             serial=(mac_raw.upper() or None),
-            state=profile.decode_state(cells.get("state", "")),
+            state=_ident_state(cells, profile),
             rx_dbm=_to_float(ocells.get("rx"), profile.rx_scale),
             tx_dbm=_to_float(ocells.get("tx"), profile.tx_scale),
             distance_m=_to_int(cells.get("distance"), profile.distance_scale),

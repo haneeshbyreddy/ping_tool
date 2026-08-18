@@ -107,6 +107,16 @@ path. `config.PROJECT_ROOT` = repo root; `central_db` defaults to `data/central.
   process start + any never-seen if_index. A deadline-cut column KEEPS fetched rows and is
   named in `missing_columns`. Raising the timeout is the wrong fix — rows grow with
   subscribers. `ScopedWalkTest`, `PortScopePlannerTest`.
+- **How long a walk TOOK is recorded** (`device_snmp_status.elapsed_s`, seconds, REAL,
+  nullable): measured ON THE EDGE, started AFTER the `_SnmpAirtime` gates, so it is walk
+  cost and not time queued behind a busy box. Every outcome carries one — a walk that
+  TIMED OUT is exactly the one whose duration matters. **NULL is "the probe never
+  reported one" (an older build) and is NOT zero**; it renders as nothing, never as an
+  instant walk. Absent on the wire PRESERVES the stored value (`COALESCE`, the sparse-wire
+  rule), so a rolled-back probe leaves a stale duration beside a fresh `updated_at` —
+  accepted, the alternative blanks a real number. Nothing alarms on it: it exists so a
+  cadence decision is arithmetic instead of judgement. `unit/test_daemon_central_brain:
+  WalkTimingTest`, `integration/test_central_snmp_status`.
 - **The wire is SPARSE and central PRESERVES on absence**: an absent row key never arrived;
   a present key, even None, is authoritative (present-None clears a deleted alias).
   **Counters are ATOMIC per row** — both octets or neither (`counters_at` is ONE stamp;
@@ -138,6 +148,19 @@ path. `config.PROJECT_ROOT` = repo root; `central_db` defaults to `data/central.
   device list. `truncated` rides to the dashboard row — a partial dump that looks complete
   turns "that OID holds nothing" into a costly false negative. A narrower root is the fix,
   never a bigger cap.
+- **The raw walk pair is SUPERADMIN-ONLY; the owner's "Test SNMP" is its OWN pair.**
+  ISPs no longer get an OID-dumping tool (`/api/inventory/snmp-walk[/result]`,
+  `snmp-walks`), but the test button stays — every fault it names is the ISP's own
+  (wrong community, source-IP ACL, UDP 161 not forwarded). So
+  `/api/inventory/snmp-test[/result]` pins the root SERVER-side
+  (`inventory.SNMP_TEST_ROOT_OID`, the system group; a body `root_oid` is IGNORED, never
+  echoed) and answers a VERDICT — status / answered / sysDescr / error, never varbinds,
+  and 404 on a walk queued at any other root, so it is no keyhole onto the CLI's dumps.
+  Do NOT re-gate the raw routes on a client-supplied OID: a permission that reads a field
+  the client chooses is not a permission. Both queues ride ONE
+  `store.create_snmp_walk` (retention + supersede). Owner-level via `_can_write`; workers
+  are blocked by the `_WORKER_ROUTES` default and stay that way.
+  `PlatformAdminOnlyTest` in `integration/test_central_snmp_walk`.
 - **Vendor health profiles are DATA** (`snmp_profiles`, org NULL = global, longest
   sysObjectID prefix, closed decode vocabulary). Onboarding a vendor = a profile row,
   never a rollout.
@@ -157,6 +180,22 @@ path. `config.PROJECT_ROOT` = repo root; `central_db` defaults to `data/central.
   `test_registry_rebuilds_when_a_device_ip_changes`,
   `test_a_device_keeps_being_monitored_after_its_ip_changes`.
 - Wire format is IP-keyed (`POST /report`); the edge never sees device ids.
+- **The edge->central body may be GZIPPED and central ALWAYS accepts both.** That is the
+  whole deployment argument: no handshake, no version dance — central ships whenever and
+  edges start saving as they roll. Central decodes in `server.decode_body`, where **the
+  gzip MAGIC decides, not the header, in both directions** (a member always opens
+  `1f 8b`, JSON never can), so a middlebox that strips `Content-Encoding` or leaves it
+  behind cannot 400 the whole fleet on rollout day. `gunzip_bounded` gives the
+  DECOMPRESSED side its own `_MAX_BODY` ceiling (Content-Length only bounds what is
+  SENT; a few KB of zeros is a gigabyte) and refuses a TRUNCATED stream even when the
+  bytes so far parse. **`_read_raw` stays byte-exact on purpose** — the payments and
+  WhatsApp webhooks HMAC what it returns, and a signature covers the bytes on the wire.
+  Edge side is `central_client._encode`: **level 1, don't "improve" it** (measured: L1
+  87% in 4 ms, L6 89% in 9 ms, L9 90% in 49 ms — some probes are very small boxes),
+  skipped under `ship_gzip_min_bytes` (4096; `<= 0` is the escape hatch), and a
+  compressor failure ships plain rather than ending a report cycle. It rides `_post`, so
+  heartbeat, walk results and proxy replies compress too. `unit/test_ship_gzip`,
+  `integration/test_central_gzip`.
 - Escalation sweeping rides the report cadence, scoped to that org.
 - **The heartbeat is the self-update channel, not liveness** (liveness = `touch_node` off
   `/report`). Update directives written atomically; DELIVERY clears the restart flag — a
@@ -192,8 +231,10 @@ path. `config.PROJECT_ROOT` = repo root; `central_db` defaults to `data/central.
   semantics need the sync result).
 - **ONE audience, no role routing**: `org_alert_recipients(org)` = owner + worker numbers,
   de-duped, one send. **The superadmin ops number is NOT in the org audience** — it
-  carries only topic-less pings (org "I've paid", self-downgrade churn, release-sync
-  failing) via `orgs._admin_whatsapp`. Don't re-add it.
+  carries only topic-less pings: the once-a-day billing digest (`dunning.py`) and
+  release-sync failures (`releasesync._admin_numbers`). Don't re-add it. (v1's "I've
+  paid" ping and self-downgrade churn died with plans; dunning's per-org overdue pages
+  go to the org OWNERS, never here.)
 - Central-only by construction: the edge builds a store-less notifier, which is inert.
 - Config lives in `app_settings` (superadmin, read FRESH each send, no restart); token is
   write-only; per-account numbers are self-service.
@@ -784,6 +825,70 @@ timeouts.
   fetches log one line on central.
 - Tests: `unit/test_webproxy`, `integration/test_central_proxy`.
 
+## Live ping (`central/liveping.py`, `api/liveping.py`, `ingress/liveping.py`)
+
+"I'm fixing it now, show me it come back": a per-packet ICMP stream for ONE device, for a
+tech standing at it. Ephemeral — in-memory hub, TTL'd, dies on restart, nothing persisted.
+
+- **NO PATH TO THE FSM, and it is structural, not just tested.** `/report` routes
+  `mode="recheck"` into `run_cycle`, so a live stream sharing it would sit one field from
+  the state machine. Instead: its OWN edge route (`POST /edge/liveping`), and
+  `central/liveping.py` **imports nothing from `wisp` at all** — pure stdlib, so there is
+  no store, registry, dispatcher or notifier handle here to reach the engine WITH. The
+  wire type is `(seq, rtt|None)`, deliberately NOT `PingResult`, so feeding a live sample
+  to the engine takes a conversion somebody writes on purpose. Why it matters: an
+  operator merely WATCHING a device must not move its flap counters and page people.
+  Pinned twice — an AST test that fails on any forbidden import, and a 120-packet session
+  with a 70-packet loss run (the shape that trips DOWN hysteresis) leaving device_states,
+  events, outages and the notifier untouched. `unit/test_liveping:FsmIsolationTest`,
+  `integration/test_central_liveping:FsmIsolationTest`.
+- **The `/report` reply carries `liveping: true`; the edge then opens its OWN long-poll**
+  and holds it 120 s past the last session. Its own channel, NOT gated on the
+  `orgs.web_proxy` superadmin flag. Dormant-until-requested, the proxy's rule (long-polls
+  consume central worker threads). Cost, accepted and SAID OUT LOUD in the panel: the
+  first session of a quiet spell waits up to one poll cadence (10-120 s) — the SPA names
+  the wait using the org's own interval and never renders a bare spinner.
+- **The edge's requested hold MUST ride the envelope, not just the HTTP timeout.** It
+  asks ~0 when it has packets to ship and a long hold only when idle; central parks for
+  what it is ASKED for, clamped DOWN to `liveping_poll_hold_s`. Sending only the timeout
+  deadlocked it once: a 2 s request waited 12 s against a 20 s park, so EVERY exchange
+  timed out, the stream arrived in ~14 s bursts instead of one line per second, and the
+  panel's own silence alarm fired on a healthy channel. Absent/junk = an older probe and
+  falls back to the configured hold. `RequestedHoldTest`.
+- **Bounds:** 1 pkt/s (2 s infra), hard 300 s stop enforced on BOTH ends (a silent
+  central can't leave a probe pinging), ONE session per device (a second viewer JOINS it
+  — a session belongs to the device, not the viewer, and two streams would double the
+  packet rate), per-org cap. Target is always a device row through `visible_device_ids`;
+  the edge ALSO refuses any IP outside its own device list. A typed IP is unsayable on
+  both sides.
+- **The infra test reads `org_device_parents`, NEVER `org_device_topology`** — topology
+  filters maintenance and inactive rows, so an OLT whose ONUs are all in maintenance came
+  back a LEAF and got the fast rung. Wrong toward "infra" costs a slower stream; wrong
+  toward "leaf" trips the box's ICMP rate limiter and makes the real sweep report an
+  outage on the device the tech is standing next to. Decided CENTRAL-side because a probe
+  only sees its own slice. `InfraCadenceEdgeCaseTest`.
+- **One NODE may not stop another node's session** (`hub.stop(node_id=)`, passed only on
+  the edge refusal path): a refusal writes probe-supplied text into `stop_detail` that the
+  panel renders as the reason. The OPERATOR's stop stays org-scoped — a person may stop
+  any session on their devices whichever probe runs it. `RefusalScopeTest`.
+- **Workers CAN use it**, route layer and SPA both — the user story IS the worker, and it
+  is safe by what it cannot do (writes nothing, pages nobody, cannot reach the FSM,
+  TTL'd). The data layer still narrows them. Note a worker on a PHONE gets `/survey` only,
+  so this is a desktop surface for them. Live ping is deliberately NOT in
+  `_BILLING_EXEMPT`: a locked org gets 402, consistent with "the ladder gates the
+  dashboard, not monitoring".
+- Version-gated off `nodes.version` (the heartbeat) — the button says "probe needs vX.Y",
+  never spins. `MIN_EDGE_VERSION` must match the tag that actually ships it.
+- `ping_stream()` sits BESIDE `ping()` in `probers.py` and `ping()` is unchanged. On
+  icmplib (the Linux default) it is one `async_ping(count=1)` per tick — with one packet
+  `avg_rtt` IS that packet, nothing is averaged. Sequence numbers are SESSION-local
+  (1..N), never the wire seq: a wrapped 16-bit seq would draw a gap that never happened.
+- SPA renders one line per packet WITH seq numbers, so 3 consecutive losses and 3
+  scattered losses cannot look alike, and reuses `<Reading>` — `frozen` + "probe stopped
+  reporting" (the probe went away) is a different sentence from the `absent` dead zone
+  (we are measuring and nothing replied).
+- Tests: `unit/test_liveping`, `integration/test_central_liveping`.
+
 ## Central management plane
 
 - **`org_devices` is THE device table** — don't reintroduce a second registry. `events`
@@ -825,17 +930,133 @@ timeouts.
 - Ack/post-mortem rights = `can_triage` (its own predicate — write rights stay
   owner-only). Workers get the full shell; `/issues` + its exports are worker-readable.
 
-### Billing / payments
+### Billing: the metered postpaid ledger (v2, 2026-08-17)
 
-- `central/billing.py`: plans free/pro/vip; paid months in `org_billing_months`
-  (pre-marking future months IS the "no reminder" switch). Unpaid current month 402s on
-  every `/api/*` except `_BILLING_EXEMPT`; **edge ingest, monitoring and paging are NEVER
-  gated** — a lapsed bill must not silence an alarm. Device caps enforce on CREATE only;
-  passives never count. Free never locks.
-- **Payments are manual** — GPay number/QR + "I've paid" ping to the admin number; the
-  admin marks the month by hand. No ledger, no gateway (two were built and removed).
-  `POST /api/billing/plan` accepts only 'free'. Tests: `unit/test_billing`,
-  `integration/test_central_billing`.
+Operator decision, a deliberate reversal of v1: prepaid month-marking became a postpaid
+daily-accrual LEDGER, manual GPay/QR became a PAYMENT GATEWAY, and plans free/pro/vip
+with device+node caps became ONE metered price with no caps. `plan`,
+`org_billing_months` and the v1 `billing_payments` table survive UNUSED (the ntfy-topics
+convention); `_retire_gateway_v1` renames the dead 2026-06 gateway table aside on open
+so v2 can reuse the NAME. Don't relitigate; don't clean the dead rows into a migration.
+
+- **Layering, and it matters**: `metering.py` is PURE (counts + rates in, an accrual row
+  out, no I/O — the `state_machine` discipline, so the money math unit-tests without a
+  DB); `store_billing.py` persists; `dunning.py` is the paging policy; `billing.py` is
+  the glue (sweep thread + `org_status`/`org_locked`); `payments.py` is the gateway seam;
+  `billing_pdf.py` renders invoices off `pdf.py`'s primitives; `api/billing.py` is the
+  route surface. Money is **integer paise everywhere**; rupees exist only at display.
+- **Daily charge = `max(ONUs × conn_rate, devices × device_floor) ÷ days_in_month`**,
+  rounded ONCE per row into `billing_accruals` (PK org+day, `INSERT OR IGNORE`, never
+  rewritten). Defaults ₹3/ONU and ₹100/device-floor per month, in `app_settings`,
+  read fresh; nullable per-org overrides on `orgs` win. Rate changes apply FORWARD only —
+  each row stores the rate it was charged at, and `carry_forward` reuses the prior row's
+  rate so a backfilled day can't ride a rate that changed during the outage.
+  Monitored device = non-passive, active; passives never count.
+- **An invoice is the SUM of its month's rows and is NEVER recomputed** — that is what
+  makes the bill equal the chart. Outstanding = SUM(accruals) − SUM(payments), computed
+  never stored; negative IS credit (advance payment is the credit mechanism), and the
+  credit projection is the no-reminder switch.
+- **THE BILL IS PER ONU** (operator decision 2026-08-17, same day, replacing the RADIUS
+  username count): a billable connection is a subscriber ONU seen online within **7**
+  days (not 30 — a 30-day window double-counts every RMA'd box for a month), counted
+  DISTINCT on `wisp_norm_mac(serial)`, never the slot (these OLTs keep every slot an ONU
+  ever occupied, so a re-registered box sits on two). The two bases disagreed by a third
+  in BOTH directions (839 usernames vs 405 live ONUs on one org, 0 vs 800 on another) —
+  the ONU is what this product measures, so it is what it charges for.
+  `radius_conn_count`/`radius_source_health` were DELETED with the rung: a dormant feed
+  is a bill waiting to move by itself. RADIUS sync still runs, for the customers page.
+  `OnuCountTest:test_a_full_RADIUS_BOOK_does_not_move_the_bill`.
+- **ONE measuring rung, and the LATCH on it is load-bearing**: `SOURCE_LADDER` is
+  `("onu", "none")`. A roster that stops answering HOLDS its last good count for 7 days,
+  then falls through to zero and stamps `downgraded` — and there is nothing underneath to
+  catch it except the device floor, which is exactly why the floor stays. A roster that
+  NEVER answered is skipped, not believed at zero ("not measured" ≠ "no subscribers").
+  **A broken walk must never silently move a bill** — that flag is the whole point, and
+  it surfaces in the superadmin console and the daily digest. `radius`/`declared` survive
+  as `RETIRED_CONN_SOURCES`: readable so an old row renders as what it was charged on,
+  never as "no source" (opposite claims), and never back in the ladder.
+- **There is NO owner-facing write that moves the bill.** The self-declared count and its
+  panel were REMOVED on the operator's call (2026-08-17) — a customer typing their own
+  billable number is not a measurement. Everything an owner may POST is paying or
+  verifying a payment. `orgs.self_declared_conns` survives with no writer and no rung
+  (the dead-column convention); an org whose OLTs report no roster counts ZERO and pays
+  the device floor, which is an honest answer and not a guess. Don't wire a declaration
+  route back in. `NoDeclarationTest`.
+- **The ladder anchors to the oldest OPEN INVOICE, never to outstanding.** Postpaid means
+  outstanding is nonzero from day one of usage; keying the lock on a balance would shut a
+  brand-new signup out on day 3. Sign up on the 20th: 11 days accrue, invoice on the 1st,
+  first possible lock the 4th. Days 1-3 banner, day 4+ the dashboard 402s, day 60 puts
+  the org on the deactivation LIST. `test_a_brand_new_org_is_NEVER_locked`.
+- **DEACTIVATED outranks EXEMPT and the order must match in BOTH places**
+  (`billing.org_locked` and `metering.ladder_stage`) — they once ranked the flags
+  oppositely and an org carrying both rendered as switched off while every `/api/*` route
+  answered 200. `test_the_gate_and_the_document_can_never_DISAGREE_about_locked`.
+- **The ladder NEVER gates monitoring**: edge ingest, probing and paging run untouched
+  however overdue an org is, because a lapsed bill must not silence an alarm. The 402
+  guards `/api/*` and nothing else. **DEACTIVATION is the one exception, and it is the
+  only thing in the product that stops an alarm**: `/edge/devices` hands a deactivated
+  org an EMPTY topology, so its probes poll nothing and page nobody (the node still gets
+  a 200 and keeps heartbeating, so it stays live and updatable, and nothing is deleted —
+  reactivating hands the network straight back). Safe only because it can never happen
+  automatically: it takes a superadmin typing the org id into a confirm dialog on an
+  account 60+ days overdue. `test_an_OVERDUE_org_keeps_its_full_topology` and
+  `test_DEACTIVATION_stands_the_probes_down` pin the two halves; keep BOTH.
+- Exempt and deactivated orgs accrue NOTHING (no phantom debt); the days they spend that
+  way are a deliberate hole, so clearing the flag re-anchors via `billing_anchor_day`
+  rather than letting the backfill charge across it. Accrual backfill is bounded (31 d):
+  a longer gap stays an honest hole.
+- **Every billing and payment route is in `_BILLING_EXEMPT`** — gating the pay screen
+  behind the paywall it exists to clear is the one unforgivable own-goal.
+  `/api/billing` is deliberately OUT of `_WORKER_GET` (workers never see billing, the
+  customers-page rule), and no billing route belongs in `_WORKER_POST`: a stale entry in
+  a permission allowlist silently grants the path if it is ever reused.
+- **Payments: the WEBHOOK is the only path that records gateway money.** `/payments/webhook`
+  is not an `/api/*` route (no session, skips both gates, needs the RAW body for its
+  HMAC) and sits beside `/whatsapp/webhook`. The browser return is verified for INSTANT
+  FEEDBACK ONLY and posts nothing: **Razorpay's return signature covers order id and
+  payment id but NOT the amount**, so recording from it would let a client name its own
+  figure. Replay safety is the partial unique index on `provider_payment_id`. Bad
+  signature 400s (a retry after the operator fixes the secret is the right cure);
+  replays, non-capture events and unattributable events answer 200 so the gateway stops
+  re-delivering. **Configuring the webhook is a required deploy step**, not optional.
+- Provider-agnostic by construction: nothing Razorpay-specific outside `RazorpayProvider`;
+  `PROVIDERS` is a closed vocabulary; PayU is one adapter class plus one entry. Dormant
+  until provider+key_id+key_secret are set, and dormant means an honest sentence naming
+  the ops number, never a broken button. Secrets are write-only, `secretbox`-encrypted.
+- **Dunning** (`central/dunning.py`): three kinds per unpaid invoice over 60 days —
+  `issued` (days 1-3), `overdue` (the dashboard now locks), `final` (on the deactivation
+  list) — deduped per `(org, month, kind)` in `billing_notices`; only `sent`/`skipped`
+  suppress, a FAILED send retries. Credit, exempt and deactivated orgs get nothing. ONE
+  superadmin digest per operator-day rides the same table keyed `('*', <day>, 'digest')`
+  (`*` is not a legal org id, so it can't collide with a real org or be swept by an org
+  delete); a quiet day writes NO row, so the afternoon's real news can still page.
+- The billing DAY is the OPERATOR's day (`WISP_DISPLAY_TZ`), the worker-tracking
+  precedent. `POST /api/billing/plan` answers a gone-message, never 404 (the SPA deploys
+  instantly, central needs a restart).
+- **CUTOVER: `tools/billing_backfill_month.py`** charges the current month from its 1st
+  at today's measured rate (operator's call: billing runs from the start of the month,
+  and an empty ledger would otherwise bill only from the day central restarted). Dry-run
+  by default, `--apply` to write, idempotent, skips exempt/deactivated, never bills past
+  today, and stamps every row `{"backfilled": true, "cutover": "<month>"}` so the one
+  month priced at a later day's rate stays auditable. **It is a TOOL and must never
+  become engine behaviour** — `accrue_org` starts a new org on the day it appears, or a
+  signup on the 20th gets charged for the 19 days before it existed.
+  `CutoverBackfillTest`.
+- **RE-PRICE: `tools/billing_reprice_month.py`** is the ONLY thing in the product that
+  deletes an accrual row (`store.clear_month_accruals`, which REFUSES any month carrying
+  an invoice — rows under an issued bill are never rewritten, or the bill stops equalling
+  the chart). Written for the per-ONU cutover and ran once, 2026-08-17: August 1–17,
+  102 rows, ₹6,758.57 → ₹6,033.13, every row stamped
+  `{"repriced": {"on": …, "from": "radius"}}`. It changes the COUNT and its source ONLY —
+  the day set, the device count and each row's stored RATES are preserved, so it cannot
+  launder a price change backwards (rate changes stay forward-only). Same TOOL-not-engine
+  rule as the backfill.
+- Tests: `unit/test_metering` (the pure math), `unit/test_billing` (gate, status, sweep,
+  invoices, dunning), `unit/test_payments` (signatures, replay, dormancy),
+  `integration/test_central_billing` (the HTTP surface end to end). **Fixture trap paid
+  for**: an invoice seeded with NO backing accrual rows is a state the engine cannot
+  produce, and pinning it pushed a semantic change into the dunning credit gate. Seed the
+  accruals under the invoice.
 
 ## Dashboard (web/ → central/static/)
 
@@ -997,6 +1218,29 @@ Built output is committed; `./run.sh` needs no Node.
   separates structurally, never by pairing plane hues. Status hues appear only for
   failure claims. Gaps break lines; windows clamp to the org's first row and HOUR-FLOOR
   it (or the partial first bucket vanishes).
+- **`ColumnMark` CLIPS columns to the plot area.** The floored first bucket legitimately
+  precedes the domain start, and unclipped it painted across the left gutter and buried
+  every y-axis label under itself (a tall first column did exactly that on Reliability).
+  Only the WIDTH is trimmed — the height is still the whole bucket, so clipping costs no
+  honesty. All three column charts ride this one mark.
+- **A quiet band in a stack may not be low ALPHA.** Alpha over the ground moves the
+  opposite direction per mode (the basemap-ladder trap): the 30% that read as a pale
+  block in light mode read as a HOLE on near-black, i.e. as no data. Stack peers get a
+  modest ratio (0.95/0.55, browser-verified in both modes), not an emphasis ramp.
+- **Reliability (Home) plots TWO measures that disagree on purpose**: outages OPENED per
+  week, and SECONDS DOWN per week split at `analytics.LONG_OUTAGE_S` (30 min, the
+  operator's line 2026-08-17; reporting only, nothing pages on it). The disagreement is
+  the finding — one org peaked at 1005 outages in the week it lost the FEWEST hours, and
+  another's worst week was its quietest by count. Counts bucket by the week the outage
+  OPENED; downtime SPREADS across every week it covered (a 105 h fault banked whole into
+  its opening week reads "we're fine" on a week a device is still dark). It replaced
+  three duration percentiles drawn as three lines in ONE hue separated by opacity and a
+  dash: opacity reads as faded rather than as another series, one outlier week owned the
+  axis, and the time-to-acknowledge line drew off 17 acks in 3,776 outages. **The median
+  was the deepest problem** — 92% of one org's outages clear inside 5 min, so "median
+  160 s" described the flaps and buried the handful needing a van; downtime weights those
+  right by construction. Acknowledge is off Home entirely (the server still computes the
+  percentiles). `ReliabilityOrgTest`.
 - Surfaces: Home cockpit band + Reliability + Busy-hour (graded amber past 70%/red past
   90%, one ladder shared with the per-port drill), `/triage` queue with the two-tier nav
   badge, device History fold (every panel leads with HEALTH — an explicit take-back,
@@ -1333,17 +1577,49 @@ python3 has no httpx, which ERRORS ~12 proxy/edge tests and looks like a standin
 failure (it never was). Never pipe the run to `tail` (masks the exit code); redirect and
 grep `^(OK|FAILED|Ran )`. Tests inject recording doubles — no real network.
 
+- **`tests/speedups.py` is why the run takes ~65 s and not ~16 min** (2026-08-18; same
+  2 790 tests, same assertions). It is installed by `tests/unit/__init__.py` and
+  `tests/integration/__init__.py`, so it applies to `discover` with no per-file opt-in;
+  import it yourself if you run a module some other way. Three shims, each measured:
+  `serve_forever`'s poll interval drops to 10 ms (the default 0.5 s was waited out by
+  `shutdown()` in every server tearDown — **28.9 s of one 29 s module**, and the biggest
+  single win in the suite); a fresh `CentralStore` is seeded from a template file built
+  once per process (116 ms → 11 ms; `__init__` still runs in full against it, so every
+  migration executes exactly as on a production restart, and a test that writes its own
+  DB file first — the migration tests — is never seeded); scrypt drops to N=2**4 (63 ms
+  a hash, paid on every user created and every login).
+- **Production is untouched by all three** — nothing outside `tests/` imports the module,
+  so there is no knob a deploy can get wrong. Don't "clean it up" into a conftest: unittest
+  discovery never imports `conftest.py`.
+- Per-test costs that are timeouts nobody asserts on get named in the Config the code
+  actually reads: `gpon_request_timeout_s` (not `snmp_timeout_s`) once cost ONE gpon test
+  40 s, `notify_retry_backoff_s` 1.5 s a whatsapp retry test, `proxy_poll_hold_s` 5 s each
+  in four proxy tests. Profile before assuming a test is slow because it does a lot.
+
 ## Removed — don't go looking for these
 
 - **The single-box era** is deleted wholesale and git history was truncated to the newest
   10 commits (2026-07-09, no backup) — don't offer to restore it. `core/state_machine`,
   `core/analytics`, `core/baseline` are ALIVE (central imports them).
-- **Both payment gateways** (Razorpay, UPIGateway) — the operator wanted manual GPay/QR.
-  Dead settings rows and an orphaned `billing_payments` table may linger; don't "clean
-  them up" into a migration (house rule for all dead columns: ntfy topics, org_workers/
-  org_attendance, operator/tech role columns).
+- **The v1 PLANS era** (free/pro/vip, device+node caps, prepaid `org_billing_months`,
+  GPay number/QR, the "I've paid" ping, `billing-card`/`pay-online`/`upgrade-notice`/
+  `qr-image` in the SPA) — replaced 2026-08-17 by the metered postpaid ledger above.
+  Dead columns and tables stay (`orgs.plan`, `org_billing_months`, and the 2026-06
+  gateway's table now parked at `billing_payments_gw1`); don't "clean them up" into a
+  migration (house rule for all dead columns: ntfy topics, org_workers/org_attendance,
+  operator/tech role columns). NOTE the earlier "both payment gateways were removed"
+  entry is itself reversed: a gateway is back, provider-agnostic, Razorpay first.
+- **RADIUS as a metering input** (`radius_conn_count`, `radius_source_health`, the
+  `radius` and `declared` ladder rungs) — deleted 2026-08-17 when the bill went per ONU.
+  The two names survive ONLY in `metering.RETIRED_CONN_SOURCES`, for labelling old rows.
+  RADIUS sync itself is very much alive; it just cannot reach the ledger.
 - **The Team page / roster model** — who works for an org is who has a login account.
 - ntfy, the read-only operator/tech roles, the spider-fan, per-ONU map spokes, the
   per-link colour, `webplan.md`/`whatsapp-notifier-plan.md` (folded into this file).
+- **`routes/worker-page.tsx`** — the pre-`FieldShell` worker view, unreachable from
+  `main.tsx` since the phone rule landed (a worker on a phone gets `/survey` and nothing
+  else). Deleted 2026-08-18 with `ui/command.tsx` + `ui/input-group.tsx` (unused shadcn,
+  the sole importer of the `cmdk` dependency — which is now unused in `web/package.json`)
+  and `assets/hansa_dashboard_mockup.html`.
 - Tags: `v0.13.0`–`v0.15.1` survive; **`v0.14.0` is the rollback floor** — no artifact
   below it, older edges can only roll forward.

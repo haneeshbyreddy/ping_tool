@@ -8,6 +8,7 @@ from wisp.central import perf as central_perf
 from wisp.central import redundancy as central_redundancy
 from wisp.central import rollup as central_rollup
 from wisp.central import weboptics
+from wisp.central.api import liveping as from_liveping
 from wisp.central.api.common import now_iso
 from wisp.central.dispatch import CentralAlertDispatcher
 from wisp.central.optics import CentralOpticsMonitor
@@ -26,6 +27,21 @@ def devices(h, qs):
         return
     if not h._ingest_ok(org):
         h._reply(401, {"error": "unauthorized"})
+        return
+    # A DEACTIVATED org is stood down: an empty topology, so the edge probes
+    # nothing and pages nobody. This is the ONE place billing touches the
+    # monitoring path, and it is safe only because deactivation can never
+    # happen automatically — it takes a superadmin typing the org's id into a
+    # confirm dialog, on an account that is already 60+ days overdue and has
+    # stopped being a customer. The overdue LADDER itself never reaches here:
+    # a locked org is still fully monitored, which is the invariant that
+    # matters ("a lapsed bill must not silence an alarm").
+    # The node keeps heartbeating and keeps posting (empty) reports, so it
+    # stays live, stays updatable, and never trips the NODE_STALE watchdog.
+    if h.store.org_billing(org)["deactivated"]:
+        h._reply(200, {"devices": [], "canary_ip": h.cfg.canary_ip,
+                       "snmp_profiles": [], "gpon_profiles": [],
+                       "poll_interval_s": h.store.org_poll_interval(org)})
         return
     devs = h.store.org_device_topology(org)
     node = (qs.get("node_id") or [None])[0]
@@ -139,6 +155,15 @@ def report(h, org: str, env: dict) -> dict:
                 reply["proxy_sessions"] = psessions
             if h.store.org_web_proxy(org):
                 reply["proxy_standby"] = True
+        # The live-ping WAKE-UP, and the only thing live ping does to this
+        # path. The probe dials central and central can never dial it, so a
+        # session started while the channel is dormant is picked up on this
+        # reply — which is why the dashboard prints the poll cadence as a wait
+        # rather than spinning. One boolean, composed in `api/liveping`, going
+        # central -> edge only: nothing a live session measures is readable
+        # from here, and nothing here reaches the FSM.
+        if from_liveping.wake_flag(h, org, env.get("node_id", "")):
+            reply["liveping"] = True
     return reply
 
 

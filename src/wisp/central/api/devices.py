@@ -4,7 +4,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 
-from wisp.central import (assignment, billing, customers as customers_mod,
+from wisp.central import (assignment, customers as customers_mod,
                           drops, fiber, inventory, nvr_profiles, onuroster,
                           ponfault, radius_profiles, radius_sync,
                           weboptics_profiles)
@@ -12,7 +12,8 @@ from wisp.central.api.common import (DENIED, body_org_write, can_survey,
                                      device_read_scope, device_write_org,
                                      in_scope, keep_visible, olt_liveness,
                                      org_or_400, q_int_or, q_int_required,
-                                     reader_or_401, survey_write_org,
+                                     reader_or_401, superadmin_or_403,
+                                     superadmin_write_or_403, survey_write_org,
                                      visible_device_ids)
 
 log = logging.getLogger("wisp.central")
@@ -224,7 +225,15 @@ def onu_search(h, qs):
 
 
 def snmp_walks(h, qs):
-    user = reader_or_401(h)
+    # Superadmin-only, like the walk that produced them: a result is a raw
+    # varbind dump off a customer's gear, so the list and the dump answer to the
+    # same gate as the queue. The org scope check stays underneath it.
+    # NO dashboard surface calls this any more — the walk dialog and the profile
+    # wizard were deleted from the SPA for every role, and vendor onboarding is
+    # an ops job now. The routes stay because the queue is how a walk reaches
+    # the edge in the next `/report` reply, so this gate is the ONLY thing in
+    # front of them: there is no hidden button to fall back on.
+    user = superadmin_or_403(h)
     if not user:
         return
     scope = device_read_scope(h, user, qs)
@@ -235,7 +244,7 @@ def snmp_walks(h, qs):
 
 
 def snmp_walk_result(h, qs):
-    user = reader_or_401(h)
+    user = superadmin_or_403(h)
     if not user:
         return
     wid = q_int_required(h, qs, "id")
@@ -249,6 +258,10 @@ def snmp_walk_result(h, qs):
 
 
 def snmp_profiles(h, qs):
+    # READABLE by an owner, on purpose — see `gpon_profiles` for the rule that
+    # governs every recipe list. Authoring is superadmin-only; PICKING which
+    # recipe applies to your own box is the ISP's job, and that is the whole
+    # payoff of the profiles going global.
     user = reader_or_401(h)
     if not user:
         return
@@ -352,7 +365,10 @@ def rx_refresh(h, user, body):
 
 
 def nvr_profiles_list(h, qs):
-
+    # Owner-readable, the recipe-list rule stated on `gpon_profiles`: the device
+    # form's NVR vendor dropdown is built from `names`. There is no NVR profile
+    # WRITE route to lock — authoring one is already an ops job, which is now
+    # the rule for every recipe table.
     user = reader_or_401(h)
     if not user:
         return
@@ -666,17 +682,6 @@ def create(h, user, body):
         passive_ids=h.store.org_passive_ids(org),
         gpon_vendors=_gpon_vendor_names(h, org),
         nvr_vendors=_nvr_vendor_names(h, org))
-    if clean.get("device_type") not in inventory.PASSIVE_TYPES:
-        plan = h.store.org_plan(org)
-        cap = billing.device_cap(plan)
-        if cap is not None and h.store.org_monitored_device_count(
-                org, inventory.PASSIVE_TYPES) >= cap:
-            label = billing.PLANS[plan]["label"]
-            upgrade = ("upgrade to Pro or VIP for more"
-                       if plan == "free" else "upgrade to VIP for unlimited devices")
-            h._reply(422, {"error": f"{label} plan is limited to {cap} monitored "
-                                    f"devices. {upgrade} (Settings → Plan & billing)"})
-            return
     did = h.store.create_org_device(org, clean)
     h._reply(200, {"id": did})
 
@@ -1685,15 +1690,18 @@ def webui_credentials_clear(h, user, body):
     h._reply(200 if ok else 404, {"ok": ok})
 
 
-def snmp_walk_create(h, user, body):
-    did = int(body.get("device_id") or 0)
-    org = device_write_org(h, user, did)
-    if org is DENIED:
-        return
+def _walk_target_node(h, org: str, did: int) -> str | None:
+    """The refusals every walk queue shares. None once one has been answered.
+
+    A walk reaches gear only through the device's assigned probe, in that
+    probe's next `/report` reply, so a device with SNMP off or no node cannot
+    be walked at all. Both queues (the platform admin's raw walk and the
+    owner's SNMP test) refuse identically, by name.
+    """
     device = h.store.get_org_device(org, did)
     if not device:
         h._reply(404, {"error": "device not found"})
-        return
+        return None
     if not device.get("snmp_enabled") or not device.get("snmp_community"):
         raise inventory.InventoryError(
             "enable SNMP (with a community) on this device first")
@@ -1702,6 +1710,19 @@ def snmp_walk_create(h, user, body):
         raise inventory.InventoryError(
             "assign this device to a probe first. The walk runs from "
             "its assigned node.")
+    return node
+
+
+def snmp_walk_create(h, user, body):
+    if not superadmin_write_or_403(h, user):
+        return
+    did = int(body.get("device_id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    node = _walk_target_node(h, org, did)
+    if node is None:
+        return
     clean = inventory.clean_walk_payload(body)
     wid = h.store.create_snmp_walk(org, did, node, clean["root_oid"],
                                    clean["max_varbinds"],
@@ -1709,29 +1730,110 @@ def snmp_walk_create(h, user, body):
     h._reply(200, {"id": wid})
 
 
-def profile_create(h, user, body):
-    clean = inventory.clean_profile_payload(body)
-    if user["is_superadmin"]:
-        org = body.get("org_id") or None
-    else:
-        org = user["org_id"]
-    if org is not None and not h._can_write(user, org):
+def snmp_test_create(h, user, body):
+    """The owner's "Test SNMP" button. A pinned walk, never an OID the client names.
+
+    Kept for owners on purpose: every fault it names is the ISP's own to fix
+    (a wrong community string, a source-IP ACL, UDP 161 not forwarded through
+    NAT), and there is no other way for them to tell "we never asked" from
+    "the box never answered".
+
+    The root and the cap come from `inventory.SNMP_TEST_*` and a `root_oid` in
+    the body is IGNORED, not echoed: the raw walk stays superadmin-only, and a
+    gate that reads a client-chosen field is not a gate. Owner-level via
+    `device_write_org` (`_can_write`), and workers never reach it at all: a new
+    `/api/*` route is worker-blocked by default at `_WORKER_ROUTES`, which is
+    right, because a worker does not manage devices.
+
+    It rides the SAME `store.create_snmp_walk` as the raw queue, so the
+    per-device retention cap and the supersede-pending behaviour keep working
+    and the table gains no second write path.
+    """
+    did = int(body.get("device_id") or 0)
+    org = device_write_org(h, user, did)
+    if org is DENIED:
+        return
+    node = _walk_target_node(h, org, did)
+    if node is None:
+        return
+    wid = h.store.create_snmp_walk(org, did, node,
+                                   inventory.SNMP_TEST_ROOT_OID,
+                                   inventory.SNMP_TEST_MAX_VARBINDS,
+                                   requested_by=user["username"])
+    h._reply(200, {"id": wid})
+
+
+SYS_DESCR_OID = "1.3.6.1.2.1.1.1"
+SYS_DESCR_MAX = 200
+
+
+def _sys_descr(rows) -> str | None:
+    """sysDescr out of a system-group dump, extracted HERE, server-side.
+
+    The verdict route ships this one string and no varbinds, so the extraction
+    cannot live in the SPA: shipping rows for the client to search is shipping
+    the dump.
+    """
+    if not isinstance(rows, list):
+        return None
+    pairs = [r for r in rows if isinstance(r, (list, tuple)) and len(r) >= 2]
+    if not pairs:
+        return None
+    hit = next((r for r in pairs if str(r[0]).startswith(SYS_DESCR_OID)), pairs[0])
+    text = " ".join(str(hit[1] or "").split())
+    return text[:SYS_DESCR_MAX] or None
+
+
+def snmp_test_result(h, qs):
+    """The verdict, NOT the dump: status, answered, sysDescr, error.
+
+    An owner may never read raw varbinds through this route, so it composes a
+    fixed five-key shape and never passes the walk row through. It also serves
+    only walks on the pinned test root, so it cannot be pointed at a walk this
+    button did not queue (a CLI walk on some vendor subtree answers 404).
+    """
+    user = reader_or_401(h)
+    if not user:
+        return
+    wid = q_int_required(h, qs, "id")
+    if wid is None:
+        return
+    org = h.store.snmp_walk_org(wid)
+    if org is None or not h._can_write(user, org):
         h._reply(403, {"error": "forbidden"})
         return
-    pid = h.store.create_snmp_profile(org, clean)
+    walk = h.store.get_snmp_walk(org, wid)
+    if not walk or walk.get("root_oid") != inventory.SNMP_TEST_ROOT_OID:
+        h._reply(404, {"error": "test not found"})
+        return
+    status = walk.get("status")
+    count = walk.get("varbind_count") or 0
+    h._reply(200, {"test": {
+        "id": walk["id"],
+        "status": status,
+        "answered": bool(status == "done" and count > 0),
+        "sys_descr": _sys_descr(walk.get("result")) if status == "done" else None,
+        "error": walk.get("error"),
+    }})
+
+
+def profile_create(h, user, body):
+    # Authoring is superadmin-only; org-scoped rows are still writable, by
+    # naming the org in the body (that is how the platform admin ships an
+    # override for one ISP's box).
+    if not superadmin_write_or_403(h, user):
+        return
+    clean = inventory.clean_profile_payload(body)
+    pid = h.store.create_snmp_profile(body.get("org_id") or None, clean)
     h._reply(200, {"id": pid})
 
 
 def _profile_mutate(h, user, body, *, delete: bool):
+    if not superadmin_write_or_403(h, user):
+        return
     profile = h.store.get_snmp_profile(int(body.get("id") or 0))
     if not profile:
         h._reply(404, {"error": "profile not found"})
-        return
-    org = profile["org_id"]
-    allowed = (user["is_superadmin"] if org is None
-               else h._can_write(user, org))
-    if not allowed:
-        h._reply(403, {"error": "forbidden"})
         return
     if delete:
         ok = h.store.delete_snmp_profile(profile["id"])
@@ -1750,6 +1852,19 @@ def profile_delete(h, user, body):
 
 
 def gpon_profiles(h, qs):
+    # THE RULE FOR EVERY RECIPE LIST (snmp / gpon / web-optics / nvr): the list
+    # stays owner-READABLE while authoring is superadmin-only. Writing a recipe
+    # is internal work; choosing which recipe applies to your own OLT is the
+    # ISP's, and once recipes are global that choice is the entire payoff — an
+    # owner picks "C-Data" instead of waiting for a per-org copy.
+    # Locking the read would be data loss, not a cosmetic refusal: the device
+    # form's vendor dropdown is built from this list, a Select with no item for
+    # its value renders BLANK, and the next save unstamps a correctly-vendored
+    # OLT. It is also why `org_devices.gpon_vendor` validates against these
+    # rows rather than the built-in names.
+    # The shape is safe to hand an owner: recipes are paths and OIDs, never a
+    # host or a secret (those live on the ACCOUNT and on the device's own
+    # credentials), and `_scope_org` pins the rows to global + their own org.
     user = reader_or_401(h)
     if not user:
         return
@@ -1761,28 +1876,19 @@ def gpon_profiles(h, qs):
 
 
 def gpon_profile_create(h, user, body):
-    clean = inventory.clean_gpon_profile_payload(body)
-    if user["is_superadmin"]:
-        org = body.get("org_id") or None
-    else:
-        org = user["org_id"]
-    if org is not None and not h._can_write(user, org):
-        h._reply(403, {"error": "forbidden"})
+    if not superadmin_write_or_403(h, user):
         return
-    pid = h.store.create_gpon_profile(org, clean)
+    clean = inventory.clean_gpon_profile_payload(body)
+    pid = h.store.create_gpon_profile(body.get("org_id") or None, clean)
     h._reply(200, {"id": pid})
 
 
 def _gpon_profile_mutate(h, user, body, *, delete: bool):
+    if not superadmin_write_or_403(h, user):
+        return
     profile = h.store.get_gpon_profile(int(body.get("id") or 0))
     if not profile:
         h._reply(404, {"error": "profile not found"})
-        return
-    org = profile["org_id"]
-    allowed = (user["is_superadmin"] if org is None
-               else h._can_write(user, org))
-    if not allowed:
-        h._reply(403, {"error": "forbidden"})
         return
     if delete:
         ok = h.store.delete_gpon_profile(profile["id"])
@@ -1801,6 +1907,8 @@ def gpon_profile_delete(h, user, body):
 
 
 def web_optics_profiles(h, qs):
+    # Owner-readable, the recipe-list rule stated on `gpon_profiles`: this feeds
+    # the weboptics vendor field. Authoring is superadmin-only below.
     user = reader_or_401(h)
     if not user:
         return
@@ -1818,26 +1926,19 @@ def web_optics_profiles(h, qs):
 
 
 def web_optics_profile_create(h, user, body):
-    clean = weboptics_profiles.clean_web_optics_profile_payload(body)
-    if user["is_superadmin"]:
-        org = body.get("org_id") or None
-    else:
-        org = user["org_id"]
-    if org is not None and not h._can_write(user, org):
-        h._reply(403, {"error": "forbidden"})
+    if not superadmin_write_or_403(h, user):
         return
-    h._reply(200, {"id": h.store.create_web_optics_profile(org, clean)})
+    clean = weboptics_profiles.clean_web_optics_profile_payload(body)
+    h._reply(200, {"id": h.store.create_web_optics_profile(
+        body.get("org_id") or None, clean)})
 
 
 def _web_optics_profile_mutate(h, user, body, *, delete: bool):
+    if not superadmin_write_or_403(h, user):
+        return
     profile = h.store.get_web_optics_profile(int(body.get("id") or 0))
     if not profile:
         h._reply(404, {"error": "profile not found"})
-        return
-    org = profile["org_id"]
-    allowed = (user["is_superadmin"] if org is None else h._can_write(user, org))
-    if not allowed:
-        h._reply(403, {"error": "forbidden"})
         return
     if delete:
         ok = h.store.delete_web_optics_profile(profile["id"])

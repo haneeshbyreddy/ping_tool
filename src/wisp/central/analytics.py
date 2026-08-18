@@ -104,26 +104,71 @@ def day_availability(store, org_id: str, device_id: int, since: str,
             "spans": spans}
 
 
+# The line between an outage that cleared itself and one somebody drove out
+# for (the operator's call, 2026-08-17). It is a BAND boundary for reporting
+# only — nothing here pages, and no threshold in the FSM moves with it.
+LONG_OUTAGE_S = 1800
+
+
+def _week_of(epoch_s: int) -> int:
+    return ((epoch_s - _MONDAY_EPOCH) // _WEEK_S) * _WEEK_S + _MONDAY_EPOCH
+
+
 def weekly_outage_stats(store, org_id: str, since: str, until: str) -> list[dict]:
-    # Org-level story in ISO-week buckets: how many outages opened, and the
-    # median / p90 of time-to-resolve and time-to-acknowledge. DOWN only, the
+    # Org-level story in ISO-week buckets, on TWO measures that answer
+    # different questions and routinely disagree: how many outages OPENED, and
+    # how many seconds the fleet was actually DOWN, split at LONG_OUTAGE_S.
+    # The disagreement is the point — a week of 1005 self-clearing flaps costs
+    # less downtime than a week of 644 with a dozen real faults in it, and a
+    # count chart alone reports those backwards. DOWN only, the
     # device_reliability rule. Buckets are keyed by the Monday 00:00 UTC epoch.
+    win_start, win_end = _parse(since), _parse(until)
     weeks: dict[int, dict] = {}
+
+    def bucket(wk: int) -> dict:
+        return weeks.setdefault(wk, {
+            "week": wk, "outages": 0, "resolved": 0, "long_outages": 0,
+            "down_short_s": 0, "down_long_s": 0, "_ttr": [], "_tta": []})
+
     for o in store.outages_in_window(org_id, since, until):
         if o["final_state"] != DOWN:
             continue
         started = _parse(o["started_at"])
-        if not (_parse(since) <= started <= _parse(until)):
+        ended = _parse(o["resolved_at"]) if o["resolved_at"] else win_end
+        # The band describes the whole OUTAGE, never the slice: an eight-hour
+        # fault is a long outage in every week it touches.
+        is_long = (ended - started).total_seconds() >= LONG_OUTAGE_S
+
+        # Counts bucket by the week the outage OPENED — that is what "outages
+        # opened" means, and it keeps this half byte-identical to before.
+        if win_start <= started <= win_end:
+            row = bucket(_week_of(_epoch(started)))
+            row["outages"] += 1
+            if is_long:
+                row["long_outages"] += 1
+            if o["resolved_at"]:
+                row["resolved"] += 1
+                row["_ttr"].append((_parse(o["resolved_at"]) - started).total_seconds())
+            if o["acknowledged_at"]:
+                row["_tta"].append((_parse(o["acknowledged_at"]) - started).total_seconds())
+
+        # Downtime SPREADS across the weeks it covers. "Hours down this week"
+        # is a claim about the week, so a 105 h fault dumped whole into the
+        # week it opened would misreport every week it ran through. Same
+        # overlap loop day_availability walks, at week grain and clamped to
+        # the window at both ends.
+        s, e = max(started, win_start), min(ended, win_end)
+        if e <= s:
             continue
-        wk = ((_epoch(started) - _MONDAY_EPOCH) // _WEEK_S) * _WEEK_S + _MONDAY_EPOCH
-        row = weeks.setdefault(wk, {"week": wk, "outages": 0, "resolved": 0,
-                                    "_ttr": [], "_tta": []})
-        row["outages"] += 1
-        if o["resolved_at"]:
-            row["resolved"] += 1
-            row["_ttr"].append((_parse(o["resolved_at"]) - started).total_seconds())
-        if o["acknowledged_at"]:
-            row["_tta"].append((_parse(o["acknowledged_at"]) - started).total_seconds())
+        cur_s, end_s = _epoch(s), _epoch(e)
+        key = "down_long_s" if is_long else "down_short_s"
+        wk = _week_of(cur_s)
+        while wk < end_s:
+            lo, hi = max(cur_s, wk), min(end_s, wk + _WEEK_S)
+            if hi > lo:
+                bucket(wk)[key] += hi - lo
+            wk += _WEEK_S
+
     out = []
     for wk in sorted(weeks):
         row = weeks[wk]

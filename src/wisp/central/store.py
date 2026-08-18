@@ -7,6 +7,7 @@ from pathlib import Path
 
 from wisp.central import fiber
 from wisp.central.store_assign import AssignmentStoreMixin
+from wisp.central.store_billing import BillingStoreMixin
 from wisp.central.store_capacity import CapacityStoreMixin
 from wisp.central.store_orgs import OrgStoreMixin
 from wisp.central.store_replay import ReplayStoreMixin
@@ -1078,6 +1079,12 @@ CREATE TABLE IF NOT EXISTS device_snmp_status (
     sysobjectid TEXT,
     profile     TEXT,                    -- matched vendor profile, if any
     item_count  INTEGER,
+    -- Seconds the walk itself took, MEASURED ON THE EDGE after the airtime
+    -- gates (so it is walk cost, not time queued behind a busy box). NULL is
+    -- "the probe reported none" — an older agent build — and is NOT zero: it
+    -- must render as nothing, never as an instant walk. This is the number a
+    -- cadence decision needs; nothing alarms on it.
+    elapsed_s   REAL,
     updated_at  TEXT NOT NULL,
     last_ok_at  TEXT,
     PRIMARY KEY (device_id, subsystem)
@@ -1095,10 +1102,16 @@ CREATE TABLE IF NOT EXISTS org_billing_months (
     marked_at TEXT NOT NULL,
     PRIMARY KEY (org_id, month)
 );
--- Transition-only billing reminders (central/billing.py, watchdog pattern):
--- kind = 'due_soon' | 'locked', one row per (org, month, kind). Only
--- status 'sent'/'skipped' suppress a retry — a failed ntfy send is retried
--- on the next sweep instead of stranding the reminder.
+-- Dunning dedupe (central/dunning.py, watchdog pattern), one row per
+-- (org, month, kind). Billing v2 kinds: 'issued' (days 1..3, the invoice is
+-- due), 'overdue' (past the banner window, the dashboard now 402s), 'final'
+-- (60 d+, on the superadmin's deactivation LIST — a human still clicks).
+-- Only status 'sent'/'skipped' suppress a retry: a FAILED send is retried on
+-- the next sweep rather than stranding the page.
+-- The superadmin's once-a-day digest rides the SAME table with org_id '*'
+-- (not a legal org id, so it can never collide with a real org's notices or
+-- be swept away by an org delete) and the operator DAY in the month slot,
+-- because that digest is about a day, not an invoice month.
 CREATE TABLE IF NOT EXISTS billing_notices (
     org_id  TEXT NOT NULL,
     month   TEXT NOT NULL,
@@ -1216,6 +1229,68 @@ CREATE TABLE IF NOT EXISTS worker_locations (
 );
 CREATE INDEX IF NOT EXISTS idx_worker_locations_ts
     ON worker_locations(org_id, user_id, ts);
+-- THE POSTPAID LEDGER (billing v2, 2026-08-17). One row per org per
+-- OPERATOR-day (WISP_DISPLAY_TZ — the worker-tracking "today" precedent):
+-- daily charge = max(connections x conn_rate, devices x device_floor) /
+-- days-in-month, INTEGER PAISE, rounded once HERE. An invoice is the SUM of
+-- its month's rows and is never recomputed — the bill always equals what the
+-- chart shows. Rows are idempotent (INSERT OR IGNORE) and never rewritten.
+-- conn_source is a closed vocabulary (radius|onu|declared|held|none);
+-- flags is sparse JSON (held/downgraded/source_changed/backfilled) — the
+-- audit trail that stops a credential rotation silently moving a bill.
+CREATE TABLE IF NOT EXISTS billing_accruals (
+    org_id          TEXT NOT NULL,
+    day             TEXT NOT NULL,          -- YYYY-MM-DD, operator's day
+    paise           INTEGER NOT NULL,
+    conn_count      INTEGER NOT NULL,
+    conn_source     TEXT NOT NULL,
+    device_count    INTEGER NOT NULL,
+    winning_side    TEXT NOT NULL,          -- conn | floor
+    conn_rate_paise INTEGER NOT NULL,       -- the rate this row was charged at
+    floor_paise     INTEGER NOT NULL,
+    flags           TEXT,                   -- sparse JSON; NULL = nothing to say
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (org_id, day)
+);
+-- A month's accruals, closed on/after the 1st. status open|paid|void; 'paid'
+-- is DERIVED by settle_invoices (payments allocated oldest-first) and
+-- re-derived idempotently — 'void' is the one human-only state. The dunning
+-- ladder anchors HERE, never on outstanding (postpaid means outstanding is
+-- nonzero from day one; a new org is never locked before its first invoice).
+CREATE TABLE IF NOT EXISTS billing_invoices (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id    TEXT NOT NULL,
+    month     TEXT NOT NULL,                -- YYYY-MM (operator months)
+    paise     INTEGER NOT NULL,
+    issued_at TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'open', -- open | paid | void
+    UNIQUE (org_id, month)
+);
+-- Money received (or adjusted). kind gateway|manual|adjustment; adjustment
+-- paise may be SIGNED (dispute resolutions cut both ways), the others must
+-- be positive. provider_payment_id carries webhook idempotency: the partial
+-- unique index makes a replayed gateway event a no-op, never a double
+-- credit. NOTE an older prod DB holds a DEAD table of this NAME from the
+-- removed 2026-06 gateway era (order-tracking shape, no `kind` column) —
+-- __init__ renames it to billing_payments_gw1 (kept unread, the ntfy-topics
+-- convention) BEFORE this CREATE runs; see _retire_gateway_v1.
+CREATE TABLE IF NOT EXISTS billing_payments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id              TEXT NOT NULL,
+    paise               INTEGER NOT NULL,
+    kind                TEXT NOT NULL,      -- gateway | manual | adjustment
+    provider            TEXT,               -- e.g. 'razorpay'
+    provider_payment_id TEXT,
+    provider_order_id   TEXT,
+    note                TEXT,
+    recorded_by         TEXT,               -- username; manual rows always carry one
+    created_at          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_payments_provider
+    ON billing_payments(provider_payment_id)
+    WHERE provider_payment_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_billing_payments_org
+    ON billing_payments(org_id, id);
 """
 
 _FIBRE_SCHEMA = """
@@ -1589,6 +1664,7 @@ class CentralStore(
     ProxyStoreMixin,
     RadiusStoreMixin,
     AssignmentStoreMixin,
+    BillingStoreMixin,
     FieldStoreMixin,
     HistoryStoreMixin,
     CapacityStoreMixin,
@@ -1620,6 +1696,7 @@ class CentralStore(
         with self._connect() as conn:
             self._migrate_tenant_to_org(conn)
             self._radius_panels_are_many(conn)
+            self._retire_gateway_v1(conn)
             conn.executescript(_SCHEMA)
             self._rebuild_fibre_plant(conn)
             conn.executescript(_FIBRE_SCHEMA)
@@ -1636,7 +1713,20 @@ class CentralStore(
                 ("poll_interval_s", "INTEGER"),
                 ("plan", "TEXT NOT NULL DEFAULT 'free'"),
                 ("web_proxy", "INTEGER NOT NULL DEFAULT 0"),
-                ("auto_update", "INTEGER NOT NULL DEFAULT 0")))
+                ("auto_update", "INTEGER NOT NULL DEFAULT 0"),
+                # Billing v2 (postpaid ledger). `plan` above is DEAD but stays
+                # (the ntfy-topics convention). Rate overrides are nullable:
+                # NULL = the app_settings global. billing_anchor_day bounds
+                # the carry-forward backfill so days an org spent exempt or
+                # deactivated are never charged as if central had been down.
+                ("billing_exempt", "INTEGER NOT NULL DEFAULT 0"),
+                ("deactivated", "INTEGER NOT NULL DEFAULT 0"),
+                ("conn_rate_paise", "INTEGER"),
+                ("floor_paise", "INTEGER"),
+                ("self_declared_conns", "INTEGER"),
+                ("self_declared_by", "TEXT"),
+                ("self_declared_at", "TEXT"),
+                ("billing_anchor_day", "TEXT")))
             self._ensure_columns(conn, "nodes", (
                 ("restart_pending", "INTEGER NOT NULL DEFAULT 0"),))
             self._ensure_columns(conn, "users", (
@@ -1701,6 +1791,8 @@ class CentralStore(
                 ("placed_at", "TEXT")))
             self._ensure_columns(conn, "onu_optics", (
                 ("last_online_at", "TEXT"),))
+            self._ensure_columns(conn, "device_snmp_status", (
+                ("elapsed_s", "REAL"),))
             self._ensure_columns(conn, "device_webui_credentials", (
                 ("auth_mode", "TEXT NOT NULL DEFAULT 'form'"),))
             self._ensure_columns(conn, "nvr_channels", (
@@ -1794,6 +1886,27 @@ class CentralStore(
         except sqlite3.OperationalError:
             pass
 
+
+    @staticmethod
+    def _retire_gateway_v1(conn) -> None:
+
+        # The 2026-06 payment-gateway era left an ORPHANED `billing_payments`
+        # table in prod (order-tracking shape: order_id PK, plan, months) and
+        # billing v2 reuses that name for the ledger's money-received table.
+        # `CREATE TABLE IF NOT EXISTS` would silently keep the old shape and
+        # every insert would fail at runtime, so the dead table is renamed
+        # aside — data kept unread (the house rule against cleanup
+        # migrations), the NAME freed. Runs before `_SCHEMA`, the
+        # `_radius_panels_are_many` precedent. Discriminator: the old shape
+        # has no `kind` column and the new one always does.
+        try:
+            cols = [r[1] for r in conn.execute(
+                "PRAGMA table_info(billing_payments)")]
+        except sqlite3.OperationalError:
+            return
+        if cols and "kind" not in cols:
+            conn.execute(
+                "ALTER TABLE billing_payments RENAME TO billing_payments_gw1")
 
     @staticmethod
     def _radius_panels_are_many(conn) -> None:
@@ -2060,4 +2173,11 @@ class CentralStore(
             w = conn.execute(
                 "SELECT COALESCE(MAX(w.id),0) || ':' || COALESCE(MAX(w.completed_at),'')"
                 " FROM snmp_walks w WHERE 1=1" + wscope, wargs).fetchone()[0]
+        # BILLING IS DELIBERATELY ABSENT. A ledger does not move on a probe
+        # report, and the SPA does not carry "billing" in LIVE_QUERY_KEYS:
+        # every key this version string moves gets invalidated together, so
+        # folding a payment in here would make one webhook refetch inventory,
+        # outages and summary on every open dashboard in the org. The one case
+        # that needs to be fast (a payer watching "processing") is served by a
+        # bounded 5 s poll in the pay dialog and the lock screen instead.
         return f"{e}.{o}.{s}.{g}.{w}"

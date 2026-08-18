@@ -95,6 +95,37 @@ class Config:
     proxy_keepalive_idle_s: float = field(
         default_factory=lambda: _env_float("WISP_PROXY_KEEPALIVE_IDLE_S", 90.0))
 
+    # Live ping: a scrolling stream of individual echoes for ONE device, for a
+    # technician standing at it. Its own channel and its own kill switch on
+    # purpose — it is NOT gated on `orgs.web_proxy`, which exists for the web
+    # UI tunnel and is a much larger grant (a browser session onto the device's
+    # own admin page). Watching a box answer pings is not that.
+    liveping_enabled: bool = field(
+        default_factory=lambda: _env_bool("WISP_LIVEPING_ENABLED", True))
+    # The hard auto-stop. A live session is EPHEMERAL: it dies with this
+    # deadline, with the process, and with a stop click, and it is enforced on
+    # BOTH sides — central drops the session and the edge's own generator is
+    # bounded by a packet count — so a central that goes silent cannot leave a
+    # probe pinging a customer's gear forever.
+    liveping_max_s: int = field(
+        default_factory=lambda: _env_int("WISP_LIVEPING_MAX_S", 300))
+    # A packet a second for a leaf, one every two for aggregation gear. The
+    # slower rung is the same reason `pings_per_poll_infra` exists: a parent
+    # box answers for everything under it, and ICMP rate-limiters read as
+    # phantom loss — so an operator WATCHING an OLT could make the real sweep
+    # report an outage on the very device they are standing next to.
+    liveping_interval_ms: int = field(
+        default_factory=lambda: _env_int("WISP_LIVEPING_INTERVAL_MS", 1000))
+    liveping_infra_interval_ms: int = field(
+        default_factory=lambda: _env_int("WISP_LIVEPING_INFRA_INTERVAL_MS", 2000))
+    liveping_max_per_org: int = field(
+        default_factory=lambda: _env_int("WISP_LIVEPING_MAX_PER_ORG", 3))
+    # How long central holds the edge's exchange when there is nothing to say.
+    # Shorter than the proxy's hold: this channel only runs while a session is
+    # armed, and a shorter hold means a stop click lands sooner.
+    liveping_poll_hold_s: float = field(
+        default_factory=lambda: _env_float("WISP_LIVEPING_POLL_HOLD_S", 20.0))
+
     snmp_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SNMP_TIMEOUT_S", 2.0))
     snmp_interval_s: int = field(default_factory=lambda: _env_int("WISP_SNMP_INTERVAL_S", 300))
     port_interval_s: int = field(default_factory=lambda: _env_int("WISP_PORT_INTERVAL_S", 300))
@@ -257,6 +288,14 @@ class Config:
     org_id: str = field(default_factory=lambda: _env("WISP_ORG_ID", "default"))
     node_id: str = field(default_factory=lambda: _env("WISP_NODE_ID", "") or _hostname())
     ship_timeout_s: float = field(default_factory=lambda: _env_float("WISP_SHIP_TIMEOUT_S", 10.0))
+    # gzip the edge -> central body once it is worth the CPU. ONE knob doing two
+    # jobs on purpose: it is the threshold AND the escape hatch (<= 0 sends
+    # everything uncompressed), because when a fleet of unknown boxes starts
+    # compressing, an operator wants one name to grep for, not two. Below ~4 KB
+    # the saving is noise and the CPU is real on a small probe. Central always
+    # accepts both, so turning this off needs nothing on the other side.
+    ship_gzip_min_bytes: int = field(
+        default_factory=lambda: _env_int("WISP_SHIP_GZIP_MIN_BYTES", 4096))
     tracemalloc_every: int = field(
         default_factory=lambda: _env_int("WISP_TRACEMALLOC_EVERY", 0))
     central_db: Path = field(

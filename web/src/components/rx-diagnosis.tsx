@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { Gauge, RotateCw } from "lucide-react"
 import { ApiError, webOpticsApi } from "@/lib/api"
 import type { OrgDevice, RxStatusResponse } from "@/lib/types"
+import { useAuth } from "@/hooks/use-auth"
 import { ago } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -14,7 +15,14 @@ interface Verdict {
   tone?: "muted" | "warning"
 }
 
-function verdict(rx: RxStatusResponse): Verdict {
+// Adding a vendor recipe is a platform-admin job (the write routes are
+// superadmin-only), so an owner's step names WHO does it instead of pointing at
+// a form that 403s. It may not say anybody has been told: nothing notifies.
+const ADMIN_ADDS_RECIPE =
+  "Recipes are added by the platform admin, centrally. One covers this hardware "
+  + "at every ISP, and reaches your OLT with no update to install."
+
+function verdict(rx: RxStatusResponse, admin: boolean): Verdict {
   const scrape = rx.scrape
   if (!rx.vendor) {
     return {
@@ -37,8 +45,10 @@ function verdict(rx: RxStatusResponse): Verdict {
       steps: [
         "Open the OLT's optical page once through the web proxy. That records "
           + "its path, which is what a recipe is written from.",
-        "Add the vendor under Settings → Monitoring → Web-UI optics vendors. "
-          + "No probe update is needed; central does the reading.",
+        admin
+          ? "Add the vendor under Settings → Monitoring → Web-UI optics vendors. "
+            + "No probe update is needed; central does the reading."
+          : ADMIN_ADDS_RECIPE,
         rx.known_vendors.length
           ? `Recipes exist today for: ${rx.known_vendors.join(", ")}.`
           : "No web-UI recipes are configured yet.",
@@ -119,7 +129,9 @@ function verdict(rx: RxStatusResponse): Verdict {
     case "no_profile":
       return {
         cause: scrape.detail ?? "The reader is not configured for this OLT.",
-        steps: ["Set it up under Settings → Monitoring → Web-UI optics vendors."],
+        steps: [admin
+          ? "Set it up under Settings → Monitoring → Web-UI optics vendors."
+          : ADMIN_ADDS_RECIPE],
       }
     case "skipped":
       return {
@@ -242,6 +254,7 @@ export function RxDiagnosis({ device, compact }: {
   device: OrgDevice
   compact?: boolean
 }) {
+  const { user } = useAuth()
   const q = useQuery({
     queryKey: ["rx-status", device.id],
     queryFn: () => webOpticsApi.rxStatus(device.id),
@@ -250,7 +263,7 @@ export function RxDiagnosis({ device, compact }: {
   if (q.isLoading || q.error || !q.data) return null
   const rx = q.data
   if (rx.onus_rx > 0 && !compact) return null
-  const v = verdict(rx)
+  const v = verdict(rx, !!user?.is_superadmin)
 
   if (compact) {
     return (

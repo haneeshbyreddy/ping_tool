@@ -6,8 +6,24 @@ import sys
 from pathlib import Path
 
 from wisp.config import CONFIG
-from wisp.central import auth, pki, releasesync
+from wisp.central import auth, inventory, pki, releasesync
 from wisp.central.store import CentralStore
+
+# The SNMP walk dialog was deleted from the dashboard, so THIS is the supported
+# way to run a vendor-onboarding walk. Queue and result are two commands because
+# they are two round trips: the edge never accepts an inbound connection, so a
+# walk rides the next full /report reply and the dump comes back on the one
+# after it.
+_WALK_DELIVERY = (
+    "The edge never accepts inbound connections, so this is not instant: the walk\n"
+    "rides the NEXT FULL /report reply and the dump comes back on a later one.\n"
+    "Allow roughly one report cycle (a recheck report carries no walks), then:")
+
+_TRUNCATED_WARNING = (
+    "*** TRUNCATED — this dump STOPS at the varbind cap and is NOT the whole\n"
+    "*** subtree. An OID missing from a truncated walk is NOT absent from the\n"
+    "*** device: reading it that way is the false negative this flag exists to\n"
+    "*** prevent. Re-run with a NARROWER --root-oid; a bigger cap is not the fix.")
 
 def _password(args) -> str:
     return args.password or getpass.getpass("password: ")
@@ -58,6 +74,22 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("rollout-status", help="show an org's rollout + node versions")
     p.add_argument("--org", required=True)
+
+    p = sub.add_parser("snmp-walk", help="queue a diagnostic SNMP walk against one "
+                       "device (vendor onboarding — the dashboard no longer offers "
+                       "this; the result arrives one report cycle later)")
+    p.add_argument("--device", required=True, type=int, help="org_devices.id")
+    p.add_argument("--root-oid", default="1.3.6.1",
+                   help="subtree to dump; keep it NARROW (default 1.3.6.1)")
+    p.add_argument("--max-varbinds", type=int, default=None,
+                   help=f"cap on varbinds returned (server cap "
+                        f"{inventory.WALK_CAP_MAX_VARBINDS})")
+
+    p = sub.add_parser("snmp-walk-result", help="print a queued walk's varbind dump")
+    p.add_argument("--id", required=True, type=int, help="walk id from snmp-walk")
+    p.add_argument("--out", default=None,
+                   help="write the varbinds to this file instead of stdout "
+                        "(these run to hundreds of KB)")
 
     p = sub.add_parser("init-ca", help="create (or reuse) the internal mTLS CA + "
                        "central's own server cert, replacing the bearer-token stopgap")
@@ -145,6 +177,72 @@ def main(argv: list[str] | None = None) -> int:
             for n in store.node_versions(args.org):
                 print(f"  {n['node_id']:<16} version={n['version'] or '?':<10} "
                       f"last_seen={n['last_seen']}")
+        elif args.cmd == "snmp-walk":
+            # Same gates the deleted dashboard handler applied, in the same
+            # order, and through the same store method — so the newest-N
+            # retention and the supersede-the-pending-walk behaviour still hold.
+            org = store.device_org(args.device)
+            device = store.get_org_device(org, args.device) if org else None
+            if not device:
+                print(f"no device with id={args.device}", file=sys.stderr)
+                return 1
+            if not device.get("snmp_enabled") or not device.get("snmp_community"):
+                print(f"{device['name']!r} has no SNMP community — enable SNMP on "
+                      "the device first", file=sys.stderr)
+                return 1
+            node = device.get("assigned_node_id")
+            if not node:
+                print(f"{device['name']!r} is not assigned to a probe — the walk "
+                      "runs from its assigned node", file=sys.stderr)
+                return 1
+            clean = inventory.clean_walk_payload(
+                {"root_oid": args.root_oid, "max_varbinds": args.max_varbinds})
+            wid = store.create_snmp_walk(org, args.device, node,
+                                         clean["root_oid"], clean["max_varbinds"],
+                                         requested_by="admin-cli")
+            print(f"queued walk id={wid} on {org}/{device['name']} "
+                  f"({device['ip_address']}) via probe {node!r}")
+            print(f"  root OID {clean['root_oid']}, max {clean['max_varbinds']} "
+                  f"varbinds")
+            print(_WALK_DELIVERY)
+            print(f"  PYTHONPATH=src python -m wisp.central.admin "
+                  f"snmp-walk-result --id {wid}")
+        elif args.cmd == "snmp-walk-result":
+            org = store.snmp_walk_org(args.id)
+            walk = store.get_snmp_walk(org, args.id) if org else None
+            if not walk:
+                print(f"no walk with id={args.id}", file=sys.stderr)
+                return 1
+            print(f"walk {walk['id']}  org={org}  device_id={walk['device_id']}  "
+                  f"probe={walk['node_id']}")
+            print(f"  root OID {walk['root_oid']}  status={walk['status']}  "
+                  f"queued {walk['created_at']}"
+                  + (f"  completed {walk['completed_at']}"
+                     if walk['completed_at'] else ""))
+            if walk["status"] == "pending":
+                print("  still queued — it is delivered in the next full /report "
+                      "reply, then the edge posts the dump back")
+                return 0
+            if walk["error"]:
+                print(f"  error: {walk['error']}", file=sys.stderr)
+                return 1
+            rows = walk["result"] or []
+            print(f"  {walk['varbind_count']} varbind(s)")
+            # Announced BEFORE the dump and repeated after it: a dump this long
+            # is read from its tail as often as its head, and a partial one that
+            # looks complete is the costly failure.
+            if walk["truncated"]:
+                print(_TRUNCATED_WARNING)
+            if args.out:
+                Path(args.out).write_text(
+                    "".join(f"{oid}\t{value}\n" for oid, value in rows),
+                    encoding="utf-8")
+                print(f"  wrote {len(rows)} varbind(s) to {args.out}")
+            else:
+                for oid, value in rows:
+                    print(f"  {oid}\t{value}")
+            if walk["truncated"]:
+                print(_TRUNCATED_WARNING)
         elif args.cmd == "init-ca":
             pki_dir = Path(args.pki_dir)
             ca_key, ca_cert = pki.ensure_ca(pki_dir)
@@ -174,6 +272,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  WISP_CENTRAL_CLIENT_CERT={cert_path} WISP_CENTRAL_CLIENT_KEY={key_path} "
                   f"WISP_CENTRAL_CA_CERT={ca_cert}")
     except auth.AuthError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except inventory.InventoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except pki.PkiError as exc:

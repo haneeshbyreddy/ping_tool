@@ -25,7 +25,6 @@ export interface Org {
   google_maps_key: string | null
   map_detail: MapDetail | null
   poll_interval_s: number | null
-  plan: Plan
   web_proxy: number
   node_count: number
   device_count: number
@@ -66,33 +65,158 @@ export interface WebUiCredentials {
   updated_at: string | null
 }
 
-export type Plan = "free" | "pro" | "vip"
-export type BillingStatus = "free" | "active" | "due_soon" | "locked"
+// BILLING v2: the metered postpaid ledger. Plans, caps and paid-month marking
+// died on 2026-08-17 (operator decision). Every amount below is INTEGER
+// PAISE; rupees exist only at display time (lib/billing.ts:inr).
 
-export interface PlanSpec {
-  label: string
-  price_inr: number
-  device_cap: number | null // null = unlimited
-  node_cap: number | null // edge probes; null = unlimited
-  features: string[]
+// Where the day's billable count came from. The bill is PER ONU since
+// 2026-08-17, so there is one measuring rung: 'onu'. 'held' means the roster
+// walk is not answering and this is its last good count, so it must LOOK
+// estimated on screen (the Reading grammar); 'none' is an honest zero, never
+// a guess. A row written before the basis changed still carries 'radius' or
+// 'declared' — connSourceMeta labels those as retired rather than unknown,
+// which is why every reader takes a string here.
+export type ConnSource = "onu" | "held" | "none"
+
+// A source as it may actually ARRIVE: the closed set above, plus whatever a
+// pre-cutover row stored. The `& {}` keeps autocomplete on the real members
+// while refusing to pretend a legacy row cannot show up.
+export type StoredConnSource = ConnSource | (string & {})
+
+// The org's rung on the dunning ladder, anchored to its oldest OPEN INVOICE.
+export type BillingStage =
+  | "clear" | "banner" | "locked" | "exempt" | "deactivated"
+
+export type InvoiceStatus = "open" | "paid" | "void"
+export type PaymentKind = "gateway" | "manual" | "adjustment"
+
+// Sparse: a key is present only when there is something to say about the row.
+export interface AccrualFlags {
+  held?: string
+  backfilled?: boolean
+  source_changed?: { from: string; to: string }
+  downgraded?: { from: string; to: string }
+  // Written by tools/billing_reprice_month.py: this day was re-costed onto a
+  // new basis before anyone was invoiced for it. `from` is the source it used
+  // to be counted on.
+  repriced?: { on: string; from?: string | null }
+}
+
+// One operator-day. The invoice is the SUM of these rows and is never
+// recomputed, so the chart and the bill cannot disagree.
+export interface Accrual {
+  day: string // YYYY-MM-DD in the operator's zone
+  paise: number
+  conn_count: number
+  conn_source: StoredConnSource
+  device_count: number
+  winning_side: "conn" | "floor"
+  conn_rate_paise: number
+  floor_paise: number
+  flags: AccrualFlags
+}
+
+export interface Invoice {
+  org_id: string
+  month: string // YYYY-MM
+  paise: number
+  issued_at: string
+  status: InvoiceStatus
+}
+
+export interface Payment {
+  id: number
+  org_id: string
+  paise: number
+  kind: PaymentKind
+  provider: string | null
+  provider_payment_id: string | null
+  provider_order_id: string | null
+  note: string | null
+  recorded_by: string | null
+  created_at: string
+}
+
+export interface BillingRates {
+  conn_paise: number
+  floor_paise: number
+  conn_override: boolean
+  floor_override: boolean
+}
+
+// Dormant until configured: with enabled=false the pay button becomes an
+// honest sentence naming admin_contact, never a broken button.
+export interface PaymentConfig {
+  enabled: boolean
+  provider: string | null
+  key_id: string | null
+  admin_contact: string
 }
 
 export interface BillingInfo {
-  plan: Plan
-  status: BillingStatus
+  org_id: string
+  org_name: string
+  exempt: boolean
+  deactivated: boolean
+  // Outstanding is SUM(accruals) - SUM(payments). Negative is CREDIT, and
+  // credit_paise carries it positive for display.
+  outstanding_paise: number
+  credit_paise: number
+  credit_lasts_until: string | null
+  open_invoice: Invoice | null
+  stage: BillingStage
   locked: boolean
-  current_month: string
-  paid_through: string | null
-  due_month: string | null
-  days_left: number | null
-  paid_months: string[]
+  days_overdue: number
+  deactivation_candidate: boolean
+  today: Accrual | null
+  rates: BillingRates
   device_count: number
-  device_cap: number | null
-  node_count: number
-  node_cap: number | null
-  gpay_number: string
-  qr_image: string | null
-  plans: Record<Plan, PlanSpec>
+  month: string
+  month_label: string
+  month_to_date_paise: number
+  days_in_month: number
+  accruals: Accrual[]
+  invoices: Invoice[]
+  payments: Payment[]
+  payment: PaymentConfig
+}
+
+// One row of the superadmin fleet table.
+export interface BillingConsoleOrg {
+  org_id: string
+  name: string
+  outstanding_paise: number
+  exempt: boolean
+  deactivated: boolean
+  conn_rate_paise: number | null
+  floor_paise: number | null
+  open_invoice: Invoice | null
+  stage: BillingStage
+  days_overdue: number
+  deactivation_candidate: boolean
+  today: {
+    day: string | null
+    paise: number | null
+    conn_count: number | null
+    conn_source: StoredConnSource | null
+    device_count: number | null
+    winning_side: "conn" | "floor" | null
+    flags: AccrualFlags
+  } | null
+}
+
+export interface BillingConsole {
+  today: string
+  month: string
+  rates: { conn_paise: number; floor_paise: number }
+  orgs: BillingConsoleOrg[]
+  payment: PaymentConfig
+  ledger?: {
+    org_id: string
+    accruals: Accrual[]
+    invoices: Invoice[]
+    payments: Payment[]
+  }
 }
 
 export const DEVICE_TYPES = [
@@ -916,6 +1040,12 @@ export interface WeekStat {
   week: number
   outages: number
   resolved: number
+  // Counts bucket by the week the outage OPENED; down_* seconds SPREAD across
+  // every week the outage actually covered. Two different questions, and on
+  // real fleets they disagree — see analytics.weekly_outage_stats.
+  long_outages: number
+  down_short_s: number
+  down_long_s: number
   ttr_p50_s: number | null
   ttr_p90_s: number | null
   tta_p50_s: number | null
@@ -1102,6 +1232,16 @@ export interface AccountUser {
   created_at: string
 }
 
+// The gateway config as the superadmin panel sees it. Secrets read back as
+// booleans only: write-only at rest, never echoed to a browser.
+export interface PaymentSettings {
+  provider: string
+  key_id: string
+  key_secret_set: boolean
+  webhook_secret_set: boolean
+  providers: string[]
+}
+
 export interface WhatsappSettings {
   enabled: boolean
   phone_id: string
@@ -1112,24 +1252,17 @@ export interface WhatsappSettings {
   token_set: boolean
 }
 
-export type SnmpWalkStatus = "pending" | "done" | "error"
+export type SnmpTestStatus = "pending" | "done" | "error"
 
-export interface SnmpWalk {
+// The VERDICT of the owner's "Test SNMP" button, never a varbind dump: the
+// walk root is pinned server-side and sysDescr is extracted there too, so the
+// raw walk stays a platform-admin tool.
+export interface SnmpTestResult {
   id: number
-  node_id: string
-  root_oid: string
-  max_varbinds: number
-  status: SnmpWalkStatus
-  requested_by: string | null
+  status: SnmpTestStatus
+  answered: boolean
+  sys_descr: string | null
   error: string | null
-  varbind_count: number | null
-  truncated: 0 | 1
-  created_at: string
-  completed_at: string | null
-}
-
-export interface SnmpWalkResult extends SnmpWalk {
-  result: Array<[string, string]> | null
 }
 
 export interface ProfileMetricSpec {
@@ -1194,6 +1327,9 @@ export interface SnmpSubsystemStatus {
   sysobjectid: string | null
   profile: string | null
   item_count: number | null
+  // Seconds the walk took, measured on the probe. null = the probe reported
+  // none (an older agent build), which is NOT zero and renders as nothing.
+  elapsed_s: number | null
   updated_at: string
   last_ok_at: string | null
 }
@@ -1437,4 +1573,68 @@ export interface ShiftState {
   started_at: string | null
   ended_at: string | null
   has_token: boolean
+}
+
+// -- Live ping ---------------------------------------------------------------
+// A scrolling stream of individual echoes for ONE device, for a technician
+// standing at it. Ephemeral by construction: nothing is persisted, and a
+// central restart ends the session. A sample is [sequence, rtt_ms] where a
+// null rtt is a packet that never came back — the sequence is what lets three
+// consecutive losses render differently from three scattered ones.
+
+export type LivePingSample = [number, number | null]
+
+export type LivePingStopReason = "operator" | "expired" | "refused"
+
+export interface LivePingSession {
+  sid: string
+  device_id: number
+  device_ip: string
+  interval_ms: number
+  infra: boolean
+  started_by: string
+  started_at: number
+  expires_at: number
+  remaining_s: number
+  live: boolean
+  /** Has the PROBE picked this up yet? "Waiting for the probe" and "the
+   *  device is not answering" are different sentences. */
+  picked_up: boolean
+  /** Seconds since a packet last ARRIVED at central. A probe that dies mid
+   *  session just stops sending; without this the panel would keep showing
+   *  its last reading and read as "the device is answering". */
+  silent_s: number
+  stop_reason: LivePingStopReason | null
+  stop_detail: string | null
+  sent: number
+  received: number
+  lost: number
+  high_seq: number
+}
+
+export interface LivePingStatus {
+  device_id: number
+  enabled: boolean
+  max_s: number
+  /** The probe's check-in cadence, in seconds. Printed as the wait rather
+   *  than hidden behind a spinner. */
+  wait_hint_s: number
+  org_live: number
+  org_max: number
+  node_id: string | null
+  node_version: string | null
+  node_seen: string | null
+  node_stale: boolean
+  supported: boolean
+  needs_version: string
+  unprobed?: boolean
+  session: LivePingSession | null
+  samples: LivePingSample[]
+  cursor: number
+}
+
+export interface LivePingStart extends Partial<LivePingStatus> {
+  session: LivePingSession
+  wait_hint_s: number
+  max_s: number
 }

@@ -9,10 +9,11 @@ import { PortTrafficProfile, useProfileState } from "@/components/capacity-panel
 import { isPassiveType, type OrgDevice, type SwitchPort } from "@/lib/types"
 import { AssignmentPanel } from "@/components/device-assignees"
 import { DeviceHistoryPanel } from "@/components/device-history"
+import { LivePingPanel } from "@/components/live-ping"
 import { Meter } from "@/components/meter"
 import { CamerasPanel } from "@/components/cameras-panel"
 import { OpticalPanel } from "@/components/optical-panel"
-import { SnmpDiagnosis } from "@/components/snmp-diagnosis"
+import { SnmpDiagnosis, walkSecs } from "@/components/snmp-diagnosis"
 import { DistributionPanel } from "@/components/splitter-panel"
 import {
   WebUiButton, WebUiCredentialsButton, canOpenWebUi, useCanManageCreds, useWebProxy,
@@ -108,8 +109,12 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
   })
   const ports = useMemo(() => data?.ports ?? [], [data])
   const [profileOpen, setProfileOpen] = useProfileState(ports)
-  const portsPartial = statusQ.data?.status.find(
-    (s) => s.subsystem === "ports" && s.state === "partial") ?? null
+  const portsStatus = statusQ.data?.status.find((s) => s.subsystem === "ports") ?? null
+  const portsPartial = portsStatus?.state === "partial" ? portsStatus : null
+  // How long the probe's last port walk took. It rides beside the "as of" stamp
+  // because it is a fact about that same walk, not a claim about now. A probe
+  // that doesn't measure it reports null, and null draws nothing.
+  const portsTook = walkSecs(portsStatus?.elapsed_s)
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["inventory-ports", device.id] })
@@ -161,6 +166,12 @@ export function PortsPanel({ device }: { device: OrgDevice }) {
           : portsStale
           ? <span className="font-semibold" title="The SNMP port walk on this device has stopped refreshing. These rows are the last good snapshot.">stale · {ago(lastWalk)}</span>
           : lastWalk && <span className="text-faint-foreground">as of {ago(lastWalk)}</span>}
+        {portsTook && (
+          <span className="text-faint-foreground"
+            title="How long that walk took on the device, measured by the probe. It is the walk itself, not time spent queued behind other SNMP work.">
+            walk took {portsTook}
+          </span>
+        )}
         {!isDown && <span className="ml-auto hidden @[30rem]:inline">watch a port to alarm on it</span>}
       </div>
       {sorted.map((p) => {
@@ -819,6 +830,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac,
         )}
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
+          <LivePingPanel device={device} />
           <DeviceHistoryPanel device={device} />
           <ConnectionPanel device={device} />
           <AssignmentPanel device={device} />
@@ -847,6 +859,7 @@ export function DeviceDetail({ device, tab, onTab, focusOnuId, focusOnuMac,
       <TabsContent value="health">
         <div className="flex flex-col gap-2.5">
           <DevicePerfPanel device={device} />
+          <LivePingPanel device={device} />
           <DeviceHistoryPanel device={device} />
           <ConnectionPanel device={device} />
           <AssignmentPanel device={device} />

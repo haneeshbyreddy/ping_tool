@@ -3,16 +3,10 @@ import { Check, ChevronDown, ChevronsUpDown, Layers } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { orgsApi } from "@/lib/api"
-import type { Plan } from "@/lib/types"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
   DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-
-function planLabel(plan?: Plan | null): string {
-  if (!plan) return ""
-  return plan === "vip" ? "VIP" : plan.charAt(0).toUpperCase() + plan.slice(1)
-}
 
 function OrgTile({ letter, all, className }: { letter: string; all: boolean; className?: string }) {
   return (
@@ -44,11 +38,18 @@ export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "t
   const name = isAllOrgs
     ? "All orgs"
     : current?.name || current?.org_id || scopeOrg || user?.org_id || "Workspace"
+  // The plan label lived here until plans died with billing v1. The org id is
+  // the only other thing this row genuinely knows without a new read — and it
+  // is what an operator types into a probe enrollment or quotes to support.
+  // This row renders for workers too, so nothing billing-shaped may go here.
+  // Skipped when the headline IS the id (no display name set) so the row never
+  // says the same thing twice.
+  const orgId = current?.org_id ?? scopeOrg ?? user?.org_id ?? null
   const sidebarSub = isAllOrgs
     ? orgs.length
       ? `${orgs.length} organization${orgs.length === 1 ? "" : "s"}`
       : "Platform"
-    : planLabel(current?.plan)
+    : orgId && orgId !== name ? orgId : ""
 
   const sidebar = variant === "sidebar"
   const tile = sidebar ? "size-7 text-xs" : "size-6 text-2xs"
@@ -61,7 +62,12 @@ export function WorkspaceRow({ variant = "sidebar" }: { variant?: "sidebar" | "t
           {name}
         </span>
         {sidebar && sidebarSub && (
-          <span className="block truncate text-2xs text-faint-foreground capitalize">{sidebarSub}</span>
+          // An org id is a key somebody retypes, so it renders verbatim and
+          // mono. The all-orgs count is prose and stays in the UI face.
+          <span className={cn("block truncate text-2xs text-faint-foreground",
+            isAllOrgs ? "" : "font-mono")}>
+            {sidebarSub}
+          </span>
         )}
       </span>
       {isSuperadmin &&

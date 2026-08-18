@@ -1019,6 +1019,17 @@ _OID_RE = re.compile(r"^\d+(\.\d+){0,127}$")
 WALK_DEFAULT_MAX_VARBINDS = 2000
 WALK_CAP_MAX_VARBINDS = 20000
 
+# The owner-facing "Test SNMP" walk, PINNED HERE and nowhere else. The client
+# never names an OID and any root in the body is ignored: a permission that
+# depends on a body field the client chooses is not a permission, and that is
+# exactly the weak spot the raw-walk lock exists to remove.
+# 1.3.6.1.2.1.1 is the RFC 1213 system group — sysDescr and its six neighbours,
+# present on every agent alive, and the cheapest proof that the community
+# string is right and UDP 161 reaches the box. The cap is small because the
+# subtree is small; a bigger number would only buy a bigger dump.
+SNMP_TEST_ROOT_OID = "1.3.6.1.2.1.1"
+SNMP_TEST_MAX_VARBINDS = 12
+
 def clean_oid(raw, *, default: str | None = None, field: str = "oid") -> str:
     oid = str(raw or "").strip().strip(".")
     if not oid and default:

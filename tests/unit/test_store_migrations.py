@@ -156,6 +156,55 @@ class OnuPlaceCoordRelaxTest(unittest.TestCase):
         self.assertIsNone(rec["phone"])
 
 
+class SnmpWalkSecondsColumnTest(unittest.TestCase):
+    # Walk timing is a NEW column on an EXISTING table, so a live DB reaches it
+    # through _ensure_columns and a fresh one through _SCHEMA. Both shapes have
+    # to end up identical, and the rows already in the table have to survive the
+    # upgrade reading NULL — "we never measured this walk", not "it took no
+    # time". This test writes its own DB file, so the suite's template seeding
+    # can't hand it a table that already has the column.
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "central.db"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_an_older_db_gains_the_column_and_keeps_its_rows(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE device_snmp_status (
+                device_id   INTEGER NOT NULL,
+                org_id      TEXT NOT NULL,
+                subsystem   TEXT NOT NULL,
+                state       TEXT NOT NULL,
+                detail      TEXT,
+                sysobjectid TEXT,
+                profile     TEXT,
+                item_count  INTEGER,
+                updated_at  TEXT NOT NULL,
+                last_ok_at  TEXT,
+                PRIMARY KEY (device_id, subsystem)
+            )""")
+        conn.execute("INSERT INTO device_snmp_status (device_id, org_id,"
+                     " subsystem, state, item_count, updated_at) VALUES"
+                     " (1,'ispA','ports','ok',28,'2026-01-01T00:00:00+00:00')")
+        conn.commit()
+        conn.close()
+
+        store = CentralStore(self.db)
+        rows = {r["subsystem"]: r for r in store.device_snmp_status("ispA", 1)}
+        self.assertEqual(rows["ports"]["item_count"], 28)
+        self.assertIsNone(rows["ports"]["elapsed_s"])
+
+        # And the migrated table takes a timed walk exactly like a fresh one.
+        store.upsert_snmp_statuses("ispA", [
+            (1, "ports", {"state": "ok", "count": 28, "elapsed_s": 12.5}),
+        ], "2026-01-02T00:00:00+00:00")
+        rows = {r["subsystem"]: r for r in store.device_snmp_status("ispA", 1)}
+        self.assertAlmostEqual(rows["ports"]["elapsed_s"], 12.5)
+
+
 class NoMigrateOpenTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

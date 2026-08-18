@@ -366,7 +366,10 @@ export function WebOpticsCard({ org, isSuperadmin }: {
     methods: data?.methods ?? [], charsets: data?.charsets ?? [],
     shapes: data?.onu_id_shapes ?? [],
   }
-  const canEdit = (p: WebOpticsProfile) => (p.org_id === null ? isSuperadmin : true)
+  // Writing a recipe is a platform-admin job now (every profile write route is
+  // superadmin-only), so an owner reads this card and is offered no button
+  // that would 403. Which vendors are covered is still theirs to see.
+  const canEdit = () => isSuperadmin
 
   return (
     <Card>
@@ -374,7 +377,7 @@ export function WebOpticsCard({ org, isSuperadmin }: {
         <CardTitle className="flex items-center gap-2 text-sm">
           <Globe className="size-4 text-muted-foreground" /> Web-UI optics vendors
         </CardTitle>
-        {!adding && !editing && (
+        {isSuperadmin && !adding && !editing && (
           <Button variant="outline" size="sm" onClick={() => setAdding(true)}>
             <Plus className="size-4" /> Add vendor
           </Button>
@@ -386,7 +389,9 @@ export function WebOpticsCard({ org, isSuperadmin }: {
           their own web page is opened. A recipe lets central read that page
           through the probe's tunnel. Needs the org's web-proxy capability and the
           OLT's stored web login. No probe update.
-          {isSuperadmin && " Recipes you add here apply to every organization."}
+          {isSuperadmin
+            ? " Recipes you add here apply to every organization."
+            : " Recipes are added by the platform admin, and reach your OLTs with no update to install."}
         </p>
         {isLoading && <div className="px-4 pb-4"><Skeleton className="h-12 w-full" /></div>}
         {!isLoading && profiles.length === 0 && !adding && (
@@ -423,7 +428,7 @@ export function WebOpticsCard({ org, isSuperadmin }: {
                   {p.spec.optics_path} · {p.spec.session} · {p.spec.charset}
                 </p>
               </div>
-              {canEdit(p) && (
+              {canEdit() && (
                 <div className="ml-auto flex shrink-0 items-center gap-1 opacity-60 group-hover:opacity-100">
                   <Button variant="ghost" size="icon" className="size-7"
                     onClick={() => { setEditing(p); setAdding(false) }}>

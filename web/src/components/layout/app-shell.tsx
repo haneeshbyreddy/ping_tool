@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Navigate, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { MoreHorizontal, Search } from "lucide-react"
@@ -6,11 +6,12 @@ import { cn } from "@/lib/utils"
 import { useAuth } from "@/hooks/use-auth"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { billingApi } from "@/lib/api"
-import { BillingBanner, BillingLock, BillingLockedNote } from "@/components/billing-lock"
+import { BillingBanner, BillingLock, BillingLockedNote, LockedBand } from "@/components/billing-lock"
 import { NAV_ITEMS, MORE_ITEMS, NAV_GROUPS } from "./nav-items"
 import { useSplit } from "@/hooks/use-split-view"
 import { SplitControl, SplitView } from "./split-view"
 import { AlarmChips } from "./alarm-chips"
+import { BillTape } from "./bill-tape"
 import { WorkspaceRow } from "./workspace-row"
 import { UserMenu } from "./user-menu"
 import { AccountMenu } from "./account-menu"
@@ -71,16 +72,28 @@ export function AppShell() {
     return () => document.removeEventListener("keydown", onKey)
   }, [navigate])
 
-  const billingOrg = user ? (user.is_superadmin ? scopeOrg : user.org_id) : null
+  // WORKERS NEVER FETCH THIS. `/api/billing` is off the worker allowlist, so a
+  // worker firing it gets a 403 and a red console line on every shell mount —
+  // and there is nothing on the reply they are allowed to see anyway. The org
+  // is null for a superadmin in All orgs: there is no one bill to show.
+  const billingOrg = user && !isWorker ? (user.is_superadmin ? scopeOrg : user.org_id) : null
   const { data: billing } = useQuery({
     queryKey: ["billing", billingOrg],
     queryFn: () => billingApi.get(billingOrg),
     enabled: !!billingOrg,
+    // The event stream deliberately does not carry billing (a ledger does not
+    // move on a probe report), so freshness is this poll plus the 402 below.
     refetchInterval: 60_000,
   })
 
+  // Any /api/* answering 402 means the ledger moved under us: the lock landed
+  // between polls, or a payment just cleared it.
+  const [paymentRequired, setPaymentRequired] = useState(false)
   useEffect(() => {
-    const handler = () => queryClient.invalidateQueries({ queryKey: ["billing"] })
+    const handler = () => {
+      setPaymentRequired(true)
+      queryClient.invalidateQueries({ queryKey: ["billing"] })
+    }
     window.addEventListener("wisp:payment-required", handler)
     return () => window.removeEventListener("wisp:payment-required", handler)
   }, [queryClient])
@@ -101,18 +114,22 @@ export function AppShell() {
 
   const wasLocked = useRef(false)
   useEffect(() => {
+    if (billing && !billing.locked) setPaymentRequired(false)
     if (wasLocked.current && billing && !billing.locked) {
       queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] !== "billing" })
     }
     wasLocked.current = !!billing?.locked
   }, [billing, queryClient])
 
+  // The lock screen carries the amount and the pay button, so it needs a
+  // billing read: owners only. A superadmin scoped to a locked org keeps the
+  // whole app (the server exempts them from the 402 for the same reason).
   if (billing?.locked && user && !user.is_superadmin) {
     return <BillingLock billing={billing} org={billingOrg} />
   }
 
   if (isWorker && isMobile) {
-    return <FieldShell />
+    return <FieldShell locked={paymentRequired} />
   }
 
   return (
@@ -174,6 +191,10 @@ export function AppShell() {
           </div>
           <div className="flex-1" />
           <AlarmChips />
+          {/* Left of search, right of the alarm chips: the chrome zone, not
+              the alarm zone. Rendered off the same read the lock and the
+              banner use, so the three never quote different money. */}
+          {billing && billingOrg && !isWorker && <BillTape billing={billing} />}
           <button
             className="hidden h-8 w-52 items-center gap-2 rounded-lg border bg-muted px-2.5 text-xs text-faint-foreground transition-colors hover:border-border-strong hover:text-muted-foreground lg:flex lg:w-72"
             onClick={goToSearch}>
@@ -198,6 +219,7 @@ export function AppShell() {
             ? <BillingLockedNote billing={billing} />
             : <BillingBanner billing={billing} org={billingOrg} />
         )}
+        {isWorker && paymentRequired && <WorkerLockedNote />}
 
         <ShellMain />
 
@@ -273,7 +295,30 @@ function ShellMain() {
   )
 }
 
-function FieldShell() {
+/** What a WORKER is told when the org is locked. `/api/billing` is off the
+ *  worker allow-list, so this shell has no BillingInfo to hand
+ *  `BillingLockedNote` and no amount, month or pay action it is allowed to
+ *  state. Its only input is a 402 landing on some other call.
+ *
+ *  Same neutral band and same reasoning as the note it stands in for: a red
+ *  bar on a NOC screen is a claim about the NETWORK, and this reader cannot
+ *  act on the account anyway. Reload is the honest reset, since nothing else
+ *  tells this shell the bill was settled. */
+function WorkerLockedNote() {
+  return (
+    <LockedBand
+      lead="This account is locked."
+      rest="Monitoring and alerts keep running. Ask an owner to settle the bill."
+      action={
+        <button type="button" onClick={() => window.location.reload()}
+          className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground">
+          Reload
+        </button>
+      } />
+  )
+}
+
+function FieldShell({ locked }: { locked: boolean }) {
   const { user } = useAuth()
   const { pathname } = useLocation()
 
@@ -287,6 +332,7 @@ function FieldShell() {
         </span>
         <UserMenu />
       </header>
+      {locked && <WorkerLockedNote />}
       <main className="flex flex-1 flex-col overflow-y-auto">
         <Outlet />
       </main>
