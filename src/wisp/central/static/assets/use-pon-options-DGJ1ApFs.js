@@ -1,0 +1,1 @@
+import{Sn as e,Yt as t,Z as n,wn as r}from"./dialog-DDILZx3F.js";import{d as i}from"./split-ratio-field-Pg6-22pF.js";var a=r(e(),1);function o(e,r=!0){let o=t({queryKey:[`optics`,e],queryFn:()=>n.optics(e),enabled:!!e&&r,staleTime:6e4});return{pons:(0,a.useMemo)(()=>i((o.data?.onus??[]).map(e=>e.pon_port)),[o.data]),loading:o.isLoading&&!!e&&r}}export{o as t};

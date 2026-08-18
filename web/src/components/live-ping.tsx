@@ -225,7 +225,10 @@ export function LivePingPanel({ device }: { device: OrgDevice }) {
           </>
         )}
         <span className="ml-auto flex items-center gap-2">
-          {live && (
+          {live && session!.picked_up && (
+            // Only once the probe has it. Before that the countdown is the
+            // ARMING bound, not the ping budget, and showing it as "left" read
+            // as the session burning down while nothing had started yet.
             <span className="font-mono text-2xs text-muted-foreground">
               {clock(session!.remaining_s)} left
             </span>

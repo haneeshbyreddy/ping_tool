@@ -288,17 +288,63 @@ class BoundsTest(_Base):
         self.assertFalse(cpe["infra"])
         self.assertEqual(cpe["interval_ms"], 1000)
 
-    def test_the_session_carries_its_own_five_minute_deadline(self):
+    def test_the_five_minutes_start_when_the_PROBE_answers(self):
+        """The budget is five minutes of PACKETS, not five minutes of wall
+        clock starting at the click.
+
+        The probe dials central, so a session started while the channel is
+        dormant waits up to a full poll cadence (clamped 10-120 s) before the
+        first packet is ever sent. Charging that to the operator meant a third
+        of the session could be gone before anything happened — which is what
+        it looked like in the field.
+        """
         body = self._start(self.cpe)[1]
         self.assertEqual(body["max_s"], 300)
         sess = body["session"]
-        self.assertAlmostEqual(sess["expires_at"] - sess["started_at"], 300.0,
-                               places=1)
+        # Before the probe answers this is the ARMING bound, not the budget.
+        self.assertFalse(sess["picked_up"])
+        self.assertLess(sess["expires_at"] - sess["started_at"], 300.0)
+
         edge = self._edge("/edge/liveping", {
             "v": 1, "org_id": "ispA", "node_id": "probe1",
             "token": 0})[1]["sessions"][0]
+        # The probe is told the full budget on the very exchange it picks up.
         self.assertLessEqual(edge["remaining_s"], 300.0)
-        self.assertGreater(edge["remaining_s"], 290.0)
+        self.assertGreater(edge["remaining_s"], 299.0)
+
+        after = self._req("GET", f"/api/liveping?device_id={self.cpe}",
+                          cookie=self._login())[1]["session"]
+        self.assertTrue(after["picked_up"])
+        self.assertGreater(after["remaining_s"], 299.0)
+
+    def test_a_chatty_probe_cannot_extend_its_own_session(self):
+        """First contact moves the deadline. Nothing after it does."""
+        self._start(self.cpe)
+        env = {"v": 1, "org_id": "ispA", "node_id": "probe1", "token": 0,
+               "hold_s": 0.0}
+        first = self._edge("/edge/liveping", dict(env))[1]["sessions"][0]["remaining_s"]
+        for _ in range(3):
+            self._edge("/edge/liveping", dict(env))
+        again = self._edge("/edge/liveping", dict(env))[1]["sessions"][0]["remaining_s"]
+        self.assertLessEqual(again, first)
+
+    def test_a_session_the_probe_never_collects_still_dies(self):
+        """The arming clock is a real deadline, not a grace period, or a
+        session aimed at a dead probe would hold its device slot forever."""
+        from wisp.central import liveping as hub_mod
+        self._start(self.cpe)
+        sess = self.hub.for_device("ispA", self.cpe)
+        self.assertFalse(sess.live(sess.started_at + hub_mod._ARM_S + 1))
+
+    def test_a_late_packet_does_not_resurrect_an_armed_out_session(self):
+        """A sample arriving after the arming deadline must not push it out."""
+        from wisp.central import liveping as hub_mod
+        sid = self._start(self.cpe)[1]["session"]["sid"]
+        sess = self.hub.for_device("ispA", self.cpe)
+        sess.expires_at = sess.started_at - 1          # armed out already
+        self.hub.ingest("ispA", "probe1", sid, [[1, 5.0]])
+        self.assertEqual(sess.sent, 0)
+        self.assertIsNone(sess.picked_up_at)
 
     def test_a_second_click_on_one_device_joins_the_running_session(self):
         first = self._start(self.cpe)[1]["session"]["sid"]

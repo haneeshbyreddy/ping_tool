@@ -59,6 +59,15 @@ _RING = 600
 # edge's set.
 _LINGER_S = 90.0
 
+# How long a session may sit waiting for the probe to pick it up. The probe
+# dials central, so a session started while the channel is dormant is not seen
+# until the next report — and that cadence is clamped 10-120 s at both ends, so
+# this covers the worst case with margin. It is NOT the ping budget: the five
+# minutes start when the probe actually answers (see `_arrived`), because a
+# technician standing at a device asked for five minutes of packets, not five
+# minutes minus however long the channel took to wake up.
+_ARM_S = 180.0
+
 STOP_OPERATOR = "operator"
 STOP_EXPIRED = "expired"
 STOP_REFUSED = "refused"
@@ -117,7 +126,12 @@ class LiveSession:
             # keep showing its last reading and read as "the device is
             # answering". Measured on CENTRAL's clock, because it is a fact
             # about the channel, not about the device.
-            "silent_s": round(now - (self.last_sample_at or self.started_at), 1),
+            # From the last packet, or from FIRST CONTACT if none has landed
+            # yet — never from creation. Measuring the wake-up wait as silence
+            # made the panel announce "the probe has gone quiet" the instant it
+            # picked a session up, which is the opposite of what happened.
+            "silent_s": round(
+                now - (self.last_sample_at or self.picked_up_at or self.started_at), 1),
             "stop_reason": self.stop_reason,
             "stop_detail": self.stop_detail,
             "sent": self.sent,
@@ -213,7 +227,7 @@ class LivePingHub:
                 sid=secrets.token_urlsafe(18), org_id=org_id, node_id=node_id,
                 device_id=device_id, device_ip=device_ip, interval_ms=interval,
                 infra=infra, started_by=started_by, started_at=now,
-                expires_at=now + self.max_s)
+                expires_at=now + _ARM_S)
             self._sessions[sess.sid] = sess
             self._bump(org_id, node_id)
             return sess, None
@@ -316,8 +330,7 @@ class LivePingHub:
             sess = self._sessions.get(sid)
             if sess is None or sess.org_id != org_id or sess.node_id != node_id:
                 return
-            if sess.picked_up_at is None:
-                sess.picked_up_at = now
+            self._arrived(sess, now)
             if not sess.live(now):
                 return
             for item in samples:
@@ -345,14 +358,32 @@ class LivePingHub:
                 sess.last_sample_at = now
             self._cond.notify_all()
 
+    def _arrived(self, sess: LiveSession, now: float) -> None:
+        """First contact from the probe: the ping budget starts HERE.
+
+        Until this moment the session was only on the arming clock. Starting
+        the five minutes at CREATION charged the operator for the wake-up: on
+        a 120 s cadence a third of the session could be gone before the first
+        packet was ever sent. Idempotent — only the first contact moves it, so
+        a chatty probe cannot extend its own session.
+        """
+        # `live` first, and it is load-bearing: without it a sample arriving
+        # for a session that already blew its arming deadline would push the
+        # deadline out and RESURRECT it. A session that timed out waiting for
+        # the probe is over; a late packet is not a reason to restart it.
+        if sess.picked_up_at is not None or not sess.live(now):
+            return
+        sess.picked_up_at = now
+        sess.expires_at = now + self.max_s
+
     def mark_picked_up(self, org_id: str, node_id: str,
                        now: float | None = None) -> None:
         now = time.time() if now is None else now
         with self._cond:
             for sess in self._sessions.values():
                 if (sess.org_id == org_id and sess.node_id == node_id
-                        and sess.live(now) and sess.picked_up_at is None):
-                    sess.picked_up_at = now
+                        and sess.live(now)):
+                    self._arrived(sess, now)
 
     def exchange(self, org_id: str, node_id: str, *, token: int,
                  hold_s: float, deliver: bool) -> tuple[int, list[dict]]:

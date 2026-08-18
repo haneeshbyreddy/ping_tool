@@ -61,12 +61,18 @@ class ProfileVocabularyTest(unittest.TestCase):
 
     def test_the_encrypted_login_form_carries_the_csrf_and_nonce_back(self):
         prof = radius_profiles.builtin("oneradius")
-        form = prof.login_form("ms_comm_admin", "pw", {
+        # The password is LONG on purpose. It used to be "pw", and a two-char
+        # needle turns up in an 836-char base64 haystack by pure chance about
+        # 0.9% of the time (measured over 3000 forms) — a one-in-a-hundred
+        # flake that says "the password leaked" when nothing leaked. The
+        # 13-char username never collided once. Keep any plaintext asserted
+        # against a ciphertext long enough that a hit means what it claims.
+        form = prof.login_form("ms_comm_admin", "s3cr3t-pa55word", {
             "_csrf-backend-admin": "CSRF1", "enckey": "noncenonce"})
         self.assertEqual(form["_csrf-backend-admin"], "CSRF1")
         self.assertEqual(form["enckey"], "noncenonce")
         for field, plain in (("LoginForm[username]", "ms_comm_admin"),
-                             ("LoginForm[password]", "pw")):
+                             ("LoginForm[password]", "s3cr3t-pa55word")):
             self.assertNotIn(plain, form[field])
             self.assertGreater(len(form[field]), 100)
 

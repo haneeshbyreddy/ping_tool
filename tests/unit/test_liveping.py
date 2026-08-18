@@ -22,8 +22,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "src"))
 
-from wisp.central.liveping import (LivePingHub, MIN_EDGE_VERSION, STOP_EXPIRED,
-                                   STOP_OPERATOR, STOP_REFUSED, is_infra)
+from wisp.central.liveping import (_ARM_S, LivePingHub, MIN_EDGE_VERSION,
+                                   STOP_EXPIRED, STOP_OPERATOR, STOP_REFUSED,
+                                   is_infra)
 from wisp.ingress.probers import SingleSocketIcmpProber
 from wisp.version import version_tuple
 
@@ -137,12 +138,36 @@ class HubBoundsTest(unittest.TestCase):
         self.assertGreaterEqual(hub.interval_ms, 200)
         self.assertGreaterEqual(hub.infra_interval_ms, hub.interval_ms)
 
-    def test_the_session_auto_stops_after_five_minutes(self):
+    def test_the_five_minutes_run_from_FIRST_CONTACT_not_from_the_click(self):
         t0 = 1_000_000.0
         sess, _ = self._start(now=t0)
-        self.assertAlmostEqual(sess.expires_at - sess.started_at, 300.0)
-        self.assertTrue(sess.live(t0 + 299))
-        self.assertFalse(sess.live(t0 + 301))
+        # Waiting for the probe: the arming bound, not the ping budget.
+        self.assertLess(sess.expires_at - sess.started_at, 300.0)
+
+        # The probe answers 100 s later. The five minutes start THERE, so the
+        # operator gets the packets they asked for rather than five minutes
+        # minus however long the channel took to wake up.
+        self.hub.mark_picked_up("ispA", "probe1", now=t0 + 100)
+        self.assertAlmostEqual(sess.expires_at, t0 + 100 + 300.0)
+        self.assertTrue(sess.live(t0 + 399))
+        self.assertFalse(sess.live(t0 + 401))
+
+    def test_first_contact_moves_the_deadline_once_and_only_once(self):
+        t0 = 1_000_000.0
+        sess, _ = self._start(now=t0)
+        self.hub.mark_picked_up("ispA", "probe1", now=t0 + 10)
+        deadline = sess.expires_at
+        self.hub.mark_picked_up("ispA", "probe1", now=t0 + 20)
+        self.hub.ingest("ispA", "probe1", sess.sid, [[1, 5.0]], now=t0 + 30)
+        self.assertEqual(sess.expires_at, deadline)
+
+    def test_the_arming_clock_is_a_real_deadline(self):
+        t0 = 1_000_000.0
+        sess, _ = self._start(now=t0)
+        self.assertFalse(sess.live(t0 + _ARM_S + 1))
+        # And a probe turning up afterwards does not restart it.
+        self.hub.mark_picked_up("ispA", "probe1", now=t0 + _ARM_S + 2)
+        self.assertIsNone(sess.picked_up_at)
 
     def test_an_expired_session_drops_out_of_the_probes_set(self):
         """The auto-stop reaches the probe with no message being sent."""
